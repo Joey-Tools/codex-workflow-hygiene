@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Skill Authoring"
+  short_description: "Create concise concise Codex skills."
+  default_prompt: "Use $codex-skill-authoring to create or update a concise Codex skill for this workflow."

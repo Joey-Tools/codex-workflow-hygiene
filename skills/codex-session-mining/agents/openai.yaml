@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Session Mining"
+  short_description: "Recover prior work from ~/.codex session and history artifacts."
+  default_prompt: "Use $codex-session-mining to inspect ~/.codex session/history files and recover recent context, prior work, or repeated workflow issues."

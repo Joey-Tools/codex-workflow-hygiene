@@ -1,0 +1,136 @@
+# Codex Session Mining Recipes
+
+Use these recipes when the task is to recover prior work, map a session ID to a rollout file, or audit repeated workflow friction from the user's local Codex history.
+
+## 1. Find The Canonical Rollout File
+
+Exact session ID:
+
+```bash
+SESSION_ID='019ce6e8-a5e3-76e1-91a2-799837c70d1e'
+rg -n -F "$SESSION_ID" ~/.codex/session_index.jsonl ~/.codex/history.jsonl
+find ~/.codex/sessions -type f -name "rollout-*${SESSION_ID}*.jsonl"
+```
+
+Do not append `~/.codex/sessions` to that `rg`. A raw rollout match prints the whole JSONL record, and a nested `function_call_output` match can expand into hundreds of thousands of tokens before the useful path is visible.
+
+Bounded date range:
+
+```bash
+find ~/.codex/sessions/2026/03/12 ~/.codex/sessions/2026/03/13 -type f -name 'rollout-*.jsonl' | sort
+```
+
+Prefer filename timestamps or date-tree boundaries over `find -mtime` when the requested window is strict.
+
+## 2. Extract Only The Relevant Parts
+
+Before printing details from a large rollout, count record shapes and then filter:
+
+```bash
+python3 - <<'PY'
+from collections import Counter
+from pathlib import Path
+import json
+
+p = Path('~/.codex/sessions/2026/03/13/rollout-2026-03-13T11-15-32-019ce6e8-a5e3-76e1-91a2-799837c70d1e.jsonl').expanduser()
+counts = Counter()
+
+for line in p.open(encoding='utf-8', errors='replace'):
+    obj = json.loads(line)
+    payload = obj.get('payload') or {}
+    counts[(obj.get('type'), payload.get('type'))] += 1
+
+for key, count in counts.most_common():
+    print(f'{key[0] or "-"} / {key[1] or "-"}: {count}')
+PY
+```
+
+Do not use `jq` or Python to print every record timestamp, key list, or tool call from a large rollout just to orient yourself. Once the counts identify the relevant shape, add an explicit selector and row cap before printing snippets.
+
+Show user and assistant messages for one rollout, while skipping the wrapper noise that otherwise makes every session look like it mentioned every listed skill:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import json
+p = Path('~/.codex/sessions/2026/03/13/rollout-2026-03-13T11-15-32-019ce6e8-a5e3-76e1-91a2-799837c70d1e.jsonl').expanduser()
+limit = 40
+printed = 0
+
+def meaningful(text: str) -> bool:
+    prefixes = (
+        '# AGENTS.md instructions',
+        '<skill>',
+        '<environment_context>',
+        '<subagent_notification>',
+        '# Review findings:',
+    )
+    return bool(text) and not text.startswith(prefixes)
+
+for line in p.open():
+    obj = json.loads(line)
+    if obj.get('type') != 'response_item':
+        continue
+    payload = obj['payload']
+    if payload.get('type') != 'message':
+        continue
+    role = payload.get('role')
+    texts = []
+    for part in payload.get('content', []):
+        if part.get('type') in ('input_text', 'output_text'):
+            texts.append(part.get('text', ''))
+    text = '\\n'.join(texts).strip()
+    if not meaningful(text):
+        continue
+    print(f'[{role}] {text[:400]}')
+    printed += 1
+    if printed >= limit:
+        print(f'... stopped after {limit} messages; tighten the selector before printing more')
+        break
+PY
+```
+
+If you need the raw wrappers for provenance, keep a second pass for them, but do not use those wrapper-only messages to classify user intent or count skill mentions.
+
+Focus on tool failures or approval friction:
+
+```bash
+rg -n -i 'auth|approval|permission|denied|Could not open file|failed|blocked' \
+  ~/.codex/sessions/2026/03/12/rollout-2026-03-12T13-19-05-019ce233-677c-7e73-a77d-a3b7eecab61e.jsonl
+```
+
+Search a bounded rollout set without dumping full JSONL records:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import json
+
+paths = sorted(Path('~/.codex/sessions/2026/03/12').expanduser().glob('rollout-*.jsonl'))
+needle = 'thread/start'
+
+for path in paths:
+    for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
+        obj = json.loads(line)
+        payload = obj.get('payload') or {}
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if needle not in text:
+            continue
+        snippet = ' '.join(text.split())[:300]
+        print(f'{path}:{line_no}:{obj.get("timestamp")}:{obj.get("type")}:{payload.get("type")}:{snippet}')
+PY
+```
+
+## 3. Audit Repeated Skill Friction
+
+- First list the sessions in scope.
+- Then look for the smallest decisive evidence:
+  - user asked for a skill explicitly but it was not used
+  - a helper or auth preflight was rediscovered manually
+  - an outdated path or command shape caused a miss
+  - the same bounded workflow appeared multiple times without a reusable skill
+- When a problem shows up only once, prefer leaving a note instead of immediately creating a new skill.
+
+## 4. Escalate To Remote Coverage Only When Needed
+
+If the user is asking for a work summary, activity audit, or session recovery that may include remote hosts, use an environment-specific remote evidence workflow before concluding that the local `~/.codex` tree is complete.
