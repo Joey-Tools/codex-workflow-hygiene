@@ -26,6 +26,7 @@ The goal is to locate the smallest relevant set of rollout files, extract only t
 
 2. Locate the smallest file set before reading content.
 - For an exact session ID or thread ID, start with `session_index.jsonl`, `history.jsonl`, or a filename search for `rollout-*<id>*.jsonl`; do not append the whole `~/.codex/sessions` tree to the same raw `rg` command.
+- For broad keyword, prompt-shape, or review-lane searches in `history.jsonl`, `session_index.jsonl`, `sessions/**/rollout-*.jsonl`, or `archived_sessions/*.jsonl`, do not use raw `rg -n` to print matching JSONL records. A single matching line can contain an injected wrapper or nested tool output; use `rg -l` / counts to find candidate files, then parse JSON and print selected fields plus short snippets.
 - For a bounded date range, prefer the date-tree layout under `~/.codex/sessions/YYYY/MM/DD/` and filename timestamps over filesystem mtime alone.
 - Do not trust `find -mtime` as the only date filter when precision matters; copies, indexing, or later metadata updates can give older rollout files a fresh mtime.
 - If a stale path such as `~/.codex/archived_sessions/...` is mentioned, verify it against the current host before using it.
@@ -41,7 +42,7 @@ The goal is to locate the smallest relevant set of rollout files, extract only t
 - Do not treat skill names that appear only inside those wrappers or pasted `SKILL.md` bodies as proof that the skill was actually invoked or even relevant to the user's real request.
 - When a session continues another thread, pick the first meaningful user request after that wrapper noise instead of blindly classifying the first user message.
 - Use `function_call_output` and tool error lines when auditing failures, approval friction, or outdated helper guidance.
-- Broad raw `rg` across rollout trees is a trap: it easily matches injected `AGENTS.md`, `<skills_instructions>`, pasted `SKILL.md` bodies, or huge nested `function_call_output` blobs and can create false skill hits or bury the decisive lines. Use it only after you have already narrowed the file set and target record type, and prefer a small JSON extractor that prints record metadata plus a short snippet instead of whole JSONL records.
+- Broad raw `rg` across transcript JSONL is a trap: it easily matches injected `AGENTS.md`, `<skills_instructions>`, pasted `SKILL.md` bodies, or huge nested `function_call_output` blobs and can create false skill hits or bury the decisive lines. This applies to `history.jsonl`, `session_index.jsonl`, `sessions/**/rollout-*.jsonl`, and `archived_sessions/*.jsonl`; `--max-count` / `-m` only limits matches per file, not output size. Use raw `rg -n` only after you have narrowed the file set and target record type enough that each printed record is known small; otherwise use a JSON extractor that prints record metadata plus a short snippet.
 - Use `event_msg` only when aborts, retries, or mode changes matter.
 
 4. Classify evidence before proposing a skill or AGENTS change.
@@ -59,6 +60,7 @@ The goal is to locate the smallest relevant set of rollout files, extract only t
 - Keep the work read-only unless the user explicitly asks to modify `~/.codex`.
 - Do not dump full JSONL files into the answer when a few key lines will do.
 - Do not dump full per-record inventories of large rollout files; a structured `jq` command can still produce tens of thousands of tokens if it emits every timestamp or tool call.
+- Do not use `sed`, `head`, or raw `rg -n` as an orientation step on rollout/history JSONL records; the first few records often contain full instructions, and a keyword hit can print a whole nested tool output. Count shapes or emit selected JSON fields instead.
 - Do not scan all of `~/.codex` when the task is already bounded by session ID, repo, or date.
 - Do not combine `session_index.jsonl`, `history.jsonl`, and `~/.codex/sessions` in one raw `rg`; if the ID appears inside a nested tool output, the match can dump an entire rollout JSON record back into context.
 - Do not confuse local transcript evidence with current repo truth; once the session points to a live file, repo, or remote artifact, that source becomes authoritative for the underlying technical question.
