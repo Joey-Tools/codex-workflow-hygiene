@@ -8,11 +8,28 @@ Exact session ID:
 
 ```bash
 SESSION_ID='019ce6e8-a5e3-76e1-91a2-799837c70d1e'
-rg -n -F "$SESSION_ID" ~/.codex/session_index.jsonl ~/.codex/history.jsonl
+python3 - "$SESSION_ID" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+session_id = sys.argv[1]
+for path in (Path('~/.codex/session_index.jsonl'), Path('~/.codex/history.jsonl')):
+    path = path.expanduser()
+    for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
+        if session_id not in line:
+            continue
+        row = json.loads(line)
+        selected = {key: row.get(key) for key in ('id', 'session_id', 'thread_name', 'updated_at', 'ts', 'cwd')}
+        text = ' '.join(str(row.get('text') or '').split())[:300]
+        if text:
+            selected['text'] = text
+        print(f'{path}:{line_no}:{json.dumps(selected, ensure_ascii=False, sort_keys=True)}')
+PY
 find ~/.codex/sessions -type f -name "rollout-*${SESSION_ID}*.jsonl"
 ```
 
-Do not append `~/.codex/sessions` to that `rg`. A raw rollout match prints the whole JSONL record, and a nested `function_call_output` match can expand into hundreds of thousands of tokens before the useful path is visible.
+Do not append `~/.codex/sessions` to a raw `rg`. A raw rollout match prints the whole JSONL record, and a nested `function_call_output` match can expand into hundreds of thousands of tokens before the useful path is visible.
 
 Bounded date range:
 
@@ -21,6 +38,31 @@ find ~/.codex/sessions/2026/03/12 ~/.codex/sessions/2026/03/13 -type f -name 'ro
 ```
 
 Prefer filename timestamps or date-tree boundaries over `find -mtime` when the requested window is strict.
+
+Broad keyword searches across `history.jsonl`, `session_index.jsonl`, `sessions/**/rollout-*.jsonl`, or `archived_sessions/*.jsonl` should not print raw JSONL matches. Use `rg -l` or counts to locate candidate files, then parse records and emit selected fields:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import json
+import re
+
+paths = [Path('~/.codex/history.jsonl').expanduser()]
+needle = re.compile(r'review|codex thread|pull/84', re.I)
+printed = 0
+
+for path in paths:
+    for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
+        if not needle.search(line):
+            continue
+        row = json.loads(line)
+        text = ' '.join(str(row.get('text') or '').split())[:300]
+        print(f'{path}:{line_no}:{row.get("session_id")}:{row.get("ts")}:{text}')
+        printed += 1
+        if printed >= 20:
+            raise SystemExit
+PY
+```
 
 ## 2. Extract Only The Relevant Parts
 
@@ -95,8 +137,27 @@ If you need the raw wrappers for provenance, keep a second pass for them, but do
 Focus on tool failures or approval friction:
 
 ```bash
-rg -n -i 'auth|approval|permission|denied|Could not open file|failed|blocked' \
-  ~/.codex/sessions/2026/03/12/rollout-2026-03-12T13-19-05-019ce233-677c-7e73-a77d-a3b7eecab61e.jsonl
+python3 - <<'PY'
+from pathlib import Path
+import json
+import re
+
+path = Path('~/.codex/sessions/2026/03/12/rollout-2026-03-12T13-19-05-019ce233-677c-7e73-a77d-a3b7eecab61e.jsonl').expanduser()
+needle = re.compile(r'auth|approval|permission|denied|Could not open file|failed|blocked', re.I)
+printed = 0
+
+for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
+    if not needle.search(line):
+        continue
+    obj = json.loads(line)
+    payload = obj.get('payload') or {}
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    snippet = ' '.join(text.split())[:400]
+    print(f'{path}:{line_no}:{obj.get("timestamp")}:{obj.get("type")}:{payload.get("type")}:{snippet}')
+    printed += 1
+    if printed >= 20:
+        break
+PY
 ```
 
 Search a bounded rollout set without dumping full JSONL records:
