@@ -844,6 +844,7 @@ def extract_rollout(
     assistant_bits: list[str] = []
     last_user_fingerprint: tuple[str, str] | None = None
     current_emitted = False
+    emit_threshold = emit_start or start
 
     def flush_assistant() -> None:
         nonlocal assistant_bits
@@ -852,7 +853,7 @@ def extract_rollout(
             assistant_bits = []
 
     def is_emit_record(timestamp: dt.datetime | None) -> bool:
-        return emit_start is None or timestamp is None or timestamp >= emit_start
+        return emit_threshold is None or timestamp is None or timestamp >= emit_threshold
 
     def emit_current(trigger_line_no: int | None = None, trigger_timestamp: str | None = None) -> None:
         nonlocal current, current_emitted
@@ -860,11 +861,11 @@ def extract_rollout(
             current_timestamp = parse_time(current.timestamp)
             event_timestamp = parse_time(trigger_timestamp) if trigger_timestamp else None
             if (
-                emit_start is not None
+                emit_threshold is not None
                 and current_timestamp is not None
-                and current_timestamp < emit_start
+                and current_timestamp < emit_threshold
                 and event_timestamp is not None
-                and event_timestamp >= emit_start
+                and event_timestamp >= emit_threshold
                 and trigger_line_no is not None
             ):
                 current = dataclasses.replace(
@@ -882,8 +883,6 @@ def extract_rollout(
             model = payload.get("model") or payload.get("model_id") or model
         timestamp = record_timestamp_or_fallback(record, path)
         parsed_timestamp = parse_time(timestamp)
-        if parsed_timestamp and start and parsed_timestamp < start:
-            continue
         if parsed_timestamp and end and parsed_timestamp >= end:
             continue
 
@@ -1300,7 +1299,7 @@ def require_non_negative_int(value: Any, *, label: str) -> int:
 
 
 def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
-    require_safe_token_string(row["episode_id"], label=f"{label}.episode_id")
+    require_opaque_digest_string(row["episode_id"], label=f"{label}.episode_id")
     require_safe_token_string(row["host"], label=f"{label}.host")
     require_opaque_digest_string(row["session_id"], label=f"{label}.session_id")
     require_timestamp_or_none(row["start"], label=f"{label}.start")
@@ -1317,8 +1316,8 @@ def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
 
 
 def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
-    require_safe_token_string(row["turn_id"], label=f"{label}.turn_id")
-    require_safe_token_string(row["episode_id"], label=f"{label}.episode_id")
+    require_opaque_digest_string(row["turn_id"], label=f"{label}.turn_id")
+    require_opaque_digest_string(row["episode_id"], label=f"{label}.episode_id")
     require_safe_token_string(row["host"], label=f"{label}.host")
     require_opaque_digest_string(row["session_id"], label=f"{label}.session_id")
     require_string(row["source_path"], label=f"{label}.source_path")
@@ -2265,6 +2264,17 @@ def cmd_validate_retained(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validate_history_commit(args: argparse.Namespace) -> int:
+    history_commit = str(args.history_commit or "")
+    if not COMMIT_SHA_PATTERN.fullmatch(history_commit):
+        raise SystemExit("--history-commit must be a full 40-character hex commit SHA")
+    retained_run_dir = Path(args.retained_run_dir)
+    validate_retained_output_dir(retained_run_dir)
+    validate_history_commit(args.history_repo, history_commit, retained_export_files_from_dir(retained_run_dir))
+    print(f"validated history commit: {history_commit}")
+    return 0
+
+
 def cmd_advance_state(args: argparse.Namespace) -> int:
     state_path = safe_state_path(args.state)
     if state_path is None:
@@ -2380,6 +2390,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate_retained = subparsers.add_parser("validate-retained")
     validate_retained.add_argument("--run-dir", required=True)
     validate_retained.set_defaults(func=cmd_validate_retained)
+
+    validate_history = subparsers.add_parser("validate-history-commit")
+    validate_history.add_argument("--retained-run-dir", required=True)
+    validate_history.add_argument("--history-repo", required=True)
+    validate_history.add_argument("--history-commit", required=True)
+    validate_history.set_defaults(func=cmd_validate_history_commit)
 
     advance = subparsers.add_parser("advance-state")
     advance.add_argument("--run-dir", required=True)

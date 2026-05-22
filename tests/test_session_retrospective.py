@@ -1154,6 +1154,51 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(continuation[0].timestamp, "2026-05-22T09:00:00Z")
         self.assertIn("failed_command", continuation[0].issue_flags)
 
+    def test_pre_window_user_with_in_window_failure_is_not_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-active.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Debug the long-running deployment.", "2026-01-01T10:00:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T09:00:00Z",
+                        "payload": {"output": "Process exited with code 1"},
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(json.dumps({"last_scan_at": "2026-05-21T10:00:00Z"}), encoding="utf-8")
+
+            with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")):
+                MODULE.main(
+                    [
+                        "scan-daily",
+                        "--active-lookback-days",
+                        "14",
+                        "--state",
+                        str(state),
+                        "--source",
+                        f"local={root}",
+                        "--allow-partial-hosts",
+                        "--output",
+                        str(output),
+                    ]
+                )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], "2026-05-22T09:00:00Z")
+        self.assertIn("failed_command", rows[0]["issue_flags"])
+
     def test_make_shards_respects_window_and_reports_oversized(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2079,6 +2124,34 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         "0" * 40,
                     ]
                 )
+
+    def test_validate_history_commit_accepts_dedicated_retained_export_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-08T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, commit = write_history_repo(raw, retained)
+
+            MODULE.main(
+                [
+                    "validate-history-commit",
+                    "--retained-run-dir",
+                    str(retained),
+                    "--history-repo",
+                    str(history_repo),
+                    "--history-commit",
+                    commit,
+                ]
+            )
 
     def test_advance_state_rejects_history_commit_without_retained_export(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3238,8 +3311,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_retained_validators_reject_raw_session_id(self) -> None:
         turn = {
-            "turn_id": "t1",
-            "episode_id": "e1",
+            "turn_id": "a" * 20,
+            "episode_id": "b" * 20,
             "host": "local",
             "session_id": "customer-incident-123",
             "source_path": "path_ref_v1:0123456789abcdef",
@@ -3254,7 +3327,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "prompt_improvement": None,
         }
         episode = {
-            "episode_id": "e1",
+            "episode_id": "b" * 20,
             "host": "local",
             "session_id": "customer-incident-123",
             "start": "2026-05-22T10:00:00Z",
@@ -3271,6 +3344,43 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "opaque keyed digest"):
             MODULE.validate_turn_flag_row(turn, label="turn")
         with self.assertRaisesRegex(SystemExit, "opaque keyed digest"):
+            MODULE.validate_episode_row(episode, label="episode")
+
+    def test_retained_validators_reject_raw_turn_and_episode_ids(self) -> None:
+        turn = {
+            "turn_id": "customer-turn-123",
+            "episode_id": "b" * 20,
+            "host": "local",
+            "session_id": "c" * 20,
+            "source_path": "path_ref_v1:0123456789abcdef",
+            "source_hash": "0" * 64,
+            "timestamp": "2026-05-22T10:00:00Z",
+            "cwd": None,
+            "model": None,
+            "model_era": "unknown",
+            "redacted_user_prompt_summary": "category=debug",
+            "assistant_action_summary": "",
+            "issue_flags": ["failed_command"],
+            "prompt_improvement": None,
+        }
+        episode = {
+            "episode_id": "customer-episode-123",
+            "host": "local",
+            "session_id": "c" * 20,
+            "start": "2026-05-22T10:00:00Z",
+            "end": "2026-05-22T10:00:00Z",
+            "cwd": None,
+            "model_era": "unknown",
+            "topic": "category=debug",
+            "turn_count": 1,
+            "friction_flags": ["failed_command"],
+            "outcome": "needs_review",
+            "work_report_hint": None,
+        }
+
+        with self.assertRaisesRegex(SystemExit, "turn.turn_id: expected opaque keyed digest"):
+            MODULE.validate_turn_flag_row(turn, label="turn")
+        with self.assertRaisesRegex(SystemExit, "episode.episode_id: expected opaque keyed digest"):
             MODULE.validate_episode_row(episode, label="episode")
 
     def test_rollout_summary_file_contributes_flags_without_text(self) -> None:
