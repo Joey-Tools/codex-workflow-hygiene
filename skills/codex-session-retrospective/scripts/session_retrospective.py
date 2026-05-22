@@ -1242,7 +1242,8 @@ def remote_evidence_gaps(
     if metadata.get("host") != source.host:
         return [remote_metadata_gap(source)]
     if metadata.get("status") != "ready":
-        return [remote_metadata_gap(source, str(metadata.get("reason") or "stale_host"))]
+        reason = metadata.get("reason") or metadata.get("status") or "stale_host"
+        return [remote_metadata_gap(source, str(reason))]
     materialized_at = parse_time(str(metadata.get("materialized_at") or ""))
     window_start = parse_time(str(metadata.get("window_start") or ""))
     window_end = parse_time(str(metadata.get("window_end") or ""))
@@ -1369,6 +1370,8 @@ def run_scan(
                 )
                 continue
             all_turns.extend(extract_summary_file(source, summary, start, end, emit_start=emit_start))
+    if getattr(args, "allow_partial_hosts", False):
+        coverage_gaps.append({"host": "scope", "reason": "partial_host_scope"})
 
     episodes = episode_records(all_turns)
     window = {
@@ -1444,6 +1447,8 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                 "status": "ready" if rollouts or summaries else "empty",
             }
         )
+    if getattr(args, "allow_partial_hosts", False):
+        coverage_gaps.append({"host": "scope", "reason": "partial_host_scope"})
 
     window = {
         "mode": mode,
@@ -1726,9 +1731,6 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
         raise SystemExit("retained export window does not match scan output window")
     if retained_manifest.get("window") != retained_export_manifest.get("window"):
         raise SystemExit("retained export manifest window does not match scan output manifest")
-    coverage_gaps = list(trend.get("coverage_gaps") or []) + list(retained_manifest.get("coverage_gaps") or [])
-    if coverage_gaps:
-        raise SystemExit("refusing to advance state while coverage gaps are present")
     window = trend.get("window") or {}
     last_scan_at = window.get("end")
     last_mode = window.get("mode")
@@ -1736,6 +1738,9 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
         raise SystemExit("trend_report.json window must include mode and end")
     if last_mode != "daily":
         raise SystemExit("advance-state only supports daily runs")
+    coverage_gaps = list(trend.get("coverage_gaps") or []) + list(retained_manifest.get("coverage_gaps") or [])
+    if coverage_gaps:
+        raise SystemExit("refusing to advance state while coverage gaps are present")
     state = load_state(state_path)
     state["last_scan_at"] = last_scan_at
     state["last_retained_export_sha256"] = retained_export_digest(actual_files)
@@ -1755,7 +1760,11 @@ def add_common_scan_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state", help="State JSON path for incremental runs.")
     parser.add_argument("--output", required=True, help="Output directory for retrospective artifacts.")
     parser.add_argument("--max-raw-bytes", type=int, default=512_000, help="Skip raw extraction for larger rollout files and report a coverage gap.")
-    parser.add_argument("--allow-partial-hosts", action="store_true", help="Allow intentionally narrowed scans without default remote-host coverage gaps.")
+    parser.add_argument(
+        "--allow-partial-hosts",
+        action="store_true",
+        help="Allow intentionally narrowed scans without default remote-host coverage gaps. Partial scans cannot advance shared state.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

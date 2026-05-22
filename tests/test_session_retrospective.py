@@ -61,6 +61,20 @@ def write_remote_metadata(
     )
 
 
+def write_default_remote_sources(base: str | Path, *, timestamp: str = "2026-05-01T10:00:00Z") -> list[str]:
+    base_path = Path(base)
+    source_args: list[str] = []
+    date_part, time_part = timestamp.removesuffix("Z").split("T", 1)
+    rollout_time = time_part.replace(":", "-")
+    for host in MODULE.DEFAULT_REMOTE_HOSTS:
+        root = base_path / host
+        write_remote_metadata(root, host)
+        rollout = root / "sessions" / date_part[:4] / date_part[5:7] / date_part[8:10] / f"rollout-{date_part}T{rollout_time}-{host}.jsonl"
+        write_jsonl(rollout, [message("user", f"{host} task.", timestamp)])
+        source_args.append(f"{host}={root}")
+    return source_args
+
+
 def manifest_fixture(**overrides: object) -> dict:
     manifest = {
         "schema_version": 1,
@@ -896,6 +910,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw)
             old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
             old_large.parent.mkdir(parents=True, exist_ok=True)
             old_large.write_text("not-json-but-old-oversized " + ("x" * 2000), encoding="utf-8")
@@ -903,7 +918,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state = safe_output_dir(raw) / "state.json"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -1237,13 +1252,14 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw)
             rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
             write_jsonl(rollout, [message("user", "Weekly task.", "2026-05-01T10:00:00Z")])
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
                 mode="weekly",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -1266,6 +1282,42 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 )
 
             self.assertFalse(state.exists())
+
+    def test_advance_state_rejects_partial_host_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Partial task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+            with self.assertRaisesRegex(SystemExit, "coverage gaps"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-commit",
+                        HISTORY_COMMIT,
+                    ]
+                )
+
+        self.assertIn("partial_host_scope", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertFalse(state.exists())
 
     def test_discover_writes_manifest_without_turn_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1367,10 +1419,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertFalse(state.exists())
-        self.assertEqual(
-            [gap["reason"] for gap in trend["coverage_gaps"]],
-            ["session_index_missing", "history_missing"],
-        )
+        self.assertEqual([gap["reason"] for gap in trend["coverage_gaps"][:2]], ["session_index_missing", "history_missing"])
+        self.assertIn("partial_host_scope", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_default_remote_missing_gap_blocks_state_update(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1434,6 +1484,24 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["host"], "miku-bot-dev")
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "stale_host")
+
+    def test_default_remote_non_ready_metadata_uses_status_as_gap_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            metadata_path = remote / MODULE.REMOTE_SOURCE_METADATA_FILE
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["status"] = "auth_gated"
+            metadata.pop("reason", None)
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            gaps = MODULE.remote_evidence_gaps(
+                MODULE.Source("miku-bot-dev", remote),
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+
+        self.assertEqual(gaps[0]["reason"], "auth_gated")
 
     def test_explicit_default_remote_requires_metadata_even_when_partial_hosts_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1574,6 +1642,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw)
             old_bad = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
             old_bad.parent.mkdir(parents=True, exist_ok=True)
             old_bad.write_text("{bad json\n", encoding="utf-8")
@@ -1581,7 +1650,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state = safe_output_dir(raw) / "state.json"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -1786,7 +1855,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_old_invalid_summary_outside_window_does_not_block_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw) / "remote"
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw)
             summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
             summary.parent.mkdir(parents=True, exist_ok=True)
             summary.write_text("{bad json\n", encoding="utf-8")
@@ -1794,7 +1865,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state = safe_output_dir(raw) / "state.json"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=str(state), max_raw_bytes=100, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
