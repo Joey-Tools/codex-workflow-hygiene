@@ -22,6 +22,9 @@ WRAPPER_PREFIXES = (
     "<subagent_notification>",
     "# Review findings:",
     "<turn_aborted>",
+    "Persistent internal Codex readonly review contract:",
+    "Review discipline:",
+    "Review the code changes against the base branch",
 )
 
 AUTOMATION_PROMPT_PATTERNS = (
@@ -302,7 +305,11 @@ def flags_for_text(text: str, *, redacted_changed: bool = False) -> set[str]:
 def source_rollouts(source: Source) -> list[Path]:
     sessions = source.root / "sessions"
     search_root = sessions if sessions.exists() else source.root
-    return sorted(path for path in search_root.rglob("rollout-*.jsonl") if path.is_file())
+    return sorted(
+        path
+        for path in search_root.rglob("rollout-*.jsonl")
+        if path.is_file() and not path.name.startswith("rollout-summary")
+    )
 
 
 def source_summary_files(source: Source) -> list[Path]:

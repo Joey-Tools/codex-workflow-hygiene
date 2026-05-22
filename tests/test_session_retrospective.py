@@ -183,6 +183,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(turns, [])
 
+    def test_synthetic_internal_review_prompt_is_not_treated_as_user_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-review.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message(
+                        "user",
+                        "Persistent internal Codex readonly review contract:\nReview discipline:\nReport findings only.",
+                        "2026-05-22T10:01:00Z",
+                    ),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(turns, [])
+
     def test_episode_splits_by_day_and_prompt_category(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -351,11 +370,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             root = Path(raw) / ".codex"
             old = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-old.jsonl"
             old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            summary = root / "sessions" / "2026" / "05" / "22" / "rollout-summary-large.jsonl"
             large = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-large.jsonl"
             write_jsonl(old, [message("user", "Old task.", "2026-01-01T10:00:00Z")])
             old_large.parent.mkdir(parents=True, exist_ok=True)
             old_large.write_text("not-json-but-old-oversized " + ("x" * 2000), encoding="utf-8")
             large.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text("summary " + ("x" * 2000), encoding="utf-8")
             large.write_text("not-json-but-oversized " + ("x" * 2000), encoding="utf-8")
             manifest = Path(raw) / "manifest.json"
             manifest.write_text(
