@@ -153,6 +153,18 @@ HISTORY_FORBIDDEN_TOKEN_PHRASES = (
     ("turn", "summaries"),
     ("user", "prompt"),
 )
+HISTORY_FORBIDDEN_COMPACT_NAME_PARTS = frozenset(
+    (
+        "conversationlog",
+        "fullprompt",
+        "messagelog",
+        "promptlog",
+        "rawtranscript",
+        "tooloutput",
+        "turnsummaries",
+        "userprompt",
+    )
+)
 HISTORY_TEXT_EXTENSIONS = (".md", ".txt")
 HISTORY_JSON_EXTENSIONS = (".json",)
 HISTORY_ROOT_FILES = frozenset((".gitignore", "AGENTS.md", "README.md"))
@@ -1697,7 +1709,8 @@ def history_artifact_name_tokens(name: str) -> list[str]:
         if not suffix:
             break
         stem = next_stem
-    return [token for token in re.split(r"[^a-z0-9]+", stem.lower()) if token]
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", stem)
+    return [token for token in re.split(r"[^a-z0-9]+", separated.lower()) if token]
 
 
 def history_artifact_token_variants(tokens: list[str]) -> set[str]:
@@ -1716,6 +1729,9 @@ def forbidden_history_artifact_name(name: str) -> bool:
         return False
     normalized = "_".join(tokens)
     if normalized in HISTORY_FORBIDDEN_NAME_STEMS:
+        return True
+    compacted = "".join(tokens)
+    if any(part in compacted for part in HISTORY_FORBIDDEN_COMPACT_NAME_PARTS):
         return True
     token_set = history_artifact_token_variants(tokens)
     if token_set & HISTORY_FORBIDDEN_NAME_TOKENS:
@@ -1794,24 +1810,33 @@ def require_history_repo(history_repo: str | None) -> Path:
 
 
 def require_history_repo_identity(repo: Path) -> None:
+    fetch_urls = history_remote_urls(repo, push=False)
+    push_urls = history_remote_urls(repo, push=True)
+    if not fetch_urls or not push_urls:
+        raise SystemExit(f"--history-repo origin must be {EXPECTED_HISTORY_REPO}")
+    if any(not history_remote_matches_expected(remote_url) for remote_url in (*fetch_urls, *push_urls)):
+        raise SystemExit(f"--history-repo origin must be {EXPECTED_HISTORY_REPO}")
+
+
+def history_remote_urls(repo: Path, *, push: bool) -> list[str]:
+    args = ["git", "-C", str(repo), "remote", "get-url"]
+    if push:
+        args.append("--push")
+    args.extend(["--all", "origin"])
     remote = subprocess.run(
-        ["git", "-C", str(repo), "remote", "get-url", "origin"],
+        args,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         check=False,
     )
     if remote.returncode != 0:
-        raise SystemExit(f"--history-repo origin must be {EXPECTED_HISTORY_REPO}")
-    remote_url = remote.stdout.strip()
-    if not history_remote_matches_expected(remote_url):
-        raise SystemExit(f"--history-repo origin must be {EXPECTED_HISTORY_REPO}")
+        return []
+    return [line.strip() for line in remote.stdout.splitlines() if line.strip()]
 
 
 def history_remote_matches_expected(remote_url: str) -> bool:
-    value = remote_url.strip().removesuffix(".git")
-    if value == EXPECTED_HISTORY_REPO:
-        return True
+    value = remote_url.strip().removesuffix(".git").removesuffix("/")
     if value == f"git@github.com:{EXPECTED_HISTORY_REPO}":
         return True
     for prefix in ("https://github.com/", "ssh://git@github.com/"):

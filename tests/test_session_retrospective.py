@@ -2666,6 +2666,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "origin must be"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
+    def test_validate_history_tree_rejects_bare_origin_repo_string(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            subprocess.run(["git", "remote", "set-url", "origin", MODULE.EXPECTED_HISTORY_REPO], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "origin must be"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_wrong_push_origin_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            subprocess.run(
+                ["git", "remote", "set-url", "--push", "origin", "git@github.com:Joey-Tools/not-session-retrospective-history.git"],
+                cwd=history_repo,
+                check=True,
+            )
+
+            with self.assertRaisesRegex(SystemExit, "origin must be"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
     def test_advance_state_rejects_dirty_history_worktree_before_saving_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2875,6 +2895,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "reports/weekly/user_prompts.md",
             "reports/weekly/prompt_logs.md",
             "reports/weekly/tool_outputs.md",
+            "reports/weekly/fullprompt.md",
+            "reports/weekly/promptlog.md",
+            "reports/weekly/rawTranscript.md",
         ):
             with self.subTest(relative_path=relative_path):
                 with tempfile.TemporaryDirectory() as raw:
