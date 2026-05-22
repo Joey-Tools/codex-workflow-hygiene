@@ -106,7 +106,7 @@ ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
 HISTORY_FORBIDDEN_FILENAMES = frozenset((*TRANSIENT_OUTPUT_FILES, *LOCAL_EVIDENCE_FILES, REMOTE_SOURCE_METADATA_FILE))
-HISTORY_FORBIDDEN_COMPONENTS = frozenset((".codex", ".codex-local"))
+HISTORY_FORBIDDEN_COMPONENTS = frozenset((".codex", ".codex-local", ".codex-tmp"))
 EPISODE_FIELDS = {
     "episode_id",
     "host",
@@ -214,6 +214,10 @@ def parse_time(value: str | None) -> dt.datetime | None:
 
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
+
+
+def default_window_end() -> dt.datetime:
+    return utc_now().replace(microsecond=0)
 
 
 def iso(value: dt.datetime) -> str:
@@ -1506,6 +1510,18 @@ def forbidden_history_artifact(file_path: str) -> bool:
     return name.startswith("rollout") and name.endswith(".jsonl")
 
 
+def history_commit_changed_files(repo: Path, commit: str) -> set[str]:
+    changed = subprocess.run(
+        ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--root", "-r", "-z", "--name-only", commit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if changed.returncode != 0:
+        raise SystemExit("failed to inspect --history-commit changed files")
+    return {raw_name.decode("utf-8", errors="surrogateescape") for raw_name in changed.stdout.split(b"\0") if raw_name}
+
+
 def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> None:
     if not history_repo:
         raise SystemExit("--history-repo is required")
@@ -1528,6 +1544,7 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
     )
     if tree.returncode != 0:
         raise SystemExit("failed to inspect --history-commit tree")
+    changed_files = history_commit_changed_files(repo, history_commit)
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
     parent_files: dict[str, set[str]] = defaultdict(set)
     for raw_name in tree.stdout.split(b"\0"):
@@ -1558,9 +1575,9 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
                 candidate = {}
                 break
             candidate[name] = blob.stdout
-        if candidate and retained_export_digest(candidate) == expected_digest:
+        if candidate and retained_export_digest(candidate) == expected_digest and changed_files == set(paths.values()):
             return
-    raise SystemExit("--history-commit does not contain the retained export")
+    raise SystemExit("--history-commit does not contain exactly one retained export and no other changed files")
 
 
 def require_positive_window(value: int, name: str) -> None:
@@ -1903,7 +1920,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
 
 
 def cmd_discover(args: argparse.Namespace) -> int:
-    end = parse_time(args.end) if args.end else utc_now()
+    end = parse_time(args.end) if args.end else default_window_end()
     if end is None:
         raise SystemExit(f"invalid --end timestamp: {args.end}")
     start = parse_time(args.start) if args.start else None
@@ -1916,7 +1933,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
 
 def scan_end(args: argparse.Namespace) -> dt.datetime:
     end_value = getattr(args, "end", None)
-    end = parse_time(end_value) if end_value else utc_now()
+    end = parse_time(end_value) if end_value else default_window_end()
     if end is None:
         raise SystemExit(f"invalid --end timestamp: {end_value}")
     return end

@@ -839,6 +839,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["turn_count"], 1)
         self.assertEqual(trend["window"]["start"], "2026-05-08T10:00:00Z")
 
+    def test_default_scan_end_truncates_microseconds(self) -> None:
+        with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00.987654Z")):
+            end = MODULE.scan_end(types.SimpleNamespace(end=None))
+
+        self.assertEqual(end, MODULE.parse_time("2026-05-22T10:00:00Z"))
+        self.assertEqual(MODULE.iso(end), "2026-05-22T10:00:00Z")
+
     def test_scan_commands_reject_non_positive_windows(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2092,6 +2099,56 @@ class SessionRetrospectiveTests(unittest.TestCase):
             raw_evidence.write_text("{}\n", encoding="utf-8")
             subprocess.run(["git", "add", "raw/history.jsonl"], cwd=history_repo, check=True)
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add raw evidence"], cwd=history_repo, check=True)
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        commit,
+                    ]
+                )
+
+    def test_advance_state_rejects_history_commit_with_existing_codex_tmp_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo = Path(raw) / "history-with-tmp"
+            history_repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-q"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=history_repo, check=True)
+            tmp_artifact = history_repo / ".codex-tmp" / "raw-tool-output.txt"
+            tmp_artifact.parent.mkdir(parents=True)
+            tmp_artifact.write_text("raw output\n", encoding="utf-8")
+            subprocess.run(["git", "add", ".codex-tmp/raw-tool-output.txt"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add bad artifact"], cwd=history_repo, check=True)
+            retained_target = history_repo / "retained" / "daily"
+            retained_target.mkdir(parents=True)
+            for name in MODULE.RETAINED_OUTPUT_FILES:
+                (retained_target / name).write_bytes((retained / name).read_bytes())
+            subprocess.run(["git", "add", "retained"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add retained export"], cwd=history_repo, check=True)
             commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
 
             with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
