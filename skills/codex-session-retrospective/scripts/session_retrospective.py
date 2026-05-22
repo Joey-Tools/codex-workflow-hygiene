@@ -862,6 +862,77 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
     return 0
 
 
+def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
+    output = Path(args.output)
+    sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
+    manifest_sources: list[dict[str, Any]] = []
+    coverage_gaps: list[dict[str, Any]] = []
+    for source in sources:
+        if not source.root.exists():
+            coverage_gaps.append(
+                {
+                    "host": source.host,
+                    "root_ref": path_ref(source.root),
+                    "reason": source.missing_reason or "source_root_missing",
+                }
+            )
+            manifest_sources.append(
+                {
+                    "host": source.host,
+                    "root": source.root.as_posix(),
+                    "root_ref": path_ref(source.root),
+                    "rollout_count": 0,
+                    "status": "missing",
+                }
+            )
+            continue
+        coverage_gaps.extend(local_evidence_gaps(source))
+        rollouts = source_rollouts(source)
+        summaries = source_summary_files(source)
+        if not rollouts and not summaries:
+            coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
+        manifest_sources.append(
+            {
+                "host": source.host,
+                "root": source.root.as_posix(),
+                "root_ref": path_ref(source.root),
+                "rollout_count": len(rollouts),
+                "summary_count": len(summaries),
+                "status": "ready" if rollouts or summaries else "empty",
+            }
+        )
+
+    window = {
+        "mode": mode,
+        "start": iso(start) if start else None,
+        "end": iso(end),
+    }
+    transient_manifest = {
+        "schema_version": 1,
+        "mode": mode,
+        "window": window,
+        "sources": manifest_sources,
+        "coverage_gaps": coverage_gaps,
+        "redaction_policy_version": 1,
+        "retention_safe": False,
+        "retention_note": "Transient execution manifest may contain raw local paths; promote redacted refs only.",
+    }
+    write_json(output / "shard_manifest.json", transient_manifest)
+    write_json(output / "retained_manifest.json", retained_manifest_from_transient(transient_manifest))
+    print(output / "shard_manifest.json")
+    return 0
+
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    end = parse_time(args.end) if args.end else utc_now()
+    if end is None:
+        raise SystemExit(f"invalid --end timestamp: {args.end}")
+    start = parse_time(args.start) if args.start else None
+    if args.start and start is None:
+        raise SystemExit(f"invalid --start timestamp: {args.start}")
+    return run_discover(args, mode=args.mode, start=start, end=end)
+
+
 def cmd_scan_daily(args: argparse.Namespace) -> int:
     end = utc_now()
     state = load_state(Path(args.state)) if args.state else {}
@@ -962,6 +1033,13 @@ def add_common_scan_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build redacted Codex session retrospective artifacts.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    discover = subparsers.add_parser("discover")
+    add_common_scan_args(discover)
+    discover.add_argument("--mode", required=True)
+    discover.add_argument("--start")
+    discover.add_argument("--end")
+    discover.set_defaults(func=cmd_discover)
 
     daily = subparsers.add_parser("scan-daily")
     add_common_scan_args(daily)

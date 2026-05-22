@@ -588,6 +588,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("path_hash:", retained["sources"][0]["root_ref"])
         self.assertTrue(retained["retention_safe"])
 
+    def test_discover_writes_manifest_without_turn_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = Path(raw) / "out"
+
+            MODULE.main(
+                [
+                    "discover",
+                    "--mode",
+                    "daily",
+                    "--start",
+                    "2026-05-01T00:00:00Z",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--output",
+                    str(output),
+                ]
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["sources"][0]["rollout_count"], 1)
+            self.assertFalse((output / "turn_summaries.jsonl").exists())
+            self.assertTrue((output / "retained_manifest.json").exists())
+
     def test_retained_manifest_converts_coverage_gap_paths(self) -> None:
         transient = {
             "schema_version": 1,
