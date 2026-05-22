@@ -128,13 +128,49 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(turns), 1)
         self.assertIn("category=debug_or_fix", turns[0].redacted_user_prompt_summary)
-        self.assertIn("Please fix this", turns[0].redacted_user_prompt_summary)
         self.assertIn("redactions=applied", turns[0].redacted_user_prompt_summary)
+        self.assertNotIn("redacted_excerpt=", turns[0].redacted_user_prompt_summary)
         self.assertNotIn("internal.example", turns[0].redacted_user_prompt_summary)
         self.assertNotIn("sk-proj", turns[0].redacted_user_prompt_summary)
         self.assertIn("failed_command", turns[0].issue_flags)
         self.assertIn("approval_auth_friction", turns[0].issue_flags)
         self.assertIn("safety_privacy_flag", turns[0].issue_flags)
+
+    def test_sensitive_prompt_excerpt_and_topic_are_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-sensitive.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message(
+                        "user",
+                        "Fix failed deploy password=hunter2 Bearer abc.def.ghi /Users/hoteng/customer/repo customer_id=AcmeCorp",
+                        "2026-05-22T10:01:00Z",
+                    )
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+            summary = turns[0].redacted_user_prompt_summary
+
+        self.assertIn("safety_privacy_flag", turns[0].issue_flags)
+        self.assertNotIn("redacted_excerpt=", summary)
+        self.assertNotIn("hunter2", summary)
+        self.assertNotIn("Bearer", summary)
+        self.assertNotIn("/Users/hoteng", summary)
+        self.assertNotIn("AcmeCorp", summary)
+
+    def test_non_sensitive_flagged_prompt_keeps_bounded_excerpt(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-failed.jsonl"
+            write_jsonl(rollout, [message("user", "Fix the failed calendar sync verification.", "2026-05-22T10:01:00Z")])
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertIn("failed_command", turns[0].issue_flags)
+        self.assertIn("redacted_excerpt=Fix the failed calendar sync verification.", turns[0].redacted_user_prompt_summary)
 
     def test_extract_rollout_groups_multiple_turns_into_one_episode(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

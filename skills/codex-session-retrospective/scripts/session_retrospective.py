@@ -36,11 +36,27 @@ AUTOMATION_PROMPT_PATTERNS = (
     re.compile(r"\bWrite task-local artifacts under \.codex-local/session-retrospective\b", re.I),
 )
 
-SECRET_PATTERNS = (
-    re.compile(r"\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
-    re.compile(r"https?://[^\s)>\]\"']+"),
+SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b"),
+        "[REDACTED_SECRET]",
+    ),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED_SECRET]"),
+    (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/\-]+=*", re.I), "[REDACTED_CREDENTIAL]"),
+    (
+        re.compile(
+            r"\b(?:password|passwd|pwd|credential|secret|token|api[_-]?key|authorization)\s*[:=]\s*['\"]?[^'\"\s,;]+",
+            re.I,
+        ),
+        "[REDACTED_CREDENTIAL]",
+    ),
+    (re.compile(r"https?://[^\s)>\]\"']+"), "[REDACTED_URL]"),
+    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[REDACTED_EMAIL]"),
+    (re.compile(r"(?<!\w)(?:~|/(?:Users|home|private|tmp|var|etc|opt|Volumes))/[^\s,;:)>\]\"']+"), "[REDACTED_PATH]"),
+    (
+        re.compile(r"\b(?:customer|client|account|tenant|org|repo|repository)[_-]?(?:id|name)?\s*[:=]\s*['\"]?[A-Za-z0-9_.-]+", re.I),
+        "[REDACTED_IDENTIFIER]",
+    ),
 )
 
 FLAG_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -125,8 +141,7 @@ def compact(text: str, limit: int = 600) -> str:
 def redact(text: str) -> tuple[str, bool]:
     redacted = text
     changed = False
-    labels = ("[REDACTED_SECRET]", "[REDACTED_SECRET]", "[REDACTED_EMAIL]", "[REDACTED_URL]")
-    for pattern, label in zip(SECRET_PATTERNS, labels, strict=True):
+    for pattern, label in SECRET_PATTERNS:
         redacted, count = pattern.subn(label, redacted)
         changed = changed or count > 0
     if len(redacted) > 1200:
@@ -201,7 +216,7 @@ def safe_prompt_summary(
         parts.append("topic_key=" + prompt_topic_key(redacted_text))
     if issue_flags:
         parts.append("flags=" + ",".join(sorted(issue_flags)))
-        if redacted_text:
+        if redacted_text and "safety_privacy_flag" not in issue_flags:
             parts.append("redacted_excerpt=" + compact(redacted_text, 240))
     if redacted_changed:
         parts.append("redactions=applied")
