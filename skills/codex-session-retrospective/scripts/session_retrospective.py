@@ -393,11 +393,15 @@ def oversized_rollout_has_timestamp_in_window(
     end: dt.datetime | None,
     *,
     chunk_bytes: int = 1024 * 1024,
+    max_scan_bytes: int = 1024 * 1024,
 ) -> bool:
+    size = path.stat().st_size
     with path.open("rb") as handle:
+        if size > max_scan_bytes:
+            handle.seek(size - max_scan_bytes)
         carry = b""
         while True:
-            data = handle.read(chunk_bytes)
+            data = handle.read(min(chunk_bytes, max_scan_bytes))
             if not data:
                 break
             window = carry + data
@@ -730,6 +734,16 @@ def validate_retained_manifest(path: Path) -> None:
         raise SystemExit(f"{path}: path-like free text is not retention-safe")
     if contains_invalid_ref(manifest):
         raise SystemExit(f"{path}: retained refs must use opaque {PATH_REF_PREFIX} values")
+    sources = manifest.get("sources")
+    if not isinstance(sources, list) or not (1 <= len(sources) <= 16):
+        raise SystemExit(f"{path}: retained sources must be a bounded non-empty list")
+    for source in sources:
+        if not isinstance(source, dict):
+            raise SystemExit(f"{path}: retained source entries must be objects")
+        for key in ("rollout_count", "summary_count"):
+            count = source.get(key)
+            if not isinstance(count, int) or count < 0:
+                raise SystemExit(f"{path}: retained source {key} must be a non-negative integer")
     for gap in manifest.get("coverage_gaps", []):
         if isinstance(gap, dict) and "path_ref" in gap:
             raise SystemExit(f"{path}: per-shard path refs are not retention-safe")
@@ -805,6 +819,9 @@ def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
 def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
     output = Path(args.output)
     ensure_safe_output_dir(output)
+    state_path = Path(args.state) if args.state else None
+    if state_path:
+        ensure_safe_output_dir(state_path)
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
     all_turns: list[TurnSummary] = []
     manifest_sources: list[dict[str, Any]] = []
@@ -825,6 +842,7 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
                     "root": source.root.as_posix(),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
+                    "summary_count": 0,
                     "status": "missing",
                 }
             )
@@ -902,11 +920,11 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
     }
     write_json(output / "shard_manifest.json", transient_manifest)
     write_json(output / "retained_manifest.json", retained_manifest_from_transient(transient_manifest))
-    if args.state and not coverage_gaps:
-        state = load_state(Path(args.state))
+    if state_path and not coverage_gaps:
+        state = load_state(state_path)
         state["last_scan_at"] = iso(end)
         state["last_mode"] = mode
-        save_state(Path(args.state), state)
+        save_state(state_path, state)
     print(output)
     return 0
 
@@ -932,6 +950,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                     "root": source.root.as_posix(),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
+                    "summary_count": 0,
                     "status": "missing",
                 }
             )
@@ -1037,14 +1056,12 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         for rollout in source_rollouts(Source(str(host), root)):
             size = rollout.stat().st_size
             row = {"host": host, "path": rollout.as_posix(), "path_ref": path_ref(rollout), "bytes": size}
+            if not oversized_rollout_relevant(rollout, start, end):
+                continue
             if size > args.max_raw_bytes:
-                if not oversized_rollout_relevant(rollout, start, end):
-                    continue
                 row["status"] = "oversized"
                 row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"
                 rows.append(row)
-                continue
-            if not rollout_filename_in_window(rollout, start, end) and not rollout_has_record_in_window(rollout, start, end):
                 continue
             if first_jsonl_error(rollout) is not None:
                 row["status"] = "invalid"

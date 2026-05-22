@@ -419,7 +419,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             rollout = root / "sessions" / "2026" / "05" / "12" / "rollout-2026-05-12T10-00-00-active.jsonl"
             write_jsonl(rollout, [message("user", "Continue active work.", "2026-05-12T10:00:00Z")])
             output = safe_output_dir(raw)
-            state = Path(raw) / "state.json"
+            state = safe_output_dir(raw) / "state.json"
 
             with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")):
                 MODULE.main(
@@ -537,6 +537,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
 
+    def test_make_shards_reports_old_invalid_jsonl_with_in_window_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            old_bad = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
+            old_bad.parent.mkdir(parents=True, exist_ok=True)
+            old_bad.write_text('{"timestamp":"2026-05-22T10:00:00Z", bad json\n', encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root)}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "invalid")
+        self.assertIn("coverage_gap", rows[0])
+
     def test_make_shards_rejects_retained_or_rootless_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             output = safe_output_dir(raw)
@@ -545,7 +572,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 json.dumps(
                     {
                         "retention_safe": True,
-                        "sources": [{"host": "local", "root_ref": "path_ref_v1:0123456789abcdef", "status": "ready"}],
+                        "sources": [{"host": "local", "root_ref": "path_ref_v1:0123456789abcdef", "rollout_count": 1, "status": "ready"}],
                     }
                 ),
                 encoding="utf-8",
@@ -579,6 +606,14 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                     end=MODULE.parse_time("2026-05-02T00:00:00Z"),
                 )
+            unsafe_state = Path(raw) / "state.json"
+            with self.assertRaisesRegex(SystemExit, "must be under .codex-local/session-retrospective"):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(safe_output_dir(raw)), state=str(unsafe_state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
 
     def test_window_outside_oversized_rollout_does_not_block_daily_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -588,7 +623,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             old_large.parent.mkdir(parents=True, exist_ok=True)
             old_large.write_text("not-json-but-old-oversized " + ("x" * 2000), encoding="utf-8")
             output = safe_output_dir(raw)
-            state = Path(raw) / "state.json"
+            state = safe_output_dir(raw) / "state.json"
 
             MODULE.run_scan(
                 types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
@@ -615,7 +650,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 encoding="utf-8",
             )
             output = safe_output_dir(raw)
-            state = Path(raw) / "state.json"
+            state = safe_output_dir(raw) / "state.json"
 
             MODULE.run_scan(
                 types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
@@ -648,7 +683,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 encoding="utf-8",
             )
             output = safe_output_dir(raw)
-            state = Path(raw) / "state.json"
+            state = safe_output_dir(raw) / "state.json"
 
             MODULE.run_scan(
                 types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
@@ -738,7 +773,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             missing = Path(raw) / "missing"
             output = safe_output_dir(raw)
-            state = Path(raw) / "state.json"
+            state = safe_output_dir(raw) / "state.json"
 
             MODULE.run_scan(
                 types.SimpleNamespace(source=[f"remote={missing}"], output=str(output), state=str(state), max_raw_bytes=100, allow_partial_hosts=True),
@@ -758,7 +793,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
             write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
             output = safe_output_dir(raw)
-            state = Path(raw) / "state.json"
+            state = safe_output_dir(raw) / "state.json"
 
             MODULE.run_scan(
                 types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
@@ -782,7 +817,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
             missing = Path(raw) / "remote"
             output = safe_output_dir(raw)
-            state = Path(raw) / "state.json"
+            state = safe_output_dir(raw) / "state.json"
 
             with mock.patch.object(
                 MODULE,
@@ -813,7 +848,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             rollout.parent.mkdir(parents=True, exist_ok=True)
             rollout.write_text("{bad json\n", encoding="utf-8")
             output = safe_output_dir(raw)
-            state = Path(raw) / "state.json"
+            state = safe_output_dir(raw) / "state.json"
 
             MODULE.run_scan(
                 types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
@@ -835,7 +870,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             old_bad.parent.mkdir(parents=True, exist_ok=True)
             old_bad.write_text("{bad json\n", encoding="utf-8")
             output = safe_output_dir(raw)
-            state = Path(raw) / "state.json"
+            state = safe_output_dir(raw) / "state.json"
 
             MODULE.run_scan(
                 types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
@@ -891,6 +926,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(SystemExit, "opaque path_ref_v1"):
+                MODULE.main(["validate-manifest", "--manifest", str(retained)])
+
+    def test_validate_manifest_requires_bounded_source_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            retained = Path(raw) / "retained_manifest.json"
+            retained.write_text(
+                json.dumps(
+                    {
+                        "retention_safe": True,
+                        "sources": [{"host": "local", "root_ref": "path_ref_v1:0123456789abcdef", "rollout_count": 1, "status": "ready"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(SystemExit, "summary_count"):
                 MODULE.main(["validate-manifest", "--manifest", str(retained)])
 
     def test_rollout_summary_file_contributes_flags_without_text(self) -> None:
