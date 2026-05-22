@@ -5,9 +5,11 @@ import argparse
 import dataclasses
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import sys
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
@@ -58,6 +60,9 @@ DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 DEFAULT_REMOTE_SOURCE_ROOT = Path(".codex-local/session-retrospective/remote-sources")
 LOCAL_EVIDENCE_FILES = ("session_index.jsonl", "history.jsonl")
 SAFE_OUTPUT_PARTS = (".codex-local", "session-retrospective")
+PATH_REF_PREFIX = "path_ref_v1"
+PATH_REF_PATTERN = re.compile(r"^path_ref_v1:[0-9a-f]{16}$")
+PATH_REF_KEY = secrets.token_bytes(32)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -189,7 +194,8 @@ def stable_hash(value: str, length: int = 16) -> str:
 def path_ref(value: str | os.PathLike[str] | None, length: int = 16) -> str | None:
     if not value:
         return None
-    return f"path_hash:{stable_hash(os.fspath(value), length)}"
+    digest = hmac.new(PATH_REF_KEY, os.fspath(value).encode("utf-8", errors="surrogatepass"), hashlib.sha256)
+    return f"{PATH_REF_PREFIX}:{digest.hexdigest()[:length]}"
 
 
 def file_hash(path: Path) -> str:
@@ -201,7 +207,7 @@ def file_hash(path: Path) -> str:
 
 
 def ensure_safe_output_dir(path: Path) -> None:
-    parts = path.expanduser().parts
+    parts = path.expanduser().resolve(strict=False).parts
     for index in range(len(parts) - len(SAFE_OUTPUT_PARTS) + 1):
         if parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS:
             return
@@ -636,7 +642,7 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
 
 def redacted_path_entry(key: str, value: Any) -> tuple[str, Any]:
     ref_key = f"{key}_ref"
-    if isinstance(value, str) and value.startswith("path_hash:"):
+    if isinstance(value, str) and PATH_REF_PATTERN.fullmatch(value):
         return ref_key, value
     return ref_key, path_ref(str(value)) if value else None
 
@@ -674,7 +680,7 @@ def retained_manifest_from_transient(manifest: dict[str, Any]) -> dict[str, Any]
         "coverage_gaps": coverage_gaps,
         "redaction_policy_version": manifest.get("redaction_policy_version", 1),
         "retention_safe": True,
-        "retention_note": "Derived retained manifest; raw root/path fields removed and path refs preserved.",
+        "retention_note": "Derived retained manifest; raw location fields removed and opaque refs preserved.",
     }
 
 
@@ -700,6 +706,20 @@ def contains_path_like_text(value: Any) -> bool:
     return False
 
 
+def contains_invalid_ref(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key.endswith("_ref"):
+                if not isinstance(child, str) or not PATH_REF_PATTERN.fullmatch(child):
+                    return True
+                continue
+            if contains_invalid_ref(child):
+                return True
+    if isinstance(value, list):
+        return any(contains_invalid_ref(child) for child in value)
+    return False
+
+
 def validate_retained_manifest(path: Path) -> None:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if manifest.get("retention_safe") is not True:
@@ -708,6 +728,8 @@ def validate_retained_manifest(path: Path) -> None:
         raise SystemExit(f"{path}: raw root/path fields are not retention-safe")
     if contains_path_like_text(manifest):
         raise SystemExit(f"{path}: path-like free text is not retention-safe")
+    if contains_invalid_ref(manifest):
+        raise SystemExit(f"{path}: retained refs must use opaque {PATH_REF_PREFIX} values")
     for gap in manifest.get("coverage_gaps", []):
         if isinstance(gap, dict) and "path_ref" in gap:
             raise SystemExit(f"{path}: per-shard path refs are not retention-safe")

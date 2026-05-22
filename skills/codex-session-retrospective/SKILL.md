@@ -69,7 +69,7 @@ Do not run the helper output directly into a tracked repository path unless that
 - `trend_report.json`: aggregate counts by host, model era, issue flag, and scan window.
 - `shard_manifest.json`: transient bounded source manifest for map-reduce orchestration. Do not retain it in history.
 - `shards.jsonl`: transient shard worklist for extractor-redactor scheduling. Do not retain it in history.
-- `retained_manifest.json`: retention-safe manifest with raw path fields removed and hash refs preserved.
+- `retained_manifest.json`: retention-safe manifest with raw path fields removed and opaque refs preserved.
 
 ## Guardrails
 

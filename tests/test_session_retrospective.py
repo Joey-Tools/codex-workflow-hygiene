@@ -308,8 +308,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             episodes = MODULE.episode_records(turns)
             serialized = json.dumps({"turns": [MODULE.asdict_turn(turns[0])], "episodes": episodes})
 
-        self.assertIn("path_hash:", turns[0].source_path)
-        self.assertIn("path_hash:", turns[0].cwd)
+        self.assertIn("path_ref_v1:", turns[0].source_path)
+        self.assertIn("path_ref_v1:", turns[0].cwd)
         self.assertNotIn("customer-secret", serialized)
         self.assertNotIn(str(root), serialized)
 
@@ -485,7 +485,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "oversized")
         self.assertIn("coverage_gap", rows[0])
         self.assertEqual(rows[0]["path"], str(large))
-        self.assertIn("path_hash:", rows[0]["path_ref"])
+        self.assertIn("path_ref_v1:", rows[0]["path_ref"])
 
     def test_make_shards_reports_in_window_invalid_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -545,7 +545,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 json.dumps(
                     {
                         "retention_safe": True,
-                        "sources": [{"host": "local", "root_ref": "path_hash:0123456789abcdef", "status": "ready"}],
+                        "sources": [{"host": "local", "root_ref": "path_ref_v1:0123456789abcdef", "status": "ready"}],
                     }
                 ),
                 encoding="utf-8",
@@ -567,6 +567,14 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "must be under .codex-local/session-retrospective"):
                 MODULE.run_scan(
                     types.SimpleNamespace(source=[f"local={root}"], output=str(unsafe), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            traversal = safe_output_dir(raw) / ".." / ".." / "reports"
+            with self.assertRaisesRegex(SystemExit, "must be under .codex-local/session-retrospective"):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(traversal), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
                     mode="daily",
                     start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                     end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -619,7 +627,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
-        self.assertIn("path_hash:", trend["coverage_gaps"][0]["path_ref"])
+        self.assertIn("path_ref_v1:", trend["coverage_gaps"][0]["path_ref"])
 
     def test_old_oversized_rollout_with_large_in_window_record_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -669,12 +677,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
             retained = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+            MODULE.main(["validate-output", "--run-dir", str(output)])
 
         self.assertEqual(manifest["sources"][0]["root"], str(root))
-        self.assertIn("path_hash:", manifest["sources"][0]["root_ref"])
+        self.assertIn("path_ref_v1:", manifest["sources"][0]["root_ref"])
         self.assertFalse(manifest["retention_safe"])
         self.assertNotIn("root", retained["sources"][0])
-        self.assertIn("path_hash:", retained["sources"][0]["root_ref"])
+        self.assertIn("path_ref_v1:", retained["sources"][0]["root_ref"])
         self.assertTrue(retained["retention_safe"])
 
     def test_discover_writes_manifest_without_turn_outputs(self) -> None:
@@ -721,7 +730,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertTrue(retained["retention_safe"])
         self.assertNotIn("root", retained["sources"][0])
-        self.assertIn("path_hash:", retained["sources"][0]["root_ref"])
+        self.assertIn("path_ref_v1:", retained["sources"][0]["root_ref"])
         self.assertNotIn("path", retained["coverage_gaps"][0])
         self.assertNotIn("path_ref", retained["coverage_gaps"][0])
 
@@ -794,7 +803,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["host"], "miku-bot-dev")
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "remote_source_not_materialized")
-        self.assertIn("path_hash:", trend["coverage_gaps"][0]["root_ref"])
+        self.assertIn("path_ref_v1:", trend["coverage_gaps"][0]["root_ref"])
 
     def test_invalid_rollout_jsonl_reports_gap_and_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -816,7 +825,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
-        self.assertIn("path_hash:", trend["coverage_gaps"][0]["path_ref"])
+        self.assertIn("path_ref_v1:", trend["coverage_gaps"][0]["path_ref"])
 
     def test_window_external_invalid_rollout_does_not_block_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -867,6 +876,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SystemExit, "raw root/path fields"):
                 MODULE.main(["validate-output", "--run-dir", str(run_dir)])
+
+    def test_validate_manifest_rejects_non_opaque_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            retained = Path(raw) / "retained_manifest.json"
+            retained.write_text(
+                json.dumps(
+                    {
+                        "retention_safe": True,
+                        "sources": [{"host": "local", "root_ref": "path_hash:0123456789abcdef", "status": "ready"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(SystemExit, "opaque path_ref_v1"):
+                MODULE.main(["validate-manifest", "--manifest", str(retained)])
 
     def test_rollout_summary_file_contributes_flags_without_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
