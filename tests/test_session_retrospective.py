@@ -1342,7 +1342,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             root = Path(raw) / ".codex"
             old = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-old.jsonl"
             old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
-            summary = root / "sessions" / "2026" / "05" / "22" / "rollout-summary-large.jsonl"
+            summary = root / "sessions" / "2026" / "01" / "02" / "rollout-summary-large.jsonl"
             large = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-large.jsonl"
             write_jsonl(old, [message("user", "Old task.", "2026-01-01T10:00:00Z")])
             old_large.parent.mkdir(parents=True, exist_ok=True)
@@ -1464,6 +1464,63 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
+        self.assertEqual(rows[0]["status"], "invalid")
+        self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_includes_relevant_rollout_summary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "05" / "22" / "rollout-summary-large.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-22T10:00:00Z", "text": "permission denied"}])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "ready")
+        self.assertIn("path_ref_v1:", rows[0]["path_ref"])
+
+    def test_make_shards_reports_invalid_relevant_rollout_summary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "05" / "22" / "rollout-summary-large.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text("{bad json\n", encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "invalid")
         self.assertIn("coverage_gap", rows[0])
 
@@ -1928,6 +1985,23 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "partial_host_scope")
+
+    def test_old_oversized_rollout_relevance_uses_bounded_timestamp_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            old_large.parent.mkdir(parents=True, exist_ok=True)
+            old_large.write_text("not-json-but-old-oversized " + ("x" * 2000), encoding="utf-8")
+
+            with mock.patch.object(MODULE, "oversized_rollout_has_timestamp_in_window", return_value=(False, False)) as scan:
+                relevance = MODULE.oversized_rollout_relevance(
+                    old_large,
+                    MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+
+        self.assertEqual(relevance, "unknown")
+        self.assertEqual(scan.call_args.kwargs["max_scan_bytes"], MODULE.ROLLOUT_TIMESTAMP_SCAN_BYTES)
 
     def test_old_oversized_rollout_with_large_in_window_record_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -2451,6 +2525,18 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add bad report"], cwd=history_repo, check=True)
 
             with self.assertRaisesRegex(SystemExit, "unredacted sensitive text"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_path_like_follow_on_report_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            report = history_repo / "reports" / "daily" / "2026" / "05" / "01.md"
+            report.parent.mkdir(parents=True)
+            report.write_text("The failed implementation was in src/private_impl.swift.\n", encoding="utf-8")
+            subprocess.run(["git", "add", "reports/daily/2026/05/01.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add path-like report"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "path-like text"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
     def test_validate_history_tree_rejects_raw_follow_on_directory(self) -> None:

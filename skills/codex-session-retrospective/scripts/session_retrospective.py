@@ -795,7 +795,12 @@ def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.d
     if rollout_date and end and rollout_date >= end:
         return "irrelevant"
     if rollout_date and start and rollout_date < start:
-        found, complete = oversized_rollout_has_timestamp_in_window(path, start, end)
+        found, complete = oversized_rollout_has_timestamp_in_window(
+            path,
+            start,
+            end,
+            max_scan_bytes=ROLLOUT_TIMESTAMP_SCAN_BYTES,
+        )
         if found:
             return "relevant"
         if not complete:
@@ -1021,11 +1026,11 @@ def extract_summary_file(
         parsed_timestamp = summary_timestamp_with_fallback(record, path)
         if parsed_timestamp is None:
             continue
-        if parsed_timestamp and start and parsed_timestamp < start:
+        if start and parsed_timestamp < start:
             continue
-        if parsed_timestamp and end and parsed_timestamp >= end:
+        if end and parsed_timestamp >= end:
             continue
-        if emit_start and parsed_timestamp and parsed_timestamp < emit_start:
+        if emit_start and parsed_timestamp < emit_start:
             continue
         text = str(record.get("text") or "")
         kind = str(record.get("kind") or "summary")
@@ -1643,6 +1648,16 @@ def history_text_contains_sensitive(data: bytes, file_path: str) -> bool:
     return contains_unredacted_sensitive_text(text)
 
 
+def history_text_contains_retention_risk(data: bytes, file_path: str) -> bool:
+    text = data.decode("utf-8", errors="replace")
+    if file_path.startswith("schemas/"):
+        text = text.replace("https://json-schema.org/draft/2020-12/schema", "")
+    if contains_unredacted_sensitive_text(text):
+        return True
+    generated_follow_on = file_path.startswith(HISTORY_TEXT_PREFIXES) or file_path.startswith(HISTORY_JSON_PREFIXES)
+    return generated_follow_on and contains_path_like_text(text)
+
+
 def history_path_kind(file_path: str) -> str:
     name = file_path.rsplit("/", 1)[-1]
     if name == "episodes.jsonl" or (file_path.startswith("data/episodes/") and file_path.endswith(".jsonl")):
@@ -1825,8 +1840,8 @@ def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
         elif kind in {"text", "json_text"}:
             if kind == "json_text":
                 history_json(data, file_path)
-            if history_text_contains_sensitive(data, file_path):
-                raise SystemExit(f"history artifact contains unredacted sensitive text: {file_path}")
+            if history_text_contains_retention_risk(data, file_path):
+                raise SystemExit(f"history artifact contains unredacted sensitive text or path-like text: {file_path}")
 
 
 def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> str:
@@ -1864,9 +1879,10 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
     raise SystemExit("--history-commit does not contain exactly one retained export and no other changed files")
 
 
-def require_positive_window(value: int, name: str) -> None:
+def require_positive_window(value: int, name: str) -> int:
     if value <= 0:
         raise SystemExit(f"{name} must be positive")
+    return value
 
 
 def validate_window_bounds(start: dt.datetime | None, end: dt.datetime | None, label: str) -> None:
@@ -1908,10 +1924,7 @@ def state_last_scan_at(state: dict[str, Any]) -> dt.datetime | None:
 
 
 def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
-    if source.host != "local":
-        return []
-    canonical_codex = Path("~/.codex").expanduser().resolve(strict=False)
-    if source.root.expanduser().resolve(strict=False) != canonical_codex and source.root.name != ".codex":
+    if not local_source_requires_index_files(source):
         return []
     gaps: list[dict[str, Any]] = []
     for name in LOCAL_EVIDENCE_FILES:
@@ -1922,6 +1935,15 @@ def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
         elif not evidence.is_file() or not os.access(evidence, os.R_OK):
             gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": f"{stem}_unreadable"})
     return gaps
+
+
+def local_source_requires_index_files(source: Source) -> bool:
+    if source.host != "local":
+        return False
+    canonical_codex = Path("~/.codex").expanduser().resolve(strict=False)
+    if source.root.expanduser().resolve(strict=False) != canonical_codex and source.root.name != ".codex":
+        return False
+    return True
 
 
 def remote_metadata_gap(source: Source, reason: str = "stale_host") -> dict[str, Any]:
@@ -1986,8 +2008,18 @@ def run_scan(
     all_turns: list[TurnSummary] = []
     manifest_sources: list[dict[str, Any]] = []
     coverage_gaps: list[dict[str, Any]] = []
-    max_raw_bytes = getattr(args, "max_raw_bytes", 512_000)
-    require_positive_window(max_raw_bytes, "--max-raw-bytes")
+    max_raw_bytes = require_positive_window(getattr(args, "max_raw_bytes", 512_000), "--max-raw-bytes")
+
+    def append_oversized_rollout_gap(path: Path, size: int) -> None:
+        coverage_gaps.append(
+            {
+                "host": source.host,
+                "path_ref": path_ref(path),
+                "bytes": size,
+                "reason": "oversized_rollout_skipped",
+            }
+        )
+
     for source in sources:
         if not source.root.exists():
             coverage_gaps.append(
@@ -2068,26 +2100,8 @@ def run_scan(
             relevance = oversized_rollout_relevance(rollout, start, end)
             if relevance == "irrelevant":
                 continue
-            if relevance == "unknown":
-                coverage_gaps.append(
-                    {
-                        "host": source.host,
-                        "path_ref": path_ref(rollout),
-                        "bytes": size,
-                        "reason": "oversized_rollout_skipped",
-                    }
-                )
-                continue
-            if size > max_raw_bytes:
-                coverage_gaps.append(
-                    {
-                        "host": source.host,
-                        "path_ref": path_ref(rollout),
-                        "bytes": size,
-                        "reason": "oversized_rollout_skipped",
-                    }
-                )
-                continue
+            append_oversized_rollout_gap(rollout, size)
+            continue
         for summary in summaries:
             if not summary_file_relevant(summary, start, end):
                 continue
@@ -2235,12 +2249,12 @@ def scan_end(args: argparse.Namespace) -> dt.datetime:
 
 
 def cmd_scan_daily(args: argparse.Namespace) -> int:
-    require_positive_window(args.active_lookback_days, "--active-lookback-days")
+    active_lookback_days = require_positive_window(args.active_lookback_days, "--active-lookback-days")
     end = scan_end(args)
     state_path = safe_state_path(args.state)
     state = load_state(state_path) if state_path else {}
     last = state_last_scan_at(state)
-    lookback_start = end - dt.timedelta(days=args.active_lookback_days)
+    lookback_start = end - dt.timedelta(days=active_lookback_days)
     if last and last <= end:
         start = min(last, lookback_start)
         emit_start = last
@@ -2251,9 +2265,9 @@ def cmd_scan_daily(args: argparse.Namespace) -> int:
 
 
 def cmd_scan_weekly(args: argparse.Namespace) -> int:
-    require_positive_window(args.days, "--days")
+    days = require_positive_window(args.days, "--days")
     end = scan_end(args)
-    start = end - dt.timedelta(days=args.days)
+    start = end - dt.timedelta(days=days)
     return run_scan(args, mode="weekly", start=start, end=end)
 
 
@@ -2262,17 +2276,17 @@ def bounded_baseline_end(start: dt.datetime, window_days: int, now: dt.datetime)
 
 
 def cmd_baseline(args: argparse.Namespace) -> int:
-    require_positive_window(args.window_days, "--window-days")
+    window_days = require_positive_window(args.window_days, "--window-days")
     now = scan_end(args)
     sources = parse_sources(args.source, require_default_hosts=not args.allow_partial_hosts)
     if args.from_value == "first":
-        start = earliest_rollout_date(sources) or (now - dt.timedelta(days=args.window_days))
+        start = earliest_rollout_date(sources) or (now - dt.timedelta(days=window_days))
     else:
         start = parse_time(args.from_value)
         if start is None:
             raise SystemExit(f"invalid --from timestamp: {args.from_value}")
-    mode = f"baseline-{args.window_days}d"
-    end = bounded_baseline_end(start, args.window_days, now)
+    mode = f"baseline-{window_days}d"
+    end = bounded_baseline_end(start, window_days, now)
     validate_window_bounds(start, end, "baseline")
     return run_scan(args, mode=mode, start=start, end=end)
 
@@ -2288,7 +2302,7 @@ def parse_manifest_window_time(window: dict[str, Any], key: str) -> dt.datetime 
 
 
 def cmd_make_shards(args: argparse.Namespace) -> int:
-    require_positive_window(args.max_raw_bytes, "--max-raw-bytes")
+    max_raw_bytes = require_positive_window(args.max_raw_bytes, "--max-raw-bytes")
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     if manifest.get("retention_safe") is True:
         raise SystemExit("make-shards requires transient shard_manifest.json, not retained_manifest.json")
@@ -2307,6 +2321,18 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             row["path"] = path.as_posix()
         return row
 
+    def append_summary_shard(summary: Path) -> None:
+        if not summary_file_relevant(summary, start, end):
+            return
+        row = shard_row(summary, bytes=summary.stat().st_size, kind="summary")
+        if first_jsonl_error(summary) is not None:
+            row["status"] = "invalid"
+            row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
+            rows.append(row)
+            return
+        row["status"] = "ready"
+        rows.append(row)
+
     for source in sources:
         host = source.get("host")
         if not source.get("root"):
@@ -2321,11 +2347,11 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             rows.append(shard_row(root, status="missing", coverage_gap="source root missing"))
             continue
         for rollout in source_rollouts(Source(str(host), root)):
-            if not rollout_candidate_relevant(rollout, start, end, max_raw_bytes=args.max_raw_bytes):
+            if not rollout_candidate_relevant(rollout, start, end, max_raw_bytes=max_raw_bytes):
                 continue
             size = rollout.stat().st_size
             row = shard_row(rollout, bytes=size)
-            if size <= args.max_raw_bytes:
+            if size <= max_raw_bytes:
                 error_line = first_jsonl_error(rollout)
                 if error_line is not None:
                     if (
@@ -2349,11 +2375,13 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 row["coverage_gap"] = "rollout exceeds timestamp relevance scan; use bounded rollout-summary before extractor handoff"
                 rows.append(row)
                 continue
-            if size > args.max_raw_bytes:
+            if size > max_raw_bytes:
                 row["status"] = "oversized"
                 row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"
                 rows.append(row)
                 continue
+        for summary in source_summary_files(Source(str(host), root)):
+            append_summary_shard(summary)
     write_jsonl(output / "shards.jsonl", rows)
     print(output / "shards.jsonl")
     return 0
@@ -2392,6 +2420,8 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
         for line_no, obj in rows:
+            if not isinstance(obj, dict):
+                raise SystemExit(f"{path}:{line_no}: JSONL record must be an object")
             missing = keys - set(obj)
             if missing:
                 raise SystemExit(f"{path}:{line_no}: missing keys {sorted(missing)}")
