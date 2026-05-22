@@ -40,7 +40,8 @@ The workflow is read-only against Codex history and remote hosts. It produces re
 - Turn level: retain flagged user prompts when a specific prompt likely caused confusion, rework, missing verification, or unsafe/noisy behavior.
 
 5. Write history-ready artifacts.
-- Commit only redacted reports, episode summaries, turn flags, trend JSON, and schemas to the private history repository.
+- Commit only redacted reports, episode summaries, turn flags, trend JSON, retained manifests, and schemas to the private history repository.
+- Treat `shard_manifest.json` and `shards.jsonl` as transient execution worklists only. They may contain raw local paths and must not be committed.
 - Do not commit raw rollout files, full prompts, source snippets, internal URLs, secrets, or unredacted tool output.
 - AGENTS/skill suggestions are recommendations only; this workflow does not directly edit rules, skills, Apple Notes, or Daily Work Report.
 
@@ -62,7 +63,9 @@ Pass repeated `--source HOST=PATH` values when remote evidence has been material
 - `turn_summaries.jsonl`: redacted meaningful turns plus flags and source pointers.
 - `episodes.jsonl`: episode/topic summaries with host, session, cwd/repo hints, outcome, and friction flags.
 - `trend_report.json`: aggregate counts by host, model era, issue flag, and scan window.
-- `shard_manifest.json`: bounded source manifest for map-reduce orchestration.
+- `shard_manifest.json`: transient bounded source manifest for map-reduce orchestration. Do not retain it in history.
+- `shards.jsonl`: transient shard worklist for extractor-redactor scheduling. Do not retain it in history.
+- `retained_manifest.json`: retention-safe manifest with raw path fields removed and hash refs preserved.
 
 ## Guardrails
 

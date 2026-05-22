@@ -601,6 +601,68 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def redacted_path_entry(key: str, value: Any) -> tuple[str, Any]:
+    ref_key = f"{key}_ref"
+    if isinstance(value, str) and value.startswith("path_hash:"):
+        return ref_key, value
+    return ref_key, path_ref(str(value)) if value else None
+
+
+def retained_manifest_from_transient(manifest: dict[str, Any]) -> dict[str, Any]:
+    sources: list[dict[str, Any]] = []
+    for source in manifest.get("sources", []):
+        retained_source: dict[str, Any] = {}
+        for key, value in source.items():
+            if key in {"root", "path"}:
+                ref_key, ref_value = redacted_path_entry(key, value)
+                retained_source.setdefault(ref_key, ref_value)
+                continue
+            retained_source[key] = value
+        sources.append(retained_source)
+
+    coverage_gaps: list[dict[str, Any]] = []
+    for gap in manifest.get("coverage_gaps", []):
+        retained_gap: dict[str, Any] = {}
+        for key, value in gap.items():
+            if key in {"root", "path"}:
+                ref_key, ref_value = redacted_path_entry(key, value)
+                retained_gap[ref_key] = ref_value
+                continue
+            retained_gap[key] = value
+        coverage_gaps.append(retained_gap)
+
+    return {
+        "schema_version": manifest.get("schema_version", 1),
+        "mode": manifest.get("mode", "unknown"),
+        "window": manifest.get("window") or {},
+        "sources": sources,
+        "coverage_gaps": coverage_gaps,
+        "redaction_policy_version": manifest.get("redaction_policy_version", 1),
+        "retention_safe": True,
+        "retention_note": "Derived retained manifest; raw root/path fields removed and path refs preserved.",
+    }
+
+
+def contains_raw_path_fields(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"root", "path"}:
+                return True
+            if contains_raw_path_fields(child):
+                return True
+    elif isinstance(value, list):
+        return any(contains_raw_path_fields(child) for child in value)
+    return False
+
+
+def validate_retained_manifest(path: Path) -> None:
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("retention_safe") is not True:
+        raise SystemExit(f"{path}: retention_safe must be true")
+    if contains_raw_path_fields(manifest):
+        raise SystemExit(f"{path}: raw root/path fields are not retention-safe")
+
+
 def parse_sources(values: list[str] | None) -> list[Source]:
     if not values:
         return [Source("local", Path("~/.codex").expanduser())]
@@ -698,19 +760,18 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
     write_jsonl(output / "turn_flags.jsonl", (asdict_turn(turn) for turn in all_turns if turn.issue_flags))
     write_jsonl(output / "episodes.jsonl", episodes)
     write_json(output / "trend_report.json", trend_report(all_turns, episodes, window, coverage_gaps))
-    write_json(
-        output / "shard_manifest.json",
-        {
-            "schema_version": 1,
-            "mode": mode,
-            "window": window,
-            "sources": manifest_sources,
-            "coverage_gaps": coverage_gaps,
-            "redaction_policy_version": 1,
-            "retention_safe": False,
-            "retention_note": "Transient execution manifest may contain raw local paths; promote redacted refs only.",
-        },
-    )
+    transient_manifest = {
+        "schema_version": 1,
+        "mode": mode,
+        "window": window,
+        "sources": manifest_sources,
+        "coverage_gaps": coverage_gaps,
+        "redaction_policy_version": 1,
+        "retention_safe": False,
+        "retention_note": "Transient execution manifest may contain raw local paths; promote redacted refs only.",
+    }
+    write_json(output / "shard_manifest.json", transient_manifest)
+    write_json(output / "retained_manifest.json", retained_manifest_from_transient(transient_manifest))
     if args.state and not coverage_gaps:
         state = load_state(Path(args.state))
         state["last_scan_at"] = iso(end)
@@ -804,7 +865,7 @@ def cmd_validate_output(args: argparse.Namespace) -> int:
             if missing:
                 raise SystemExit(f"{path}:{line_no}: missing keys {sorted(missing)}")
     json.loads((run_dir / "trend_report.json").read_text(encoding="utf-8"))
-    json.loads((run_dir / "shard_manifest.json").read_text(encoding="utf-8"))
+    validate_retained_manifest(run_dir / "retained_manifest.json")
     print(f"validated: {run_dir}")
     return 0
 

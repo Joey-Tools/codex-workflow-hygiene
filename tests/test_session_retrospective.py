@@ -522,10 +522,32 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
             )
             manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            retained = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
 
         self.assertEqual(manifest["sources"][0]["root"], str(root))
         self.assertIn("path_hash:", manifest["sources"][0]["root_ref"])
         self.assertFalse(manifest["retention_safe"])
+        self.assertNotIn("root", retained["sources"][0])
+        self.assertIn("path_hash:", retained["sources"][0]["root_ref"])
+        self.assertTrue(retained["retention_safe"])
+
+    def test_retained_manifest_converts_coverage_gap_paths(self) -> None:
+        transient = {
+            "schema_version": 1,
+            "mode": "daily",
+            "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+            "sources": [{"host": "local", "root": "/secret/.codex", "status": "ready"}],
+            "coverage_gaps": [{"host": "local", "path": "/secret/.codex/rollout.jsonl", "reason": "oversized"}],
+            "retention_safe": False,
+        }
+
+        retained = MODULE.retained_manifest_from_transient(transient)
+
+        self.assertTrue(retained["retention_safe"])
+        self.assertNotIn("root", retained["sources"][0])
+        self.assertIn("path_hash:", retained["sources"][0]["root_ref"])
+        self.assertNotIn("path", retained["coverage_gaps"][0])
+        self.assertIn("path_hash:", retained["coverage_gaps"][0]["path_ref"])
 
     def test_missing_source_reports_gap_and_does_not_update_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -553,9 +575,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(run_dir / "episodes.jsonl", [])
             write_jsonl(run_dir / "turn_flags.jsonl", [])
             (run_dir / "trend_report.json").write_text("{}\n", encoding="utf-8")
-            (run_dir / "shard_manifest.json").write_text("{}\n", encoding="utf-8")
+            (run_dir / "retained_manifest.json").write_text('{"retention_safe": true}\n', encoding="utf-8")
 
             with self.assertRaisesRegex(SystemExit, "invalid JSON"):
+                MODULE.main(["validate-output", "--run-dir", str(run_dir)])
+
+    def test_validate_output_rejects_raw_retained_manifest_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw) / "run"
+            run_dir.mkdir()
+            (run_dir / "turn_summaries.jsonl").write_text("", encoding="utf-8")
+            (run_dir / "episodes.jsonl").write_text("", encoding="utf-8")
+            (run_dir / "turn_flags.jsonl").write_text("", encoding="utf-8")
+            (run_dir / "trend_report.json").write_text("{}\n", encoding="utf-8")
+            (run_dir / "retained_manifest.json").write_text(
+                json.dumps({"retention_safe": True, "sources": [{"host": "local", "root": "/secret/.codex"}]}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(SystemExit, "raw root/path fields"):
                 MODULE.main(["validate-output", "--run-dir", str(run_dir)])
 
     def test_rollout_summary_file_contributes_flags_without_text(self) -> None:
