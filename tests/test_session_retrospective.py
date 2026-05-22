@@ -308,6 +308,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual({path.name for path in paths}, {active.name, archived.name})
 
+    def test_source_rollouts_does_not_duplicate_archived_sessions_during_root_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            archived = root / "archived_sessions" / "2026" / "04" / "01" / "rollout-2026-04-01T10-00-00-archived.jsonl"
+            write_jsonl(archived, [message("user", "Archived task.", "2026-04-01T10:00:00Z")])
+
+            paths = MODULE.source_rollouts(MODULE.Source("local", root))
+
+        self.assertEqual(paths, [archived])
+
     def test_ignores_wrapper_and_redacts_flagged_turns(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -553,6 +563,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
             turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
 
         self.assertEqual(len(turns), 1)
+        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+
+    def test_wrapper_only_user_message_keeps_prompt_flagged_active_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-wrapper.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Fix the failed deployment.", "2026-05-22T10:01:00Z"),
+                    message("user", "# AGENTS.md instructions\nRepository policy only.", "2026-05-22T10:01:01Z"),
+                    message("assistant", "Ran the verification and it failed.", "2026-05-22T10:02:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("failed_command", turns[0].issue_flags)
         self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
 
     def test_automation_prompt_is_not_treated_as_user_episode(self) -> None:
@@ -1584,6 +1613,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "invalid manifest window start"):
                 MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
 
+    def test_make_shards_requires_bounded_manifest_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-ready.jsonl"
+            write_jsonl(rollout, [message("user", "Shard task.", "2026-05-22T10:00:00Z")])
+            output = safe_output_dir(raw)
+            for window in (
+                {},
+                {"start": "2026-05-01T00:00:00Z"},
+                {"end": "2026-06-01T00:00:00Z"},
+            ):
+                manifest = Path(raw) / f"manifest-{len(window)}.json"
+                manifest.write_text(
+                    json.dumps({"sources": [{"host": "local", "root": str(root), "status": "ready"}], "window": window}),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(SystemExit, "requires bounded start and end"):
+                    MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+
     def test_make_shards_ignores_window_external_invalid_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1729,7 +1777,15 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 encoding="utf-8",
             )
             rootless = Path(raw) / "rootless_manifest.json"
-            rootless.write_text(json.dumps({"sources": [{"host": "local"}]}), encoding="utf-8")
+            rootless.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             with self.assertRaisesRegex(SystemExit, "requires transient"):
                 MODULE.main(["make-shards", "--manifest", str(retained), "--output", str(output)])

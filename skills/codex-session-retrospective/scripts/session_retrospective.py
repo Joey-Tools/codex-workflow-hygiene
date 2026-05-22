@@ -661,7 +661,7 @@ def source_rollouts(source: Source) -> list[Path]:
     sessions = source.root / "sessions"
     search_roots = [sessions] if sessions.exists() else [source.root]
     archived = source.root / "archived_sessions"
-    if archived.exists():
+    if archived.exists() and sessions.exists():
         search_roots.append(archived)
     return sorted(
         path
@@ -891,6 +891,7 @@ def extract_rollout(
     assistant_bits: list[str] = []
     last_user_fingerprint: tuple[str, str] | None = None
     current_emitted = False
+    current_has_post_prompt_evidence = False
     emit_threshold = emit_start or start
 
     def flush_assistant() -> None:
@@ -940,10 +941,11 @@ def extract_rollout(
             assistant_text = assistant_text_from_payload(payload)
             prompt_text = meaningful_prompt_text(user_text) if user_text else ""
             if user_text and not meaningful_user_text(user_text):
-                if current and (assistant_bits or current.issue_flags):
+                if current and (assistant_bits or current_has_post_prompt_evidence):
                     flush_assistant()
                     current = None
                     current_emitted = False
+                    current_has_post_prompt_evidence = False
                     assistant_bits = []
                 continue
             if prompt_text and meaningful_user_text(user_text):
@@ -988,18 +990,21 @@ def extract_rollout(
                     turn.prompt_improvement = "Clarify the expected outcome, scope boundary, and any prior correction before asking Codex to continue."
                 current = turn
                 current_emitted = False
+                current_has_post_prompt_evidence = False
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current()
                 continue
             if assistant_text and current and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                 emit_current(line_no, timestamp)
                 assistant_bits.append(assistant_text)
+                current_has_post_prompt_evidence = True
 
         text = record_text(record)
         _redacted_text, changed = redact(text)
         record_flags = flags_for_text(text, redacted_changed=changed)
         if current and record_flags and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
             emit_current(line_no, timestamp)
+            current_has_post_prompt_evidence = True
             merged = set(current.issue_flags)
             merged.update(record_flags)
             current.issue_flags = sorted(merged)
@@ -2301,6 +2306,15 @@ def parse_manifest_window_time(window: dict[str, Any], key: str) -> dt.datetime 
     return parsed
 
 
+def require_manifest_window_bounds(window: dict[str, Any], label: str) -> tuple[dt.datetime, dt.datetime]:
+    start = parse_manifest_window_time(window, "start")
+    end = parse_manifest_window_time(window, "end")
+    if start is None or end is None:
+        raise SystemExit(f"{label} requires bounded start and end")
+    validate_window_bounds(start, end, label)
+    return start, end
+
+
 def cmd_make_shards(args: argparse.Namespace) -> int:
     max_raw_bytes = require_positive_window(args.max_raw_bytes, "--max-raw-bytes")
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
@@ -2310,9 +2324,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     ensure_safe_output_dir(output)
     sources = manifest.get("sources", [])
     window = manifest.get("window") or {}
-    start = parse_manifest_window_time(window, "start")
-    end = parse_manifest_window_time(window, "end")
-    validate_window_bounds(start, end, "manifest window")
+    start, end = require_manifest_window_bounds(window, "manifest window")
     rows: list[dict[str, Any]] = []
 
     def shard_row(path: Path, **values: Any) -> dict[str, Any]:
