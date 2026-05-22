@@ -763,13 +763,10 @@ def oversized_rollout_has_timestamp_in_window(
 ) -> tuple[bool, bool]:
     if chunk_bytes is None:
         chunk_bytes = ROLLOUT_TIMESTAMP_SCAN_BYTES
-    if max_scan_bytes is None:
-        max_scan_bytes = ROLLOUT_TIMESTAMP_SCAN_BYTES
     size = path.stat().st_size
-    scan_bytes = min(size, max_scan_bytes)
+    scan_bytes = size if max_scan_bytes is None else min(size, max_scan_bytes)
+    complete = scan_bytes == size
     with path.open("rb") as handle:
-        if size > max_scan_bytes:
-            handle.seek(size - max_scan_bytes)
         carry = b""
         remaining = scan_bytes
         while remaining > 0:
@@ -786,9 +783,9 @@ def oversized_rollout_has_timestamp_in_window(
                     continue
                 if end and timestamp >= end:
                     continue
-                return True, size <= max_scan_bytes
+                return True, complete
             carry = window[-256:]
-    return False, size <= max_scan_bytes
+    return False, complete
 
 
 def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> str:
@@ -840,6 +837,10 @@ def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetim
     if summary_date and end and summary_date >= end:
         return False
     return True
+
+
+def summary_timestamp_with_fallback(record: dict[str, Any], path: Path) -> dt.datetime | None:
+    return parse_time(str(record.get("timestamp") or "")) or summary_date_from_path(path)
 
 
 def infer_model_era(model: str | None, timestamp: str | None) -> str:
@@ -1015,11 +1016,10 @@ def extract_summary_file(
     turns: list[TurnSummary] = []
     source_hash = file_source_hash(path)
     session_id = opaque_session_id(path.as_posix())
-    fallback = summary_date_from_path(path)
     for line_no, record in iter_jsonl(path):
         timestamp = str(record.get("timestamp") or "") or None
-        parsed_timestamp = parse_time(timestamp) or fallback
-        if parsed_timestamp is None and (start or end):
+        parsed_timestamp = summary_timestamp_with_fallback(record, path)
+        if parsed_timestamp is None:
             continue
         if parsed_timestamp and start and parsed_timestamp < start:
             continue
@@ -1039,7 +1039,7 @@ def extract_summary_file(
         if not flags:
             continue
         timestamp_value = timestamp if parse_time(timestamp) else (iso(parsed_timestamp) if parsed_timestamp else None)
-        date_bucket = (parsed_timestamp or utc_now()).date().isoformat()
+        date_bucket = parsed_timestamp.date().isoformat()
         episode_id = opaque_digest("|".join([source.host, session_id, "rollout-summary", date_bucket, kind]), 20)
         turns.append(
             TurnSummary(
@@ -1507,7 +1507,7 @@ def sanitize_retained_manifest_obj(data: Any, *, label: str, strict: bool) -> di
 
 
 def validate_retained_manifest(path: Path) -> None:
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest = history_json(path.read_bytes(), str(path))
     if contains_raw_path_fields(manifest):
         raise SystemExit(f"{path}: raw root/path fields are not retention-safe")
     if contains_invalid_ref(manifest):
@@ -1883,10 +1883,13 @@ def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
                 earliest = parsed
         for summary in source_summary_files(source):
             parsed = summary_date_from_path(summary)
-            for _line_no, record in iter_jsonl(summary):
-                timestamp = parse_time(record_timestamp(record))
-                if timestamp and (parsed is None or timestamp < parsed):
-                    parsed = timestamp
+            try:
+                for _line_no, record in iter_jsonl(summary):
+                    timestamp = parse_time(record_timestamp(record))
+                    if timestamp and (parsed is None or timestamp < parsed):
+                        parsed = timestamp
+            except ValueError:
+                pass
             if parsed and (earliest is None or parsed < earliest):
                 earliest = parsed
     return earliest
@@ -1984,6 +1987,7 @@ def run_scan(
     manifest_sources: list[dict[str, Any]] = []
     coverage_gaps: list[dict[str, Any]] = []
     max_raw_bytes = getattr(args, "max_raw_bytes", 512_000)
+    require_positive_window(max_raw_bytes, "--max-raw-bytes")
     for source in sources:
         if not source.root.exists():
             coverage_gaps.append(
@@ -2284,6 +2288,7 @@ def parse_manifest_window_time(window: dict[str, Any], key: str) -> dt.datetime 
 
 
 def cmd_make_shards(args: argparse.Namespace) -> int:
+    require_positive_window(args.max_raw_bytes, "--max-raw-bytes")
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     if manifest.get("retention_safe") is True:
         raise SystemExit("make-shards requires transient shard_manifest.json, not retained_manifest.json")
@@ -2395,9 +2400,10 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     sanitize_retained_jsonl(run_dir / "episodes.jsonl", allowed=EPISODE_FIELDS, strict=False, validator=validate_episode_row)
     sanitize_retained_jsonl(run_dir / "turn_flags.jsonl", allowed=TURN_FLAG_FIELDS, strict=False, validator=validate_turn_flag_row)
     trend_path = run_dir / "trend_report.json"
-    trend = sanitize_trend_report(json.loads(trend_path.read_text(encoding="utf-8")), label=str(trend_path), strict=True)
+    trend = sanitize_trend_report(history_json(trend_path.read_bytes(), str(trend_path)), label=str(trend_path), strict=True)
     validate_retained_manifest(run_dir / "retained_manifest.json")
-    retained_manifest = json.loads((run_dir / "retained_manifest.json").read_text(encoding="utf-8"))
+    manifest_path = run_dir / "retained_manifest.json"
+    retained_manifest = history_json(manifest_path.read_bytes(), str(manifest_path))
     return trend, retained_manifest
 
 

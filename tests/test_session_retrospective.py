@@ -931,6 +931,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_baseline_from_first_includes_rollout_summary_dates(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
+            write_local_evidence(root)
             summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
             later = root / "sessions" / "2026" / "04" / "15" / "rollout-2026-04-15T10-00-00-later.jsonl"
             write_jsonl(summary, [{"timestamp": "2026-01-01T10:00:00Z", "kind": "summary", "text": "failed verification"}])
@@ -958,6 +959,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["turn_count"], 1)
         self.assertEqual(trend["window"]["start"], "2026-01-01T00:00:00Z")
         self.assertEqual(trend["window"]["end"], "2026-04-01T00:00:00Z")
+
+    def test_baseline_from_first_ignores_malformed_summary_when_deriving_start(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            summary.parent.mkdir(parents=True)
+            summary.write_text("{bad json\n", encoding="utf-8")
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-fresh.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh baseline task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.main(
+                [
+                    "baseline",
+                    "--window-days",
+                    "90",
+                    "--from",
+                    "first",
+                    "--end",
+                    "2026-06-01T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--output",
+                    str(output),
+                ]
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["window"]["start"], "2026-01-01T00:00:00Z")
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
 
     def test_daily_first_run_uses_active_lookback_days(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1020,7 +1053,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     [
                         "scan-weekly",
                         "--days",
-                        "0",
+                        "-7",
                         "--source",
                         f"local={root}",
                         "--allow-partial-hosts",
@@ -3622,6 +3655,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "invalid JSON"):
                 MODULE.main(["validate-output", "--run-dir", str(run_dir)])
 
+    def test_validate_output_rejects_non_object_jsonl_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw) / "run"
+            run_dir.mkdir()
+            (run_dir / "turn_summaries.jsonl").write_text("1\n", encoding="utf-8")
+            write_jsonl(run_dir / "episodes.jsonl", [])
+            write_jsonl(run_dir / "turn_flags.jsonl", [])
+            (run_dir / "trend_report.json").write_text("{}\n", encoding="utf-8")
+            (run_dir / "retained_manifest.json").write_text('{"retention_safe": true}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "JSONL record must be an object"):
+                MODULE.main(["validate-output", "--run-dir", str(run_dir)])
+
+    def test_validate_output_reports_missing_required_json_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw) / "run"
+            run_dir.mkdir()
+            write_jsonl(run_dir / "turn_summaries.jsonl", [])
+            write_jsonl(run_dir / "episodes.jsonl", [])
+            write_jsonl(run_dir / "turn_flags.jsonl", [])
+            (run_dir / "retained_manifest.json").write_text('{"retention_safe": true}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "missing output"):
+                MODULE.main(["validate-output", "--run-dir", str(run_dir)])
+
     def test_validate_output_rejects_symlink_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -3973,6 +4031,46 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = list((output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines())
+
+        self.assertEqual(rows, [])
+
+    def test_summary_with_invalid_timestamp_uses_path_date_for_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            old_summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            fresh_summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-fresh.jsonl"
+            write_jsonl(old_summary, [{"kind": "summary", "timestamp": "not-a-date", "text": "permission denied"}])
+            write_jsonl(fresh_summary, [{"kind": "summary", "timestamp": "not-a-date", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], "2026-05-01T00:00:00Z")
+
+    def test_summary_without_timestamp_or_path_date_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-undated.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-08T00:00:00Z"),
             )
             rows = list((output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines())
 
