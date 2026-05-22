@@ -157,13 +157,52 @@ def prompt_category(text: str) -> str:
     return "+".join(sorted(set(categories)))
 
 
-def safe_prompt_summary(text: str, issue_flags: set[str], redacted_changed: bool) -> str:
+TOPIC_STOPWORDS = {
+    "also",
+    "and",
+    "build",
+    "create",
+    "fix",
+    "for",
+    "implement",
+    "please",
+    "the",
+    "this",
+    "update",
+    "using",
+    "with",
+}
+
+
+def prompt_topic_key(redacted_text: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", redacted_text.casefold())
+    meaningful = [
+        token
+        for token in tokens
+        if len(token) > 2 and token not in TOPIC_STOPWORDS and not token.startswith("redacted")
+    ]
+    if meaningful:
+        return "+".join(sorted(dict.fromkeys(meaningful))[:6])
+    compacted = re.sub(r"\s+", "", redacted_text)
+    return stable_hash(compacted, 12) if compacted else "unknown"
+
+
+def safe_prompt_summary(
+    text: str,
+    issue_flags: set[str],
+    redacted_changed: bool,
+    redacted_text: str | None = None,
+) -> str:
     parts = [
         f"category={prompt_category(text)}",
         f"prompt_chars={len(text)}",
     ]
+    if redacted_text:
+        parts.append("topic_key=" + prompt_topic_key(redacted_text))
     if issue_flags:
         parts.append("flags=" + ",".join(sorted(issue_flags)))
+        if redacted_text:
+            parts.append("redacted_excerpt=" + compact(redacted_text, 240))
     if redacted_changed:
         parts.append("redactions=applied")
     return "; ".join(parts)
@@ -228,6 +267,21 @@ def rollout_date_from_path(path: Path) -> dt.datetime | None:
     if not match:
         return None
     return parse_time(match.group(1) + "T00:00:00Z")
+
+
+def dated_path_from_parts(path: Path) -> dt.datetime | None:
+    parts = path.parts
+    for index in range(len(parts) - 2):
+        year, month, day = parts[index : index + 3]
+        if re.fullmatch(r"\d{4}", year) and re.fullmatch(r"\d{2}", month) and re.fullmatch(r"\d{2}", day):
+            parsed = parse_time(f"{year}-{month}-{day}T00:00:00Z")
+            if parsed:
+                return parsed
+    return None
+
+
+def summary_date_from_path(path: Path) -> dt.datetime | None:
+    return dated_path_from_parts(path)
 
 
 def first_jsonl_error(path: Path) -> int | None:
@@ -296,7 +350,8 @@ def record_timestamp(record: dict[str, Any]) -> str | None:
 
 
 def record_timestamp_or_fallback(record: dict[str, Any], path: Path) -> str | None:
-    return record_timestamp(record) or (iso(rollout_date_from_path(path)) if rollout_date_from_path(path) else None)
+    fallback = rollout_date_from_path(path) or dated_path_from_parts(path)
+    return record_timestamp(record) or (iso(fallback) if fallback else None)
 
 
 def record_text(record: dict[str, Any]) -> str:
@@ -453,6 +508,27 @@ def oversized_rollout_relevant(path: Path, start: dt.datetime | None, end: dt.da
     return oversized_rollout_relevance(path, start, end) == "relevant"
 
 
+def raw_timestamp_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    found, _complete = oversized_rollout_has_timestamp_in_window(
+        path,
+        start,
+        end,
+        max_scan_bytes=path.stat().st_size,
+    )
+    return found
+
+
+def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    if start is None and end is None:
+        return True
+    summary_date = summary_date_from_path(path)
+    if summary_date and end and summary_date >= end:
+        return False
+    if summary_date and start and summary_date < start:
+        return raw_timestamp_in_window(path, start, end)
+    return True
+
+
 def infer_model_era(model: str | None, timestamp: str | None) -> str:
     if model:
         if "gpt-5.5" in model:
@@ -511,11 +587,20 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
                     continue
                 last_user_fingerprint = fingerprint
                 flush_assistant()
-                _redacted_prompt, prompt_changed = redact(user_text)
+                redacted_prompt, prompt_changed = redact(user_text)
                 prompt_flags = flags_for_text(user_text, redacted_changed=prompt_changed)
-                prompt_summary = safe_prompt_summary(user_text, prompt_flags, prompt_changed)
+                prompt_summary = safe_prompt_summary(user_text, prompt_flags, prompt_changed, redacted_prompt)
                 date_bucket = (parse_time(timestamp) or rollout_date_from_path(path) or utc_now()).date().isoformat()
-                episode_seed = "|".join([source.host, session_id, (cwd or ""), date_bucket, prompt_category(user_text)])
+                episode_seed = "|".join(
+                    [
+                        source.host,
+                        session_id,
+                        (cwd or ""),
+                        date_bucket,
+                        prompt_category(user_text),
+                        prompt_topic_key(redacted_prompt),
+                    ]
+                )
                 episode_id = stable_hash(episode_seed, 20)
                 turn = TurnSummary(
                     turn_id=stable_hash(f"{source.host}|{path}|{line_no}|{timestamp}", 20),
@@ -559,9 +644,12 @@ def extract_summary_file(source: Source, path: Path, start: dt.datetime | None, 
     turns: list[TurnSummary] = []
     source_hash = file_hash(path)
     session_id = stable_hash(path.as_posix(), 20)
+    fallback = summary_date_from_path(path)
     for line_no, record in iter_jsonl(path):
         timestamp = str(record.get("timestamp") or "") or None
-        parsed_timestamp = parse_time(timestamp)
+        parsed_timestamp = parse_time(timestamp) or fallback
+        if parsed_timestamp is None and (start or end):
+            continue
         if parsed_timestamp and start and parsed_timestamp < start:
             continue
         if parsed_timestamp and end and parsed_timestamp >= end:
@@ -577,6 +665,7 @@ def extract_summary_file(source: Source, path: Path, start: dt.datetime | None, 
         flags = flags_for_text(text, redacted_changed=changed)
         if not flags:
             continue
+        timestamp_value = timestamp if parse_time(timestamp) else (iso(parsed_timestamp) if parsed_timestamp else None)
         date_bucket = (parsed_timestamp or utc_now()).date().isoformat()
         episode_id = stable_hash("|".join([source.host, session_id, "rollout-summary", date_bucket, kind]), 20)
         turns.append(
@@ -587,7 +676,7 @@ def extract_summary_file(source: Source, path: Path, start: dt.datetime | None, 
                 session_id=session_id,
                 source_path=path_ref(path) or "",
                 source_hash=source_hash,
-                timestamp=timestamp,
+                timestamp=timestamp_value,
                 cwd=None,
                 model=None,
                 model_era=infer_model_era(None, timestamp),
@@ -897,11 +986,25 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
         )
         for rollout in rollouts:
             size = rollout.stat().st_size
+            if size <= max_raw_bytes:
+                error_line = first_jsonl_error(rollout)
+                if error_line is not None:
+                    if rollout_filename_in_window(rollout, start, end) or raw_timestamp_in_window(rollout, start, end):
+                        coverage_gaps.append(
+                            {
+                                "host": source.host,
+                                "path_ref": path_ref(rollout),
+                                "reason": "invalid_jsonl",
+                            }
+                        )
+                    continue
+                if not rollout_has_record_in_window(rollout, start, end):
+                    continue
+                all_turns.extend(extract_rollout(source, rollout, start, end))
+                continue
             relevance = oversized_rollout_relevance(rollout, start, end)
             if relevance == "irrelevant":
                 continue
-            if relevance == "unknown" and size <= max_raw_bytes:
-                relevance = "relevant"
             if relevance == "unknown":
                 coverage_gaps.append(
                     {
@@ -922,17 +1025,9 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
                     }
                 )
                 continue
-            if first_jsonl_error(rollout) is not None:
-                coverage_gaps.append(
-                    {
-                        "host": source.host,
-                        "path_ref": path_ref(rollout),
-                        "reason": "invalid_jsonl",
-                    }
-                )
-                continue
-            all_turns.extend(extract_rollout(source, rollout, start, end))
         for summary in summaries:
+            if not summary_file_relevant(summary, start, end):
+                continue
             if first_jsonl_error(summary) is not None:
                 coverage_gaps.append(
                     {
@@ -1054,7 +1149,7 @@ def cmd_scan_daily(args: argparse.Namespace) -> int:
     state = load_state(state_path) if state_path else {}
     last = parse_time(state.get("last_scan_at"))
     lookback_start = end - dt.timedelta(days=args.active_lookback_days)
-    start = min(last, lookback_start) if last else lookback_start
+    start = last if last and last <= end else lookback_start
     return run_scan(args, mode="daily", start=start, end=end)
 
 
@@ -1113,11 +1208,21 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         for rollout in source_rollouts(Source(str(host), root)):
             size = rollout.stat().st_size
             row = {"host": host, "path": rollout.as_posix(), "path_ref": path_ref(rollout), "bytes": size}
+            if size <= args.max_raw_bytes:
+                error_line = first_jsonl_error(rollout)
+                if error_line is not None:
+                    if rollout_filename_in_window(rollout, start, end) or raw_timestamp_in_window(rollout, start, end):
+                        row["status"] = "invalid"
+                        row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"
+                        rows.append(row)
+                    continue
+                if rollout_has_record_in_window(rollout, start, end):
+                    row["status"] = "ready"
+                    rows.append(row)
+                continue
             relevance = oversized_rollout_relevance(rollout, start, end)
             if relevance == "irrelevant":
                 continue
-            if relevance == "unknown" and size <= args.max_raw_bytes:
-                relevance = "relevant"
             if relevance == "unknown":
                 row["status"] = "oversized"
                 row["coverage_gap"] = "rollout exceeds timestamp relevance scan; use bounded rollout-summary before extractor handoff"
@@ -1128,14 +1233,6 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"
                 rows.append(row)
                 continue
-            if first_jsonl_error(rollout) is not None:
-                row["status"] = "invalid"
-                row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"
-                rows.append(row)
-                continue
-            if rollout_has_record_in_window(rollout, start, end):
-                row["status"] = "ready"
-                rows.append(row)
     write_jsonl(output / "shards.jsonl", rows)
     print(output / "shards.jsonl")
     return 0

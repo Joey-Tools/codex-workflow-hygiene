@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -127,6 +128,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(turns), 1)
         self.assertIn("category=debug_or_fix", turns[0].redacted_user_prompt_summary)
+        self.assertIn("Please fix this", turns[0].redacted_user_prompt_summary)
         self.assertIn("redactions=applied", turns[0].redacted_user_prompt_summary)
         self.assertNotIn("internal.example", turns[0].redacted_user_prompt_summary)
         self.assertNotIn("sk-proj", turns[0].redacted_user_prompt_summary)
@@ -154,6 +156,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(turns[0].episode_id, turns[1].episode_id)
         self.assertEqual(len(episodes), 1)
         self.assertEqual(episodes[0]["turn_count"], 2)
+
+    def test_extract_rollout_splits_unrelated_same_category_topics(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-abc.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the billing helper.", "2026-05-22T10:01:00Z"),
+                    message("user", "Please implement the calendar sync.", "2026-05-22T10:03:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+            episodes = MODULE.episode_records(turns)
+
+        self.assertEqual(len(turns), 2)
+        self.assertNotEqual(turns[0].episode_id, turns[1].episode_id)
+        self.assertEqual(len(episodes), 2)
 
     def test_extract_rollout_reads_event_msg_user_messages_once(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -368,6 +389,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     message("user", "New continuation.", "2026-05-22T10:00:00Z"),
                 ],
             )
+            old_mtime = MODULE.parse_time("2026-01-02T00:00:00Z").timestamp()
+            os.utime(rollout, (old_mtime, old_mtime))
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
@@ -440,6 +463,39 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(trend["turn_count"], 1)
         self.assertEqual(trend["window"]["start"], "2026-05-08T10:00:00Z")
+
+    def test_daily_existing_state_uses_last_scan_for_output_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            old_rollout = root / "sessions" / "2026" / "05" / "12" / "rollout-2026-05-12T10-00-00-active.jsonl"
+            new_rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T09-00-00-active.jsonl"
+            write_jsonl(old_rollout, [message("user", "Already reported active work.", "2026-05-12T10:00:00Z")])
+            write_jsonl(new_rollout, [message("user", "New daily work.", "2026-05-22T09:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(json.dumps({"last_scan_at": "2026-05-21T10:00:00Z"}), encoding="utf-8")
+
+            with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")):
+                MODULE.main(
+                    [
+                        "scan-daily",
+                        "--active-lookback-days",
+                        "14",
+                        "--state",
+                        str(state),
+                        "--source",
+                        f"local={root}",
+                        "--allow-partial-hosts",
+                        "--output",
+                        str(output),
+                    ]
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["turn_count"], 1)
+        self.assertEqual(trend["window"]["start"], "2026-05-21T10:00:00Z")
 
     def test_make_shards_respects_window_and_reports_oversized(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1070,6 +1126,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("safety_privacy_flag", rows[0]["issue_flags"])
         self.assertNotIn("joey@example.com", json.dumps(rows[0]))
+
+    def test_old_invalid_summary_outside_window_does_not_block_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text("{bad json\n", encoding="utf-8")
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=str(state), max_raw_bytes=100, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            state_exists = state.exists()
+
+        self.assertTrue(state_exists)
+        self.assertEqual(trend["coverage_gaps"], [])
+
+    def test_old_summary_without_timestamp_outside_window_is_not_current_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = list((output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines())
+
+        self.assertEqual(rows, [])
 
     def test_chinese_privacy_marker_contributes_flag(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
