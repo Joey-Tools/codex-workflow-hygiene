@@ -1385,7 +1385,7 @@ def remote_evidence_gaps(
         return [remote_metadata_gap(source)]
     if start and window_start > start:
         return [remote_metadata_gap(source)]
-    if end and window_end < end:
+    if end and window_end != end:
         return [remote_metadata_gap(source)]
     if materialized_at < window_end:
         return [remote_metadata_gap(source)]
@@ -1909,6 +1909,12 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
         raise SystemExit("trend_report.json window end must be a valid timestamp")
     if previous_scan_at and new_scan_at < previous_scan_at:
         raise SystemExit("refusing to move retrospective state backwards")
+    if previous_scan_at:
+        window_start_at = parse_time(str(window.get("start") or ""))
+        if window_start_at is None:
+            raise SystemExit("trend_report.json window start must be valid when advancing existing state")
+        if window_start_at > previous_scan_at:
+            raise SystemExit("refusing to advance state with a scan window that does not cover previous state")
     state["last_scan_at"] = last_scan_at
     state["last_retained_export_sha256"] = retained_export_digest(actual_files)
     state["last_history_commit"] = history_commit

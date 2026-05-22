@@ -1447,6 +1447,53 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state_data = json.loads(state.read_text(encoding="utf-8"))
             self.assertEqual(state_data["last_scan_at"], "2026-05-03T00:00:00Z")
 
+    def test_advance_state_rejects_run_that_does_not_cover_previous_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw, timestamp="2026-05-15T10:00:00Z")
+            for source_arg in remote_sources:
+                host, path = source_arg.split("=", 1)
+                write_remote_metadata(
+                    Path(path),
+                    host,
+                    window_start="2026-05-15T00:00:00Z",
+                    window_end="2026-05-16T00:00:00Z",
+                    materialized_at="2026-05-16T00:00:00Z",
+                )
+            rollout = root / "sessions" / "2026" / "05" / "15" / "rollout-2026-05-15T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Late daily task.", "2026-05-15T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(json.dumps({"last_scan_at": "2026-05-10T00:00:00Z"}), encoding="utf-8")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-15T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-16T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+
+            with self.assertRaisesRegex(SystemExit, "does not cover previous state"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-commit",
+                        HISTORY_COMMIT,
+                    ]
+                )
+
+            state_data = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(state_data["last_scan_at"], "2026-05-10T00:00:00Z")
+
     def test_advance_state_rejects_non_daily_runs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1744,6 +1791,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_default_remote_metadata_must_cover_window_tail(self) -> None:
         for metadata_overrides in (
             {"window_end": "2026-05-01T22:30:00Z", "materialized_at": "2026-05-02T00:00:00Z"},
+            {"window_end": "2026-05-03T00:00:00Z", "materialized_at": "2026-05-03T00:00:00Z"},
             {"window_end": "2026-05-02T00:00:00Z", "materialized_at": "2026-05-01T22:30:00Z"},
         ):
             with self.subTest(metadata_overrides=metadata_overrides):
