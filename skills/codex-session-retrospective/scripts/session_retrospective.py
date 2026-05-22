@@ -29,6 +29,7 @@ WRAPPER_PREFIXES = (
 
 AUTOMATION_PROMPT_PATTERNS = (
     re.compile(r"^Run the (?:daily|weekly) Codex session retrospective\b", re.I),
+    re.compile(r"^Use \$codex-session-retrospective to run\b", re.I),
     re.compile(r"\bcodex-session-retrospective workflow\b", re.I),
     re.compile(r"\bWrite task-local artifacts under \.codex-local/session-retrospective\b", re.I),
 )

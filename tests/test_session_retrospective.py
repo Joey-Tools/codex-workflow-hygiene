@@ -183,6 +183,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(turns, [])
 
+    def test_agent_default_prompt_is_not_treated_as_user_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-agent.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message(
+                        "user",
+                        "Use $codex-session-retrospective to run a read-only retrospective over Codex session history and produce redacted episode, turn, and trend artifacts.",
+                        "2026-05-22T10:01:00Z",
+                    ),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(turns, [])
+
     def test_synthetic_internal_review_prompt_is_not_treated_as_user_episode(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
