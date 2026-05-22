@@ -168,6 +168,7 @@ HISTORY_FORBIDDEN_COMPACT_NAME_PARTS = frozenset(
 HISTORY_FORBIDDEN_COMPACT_NAME_PREFIXES = frozenset(("raw",))
 HISTORY_TEXT_EXTENSIONS = (".md", ".txt")
 HISTORY_JSON_EXTENSIONS = (".json",)
+HISTORY_STRIPPABLE_NAME_SUFFIXES = frozenset((*HISTORY_TEXT_EXTENSIONS, *HISTORY_JSON_EXTENSIONS, ".jsonl"))
 HISTORY_ROOT_FILES = frozenset((".gitignore", "AGENTS.md", "README.md"))
 HISTORY_TEXT_PREFIXES = ("annotations/", "indexes/", "reports/")
 HISTORY_JSON_PREFIXES = ("annotations/", "indexes/", "schemas/")
@@ -1707,7 +1708,7 @@ def history_artifact_name_tokens(name: str) -> list[str]:
     stem = name
     while True:
         next_stem, suffix = os.path.splitext(stem)
-        if not suffix:
+        if suffix.lower() not in HISTORY_STRIPPABLE_NAME_SUFFIXES:
             break
         stem = next_stem
     separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", stem)
@@ -1749,7 +1750,7 @@ def forbidden_history_artifact(file_path: str) -> bool:
         return True
     if forbidden_history_artifact_name(name):
         return True
-    if any(part in HISTORY_FORBIDDEN_COMPONENTS for part in parts):
+    if any(part in HISTORY_FORBIDDEN_COMPONENTS or forbidden_history_artifact_name(part) for part in parts[:-1]):
         return True
     return name.startswith("rollout") and name.endswith(".jsonl")
 
@@ -2172,6 +2173,7 @@ def run_scan(
     output = ensure_safe_output_dir(Path(args.output))
     safe_state_path(args.state)
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
+    gap_start = emit_start or start
     all_turns: list[TurnSummary] = []
     manifest_sources: list[dict[str, Any]] = []
     coverage_gaps: list[dict[str, Any]] = []
@@ -2255,9 +2257,9 @@ def run_scan(
                 error_line = first_jsonl_error(rollout)
                 if error_line is not None:
                     if (
-                        rollout_filename_in_window(rollout, start, end)
-                        or raw_timestamp_in_window(rollout, start, end)
-                        or (allow_mtime_fallback and rollout_mtime_active(rollout, start, end))
+                        rollout_filename_in_window(rollout, gap_start, end)
+                        or raw_timestamp_in_window(rollout, gap_start, end)
+                        or (allow_mtime_fallback and rollout_mtime_active(rollout, gap_start, end))
                     ):
                         coverage_gaps.append(
                             {
@@ -2280,7 +2282,7 @@ def run_scan(
                     )
                 )
                 continue
-            relevance = oversized_rollout_relevance(rollout, start, end)
+            relevance = oversized_rollout_relevance(rollout, gap_start, end)
             if relevance == "irrelevant":
                 continue
             append_oversized_rollout_gap(rollout, size)
@@ -2289,13 +2291,14 @@ def run_scan(
             if not summary_file_relevant(summary, start, end):
                 continue
             if first_jsonl_error(summary) is not None:
-                coverage_gaps.append(
-                    {
-                        "host": source.host,
-                        "path_ref": path_ref(summary),
-                        "reason": "invalid_jsonl",
-                    }
-                )
+                if summary_file_relevant(summary, gap_start, end):
+                    coverage_gaps.append(
+                        {
+                            "host": source.host,
+                            "path_ref": path_ref(summary),
+                            "reason": "invalid_jsonl",
+                        }
+                    )
                 continue
             all_turns.extend(extract_summary_file(source, summary, start, end, emit_start=emit_start))
     if getattr(args, "allow_partial_hosts", False):
