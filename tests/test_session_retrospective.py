@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import types
@@ -305,6 +306,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertTrue(topic_ref.startswith("topic_ref:"))
         self.assertEqual(topic_ref, MODULE.prompt_topic_key(redacted_text))
         self.assertNotEqual(topic_ref, old_dictionary_ref)
+
+    def test_path_refs_are_stable_across_processes_with_key_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            key_file = Path(raw) / ".codex-local" / "session-retrospective" / "opaque_ref_key"
+            probe = (
+                "import importlib.util, sys\n"
+                f"spec = importlib.util.spec_from_file_location('session_retrospective', {str(SCRIPT)!r})\n"
+                "module = importlib.util.module_from_spec(spec)\n"
+                "sys.modules[spec.name] = module\n"
+                "spec.loader.exec_module(module)\n"
+                "print(module.path_ref('/tmp/customer/repo'))\n"
+            )
+            env = os.environ.copy()
+            env["CODEX_SESSION_RETROSPECTIVE_KEY_FILE"] = str(key_file)
+
+            first = subprocess.check_output([sys.executable, "-c", probe], env=env, text=True).strip()
+            second = subprocess.check_output([sys.executable, "-c", probe], env=env, text=True).strip()
+
+        self.assertEqual(first, second)
+        self.assertTrue(first.startswith("path_ref_v1:"))
 
     def test_human_prompt_mentioning_retrospective_workflow_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -626,6 +647,37 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["window"]["start"], "2026-01-01T00:00:00Z")
         self.assertEqual(trend["window"]["end"], "2026-04-01T00:00:00Z")
 
+    def test_baseline_from_first_includes_rollout_summary_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            later = root / "sessions" / "2026" / "04" / "15" / "rollout-2026-04-15T10-00-00-later.jsonl"
+            write_jsonl(summary, [{"timestamp": "2026-01-01T10:00:00Z", "kind": "summary", "text": "failed verification"}])
+            write_jsonl(later, [message("user", "Later window task.", "2026-04-15T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.main(
+                [
+                    "baseline",
+                    "--window-days",
+                    "90",
+                    "--from",
+                    "first",
+                    "--end",
+                    "2026-05-22T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--output",
+                    str(output),
+                ]
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["turn_count"], 1)
+        self.assertEqual(trend["window"]["start"], "2026-01-01T00:00:00Z")
+        self.assertEqual(trend["window"]["end"], "2026-04-01T00:00:00Z")
+
     def test_daily_first_run_uses_active_lookback_days(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -729,6 +781,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["turn_count"], 1)
         self.assertEqual(trend["window"]["start"], "2026-05-21T10:00:00Z")
         self.assertEqual(state_after_scan["last_scan_at"], "2026-05-21T10:00:00Z")
+
+    def test_daily_existing_state_rejects_invalid_last_scan_at(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(json.dumps({"last_scan_at": "not-a-date"}), encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "state last_scan_at"):
+                MODULE.main(
+                    [
+                        "scan-daily",
+                        "--state",
+                        str(state),
+                        "--source",
+                        f"local={root}",
+                        "--allow-partial-hosts",
+                        "--output",
+                        str(output),
+                        "--end",
+                        "2026-05-22T10:00:00Z",
+                    ]
+                )
 
     def test_daily_existing_state_revisits_active_thread_context_without_duplicate_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1481,6 +1558,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             state_data = json.loads(state.read_text(encoding="utf-8"))
             self.assertEqual(state_data["last_scan_at"], "2026-05-03T00:00:00Z")
+
+    def test_advance_state_rejects_invalid_previous_last_scan_at(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Daily task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(json.dumps({"last_scan_at": "not-a-date"}), encoding="utf-8")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+
+            with self.assertRaisesRegex(SystemExit, "state last_scan_at"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-commit",
+                        HISTORY_COMMIT,
+                    ]
+                )
+
+            state_data = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(state_data["last_scan_at"], "not-a-date")
 
     def test_advance_state_rejects_run_that_does_not_cover_previous_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

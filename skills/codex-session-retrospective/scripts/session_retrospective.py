@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import errno
 import hashlib
 import hmac
 import json
@@ -11,6 +12,7 @@ import os
 import re
 import secrets
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -94,7 +96,8 @@ SAFE_OUTPUT_PARTS = (".codex-local", "session-retrospective")
 PATH_REF_PREFIX = "path_ref_v1"
 PATH_REF_PATTERN = re.compile(r"^path_ref_v1:[0-9a-f]{16}$")
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-PATH_REF_KEY = secrets.token_bytes(32)
+OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
+PATH_REF_KEY: bytes | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
@@ -277,7 +280,7 @@ def prompt_topic_key(redacted_text: str) -> str:
         if len(token) > 2 and token not in TOPIC_STOPWORDS and not token.startswith("redacted")
     ]
     def topic_ref(value: str) -> str:
-        digest = hmac.new(PATH_REF_KEY, f"topic\0{value}".encode("utf-8", errors="surrogatepass"), hashlib.sha256)
+        digest = hmac.new(path_ref_key(), f"topic\0{value}".encode("utf-8", errors="surrogatepass"), hashlib.sha256)
         return "topic_ref:" + digest.hexdigest()[:12]
 
     if meaningful:
@@ -329,10 +332,64 @@ def stable_hash(value: str, length: int = 16) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 
 
+def parse_opaque_ref_key(raw: str, *, label: str) -> bytes:
+    value = raw.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        raise SystemExit(f"{label}: opaque ref key must be 64 hex characters")
+    return bytes.fromhex(value)
+
+
+def read_opaque_ref_key_file(path: Path) -> bytes:
+    if path.is_symlink():
+        raise SystemExit(f"refusing symlinked opaque ref key file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise SystemExit(f"refusing symlinked opaque ref key file: {path}") from exc
+        raise
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        return parse_opaque_ref_key(handle.read(), label=str(path))
+
+
+def create_or_read_opaque_ref_key(path: Path) -> bytes:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key_hex = secrets.token_hex(32)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return read_opaque_ref_key_file(path)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise SystemExit(f"refusing symlinked opaque ref key file: {path}") from exc
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(key_hex + "\n")
+    return bytes.fromhex(key_hex)
+
+
+def path_ref_key() -> bytes:
+    global PATH_REF_KEY
+    if PATH_REF_KEY is not None:
+        return PATH_REF_KEY
+    env_key = os.environ.get("CODEX_SESSION_RETROSPECTIVE_KEY")
+    if env_key:
+        PATH_REF_KEY = parse_opaque_ref_key(env_key, label="CODEX_SESSION_RETROSPECTIVE_KEY")
+        return PATH_REF_KEY
+    key_path = Path(os.environ.get("CODEX_SESSION_RETROSPECTIVE_KEY_FILE", OPAQUE_REF_KEY_FILE.as_posix())).expanduser()
+    if key_path.exists():
+        PATH_REF_KEY = read_opaque_ref_key_file(key_path)
+    else:
+        PATH_REF_KEY = create_or_read_opaque_ref_key(key_path)
+    return PATH_REF_KEY
+
+
 def path_ref(value: str | os.PathLike[str] | None, length: int = 16) -> str | None:
     if not value:
         return None
-    digest = hmac.new(PATH_REF_KEY, os.fspath(value).encode("utf-8", errors="surrogatepass"), hashlib.sha256)
+    digest = hmac.new(path_ref_key(), os.fspath(value).encode("utf-8", errors="surrogatepass"), hashlib.sha256)
     return f"{PATH_REF_PREFIX}:{digest.hexdigest()[:length]}"
 
 
@@ -1312,7 +1369,10 @@ def parse_sources(values: list[str] | None, *, require_default_hosts: bool = Tru
 def load_state(path: Path | None) -> dict[str, Any]:
     if not path or not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit("state file must contain an object")
+    return data
 
 
 def save_state(path: Path | None, data: dict[str, Any]) -> None:
@@ -1337,7 +1397,27 @@ def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
             parsed = dated_path_from_parts(rollout) or rollout_date_from_path(rollout)
             if parsed and (earliest is None or parsed < earliest):
                 earliest = parsed
+        for summary in source_summary_files(source):
+            parsed = summary_date_from_path(summary)
+            for _line_no, record in iter_jsonl(summary):
+                timestamp = parse_time(record_timestamp(record))
+                if timestamp and (parsed is None or timestamp < parsed):
+                    parsed = timestamp
+            if parsed and (earliest is None or parsed < earliest):
+                earliest = parsed
     return earliest
+
+
+def state_last_scan_at(state: dict[str, Any]) -> dt.datetime | None:
+    if "last_scan_at" not in state:
+        return None
+    value = state.get("last_scan_at")
+    if not isinstance(value, str):
+        raise SystemExit("state last_scan_at must be a valid timestamp")
+    parsed = parse_time(value)
+    if parsed is None:
+        raise SystemExit("state last_scan_at must be a valid timestamp")
+    return parsed
 
 
 def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
@@ -1655,7 +1735,7 @@ def cmd_scan_daily(args: argparse.Namespace) -> int:
     end = scan_end(args)
     state_path = safe_state_path(args.state)
     state = load_state(state_path) if state_path else {}
-    last = parse_time(state.get("last_scan_at"))
+    last = state_last_scan_at(state)
     lookback_start = end - dt.timedelta(days=args.active_lookback_days)
     if last and last <= end:
         start = min(last, lookback_start)
@@ -1886,10 +1966,21 @@ def cmd_export_retained(args: argparse.Namespace) -> int:
         target = output / name
         if target.exists() and (target.is_symlink() or not target.is_file()):
             raise SystemExit(f"refusing to overwrite unexpected retained output: {target}")
-        temp = output / f".{name}.tmp"
         target.parent.mkdir(parents=True, exist_ok=True)
-        temp.write_bytes(content)
-        os.replace(temp, target)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=output)
+        temp = Path(temp_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, target)
+        except Exception:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
     validate_retained_output_dir(output)
     print(output)
     return 0
@@ -1932,7 +2023,7 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
         raise SystemExit("refusing to advance state while coverage gaps are present")
     state = load_state(state_path)
     new_scan_at = parse_time(last_scan_at)
-    previous_scan_at = parse_time(state.get("last_scan_at"))
+    previous_scan_at = state_last_scan_at(state)
     if new_scan_at is None:
         raise SystemExit("trend_report.json window end must be a valid timestamp")
     if previous_scan_at and new_scan_at < previous_scan_at:

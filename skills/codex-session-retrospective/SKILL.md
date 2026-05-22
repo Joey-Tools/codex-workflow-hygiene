@@ -18,6 +18,7 @@ The workflow is read-only against Codex history and remote hosts. It produces re
 - Once remote rollout data is copied or summarized locally, use this skill's helper for extraction and aggregation.
 - Each materialized default remote source root must include `source_metadata.json` with `host`, `status`, `window_start`, `window_end`, and `materialized_at`; missing or stale metadata is a coverage gap and blocks state advancement.
 - Choose the scan `--end` timestamp before materializing remote evidence, use that same timestamp as the remote metadata `window_end`, and pass it to `scan-daily`, `scan-weekly`, or `baseline`.
+- Opaque retained refs use a stable local HMAC key at `.codex-local/session-retrospective/opaque_ref_key` by default. Keep this key ignored and private; set `CODEX_SESSION_RETROSPECTIVE_KEY_FILE` or `CODEX_SESSION_RETROSPECTIVE_KEY` only when intentionally sharing the same private history root across workspaces.
 - Never modify `~/.codex`, remote hosts, Apple Notes, or raw rollout files during retrospective collection.
 
 ## Workflow
@@ -67,7 +68,7 @@ python3 scripts/session_retrospective.py export-retained --run-dir .codex-local/
 python3 scripts/session_retrospective.py validate-retained --run-dir .codex-local/session-retrospective/retained/20260522/weekly
 ```
 
-Use `discover` before map-reduce shard work. `scan-*` remains the compact local extraction path for bounded windows and final retained outputs.
+Use `discover` before map-reduce shard work. `make-shards` only emits sources marked `ready` by the transient manifest; stale, missing, empty, or otherwise non-ready sources stay as coverage gaps and must not be handed to extractor subagents. `scan-*` remains the compact local extraction path for bounded windows and final retained outputs.
 Pass repeated `--source HOST=PATH` values when remote evidence has been materialized locally. `PATH` may be a Codex home containing `sessions/` or a task-scoped directory containing copied `rollout-*.jsonl` files.
 `scan-daily --state` reads the last completed scan but does not advance it. Run `advance-state` only for the same daily run dir and retained export after `validate-output`, `export-retained`, and `validate-retained` pass and the retained export has been committed to private history; pass the resulting 40-character history commit SHA with `--history-commit`.
 Do not run `scan-*`, `discover`, or `make-shards` output directly into a tracked repository path unless that path ignores `.codex-local/`; those commands write transient execution artifacts. `export-retained` is the safe path for materializing files that may be copied into or written inside the private history worktree.
