@@ -145,7 +145,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 [
                     message(
                         "user",
-                        "Fix failed deploy password=hunter2 Bearer abc.def.ghi /Users/hoteng/customer/repo customer_id=AcmeCorp",
+                        "Fix failed deploy password=hunter2 Bearer abc.def.ghi /Users/hoteng/customer/repo /root/workspace/customer/repo customer_id=AcmeCorp",
                         "2026-05-22T10:01:00Z",
                     )
                 ],
@@ -159,6 +159,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("hunter2", summary)
         self.assertNotIn("Bearer", summary)
         self.assertNotIn("/Users/hoteng", summary)
+        self.assertNotIn("/root/workspace", summary)
         self.assertNotIn("AcmeCorp", summary)
 
     def test_non_sensitive_flagged_prompt_keeps_opaque_topic_ref(self) -> None:
@@ -530,9 +531,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     ]
                 )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            state_after_scan = json.loads(state.read_text(encoding="utf-8"))
 
         self.assertEqual(trend["turn_count"], 1)
         self.assertEqual(trend["window"]["start"], "2026-05-21T10:00:00Z")
+        self.assertEqual(state_after_scan["last_scan_at"], "2026-05-21T10:00:00Z")
 
     def test_daily_existing_state_revisits_active_thread_context_without_duplicate_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -575,10 +578,12 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            state_after_scan = json.loads(state.read_text(encoding="utf-8"))
 
         self.assertEqual(len(rows), 1)
         self.assertIn("failed_command", rows[0]["issue_flags"])
         self.assertEqual(trend["window"]["start"], "2026-05-21T10:00:00Z")
+        self.assertEqual(state_after_scan["last_scan_at"], "2026-05-21T10:00:00Z")
 
     def test_make_shards_respects_window_and_reports_oversized(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -796,7 +801,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         ]
                     )
 
-    def test_window_outside_oversized_rollout_does_not_block_daily_state(self) -> None:
+    def test_advance_state_after_valid_scan_ignores_window_external_oversized_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
@@ -814,7 +819,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
+            self.assertFalse(state.exists())
+            MODULE.main(["advance-state", "--run-dir", str(output), "--state", str(state)])
+
             self.assertTrue(state.exists())
+            self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["last_scan_at"], "2026-05-02T00:00:00Z")
             self.assertEqual(trend["coverage_gaps"], [])
 
     def test_old_oversized_rollout_with_in_window_tail_blocks_state(self) -> None:
@@ -840,6 +849,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            with self.assertRaisesRegex(SystemExit, "coverage gaps"):
+                MODULE.main(["advance-state", "--run-dir", str(output), "--state", str(state)])
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
@@ -1089,6 +1100,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
+            self.assertFalse(state.exists())
+            MODULE.main(["advance-state", "--run-dir", str(output), "--state", str(state)])
+
             self.assertTrue(state.exists())
             self.assertEqual(trend["coverage_gaps"], [])
 
@@ -1272,9 +1286,12 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
-            state_exists = state.exists()
+            state_exists_after_scan = state.exists()
+            MODULE.main(["advance-state", "--run-dir", str(output), "--state", str(state)])
+            state_exists_after_advance = state.exists()
 
-        self.assertTrue(state_exists)
+        self.assertFalse(state_exists_after_scan)
+        self.assertTrue(state_exists_after_advance)
         self.assertEqual(trend["coverage_gaps"], [])
 
     def test_old_summary_without_timestamp_outside_window_is_not_current_flag(self) -> None:

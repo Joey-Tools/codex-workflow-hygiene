@@ -43,6 +43,7 @@ The workflow is read-only against Codex history and remote hosts. It produces re
 - Commit only redacted reports, episode summaries, turn flags, trend JSON, retained manifests, and schemas to the private history repository.
 - Treat `shard_manifest.json` and `shards.jsonl` as transient execution worklists only. They may contain raw local paths and must not be committed.
 - Do not commit raw rollout files, full prompts, source snippets, internal URLs, secrets, or unredacted tool output.
+- Advance incremental scan state only after retained output validation passes and the private history commit succeeds.
 - AGENTS/skill suggestions are recommendations only; this workflow does not directly edit rules, skills, Apple Notes, or Daily Work Report.
 
 ## Helper
@@ -56,10 +57,12 @@ python3 scripts/session_retrospective.py scan-daily --state .codex-local/session
 python3 scripts/session_retrospective.py scan-weekly --days 7 --output .codex-local/session-retrospective/runs/20260522/weekly
 python3 scripts/session_retrospective.py baseline --window-days 90 --from first --output .codex-local/session-retrospective/runs/20260522/baseline
 python3 scripts/session_retrospective.py validate-output --run-dir .codex-local/session-retrospective/runs/20260522/weekly
+python3 scripts/session_retrospective.py advance-state --run-dir .codex-local/session-retrospective/runs/20260522/daily --state .codex-local/session-retrospective/state.json
 ```
 
 Use `discover` before map-reduce shard work. `scan-*` remains the compact local extraction path for bounded windows and final retained outputs.
 Pass repeated `--source HOST=PATH` values when remote evidence has been materialized locally. `PATH` may be a Codex home containing `sessions/` or a task-scoped directory containing copied `rollout-*.jsonl` files.
+`scan-daily --state` reads the last completed scan but does not advance it. Run `advance-state` only after `validate-output` passes and the retained artifacts have been committed to private history.
 Do not run the helper output directly into a tracked repository path unless that path ignores `.codex-local/`; the transient `shard_manifest.json` and `shards.jsonl` are execution artifacts, not history artifacts.
 
 ## Output Contract

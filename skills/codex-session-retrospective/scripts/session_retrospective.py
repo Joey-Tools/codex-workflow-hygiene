@@ -55,7 +55,7 @@ SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"https?://[^\s)>\]\"']+"), "[REDACTED_URL]"),
     (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[REDACTED_EMAIL]"),
     (
-        re.compile(r"(?<!\w)(?:~|/(?:Users|home|private|tmp|var|etc|opt|Volumes|workspace|workspaces))/[^\s,;:)>\]\"']+"),
+        re.compile(r"(?<!\w)(?:~|/(?:Users|home|root|private|tmp|var|etc|opt|Volumes|workspace|workspaces))/[^\s,;:)>\]\"']+"),
         "[REDACTED_PATH]",
     ),
     (
@@ -1009,7 +1009,7 @@ def run_scan(
 ) -> int:
     output = Path(args.output)
     ensure_safe_output_dir(output)
-    state_path = safe_state_path(args.state)
+    safe_state_path(args.state)
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
     all_turns: list[TurnSummary] = []
     manifest_sources: list[dict[str, Any]] = []
@@ -1127,11 +1127,6 @@ def run_scan(
     }
     write_json(output / "shard_manifest.json", transient_manifest)
     write_json(output / "retained_manifest.json", retained_manifest_from_transient(transient_manifest))
-    if state_path and not coverage_gaps:
-        state = load_state(state_path)
-        state["last_scan_at"] = iso(end)
-        state["last_mode"] = mode
-        save_state(state_path, state)
     print(output)
     return 0
 
@@ -1315,8 +1310,7 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_validate_output(args: argparse.Namespace) -> int:
-    run_dir = Path(args.run_dir)
+def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     required = {
         "turn_summaries.jsonl": {"turn_id", "episode_id", "host", "redacted_user_prompt_summary", "issue_flags"},
         "episodes.jsonl": {"episode_id", "host", "topic", "friction_flags"},
@@ -1336,9 +1330,38 @@ def cmd_validate_output(args: argparse.Namespace) -> int:
                 raise SystemExit(f"{path}:{line_no}: missing keys {sorted(missing)}")
             if contains_unredacted_sensitive_text(obj):
                 raise SystemExit(f"{path}:{line_no}: unredacted sensitive text in retained output")
-    json.loads((run_dir / "trend_report.json").read_text(encoding="utf-8"))
+    trend = json.loads((run_dir / "trend_report.json").read_text(encoding="utf-8"))
     validate_retained_manifest(run_dir / "retained_manifest.json")
+    retained_manifest = json.loads((run_dir / "retained_manifest.json").read_text(encoding="utf-8"))
+    return trend, retained_manifest
+
+
+def cmd_validate_output(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir)
+    validate_output_run(run_dir)
     print(f"validated: {run_dir}")
+    return 0
+
+
+def cmd_advance_state(args: argparse.Namespace) -> int:
+    state_path = safe_state_path(args.state)
+    if state_path is None:
+        raise SystemExit("--state is required")
+    run_dir = Path(args.run_dir)
+    trend, retained_manifest = validate_output_run(run_dir)
+    coverage_gaps = list(trend.get("coverage_gaps") or []) + list(retained_manifest.get("coverage_gaps") or [])
+    if coverage_gaps:
+        raise SystemExit("refusing to advance state while coverage gaps are present")
+    window = trend.get("window") or {}
+    last_scan_at = window.get("end")
+    last_mode = window.get("mode")
+    if not isinstance(last_scan_at, str) or not isinstance(last_mode, str):
+        raise SystemExit("trend_report.json window must include mode and end")
+    state = load_state(state_path)
+    state["last_scan_at"] = last_scan_at
+    state["last_mode"] = last_mode
+    save_state(state_path, state)
+    print(f"advanced: {state_path}")
     return 0
 
 
@@ -1386,6 +1409,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate-output")
     validate.add_argument("--run-dir", required=True)
     validate.set_defaults(func=cmd_validate_output)
+
+    advance = subparsers.add_parser("advance-state")
+    advance.add_argument("--run-dir", required=True)
+    advance.add_argument("--state", required=True)
+    advance.set_defaults(func=cmd_advance_state)
 
     validate_manifest = subparsers.add_parser("validate-manifest")
     validate_manifest.add_argument("--manifest", required=True)
