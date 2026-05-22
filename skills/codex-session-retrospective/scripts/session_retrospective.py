@@ -57,6 +57,7 @@ SAFETY_PATTERN = re.compile(
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 DEFAULT_REMOTE_SOURCE_ROOT = Path(".codex-local/session-retrospective/remote-sources")
 LOCAL_EVIDENCE_FILES = ("session_index.jsonl", "history.jsonl")
+SAFE_OUTPUT_PARTS = (".codex-local", "session-retrospective")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -197,6 +198,14 @@ def file_hash(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def ensure_safe_output_dir(path: Path) -> None:
+    parts = path.expanduser().parts
+    for index in range(len(parts) - len(SAFE_OUTPUT_PARTS) + 1):
+        if parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS:
+            return
+    raise SystemExit("output directory for transient artifacts must be under .codex-local/session-retrospective")
 
 
 def session_id_from_path(path: Path) -> str:
@@ -648,7 +657,9 @@ def retained_manifest_from_transient(manifest: dict[str, Any]) -> dict[str, Any]
     for gap in manifest.get("coverage_gaps", []):
         retained_gap: dict[str, Any] = {}
         for key, value in gap.items():
-            if key in {"root", "path"}:
+            if key == "path" or key == "path_ref":
+                continue
+            if key == "root":
                 ref_key, ref_value = redacted_path_entry(key, value)
                 retained_gap[ref_key] = ref_value
                 continue
@@ -679,12 +690,27 @@ def contains_raw_path_fields(value: Any) -> bool:
     return False
 
 
+def contains_path_like_text(value: Any) -> bool:
+    if isinstance(value, str):
+        return "/" in value or "\\" in value or "://" in value
+    if isinstance(value, dict):
+        return any(contains_path_like_text(child) for child in value.values())
+    if isinstance(value, list):
+        return any(contains_path_like_text(child) for child in value)
+    return False
+
+
 def validate_retained_manifest(path: Path) -> None:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if manifest.get("retention_safe") is not True:
         raise SystemExit(f"{path}: retention_safe must be true")
     if contains_raw_path_fields(manifest):
         raise SystemExit(f"{path}: raw root/path fields are not retention-safe")
+    if contains_path_like_text(manifest):
+        raise SystemExit(f"{path}: path-like free text is not retention-safe")
+    for gap in manifest.get("coverage_gaps", []):
+        if isinstance(gap, dict) and "path_ref" in gap:
+            raise SystemExit(f"{path}: per-shard path refs are not retention-safe")
 
 
 def parse_sources(values: list[str] | None, *, require_default_hosts: bool = True) -> list[Source]:
@@ -756,6 +782,7 @@ def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
 
 def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
     output = Path(args.output)
+    ensure_safe_output_dir(output)
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
     all_turns: list[TurnSummary] = []
     manifest_sources: list[dict[str, Any]] = []
@@ -797,9 +824,9 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
         )
         for rollout in rollouts:
             size = rollout.stat().st_size
+            if not oversized_rollout_relevant(rollout, start, end):
+                continue
             if size > max_raw_bytes:
-                if not oversized_rollout_relevant(rollout, start, end):
-                    continue
                 coverage_gaps.append(
                     {
                         "host": source.host,
@@ -864,6 +891,7 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
 
 def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
     output = Path(args.output)
+    ensure_safe_output_dir(output)
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
     manifest_sources: list[dict[str, Any]] = []
     coverage_gaps: list[dict[str, Any]] = []
@@ -954,7 +982,7 @@ def bounded_baseline_end(start: dt.datetime, window_days: int, now: dt.datetime)
 
 def cmd_baseline(args: argparse.Namespace) -> int:
     now = utc_now()
-    sources = parse_sources(args.source)
+    sources = parse_sources(args.source, require_default_hosts=not args.allow_partial_hosts)
     if args.from_value == "first":
         start = earliest_rollout_date(sources) or (now - dt.timedelta(days=args.window_days))
     else:
@@ -967,7 +995,10 @@ def cmd_baseline(args: argparse.Namespace) -> int:
 
 def cmd_make_shards(args: argparse.Namespace) -> int:
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    if manifest.get("retention_safe") is True:
+        raise SystemExit("make-shards requires transient shard_manifest.json, not retained_manifest.json")
     output = Path(args.output)
+    ensure_safe_output_dir(output)
     sources = manifest.get("sources", [])
     window = manifest.get("window") or {}
     start = parse_time(window.get("start"))
@@ -975,7 +1006,9 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     rows: list[dict[str, Any]] = []
     for source in sources:
         host = source.get("host")
-        root = Path(source.get("root", "")).expanduser()
+        if not source.get("root"):
+            raise SystemExit("make-shards requires transient manifest sources with raw root fields")
+        root = Path(source["root"]).expanduser()
         if not root.exists():
             rows.append({"host": host, "path": root.as_posix(), "path_ref": path_ref(root), "status": "missing", "coverage_gap": "source root missing"})
             continue
@@ -989,11 +1022,24 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"
                 rows.append(row)
                 continue
+            if not rollout_filename_in_window(rollout, start, end) and not rollout_has_record_in_window(rollout, start, end):
+                continue
+            if first_jsonl_error(rollout) is not None:
+                row["status"] = "invalid"
+                row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"
+                rows.append(row)
+                continue
             if rollout_has_record_in_window(rollout, start, end):
                 row["status"] = "ready"
                 rows.append(row)
     write_jsonl(output / "shards.jsonl", rows)
     print(output / "shards.jsonl")
+    return 0
+
+
+def cmd_validate_manifest(args: argparse.Namespace) -> int:
+    validate_retained_manifest(Path(args.manifest))
+    print(f"validated: {args.manifest}")
     return 0
 
 
@@ -1066,6 +1112,10 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate-output")
     validate.add_argument("--run-dir", required=True)
     validate.set_defaults(func=cmd_validate_output)
+
+    validate_manifest = subparsers.add_parser("validate-manifest")
+    validate_manifest.add_argument("--manifest", required=True)
+    validate_manifest.set_defaults(func=cmd_validate_manifest)
     return parser
 
 
