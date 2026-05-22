@@ -668,6 +668,18 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotEqual(turns[0].turn_id, raw_turn_hash)
         self.assertNotEqual(episodes[0]["episode_id"], raw_episode_hash)
 
+    def test_retained_source_hash_does_not_use_plain_file_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Please summarize this session.", "2026-05-22T10:00:00Z")])
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+            plain_hash = MODULE.file_hash(rollout)
+
+        self.assertRegex(turns[0].source_hash, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(turns[0].source_hash, plain_hash)
+
     def test_wrapper_user_message_does_not_flag_previous_turn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1142,7 +1154,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "sources": [{"host": "local", "root": str(root)}],
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
                         "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
                     }
                 ),
@@ -1181,7 +1193,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "sources": [{"host": "local", "root": str(root)}],
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
                         "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
                     }
                 ),
@@ -1208,7 +1220,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "sources": [{"host": "local", "root": str(root)}],
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
                         "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
                     }
                 ),
@@ -1247,7 +1259,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
 
-    def test_make_shards_rejects_invalid_manifest_window(self) -> None:
+    def test_make_shards_rejects_missing_manifest_source_status(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
@@ -1256,6 +1268,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 json.dumps(
                     {
                         "sources": [{"host": "local", "root": str(root)}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            with self.assertRaisesRegex(SystemExit, "status=ready"):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+
+    def test_make_shards_rejects_invalid_manifest_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
                         "window": {"start": "not-a-date", "end": "2026-06-01T00:00:00Z"},
                     }
                 ),
@@ -1278,7 +1309,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "sources": [{"host": "local", "root": str(root)}],
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
                         "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
                     }
                 ),
@@ -1303,7 +1334,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "sources": [{"host": "local", "root": str(root)}],
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
                         "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
                     }
                 ),
@@ -1326,7 +1357,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "sources": [{"host": "local", "root": str(root)}],
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
                         "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
                     }
                 ),
@@ -1355,7 +1386,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "sources": [{"host": "local", "root": str(root)}],
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
                         "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
                     }
                 ),
@@ -1384,7 +1415,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "sources": [{"host": "local", "root": str(root)}],
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
                         "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
                     }
                 ),
@@ -2083,6 +2114,55 @@ class SessionRetrospectiveTests(unittest.TestCase):
             extra.write_text("{}\n", encoding="utf-8")
             subprocess.run(["git", "add", "retained/daily/raw-copy.jsonl"], cwd=history_repo, check=True)
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add extra retained file"], cwd=history_repo, check=True)
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            with self.assertRaisesRegex(SystemExit, "does not contain"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        commit,
+                    ]
+                )
+
+    def test_advance_state_rejects_history_commit_with_existing_nested_retained_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo = Path(raw) / "history-with-nested-retained"
+            history_repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-q"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=history_repo, check=True)
+            nested = history_repo / "retained" / "daily" / "raw" / "debug.txt"
+            nested.parent.mkdir(parents=True)
+            nested.write_text("debug artifact\n", encoding="utf-8")
+            subprocess.run(["git", "add", "retained/daily/raw/debug.txt"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add nested retained artifact"], cwd=history_repo, check=True)
+            retained_target = history_repo / "retained" / "daily"
+            for name in MODULE.RETAINED_OUTPUT_FILES:
+                (retained_target / name).write_bytes((retained / name).read_bytes())
+            subprocess.run(["git", "add", *[f"retained/daily/{name}" for name in MODULE.RETAINED_OUTPUT_FILES]], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add retained export"], cwd=history_repo, check=True)
             commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
 
             with self.assertRaisesRegex(SystemExit, "does not contain"):

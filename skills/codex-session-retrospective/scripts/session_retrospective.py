@@ -415,6 +415,14 @@ def file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
+def file_source_hash(path: Path) -> str:
+    digest = hmac.new(path_ref_key(), b"source_hash_v1\0", hashlib.sha256)
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def ensure_safe_output_dir(path: Path) -> None:
     parts = path.expanduser().resolve(strict=False).parts
     for index in range(len(parts) - len(SAFE_OUTPUT_PARTS) + 1):
@@ -824,7 +832,7 @@ def extract_rollout(
     emit_start: dt.datetime | None = None,
 ) -> list[TurnSummary]:
     session_id = session_id_from_path(path)
-    source_hash = file_hash(path)
+    source_hash = file_source_hash(path)
     cwd: str | None = None
     model: str | None = None
     current: TurnSummary | None = None
@@ -958,7 +966,7 @@ def extract_summary_file(
     emit_start: dt.datetime | None = None,
 ) -> list[TurnSummary]:
     turns: list[TurnSummary] = []
-    source_hash = file_hash(path)
+    source_hash = file_source_hash(path)
     session_id = opaque_digest(path.as_posix(), 20)
     fallback = summary_date_from_path(path)
     for line_no, record in iter_jsonl(path):
@@ -1307,7 +1315,7 @@ def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
         raise SystemExit(f"{label}.source_path: retained refs must use opaque {PATH_REF_PREFIX} values")
     source_hash = require_string(row["source_hash"], label=f"{label}.source_hash")
     if not re.fullmatch(r"[0-9a-f]{64}", source_hash):
-        raise SystemExit(f"{label}.source_hash: expected sha256 hex digest")
+        raise SystemExit(f"{label}.source_hash: expected keyed hex digest")
     require_timestamp_or_none(row["timestamp"], label=f"{label}.timestamp")
     require_path_ref_or_none(row["cwd"], label=f"{label}.cwd")
     require_optional_string(row["model"], label=f"{label}.model")
@@ -1558,10 +1566,12 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
     changed_files = history_commit_changed_files(repo, history_commit)
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
     parent_files: dict[str, set[str]] = defaultdict(set)
+    tree_files: set[str] = set()
     for raw_name in tree.stdout.split(b"\0"):
         if not raw_name:
             continue
         file_path = raw_name.decode("utf-8", errors="surrogateescape")
+        tree_files.add(file_path)
         if forbidden_history_artifact(file_path):
             raise SystemExit(f"--history-commit contains forbidden transient/raw artifact: {file_path}")
         parent, _, name = file_path.rpartition("/")
@@ -1573,6 +1583,13 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
         if set(paths) != set(RETAINED_OUTPUT_FILES):
             continue
         if parent_files[parent] != set(RETAINED_OUTPUT_FILES):
+            continue
+        allowed_paths = {f"{parent}/{name}" if parent else name for name in RETAINED_OUTPUT_FILES}
+        if parent:
+            descendant_paths = {file_path for file_path in tree_files if file_path.startswith(f"{parent}/")}
+        else:
+            descendant_paths = {file_path for file_path in tree_files if "/" not in file_path}
+        if descendant_paths != allowed_paths:
             continue
         candidate: dict[str, bytes] = {}
         for name, file_path in paths.items():
@@ -2020,7 +2037,10 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         if not source.get("root"):
             raise SystemExit("make-shards requires transient manifest sources with raw root fields")
         root = Path(source["root"]).expanduser()
-        if source.get("status") not in (None, "ready"):
+        status = source.get("status")
+        if status is None:
+            raise SystemExit("make-shards requires transient manifest sources with status=ready")
+        if status != "ready":
             continue
         if not root.exists():
             rows.append({"host": host, "path": root.as_posix(), "path_ref": path_ref(root), "status": "missing", "coverage_gap": "source root missing"})
