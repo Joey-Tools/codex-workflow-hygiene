@@ -80,7 +80,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 [
                     message("user", "Please implement the helper.", "2026-05-22T10:01:00Z"),
                     message("assistant", "Implemented the helper.", "2026-05-22T10:02:00Z"),
-                    message("user", "Also add tests.", "2026-05-22T10:03:00Z"),
+                    message("user", "Also update helper.", "2026-05-22T10:03:00Z"),
                 ],
             )
 
@@ -91,6 +91,62 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(turns[0].episode_id, turns[1].episode_id)
         self.assertEqual(len(episodes), 1)
         self.assertEqual(episodes[0]["turn_count"], 2)
+
+    def test_episode_splits_by_day_and_prompt_category(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-abc.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the helper.", "2026-05-22T10:01:00Z"),
+                    message("user", "Please plan the rollout.", "2026-05-22T10:03:00Z"),
+                    message("user", "Please implement the helper.", "2026-05-23T10:01:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+            episodes = MODULE.episode_records(turns)
+
+        self.assertEqual(len(turns), 3)
+        self.assertEqual(len(episodes), 3)
+
+    def test_assistant_summary_does_not_persist_response_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-abc.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the helper.", "2026-05-22T10:01:00Z"),
+                    message("assistant", "Implemented secret project path /internal/customer/code.py and ran unittest.", "2026-05-22T10:02:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+        self.assertIn("implementation", turns[0].assistant_action_summary)
+        self.assertIn("verification", turns[0].assistant_action_summary)
+        self.assertNotIn("customer", turns[0].assistant_action_summary)
+        self.assertNotIn("code.py", turns[0].assistant_action_summary)
+
+    def test_wrapper_user_message_does_not_flag_previous_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-abc.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the helper.", "2026-05-22T10:01:00Z"),
+                    message("user", "# AGENTS.md instructions\napproval sandbox error", "2026-05-22T10:02:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].issue_flags, [])
 
     def test_scan_does_not_skip_old_rollout_with_new_turn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -153,12 +209,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             old = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-old.jsonl"
             large = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-large.jsonl"
             write_jsonl(old, [message("user", "Old task.", "2026-01-01T10:00:00Z")])
-            write_jsonl(
-                large,
-                [
-                    message("user", "New task with a long body." + ("x" * 200), "2026-05-22T10:00:00Z"),
-                ],
-            )
+            large.parent.mkdir(parents=True, exist_ok=True)
+            large.write_text("not-json-but-oversized " + ("x" * 2000), encoding="utf-8")
             manifest = Path(raw) / "manifest.json"
             manifest.write_text(
                 json.dumps(
@@ -178,7 +230,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     "--output",
                     str(output),
                     "--max-raw-bytes",
-                    "80",
+                    "1000",
                 ]
             )
             rows = [
@@ -189,6 +241,52 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "oversized")
         self.assertIn("coverage_gap", rows[0])
+
+    def test_missing_source_reports_gap_and_does_not_update_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            missing = Path(raw) / "missing"
+            output = Path(raw) / "out"
+            state = Path(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={missing}"], output=str(output), state=str(state), max_raw_bytes=100),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "source_root_missing")
+
+    def test_rollout_summary_file_contributes_flags_without_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {"kind": "session_meta", "timestamp": "2026-05-22T10:00:00Z", "text": "session_id=s1 cwd=/secret/repo"},
+                    {"kind": "function_call_output", "timestamp": "2026-05-22T10:01:00Z", "text": "permission denied in /customer/code.py"},
+                ],
+            )
+            output = Path(raw) / "out"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-06-01T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["redacted_user_prompt_summary"], "category=remote_rollout_summary; summary_kind=function_call_output")
+        self.assertIn("approval_auth_friction", rows[0]["issue_flags"])
+        self.assertNotIn("customer", json.dumps(rows[0]))
 
     def test_episode_and_trend_outputs_are_schema_shaped(self) -> None:
         turn = MODULE.TurnSummary(

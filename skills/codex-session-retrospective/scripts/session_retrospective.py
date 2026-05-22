@@ -111,14 +111,14 @@ def redact(text: str) -> tuple[str, bool]:
     return redacted, changed
 
 
-def safe_prompt_summary(text: str, issue_flags: set[str], redacted_changed: bool) -> str:
+def prompt_category(text: str) -> str:
     categories: list[str] = []
     lowered = text.lower()
     if any(word in lowered for word in ("review", "pr", "pull request")):
         categories.append("review")
     if any(word in lowered for word in ("fix", "bug", "error", "failed", "failure")):
         categories.append("debug_or_fix")
-    if any(word in lowered for word in ("implement", "add", "create", "build")):
+    if any(word in lowered for word in ("implement", "add", "create", "build", "update")):
         categories.append("implementation")
     if any(word in lowered for word in ("plan", "design", "怎么", "设计")):
         categories.append("planning")
@@ -126,8 +126,12 @@ def safe_prompt_summary(text: str, issue_flags: set[str], redacted_changed: bool
         categories.append("verification")
     if not categories:
         categories.append("general")
+    return "+".join(sorted(set(categories)))
+
+
+def safe_prompt_summary(text: str, issue_flags: set[str], redacted_changed: bool) -> str:
     parts = [
-        f"category={'+'.join(sorted(set(categories)))}",
+        f"category={prompt_category(text)}",
         f"prompt_chars={len(text)}",
     ]
     if issue_flags:
@@ -135,6 +139,26 @@ def safe_prompt_summary(text: str, issue_flags: set[str], redacted_changed: bool
     if redacted_changed:
         parts.append("redactions=applied")
     return "; ".join(parts)
+
+
+def safe_assistant_summary(texts: list[str]) -> str:
+    if not texts:
+        return ""
+    categories: list[str] = []
+    joined = "\n".join(texts).lower()
+    if any(word in joined for word in ("test", "pytest", "unittest", "validated", "verification")):
+        categories.append("verification")
+    if any(word in joined for word in ("implement", "add", "create", "update", "patch", "edit")):
+        categories.append("implementation")
+    if any(word in joined for word in ("commit", "push", "pr", "pull request")):
+        categories.append("git_or_pr")
+    if any(word in joined for word in ("blocked", "cannot", "unable", "failed", "error")):
+        categories.append("blocked_or_failed")
+    if any(word in joined for word in ("read", "search", "inspect", "rg ", "grep")):
+        categories.append("inspection")
+    if not categories:
+        categories.append("response")
+    return f"assistant_messages={len(texts)}; action_categories={','.join(sorted(set(categories)))}"
 
 
 def stable_hash(value: str, length: int = 16) -> str:
@@ -217,6 +241,12 @@ def source_rollouts(source: Source) -> list[Path]:
     return sorted(path for path in search_root.rglob("rollout-*.jsonl") if path.is_file())
 
 
+def source_summary_files(source: Source) -> list[Path]:
+    if not source.root.exists():
+        return []
+    return sorted(path for path in source.root.rglob("rollout-summary*.jsonl") if path.is_file())
+
+
 def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
     if start is None and end is None:
         return True
@@ -262,7 +292,7 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
     def flush_assistant() -> None:
         nonlocal assistant_bits
         if current and assistant_bits:
-            current.assistant_action_summary = compact(" ".join(assistant_bits), 500)
+            current.assistant_action_summary = safe_assistant_summary(assistant_bits)
             assistant_bits = []
 
     for line_no, record in iter_jsonl(path):
@@ -277,19 +307,18 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
         if parsed_timestamp and end and parsed_timestamp >= end:
             continue
 
-        text = record_text(record)
-        redacted_text, changed = redact(text)
-        record_flags = flags_for_text(text, redacted_changed=changed)
-
         if isinstance(payload, dict) and payload.get("type") == "message":
             role = payload.get("role")
             message_text = text_from_message_payload(payload)
+            if role == "user" and not meaningful_user_text(message_text):
+                continue
             if role == "user" and meaningful_user_text(message_text):
                 flush_assistant()
                 _redacted_prompt, prompt_changed = redact(message_text)
                 prompt_flags = flags_for_text(message_text, redacted_changed=prompt_changed)
                 prompt_summary = safe_prompt_summary(message_text, prompt_flags, prompt_changed)
-                episode_seed = "|".join([source.host, session_id, (cwd or "")])
+                date_bucket = (parse_time(timestamp) or rollout_date_from_path(path) or utc_now()).date().isoformat()
+                episode_seed = "|".join([source.host, session_id, (cwd or ""), date_bucket, prompt_category(message_text)])
                 episode_id = stable_hash(episode_seed, 20)
                 turn = TurnSummary(
                     turn_id=stable_hash(f"{source.host}|{path}|{line_no}|{timestamp}", 20),
@@ -313,8 +342,11 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
                 current = turn
                 continue
             if role == "assistant" and current and message_text:
-                assistant_bits.append(redacted_text)
+                assistant_bits.append(message_text)
 
+        text = record_text(record)
+        _redacted_text, changed = redact(text)
+        record_flags = flags_for_text(text, redacted_changed=changed)
         if current and record_flags:
             merged = set(current.issue_flags)
             merged.update(record_flags)
@@ -323,6 +355,50 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
                 current.prompt_improvement = "Ask Codex to report the exact verification run and stop if it cannot complete the requested check."
 
     flush_assistant()
+    return turns
+
+
+def extract_summary_file(source: Source, path: Path, start: dt.datetime | None, end: dt.datetime | None) -> list[TurnSummary]:
+    turns: list[TurnSummary] = []
+    source_hash = file_hash(path)
+    session_id = stable_hash(path.as_posix(), 20)
+    for line_no, record in iter_jsonl(path):
+        timestamp = str(record.get("timestamp") or "") or None
+        parsed_timestamp = parse_time(timestamp)
+        if parsed_timestamp and start and parsed_timestamp < start:
+            continue
+        if parsed_timestamp and end and parsed_timestamp >= end:
+            continue
+        text = str(record.get("text") or "")
+        kind = str(record.get("kind") or "summary")
+        if kind == "session_meta" and text:
+            match = re.search(r"session_id=([^\s]+)", text)
+            if match:
+                session_id = match.group(1)
+            continue
+        flags = flags_for_text(text, redacted_changed=False)
+        if not flags:
+            continue
+        date_bucket = (parsed_timestamp or utc_now()).date().isoformat()
+        episode_id = stable_hash("|".join([source.host, session_id, "rollout-summary", date_bucket, kind]), 20)
+        turns.append(
+            TurnSummary(
+                turn_id=stable_hash(f"{source.host}|{path}|{line_no}|{timestamp}", 20),
+                episode_id=episode_id,
+                host=source.host,
+                session_id=session_id,
+                source_path=path.as_posix(),
+                source_hash=source_hash,
+                timestamp=timestamp,
+                cwd=None,
+                model=None,
+                model_era=infer_model_era(None, timestamp),
+                redacted_user_prompt_summary=f"category=remote_rollout_summary; summary_kind={kind}",
+                assistant_action_summary="summary_source=remote_rollout_summary",
+                issue_flags=sorted(flags),
+                prompt_improvement=None,
+            )
+        )
     return turns
 
 
@@ -356,7 +432,12 @@ def episode_records(turns: list[TurnSummary]) -> list[dict[str, Any]]:
     return episodes
 
 
-def trend_report(turns: list[TurnSummary], episodes: list[dict[str, Any]], window: dict[str, Any]) -> dict[str, Any]:
+def trend_report(
+    turns: list[TurnSummary],
+    episodes: list[dict[str, Any]],
+    window: dict[str, Any],
+    coverage_gaps: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     flags = Counter(flag for turn in turns for flag in turn.issue_flags)
     hosts = Counter(turn.host for turn in turns)
     eras = Counter(turn.model_era for turn in turns)
@@ -369,6 +450,7 @@ def trend_report(turns: list[TurnSummary], episodes: list[dict[str, Any]], windo
         "flags": dict(sorted(flags.items())),
         "hosts": dict(sorted(hosts.items())),
         "model_eras": dict(sorted(eras.items())),
+        "coverage_gaps": coverage_gaps or [],
     }
 
 
@@ -428,17 +510,41 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
     sources = parse_sources(args.source)
     all_turns: list[TurnSummary] = []
     manifest_sources: list[dict[str, Any]] = []
+    coverage_gaps: list[dict[str, Any]] = []
+    max_raw_bytes = getattr(args, "max_raw_bytes", 512_000)
     for source in sources:
+        if not source.root.exists():
+            coverage_gaps.append({"host": source.host, "root": source.root.as_posix(), "reason": "source_root_missing"})
+            manifest_sources.append({"host": source.host, "root": source.root.as_posix(), "rollout_count": 0, "status": "missing"})
+            continue
         rollouts = source_rollouts(source)
+        summaries = source_summary_files(source)
+        if not rollouts and not summaries:
+            coverage_gaps.append({"host": source.host, "root": source.root.as_posix(), "reason": "no_rollout_or_summary_files"})
         manifest_sources.append(
             {
                 "host": source.host,
                 "root": source.root.as_posix(),
                 "rollout_count": len(rollouts),
+                "summary_count": len(summaries),
+                "status": "ready" if rollouts or summaries else "empty",
             }
         )
         for rollout in rollouts:
+            size = rollout.stat().st_size
+            if size > max_raw_bytes:
+                coverage_gaps.append(
+                    {
+                        "host": source.host,
+                        "path": rollout.as_posix(),
+                        "bytes": size,
+                        "reason": "oversized_rollout_skipped",
+                    }
+                )
+                continue
             all_turns.extend(extract_rollout(source, rollout, start, end))
+        for summary in summaries:
+            all_turns.extend(extract_summary_file(source, summary, start, end))
 
     episodes = episode_records(all_turns)
     window = {
@@ -449,7 +555,7 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
     write_jsonl(output / "turn_summaries.jsonl", (asdict_turn(turn) for turn in all_turns))
     write_jsonl(output / "turn_flags.jsonl", (asdict_turn(turn) for turn in all_turns if turn.issue_flags))
     write_jsonl(output / "episodes.jsonl", episodes)
-    write_json(output / "trend_report.json", trend_report(all_turns, episodes, window))
+    write_json(output / "trend_report.json", trend_report(all_turns, episodes, window, coverage_gaps))
     write_json(
         output / "shard_manifest.json",
         {
@@ -457,10 +563,11 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
             "mode": mode,
             "window": window,
             "sources": manifest_sources,
+            "coverage_gaps": coverage_gaps,
             "redaction_policy_version": 1,
         },
     )
-    if args.state:
+    if args.state and not coverage_gaps:
         state = load_state(Path(args.state))
         state["last_scan_at"] = iso(end)
         state["last_mode"] = mode
@@ -508,17 +615,23 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     for source in sources:
         host = source.get("host")
         root = Path(source.get("root", "")).expanduser()
+        if not root.exists():
+            rows.append({"host": host, "path": root.as_posix(), "status": "missing", "coverage_gap": "source root missing"})
+            continue
         for rollout in source_rollouts(Source(str(host), root)):
-            if not rollout_has_record_in_window(rollout, start, end):
-                continue
             size = rollout.stat().st_size
             row = {"host": host, "path": rollout.as_posix(), "bytes": size}
-            if size <= args.max_raw_bytes:
-                row["status"] = "ready"
-            else:
+            if size > args.max_raw_bytes:
+                rollout_date = rollout_date_from_path(rollout)
+                if rollout_date and end and rollout_date >= end:
+                    continue
                 row["status"] = "oversized"
                 row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"
-            rows.append(row)
+                rows.append(row)
+                continue
+            if rollout_has_record_in_window(rollout, start, end):
+                row["status"] = "ready"
+                rows.append(row)
     write_jsonl(output / "shards.jsonl", rows)
     print(output / "shards.jsonl")
     return 0
@@ -549,6 +662,7 @@ def add_common_scan_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source", action="append", help="Source in HOST=PATH form. Defaults to local=~/.codex.")
     parser.add_argument("--state", help="State JSON path for incremental runs.")
     parser.add_argument("--output", required=True, help="Output directory for retrospective artifacts.")
+    parser.add_argument("--max-raw-bytes", type=int, default=512_000, help="Skip raw extraction for larger rollout files and report a coverage gap.")
 
 
 def build_parser() -> argparse.ArgumentParser:
