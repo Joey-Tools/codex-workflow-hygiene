@@ -2994,6 +2994,37 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertIn("safety_privacy_flag", rows[0]["issue_flags"])
 
+    def test_unsafe_model_id_is_bucketed_for_retained_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            row = message("user", "Permission denied while running helper.", "2026-05-01T10:00:00Z")
+            row["payload"]["model"] = "openai/gpt-6 preview"
+            write_jsonl(rollout, [row])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            MODULE.main(["validate-output", "--run-dir", str(output)])
+            retained = export_retained(output, raw)
+            turns = [
+                json.loads(line)
+                for line in (retained / "turn_flags.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            episodes = [
+                json.loads(line)
+                for line in (retained / "episodes.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(turns[0]["model"], None)
+        self.assertEqual(turns[0]["model_era"], "other-model")
+        self.assertEqual(episodes[0]["model_era"], "other-model")
+
     def test_episode_and_trend_outputs_are_schema_shaped(self) -> None:
         turn = MODULE.TurnSummary(
             turn_id="t1",

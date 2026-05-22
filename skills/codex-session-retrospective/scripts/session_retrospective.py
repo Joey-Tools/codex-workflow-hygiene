@@ -775,11 +775,22 @@ def infer_model_era(model: str | None, timestamp: str | None) -> str:
             return "gpt-5.4"
         if "gpt-5.3" in model:
             return "gpt-5.3-codex"
-        return model
+        return "other-model"
     parsed = parse_time(timestamp)
     if parsed and parsed.date() < dt.date(2026, 1, 1):
         return "pre-gpt-5.3-codex"
     return "unknown"
+
+
+def retained_model_id(model: str | None) -> str | None:
+    if not model:
+        return None
+    era = infer_model_era(model, None)
+    if era != "other-model":
+        return era
+    if safe_token(model):
+        return model
+    return None
 
 
 def extract_rollout(
@@ -883,7 +894,7 @@ def extract_rollout(
                     source_hash=source_hash,
                     timestamp=timestamp,
                     cwd=path_ref(cwd),
-                    model=model,
+                    model=retained_model_id(model),
                     model_era=infer_model_era(model, timestamp),
                     redacted_user_prompt_summary=prompt_summary,
                     assistant_action_summary="",
