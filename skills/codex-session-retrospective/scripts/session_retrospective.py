@@ -105,6 +105,8 @@ PATH_REF_KEY: bytes | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
+HISTORY_FORBIDDEN_FILENAMES = frozenset((*TRANSIENT_OUTPUT_FILES, REMOTE_SOURCE_METADATA_FILE))
+HISTORY_FORBIDDEN_COMPONENTS = frozenset((".codex", ".codex-local"))
 EPISODE_FIELDS = {
     "episode_id",
     "host",
@@ -227,14 +229,13 @@ def compact(text: str, limit: int = 600) -> str:
 
 def redact(text: str) -> tuple[str, bool]:
     redacted = text
-    changed = False
+    sensitive_redacted = False
     for pattern, label in SECRET_PATTERNS:
         redacted, count = pattern.subn(label, redacted)
-        changed = changed or count > 0
+        sensitive_redacted = sensitive_redacted or count > 0
     if len(redacted) > 1200:
         redacted = redacted[:1200].rstrip() + " [TRUNCATED]"
-        changed = True
-    return redacted, changed
+    return redacted, sensitive_redacted
 
 
 def has_pr_intent(text: str) -> bool:
@@ -1489,6 +1490,16 @@ def safe_state_path(raw: str | None) -> Path | None:
     return path
 
 
+def forbidden_history_artifact(file_path: str) -> bool:
+    parts = file_path.split("/")
+    name = parts[-1]
+    if name in HISTORY_FORBIDDEN_FILENAMES:
+        return True
+    if any(part in HISTORY_FORBIDDEN_COMPONENTS for part in parts):
+        return True
+    return name.startswith("rollout") and name.endswith(".jsonl")
+
+
 def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> None:
     if not history_repo:
         raise SystemExit("--history-repo is required")
@@ -1517,6 +1528,8 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
         if not raw_name:
             continue
         file_path = raw_name.decode("utf-8", errors="surrogateescape")
+        if forbidden_history_artifact(file_path):
+            raise SystemExit(f"--history-commit contains forbidden transient/raw artifact: {file_path}")
         parent, _, name = file_path.rpartition("/")
         parent_files[parent].add(name)
         if name in RETAINED_OUTPUT_FILES:

@@ -1629,7 +1629,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=10000, allow_partial_hosts=True),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -1976,6 +1976,46 @@ class SessionRetrospectiveTests(unittest.TestCase):
             commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
 
             with self.assertRaisesRegex(SystemExit, "does not contain"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        commit,
+                    ]
+                )
+
+    def test_advance_state_rejects_history_commit_with_transient_file_elsewhere(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, _commit = write_history_repo(raw, retained)
+            transient = history_repo / "raw" / "turn_summaries.jsonl"
+            transient.parent.mkdir(parents=True)
+            transient.write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "raw/turn_summaries.jsonl"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add transient artifact"], cwd=history_repo, check=True)
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
                 MODULE.main(
                     [
                         "advance-state",
@@ -2982,7 +3022,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=10000, allow_partial_hosts=True),
                 mode="weekly",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -2993,6 +3033,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
             ]
 
         self.assertIn("safety_privacy_flag", rows[0]["issue_flags"])
+
+    def test_long_prompt_truncation_does_not_create_privacy_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            long_prompt = "Please summarize this ordinary planning note. " + ("alpha beta " * 160)
+            write_jsonl(rollout, [message("user", long_prompt, "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=10000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertNotIn("safety_privacy_flag", rows[0]["issue_flags"])
+        self.assertNotIn("redactions=applied", rows[0]["redacted_user_prompt_summary"])
 
     def test_unsafe_model_id_is_bucketed_for_retained_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
