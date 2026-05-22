@@ -1292,6 +1292,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "unexpected keys"):
                 MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
 
+    def test_validate_retained_rejects_malformed_jsonl_types(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fix failed verification.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            malformed_episode = export_retained(output, raw, "bad-episode")
+            episodes = [json.loads(line) for line in (malformed_episode / "episodes.jsonl").read_text(encoding="utf-8").splitlines()]
+            episodes[0]["turn_count"] = "bad"
+            write_jsonl(malformed_episode / "episodes.jsonl", episodes)
+
+            with self.assertRaisesRegex(SystemExit, "turn_count"):
+                MODULE.main(["validate-retained", "--run-dir", str(malformed_episode)])
+
+            malformed_turn = export_retained(output, raw, "bad-turn")
+            rows = [json.loads(line) for line in (malformed_turn / "turn_flags.jsonl").read_text(encoding="utf-8").splitlines()]
+            rows[0]["issue_flags"] = "failed_command"
+            write_jsonl(malformed_turn / "turn_flags.jsonl", rows)
+
+            with self.assertRaisesRegex(SystemExit, "issue_flags"):
+                MODULE.main(["validate-retained", "--run-dir", str(malformed_turn)])
+
     def test_validate_retained_rejects_path_like_allowed_fields(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

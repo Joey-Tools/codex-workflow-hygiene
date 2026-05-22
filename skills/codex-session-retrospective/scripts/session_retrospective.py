@@ -1051,15 +1051,117 @@ def sanitize_mapping(
     return sanitized
 
 
-def sanitize_retained_jsonl(path: Path, *, allowed: set[str], strict: bool) -> list[dict[str, Any]]:
+def require_string(value: Any, *, label: str, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise SystemExit(f"{label}: expected non-empty string")
+    return value
+
+
+def require_optional_string(value: Any, *, label: str) -> str | None:
+    if value is None:
+        return None
+    return require_string(value, label=label)
+
+
+def require_timestamp_or_none(value: Any, *, label: str) -> str | None:
+    if value is None:
+        return None
+    text = require_string(value, label=label)
+    if parse_time(text) is None:
+        raise SystemExit(f"{label}: expected timestamp")
+    return text
+
+
+def require_safe_token_string(value: Any, *, label: str) -> str:
+    text = require_string(value, label=label)
+    if not safe_token(text):
+        raise SystemExit(f"{label}: expected safe token")
+    return text
+
+
+def require_path_ref_or_none(value: Any, *, label: str) -> str | None:
+    if value is None:
+        return None
+    text = require_string(value, label=label)
+    if not PATH_REF_PATTERN.fullmatch(text):
+        raise SystemExit(f"{label}: retained refs must use opaque {PATH_REF_PREFIX} values")
+    return text
+
+
+def require_token_list(value: Any, *, label: str) -> list[str]:
+    if not isinstance(value, list):
+        raise SystemExit(f"{label}: expected list")
+    tokens: list[str] = []
+    for index, item in enumerate(value):
+        tokens.append(require_safe_token_string(item, label=f"{label}[{index}]"))
+    return tokens
+
+
+def require_non_negative_int(value: Any, *, label: str) -> int:
+    if not isinstance(value, int) or value < 0:
+        raise SystemExit(f"{label}: expected non-negative integer")
+    return value
+
+
+def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
+    require_safe_token_string(row["episode_id"], label=f"{label}.episode_id")
+    require_safe_token_string(row["host"], label=f"{label}.host")
+    require_safe_token_string(row["session_id"], label=f"{label}.session_id")
+    require_timestamp_or_none(row["start"], label=f"{label}.start")
+    require_timestamp_or_none(row["end"], label=f"{label}.end")
+    require_path_ref_or_none(row["cwd"], label=f"{label}.cwd")
+    require_safe_token_string(row["model_era"], label=f"{label}.model_era")
+    require_string(row["topic"], label=f"{label}.topic")
+    turn_count = require_non_negative_int(row["turn_count"], label=f"{label}.turn_count")
+    if turn_count == 0:
+        raise SystemExit(f"{label}.turn_count: expected positive integer")
+    require_token_list(row["friction_flags"], label=f"{label}.friction_flags")
+    require_safe_token_string(row["outcome"], label=f"{label}.outcome")
+    require_optional_string(row["work_report_hint"], label=f"{label}.work_report_hint")
+
+
+def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
+    require_safe_token_string(row["turn_id"], label=f"{label}.turn_id")
+    require_safe_token_string(row["episode_id"], label=f"{label}.episode_id")
+    require_safe_token_string(row["host"], label=f"{label}.host")
+    require_safe_token_string(row["session_id"], label=f"{label}.session_id")
+    require_string(row["source_path"], label=f"{label}.source_path")
+    if not PATH_REF_PATTERN.fullmatch(row["source_path"]):
+        raise SystemExit(f"{label}.source_path: retained refs must use opaque {PATH_REF_PREFIX} values")
+    source_hash = require_string(row["source_hash"], label=f"{label}.source_hash")
+    if not re.fullmatch(r"[0-9a-f]{64}", source_hash):
+        raise SystemExit(f"{label}.source_hash: expected sha256 hex digest")
+    require_timestamp_or_none(row["timestamp"], label=f"{label}.timestamp")
+    require_path_ref_or_none(row["cwd"], label=f"{label}.cwd")
+    require_optional_string(row["model"], label=f"{label}.model")
+    require_safe_token_string(row["model_era"], label=f"{label}.model_era")
+    require_string(row["redacted_user_prompt_summary"], label=f"{label}.redacted_user_prompt_summary")
+    require_string(row["assistant_action_summary"], label=f"{label}.assistant_action_summary", allow_empty=True)
+    issue_flags = require_token_list(row["issue_flags"], label=f"{label}.issue_flags")
+    if not issue_flags:
+        raise SystemExit(f"{label}.issue_flags: expected non-empty list")
+    require_optional_string(row["prompt_improvement"], label=f"{label}.prompt_improvement")
+
+
+def sanitize_retained_jsonl(
+    path: Path,
+    *,
+    allowed: set[str],
+    strict: bool,
+    validator: Any | None = None,
+) -> list[dict[str, Any]]:
     try:
         rows = list(iter_jsonl_strict(path))
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    return [
-        sanitize_mapping(obj, allowed=allowed, required=allowed, label=f"{path}:{line_no}", strict=strict)
-        for line_no, obj in rows
-    ]
+    sanitized_rows: list[dict[str, Any]] = []
+    for line_no, obj in rows:
+        label = f"{path}:{line_no}"
+        sanitized = sanitize_mapping(obj, allowed=allowed, required=allowed, label=label, strict=strict)
+        if validator is not None:
+            validator(sanitized, label=label)
+        sanitized_rows.append(sanitized)
+    return sanitized_rows
 
 
 def sanitize_count_map(value: Any, *, label: str, strict: bool) -> dict[str, int]:
@@ -1651,6 +1753,8 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 raise SystemExit(f"{path}:{line_no}: missing keys {sorted(missing)}")
             if contains_unredacted_sensitive_text(obj):
                 raise SystemExit(f"{path}:{line_no}: unredacted sensitive text in retained output")
+    sanitize_retained_jsonl(run_dir / "episodes.jsonl", allowed=EPISODE_FIELDS, strict=False, validator=validate_episode_row)
+    sanitize_retained_jsonl(run_dir / "turn_flags.jsonl", allowed=TURN_FLAG_FIELDS, strict=False, validator=validate_turn_flag_row)
     trend_path = run_dir / "trend_report.json"
     trend = sanitize_trend_report(json.loads(trend_path.read_text(encoding="utf-8")), label=str(trend_path), strict=True)
     validate_retained_manifest(run_dir / "retained_manifest.json")
@@ -1660,8 +1764,18 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
 
 def retained_export_files_from_run(run_dir: Path) -> dict[str, bytes]:
     validate_output_run(run_dir)
-    episodes = sanitize_retained_jsonl(run_dir / "episodes.jsonl", allowed=EPISODE_FIELDS, strict=False)
-    turn_flags = sanitize_retained_jsonl(run_dir / "turn_flags.jsonl", allowed=TURN_FLAG_FIELDS, strict=False)
+    episodes = sanitize_retained_jsonl(
+        run_dir / "episodes.jsonl",
+        allowed=EPISODE_FIELDS,
+        strict=False,
+        validator=validate_episode_row,
+    )
+    turn_flags = sanitize_retained_jsonl(
+        run_dir / "turn_flags.jsonl",
+        allowed=TURN_FLAG_FIELDS,
+        strict=False,
+        validator=validate_turn_flag_row,
+    )
     trend = sanitize_trend_report(
         json.loads((run_dir / "trend_report.json").read_text(encoding="utf-8")),
         label=str(run_dir / "trend_report.json"),
@@ -1708,8 +1822,8 @@ def validate_retained_output_dir(run_dir: Path) -> tuple[dict[str, Any], dict[st
     for path in (episodes_path, turn_flags_path):
         if not path.exists():
             raise SystemExit(f"missing retained output: {path}")
-    sanitize_retained_jsonl(episodes_path, allowed=EPISODE_FIELDS, strict=True)
-    sanitize_retained_jsonl(turn_flags_path, allowed=TURN_FLAG_FIELDS, strict=True)
+    sanitize_retained_jsonl(episodes_path, allowed=EPISODE_FIELDS, strict=True, validator=validate_episode_row)
+    sanitize_retained_jsonl(turn_flags_path, allowed=TURN_FLAG_FIELDS, strict=True, validator=validate_turn_flag_row)
     trend_path = run_dir / "trend_report.json"
     if not trend_path.exists():
         raise SystemExit(f"missing retained output: {trend_path}")
