@@ -276,10 +276,14 @@ def prompt_topic_key(redacted_text: str) -> str:
         for token in tokens
         if len(token) > 2 and token not in TOPIC_STOPWORDS and not token.startswith("redacted")
     ]
+    def topic_ref(value: str) -> str:
+        digest = hmac.new(PATH_REF_KEY, f"topic\0{value}".encode("utf-8", errors="surrogatepass"), hashlib.sha256)
+        return "topic_ref:" + digest.hexdigest()[:12]
+
     if meaningful:
-        return "topic_ref:" + stable_hash("+".join(sorted(dict.fromkeys(meaningful))[:6]), 12)
+        return topic_ref("+".join(sorted(dict.fromkeys(meaningful))[:6]))
     compacted = re.sub(r"\s+", "", redacted_text)
-    return "topic_ref:" + stable_hash(compacted, 12) if compacted else "unknown"
+    return topic_ref(compacted) if compacted else "unknown"
 
 
 def safe_prompt_summary(
@@ -1429,13 +1433,24 @@ def run_scan(
             )
             continue
         coverage_gaps.extend(local_evidence_gaps(source))
-        coverage_gaps.extend(
-            remote_evidence_gaps(
-                source,
-                start=start,
-                end=end,
-            )
+        source_remote_gaps = remote_evidence_gaps(
+            source,
+            start=start,
+            end=end,
         )
+        coverage_gaps.extend(source_remote_gaps)
+        if source_remote_gaps:
+            manifest_sources.append(
+                {
+                    "host": source.host,
+                    "root": source.root.as_posix(),
+                    "root_ref": path_ref(source.root),
+                    "rollout_count": 0,
+                    "summary_count": 0,
+                    "status": "stale",
+                }
+            )
+            continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         if not rollouts and not summaries:
@@ -1560,13 +1575,24 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             )
             continue
         coverage_gaps.extend(local_evidence_gaps(source))
-        coverage_gaps.extend(
-            remote_evidence_gaps(
-                source,
-                start=start,
-                end=end,
-            )
+        source_remote_gaps = remote_evidence_gaps(
+            source,
+            start=start,
+            end=end,
         )
+        coverage_gaps.extend(source_remote_gaps)
+        if source_remote_gaps:
+            manifest_sources.append(
+                {
+                    "host": source.host,
+                    "root": source.root.as_posix(),
+                    "root_ref": path_ref(source.root),
+                    "rollout_count": 0,
+                    "summary_count": 0,
+                    "status": "stale",
+                }
+            )
+            continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         if not rollouts and not summaries:

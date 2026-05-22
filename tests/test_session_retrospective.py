@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -292,6 +293,18 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("failed_command", turns[0].issue_flags)
         self.assertIn("topic_ref=topic_ref:", turns[0].redacted_user_prompt_summary)
         self.assertNotIn("redacted_excerpt=", turns[0].redacted_user_prompt_summary)
+
+    def test_topic_ref_is_not_unsalted_dictionary_hash(self) -> None:
+        redacted_text = "Fix the failed calendar sync verification."
+        old_dictionary_ref = "topic_ref:" + hashlib.sha256(
+            "calendar+failed+sync+verification".encode("utf-8")
+        ).hexdigest()[:12]
+
+        topic_ref = MODULE.prompt_topic_key(redacted_text)
+
+        self.assertTrue(topic_ref.startswith("topic_ref:"))
+        self.assertEqual(topic_ref, MODULE.prompt_topic_key(redacted_text))
+        self.assertNotEqual(topic_ref, old_dictionary_ref)
 
     def test_human_prompt_mentioning_retrospective_workflow_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1726,10 +1739,52 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     end=MODULE.parse_time("2026-05-02T00:00:00Z"),
                 )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["host"], "miku-bot-dev")
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "stale_host")
+        self.assertEqual(trend["hosts"], {"local": 1})
+        self.assertEqual([row["host"] for row in rows], ["local"])
+        remote_source = next(source for source in manifest["sources"] if source["host"] == "miku-bot-dev")
+        self.assertEqual(remote_source["status"], "stale")
+        self.assertEqual(remote_source["rollout_count"], 0)
+
+    def test_discover_skips_default_remote_with_stale_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            local = Path(raw) / ".codex"
+            remote = Path(raw) / "miku-bot-dev"
+            write_local_evidence(local)
+            local_rollout = local / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-local.jsonl"
+            remote_rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            write_jsonl(local_rollout, [message("user", "Local task.", "2026-05-01T10:00:00Z")])
+            write_jsonl(remote_rollout, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            with mock.patch.object(
+                MODULE,
+                "parse_sources",
+                return_value=[
+                    MODULE.Source("local", local),
+                    MODULE.Source("miku-bot-dev", remote),
+                ],
+            ):
+                MODULE.run_discover(
+                    types.SimpleNamespace(source=None, output=str(output), allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+        remote_source = next(source for source in manifest["sources"] if source["host"] == "miku-bot-dev")
+        self.assertEqual(remote_source["status"], "stale")
+        self.assertEqual(remote_source["rollout_count"], 0)
+        self.assertEqual(manifest["coverage_gaps"][0]["reason"], "stale_host")
 
     def test_default_remote_non_ready_metadata_uses_status_as_gap_reason(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
