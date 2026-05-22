@@ -2898,6 +2898,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "reports/weekly/fullprompt.md",
             "reports/weekly/promptlog.md",
             "reports/weekly/rawTranscript.md",
+            "reports/weekly/rawdata.md",
+            "reports/weekly/rawdump.md",
+            "reports/weekly/rawcopy.md",
         ):
             with self.subTest(relative_path=relative_path):
                 with tempfile.TemporaryDirectory() as raw:

@@ -165,6 +165,7 @@ HISTORY_FORBIDDEN_COMPACT_NAME_PARTS = frozenset(
         "userprompt",
     )
 )
+HISTORY_FORBIDDEN_COMPACT_NAME_PREFIXES = frozenset(("raw",))
 HISTORY_TEXT_EXTENSIONS = (".md", ".txt")
 HISTORY_JSON_EXTENSIONS = (".json",)
 HISTORY_ROOT_FILES = frozenset((".gitignore", "AGENTS.md", "README.md"))
@@ -1731,6 +1732,8 @@ def forbidden_history_artifact_name(name: str) -> bool:
     if normalized in HISTORY_FORBIDDEN_NAME_STEMS:
         return True
     compacted = "".join(tokens)
+    if any(compacted.startswith(prefix) for prefix in HISTORY_FORBIDDEN_COMPACT_NAME_PREFIXES):
+        return True
     if any(part in compacted for part in HISTORY_FORBIDDEN_COMPACT_NAME_PARTS):
         return True
     token_set = history_artifact_token_variants(tokens)
