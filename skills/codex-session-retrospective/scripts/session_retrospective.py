@@ -99,6 +99,7 @@ SAFE_OUTPUT_PARTS = (".codex-local", "session-retrospective")
 PATH_REF_PREFIX = "path_ref_v1"
 PATH_REF_PATTERN = re.compile(r"^path_ref_v1:[0-9a-f]{16}$")
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+BARE_64_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
@@ -116,7 +117,24 @@ HISTORY_FORBIDDEN_NAME_STEMS = frozenset(
         "turn_summaries",
     )
 )
-HISTORY_FORBIDDEN_NAME_TOKENS = frozenset(("raw", "rollout", "scratch", "transcript", "transcripts", "transient"))
+HISTORY_FORBIDDEN_NAME_TOKENS = frozenset(
+    (
+        "credential",
+        "credentials",
+        "key",
+        "keys",
+        "raw",
+        "rollout",
+        "scratch",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+        "transcript",
+        "transcripts",
+        "transient",
+    )
+)
 HISTORY_FORBIDDEN_TOKEN_PHRASES = (
     ("conversation", "log"),
     ("full", "prompt"),
@@ -686,13 +704,14 @@ def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.
         return True
     fallback = rollout_window_date(path)
     saw_record = False
-    saw_explicit_timestamp = False
+    saw_record_without_timestamp = False
     for _line_no, record in iter_jsonl(path):
         saw_record = True
         timestamp = parse_time(record_timestamp(record))
         if timestamp is not None:
-            saw_explicit_timestamp = True
+            pass
         else:
+            saw_record_without_timestamp = True
             timestamp = fallback
         if timestamp is None:
             continue
@@ -701,7 +720,7 @@ def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.
         if end and timestamp >= end:
             continue
         return True
-    if saw_record and not saw_explicit_timestamp and rollout_mtime_active(path, start, end):
+    if saw_record and saw_record_without_timestamp and rollout_mtime_active(path, start, end):
         return True
     return False
 
@@ -1628,6 +1647,16 @@ def history_artifact_name_tokens(name: str) -> list[str]:
     return [token for token in re.split(r"[^a-z0-9]+", stem.lower()) if token]
 
 
+def history_artifact_token_variants(tokens: list[str]) -> set[str]:
+    variants = set(tokens)
+    for token in tokens:
+        if token.endswith("ies") and len(token) > 4:
+            variants.add(token[:-3] + "y")
+        elif token.endswith("s") and len(token) > 3:
+            variants.add(token[:-1])
+    return variants
+
+
 def forbidden_history_artifact_name(name: str) -> bool:
     tokens = history_artifact_name_tokens(name)
     if not tokens:
@@ -1635,7 +1664,7 @@ def forbidden_history_artifact_name(name: str) -> bool:
     normalized = "_".join(tokens)
     if normalized in HISTORY_FORBIDDEN_NAME_STEMS:
         return True
-    token_set = set(tokens)
+    token_set = history_artifact_token_variants(tokens)
     if token_set & HISTORY_FORBIDDEN_NAME_TOKENS:
         return True
     return any(all(token in token_set for token in phrase) for phrase in HISTORY_FORBIDDEN_TOKEN_PHRASES)
@@ -1657,14 +1686,14 @@ def history_text_contains_sensitive(data: bytes, file_path: str) -> bool:
     text = data.decode("utf-8", errors="replace")
     if file_path.startswith("schemas/"):
         text = text.replace("https://json-schema.org/draft/2020-12/schema", "")
-    return contains_unredacted_sensitive_text(text)
+    return contains_unredacted_sensitive_text(text) or bool(BARE_64_HEX_PATTERN.search(text))
 
 
 def history_text_contains_retention_risk(data: bytes, file_path: str) -> bool:
     text = data.decode("utf-8", errors="replace")
     if file_path.startswith("schemas/"):
         text = text.replace("https://json-schema.org/draft/2020-12/schema", "")
-    if contains_unredacted_sensitive_text(text):
+    if contains_unredacted_sensitive_text(text) or BARE_64_HEX_PATTERN.search(text):
         return True
     generated_follow_on = file_path.startswith(HISTORY_TEXT_PREFIXES) or file_path.startswith(HISTORY_JSON_PREFIXES)
     return generated_follow_on and contains_path_like_text(text)

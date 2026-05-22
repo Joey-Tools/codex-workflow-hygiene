@@ -1790,6 +1790,70 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "ready")
 
+    def test_active_mtime_rollout_with_mixed_record_timestamps_is_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-mixed-active.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Fix the deployment issue.", "2026-01-02T10:00:00Z"),
+                    untimestamped_message("assistant", "The verification command failed with exit code 1."),
+                ],
+            )
+            active_mtime = MODULE.parse_time("2026-05-01T12:00:00Z").timestamp()
+            os.utime(rollout, (active_mtime, active_mtime))
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("failed_command", rows[0]["issue_flags"])
+
+    def test_make_shards_includes_active_mtime_rollout_with_mixed_record_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-mixed-active.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Fix the deployment issue.", "2026-01-02T10:00:00Z"),
+                    untimestamped_message("assistant", "The verification command failed with exit code 1."),
+                ],
+            )
+            active_mtime = MODULE.parse_time("2026-05-01T12:00:00Z").timestamp()
+            os.utime(rollout, (active_mtime, active_mtime))
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "ready")
+
     def test_make_shards_ignores_old_invalid_jsonl_with_future_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2623,6 +2687,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
+    def test_validate_history_tree_rejects_plural_raw_report_artifact_names(self) -> None:
+        for relative_path in (
+            "reports/weekly/full_prompts.md",
+            "reports/weekly/user_prompts.md",
+            "reports/weekly/prompt_logs.md",
+            "reports/weekly/tool_outputs.md",
+        ):
+            with self.subTest(relative_path=relative_path):
+                with tempfile.TemporaryDirectory() as raw:
+                    history_repo, _commit = write_history_repo(raw)
+                    artifact = history_repo / relative_path
+                    artifact.parent.mkdir(parents=True)
+                    artifact.write_text("Summarized text.\n", encoding="utf-8")
+                    subprocess.run(["git", "add", relative_path], cwd=history_repo, check=True)
+                    subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add plural raw artifact"], cwd=history_repo, check=True)
+
+                    with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
+                        MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
     def test_validate_history_tree_rejects_unredacted_report_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             history_repo, _commit = write_history_repo(raw)
@@ -2657,6 +2740,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add raw artifact"], cwd=history_repo, check=True)
 
             with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_sensitive_named_follow_on_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            key_artifact = history_repo / "reports" / "weekly" / "opaque_ref_key.txt"
+            key_artifact.parent.mkdir(parents=True)
+            key_artifact.write_text("redacted placeholder\n", encoding="utf-8")
+            subprocess.run(["git", "add", "reports/weekly/opaque_ref_key.txt"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add key artifact"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_bare_retrospective_key_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            report = history_repo / "reports" / "weekly" / "2026" / "05" / "08.md"
+            report.parent.mkdir(parents=True)
+            report.write_text("Opaque key: " + "a" * 64 + "\n", encoding="utf-8")
+            subprocess.run(["git", "add", "reports/weekly/2026/05/08.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add key leak"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "unredacted sensitive text"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
     def test_validate_history_tree_requires_retention_safe_manifest(self) -> None:
