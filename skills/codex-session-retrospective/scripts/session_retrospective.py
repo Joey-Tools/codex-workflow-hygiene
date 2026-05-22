@@ -583,15 +583,15 @@ def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.d
     if rollout_date and end and rollout_date >= end:
         return "irrelevant"
     if rollout_date and start and rollout_date < start:
+        found, complete = oversized_rollout_has_timestamp_in_window(path, start, end)
+        if found:
+            return "relevant"
         try:
             mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
         except OSError:
             mtime = None
         if mtime and mtime < start:
             return "irrelevant"
-        found, complete = oversized_rollout_has_timestamp_in_window(path, start, end)
-        if found:
-            return "relevant"
         if complete:
             return "irrelevant"
         return "unknown"
