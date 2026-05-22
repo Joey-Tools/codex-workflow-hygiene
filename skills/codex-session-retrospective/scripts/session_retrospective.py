@@ -114,7 +114,7 @@ def redact(text: str) -> tuple[str, bool]:
 def prompt_category(text: str) -> str:
     categories: list[str] = []
     lowered = text.lower()
-    if any(word in lowered for word in ("review", "pr", "pull request")):
+    if re.search(r"\b(?:review|pr|pull request)\b", lowered):
         categories.append("review")
     if any(word in lowered for word in ("fix", "bug", "error", "failed", "failure")):
         categories.append("debug_or_fix")
@@ -174,25 +174,27 @@ def file_hash(path: Path) -> str:
 
 
 def session_id_from_path(path: Path) -> str:
-    match = re.search(r"rollout-[^-]+-[^-]+-(.+)\.jsonl$", path.name)
+    match = re.search(r"^rollout-\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2})?-(.+)\.jsonl$", path.name)
     if match:
         return match.group(1)
     return stable_hash(path.as_posix())
 
 
 def rollout_date_from_path(path: Path) -> dt.datetime | None:
-    match = re.search(r"rollout-(\d{4}-\d{2}-\d{2})T", path.name)
+    match = re.search(r"^rollout-(\d{4}-\d{2}-\d{2})(?:T|-)", path.name)
     if not match:
         return None
     return parse_time(match.group(1) + "T00:00:00Z")
 
 
-def iter_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
+def iter_jsonl(path: Path, *, strict: bool = False) -> Iterable[tuple[int, dict[str, Any]]]:
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line_no, line in enumerate(handle, 1):
             try:
                 yield line_no, json.loads(line)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                if strict:
+                    raise ValueError(f"{path}:{line_no}: invalid JSON") from exc
                 continue
 
 
@@ -204,6 +206,20 @@ def text_from_message_payload(payload: dict[str, Any]) -> str:
     return "\n".join(texts).strip()
 
 
+def user_text_from_payload(payload: dict[str, Any]) -> str:
+    if payload.get("type") == "message" and payload.get("role") == "user":
+        return text_from_message_payload(payload)
+    if payload.get("type") == "user_message":
+        return str(payload.get("message") or "").strip()
+    return ""
+
+
+def assistant_text_from_payload(payload: dict[str, Any]) -> str:
+    if payload.get("type") == "message" and payload.get("role") == "assistant":
+        return text_from_message_payload(payload)
+    return ""
+
+
 def record_timestamp(record: dict[str, Any]) -> str | None:
     payload = record.get("payload") or {}
     for key in ("timestamp", "time", "created_at", "ts"):
@@ -213,9 +229,15 @@ def record_timestamp(record: dict[str, Any]) -> str | None:
     return None
 
 
+def record_timestamp_or_fallback(record: dict[str, Any], path: Path) -> str | None:
+    return record_timestamp(record) or (iso(rollout_date_from_path(path)) if rollout_date_from_path(path) else None)
+
+
 def record_text(record: dict[str, Any]) -> str:
     payload = record.get("payload") or {}
-    if isinstance(payload, dict) and payload.get("type") == "message":
+    if isinstance(payload, dict) and payload.get("type") in {"message", "user_message"}:
+        if payload.get("type") == "user_message":
+            return str(payload.get("message") or "")
         return text_from_message_payload(payload)
     try:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -288,6 +310,7 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
     current: TurnSummary | None = None
     turns: list[TurnSummary] = []
     assistant_bits: list[str] = []
+    last_user_fingerprint: tuple[str, str] | None = None
 
     def flush_assistant() -> None:
         nonlocal assistant_bits
@@ -300,25 +323,30 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
         if isinstance(payload, dict):
             cwd = payload.get("cwd") or cwd
             model = payload.get("model") or payload.get("model_id") or model
-        timestamp = record_timestamp(record) or (iso(rollout_date_from_path(path)) if rollout_date_from_path(path) else None)
+        timestamp = record_timestamp_or_fallback(record, path)
         parsed_timestamp = parse_time(timestamp)
         if parsed_timestamp and start and parsed_timestamp < start:
             continue
         if parsed_timestamp and end and parsed_timestamp >= end:
             continue
 
-        if isinstance(payload, dict) and payload.get("type") == "message":
-            role = payload.get("role")
-            message_text = text_from_message_payload(payload)
-            if role == "user" and not meaningful_user_text(message_text):
+        if isinstance(payload, dict):
+            user_text = user_text_from_payload(payload)
+            assistant_text = assistant_text_from_payload(payload)
+            if user_text and not meaningful_user_text(user_text):
                 continue
-            if role == "user" and meaningful_user_text(message_text):
+            if user_text and meaningful_user_text(user_text):
+                fingerprint_time = iso(parsed_timestamp.replace(microsecond=0)) if parsed_timestamp else ""
+                fingerprint = (user_text, fingerprint_time)
+                if fingerprint == last_user_fingerprint:
+                    continue
+                last_user_fingerprint = fingerprint
                 flush_assistant()
-                _redacted_prompt, prompt_changed = redact(message_text)
-                prompt_flags = flags_for_text(message_text, redacted_changed=prompt_changed)
-                prompt_summary = safe_prompt_summary(message_text, prompt_flags, prompt_changed)
+                _redacted_prompt, prompt_changed = redact(user_text)
+                prompt_flags = flags_for_text(user_text, redacted_changed=prompt_changed)
+                prompt_summary = safe_prompt_summary(user_text, prompt_flags, prompt_changed)
                 date_bucket = (parse_time(timestamp) or rollout_date_from_path(path) or utc_now()).date().isoformat()
-                episode_seed = "|".join([source.host, session_id, (cwd or ""), date_bucket, prompt_category(message_text)])
+                episode_seed = "|".join([source.host, session_id, (cwd or ""), date_bucket, prompt_category(user_text)])
                 episode_id = stable_hash(episode_seed, 20)
                 turn = TurnSummary(
                     turn_id=stable_hash(f"{source.host}|{path}|{line_no}|{timestamp}", 20),
@@ -341,8 +369,8 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
                 turns.append(turn)
                 current = turn
                 continue
-            if role == "assistant" and current and message_text:
-                assistant_bits.append(message_text)
+            if assistant_text and current:
+                assistant_bits.append(assistant_text)
 
         text = record_text(record)
         _redacted_text, changed = redact(text)
@@ -581,7 +609,7 @@ def cmd_scan_daily(args: argparse.Namespace) -> int:
     state = load_state(Path(args.state)) if args.state else {}
     last = parse_time(state.get("last_scan_at"))
     lookback_start = end - dt.timedelta(days=args.active_lookback_days)
-    start = min(last, lookback_start) if last else end - dt.timedelta(days=1)
+    start = min(last, lookback_start) if last else lookback_start
     return run_scan(args, mode="daily", start=start, end=end)
 
 
@@ -648,7 +676,11 @@ def cmd_validate_output(args: argparse.Namespace) -> int:
         path = run_dir / name
         if not path.exists():
             raise SystemExit(f"missing output: {path}")
-        for line_no, obj in iter_jsonl(path):
+        try:
+            rows = list(iter_jsonl(path, strict=True))
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        for line_no, obj in rows:
             missing = keys - set(obj)
             if missing:
                 raise SystemExit(f"{path}:{line_no}: missing keys {sorted(missing)}")
