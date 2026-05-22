@@ -91,6 +91,7 @@ LOCAL_EVIDENCE_FILES = ("session_index.jsonl", "history.jsonl")
 SAFE_OUTPUT_PARTS = (".codex-local", "session-retrospective")
 PATH_REF_PREFIX = "path_ref_v1"
 PATH_REF_PATTERN = re.compile(r"^path_ref_v1:[0-9a-f]{16}$")
+COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 PATH_REF_KEY = secrets.token_bytes(32)
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
@@ -1349,10 +1350,12 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
 
 
 def validate_retained_output_dir(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    for name in TRANSIENT_OUTPUT_FILES:
-        path = run_dir / name
-        if path.exists():
-            raise SystemExit(f"transient output must not be retained: {path}")
+    if not run_dir.is_dir():
+        raise SystemExit(f"retained output directory not found: {run_dir}")
+    allowed = set(RETAINED_OUTPUT_FILES)
+    for path in run_dir.iterdir():
+        if path.name not in allowed or not path.is_file():
+            raise SystemExit(f"unexpected retained output: {path}")
     required = {
         "episodes.jsonl": {"episode_id", "host", "topic", "friction_flags"},
         "turn_flags.jsonl": {"turn_id", "episode_id", "issue_flags"},
@@ -1399,6 +1402,10 @@ def cmd_export_retained(args: argparse.Namespace) -> int:
     validate_output_run(run_dir)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    allowed = set(RETAINED_OUTPUT_FILES)
+    for path in output.iterdir():
+        if path.name not in allowed or not path.is_file():
+            raise SystemExit(f"refusing to export into directory with unexpected retained output: {path}")
     for name in RETAINED_OUTPUT_FILES:
         source = run_dir / name
         target = output / name
@@ -1420,8 +1427,16 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
     state_path = safe_state_path(args.state)
     if state_path is None:
         raise SystemExit("--state is required")
+    history_commit = str(args.history_commit or "")
+    if not COMMIT_SHA_PATTERN.fullmatch(history_commit):
+        raise SystemExit("--history-commit must be a full 40-character hex commit SHA")
     run_dir = Path(args.run_dir)
     trend, retained_manifest = validate_output_run(run_dir)
+    retained_trend, retained_export_manifest = validate_retained_output_dir(Path(args.retained_run_dir))
+    if trend.get("window") != retained_trend.get("window"):
+        raise SystemExit("retained export window does not match scan output window")
+    if retained_manifest.get("window") != retained_export_manifest.get("window"):
+        raise SystemExit("retained export manifest window does not match scan output manifest")
     coverage_gaps = list(trend.get("coverage_gaps") or []) + list(retained_manifest.get("coverage_gaps") or [])
     if coverage_gaps:
         raise SystemExit("refusing to advance state while coverage gaps are present")
@@ -1432,6 +1447,7 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
         raise SystemExit("trend_report.json window must include mode and end")
     state = load_state(state_path)
     state["last_scan_at"] = last_scan_at
+    state["last_history_commit"] = history_commit
     state["last_mode"] = last_mode
     save_state(state_path, state)
     print(f"advanced: {state_path}")
@@ -1494,7 +1510,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     advance = subparsers.add_parser("advance-state")
     advance.add_argument("--run-dir", required=True)
+    advance.add_argument("--retained-run-dir", required=True)
     advance.add_argument("--state", required=True)
+    advance.add_argument("--history-commit", required=True)
     advance.set_defaults(func=cmd_advance_state)
 
     validate_manifest = subparsers.add_parser("validate-manifest")

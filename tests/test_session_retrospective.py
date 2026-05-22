@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 
+HISTORY_COMMIT = "a" * 40
 SCRIPT = (
     Path(__file__).resolve().parents[1]
     / "skills"
@@ -39,6 +40,30 @@ def write_local_evidence(root: Path) -> None:
 
 def safe_output_dir(root: str, name: str = "out") -> Path:
     return Path(root) / ".codex-local" / "session-retrospective" / name
+
+
+def export_retained(run_dir: Path, root: str, name: str = "history-retained") -> Path:
+    retained_output = Path(root) / name
+    MODULE.main(["export-retained", "--run-dir", str(run_dir), "--output", str(retained_output)])
+    return retained_output
+
+
+def advance_state(run_dir: Path, state: Path, root: str) -> Path:
+    retained_output = export_retained(run_dir, root)
+    MODULE.main(
+        [
+            "advance-state",
+            "--run-dir",
+            str(run_dir),
+            "--retained-run-dir",
+            str(retained_output),
+            "--state",
+            str(state),
+            "--history-commit",
+            HISTORY_COMMIT,
+        ]
+    )
+    return retained_output
 
 
 def message(role: str, text: str, timestamp: str) -> dict:
@@ -840,10 +865,12 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
             self.assertFalse(state.exists())
-            MODULE.main(["advance-state", "--run-dir", str(output), "--state", str(state)])
+            advance_state(output, state, raw)
 
             self.assertTrue(state.exists())
-            self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["last_scan_at"], "2026-05-02T00:00:00Z")
+            state_data = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(state_data["last_scan_at"], "2026-05-02T00:00:00Z")
+            self.assertEqual(state_data["last_history_commit"], HISTORY_COMMIT)
             self.assertEqual(trend["coverage_gaps"], [])
 
     def test_old_oversized_rollout_with_in_window_tail_blocks_state(self) -> None:
@@ -869,8 +896,21 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            retained_output = export_retained(output, raw)
             with self.assertRaisesRegex(SystemExit, "coverage gaps"):
-                MODULE.main(["advance-state", "--run-dir", str(output), "--state", str(state)])
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained_output),
+                        "--state",
+                        str(state),
+                        "--history-commit",
+                        HISTORY_COMMIT,
+                    ]
+                )
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
@@ -976,7 +1016,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
             )
-            MODULE.main(["export-retained", "--run-dir", str(output), "--output", str(retained_output)])
+            export_retained(output, raw)
             MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
 
             self.assertTrue((retained_output / "episodes.jsonl").exists())
@@ -987,11 +1027,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertFalse((retained_output / "shard_manifest.json").exists())
             self.assertFalse((retained_output / "shards.jsonl").exists())
 
-    def test_validate_retained_rejects_transient_files(self) -> None:
+    def test_validate_retained_rejects_unexpected_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             retained_output = Path(raw) / "history-retained"
             retained_output.mkdir()
-            (retained_output / "turn_summaries.jsonl").write_text("", encoding="utf-8")
+            (retained_output / "debug.txt").write_text("/workspace/customer/raw-rollout.jsonl", encoding="utf-8")
             write_jsonl(retained_output / "episodes.jsonl", [])
             write_jsonl(retained_output / "turn_flags.jsonl", [])
             (retained_output / "trend_report.json").write_text("{}\n", encoding="utf-8")
@@ -1014,8 +1054,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(SystemExit, "transient output"):
+            with self.assertRaisesRegex(SystemExit, "unexpected retained output"):
                 MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
+
+    def test_export_retained_rejects_dirty_output_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            retained_output = Path(raw) / "history-retained"
+            retained_output.mkdir()
+            (retained_output / "debug.txt").write_text("raw debug", encoding="utf-8")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+
+            with self.assertRaisesRegex(SystemExit, "unexpected retained output"):
+                MODULE.main(["export-retained", "--run-dir", str(output), "--output", str(retained_output)])
 
     def test_discover_writes_manifest_without_turn_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1177,7 +1238,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
             self.assertFalse(state.exists())
-            MODULE.main(["advance-state", "--run-dir", str(output), "--state", str(state)])
+            advance_state(output, state, raw)
 
             self.assertTrue(state.exists())
             self.assertEqual(trend["coverage_gaps"], [])
@@ -1363,7 +1424,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
             state_exists_after_scan = state.exists()
-            MODULE.main(["advance-state", "--run-dir", str(output), "--state", str(state)])
+            advance_state(output, state, raw)
             state_exists_after_advance = state.exists()
 
         self.assertFalse(state_exists_after_scan)
