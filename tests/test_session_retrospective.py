@@ -27,6 +27,10 @@ assert SPEC.loader is not None
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
+VALID_TURN_ID = f"{MODULE.TURN_REF_PREFIX}:{'a' * 20}"
+VALID_EPISODE_ID = f"{MODULE.EPISODE_REF_PREFIX}:{'b' * 20}"
+VALID_SESSION_ID = f"{MODULE.SESSION_REF_PREFIX}:{'c' * 20}"
+
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,7 +225,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(MODULE.session_id_from_path(current), MODULE.opaque_session_id("019d-uuid"))
         self.assertEqual(MODULE.session_id_from_path(legacy), MODULE.opaque_session_id("legacy-uuid"))
-        self.assertRegex(MODULE.session_id_from_path(current), r"^[0-9a-f]{20}$")
+        self.assertRegex(MODULE.session_id_from_path(current), r"^session_ref_v1:[0-9a-f]{20}$")
         self.assertNotEqual(MODULE.session_id_from_path(current), "019d-uuid")
         self.assertNotEqual(MODULE.session_id_from_path(legacy), "legacy-uuid")
         self.assertEqual(MODULE.iso(MODULE.rollout_date_from_path(current)), "2026-05-07T13:24:44Z")
@@ -786,7 +790,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             turns = MODULE.extract_summary_file(MODULE.Source("remote", root), summary, None, None)
 
-        self.assertRegex(turns[0].session_id, r"^[0-9a-f]{20}$")
+        self.assertRegex(turns[0].session_id, r"^session_ref_v1:[0-9a-f]{20}$")
         self.assertNotEqual(turns[0].session_id, "customer-incident-123")
 
     def test_wrapper_user_message_does_not_flag_previous_turn(self) -> None:
@@ -924,6 +928,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
             )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual([gap["reason"] for gap in trend["coverage_gaps"]], ["partial_host_scope"])
+
+    def test_copied_dot_codex_source_does_not_require_index_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-copied.jsonl"
+            write_jsonl(rollout, [message("user", "Copied rollout task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertEqual([gap["reason"] for gap in trend["coverage_gaps"]], ["partial_host_scope"])
@@ -1316,6 +1339,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 MODULE.parse_time("2026-05-08T00:00:00Z"),
                 MODULE.parse_time("2026-05-23T00:00:00Z"),
                 emit_start=MODULE.parse_time("2026-05-21T10:00:00Z"),
+                allow_mtime_fallback=True,
             )
 
         self.assertEqual(len(turns), 1)
@@ -1711,7 +1735,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_make_shards_reports_old_invalid_jsonl_with_active_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw) / ".codex"
+            home = Path(raw) / "home"
+            root = home / ".codex"
             old_bad = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
             old_bad.parent.mkdir(parents=True, exist_ok=True)
             old_bad.write_text("{bad json\n", encoding="utf-8")
@@ -1729,7 +1754,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             output = safe_output_dir(raw)
 
-            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
             rows = [
                 json.loads(line)
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
@@ -1740,7 +1766,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_active_mtime_rollout_without_record_timestamps_is_scanned(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw) / ".codex"
+            home = Path(raw) / "home"
+            root = home / ".codex"
             write_local_evidence(root)
             rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-undated-active.jsonl"
             write_jsonl(rollout, [untimestamped_message("user", "Fix the failed deployment.")])
@@ -1748,23 +1775,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
             os.utime(rollout, (active_mtime, active_mtime))
             output = safe_output_dir(raw)
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             rows = [
                 json.loads(line)
                 for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], "2026-05-01T12:00:00Z")
         self.assertIn("failed_command", rows[0]["issue_flags"])
 
     def test_make_shards_includes_active_mtime_rollout_without_record_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw) / ".codex"
+            home = Path(raw) / "home"
+            root = home / ".codex"
             rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-undated-active.jsonl"
             write_jsonl(rollout, [untimestamped_message("user", "Fix the failed deployment.")])
             active_mtime = MODULE.parse_time("2026-05-01T12:00:00Z").timestamp()
@@ -1781,7 +1811,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             output = safe_output_dir(raw)
 
-            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
             rows = [
                 json.loads(line)
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
@@ -1792,7 +1823,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_active_mtime_rollout_with_mixed_record_timestamps_is_scanned(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw) / ".codex"
+            home = Path(raw) / "home"
+            root = home / ".codex"
             write_local_evidence(root)
             rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-mixed-active.jsonl"
             write_jsonl(
@@ -1806,23 +1838,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
             os.utime(rollout, (active_mtime, active_mtime))
             output = safe_output_dir(raw)
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             rows = [
                 json.loads(line)
                 for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], "2026-05-01T12:00:00Z")
         self.assertIn("failed_command", rows[0]["issue_flags"])
 
     def test_make_shards_includes_active_mtime_rollout_with_mixed_record_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw) / ".codex"
+            home = Path(raw) / "home"
+            root = home / ".codex"
             rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-mixed-active.jsonl"
             write_jsonl(
                 rollout,
@@ -1845,7 +1880,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             output = safe_output_dir(raw)
 
-            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
             rows = [
                 json.loads(line)
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
@@ -1853,6 +1889,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "ready")
+
+    def test_copied_rollout_source_does_not_use_local_mtime_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "copied-local"
+            rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-copied-active.jsonl"
+            write_jsonl(rollout, [untimestamped_message("user", "Fix the failed deployment.")])
+            active_mtime = MODULE.parse_time("2026-05-01T12:00:00Z").timestamp()
+            os.utime(rollout, (active_mtime, active_mtime))
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows, [])
 
     def test_make_shards_ignores_old_invalid_jsonl_with_future_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1937,6 +1995,39 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                     end=MODULE.parse_time("2026-05-02T00:00:00Z"),
                 )
+
+    def test_safe_state_path_expands_tilde_after_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                state = MODULE.safe_state_path("~/.codex-local/session-retrospective/state.json")
+
+        self.assertEqual(state, home / ".codex-local" / "session-retrospective" / "state.json")
+
+    def test_scan_output_expands_tilde_after_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = Path(raw) / "source"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.run_scan(
+                    types.SimpleNamespace(
+                        source=[f"local={root}"],
+                        output="~/.codex-local/session-retrospective/out",
+                        state=None,
+                        max_raw_bytes=1000,
+                        allow_partial_hosts=True,
+                    ),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            output_exists = (home / ".codex-local" / "session-retrospective" / "out" / "turn_summaries.jsonl").exists()
+
+        self.assertTrue(output_exists)
 
     def test_transient_output_rejects_child_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -2113,7 +2204,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_old_oversized_rollout_with_active_mtime_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw) / ".codex"
+            home = Path(raw) / "home"
+            root = home / ".codex"
             write_local_evidence(root)
             old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
             old_large.parent.mkdir(parents=True, exist_ok=True)
@@ -2123,12 +2215,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertFalse(state.exists())
@@ -2535,6 +2628,57 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         "0" * 40,
                     ]
                 )
+
+    def test_validate_history_tree_rejects_wrong_origin_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "git@github.com:Joey-Tools/not-session-retrospective-history.git"],
+                cwd=history_repo,
+                check=True,
+            )
+
+            with self.assertRaisesRegex(SystemExit, "origin must be"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_advance_state_rejects_dirty_history_worktree_before_saving_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, commit = write_history_repo(raw, retained)
+            raw_artifact = history_repo / "turn_summaries.jsonl"
+            raw_artifact.write_text("{}\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "worktree must be clean"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        commit,
+                    ]
+                )
+
+        self.assertFalse(state.exists())
 
     def test_validate_history_commit_accepts_dedicated_retained_export_commit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3495,18 +3639,20 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_missing_local_index_files_report_gaps_and_block_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw) / ".codex"
+            home = Path(raw) / "home"
+            root = home / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
             write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertFalse(state.exists())
@@ -3871,7 +4017,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_old_invalid_rollout_with_active_mtime_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw) / ".codex"
+            home = Path(raw) / "home"
+            root = home / ".codex"
             write_local_evidence(root)
             rollout = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
             rollout.parent.mkdir(parents=True, exist_ok=True)
@@ -3881,12 +4028,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertFalse(state.exists())
@@ -4122,10 +4270,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             run_dir = Path(raw) / "run"
             run_dir.mkdir()
             row = {
-                "turn_id": "t1",
-                "episode_id": "e1",
+                "turn_id": VALID_TURN_ID,
+                "episode_id": VALID_EPISODE_ID,
                 "host": "local",
-                "session_id": "a" * 20,
+                "session_id": VALID_SESSION_ID,
                 "source_path": "path_ref_v1:0123456789abcdef",
                 "source_hash": "0" * 64,
                 "timestamp": "2026-05-22T10:00:00Z",
@@ -4165,8 +4313,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_retained_validators_reject_raw_session_id(self) -> None:
         turn = {
-            "turn_id": "a" * 20,
-            "episode_id": "b" * 20,
+            "turn_id": VALID_TURN_ID,
+            "episode_id": VALID_EPISODE_ID,
             "host": "local",
             "session_id": "customer-incident-123",
             "source_path": "path_ref_v1:0123456789abcdef",
@@ -4181,7 +4329,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "prompt_improvement": None,
         }
         episode = {
-            "episode_id": "b" * 20,
+            "episode_id": VALID_EPISODE_ID,
             "host": "local",
             "session_id": "customer-incident-123",
             "start": "2026-05-22T10:00:00Z",
@@ -4203,9 +4351,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_retained_validators_reject_raw_turn_and_episode_ids(self) -> None:
         turn = {
             "turn_id": "customer-turn-123",
-            "episode_id": "b" * 20,
+            "episode_id": VALID_EPISODE_ID,
             "host": "local",
-            "session_id": "c" * 20,
+            "session_id": VALID_SESSION_ID,
             "source_path": "path_ref_v1:0123456789abcdef",
             "source_hash": "0" * 64,
             "timestamp": "2026-05-22T10:00:00Z",
@@ -4220,7 +4368,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         episode = {
             "episode_id": "customer-episode-123",
             "host": "local",
-            "session_id": "c" * 20,
+            "session_id": VALID_SESSION_ID,
             "start": "2026-05-22T10:00:00Z",
             "end": "2026-05-22T10:00:00Z",
             "cwd": None,

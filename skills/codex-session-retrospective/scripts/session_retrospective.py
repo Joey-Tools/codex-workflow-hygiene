@@ -92,12 +92,17 @@ SAFETY_PATTERN = re.compile(
 )
 
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
+EXPECTED_HISTORY_REPO = "Joey-Tools/codex-session-retrospective-history"
 DEFAULT_REMOTE_SOURCE_ROOT = Path(".codex-local/session-retrospective/remote-sources")
 REMOTE_SOURCE_METADATA_FILE = "source_metadata.json"
 LOCAL_EVIDENCE_FILES = ("session_index.jsonl", "history.jsonl")
 SAFE_OUTPUT_PARTS = (".codex-local", "session-retrospective")
 PATH_REF_PREFIX = "path_ref_v1"
 PATH_REF_PATTERN = re.compile(r"^path_ref_v1:[0-9a-f]{16}$")
+SESSION_REF_PREFIX = "session_ref_v1"
+EPISODE_REF_PREFIX = "episode_ref_v1"
+TURN_REF_PREFIX = "turn_ref_v1"
+OPAQUE_ID_PATTERN = re.compile(r"^(?:session_ref_v1|episode_ref_v1|turn_ref_v1):[0-9a-f]{20}$")
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 BARE_64_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
@@ -449,8 +454,20 @@ def opaque_digest(value: str | os.PathLike[str], length: int = 20) -> str:
     return digest.hexdigest()[:length]
 
 
+def opaque_id(prefix: str, value: str | os.PathLike[str]) -> str:
+    return f"{prefix}:{opaque_digest(value, 20)}"
+
+
 def opaque_session_id(value: str | os.PathLike[str]) -> str:
-    return opaque_digest(f"session_id_v1|{os.fspath(value)}", 20)
+    return opaque_id(SESSION_REF_PREFIX, f"session_id_v1|{os.fspath(value)}")
+
+
+def opaque_episode_id(value: str | os.PathLike[str]) -> str:
+    return opaque_id(EPISODE_REF_PREFIX, f"episode_id_v1|{os.fspath(value)}")
+
+
+def opaque_turn_id(value: str | os.PathLike[str]) -> str:
+    return opaque_id(TURN_REF_PREFIX, f"turn_id_v1|{os.fspath(value)}")
 
 
 def file_hash(path: Path) -> str:
@@ -469,11 +486,12 @@ def file_source_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def ensure_safe_output_dir(path: Path) -> None:
-    parts = path.expanduser().resolve(strict=False).parts
+def ensure_safe_output_dir(path: Path) -> Path:
+    expanded = path.expanduser()
+    parts = expanded.resolve(strict=False).parts
     for index in range(len(parts) - len(SAFE_OUTPUT_PARTS) + 1):
         if parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS:
-            return
+            return expanded
     raise SystemExit("output directory for transient artifacts must be under .codex-local/session-retrospective")
 
 
@@ -699,7 +717,13 @@ def rollout_window_date(path: Path) -> dt.datetime | None:
     return rollout_date_from_path(path) or dated_path_from_parts(path)
 
 
-def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+def rollout_has_record_in_window(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    allow_mtime_fallback: bool = False,
+) -> bool:
     if start is None and end is None:
         return True
     fallback = rollout_window_date(path)
@@ -720,7 +744,7 @@ def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.
         if end and timestamp >= end:
             continue
         return True
-    if saw_record and saw_record_without_timestamp and rollout_mtime_active(path, start, end):
+    if saw_record and saw_record_without_timestamp and allow_mtime_fallback and rollout_mtime_active(path, start, end):
         return True
     return False
 
@@ -743,6 +767,7 @@ def rollout_candidate_relevant(
     end: dt.datetime | None,
     *,
     max_raw_bytes: int | None = None,
+    allow_mtime_fallback: bool = False,
 ) -> bool:
     if start is None and end is None:
         return True
@@ -754,7 +779,7 @@ def rollout_candidate_relevant(
             mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
         except OSError:
             return True
-        if (not start or mtime >= start) and (not end or mtime < end):
+        if allow_mtime_fallback and (not start or mtime >= start) and (not end or mtime < end):
             return True
         if max_raw_bytes is not None and path.stat().st_size > max_raw_bytes:
             return True
@@ -763,17 +788,21 @@ def rollout_candidate_relevant(
 
 
 def rollout_mtime_active(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    return rollout_active_mtime(path, start, end) is not None
+
+
+def rollout_active_mtime(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> dt.datetime | None:
     if start is None and end is None:
-        return False
+        return None
     try:
         mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
     except OSError:
-        return True
+        return start
     if start and mtime < start:
-        return False
+        return None
     if end and mtime >= end:
-        return False
-    return True
+        return None
+    return mtime
 
 
 TIMESTAMP_BYTES_PATTERN = re.compile(rb'"(?:timestamp|time|created_at|ts)"\s*:\s*"([^"]+)"')
@@ -907,6 +936,7 @@ def extract_rollout(
     end: dt.datetime | None,
     *,
     emit_start: dt.datetime | None = None,
+    allow_mtime_fallback: bool = False,
 ) -> list[TurnSummary]:
     session_id = session_id_from_path(path)
     source_hash = file_source_hash(path)
@@ -929,7 +959,19 @@ def extract_rollout(
     def is_emit_record(timestamp: dt.datetime | None, *, timestamp_is_fallback: bool) -> bool:
         if emit_threshold is None or timestamp is None or timestamp >= emit_threshold:
             return True
-        return timestamp_is_fallback and rollout_mtime_active(path, emit_threshold, end)
+        return timestamp_is_fallback and allow_mtime_fallback and rollout_mtime_active(path, emit_threshold, end)
+
+    def effective_record_time(
+        raw_timestamp: str | None,
+        parsed: dt.datetime | None,
+        *,
+        timestamp_is_fallback: bool,
+    ) -> tuple[str | None, dt.datetime | None]:
+        if allow_mtime_fallback and timestamp_is_fallback and emit_threshold is not None and (parsed is None or parsed < emit_threshold):
+            active_mtime = rollout_active_mtime(path, emit_threshold, end)
+            if active_mtime is not None:
+                return iso(active_mtime), active_mtime
+        return raw_timestamp, parsed
 
     def emit_current(trigger_line_no: int | None = None, trigger_timestamp: str | None = None) -> None:
         nonlocal current, current_emitted
@@ -946,7 +988,7 @@ def extract_rollout(
             ):
                 current = dataclasses.replace(
                     current,
-                    turn_id=opaque_digest(f"{source.host}|{path_ref(path)}|{trigger_line_no}|{trigger_timestamp}|continuation", 20),
+                    turn_id=opaque_turn_id(f"{source.host}|{path_ref(path)}|{trigger_line_no}|{trigger_timestamp}|continuation"),
                     timestamp=trigger_timestamp or current.timestamp,
                 )
             turns.append(current)
@@ -959,6 +1001,11 @@ def extract_rollout(
             model = payload.get("model") or payload.get("model_id") or model
         timestamp, timestamp_is_fallback = record_timestamp_with_origin(record, path)
         parsed_timestamp = parse_time(timestamp)
+        timestamp, parsed_timestamp = effective_record_time(
+            timestamp,
+            parsed_timestamp,
+            timestamp_is_fallback=timestamp_is_fallback,
+        )
         if parsed_timestamp and end and parsed_timestamp >= end:
             continue
 
@@ -995,9 +1042,9 @@ def extract_rollout(
                         prompt_topic_key(redacted_prompt),
                     ]
                 )
-                episode_id = opaque_digest(episode_seed, 20)
+                episode_id = opaque_episode_id(episode_seed)
                 turn = TurnSummary(
-                    turn_id=opaque_digest(f"{source.host}|{path_ref(path)}|{line_no}|{timestamp}", 20),
+                    turn_id=opaque_turn_id(f"{source.host}|{path_ref(path)}|{line_no}|{timestamp}"),
                     episode_id=episode_id,
                     host=source.host,
                     session_id=session_id,
@@ -1076,10 +1123,10 @@ def extract_summary_file(
             continue
         timestamp_value = timestamp if parse_time(timestamp) else (iso(parsed_timestamp) if parsed_timestamp else None)
         date_bucket = parsed_timestamp.date().isoformat()
-        episode_id = opaque_digest("|".join([source.host, session_id, "rollout-summary", date_bucket, kind]), 20)
+        episode_id = opaque_episode_id("|".join([source.host, session_id, "rollout-summary", date_bucket, kind]))
         turns.append(
             TurnSummary(
-                turn_id=opaque_digest(f"{source.host}|{path_ref(path)}|{line_no}|{timestamp}", 20),
+                turn_id=opaque_turn_id(f"{source.host}|{path_ref(path)}|{line_no}|{timestamp}"),
                 episode_id=episode_id,
                 host=source.host,
                 session_id=session_id,
@@ -1347,9 +1394,13 @@ def require_safe_token_string(value: Any, *, label: str) -> str:
     return text
 
 
-def require_opaque_digest_string(value: Any, *, label: str) -> str:
+def require_opaque_digest_string(value: Any, *, label: str, prefix: str | None = None) -> str:
     text = require_string(value, label=label)
-    if not re.fullmatch(r"[0-9a-f]{20}", text):
+    if prefix is None:
+        pattern = OPAQUE_ID_PATTERN
+    else:
+        pattern = re.compile(rf"^{re.escape(prefix)}:[0-9a-f]{{20}}$")
+    if not pattern.fullmatch(text):
         raise SystemExit(f"{label}: expected opaque keyed digest")
     return text
 
@@ -1379,9 +1430,9 @@ def require_non_negative_int(value: Any, *, label: str) -> int:
 
 
 def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
-    require_opaque_digest_string(row["episode_id"], label=f"{label}.episode_id")
+    require_opaque_digest_string(row["episode_id"], label=f"{label}.episode_id", prefix=EPISODE_REF_PREFIX)
     require_safe_token_string(row["host"], label=f"{label}.host")
-    require_opaque_digest_string(row["session_id"], label=f"{label}.session_id")
+    require_opaque_digest_string(row["session_id"], label=f"{label}.session_id", prefix=SESSION_REF_PREFIX)
     require_timestamp_or_none(row["start"], label=f"{label}.start")
     require_timestamp_or_none(row["end"], label=f"{label}.end")
     require_path_ref_or_none(row["cwd"], label=f"{label}.cwd")
@@ -1396,10 +1447,10 @@ def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
 
 
 def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
-    require_opaque_digest_string(row["turn_id"], label=f"{label}.turn_id")
-    require_opaque_digest_string(row["episode_id"], label=f"{label}.episode_id")
+    require_opaque_digest_string(row["turn_id"], label=f"{label}.turn_id", prefix=TURN_REF_PREFIX)
+    require_opaque_digest_string(row["episode_id"], label=f"{label}.episode_id", prefix=EPISODE_REF_PREFIX)
     require_safe_token_string(row["host"], label=f"{label}.host")
-    require_opaque_digest_string(row["session_id"], label=f"{label}.session_id")
+    require_opaque_digest_string(row["session_id"], label=f"{label}.session_id", prefix=SESSION_REF_PREFIX)
     require_string(row["source_path"], label=f"{label}.source_path")
     if not PATH_REF_PATTERN.fullmatch(row["source_path"]):
         raise SystemExit(f"{label}.source_path: retained refs must use opaque {PATH_REF_PREFIX} values")
@@ -1632,9 +1683,7 @@ def save_state(path: Path | None, data: dict[str, Any]) -> None:
 def safe_state_path(raw: str | None) -> Path | None:
     if not raw:
         return None
-    path = Path(raw)
-    ensure_safe_output_dir(path)
-    return path
+    return ensure_safe_output_dir(Path(raw))
 
 
 def history_artifact_name_tokens(name: str) -> list[str]:
@@ -1736,7 +1785,23 @@ def require_history_repo(history_repo: str | None) -> Path:
     repo = Path(history_repo).expanduser()
     if not repo.exists() or not repo.is_dir():
         raise SystemExit("--history-repo must be an existing git repository")
+    require_history_repo_identity(repo)
     return repo
+
+
+def require_history_repo_identity(repo: Path) -> None:
+    remote = subprocess.run(
+        ["git", "-C", str(repo), "remote", "get-url", "origin"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if remote.returncode != 0:
+        return
+    remote_url = remote.stdout.strip()
+    if remote_url and EXPECTED_HISTORY_REPO not in remote_url:
+        raise SystemExit(f"--history-repo origin must be {EXPECTED_HISTORY_REPO}")
 
 
 def require_history_commit(repo: Path, commit: str) -> None:
@@ -1782,6 +1847,19 @@ def require_history_ref_current_head(repo: Path, ref: str) -> None:
     head_oid = history_commit_oid(repo, "HEAD")
     if ref_oid != head_oid:
         raise SystemExit("--history-ref must resolve to the current history worktree HEAD")
+
+
+def require_history_worktree_clean(repo: Path) -> None:
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise SystemExit("failed to inspect history worktree status")
+    if status.stdout:
+        raise SystemExit("--history-repo worktree must be clean before advancing state")
 
 
 def history_tree_files(repo: Path, ref: str) -> list[str]:
@@ -1982,9 +2060,14 @@ def local_source_requires_index_files(source: Source) -> bool:
     if source.host != "local":
         return False
     canonical_codex = Path("~/.codex").expanduser().resolve(strict=False)
-    if source.root.expanduser().resolve(strict=False) != canonical_codex and source.root.name != ".codex":
+    return source.root.expanduser().resolve(strict=False) == canonical_codex
+
+
+def source_allows_mtime_fallback(source: Source) -> bool:
+    if source.host != "local":
         return False
-    return True
+    canonical_codex = Path("~/.codex").expanduser().resolve(strict=False)
+    return source.root.expanduser().resolve(strict=False) == canonical_codex
 
 
 def remote_metadata_gap(source: Source, reason: str = "stale_host") -> dict[str, Any]:
@@ -2042,8 +2125,7 @@ def run_scan(
     emit_start: dt.datetime | None = None,
 ) -> int:
     validate_window_bounds(start, end, "scan")
-    output = Path(args.output)
-    ensure_safe_output_dir(output)
+    output = ensure_safe_output_dir(Path(args.output))
     safe_state_path(args.state)
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
     all_turns: list[TurnSummary] = []
@@ -2102,6 +2184,7 @@ def run_scan(
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
+        allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
         manifest_sources.append(
@@ -2115,7 +2198,13 @@ def run_scan(
             }
         )
         for rollout in rollouts:
-            if not rollout_candidate_relevant(rollout, start, end, max_raw_bytes=max_raw_bytes):
+            if not rollout_candidate_relevant(
+                rollout,
+                start,
+                end,
+                max_raw_bytes=max_raw_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+            ):
                 continue
             size = rollout.stat().st_size
             if size <= max_raw_bytes:
@@ -2124,7 +2213,7 @@ def run_scan(
                     if (
                         rollout_filename_in_window(rollout, start, end)
                         or raw_timestamp_in_window(rollout, start, end)
-                        or rollout_mtime_active(rollout, start, end)
+                        or (allow_mtime_fallback and rollout_mtime_active(rollout, start, end))
                     ):
                         coverage_gaps.append(
                             {
@@ -2134,9 +2223,18 @@ def run_scan(
                             }
                         )
                     continue
-                if not rollout_has_record_in_window(rollout, start, end):
+                if not rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=allow_mtime_fallback):
                     continue
-                all_turns.extend(extract_rollout(source, rollout, start, end, emit_start=emit_start))
+                all_turns.extend(
+                    extract_rollout(
+                        source,
+                        rollout,
+                        start,
+                        end,
+                        emit_start=emit_start,
+                        allow_mtime_fallback=allow_mtime_fallback,
+                    )
+                )
                 continue
             relevance = oversized_rollout_relevance(rollout, start, end)
             if relevance == "irrelevant":
@@ -2187,8 +2285,7 @@ def run_scan(
 
 def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
     validate_window_bounds(start, end, "discover")
-    output = Path(args.output)
-    ensure_safe_output_dir(output)
+    output = ensure_safe_output_dir(Path(args.output))
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
     manifest_sources: list[dict[str, Any]] = []
     coverage_gaps: list[dict[str, Any]] = []
@@ -2356,8 +2453,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     if manifest.get("retention_safe") is True:
         raise SystemExit("make-shards requires transient shard_manifest.json, not retained_manifest.json")
-    output = Path(args.output)
-    ensure_safe_output_dir(output)
+    output = ensure_safe_output_dir(Path(args.output))
     sources = manifest.get("sources", [])
     window = manifest.get("window") or {}
     start, end = require_manifest_window_bounds(window, "manifest window")
@@ -2391,11 +2487,19 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             raise SystemExit("make-shards requires transient manifest sources with status=ready")
         if status != "ready":
             continue
+        source = Source(str(host), root)
+        allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not root.exists():
             rows.append(shard_row(root, status="missing", coverage_gap="source root missing"))
             continue
-        for rollout in source_rollouts(Source(str(host), root)):
-            if not rollout_candidate_relevant(rollout, start, end, max_raw_bytes=max_raw_bytes):
+        for rollout in source_rollouts(source):
+            if not rollout_candidate_relevant(
+                rollout,
+                start,
+                end,
+                max_raw_bytes=max_raw_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+            ):
                 continue
             size = rollout.stat().st_size
             row = shard_row(rollout, bytes=size)
@@ -2405,13 +2509,13 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     if (
                         rollout_filename_in_window(rollout, start, end)
                         or raw_timestamp_in_window(rollout, start, end)
-                        or rollout_mtime_active(rollout, start, end)
+                        or (allow_mtime_fallback and rollout_mtime_active(rollout, start, end))
                     ):
                         row["status"] = "invalid"
                         row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"
                         rows.append(row)
                     continue
-                if rollout_has_record_in_window(rollout, start, end):
+                if rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=allow_mtime_fallback):
                     row["status"] = "ready"
                     rows.append(row)
                 continue
@@ -2648,6 +2752,7 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
     history_repo = require_history_repo(args.history_repo)
     require_history_ancestor(history_repo, history_commit, history_ref)
     require_history_ref_current_head(history_repo, history_ref)
+    require_history_worktree_clean(history_repo)
     validate_history_tree(args.history_repo, history_ref)
     require_retained_export_in_history_ref(history_repo, history_ref, retained_parent, actual_files)
     window = trend.get("window") or {}
