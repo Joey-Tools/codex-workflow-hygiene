@@ -347,6 +347,49 @@ def rollout_filename_in_window(path: Path, start: dt.datetime | None, end: dt.da
     return True
 
 
+def tail_has_record_in_window(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    tail_bytes: int = 256 * 1024,
+) -> bool:
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if size > tail_bytes:
+            handle.seek(size - tail_bytes)
+            handle.readline()
+        data = handle.read()
+    fallback = rollout_date_from_path(path)
+    for raw_line in data.splitlines():
+        try:
+            record = json.loads(raw_line.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            continue
+        timestamp = parse_time(record_timestamp(record))
+        if timestamp is None:
+            timestamp = fallback
+        if timestamp is None:
+            continue
+        if start and timestamp < start:
+            continue
+        if end and timestamp >= end:
+            continue
+        return True
+    return False
+
+
+def oversized_rollout_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    if start is None and end is None:
+        return True
+    rollout_date = rollout_date_from_path(path)
+    if rollout_date and end and rollout_date >= end:
+        return False
+    if rollout_date and start and rollout_date < start:
+        return tail_has_record_in_window(path, start, end)
+    return True
+
+
 def infer_model_era(model: str | None, timestamp: str | None) -> str:
     if model:
         if "gpt-5.5" in model:
@@ -604,7 +647,15 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
     for source in sources:
         if not source.root.exists():
             coverage_gaps.append({"host": source.host, "root": path_ref(source.root), "reason": "source_root_missing"})
-            manifest_sources.append({"host": source.host, "root": path_ref(source.root), "rollout_count": 0, "status": "missing"})
+            manifest_sources.append(
+                {
+                    "host": source.host,
+                    "root": source.root.as_posix(),
+                    "root_ref": path_ref(source.root),
+                    "rollout_count": 0,
+                    "status": "missing",
+                }
+            )
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
@@ -613,7 +664,8 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
         manifest_sources.append(
             {
                 "host": source.host,
-                "root": path_ref(source.root),
+                "root": source.root.as_posix(),
+                "root_ref": path_ref(source.root),
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
                 "status": "ready" if rollouts or summaries else "empty",
@@ -622,7 +674,7 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
         for rollout in rollouts:
             size = rollout.stat().st_size
             if size > max_raw_bytes:
-                if not rollout_filename_in_window(rollout, start, end):
+                if not oversized_rollout_relevant(rollout, start, end):
                     continue
                 coverage_gaps.append(
                     {
@@ -656,6 +708,8 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
             "sources": manifest_sources,
             "coverage_gaps": coverage_gaps,
             "redaction_policy_version": 1,
+            "retention_safe": False,
+            "retention_note": "Transient execution manifest may contain raw local paths; promote redacted refs only.",
         },
     )
     if args.state and not coverage_gaps:
@@ -711,13 +765,13 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         host = source.get("host")
         root = Path(source.get("root", "")).expanduser()
         if not root.exists():
-            rows.append({"host": host, "path": path_ref(root), "status": "missing", "coverage_gap": "source root missing"})
+            rows.append({"host": host, "path": root.as_posix(), "path_ref": path_ref(root), "status": "missing", "coverage_gap": "source root missing"})
             continue
         for rollout in source_rollouts(Source(str(host), root)):
             size = rollout.stat().st_size
-            row = {"host": host, "path": path_ref(rollout), "bytes": size}
+            row = {"host": host, "path": rollout.as_posix(), "path_ref": path_ref(rollout), "bytes": size}
             if size > args.max_raw_bytes:
-                if not rollout_filename_in_window(rollout, start, end):
+                if not oversized_rollout_relevant(rollout, start, end):
                     continue
                 row["status"] = "oversized"
                 row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"

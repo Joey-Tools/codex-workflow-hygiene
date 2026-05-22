@@ -408,7 +408,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "oversized")
         self.assertIn("coverage_gap", rows[0])
-        self.assertNotIn(str(root), json.dumps(rows))
+        self.assertEqual(rows[0]["path"], str(large))
+        self.assertIn("path_hash:", rows[0]["path_ref"])
 
     def test_window_outside_oversized_rollout_does_not_block_daily_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -429,6 +430,52 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             self.assertTrue(state.exists())
             self.assertEqual(trend["coverage_gaps"], [])
+
+    def test_old_oversized_rollout_with_in_window_tail_blocks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            old_large.parent.mkdir(parents=True, exist_ok=True)
+            old_large.write_text(
+                ("x" * 2000)
+                + "\n"
+                + json.dumps(message("user", "Fresh continuation.", "2026-05-01T12:00:00Z"))
+                + "\n",
+                encoding="utf-8",
+            )
+            output = Path(raw) / "out"
+            state = Path(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
+        self.assertIn("path_hash:", trend["coverage_gaps"][0]["path"])
+
+    def test_scan_manifest_keeps_execution_path_and_redacted_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = Path(raw) / "out"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["sources"][0]["root"], str(root))
+        self.assertIn("path_hash:", manifest["sources"][0]["root_ref"])
+        self.assertFalse(manifest["retention_safe"])
 
     def test_missing_source_reports_gap_and_does_not_update_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
