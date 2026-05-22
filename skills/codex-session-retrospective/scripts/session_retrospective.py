@@ -1715,6 +1715,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         if not source.get("root"):
             raise SystemExit("make-shards requires transient manifest sources with raw root fields")
         root = Path(source["root"]).expanduser()
+        if source.get("status") not in (None, "ready"):
+            continue
         if not root.exists():
             rows.append({"host": host, "path": root.as_posix(), "path_ref": path_ref(root), "status": "missing", "coverage_gap": "source root missing"})
             continue
