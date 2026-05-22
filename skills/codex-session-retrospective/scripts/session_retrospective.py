@@ -685,9 +685,14 @@ def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.
     if start is None and end is None:
         return True
     fallback = rollout_window_date(path)
+    saw_record = False
+    saw_explicit_timestamp = False
     for _line_no, record in iter_jsonl(path):
+        saw_record = True
         timestamp = parse_time(record_timestamp(record))
-        if timestamp is None:
+        if timestamp is not None:
+            saw_explicit_timestamp = True
+        else:
             timestamp = fallback
         if timestamp is None:
             continue
@@ -695,6 +700,8 @@ def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.
             continue
         if end and timestamp >= end:
             continue
+        return True
+    if saw_record and not saw_explicit_timestamp and rollout_mtime_active(path, start, end):
         return True
     return False
 
