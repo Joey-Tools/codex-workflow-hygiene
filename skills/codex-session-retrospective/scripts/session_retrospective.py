@@ -1630,6 +1630,8 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
 
 
 def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    if run_dir.is_symlink():
+        raise SystemExit(f"refusing symlinked output directory: {run_dir}")
     required = {
         "turn_summaries.jsonl": {"turn_id", "episode_id", "host", "redacted_user_prompt_summary", "issue_flags"},
         "episodes.jsonl": {"episode_id", "host", "topic", "friction_flags"},
@@ -1693,6 +1695,8 @@ def retained_export_files_from_dir(run_dir: Path) -> dict[str, bytes]:
 
 
 def validate_retained_output_dir(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    if run_dir.is_symlink():
+        raise SystemExit(f"refusing symlinked retained output directory: {run_dir}")
     if not run_dir.is_dir():
         raise SystemExit(f"retained output directory not found: {run_dir}")
     allowed = set(RETAINED_OUTPUT_FILES)
@@ -1729,6 +1733,8 @@ def cmd_export_retained(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir)
     files = retained_export_files_from_run(run_dir)
     output = Path(args.output)
+    if output.is_symlink():
+        raise SystemExit(f"refusing symlinked retained output directory: {output}")
     output.mkdir(parents=True, exist_ok=True)
     allowed = set(RETAINED_OUTPUT_FILES)
     for path in output.iterdir():

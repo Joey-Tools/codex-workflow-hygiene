@@ -1245,6 +1245,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "unexpected retained output"):
                 MODULE.main(["export-retained", "--run-dir", str(output), "--output", str(retained_output)])
 
+    def test_export_retained_rejects_symlink_output_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            real_output = Path(raw) / "real-retained"
+            real_output.mkdir()
+            retained_output = Path(raw) / "history-retained"
+            retained_output.symlink_to(real_output, target_is_directory=True)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+
+            with self.assertRaisesRegex(SystemExit, "symlinked retained output directory"):
+                MODULE.main(["export-retained", "--run-dir", str(output), "--output", str(retained_output)])
+            with self.assertRaisesRegex(SystemExit, "symlinked retained output directory"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
+            self.assertEqual(list(real_output.iterdir()), [])
+
     def test_validate_retained_rejects_extra_jsonl_fields(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
