@@ -219,8 +219,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
         current = Path("rollout-2026-05-07T13-24-44-019d-uuid.jsonl")
         legacy = Path("rollout-2025-05-26-legacy-uuid.jsonl")
 
-        self.assertEqual(MODULE.session_id_from_path(current), "019d-uuid")
-        self.assertEqual(MODULE.session_id_from_path(legacy), "legacy-uuid")
+        self.assertEqual(MODULE.session_id_from_path(current), MODULE.opaque_session_id("019d-uuid"))
+        self.assertEqual(MODULE.session_id_from_path(legacy), MODULE.opaque_session_id("legacy-uuid"))
+        self.assertRegex(MODULE.session_id_from_path(current), r"^[0-9a-f]{20}$")
+        self.assertNotEqual(MODULE.session_id_from_path(current), "019d-uuid")
+        self.assertNotEqual(MODULE.session_id_from_path(legacy), "legacy-uuid")
         self.assertEqual(MODULE.iso(MODULE.rollout_date_from_path(current)), "2026-05-07T13:24:44Z")
         self.assertEqual(MODULE.iso(MODULE.rollout_date_from_path(legacy)), "2025-05-26T00:00:00Z")
 
@@ -679,6 +682,23 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertRegex(turns[0].source_hash, r"^[0-9a-f]{64}$")
         self.assertNotEqual(turns[0].source_hash, plain_hash)
+
+    def test_summary_session_id_is_opaque(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {"kind": "session_meta", "timestamp": "2026-05-22T10:00:00Z", "text": "session_id=customer-incident-123 cwd=/secret/repo"},
+                    {"kind": "summary", "timestamp": "2026-05-22T10:01:00Z", "text": "permission denied"},
+                ],
+            )
+
+            turns = MODULE.extract_summary_file(MODULE.Source("remote", root), summary, None, None)
+
+        self.assertRegex(turns[0].session_id, r"^[0-9a-f]{20}$")
+        self.assertNotEqual(turns[0].session_id, "customer-incident-123")
 
     def test_wrapper_user_message_does_not_flag_previous_turn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3178,7 +3198,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "turn_id": "t1",
                 "episode_id": "e1",
                 "host": "local",
-                "session_id": "s1",
+                "session_id": "a" * 20,
                 "source_path": "path_ref_v1:0123456789abcdef",
                 "source_hash": "0" * 64,
                 "timestamp": "2026-05-22T10:00:00Z",
@@ -3216,6 +3236,43 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "unredacted sensitive text"):
                 MODULE.main(["validate-output", "--run-dir", str(run_dir)])
 
+    def test_retained_validators_reject_raw_session_id(self) -> None:
+        turn = {
+            "turn_id": "t1",
+            "episode_id": "e1",
+            "host": "local",
+            "session_id": "customer-incident-123",
+            "source_path": "path_ref_v1:0123456789abcdef",
+            "source_hash": "0" * 64,
+            "timestamp": "2026-05-22T10:00:00Z",
+            "cwd": None,
+            "model": None,
+            "model_era": "unknown",
+            "redacted_user_prompt_summary": "category=debug",
+            "assistant_action_summary": "",
+            "issue_flags": ["failed_command"],
+            "prompt_improvement": None,
+        }
+        episode = {
+            "episode_id": "e1",
+            "host": "local",
+            "session_id": "customer-incident-123",
+            "start": "2026-05-22T10:00:00Z",
+            "end": "2026-05-22T10:00:00Z",
+            "cwd": None,
+            "model_era": "unknown",
+            "topic": "category=debug",
+            "turn_count": 1,
+            "friction_flags": ["failed_command"],
+            "outcome": "needs_review",
+            "work_report_hint": None,
+        }
+
+        with self.assertRaisesRegex(SystemExit, "opaque keyed digest"):
+            MODULE.validate_turn_flag_row(turn, label="turn")
+        with self.assertRaisesRegex(SystemExit, "opaque keyed digest"):
+            MODULE.validate_episode_row(episode, label="episode")
+
     def test_rollout_summary_file_contributes_flags_without_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "remote"
@@ -3223,7 +3280,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(
                 summary,
                 [
-                    {"kind": "session_meta", "timestamp": "2026-05-22T10:00:00Z", "text": "session_id=s1 cwd=/secret/repo"},
+                    {"kind": "session_meta", "timestamp": "2026-05-22T10:00:00Z", "text": "session_id=customer-incident-123 cwd=/secret/repo"},
                     {"kind": "function_call_output", "timestamp": "2026-05-22T10:01:00Z", "text": "permission denied in /customer/code.py"},
                 ],
             )

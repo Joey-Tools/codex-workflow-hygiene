@@ -407,6 +407,10 @@ def opaque_digest(value: str | os.PathLike[str], length: int = 20) -> str:
     return digest.hexdigest()[:length]
 
 
+def opaque_session_id(value: str | os.PathLike[str]) -> str:
+    return opaque_digest(f"session_id_v1|{os.fspath(value)}", 20)
+
+
 def file_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -434,8 +438,8 @@ def ensure_safe_output_dir(path: Path) -> None:
 def session_id_from_path(path: Path) -> str:
     match = re.search(r"^rollout-\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2})?-(.+)\.jsonl$", path.name)
     if match:
-        return match.group(1)
-    return opaque_digest(path.as_posix())
+        return opaque_session_id(match.group(1))
+    return opaque_session_id(path.as_posix())
 
 
 def rollout_date_from_path(path: Path) -> dt.datetime | None:
@@ -967,7 +971,7 @@ def extract_summary_file(
 ) -> list[TurnSummary]:
     turns: list[TurnSummary] = []
     source_hash = file_source_hash(path)
-    session_id = opaque_digest(path.as_posix(), 20)
+    session_id = opaque_session_id(path.as_posix())
     fallback = summary_date_from_path(path)
     for line_no, record in iter_jsonl(path):
         timestamp = str(record.get("timestamp") or "") or None
@@ -985,7 +989,7 @@ def extract_summary_file(
         if kind == "session_meta" and text:
             match = re.search(r"session_id=([^\s]+)", text)
             if match:
-                session_id = match.group(1)
+                session_id = opaque_session_id(match.group(1))
             continue
         _redacted_text, changed = redact(text)
         flags = flags_for_text(text, redacted_changed=changed)
@@ -1264,6 +1268,13 @@ def require_safe_token_string(value: Any, *, label: str) -> str:
     return text
 
 
+def require_opaque_digest_string(value: Any, *, label: str) -> str:
+    text = require_string(value, label=label)
+    if not re.fullmatch(r"[0-9a-f]{20}", text):
+        raise SystemExit(f"{label}: expected opaque keyed digest")
+    return text
+
+
 def require_path_ref_or_none(value: Any, *, label: str) -> str | None:
     if value is None:
         return None
@@ -1291,7 +1302,7 @@ def require_non_negative_int(value: Any, *, label: str) -> int:
 def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
     require_safe_token_string(row["episode_id"], label=f"{label}.episode_id")
     require_safe_token_string(row["host"], label=f"{label}.host")
-    require_safe_token_string(row["session_id"], label=f"{label}.session_id")
+    require_opaque_digest_string(row["session_id"], label=f"{label}.session_id")
     require_timestamp_or_none(row["start"], label=f"{label}.start")
     require_timestamp_or_none(row["end"], label=f"{label}.end")
     require_path_ref_or_none(row["cwd"], label=f"{label}.cwd")
@@ -1309,7 +1320,7 @@ def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
     require_safe_token_string(row["turn_id"], label=f"{label}.turn_id")
     require_safe_token_string(row["episode_id"], label=f"{label}.episode_id")
     require_safe_token_string(row["host"], label=f"{label}.host")
-    require_safe_token_string(row["session_id"], label=f"{label}.session_id")
+    require_opaque_digest_string(row["session_id"], label=f"{label}.session_id")
     require_string(row["source_path"], label=f"{label}.source_path")
     if not PATH_REF_PATTERN.fullmatch(row["source_path"]):
         raise SystemExit(f"{label}.source_path: retained refs must use opaque {PATH_REF_PREFIX} values")
