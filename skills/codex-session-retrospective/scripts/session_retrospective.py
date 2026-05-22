@@ -106,6 +106,26 @@ RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.jso
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
 HISTORY_FORBIDDEN_FILENAMES = frozenset((*TRANSIENT_OUTPUT_FILES, *LOCAL_EVIDENCE_FILES, REMOTE_SOURCE_METADATA_FILE))
 HISTORY_FORBIDDEN_COMPONENTS = frozenset((".codex", ".codex-local", ".codex-tmp", "raw", "scratch", "transient"))
+HISTORY_FORBIDDEN_NAME_STEMS = frozenset(
+    (
+        "history",
+        "session_index",
+        "shard_manifest",
+        "shards",
+        "source_metadata",
+        "turn_summaries",
+    )
+)
+HISTORY_FORBIDDEN_NAME_TOKENS = frozenset(("raw", "rollout", "scratch", "transcript", "transcripts", "transient"))
+HISTORY_FORBIDDEN_TOKEN_PHRASES = (
+    ("conversation", "log"),
+    ("full", "prompt"),
+    ("message", "log"),
+    ("prompt", "log"),
+    ("tool", "output"),
+    ("turn", "summaries"),
+    ("user", "prompt"),
+)
 HISTORY_TEXT_EXTENSIONS = (".md", ".txt")
 HISTORY_JSON_EXTENSIONS = (".json",)
 HISTORY_ROOT_FILES = frozenset((".gitignore", "AGENTS.md", "README.md"))
@@ -1581,10 +1601,35 @@ def safe_state_path(raw: str | None) -> Path | None:
     return path
 
 
+def history_artifact_name_tokens(name: str) -> list[str]:
+    stem = name
+    while True:
+        next_stem, suffix = os.path.splitext(stem)
+        if not suffix:
+            break
+        stem = next_stem
+    return [token for token in re.split(r"[^a-z0-9]+", stem.lower()) if token]
+
+
+def forbidden_history_artifact_name(name: str) -> bool:
+    tokens = history_artifact_name_tokens(name)
+    if not tokens:
+        return False
+    normalized = "_".join(tokens)
+    if normalized in HISTORY_FORBIDDEN_NAME_STEMS:
+        return True
+    token_set = set(tokens)
+    if token_set & HISTORY_FORBIDDEN_NAME_TOKENS:
+        return True
+    return any(all(token in token_set for token in phrase) for phrase in HISTORY_FORBIDDEN_TOKEN_PHRASES)
+
+
 def forbidden_history_artifact(file_path: str) -> bool:
     parts = file_path.split("/")
     name = parts[-1]
     if name in HISTORY_FORBIDDEN_FILENAMES:
+        return True
+    if forbidden_history_artifact_name(name):
         return True
     if any(part in HISTORY_FORBIDDEN_COMPONENTS for part in parts):
         return True
@@ -1662,6 +1707,27 @@ def require_history_ancestor(repo: Path, ancestor: str, ref: str) -> None:
         raise SystemExit("--history-ref must include --history-commit")
 
 
+def history_commit_oid(repo: Path, ref: str) -> str:
+    require_history_commit(repo, ref)
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SystemExit("failed to resolve history ref")
+    return completed.stdout.strip()
+
+
+def require_history_ref_current_head(repo: Path, ref: str) -> None:
+    ref_oid = history_commit_oid(repo, ref)
+    head_oid = history_commit_oid(repo, "HEAD")
+    if ref_oid != head_oid:
+        raise SystemExit("--history-ref must resolve to the current history worktree HEAD")
+
+
 def history_tree_files(repo: Path, ref: str) -> list[str]:
     require_history_commit(repo, ref)
     tree = subprocess.run(
@@ -1692,6 +1758,27 @@ def history_json(data: bytes, label: str) -> Any:
         return json.loads(data.decode("utf-8", errors="replace"))
     except json.JSONDecodeError as exc:
         raise SystemExit(f"{label}: invalid JSON") from exc
+
+
+def retained_export_paths(parent: str) -> dict[str, str]:
+    return {name: f"{parent}/{name}" if parent else name for name in RETAINED_OUTPUT_FILES}
+
+
+def require_retained_export_in_history_ref(repo: Path, ref: str, parent: str, retained_files: dict[str, bytes]) -> None:
+    tree_files = set(history_tree_files(repo, ref))
+    expected_paths = retained_export_paths(parent)
+    missing = [path for path in expected_paths.values() if path not in tree_files]
+    if missing:
+        raise SystemExit("--history-ref does not contain the retained export from --history-commit")
+    if parent:
+        descendant_paths = {file_path for file_path in tree_files if file_path.startswith(f"{parent}/")}
+    else:
+        descendant_paths = {file_path for file_path in tree_files if "/" not in file_path}
+    if descendant_paths != set(expected_paths.values()):
+        raise SystemExit("--history-ref retained export directory changed after --history-commit")
+    actual = {name: history_blob(repo, ref, file_path) for name, file_path in expected_paths.items()}
+    if actual != retained_files:
+        raise SystemExit("--history-ref retained export content changed after --history-commit")
 
 
 def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
@@ -1742,7 +1829,7 @@ def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
                 raise SystemExit(f"history artifact contains unredacted sensitive text: {file_path}")
 
 
-def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> None:
+def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> str:
     repo = require_history_repo(history_repo)
     require_history_commit(repo, history_commit)
     tree_files = set(history_tree_files(repo, history_commit))
@@ -1762,7 +1849,7 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
             continue
         if parent_files[parent] != set(RETAINED_OUTPUT_FILES):
             continue
-        allowed_paths = {f"{parent}/{name}" if parent else name for name in RETAINED_OUTPUT_FILES}
+        allowed_paths = set(retained_export_paths(parent).values())
         if parent:
             descendant_paths = {file_path for file_path in tree_files if file_path.startswith(f"{parent}/")}
         else:
@@ -1773,7 +1860,7 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
         for name, file_path in paths.items():
             candidate[name] = history_blob(repo, history_commit, file_path)
         if candidate and retained_export_digest(candidate) == expected_digest and changed_files == set(paths.values()):
-            return
+            return parent
     raise SystemExit("--history-commit does not contain exactly one retained export and no other changed files")
 
 
@@ -2473,10 +2560,12 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
     if retained_manifest.get("window") != retained_export_manifest.get("window"):
         raise SystemExit("retained export manifest window does not match scan output manifest")
     history_ref = str(args.history_ref or "HEAD")
-    validate_history_commit(args.history_repo, history_commit, actual_files)
+    retained_parent = validate_history_commit(args.history_repo, history_commit, actual_files)
     history_repo = require_history_repo(args.history_repo)
     require_history_ancestor(history_repo, history_commit, history_ref)
+    require_history_ref_current_head(history_repo, history_ref)
     validate_history_tree(args.history_repo, history_ref)
+    require_retained_export_in_history_ref(history_repo, history_ref, retained_parent, actual_files)
     window = trend.get("window") or {}
     last_scan_at = window.get("end")
     last_mode = window.get("mode")

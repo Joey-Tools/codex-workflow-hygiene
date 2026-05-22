@@ -2384,6 +2384,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
+    def test_validate_history_tree_rejects_renamed_raw_report_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            raw_artifact = history_repo / "reports" / "weekly" / "raw_tool_output.md"
+            raw_artifact.parent.mkdir(parents=True)
+            raw_artifact.write_text("Tool stdout was copied here.\n", encoding="utf-8")
+            subprocess.run(["git", "add", "reports/weekly/raw_tool_output.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add renamed raw artifact"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_full_prompt_report_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            prompt_artifact = history_repo / "reports" / "weekly" / "full_prompt.md"
+            prompt_artifact.parent.mkdir(parents=True)
+            prompt_artifact.write_text("Summarized prompt text.\n", encoding="utf-8")
+            subprocess.run(["git", "add", "reports/weekly/full_prompt.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add full prompt artifact"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
     def test_validate_history_tree_rejects_unredacted_report_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             history_repo, _commit = write_history_repo(raw)
@@ -2478,6 +2502,123 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add raw follow-on"], cwd=history_repo, check=True)
 
             with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        retained_commit,
+                    ]
+                )
+
+    def test_advance_state_requires_history_ref_to_be_current_head(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, retained_commit = write_history_repo(raw, retained)
+            report = history_repo / "reports" / "daily" / "2026" / "05" / "02.md"
+            report.parent.mkdir(parents=True)
+            report.write_text("# Daily retrospective\n\nRedacted follow-on summary.\n", encoding="utf-8")
+            subprocess.run(["git", "add", "reports/daily/2026/05/02.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add follow-on report"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "current history worktree HEAD"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        retained_commit,
+                        "--history-ref",
+                        retained_commit,
+                    ]
+                )
+
+    def test_advance_state_requires_retained_export_still_present_in_final_head(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, retained_commit = write_history_repo(raw, retained)
+            subprocess.run(["git", "rm", "-r", "-q", "retained"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Remove retained export"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "does not contain the retained export"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        retained_commit,
+                    ]
+                )
+
+    def test_advance_state_requires_retained_export_unchanged_in_final_head(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, retained_commit = write_history_repo(raw, retained)
+            manifest_path = history_repo / "retained" / "daily" / "retained_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["retention_note"] = "Different retained export"
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+            subprocess.run(["git", "add", "retained/daily/retained_manifest.json"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Modify retained export"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "content changed"):
                 MODULE.main(
                     [
                         "advance-state",
