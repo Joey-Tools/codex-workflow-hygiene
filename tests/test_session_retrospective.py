@@ -13,7 +13,6 @@ import unittest
 from unittest import mock
 
 
-HISTORY_COMMIT = "a" * 40
 SCRIPT = (
     Path(__file__).resolve().parents[1]
     / "skills"
@@ -110,6 +109,24 @@ def export_retained(run_dir: Path, root: str, name: str = "history-retained") ->
     return retained_output
 
 
+def write_history_repo(root: str | Path) -> tuple[Path, str]:
+    repo = Path(root) / "history-repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=repo, check=True)
+    (repo / "retained.json").write_text("{}\n", encoding="utf-8")
+    subprocess.run(["git", "add", "retained.json"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add retained export"], cwd=repo, check=True)
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+    return repo, commit
+
+
+def history_commit_args(root: str | Path) -> list[str]:
+    repo, commit = write_history_repo(root)
+    return ["--history-repo", str(repo), "--history-commit", commit]
+
+
 def advance_state(run_dir: Path, state: Path, root: str) -> Path:
     retained_output = export_retained(run_dir, root)
     MODULE.main(
@@ -121,8 +138,7 @@ def advance_state(run_dir: Path, state: Path, root: str) -> Path:
             str(retained_output),
             "--state",
             str(state),
-            "--history-commit",
-            HISTORY_COMMIT,
+            *history_commit_args(root),
         ]
     )
     return retained_output
@@ -943,6 +959,42 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["window"]["start"], "2026-05-21T10:00:00Z")
         self.assertEqual(state_after_scan["last_scan_at"], "2026-05-21T10:00:00Z")
 
+    def test_active_thread_continuation_uses_window_event_turn_id(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "12" / "rollout-2026-05-12T10-00-00-active.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Debug the active deployment.", "2026-05-12T10:00:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T09:00:00Z",
+                        "payload": {"output": "Process exited with code 1"},
+                    },
+                ],
+            )
+
+            first = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-08T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+            )
+            continuation = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-08T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T10:00:00Z"),
+            )
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(continuation), 1)
+        self.assertNotEqual(first[0].turn_id, continuation[0].turn_id)
+        self.assertEqual(continuation[0].timestamp, "2026-05-22T09:00:00Z")
+        self.assertIn("failed_command", continuation[0].issue_flags)
+
     def test_make_shards_respects_window_and_reports_oversized(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1233,6 +1285,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         ]
                     )
 
+    def test_scan_daily_rejects_symlink_state_before_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            state = safe_output_dir(raw) / "state.json"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            linked_state = safe_output_dir(raw) / "linked-state.json"
+            linked_state.write_text(json.dumps({"last_scan_at": "2026-05-21T10:00:00Z"}), encoding="utf-8")
+            state.symlink_to(linked_state)
+            output = safe_output_dir(raw, "out")
+
+            with self.assertRaisesRegex(SystemExit, "unsafe state file"):
+                MODULE.main(
+                    [
+                        "scan-daily",
+                        "--state",
+                        str(state),
+                        "--source",
+                        f"local={root}",
+                        "--allow-partial-hosts",
+                        "--output",
+                        str(output),
+                        "--end",
+                        "2026-05-22T10:00:00Z",
+                    ]
+                )
+
     def test_advance_state_after_valid_scan_ignores_window_external_oversized_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1260,7 +1339,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertTrue(state.exists())
             state_data = json.loads(state.read_text(encoding="utf-8"))
             self.assertEqual(state_data["last_scan_at"], "2026-05-02T00:00:00Z")
-            self.assertEqual(state_data["last_history_commit"], HISTORY_COMMIT)
+            self.assertRegex(state_data["last_history_commit"], r"^[0-9a-f]{40}$")
             self.assertEqual(trend["coverage_gaps"], [])
 
     def test_old_oversized_rollout_with_in_window_tail_blocks_state(self) -> None:
@@ -1297,8 +1376,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained_output),
                         "--state",
                         str(state),
-                        "--history-commit",
-                        HISTORY_COMMIT,
+                        *history_commit_args(raw),
                     ]
                 )
 
@@ -1358,6 +1436,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
         self.assertNotIn("path_ref", trend["coverage_gaps"][0])
+
+    def test_old_oversized_rollout_prefilter_does_not_use_full_raw_timestamp_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            old_large.parent.mkdir(parents=True, exist_ok=True)
+            old_large.write_text("not-json-but-old-oversized " + ("x" * 2000), encoding="utf-8")
+            old_mtime = MODULE.parse_time("2026-01-02T10:00:00Z").timestamp()
+            os.utime(old_large, (old_mtime, old_mtime))
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with mock.patch.object(MODULE, "raw_timestamp_in_window", side_effect=AssertionError("unbounded raw scan")):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "partial_host_scope")
 
     def test_old_oversized_rollout_with_large_in_window_record_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1682,8 +1783,41 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained_two),
                         "--state",
                         str(state),
+                        *history_commit_args(raw),
+                    ]
+                )
+
+    def test_advance_state_rejects_unknown_history_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, _commit = write_history_repo(raw)
+
+            with self.assertRaisesRegex(SystemExit, "must exist"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
                         "--history-commit",
-                        HISTORY_COMMIT,
+                        "0" * 40,
                     ]
                 )
 
@@ -1717,8 +1851,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained),
                         "--state",
                         str(state),
-                        "--history-commit",
-                        HISTORY_COMMIT,
+                        *history_commit_args(raw),
                     ]
                 )
 
@@ -1755,8 +1888,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained),
                         "--state",
                         str(state),
-                        "--history-commit",
-                        HISTORY_COMMIT,
+                        *history_commit_args(raw),
                     ]
                 )
 
@@ -1802,8 +1934,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained),
                         "--state",
                         str(state),
-                        "--history-commit",
-                        HISTORY_COMMIT,
+                        *history_commit_args(raw),
                     ]
                 )
 
@@ -1838,8 +1969,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained),
                         "--state",
                         str(state),
-                        "--history-commit",
-                        HISTORY_COMMIT,
+                        *history_commit_args(raw),
                     ]
                 )
 
@@ -1873,8 +2003,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained),
                         "--state",
                         str(state),
-                        "--history-commit",
-                        HISTORY_COMMIT,
+                        *history_commit_args(raw),
                     ]
                 )
 

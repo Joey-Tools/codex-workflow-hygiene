@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import tempfile
 from collections import Counter, defaultdict
@@ -637,7 +638,13 @@ def rollout_filename_in_window(path: Path, start: dt.datetime | None, end: dt.da
     return True
 
 
-def rollout_candidate_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+def rollout_candidate_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_raw_bytes: int | None = None,
+) -> bool:
     if start is None and end is None:
         return True
     rollout_date = rollout_date_from_path(path)
@@ -649,6 +656,8 @@ def rollout_candidate_relevant(path: Path, start: dt.datetime | None, end: dt.da
         except OSError:
             return True
         if mtime >= start:
+            return True
+        if max_raw_bytes is not None and path.stat().st_size > max_raw_bytes:
             return True
         return raw_timestamp_in_window(path, start, end)
     return True
@@ -721,12 +730,14 @@ def oversized_rollout_relevant(path: Path, start: dt.datetime | None, end: dt.da
     return oversized_rollout_relevance(path, start, end) == "relevant"
 
 
-def raw_timestamp_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+def raw_timestamp_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None, *, max_scan_bytes: int | None = None) -> bool:
+    if max_scan_bytes is None:
+        max_scan_bytes = path.stat().st_size
     found, _complete = oversized_rollout_has_timestamp_in_window(
         path,
         start,
         end,
-        max_scan_bytes=path.stat().st_size,
+        max_scan_bytes=max_scan_bytes,
     )
     return found
 
@@ -784,9 +795,24 @@ def extract_rollout(
     def is_emit_record(timestamp: dt.datetime | None) -> bool:
         return emit_start is None or timestamp is None or timestamp >= emit_start
 
-    def emit_current() -> None:
-        nonlocal current_emitted
+    def emit_current(trigger_line_no: int | None = None, trigger_timestamp: str | None = None) -> None:
+        nonlocal current, current_emitted
         if current and not current_emitted:
+            current_timestamp = parse_time(current.timestamp)
+            event_timestamp = parse_time(trigger_timestamp) if trigger_timestamp else None
+            if (
+                emit_start is not None
+                and current_timestamp is not None
+                and current_timestamp < emit_start
+                and event_timestamp is not None
+                and event_timestamp >= emit_start
+                and trigger_line_no is not None
+            ):
+                current = dataclasses.replace(
+                    current,
+                    turn_id=stable_hash(f"{source.host}|{path}|{trigger_line_no}|{trigger_timestamp}|continuation", 20),
+                    timestamp=trigger_timestamp or current.timestamp,
+                )
             turns.append(current)
             current_emitted = True
 
@@ -858,14 +884,14 @@ def extract_rollout(
                     emit_current()
                 continue
             if assistant_text and current and is_emit_record(parsed_timestamp):
-                emit_current()
+                emit_current(line_no, timestamp)
                 assistant_bits.append(assistant_text)
 
         text = record_text(record)
         _redacted_text, changed = redact(text)
         record_flags = flags_for_text(text, redacted_changed=changed)
         if current and record_flags and is_emit_record(parsed_timestamp):
-            emit_current()
+            emit_current(line_no, timestamp)
             merged = set(current.issue_flags)
             merged.update(record_flags)
             current.issue_flags = sorted(merged)
@@ -1410,8 +1436,14 @@ def parse_sources(values: list[str] | None, *, require_default_hosts: bool = Tru
 
 
 def load_state(path: Path | None) -> dict[str, Any]:
-    if not path or not path.exists():
+    if not path:
         return {}
+    if path.is_symlink():
+        raise SystemExit(f"refusing to read unsafe state file: {path}")
+    if not path.exists():
+        return {}
+    if not path.is_file():
+        raise SystemExit(f"refusing to read unsafe state file: {path}")
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise SystemExit("state file must contain an object")
@@ -1430,6 +1462,22 @@ def safe_state_path(raw: str | None) -> Path | None:
     path = Path(raw)
     ensure_safe_output_dir(path)
     return path
+
+
+def validate_history_commit(history_repo: str | None, history_commit: str) -> None:
+    if not history_repo:
+        raise SystemExit("--history-repo is required")
+    repo = Path(history_repo).expanduser()
+    if not repo.exists() or not repo.is_dir():
+        raise SystemExit("--history-repo must be an existing git repository")
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", f"{history_commit}^{{commit}}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SystemExit("--history-commit must exist in --history-repo")
 
 
 def require_positive_window(value: int, name: str) -> None:
@@ -1599,7 +1647,7 @@ def run_scan(
             }
         )
         for rollout in rollouts:
-            if not rollout_candidate_relevant(rollout, start, end):
+            if not rollout_candidate_relevant(rollout, start, end, max_raw_bytes=max_raw_bytes):
                 continue
             size = rollout.stat().st_size
             if size <= max_raw_bytes:
@@ -1863,7 +1911,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             rows.append({"host": host, "path": root.as_posix(), "path_ref": path_ref(root), "status": "missing", "coverage_gap": "source root missing"})
             continue
         for rollout in source_rollouts(Source(str(host), root)):
-            if not rollout_candidate_relevant(rollout, start, end):
+            if not rollout_candidate_relevant(rollout, start, end, max_raw_bytes=args.max_raw_bytes):
                 continue
             size = rollout.stat().st_size
             row = {"host": host, "path": rollout.as_posix(), "path_ref": path_ref(rollout), "bytes": size}
@@ -2064,6 +2112,7 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
     history_commit = str(args.history_commit or "")
     if not COMMIT_SHA_PATTERN.fullmatch(history_commit):
         raise SystemExit("--history-commit must be a full 40-character hex commit SHA")
+    validate_history_commit(args.history_repo, history_commit)
     run_dir = Path(args.run_dir)
     expected_files = retained_export_files_from_run(run_dir)
     trend, retained_manifest = validate_output_run(run_dir)
@@ -2176,6 +2225,7 @@ def build_parser() -> argparse.ArgumentParser:
     advance.add_argument("--run-dir", required=True)
     advance.add_argument("--retained-run-dir", required=True)
     advance.add_argument("--state", required=True)
+    advance.add_argument("--history-repo", required=True)
     advance.add_argument("--history-commit", required=True)
     advance.set_defaults(func=cmd_advance_state)
 

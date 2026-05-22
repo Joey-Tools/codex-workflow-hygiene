@@ -60,7 +60,7 @@ python3 scripts/session_retrospective.py scan-daily --end 2026-05-22T00:00:00Z -
 python3 scripts/session_retrospective.py validate-output --run-dir .codex-local/session-retrospective/runs/20260522/daily
 python3 scripts/session_retrospective.py export-retained --run-dir .codex-local/session-retrospective/runs/20260522/daily --output .codex-local/session-retrospective/retained/20260522/daily
 python3 scripts/session_retrospective.py validate-retained --run-dir .codex-local/session-retrospective/retained/20260522/daily
-python3 scripts/session_retrospective.py advance-state --run-dir .codex-local/session-retrospective/runs/20260522/daily --retained-run-dir .codex-local/session-retrospective/retained/20260522/daily --state .codex-local/session-retrospective/state.json --history-commit <40-char-history-commit-sha>
+python3 scripts/session_retrospective.py advance-state --run-dir .codex-local/session-retrospective/runs/20260522/daily --retained-run-dir .codex-local/session-retrospective/retained/20260522/daily --state .codex-local/session-retrospective/state.json --history-repo /path/to/codex-session-retrospective-history --history-commit <40-char-history-commit-sha>
 python3 scripts/session_retrospective.py scan-weekly --days 7 --end 2026-05-22T00:00:00Z --output .codex-local/session-retrospective/runs/20260522/weekly
 python3 scripts/session_retrospective.py baseline --window-days 90 --from first --end 2026-05-22T00:00:00Z --output .codex-local/session-retrospective/runs/20260522/baseline
 python3 scripts/session_retrospective.py validate-output --run-dir .codex-local/session-retrospective/runs/20260522/weekly
@@ -70,7 +70,7 @@ python3 scripts/session_retrospective.py validate-retained --run-dir .codex-loca
 
 Use `discover` before map-reduce shard work. `make-shards` only emits sources marked `ready` by the transient manifest; stale, missing, empty, or otherwise non-ready sources stay as coverage gaps and must not be handed to extractor subagents. `scan-*` remains the compact local extraction path for bounded windows and final retained outputs.
 Pass repeated `--source HOST=PATH` values when remote evidence has been materialized locally. `PATH` may be a Codex home containing `sessions/` or a task-scoped directory containing copied `rollout-*.jsonl` files.
-`scan-daily --state` reads the last completed scan but does not advance it. Run `advance-state` only for the same daily run dir and retained export after `validate-output`, `export-retained`, and `validate-retained` pass and the retained export has been committed to private history; pass the resulting 40-character history commit SHA with `--history-commit`.
+`scan-daily --state` reads the last completed scan but does not advance it. Run `advance-state` only for the same daily run dir and retained export after `validate-output`, `export-retained`, and `validate-retained` pass and the retained export has been committed to private history; pass the history repository with `--history-repo` and the resulting 40-character history commit SHA with `--history-commit`, so the helper can verify the commit exists before moving the scan cursor.
 Do not run `scan-*`, `discover`, or `make-shards` output directly into a tracked repository path unless that path ignores `.codex-local/`; those commands write transient execution artifacts. `export-retained` is the safe path for materializing files that may be copied into or written inside the private history worktree.
 
 ## Output Contract
