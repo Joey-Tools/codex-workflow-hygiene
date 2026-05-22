@@ -31,6 +31,7 @@ WRAPPER_PREFIXES = (
 
 AUTOMATION_PROMPT_PATTERNS = (
     re.compile(r"^Run the (?:daily|weekly) Codex session retrospective\b", re.I),
+    re.compile(r"^Run a read-only (?:daily|weekly) retrospective over Joey's Codex session activity\b", re.I),
     re.compile(r"^Use \$codex-session-retrospective to run\b", re.I),
     re.compile(r"^Use the installed codex-session-retrospective workflow\b", re.I),
     re.compile(r"\bWrite task-local artifacts under \.codex-local/session-retrospective\b", re.I),
@@ -152,10 +153,13 @@ MANIFEST_SOURCE_FIELDS = {"host", "root_ref", "status", "rollout_count", "summar
 MANIFEST_GAP_FIELDS = {"host", "root_ref", "reason", "bytes"}
 ALLOWED_REMOTE_GAP_REASONS = {
     "auth_gated",
+    "codex_missing",
     "host_unreachable",
+    "missing_codex",
     "remote_source_not_materialized",
     "source_root_missing",
     "stale_host",
+    "unreachable",
 }
 
 
@@ -458,13 +462,28 @@ def record_text(record: dict[str, Any]) -> str:
 
 
 def meaningful_user_text(text: str) -> bool:
-    stripped = text.strip()
-    if not stripped or any(stripped.startswith(prefix) for prefix in WRAPPER_PREFIXES):
+    stripped = meaningful_prompt_text(text)
+    if not stripped:
         return False
     if any(pattern.search(stripped) for pattern in AUTOMATION_PROMPT_PATTERNS):
         return False
     marker_count = sum(1 for marker in AUTOMATION_PROMPT_MARKERS if marker in stripped)
     return marker_count < 2
+
+
+def meaningful_prompt_text(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    if any(stripped.startswith(prefix) for prefix in WRAPPER_PREFIXES):
+        for marker in ("</INSTRUCTIONS>", "</environment_context>", "</skill>", "</subagent_notification>", "</turn_aborted>"):
+            index = stripped.rfind(marker)
+            if index >= 0:
+                candidate = stripped[index + len(marker) :].strip()
+                if candidate and not any(candidate.startswith(prefix) for prefix in WRAPPER_PREFIXES):
+                    return candidate
+        return ""
+    return stripped
 
 
 def dedupe_text_key(text: str) -> str:
@@ -586,15 +605,15 @@ def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.d
         found, complete = oversized_rollout_has_timestamp_in_window(path, start, end)
         if found:
             return "relevant"
+        if not complete:
+            return "unknown"
         try:
             mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
         except OSError:
             mtime = None
         if mtime and mtime < start:
             return "irrelevant"
-        if complete:
-            return "irrelevant"
-        return "unknown"
+        return "irrelevant"
     return "relevant"
 
 
@@ -686,22 +705,23 @@ def extract_rollout(
         if isinstance(payload, dict):
             user_text = user_text_from_payload(payload)
             assistant_text = assistant_text_from_payload(payload)
+            prompt_text = meaningful_prompt_text(user_text) if user_text else ""
             if user_text and not meaningful_user_text(user_text):
                 flush_assistant()
                 current = None
                 current_emitted = False
                 assistant_bits = []
                 continue
-            if user_text and meaningful_user_text(user_text):
+            if prompt_text and meaningful_user_text(user_text):
                 fingerprint_time = iso(parsed_timestamp.replace(microsecond=0)) if parsed_timestamp else ""
-                fingerprint = (user_text, fingerprint_time)
-                if duplicate_user_turn(user_text, fingerprint_time, last_user_fingerprint):
+                fingerprint = (prompt_text, fingerprint_time)
+                if duplicate_user_turn(prompt_text, fingerprint_time, last_user_fingerprint):
                     continue
                 last_user_fingerprint = fingerprint
                 flush_assistant()
-                redacted_prompt, prompt_changed = redact(user_text)
-                prompt_flags = flags_for_text(user_text, redacted_changed=prompt_changed)
-                prompt_summary = safe_prompt_summary(user_text, prompt_flags, prompt_changed, redacted_prompt)
+                redacted_prompt, prompt_changed = redact(prompt_text)
+                prompt_flags = flags_for_text(prompt_text, redacted_changed=prompt_changed)
+                prompt_summary = safe_prompt_summary(prompt_text, prompt_flags, prompt_changed, redacted_prompt)
                 date_bucket = (parse_time(timestamp) or rollout_date_from_path(path) or utc_now()).date().isoformat()
                 episode_seed = "|".join(
                     [
@@ -709,7 +729,7 @@ def extract_rollout(
                         session_id,
                         (cwd or ""),
                         date_bucket,
-                        prompt_category(user_text),
+                        prompt_category(prompt_text),
                         prompt_topic_key(redacted_prompt),
                     ]
                 )
@@ -1253,7 +1273,7 @@ def remote_evidence_gaps(
         return [remote_metadata_gap(source)]
     if end and window_end < end:
         return [remote_metadata_gap(source)]
-    if end and materialized_at < end:
+    if materialized_at < window_end:
         return [remote_metadata_gap(source)]
     return []
 
@@ -1483,8 +1503,16 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return run_discover(args, mode=args.mode, start=start, end=end)
 
 
+def scan_end(args: argparse.Namespace) -> dt.datetime:
+    end_value = getattr(args, "end", None)
+    end = parse_time(end_value) if end_value else utc_now()
+    if end is None:
+        raise SystemExit(f"invalid --end timestamp: {end_value}")
+    return end
+
+
 def cmd_scan_daily(args: argparse.Namespace) -> int:
-    end = utc_now()
+    end = scan_end(args)
     state_path = safe_state_path(args.state)
     state = load_state(state_path) if state_path else {}
     last = parse_time(state.get("last_scan_at"))
@@ -1499,7 +1527,7 @@ def cmd_scan_daily(args: argparse.Namespace) -> int:
 
 
 def cmd_scan_weekly(args: argparse.Namespace) -> int:
-    end = utc_now()
+    end = scan_end(args)
     start = end - dt.timedelta(days=args.days)
     return run_scan(args, mode="weekly", start=start, end=end)
 
@@ -1509,7 +1537,7 @@ def bounded_baseline_end(start: dt.datetime, window_days: int, now: dt.datetime)
 
 
 def cmd_baseline(args: argparse.Namespace) -> int:
-    now = utc_now()
+    now = scan_end(args)
     sources = parse_sources(args.source, require_default_hosts=not args.allow_partial_hosts)
     if args.from_value == "first":
         start = earliest_rollout_date(sources) or (now - dt.timedelta(days=args.window_days))
@@ -1781,17 +1809,20 @@ def build_parser() -> argparse.ArgumentParser:
     daily = subparsers.add_parser("scan-daily")
     add_common_scan_args(daily)
     daily.add_argument("--active-lookback-days", type=int, default=14)
+    daily.add_argument("--end", help="Fixed exclusive window end timestamp. Use the same timestamp used to materialize remote sources.")
     daily.set_defaults(func=cmd_scan_daily)
 
     weekly = subparsers.add_parser("scan-weekly")
     add_common_scan_args(weekly)
     weekly.add_argument("--days", type=int, default=7)
+    weekly.add_argument("--end", help="Fixed exclusive window end timestamp. Use the same timestamp used to materialize remote sources.")
     weekly.set_defaults(func=cmd_scan_weekly)
 
     baseline = subparsers.add_parser("baseline")
     add_common_scan_args(baseline)
     baseline.add_argument("--window-days", type=int, default=90)
     baseline.add_argument("--from", dest="from_value", default="first")
+    baseline.add_argument("--end", help="Fixed upper bound timestamp for the baseline window.")
     baseline.set_defaults(func=cmd_baseline)
 
     shards = subparsers.add_parser("make-shards")

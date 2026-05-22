@@ -17,6 +17,7 @@ The workflow is read-only against Codex history and remote hosts. It produces re
 - Remote evidence must be collected through `$remote-host-context` preflight plus `remote_codex_probe.py` bounded reads.
 - Once remote rollout data is copied or summarized locally, use this skill's helper for extraction and aggregation.
 - Each materialized default remote source root must include `source_metadata.json` with `host`, `status`, `window_start`, `window_end`, and `materialized_at`; missing or stale metadata is a coverage gap and blocks state advancement.
+- Choose the scan `--end` timestamp before materializing remote evidence, use that same timestamp as the remote metadata `window_end`, and pass it to `scan-daily`, `scan-weekly`, or `baseline`.
 - Never modify `~/.codex`, remote hosts, Apple Notes, or raw rollout files during retrospective collection.
 
 ## Workflow
@@ -54,13 +55,13 @@ Use `scripts/session_retrospective.py`:
 ```bash
 python3 scripts/session_retrospective.py discover --mode weekly --start 2026-05-15T00:00:00Z --end 2026-05-22T00:00:00Z --output .codex-local/session-retrospective/runs/20260522/weekly
 python3 scripts/session_retrospective.py make-shards --manifest .codex-local/session-retrospective/runs/20260522/weekly/shard_manifest.json --output .codex-local/session-retrospective/runs/20260522/weekly --max-raw-bytes 512000
-python3 scripts/session_retrospective.py scan-daily --state .codex-local/session-retrospective/state.json --output .codex-local/session-retrospective/runs/20260522/daily
+python3 scripts/session_retrospective.py scan-daily --end 2026-05-22T00:00:00Z --state .codex-local/session-retrospective/state.json --output .codex-local/session-retrospective/runs/20260522/daily
 python3 scripts/session_retrospective.py validate-output --run-dir .codex-local/session-retrospective/runs/20260522/daily
 python3 scripts/session_retrospective.py export-retained --run-dir .codex-local/session-retrospective/runs/20260522/daily --output .codex-local/session-retrospective/retained/20260522/daily
 python3 scripts/session_retrospective.py validate-retained --run-dir .codex-local/session-retrospective/retained/20260522/daily
 python3 scripts/session_retrospective.py advance-state --run-dir .codex-local/session-retrospective/runs/20260522/daily --retained-run-dir .codex-local/session-retrospective/retained/20260522/daily --state .codex-local/session-retrospective/state.json --history-commit <40-char-history-commit-sha>
-python3 scripts/session_retrospective.py scan-weekly --days 7 --output .codex-local/session-retrospective/runs/20260522/weekly
-python3 scripts/session_retrospective.py baseline --window-days 90 --from first --output .codex-local/session-retrospective/runs/20260522/baseline
+python3 scripts/session_retrospective.py scan-weekly --days 7 --end 2026-05-22T00:00:00Z --output .codex-local/session-retrospective/runs/20260522/weekly
+python3 scripts/session_retrospective.py baseline --window-days 90 --from first --end 2026-05-22T00:00:00Z --output .codex-local/session-retrospective/runs/20260522/baseline
 python3 scripts/session_retrospective.py validate-output --run-dir .codex-local/session-retrospective/runs/20260522/weekly
 python3 scripts/session_retrospective.py export-retained --run-dir .codex-local/session-retrospective/runs/20260522/weekly --output .codex-local/session-retrospective/retained/20260522/weekly
 python3 scripts/session_retrospective.py validate-retained --run-dir .codex-local/session-retrospective/retained/20260522/weekly

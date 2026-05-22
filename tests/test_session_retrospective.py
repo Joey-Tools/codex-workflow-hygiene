@@ -173,6 +173,24 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(MODULE.prompt_category("Review this PR."), "review")
         self.assertNotIn("git_or_pr", MODULE.safe_assistant_summary(["Improved the prompt."]))
 
+    def test_meaningful_prompt_text_keeps_real_prompt_after_leading_wrappers(self) -> None:
+        wrapped = (
+            "# AGENTS.md instructions for /tmp/repo\n"
+            "<INSTRUCTIONS>Repository policy.</INSTRUCTIONS>"
+            "<environment_context>Runtime metadata.</environment_context>\n"
+            "Please implement the session retrospective workflow."
+        )
+
+        self.assertEqual(
+            MODULE.meaningful_prompt_text(wrapped),
+            "Please implement the session retrospective workflow.",
+        )
+        self.assertTrue(MODULE.meaningful_user_text(wrapped))
+        self.assertFalse(MODULE.meaningful_user_text("# AGENTS.md instructions\nRepository policy only."))
+        self.assertFalse(
+            MODULE.meaningful_user_text("Run a read-only daily retrospective over Joey's Codex session activity.")
+        )
+
     def test_default_sources_include_remote_hosts_as_missing_until_materialized(self) -> None:
         sources = MODULE.parse_sources(None)
 
@@ -606,6 +624,47 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(trend["turn_count"], 1)
         self.assertEqual(trend["window"]["start"], "2026-05-08T10:00:00Z")
+
+    def test_daily_scan_uses_explicit_end_for_materialized_remote_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            local = Path(raw) / ".codex"
+            remote = Path(raw) / "miku-bot-dev"
+            write_local_evidence(local)
+            write_remote_metadata(remote, "miku-bot-dev")
+            local_rollout = local / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-local.jsonl"
+            remote_rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            write_jsonl(local_rollout, [message("user", "Local task.", "2026-05-01T10:00:00Z")])
+            write_jsonl(remote_rollout, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with mock.patch.object(
+                MODULE,
+                "parse_sources",
+                return_value=[
+                    MODULE.Source("local", local),
+                    MODULE.Source("miku-bot-dev", remote),
+                ],
+            ), mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-02T00:05:00Z")):
+                MODULE.main(
+                    [
+                        "scan-daily",
+                        "--active-lookback-days",
+                        "1",
+                        "--end",
+                        "2026-05-02T00:00:00Z",
+                        "--state",
+                        str(state),
+                        "--source",
+                        f"local={local}",
+                        "--output",
+                        str(output),
+                    ]
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["window"]["end"], "2026-05-02T00:00:00Z")
+        self.assertEqual(trend["coverage_gaps"], [])
 
     def test_daily_existing_state_uses_last_scan_for_output_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1050,6 +1109,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 + ("x" * 1000),
                 encoding="utf-8",
             )
+            old_mtime = MODULE.parse_time("2026-01-02T10:00:00Z").timestamp()
+            os.utime(old_large, (old_mtime, old_mtime))
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
@@ -1531,6 +1592,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
 
         self.assertEqual(gaps[0]["reason"], "auth_gated")
+
+    def test_default_remote_non_ready_metadata_preserves_common_gap_reasons(self) -> None:
+        for reason in ("missing_codex", "codex_missing", "unreachable", "host_unreachable"):
+            with self.subTest(reason=reason):
+                with tempfile.TemporaryDirectory() as raw:
+                    remote = Path(raw) / "miku-bot-dev"
+                    write_remote_metadata(remote, "miku-bot-dev")
+                    metadata_path = remote / MODULE.REMOTE_SOURCE_METADATA_FILE
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    metadata["status"] = reason
+                    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+                    gaps = MODULE.remote_evidence_gaps(
+                        MODULE.Source("miku-bot-dev", remote),
+                        start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                        end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    )
+
+                self.assertEqual(gaps[0]["reason"], reason)
 
     def test_explicit_default_remote_requires_metadata_even_when_partial_hosts_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
