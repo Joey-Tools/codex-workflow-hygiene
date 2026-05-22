@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import types
 import unittest
 
 
@@ -49,7 +50,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 rollout,
                 [
                     message("user", "# AGENTS.md instructions\nsecret wrapper", "2026-05-22T10:00:00Z"),
-                    message("user", "Please fix this using https://internal.example/case and token ghp_abcdefghijklmnop123456.", "2026-05-22T10:01:00Z"),
+                    message("user", "Please fix this using https://internal.example/case and token sk-proj-abcdefghijklmnop123456.", "2026-05-22T10:01:00Z"),
                     {
                         "type": "function_call_output",
                         "timestamp": "2026-05-22T10:02:00Z",
@@ -62,11 +63,132 @@ class SessionRetrospectiveTests(unittest.TestCase):
             turns = MODULE.extract_rollout(source, rollout, None, None)
 
         self.assertEqual(len(turns), 1)
-        self.assertIn("[REDACTED_URL]", turns[0].redacted_user_prompt_summary)
-        self.assertIn("[REDACTED_SECRET]", turns[0].redacted_user_prompt_summary)
+        self.assertIn("category=debug_or_fix", turns[0].redacted_user_prompt_summary)
+        self.assertIn("redactions=applied", turns[0].redacted_user_prompt_summary)
+        self.assertNotIn("internal.example", turns[0].redacted_user_prompt_summary)
+        self.assertNotIn("sk-proj", turns[0].redacted_user_prompt_summary)
         self.assertIn("failed_command", turns[0].issue_flags)
         self.assertIn("approval_auth_friction", turns[0].issue_flags)
         self.assertIn("safety_privacy_flag", turns[0].issue_flags)
+
+    def test_extract_rollout_groups_multiple_turns_into_one_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-abc.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the helper.", "2026-05-22T10:01:00Z"),
+                    message("assistant", "Implemented the helper.", "2026-05-22T10:02:00Z"),
+                    message("user", "Also add tests.", "2026-05-22T10:03:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+            episodes = MODULE.episode_records(turns)
+
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].episode_id, turns[1].episode_id)
+        self.assertEqual(len(episodes), 1)
+        self.assertEqual(episodes[0]["turn_count"], 2)
+
+    def test_scan_does_not_skip_old_rollout_with_new_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-old.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Old task.", "2026-01-01T10:00:00Z"),
+                    message("user", "New continuation.", "2026-05-22T10:00:00Z"),
+                ],
+            )
+            output = Path(raw) / "out"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-15T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-23T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("category=general", rows[0]["redacted_user_prompt_summary"])
+
+    def test_baseline_honors_window_days(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            first = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-first.jsonl"
+            later = root / "sessions" / "2026" / "04" / "15" / "rollout-2026-04-15T10-00-00-later.jsonl"
+            write_jsonl(first, [message("user", "First window task.", "2026-01-01T10:00:00Z")])
+            write_jsonl(later, [message("user", "Later window task.", "2026-04-15T10:00:00Z")])
+            output = Path(raw) / "out"
+
+            MODULE.main(
+                [
+                    "baseline",
+                    "--window-days",
+                    "90",
+                    "--from",
+                    "first",
+                    "--source",
+                    f"local={root}",
+                    "--output",
+                    str(output),
+                ]
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["turn_count"], 1)
+        self.assertEqual(trend["window"]["start"], "2026-01-01T00:00:00Z")
+        self.assertEqual(trend["window"]["end"], "2026-04-01T00:00:00Z")
+
+    def test_make_shards_respects_window_and_reports_oversized(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            old = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-old.jsonl"
+            large = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-large.jsonl"
+            write_jsonl(old, [message("user", "Old task.", "2026-01-01T10:00:00Z")])
+            write_jsonl(
+                large,
+                [
+                    message("user", "New task with a long body." + ("x" * 200), "2026-05-22T10:00:00Z"),
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root)}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = Path(raw) / "out"
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(manifest),
+                    "--output",
+                    str(output),
+                    "--max-raw-bytes",
+                    "80",
+                ]
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "oversized")
+        self.assertIn("coverage_gap", rows[0])
 
     def test_episode_and_trend_outputs_are_schema_shaped(self) -> None:
         turn = MODULE.TurnSummary(

@@ -24,7 +24,7 @@ WRAPPER_PREFIXES = (
 )
 
 SECRET_PATTERNS = (
-    re.compile(r"\b(?:sk|rk|gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b"),
+    re.compile(r"\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
     re.compile(r"https?://[^\s)>\]\"']+"),
@@ -111,6 +111,32 @@ def redact(text: str) -> tuple[str, bool]:
     return redacted, changed
 
 
+def safe_prompt_summary(text: str, issue_flags: set[str], redacted_changed: bool) -> str:
+    categories: list[str] = []
+    lowered = text.lower()
+    if any(word in lowered for word in ("review", "pr", "pull request")):
+        categories.append("review")
+    if any(word in lowered for word in ("fix", "bug", "error", "failed", "failure")):
+        categories.append("debug_or_fix")
+    if any(word in lowered for word in ("implement", "add", "create", "build")):
+        categories.append("implementation")
+    if any(word in lowered for word in ("plan", "design", "怎么", "设计")):
+        categories.append("planning")
+    if any(word in lowered for word in ("test", "verify", "validate")):
+        categories.append("verification")
+    if not categories:
+        categories.append("general")
+    parts = [
+        f"category={'+'.join(sorted(set(categories)))}",
+        f"prompt_chars={len(text)}",
+    ]
+    if issue_flags:
+        parts.append("flags=" + ",".join(sorted(issue_flags)))
+    if redacted_changed:
+        parts.append("redactions=applied")
+    return "; ".join(parts)
+
+
 def stable_hash(value: str, length: int = 16) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 
@@ -191,6 +217,24 @@ def source_rollouts(source: Source) -> list[Path]:
     return sorted(path for path in search_root.rglob("rollout-*.jsonl") if path.is_file())
 
 
+def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    if start is None and end is None:
+        return True
+    fallback = rollout_date_from_path(path)
+    for _line_no, record in iter_jsonl(path):
+        timestamp = parse_time(record_timestamp(record))
+        if timestamp is None:
+            timestamp = fallback
+        if timestamp is None:
+            continue
+        if start and timestamp < start:
+            continue
+        if end and timestamp >= end:
+            continue
+        return True
+    return False
+
+
 def infer_model_era(model: str | None, timestamp: str | None) -> str:
     if model:
         if "gpt-5.5" in model:
@@ -242,17 +286,10 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
             message_text = text_from_message_payload(payload)
             if role == "user" and meaningful_user_text(message_text):
                 flush_assistant()
-                redacted_prompt, prompt_changed = redact(message_text)
+                _redacted_prompt, prompt_changed = redact(message_text)
                 prompt_flags = flags_for_text(message_text, redacted_changed=prompt_changed)
-                episode_seed = "|".join(
-                    [
-                        source.host,
-                        session_id,
-                        (cwd or ""),
-                        (timestamp or ""),
-                        compact(redacted_prompt, 80),
-                    ]
-                )
+                prompt_summary = safe_prompt_summary(message_text, prompt_flags, prompt_changed)
+                episode_seed = "|".join([source.host, session_id, (cwd or "")])
                 episode_id = stable_hash(episode_seed, 20)
                 turn = TurnSummary(
                     turn_id=stable_hash(f"{source.host}|{path}|{line_no}|{timestamp}", 20),
@@ -265,7 +302,7 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
                     cwd=cwd,
                     model=model,
                     model_era=infer_model_era(model, timestamp),
-                    redacted_user_prompt_summary=compact(redacted_prompt, 700),
+                    redacted_user_prompt_summary=prompt_summary,
                     assistant_action_summary="",
                     issue_flags=sorted(prompt_flags),
                     prompt_improvement=None,
@@ -376,6 +413,16 @@ def save_state(path: Path | None, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
+    earliest: dt.datetime | None = None
+    for source in sources:
+        for rollout in source_rollouts(source):
+            parsed = rollout_date_from_path(rollout)
+            if parsed and (earliest is None or parsed < earliest):
+                earliest = parsed
+    return earliest
+
+
 def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
     output = Path(args.output)
     sources = parse_sources(args.source)
@@ -391,11 +438,6 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
             }
         )
         for rollout in rollouts:
-            rollout_date = rollout_date_from_path(rollout)
-            if rollout_date and start and rollout_date.date() < start.date():
-                continue
-            if rollout_date and rollout_date >= end:
-                continue
             all_turns.extend(extract_rollout(source, rollout, start, end))
 
     episodes = episode_records(all_turns)
@@ -443,8 +485,15 @@ def cmd_scan_weekly(args: argparse.Namespace) -> int:
 
 
 def cmd_baseline(args: argparse.Namespace) -> int:
-    end = utc_now()
-    start = None if args.from_value == "first" else parse_time(args.from_value)
+    now = utc_now()
+    sources = parse_sources(args.source)
+    if args.from_value == "first":
+        start = earliest_rollout_date(sources) or (now - dt.timedelta(days=args.window_days))
+    else:
+        start = parse_time(args.from_value)
+        if start is None:
+            raise SystemExit(f"invalid --from timestamp: {args.from_value}")
+    end = min(now, start + dt.timedelta(days=args.window_days))
     return run_scan(args, mode=f"baseline-{args.window_days}d", start=start, end=end)
 
 
@@ -452,13 +501,24 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     output = Path(args.output)
     sources = manifest.get("sources", [])
+    window = manifest.get("window") or {}
+    start = parse_time(window.get("start"))
+    end = parse_time(window.get("end"))
     rows: list[dict[str, Any]] = []
     for source in sources:
         host = source.get("host")
         root = Path(source.get("root", "")).expanduser()
         for rollout in source_rollouts(Source(str(host), root)):
-            if rollout.stat().st_size <= args.max_raw_bytes:
-                rows.append({"host": host, "path": rollout.as_posix(), "bytes": rollout.stat().st_size})
+            if not rollout_has_record_in_window(rollout, start, end):
+                continue
+            size = rollout.stat().st_size
+            row = {"host": host, "path": rollout.as_posix(), "bytes": size}
+            if size <= args.max_raw_bytes:
+                row["status"] = "ready"
+            else:
+                row["status"] = "oversized"
+                row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"
+            rows.append(row)
     write_jsonl(output / "shards.jsonl", rows)
     print(output / "shards.jsonl")
     return 0
