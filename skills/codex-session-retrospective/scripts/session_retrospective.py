@@ -34,6 +34,7 @@ WRAPPER_PREFIXES = (
 AUTOMATION_PROMPT_PATTERNS = (
     re.compile(r"^Run the (?:daily|weekly) Codex session retrospective\b", re.I),
     re.compile(r"^Run a read-only (?:daily|weekly) retrospective over Joey's Codex session activity\b", re.I),
+    re.compile(r"^Run inside the dedicated worktree provisioned for this automation\b", re.I),
     re.compile(r"^Use \$codex-session-retrospective to run\b", re.I),
     re.compile(r"^Use the installed codex-session-retrospective workflow\b", re.I),
     re.compile(r"\bWrite task-local artifacts under \.codex-local/session-retrospective\b", re.I),
@@ -43,6 +44,8 @@ AUTOMATION_PROMPT_MARKERS = (
     "Run a read-only daily retrospective over Joey's Codex session activity.",
     "Run a read-only weekly retrospective over Joey's Codex session activity.",
     "Evidence scope must match $remote-host-context's default host policy",
+    "Use the automation's configured model and reasoning effort",
+    "When reconstructing the real user task from rollouts, ignore injected wrapper content",
     "Write task-local artifacts under .codex-local/session-retrospective/runs/",
 )
 
@@ -446,8 +449,10 @@ def first_jsonl_error(path: Path) -> int | None:
             if not line.strip():
                 continue
             try:
-                json.loads(line)
+                record = json.loads(line)
             except json.JSONDecodeError:
+                return line_no
+            if not isinstance(record, dict):
                 return line_no
     return None
 
@@ -458,9 +463,11 @@ def iter_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
             if not line.strip():
                 continue
             try:
-                yield line_no, json.loads(line)
+                record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(record, dict):
+                yield line_no, record
 
 
 def iter_jsonl_strict(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -469,9 +476,12 @@ def iter_jsonl_strict(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
             if not line.strip():
                 continue
             try:
-                yield line_no, json.loads(line)
+                record = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{path}:{line_no}: invalid JSON") from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"{path}:{line_no}: JSONL record must be an object")
+            yield line_no, record
 
 
 def text_from_message_payload(payload: dict[str, Any]) -> str:
@@ -627,6 +637,23 @@ def rollout_filename_in_window(path: Path, start: dt.datetime | None, end: dt.da
     return True
 
 
+def rollout_candidate_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    if start is None and end is None:
+        return True
+    rollout_date = rollout_date_from_path(path)
+    if rollout_date and end and rollout_date >= end:
+        return False
+    if rollout_date and start and rollout_date < start:
+        try:
+            mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+        except OSError:
+            return True
+        if mtime >= start:
+            return True
+        return raw_timestamp_in_window(path, start, end)
+    return True
+
+
 TIMESTAMP_BYTES_PATTERN = re.compile(rb'"(?:timestamp|time|created_at|ts)"\s*:\s*"([^"]+)"')
 
 
@@ -686,7 +713,7 @@ def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.d
             mtime = None
         if mtime and mtime < start:
             return "irrelevant"
-        return "irrelevant"
+        return "unknown"
     return "relevant"
 
 
@@ -963,16 +990,32 @@ def asdict_turn(turn: TurnSummary) -> dict[str, Any]:
     return dataclasses.asdict(turn)
 
 
-def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+def write_bytes_atomic(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise SystemExit(f"refusing to write unsafe output path: {path}")
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except Exception:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+    write_bytes_atomic(path, jsonl_bytes(rows))
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_bytes_atomic(path, json_bytes(data))
 
 
 def jsonl_bytes(rows: Iterable[dict[str, Any]]) -> bytes:
@@ -1378,8 +1421,7 @@ def load_state(path: Path | None) -> dict[str, Any]:
 def save_state(path: Path | None, data: dict[str, Any]) -> None:
     if not path:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_bytes_atomic(path, (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
 
 def safe_state_path(raw: str | None) -> Path | None:
@@ -1388,6 +1430,16 @@ def safe_state_path(raw: str | None) -> Path | None:
     path = Path(raw)
     ensure_safe_output_dir(path)
     return path
+
+
+def require_positive_window(value: int, name: str) -> None:
+    if value <= 0:
+        raise SystemExit(f"{name} must be positive")
+
+
+def validate_window_bounds(start: dt.datetime | None, end: dt.datetime | None, label: str) -> None:
+    if start is not None and end is not None and start >= end:
+        raise SystemExit(f"{label} start must be before end")
 
 
 def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
@@ -1484,6 +1536,7 @@ def run_scan(
     end: dt.datetime,
     emit_start: dt.datetime | None = None,
 ) -> int:
+    validate_window_bounds(start, end, "scan")
     output = Path(args.output)
     ensure_safe_output_dir(output)
     safe_state_path(args.state)
@@ -1546,6 +1599,8 @@ def run_scan(
             }
         )
         for rollout in rollouts:
+            if not rollout_candidate_relevant(rollout, start, end):
+                continue
             size = rollout.stat().st_size
             if size <= max_raw_bytes:
                 error_line = first_jsonl_error(rollout)
@@ -1629,6 +1684,7 @@ def run_scan(
 
 
 def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
+    validate_window_bounds(start, end, "discover")
     output = Path(args.output)
     ensure_safe_output_dir(output)
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
@@ -1732,6 +1788,7 @@ def scan_end(args: argparse.Namespace) -> dt.datetime:
 
 
 def cmd_scan_daily(args: argparse.Namespace) -> int:
+    require_positive_window(args.active_lookback_days, "--active-lookback-days")
     end = scan_end(args)
     state_path = safe_state_path(args.state)
     state = load_state(state_path) if state_path else {}
@@ -1747,6 +1804,7 @@ def cmd_scan_daily(args: argparse.Namespace) -> int:
 
 
 def cmd_scan_weekly(args: argparse.Namespace) -> int:
+    require_positive_window(args.days, "--days")
     end = scan_end(args)
     start = end - dt.timedelta(days=args.days)
     return run_scan(args, mode="weekly", start=start, end=end)
@@ -1757,6 +1815,7 @@ def bounded_baseline_end(start: dt.datetime, window_days: int, now: dt.datetime)
 
 
 def cmd_baseline(args: argparse.Namespace) -> int:
+    require_positive_window(args.window_days, "--window-days")
     now = scan_end(args)
     sources = parse_sources(args.source, require_default_hosts=not args.allow_partial_hosts)
     if args.from_value == "first":
@@ -1766,7 +1825,9 @@ def cmd_baseline(args: argparse.Namespace) -> int:
         if start is None:
             raise SystemExit(f"invalid --from timestamp: {args.from_value}")
     mode = f"baseline-{args.window_days}d"
-    return run_scan(args, mode=mode, start=start, end=bounded_baseline_end(start, args.window_days, now))
+    end = bounded_baseline_end(start, args.window_days, now)
+    validate_window_bounds(start, end, "baseline")
+    return run_scan(args, mode=mode, start=start, end=end)
 
 
 def parse_manifest_window_time(window: dict[str, Any], key: str) -> dt.datetime | None:
@@ -1789,6 +1850,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     window = manifest.get("window") or {}
     start = parse_manifest_window_time(window, "start")
     end = parse_manifest_window_time(window, "end")
+    validate_window_bounds(start, end, "manifest window")
     rows: list[dict[str, Any]] = []
     for source in sources:
         host = source.get("host")
@@ -1801,6 +1863,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             rows.append({"host": host, "path": root.as_posix(), "path_ref": path_ref(root), "status": "missing", "coverage_gap": "source root missing"})
             continue
         for rollout in source_rollouts(Source(str(host), root)):
+            if not rollout_candidate_relevant(rollout, start, end):
+                continue
             size = rollout.stat().st_size
             row = {"host": host, "path": rollout.as_posix(), "path_ref": path_ref(rollout), "bytes": size}
             if size <= args.max_raw_bytes:

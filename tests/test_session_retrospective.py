@@ -161,6 +161,26 @@ def event_user_message(text: str, timestamp: str) -> dict:
 
 
 class SessionRetrospectiveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._key_tmp = tempfile.TemporaryDirectory()
+        self._old_key_file = os.environ.get("CODEX_SESSION_RETROSPECTIVE_KEY_FILE")
+        self._old_key = os.environ.get("CODEX_SESSION_RETROSPECTIVE_KEY")
+        os.environ["CODEX_SESSION_RETROSPECTIVE_KEY_FILE"] = str(Path(self._key_tmp.name) / "opaque_ref_key")
+        os.environ.pop("CODEX_SESSION_RETROSPECTIVE_KEY", None)
+        MODULE.PATH_REF_KEY = None
+
+    def tearDown(self) -> None:
+        if self._old_key_file is None:
+            os.environ.pop("CODEX_SESSION_RETROSPECTIVE_KEY_FILE", None)
+        else:
+            os.environ["CODEX_SESSION_RETROSPECTIVE_KEY_FILE"] = self._old_key_file
+        if self._old_key is None:
+            os.environ.pop("CODEX_SESSION_RETROSPECTIVE_KEY", None)
+        else:
+            os.environ["CODEX_SESSION_RETROSPECTIVE_KEY"] = self._old_key
+        MODULE.PATH_REF_KEY = None
+        self._key_tmp.cleanup()
+
     def test_filename_parsers_support_current_and_legacy_rollouts(self) -> None:
         current = Path("rollout-2026-05-07T13-24-44-019d-uuid.jsonl")
         legacy = Path("rollout-2025-05-26-legacy-uuid.jsonl")
@@ -443,6 +463,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(turns, [])
 
+    def test_existing_daily_skill_friction_wrapper_is_not_user_episode(self) -> None:
+        prompt = (
+            "Run inside the dedicated worktree provisioned for this automation. "
+            "Use the automation's configured model and reasoning effort unless the runtime refuses them. "
+            "When reconstructing the real user task from rollouts, ignore injected wrapper content. "
+            "Check approval/auth friction, secrets, customer data, and destructive commands."
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-dsf.jsonl"
+            write_jsonl(rollout, [message("user", prompt, "2026-05-22T10:01:00Z")])
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(turns, [])
+
     def test_agent_default_prompt_is_not_treated_as_user_episode(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -706,6 +742,58 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["turn_count"], 1)
         self.assertEqual(trend["window"]["start"], "2026-05-08T10:00:00Z")
 
+    def test_scan_commands_reject_non_positive_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            output = safe_output_dir(raw)
+
+            with self.assertRaisesRegex(SystemExit, "active-lookback-days.*positive"):
+                MODULE.main(
+                    [
+                        "scan-daily",
+                        "--active-lookback-days",
+                        "0",
+                        "--source",
+                        f"local={root}",
+                        "--allow-partial-hosts",
+                        "--output",
+                        str(output),
+                        "--end",
+                        "2026-05-22T10:00:00Z",
+                    ]
+                )
+            with self.assertRaisesRegex(SystemExit, "--days.*positive"):
+                MODULE.main(
+                    [
+                        "scan-weekly",
+                        "--days",
+                        "0",
+                        "--source",
+                        f"local={root}",
+                        "--allow-partial-hosts",
+                        "--output",
+                        str(output),
+                        "--end",
+                        "2026-05-22T10:00:00Z",
+                    ]
+                )
+            with self.assertRaisesRegex(SystemExit, "--window-days.*positive"):
+                MODULE.main(
+                    [
+                        "baseline",
+                        "--window-days",
+                        "0",
+                        "--source",
+                        f"local={root}",
+                        "--allow-partial-hosts",
+                        "--output",
+                        str(output),
+                        "--end",
+                        "2026-05-22T10:00:00Z",
+                    ]
+                )
+
     def test_daily_scan_uses_explicit_end_for_materialized_remote_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             local = Path(raw) / ".codex"
@@ -868,6 +956,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
             large.parent.mkdir(parents=True, exist_ok=True)
             summary.write_text("summary " + ("x" * 2000), encoding="utf-8")
             large.write_text("not-json-but-oversized " + ("x" * 2000), encoding="utf-8")
+            old_mtime = MODULE.parse_time("2026-01-02T10:00:00Z").timestamp()
+            os.utime(old, (old_mtime, old_mtime))
+            os.utime(old_large, (old_mtime, old_mtime))
             manifest = Path(raw) / "manifest.json"
             manifest.write_text(
                 json.dumps(
@@ -907,6 +998,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
             bad = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-bad.jsonl"
             bad.parent.mkdir(parents=True, exist_ok=True)
             bad.write_text("{bad json\n", encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root)}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "invalid")
+        self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_reports_non_object_jsonl_record(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            bad = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-array.jsonl"
+            bad.parent.mkdir(parents=True, exist_ok=True)
+            bad.write_text("[]\n", encoding="utf-8")
             manifest = Path(raw) / "manifest.json"
             manifest.write_text(
                 json.dumps(
@@ -1070,6 +1188,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     end=MODULE.parse_time("2026-05-02T00:00:00Z"),
                 )
 
+    def test_transient_output_rejects_child_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            output.mkdir(parents=True)
+            outside = Path(raw) / "outside.jsonl"
+            outside.write_text("do not overwrite\n", encoding="utf-8")
+            (output / "turn_summaries.jsonl").symlink_to(outside)
+
+            with self.assertRaisesRegex(SystemExit, "unsafe output path"):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+
+            self.assertEqual(outside.read_text(encoding="utf-8"), "do not overwrite\n")
+
     def test_scan_daily_rejects_unsafe_state_before_loading(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1101,6 +1241,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
             old_large.parent.mkdir(parents=True, exist_ok=True)
             old_large.write_text("not-json-but-old-oversized " + ("x" * 2000), encoding="utf-8")
+            old_mtime = MODULE.parse_time("2026-01-02T10:00:00Z").timestamp()
+            os.utime(old_large, (old_mtime, old_mtime))
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
@@ -1178,6 +1320,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             old_mtime = MODULE.parse_time("2026-01-02T10:00:00Z").timestamp()
             os.utime(old_large, (old_mtime, old_mtime))
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
+        self.assertNotIn("path_ref", trend["coverage_gaps"][0])
+
+    def test_old_oversized_rollout_with_active_mtime_blocks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            old_large.parent.mkdir(parents=True, exist_ok=True)
+            old_large.write_text("not-json-but-active-oversized " + ("x" * 2000), encoding="utf-8")
+            active_mtime = MODULE.parse_time("2026-05-01T12:00:00Z").timestamp()
+            os.utime(old_large, (active_mtime, active_mtime))
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
@@ -2118,6 +2284,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
         self.assertNotIn("path_ref", trend["coverage_gaps"][0])
 
+    def test_non_object_rollout_jsonl_reports_gap_and_blocks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-array.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("[]\n", encoding="utf-8")
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
+        self.assertNotIn("path_ref", trend["coverage_gaps"][0])
+
     def test_invalid_rollout_jsonl_on_start_date_after_start_time_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2147,6 +2335,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             old_bad = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
             old_bad.parent.mkdir(parents=True, exist_ok=True)
             old_bad.write_text("{bad json\n", encoding="utf-8")
+            old_mtime = MODULE.parse_time("2026-01-01T10:00:00Z").timestamp()
+            os.utime(old_bad, (old_mtime, old_mtime))
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
