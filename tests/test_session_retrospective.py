@@ -151,7 +151,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(MODULE.session_id_from_path(current), "019d-uuid")
         self.assertEqual(MODULE.session_id_from_path(legacy), "legacy-uuid")
-        self.assertEqual(MODULE.iso(MODULE.rollout_date_from_path(current)), "2026-05-07T00:00:00Z")
+        self.assertEqual(MODULE.iso(MODULE.rollout_date_from_path(current)), "2026-05-07T13:24:44Z")
         self.assertEqual(MODULE.iso(MODULE.rollout_date_from_path(legacy)), "2025-05-26T00:00:00Z")
 
     def test_prompt_category_does_not_treat_prompt_as_pr_review(self) -> None:
@@ -1233,6 +1233,40 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     ]
                 )
 
+    def test_advance_state_rejects_non_daily_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Weekly task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+
+            with self.assertRaisesRegex(SystemExit, "only supports daily"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-commit",
+                        HISTORY_COMMIT,
+                    ]
+                )
+
+            self.assertFalse(state.exists())
+
     def test_discover_writes_manifest_without_turn_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1262,6 +1296,23 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertEqual(manifest["sources"][0]["rollout_count"], 1)
             self.assertFalse((output / "turn_summaries.jsonl").exists())
             self.assertTrue((output / "retained_manifest.json").exists())
+
+    def test_discover_requires_bounded_start_for_retained_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = safe_output_dir(raw)
+
+            with self.assertRaisesRegex(SystemExit, "--start is required"):
+                MODULE.cmd_discover(
+                    types.SimpleNamespace(
+                        mode="daily",
+                        start=None,
+                        end="2026-05-02T00:00:00Z",
+                        source=None,
+                        output=str(output),
+                        max_raw_bytes=1000,
+                        allow_partial_hosts=True,
+                    )
+                )
 
     def test_retained_manifest_converts_coverage_gap_paths(self) -> None:
         transient = {
@@ -1384,6 +1435,64 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["coverage_gaps"][0]["host"], "miku-bot-dev")
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "stale_host")
 
+    def test_explicit_default_remote_requires_metadata_even_when_partial_hosts_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            remote_rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            write_jsonl(remote_rollout, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["host"], "miku-bot-dev")
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "stale_host")
+
+    def test_default_remote_metadata_must_cover_window_tail(self) -> None:
+        for metadata_overrides in (
+            {"window_end": "2026-05-01T22:30:00Z", "materialized_at": "2026-05-02T00:00:00Z"},
+            {"window_end": "2026-05-02T00:00:00Z", "materialized_at": "2026-05-01T22:30:00Z"},
+        ):
+            with self.subTest(metadata_overrides=metadata_overrides):
+                with tempfile.TemporaryDirectory() as raw:
+                    local = Path(raw) / ".codex"
+                    remote = Path(raw) / "miku-bot-dev"
+                    write_local_evidence(local)
+                    write_remote_metadata(remote, "miku-bot-dev", **metadata_overrides)
+                    local_rollout = local / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-local.jsonl"
+                    remote_rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+                    write_jsonl(local_rollout, [message("user", "Local task.", "2026-05-01T10:00:00Z")])
+                    write_jsonl(remote_rollout, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
+                    output = safe_output_dir(raw)
+                    state = safe_output_dir(raw) / "state.json"
+
+                    with mock.patch.object(
+                        MODULE,
+                        "parse_sources",
+                        return_value=[
+                            MODULE.Source("local", local),
+                            MODULE.Source("miku-bot-dev", remote),
+                        ],
+                    ):
+                        MODULE.run_scan(
+                            types.SimpleNamespace(source=None, output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                            mode="daily",
+                            start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                            end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                        )
+                    trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+                self.assertFalse(state.exists())
+                self.assertEqual(trend["coverage_gaps"][0]["host"], "miku-bot-dev")
+                self.assertEqual(trend["coverage_gaps"][0]["reason"], "stale_host")
+
     def test_default_remote_with_fresh_metadata_can_advance_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             local = Path(raw) / ".codex"
@@ -1439,6 +1548,27 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
         self.assertNotIn("path_ref", trend["coverage_gaps"][0])
+
+    def test_invalid_rollout_jsonl_on_start_date_after_start_time_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T18-00-00-abc.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n", encoding="utf-8")
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T10:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
 
     def test_window_external_invalid_rollout_does_not_block_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

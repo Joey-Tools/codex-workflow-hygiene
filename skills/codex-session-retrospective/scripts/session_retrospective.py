@@ -88,7 +88,6 @@ SAFETY_PATTERN = re.compile(
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 DEFAULT_REMOTE_SOURCE_ROOT = Path(".codex-local/session-retrospective/remote-sources")
 REMOTE_SOURCE_METADATA_FILE = "source_metadata.json"
-REMOTE_FRESHNESS_TOLERANCE = dt.timedelta(hours=2)
 LOCAL_EVIDENCE_FILES = ("session_index.jsonl", "history.jsonl")
 SAFE_OUTPUT_PARTS = (".codex-local", "session-retrospective")
 PATH_REF_PREFIX = "path_ref_v1"
@@ -353,10 +352,12 @@ def session_id_from_path(path: Path) -> str:
 
 
 def rollout_date_from_path(path: Path) -> dt.datetime | None:
-    match = re.search(r"^rollout-(\d{4}-\d{2}-\d{2})(?:T|-)", path.name)
+    match = re.search(r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?-", path.name)
     if not match:
         return None
-    return parse_time(match.group(1) + "T00:00:00Z")
+    if match.group(2):
+        return parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+    return parse_time(f"{match.group(1)}T00:00:00Z")
 
 
 def dated_path_from_parts(path: Path) -> dt.datetime | None:
@@ -1195,7 +1196,7 @@ def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
     earliest: dt.datetime | None = None
     for source in sources:
         for rollout in source_rollouts(source):
-            parsed = rollout_date_from_path(rollout)
+            parsed = dated_path_from_parts(rollout) or rollout_date_from_path(rollout)
             if parsed and (earliest is None or parsed < earliest):
                 earliest = parsed
     return earliest
@@ -1226,9 +1227,8 @@ def remote_evidence_gaps(
     *,
     start: dt.datetime | None,
     end: dt.datetime | None,
-    require_freshness: bool,
 ) -> list[dict[str, Any]]:
-    if not require_freshness or source.host not in DEFAULT_REMOTE_HOSTS:
+    if source.host not in DEFAULT_REMOTE_HOSTS:
         return []
     metadata_path = source.root / REMOTE_SOURCE_METADATA_FILE
     if not metadata_path.exists() or metadata_path.is_symlink() or not metadata_path.is_file():
@@ -1248,11 +1248,11 @@ def remote_evidence_gaps(
     window_end = parse_time(str(metadata.get("window_end") or ""))
     if materialized_at is None or window_start is None or window_end is None:
         return [remote_metadata_gap(source)]
-    if start and window_start > start + REMOTE_FRESHNESS_TOLERANCE:
+    if start and window_start > start:
         return [remote_metadata_gap(source)]
-    if end and window_end + REMOTE_FRESHNESS_TOLERANCE < end:
+    if end and window_end < end:
         return [remote_metadata_gap(source)]
-    if end and materialized_at + REMOTE_FRESHNESS_TOLERANCE < end:
+    if end and materialized_at < end:
         return [remote_metadata_gap(source)]
     return []
 
@@ -1299,7 +1299,6 @@ def run_scan(
                 source,
                 start=start,
                 end=end,
-                require_freshness=not getattr(args, "allow_partial_hosts", False),
             )
         )
         rollouts = source_rollouts(source)
@@ -1429,7 +1428,6 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                 source,
                 start=start,
                 end=end,
-                require_freshness=not getattr(args, "allow_partial_hosts", False),
             )
         )
         rollouts = source_rollouts(source)
@@ -1473,7 +1471,9 @@ def cmd_discover(args: argparse.Namespace) -> int:
     if end is None:
         raise SystemExit(f"invalid --end timestamp: {args.end}")
     start = parse_time(args.start) if args.start else None
-    if args.start and start is None:
+    if not args.start:
+        raise SystemExit("--start is required for discover")
+    if start is None:
         raise SystemExit(f"invalid --start timestamp: {args.start}")
     return run_discover(args, mode=args.mode, start=start, end=end)
 
@@ -1734,6 +1734,8 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
     last_mode = window.get("mode")
     if not isinstance(last_scan_at, str) or not isinstance(last_mode, str):
         raise SystemExit("trend_report.json window must include mode and end")
+    if last_mode != "daily":
+        raise SystemExit("advance-state only supports daily runs")
     state = load_state(state_path)
     state["last_scan_at"] = last_scan_at
     state["last_retained_export_sha256"] = retained_export_digest(actual_files)
@@ -1763,7 +1765,7 @@ def build_parser() -> argparse.ArgumentParser:
     discover = subparsers.add_parser("discover")
     add_common_scan_args(discover)
     discover.add_argument("--mode", required=True)
-    discover.add_argument("--start")
+    discover.add_argument("--start", required=True)
     discover.add_argument("--end")
     discover.set_defaults(func=cmd_discover)
 
