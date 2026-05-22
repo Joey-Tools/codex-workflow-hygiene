@@ -458,6 +458,37 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
         self.assertIn("path_hash:", trend["coverage_gaps"][0]["path"])
 
+    def test_old_oversized_rollout_with_large_in_window_record_blocks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            old_large.parent.mkdir(parents=True, exist_ok=True)
+            large_payload = "x" * (300 * 1024)
+            old_large.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-05-01T12:00:00Z",
+                        "type": "function_call_output",
+                        "payload": {"output": large_payload},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            output = Path(raw) / "out"
+            state = Path(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
+
     def test_scan_manifest_keeps_execution_path_and_redacted_ref(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

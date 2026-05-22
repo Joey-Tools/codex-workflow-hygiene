@@ -347,35 +347,33 @@ def rollout_filename_in_window(path: Path, start: dt.datetime | None, end: dt.da
     return True
 
 
-def tail_has_record_in_window(
+TIMESTAMP_BYTES_PATTERN = re.compile(rb'"(?:timestamp|time|created_at|ts)"\s*:\s*"([^"]+)"')
+
+
+def oversized_rollout_has_timestamp_in_window(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
     *,
-    tail_bytes: int = 256 * 1024,
+    chunk_bytes: int = 1024 * 1024,
 ) -> bool:
-    size = path.stat().st_size
     with path.open("rb") as handle:
-        if size > tail_bytes:
-            handle.seek(size - tail_bytes)
-            handle.readline()
-        data = handle.read()
-    fallback = rollout_date_from_path(path)
-    for raw_line in data.splitlines():
-        try:
-            record = json.loads(raw_line.decode("utf-8", errors="replace"))
-        except json.JSONDecodeError:
-            continue
-        timestamp = parse_time(record_timestamp(record))
-        if timestamp is None:
-            timestamp = fallback
-        if timestamp is None:
-            continue
-        if start and timestamp < start:
-            continue
-        if end and timestamp >= end:
-            continue
-        return True
+        carry = b""
+        while True:
+            data = handle.read(chunk_bytes)
+            if not data:
+                break
+            window = carry + data
+            for match in TIMESTAMP_BYTES_PATTERN.finditer(window):
+                timestamp = parse_time(match.group(1).decode("utf-8", errors="replace"))
+                if timestamp is None:
+                    continue
+                if start and timestamp < start:
+                    continue
+                if end and timestamp >= end:
+                    continue
+                return True
+            carry = window[-256:]
     return False
 
 
@@ -386,7 +384,7 @@ def oversized_rollout_relevant(path: Path, start: dt.datetime | None, end: dt.da
     if rollout_date and end and rollout_date >= end:
         return False
     if rollout_date and start and rollout_date < start:
-        return tail_has_record_in_window(path, start, end)
+        return oversized_rollout_has_timestamp_in_window(path, start, end)
     return True
 
 
