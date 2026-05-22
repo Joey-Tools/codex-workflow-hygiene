@@ -74,7 +74,7 @@ SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 FLAG_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("failed_command", re.compile(r"(?:exit(?:ed)?(?: with)? code [1-9]\d*|failed|traceback|error:|permission denied)", re.I)),
-    ("approval_auth_friction", re.compile(r"(?:approval|require_escalated|sandbox|auth|credential|permission denied|TCC)", re.I)),
+    ("approval_auth_friction", re.compile(r"(?:approval|require_escalated|sandbox|\bauth(?:entication|orization|[-_ ]?gated)?\b|credential|permission denied|TCC)", re.I)),
     ("verification_gap", re.compile(r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)", re.I)),
     ("user_correction", re.compile(r"(?:you missed|you forgot|wrong|incorrect|not what I asked|漏了|忘了|不对|错了)", re.I)),
     ("context_loss", re.compile(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", re.I)),
@@ -509,20 +509,32 @@ def flags_for_text(text: str, *, redacted_changed: bool = False) -> set[str]:
     return flags
 
 
+def safe_source_file(path: Path, root: Path) -> bool:
+    if path.is_symlink():
+        return False
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_path = path.resolve(strict=True)
+        resolved_path.relative_to(resolved_root)
+    except (OSError, ValueError):
+        return False
+    return path.is_file()
+
+
 def source_rollouts(source: Source) -> list[Path]:
     sessions = source.root / "sessions"
     search_root = sessions if sessions.exists() else source.root
     return sorted(
         path
         for path in search_root.rglob("rollout-*.jsonl")
-        if path.is_file() and not path.name.startswith("rollout-summary")
+        if safe_source_file(path, source.root) and not path.name.startswith("rollout-summary")
     )
 
 
 def source_summary_files(source: Source) -> list[Path]:
     if not source.root.exists():
         return []
-    return sorted(path for path in source.root.rglob("rollout-summary*.jsonl") if path.is_file())
+    return sorted(path for path in source.root.rglob("rollout-summary*.jsonl") if safe_source_file(path, source.root))
 
 
 def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
@@ -1637,7 +1649,8 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 raise SystemExit(f"{path}:{line_no}: missing keys {sorted(missing)}")
             if contains_unredacted_sensitive_text(obj):
                 raise SystemExit(f"{path}:{line_no}: unredacted sensitive text in retained output")
-    trend = json.loads((run_dir / "trend_report.json").read_text(encoding="utf-8"))
+    trend_path = run_dir / "trend_report.json"
+    trend = sanitize_trend_report(json.loads(trend_path.read_text(encoding="utf-8")), label=str(trend_path), strict=True)
     validate_retained_manifest(run_dir / "retained_manifest.json")
     retained_manifest = json.loads((run_dir / "retained_manifest.json").read_text(encoding="utf-8"))
     return trend, retained_manifest
@@ -1770,6 +1783,12 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
     if coverage_gaps:
         raise SystemExit("refusing to advance state while coverage gaps are present")
     state = load_state(state_path)
+    new_scan_at = parse_time(last_scan_at)
+    previous_scan_at = parse_time(state.get("last_scan_at"))
+    if new_scan_at is None:
+        raise SystemExit("trend_report.json window end must be a valid timestamp")
+    if previous_scan_at and new_scan_at < previous_scan_at:
+        raise SystemExit("refusing to move retrospective state backwards")
     state["last_scan_at"] = last_scan_at
     state["last_retained_export_sha256"] = retained_export_digest(actual_files)
     state["last_history_commit"] = history_commit

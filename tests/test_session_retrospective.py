@@ -173,6 +173,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(MODULE.prompt_category("Review this PR."), "review")
         self.assertNotIn("git_or_pr", MODULE.safe_assistant_summary(["Improved the prompt."]))
 
+    def test_auth_friction_flag_does_not_match_authoring(self) -> None:
+        self.assertNotIn("approval_auth_friction", MODULE.flags_for_text("Improve skill authoring guidance."))
+        self.assertIn("approval_auth_friction", MODULE.flags_for_text("Remote host is auth gated."))
+
     def test_meaningful_prompt_text_keeps_real_prompt_after_leading_wrappers(self) -> None:
         wrapped = (
             "# AGENTS.md instructions for /tmp/repo\n"
@@ -208,6 +212,18 @@ class SessionRetrospectiveTests(unittest.TestCase):
             [source.host for source in MODULE.parse_sources(["local=/tmp/local"], require_default_hosts=False)],
             ["local"],
         )
+
+    def test_source_file_discovery_rejects_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            outside = Path(raw) / "outside-rollout.jsonl"
+            outside.write_text(json.dumps(message("user", "Outside task.", "2026-05-01T10:00:00Z")) + "\n", encoding="utf-8")
+            link = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-link.jsonl"
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(outside)
+
+            source = MODULE.Source("local", root)
+            self.assertEqual(MODULE.source_rollouts(source), [])
 
     def test_ignores_wrapper_and_redacts_flagged_turns(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1338,6 +1354,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     ]
                 )
 
+    def test_advance_state_rejects_backward_last_scan_at(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Daily task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(json.dumps({"last_scan_at": "2026-05-03T00:00:00Z"}), encoding="utf-8")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+
+            with self.assertRaisesRegex(SystemExit, "backwards"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-commit",
+                        HISTORY_COMMIT,
+                    ]
+                )
+
+            state_data = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(state_data["last_scan_at"], "2026-05-03T00:00:00Z")
+
     def test_advance_state_rejects_non_daily_runs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1792,7 +1846,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
             (run_dir / "turn_summaries.jsonl").write_text("", encoding="utf-8")
             (run_dir / "episodes.jsonl").write_text("", encoding="utf-8")
             (run_dir / "turn_flags.jsonl").write_text("", encoding="utf-8")
-            (run_dir / "trend_report.json").write_text("{}\n", encoding="utf-8")
+            (run_dir / "trend_report.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "window": {"mode": "daily", "start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                        "turn_count": 0,
+                        "flagged_turn_count": 0,
+                        "episode_count": 0,
+                        "flags": {},
+                        "hosts": {},
+                        "model_eras": {},
+                        "coverage_gaps": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
             (run_dir / "retained_manifest.json").write_text(
                 json.dumps(
                     manifest_fixture(
@@ -1812,6 +1881,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(SystemExit, "raw root/path fields"):
+                MODULE.main(["validate-output", "--run-dir", str(run_dir)])
+
+    def test_validate_output_rejects_unexpected_trend_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw) / "run"
+            run_dir.mkdir()
+            (run_dir / "turn_summaries.jsonl").write_text("", encoding="utf-8")
+            (run_dir / "episodes.jsonl").write_text("", encoding="utf-8")
+            (run_dir / "turn_flags.jsonl").write_text("", encoding="utf-8")
+            trend = {
+                "schema_version": 1,
+                "window": {"mode": "daily", "start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                "turn_count": 0,
+                "flagged_turn_count": 0,
+                "episode_count": 0,
+                "flags": {},
+                "hosts": {},
+                "model_eras": {},
+                "coverage_gaps": [],
+                "raw_path": "/Users/example/.codex",
+            }
+            (run_dir / "trend_report.json").write_text(json.dumps(trend), encoding="utf-8")
+            (run_dir / "retained_manifest.json").write_text(json.dumps(manifest_fixture()), encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "unexpected keys"):
                 MODULE.main(["validate-output", "--run-dir", str(run_dir)])
 
     def test_validate_manifest_rejects_non_opaque_refs(self) -> None:
