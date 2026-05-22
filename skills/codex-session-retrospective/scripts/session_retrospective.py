@@ -507,6 +507,19 @@ def iter_jsonl_strict(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
             yield line_no, record
 
 
+def iter_jsonl_strict_bytes(data: bytes, label: str) -> Iterable[tuple[int, dict[str, Any]]]:
+    for line_no, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{label}:{line_no}: invalid JSON") from exc
+        if not isinstance(record, dict):
+            raise ValueError(f"{label}:{line_no}: JSONL record must be an object")
+        yield line_no, record
+
+
 def text_from_message_payload(payload: dict[str, Any]) -> str:
     texts: list[str] = []
     for part in payload.get("content") or []:
@@ -1359,6 +1372,28 @@ def sanitize_retained_jsonl(
     return sanitized_rows
 
 
+def sanitize_retained_jsonl_bytes(
+    data: bytes,
+    *,
+    label: str,
+    allowed: set[str],
+    strict: bool,
+    validator: Any | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        rows = list(iter_jsonl_strict_bytes(data, label))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    sanitized_rows: list[dict[str, Any]] = []
+    for line_no, obj in rows:
+        row_label = f"{label}:{line_no}"
+        sanitized = sanitize_mapping(obj, allowed=allowed, required=allowed, label=row_label, strict=strict)
+        if validator is not None:
+            validator(sanitized, label=row_label)
+        sanitized_rows.append(sanitized)
+    return sanitized_rows
+
+
 def sanitize_count_map(value: Any, *, label: str, strict: bool) -> dict[str, int]:
     if not isinstance(value, dict):
         raise SystemExit(f"{label}: expected count map")
@@ -1551,37 +1586,102 @@ def history_commit_changed_files(repo: Path, commit: str) -> set[str]:
     return {raw_name.decode("utf-8", errors="surrogateescape") for raw_name in changed.stdout.split(b"\0") if raw_name}
 
 
-def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> None:
+def require_history_repo(history_repo: str | None) -> Path:
     if not history_repo:
         raise SystemExit("--history-repo is required")
     repo = Path(history_repo).expanduser()
     if not repo.exists() or not repo.is_dir():
         raise SystemExit("--history-repo must be an existing git repository")
+    return repo
+
+
+def require_history_commit(repo: Path, commit: str) -> None:
     completed = subprocess.run(
-        ["git", "-C", str(repo), "cat-file", "-e", f"{history_commit}^{{commit}}"],
+        ["git", "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
     )
     if completed.returncode != 0:
-        raise SystemExit("--history-commit must exist in --history-repo")
+        raise SystemExit("history ref must exist in --history-repo")
+
+
+def history_tree_files(repo: Path, ref: str) -> list[str]:
+    require_history_commit(repo, ref)
     tree = subprocess.run(
-        ["git", "-C", str(repo), "ls-tree", "-r", "-z", "--name-only", history_commit],
+        ["git", "-C", str(repo), "ls-tree", "-r", "-z", "--name-only", ref],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
     )
     if tree.returncode != 0:
-        raise SystemExit("failed to inspect --history-commit tree")
+        raise SystemExit("failed to inspect history tree")
+    return [raw_name.decode("utf-8", errors="surrogateescape") for raw_name in tree.stdout.split(b"\0") if raw_name]
+
+
+def history_blob(repo: Path, ref: str, file_path: str) -> bytes:
+    blob = subprocess.run(
+        ["git", "-C", str(repo), "show", f"{ref}:{file_path}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if blob.returncode != 0:
+        raise SystemExit(f"failed to inspect history artifact: {file_path}")
+    return blob.stdout
+
+
+def history_json(data: bytes, label: str) -> Any:
+    try:
+        return json.loads(data.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{label}: invalid JSON") from exc
+
+
+def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
+    repo = require_history_repo(history_repo)
+    files = history_tree_files(repo, history_ref)
+    for file_path in files:
+        if forbidden_history_artifact(file_path):
+            raise SystemExit(f"history tree contains forbidden transient/raw artifact: {file_path}")
+        name = file_path.rsplit("/", 1)[-1]
+        data = history_blob(repo, history_ref, file_path)
+        if name == "episodes.jsonl" or (file_path.startswith("data/episodes/") and file_path.endswith(".jsonl")):
+            sanitize_retained_jsonl_bytes(
+                data,
+                label=file_path,
+                allowed=EPISODE_FIELDS,
+                strict=True,
+                validator=validate_episode_row,
+            )
+        elif name == "turn_flags.jsonl" or (file_path.startswith("data/turn_flags/") and file_path.endswith(".jsonl")):
+            sanitize_retained_jsonl_bytes(
+                data,
+                label=file_path,
+                allowed=TURN_FLAG_FIELDS,
+                strict=True,
+                validator=validate_turn_flag_row,
+            )
+        elif name == "trend_report.json" or (file_path.startswith("data/trends/") and file_path.endswith(".json")):
+            sanitize_trend_report(history_json(data, file_path), label=file_path, strict=True)
+        elif name == "retained_manifest.json" or (file_path.startswith("data/manifests/") and file_path.endswith(".json")):
+            sanitize_retained_manifest_obj(history_json(data, file_path), label=file_path, strict=True)
+        elif file_path.startswith("reports/") and file_path.endswith((".md", ".txt")):
+            text = data.decode("utf-8", errors="replace")
+            if contains_unredacted_sensitive_text(text):
+                raise SystemExit(f"history report contains unredacted sensitive text: {file_path}")
+        elif file_path.endswith(".jsonl"):
+            raise SystemExit(f"history tree contains unexpected JSONL artifact: {file_path}")
+
+
+def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> None:
+    repo = require_history_repo(history_repo)
+    require_history_commit(repo, history_commit)
+    tree_files = set(history_tree_files(repo, history_commit))
     changed_files = history_commit_changed_files(repo, history_commit)
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
     parent_files: dict[str, set[str]] = defaultdict(set)
-    tree_files: set[str] = set()
-    for raw_name in tree.stdout.split(b"\0"):
-        if not raw_name:
-            continue
-        file_path = raw_name.decode("utf-8", errors="surrogateescape")
-        tree_files.add(file_path)
+    for file_path in tree_files:
         if forbidden_history_artifact(file_path):
             raise SystemExit(f"--history-commit contains forbidden transient/raw artifact: {file_path}")
         parent, _, name = file_path.rpartition("/")
@@ -1603,16 +1703,7 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
             continue
         candidate: dict[str, bytes] = {}
         for name, file_path in paths.items():
-            blob = subprocess.run(
-                ["git", "-C", str(repo), "show", f"{history_commit}:{file_path}"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            if blob.returncode != 0:
-                candidate = {}
-                break
-            candidate[name] = blob.stdout
+            candidate[name] = history_blob(repo, history_commit, file_path)
         if candidate and retained_export_digest(candidate) == expected_digest and changed_files == set(paths.values()):
             return
     raise SystemExit("--history-commit does not contain exactly one retained export and no other changed files")
@@ -2275,6 +2366,12 @@ def cmd_validate_history_commit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validate_history_tree(args: argparse.Namespace) -> int:
+    validate_history_tree(args.history_repo, str(args.history_ref or "HEAD"))
+    print(f"validated history tree: {args.history_ref or 'HEAD'}")
+    return 0
+
+
 def cmd_advance_state(args: argparse.Namespace) -> int:
     state_path = safe_state_path(args.state)
     if state_path is None:
@@ -2396,6 +2493,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate_history.add_argument("--history-repo", required=True)
     validate_history.add_argument("--history-commit", required=True)
     validate_history.set_defaults(func=cmd_validate_history_commit)
+
+    validate_history_tree_parser = subparsers.add_parser("validate-history-tree")
+    validate_history_tree_parser.add_argument("--history-repo", required=True)
+    validate_history_tree_parser.add_argument("--history-ref", default="HEAD")
+    validate_history_tree_parser.set_defaults(func=cmd_validate_history_tree)
 
     advance = subparsers.add_parser("advance-state")
     advance.add_argument("--run-dir", required=True)
