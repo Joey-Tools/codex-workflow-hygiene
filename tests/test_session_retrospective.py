@@ -163,6 +163,17 @@ def message(role: str, text: str, timestamp: str) -> dict:
     }
 
 
+def untimestamped_message(role: str, text: str) -> dict:
+    return {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": role,
+            "content": [{"type": "input_text" if role == "user" else "output_text", "text": text}],
+        },
+    }
+
+
 def message_with_cwd(role: str, text: str, timestamp: str, cwd: str) -> dict:
     row = message(role, text, timestamp)
     row["payload"]["cwd"] = cwd
@@ -677,6 +688,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("category=general", rows[0]["redacted_user_prompt_summary"])
 
+    def test_scan_uses_dated_path_for_untimestamped_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-undated.jsonl"
+            write_jsonl(rollout, [untimestamped_message("user", "Directory dated task.")])
+            old_mtime = MODULE.parse_time("2026-01-01T00:00:00Z").timestamp()
+            os.utime(rollout, (old_mtime, old_mtime))
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], "2026-05-01T00:00:00Z")
+        self.assertIn("category=general", rows[0]["redacted_user_prompt_summary"])
+
     def test_baseline_honors_window_days(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1150,6 +1185,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             old_bad = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
+            old_bad.parent.mkdir(parents=True, exist_ok=True)
+            old_bad.write_text("{bad json\n", encoding="utf-8")
+            old_mtime = MODULE.parse_time("2026-01-01T10:00:00Z").timestamp()
+            os.utime(old_bad, (old_mtime, old_mtime))
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root)}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = list((output / "shards.jsonl").read_text(encoding="utf-8").splitlines())
+
+        self.assertEqual(rows, [])
+
+    def test_make_shards_uses_dated_path_to_ignore_old_invalid_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            old_bad = root / "sessions" / "2026" / "01" / "01" / "rollout-undated-bad.jsonl"
             old_bad.parent.mkdir(parents=True, exist_ok=True)
             old_bad.write_text("{bad json\n", encoding="utf-8")
             old_mtime = MODULE.parse_time("2026-01-01T10:00:00Z").timestamp()
@@ -1893,6 +1953,45 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     ]
                 )
 
+    def test_advance_state_rejects_history_commit_with_extra_retained_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, _commit = write_history_repo(raw, retained)
+            extra = history_repo / "retained" / "daily" / "raw-copy.jsonl"
+            extra.write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "retained/daily/raw-copy.jsonl"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add extra retained file"], cwd=history_repo, check=True)
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            with self.assertRaisesRegex(SystemExit, "does not contain"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        commit,
+                    ]
+                )
+
     def test_advance_state_rejects_backward_last_scan_at(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2591,6 +2690,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SystemExit, "invalid JSON"):
                 MODULE.main(["validate-output", "--run-dir", str(run_dir)])
+
+    def test_validate_output_rejects_symlink_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            symlink_target = Path(raw) / "turn-copy.jsonl"
+            symlink_target.write_text((output / "turn_summaries.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+            (output / "turn_summaries.jsonl").unlink()
+            (output / "turn_summaries.jsonl").symlink_to(symlink_target)
+
+            with self.assertRaisesRegex(SystemExit, "unexpected output file"):
+                MODULE.main(["validate-output", "--run-dir", str(output)])
 
     def test_validate_output_rejects_raw_retained_manifest_paths(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

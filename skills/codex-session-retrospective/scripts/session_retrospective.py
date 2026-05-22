@@ -609,10 +609,14 @@ def source_summary_files(source: Source) -> list[Path]:
     return sorted(path for path in source.root.rglob("rollout-summary*.jsonl") if safe_source_file(path, source.root))
 
 
+def rollout_window_date(path: Path) -> dt.datetime | None:
+    return rollout_date_from_path(path) or dated_path_from_parts(path)
+
+
 def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
     if start is None and end is None:
         return True
-    fallback = rollout_date_from_path(path)
+    fallback = rollout_window_date(path)
     for _line_no, record in iter_jsonl(path):
         timestamp = parse_time(record_timestamp(record))
         if timestamp is None:
@@ -628,7 +632,7 @@ def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.
 
 
 def rollout_filename_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
-    rollout_date = rollout_date_from_path(path)
+    rollout_date = rollout_window_date(path)
     if rollout_date is None:
         return True
     if start and rollout_date < start:
@@ -647,7 +651,7 @@ def rollout_candidate_relevant(
 ) -> bool:
     if start is None and end is None:
         return True
-    rollout_date = rollout_date_from_path(path)
+    rollout_date = rollout_window_date(path)
     if rollout_date and end and rollout_date >= end:
         return False
     if rollout_date and start and rollout_date < start:
@@ -717,7 +721,7 @@ def oversized_rollout_has_timestamp_in_window(
 def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> str:
     if start is None and end is None:
         return "relevant"
-    rollout_date = rollout_date_from_path(path)
+    rollout_date = rollout_window_date(path)
     if rollout_date and end and rollout_date >= end:
         return "irrelevant"
     if rollout_date and start and rollout_date < start:
@@ -1497,16 +1501,20 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
     if tree.returncode != 0:
         raise SystemExit("failed to inspect --history-commit tree")
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
+    parent_files: dict[str, set[str]] = defaultdict(set)
     for raw_name in tree.stdout.split(b"\0"):
         if not raw_name:
             continue
         file_path = raw_name.decode("utf-8", errors="surrogateescape")
         parent, _, name = file_path.rpartition("/")
+        parent_files[parent].add(name)
         if name in RETAINED_OUTPUT_FILES:
             grouped[parent][name] = file_path
     expected_digest = retained_export_digest(retained_files)
-    for paths in grouped.values():
+    for parent, paths in grouped.items():
         if set(paths) != set(RETAINED_OUTPUT_FILES):
+            continue
+        if parent_files[parent] != set(RETAINED_OUTPUT_FILES):
             continue
         candidate: dict[str, bytes] = {}
         for name, file_path in paths.items():
@@ -2007,6 +2015,16 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
 def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     if run_dir.is_symlink():
         raise SystemExit(f"refusing symlinked output directory: {run_dir}")
+    for name in (
+        "turn_summaries.jsonl",
+        "episodes.jsonl",
+        "turn_flags.jsonl",
+        "trend_report.json",
+        "retained_manifest.json",
+    ):
+        path = run_dir / name
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise SystemExit(f"unexpected output file: {path}")
     required = {
         "turn_summaries.jsonl": {"turn_id", "episode_id", "host", "redacted_user_prompt_summary", "issue_flags"},
         "episodes.jsonl": {"episode_id", "host", "topic", "friction_flags"},
