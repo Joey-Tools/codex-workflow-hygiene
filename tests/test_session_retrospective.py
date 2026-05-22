@@ -2053,6 +2053,49 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["coverage_gaps"], [])
         self.assertTrue(state_exists)
 
+    def test_default_remote_with_fresh_metadata_and_no_activity_is_not_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            local = Path(raw) / ".codex"
+            remote = Path(raw) / "miku-bot-dev"
+            write_local_evidence(local)
+            write_remote_metadata(remote, "miku-bot-dev")
+            local_rollout = local / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-local.jsonl"
+            write_jsonl(local_rollout, [message("user", "Local task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with mock.patch.object(
+                MODULE,
+                "parse_sources",
+                return_value=[
+                    MODULE.Source("local", local),
+                    MODULE.Source("miku-bot-dev", remote),
+                ],
+            ):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=None, output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+                discover_output = safe_output_dir(raw, "discover")
+                MODULE.run_discover(
+                    types.SimpleNamespace(source=None, output=str(discover_output), allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((discover_output / "shard_manifest.json").read_text(encoding="utf-8"))
+            advance_state(output, state, raw)
+            state_exists = state.exists()
+
+        self.assertEqual(trend["coverage_gaps"], [])
+        remote_source = next(source for source in manifest["sources"] if source["host"] == "miku-bot-dev")
+        self.assertEqual(remote_source["status"], "empty")
+        self.assertEqual(manifest["coverage_gaps"], [])
+        self.assertTrue(state_exists)
+
     def test_invalid_rollout_jsonl_reports_gap_and_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
