@@ -113,12 +113,21 @@ def export_retained(run_dir: Path, root: str, name: str = "history-retained") ->
     return retained_output
 
 
+def add_expected_history_origin(repo: Path) -> None:
+    subprocess.run(
+        ["git", "remote", "add", "origin", f"git@github.com:{MODULE.EXPECTED_HISTORY_REPO}.git"],
+        cwd=repo,
+        check=True,
+    )
+
+
 def write_history_repo(root: str | Path, retained_dir: Path | None = None) -> tuple[Path, str]:
     repo = Path(root) / "history-repo"
     repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=repo, check=True)
+    add_expected_history_origin(repo)
     if retained_dir is None:
         (repo / "retained.json").write_text("{}\n", encoding="utf-8")
         subprocess.run(["git", "add", "retained.json"], cwd=repo, check=True)
@@ -2632,8 +2641,24 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_validate_history_tree_rejects_wrong_origin_repo(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             history_repo, _commit = write_history_repo(raw)
+            subprocess.run(["git", "remote", "set-url", "origin", "git@github.com:Joey-Tools/not-session-retrospective-history.git"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "origin must be"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_missing_origin_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            subprocess.run(["git", "remote", "remove", "origin"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "origin must be"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_substring_spoofed_origin_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
             subprocess.run(
-                ["git", "remote", "add", "origin", "git@github.com:Joey-Tools/not-session-retrospective-history.git"],
+                ["git", "remote", "set-url", "origin", f"git@github.com:Joey-Tools/codex-session-retrospective-history-fork.git"],
                 cwd=history_repo,
                 check=True,
             )
@@ -2727,6 +2752,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=history_repo, check=True)
             subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=history_repo, check=True)
             subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=history_repo, check=True)
+            add_expected_history_origin(history_repo)
             (history_repo / "README.md").write_text("# History\n", encoding="utf-8")
             subprocess.run(["git", "add", "README.md"], cwd=history_repo, check=True)
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Initial history"], cwd=history_repo, check=True)
@@ -2782,6 +2808,18 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add redacted report"], cwd=history_repo, check=True)
 
             MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_internal_hostname_in_follow_on_report(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            report = history_repo / "reports" / "weekly" / "2026" / "05" / "08.md"
+            report.parent.mkdir(parents=True)
+            report.write_text("Investigation mentioned jira.cisco.example but no raw URLs.\n", encoding="utf-8")
+            subprocess.run(["git", "add", "reports/weekly/2026/05/08.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add internal hostname"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "sensitive text"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
     def test_validate_history_tree_rejects_follow_on_transient_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3206,6 +3244,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=history_repo, check=True)
             subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=history_repo, check=True)
             subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=history_repo, check=True)
+            add_expected_history_origin(history_repo)
             nested = history_repo / "retained" / "daily" / "raw" / "debug.txt"
             nested.parent.mkdir(parents=True)
             nested.write_text("debug artifact\n", encoding="utf-8")
@@ -3335,6 +3374,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=history_repo, check=True)
             subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=history_repo, check=True)
             subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=history_repo, check=True)
+            add_expected_history_origin(history_repo)
             tmp_artifact = history_repo / ".codex-tmp" / "raw-tool-output.txt"
             tmp_artifact.parent.mkdir(parents=True)
             tmp_artifact.write_text("raw output\n", encoding="utf-8")

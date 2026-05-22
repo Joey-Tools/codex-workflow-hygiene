@@ -105,6 +105,10 @@ TURN_REF_PREFIX = "turn_ref_v1"
 OPAQUE_ID_PATTERN = re.compile(r"^(?:session_ref_v1|episode_ref_v1|turn_ref_v1):[0-9a-f]{20}$")
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 BARE_64_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
+INTERNAL_HOSTNAME_PATTERN = re.compile(
+    r"\b(?:[A-Za-z0-9-]+\.)+(?:internal|corp|local|lan|example|invalid|test)\b",
+    re.I,
+)
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
@@ -1323,7 +1327,7 @@ def contains_invalid_ref(value: Any) -> bool:
 
 def contains_unredacted_sensitive_text(value: Any) -> bool:
     if isinstance(value, str):
-        return any(pattern.search(value) for pattern, _label in SECRET_PATTERNS)
+        return any(pattern.search(value) for pattern, _label in SECRET_PATTERNS) or bool(INTERNAL_HOSTNAME_PATTERN.search(value))
     if isinstance(value, dict):
         return any(contains_unredacted_sensitive_text(child) for child in value.values())
     if isinstance(value, list):
@@ -1798,10 +1802,22 @@ def require_history_repo_identity(repo: Path) -> None:
         check=False,
     )
     if remote.returncode != 0:
-        return
-    remote_url = remote.stdout.strip()
-    if remote_url and EXPECTED_HISTORY_REPO not in remote_url:
         raise SystemExit(f"--history-repo origin must be {EXPECTED_HISTORY_REPO}")
+    remote_url = remote.stdout.strip()
+    if not history_remote_matches_expected(remote_url):
+        raise SystemExit(f"--history-repo origin must be {EXPECTED_HISTORY_REPO}")
+
+
+def history_remote_matches_expected(remote_url: str) -> bool:
+    value = remote_url.strip().removesuffix(".git")
+    if value == EXPECTED_HISTORY_REPO:
+        return True
+    if value == f"git@github.com:{EXPECTED_HISTORY_REPO}":
+        return True
+    for prefix in ("https://github.com/", "ssh://git@github.com/"):
+        if value.startswith(prefix):
+            return value.removeprefix(prefix) == EXPECTED_HISTORY_REPO
+    return False
 
 
 def require_history_commit(repo: Path, commit: str) -> None:
