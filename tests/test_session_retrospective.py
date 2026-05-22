@@ -161,7 +161,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("/Users/hoteng", summary)
         self.assertNotIn("AcmeCorp", summary)
 
-    def test_non_sensitive_flagged_prompt_keeps_bounded_excerpt(self) -> None:
+    def test_non_sensitive_flagged_prompt_keeps_opaque_topic_ref(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-failed.jsonl"
@@ -170,7 +170,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
 
         self.assertIn("failed_command", turns[0].issue_flags)
-        self.assertIn("redacted_excerpt=Fix the failed calendar sync verification.", turns[0].redacted_user_prompt_summary)
+        self.assertIn("topic_ref=topic_ref:", turns[0].redacted_user_prompt_summary)
+        self.assertNotIn("redacted_excerpt=", turns[0].redacted_user_prompt_summary)
 
     def test_extract_rollout_groups_multiple_turns_into_one_episode(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1167,7 +1168,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "cwd": None,
                 "model": None,
                 "model_era": "unknown",
-                "redacted_user_prompt_summary": "category=debug; redacted_excerpt=/Users/hoteng/secret password=hunter2",
+                "redacted_user_prompt_summary": "category=debug; redacted_excerpt=/workspace/customer/Foo.java",
                 "assistant_action_summary": "",
                 "issue_flags": ["failed_command"],
                 "prompt_improvement": None,

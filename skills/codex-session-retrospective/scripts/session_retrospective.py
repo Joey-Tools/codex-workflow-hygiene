@@ -54,7 +54,10 @@ SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (re.compile(r"https?://[^\s)>\]\"']+"), "[REDACTED_URL]"),
     (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[REDACTED_EMAIL]"),
-    (re.compile(r"(?<!\w)(?:~|/(?:Users|home|private|tmp|var|etc|opt|Volumes))/[^\s,;:)>\]\"']+"), "[REDACTED_PATH]"),
+    (
+        re.compile(r"(?<!\w)(?:~|/(?:Users|home|private|tmp|var|etc|opt|Volumes|workspace|workspaces))/[^\s,;:)>\]\"']+"),
+        "[REDACTED_PATH]",
+    ),
     (
         re.compile(r"\b(?:customer|client|account|tenant|org|repo|repository)[_-]?(?:id|name)?\s*[:=]\s*['\"]?[A-Za-z0-9_.-]+", re.I),
         "[REDACTED_IDENTIFIER]",
@@ -218,8 +221,6 @@ def safe_prompt_summary(
         parts.append("topic_ref=" + prompt_topic_key(redacted_text))
     if issue_flags:
         parts.append("flags=" + ",".join(sorted(issue_flags)))
-        if redacted_text and "safety_privacy_flag" not in issue_flags:
-            parts.append("redacted_excerpt=" + compact(redacted_text, 240))
     if redacted_changed:
         parts.append("redactions=applied")
     return "; ".join(parts)
