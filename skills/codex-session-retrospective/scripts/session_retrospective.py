@@ -15,7 +15,6 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -106,7 +105,12 @@ ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
 HISTORY_FORBIDDEN_FILENAMES = frozenset((*TRANSIENT_OUTPUT_FILES, *LOCAL_EVIDENCE_FILES, REMOTE_SOURCE_METADATA_FILE))
-HISTORY_FORBIDDEN_COMPONENTS = frozenset((".codex", ".codex-local", ".codex-tmp"))
+HISTORY_FORBIDDEN_COMPONENTS = frozenset((".codex", ".codex-local", ".codex-tmp", "raw", "scratch", "transient"))
+HISTORY_TEXT_EXTENSIONS = (".md", ".txt")
+HISTORY_JSON_EXTENSIONS = (".json",)
+HISTORY_ROOT_FILES = frozenset((".gitignore", "AGENTS.md", "README.md"))
+HISTORY_TEXT_PREFIXES = ("annotations/", "indexes/", "reports/")
+HISTORY_JSON_PREFIXES = ("annotations/", "indexes/", "schemas/")
 EPISODE_FIELDS = {
     "episode_id",
     "host",
@@ -453,7 +457,7 @@ def rollout_date_from_path(path: Path) -> dt.datetime | None:
 
 def dated_path_from_parts(path: Path) -> dt.datetime | None:
     parts = path.parts
-    for index in range(len(parts) - 2):
+    for index in range(len(parts) - 3, -1, -1):
         year, month, day = parts[index : index + 3]
         if re.fullmatch(r"\d{4}", year) and re.fullmatch(r"\d{2}", month) and re.fullmatch(r"\d{2}", day):
             parsed = parse_time(f"{year}-{month}-{day}T00:00:00Z")
@@ -481,16 +485,7 @@ def first_jsonl_error(path: Path) -> int | None:
 
 
 def iter_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
-    with path.open(encoding="utf-8", errors="replace") as handle:
-        for line_no, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                yield line_no, record
+    yield from iter_jsonl_strict(path)
 
 
 def iter_jsonl_strict(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -560,6 +555,14 @@ def record_timestamp_or_fallback(record: dict[str, Any], path: Path) -> str | No
     return record_timestamp(record) or (iso(fallback) if fallback else None)
 
 
+def record_timestamp_with_origin(record: dict[str, Any], path: Path) -> tuple[str | None, bool]:
+    timestamp = record_timestamp(record)
+    if timestamp:
+        return timestamp, False
+    fallback = rollout_date_from_path(path) or dated_path_from_parts(path)
+    return (iso(fallback) if fallback else None), True
+
+
 def record_text(record: dict[str, Any]) -> str:
     payload = record.get("payload") or {}
     if isinstance(payload, dict) and payload.get("type") in {"message", "user_message"}:
@@ -598,19 +601,21 @@ def meaningful_prompt_text(text: str) -> str:
 
 
 def dedupe_text_key(text: str) -> str:
-    return re.sub(r"\W+", " ", text.casefold()).strip()
+    key = re.sub(r"\W+", " ", text.casefold()).strip()
+    for prefix in ("user says ", "user said "):
+        if key.startswith(prefix):
+            return key[len(prefix) :].strip()
+    return key
 
 
 def duplicate_user_turn(current_text: str, current_time: str, previous: tuple[str, str] | None) -> bool:
-    if previous is None or current_time != previous[1]:
+    if previous is None or not current_time or current_time != previous[1]:
         return False
     current_key = dedupe_text_key(current_text)
     previous_key = dedupe_text_key(previous[0])
     if not current_key or not previous_key:
         return False
-    if current_key == previous_key or current_key in previous_key or previous_key in current_key:
-        return True
-    return SequenceMatcher(None, current_key, previous_key).ratio() >= 0.88
+    return current_key == previous_key
 
 
 def flags_for_text(text: str, *, redacted_changed: bool = False) -> set[str]:
@@ -678,7 +683,8 @@ def rollout_filename_in_window(path: Path, start: dt.datetime | None, end: dt.da
     rollout_date = rollout_window_date(path)
     if rollout_date is None:
         return True
-    if start and rollout_date < start:
+    rollout_end = rollout_date + dt.timedelta(days=1)
+    if start and rollout_end <= start:
         return False
     if end and rollout_date >= end:
         return False
@@ -807,10 +813,12 @@ def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetim
     if start is None and end is None:
         return True
     summary_date = summary_date_from_path(path)
+    if summary_date and start and summary_date < start:
+        if summary_date + dt.timedelta(days=1) > start:
+            return True
+        return raw_timestamp_in_window(path, start, end)
     if summary_date and end and summary_date >= end:
         return False
-    if summary_date and start and summary_date < start:
-        return raw_timestamp_in_window(path, start, end)
     return True
 
 
@@ -865,8 +873,10 @@ def extract_rollout(
             current.assistant_action_summary = safe_assistant_summary(assistant_bits)
             assistant_bits = []
 
-    def is_emit_record(timestamp: dt.datetime | None) -> bool:
-        return emit_threshold is None or timestamp is None or timestamp >= emit_threshold
+    def is_emit_record(timestamp: dt.datetime | None, *, timestamp_is_fallback: bool) -> bool:
+        if emit_threshold is None or timestamp is None or timestamp >= emit_threshold:
+            return True
+        return timestamp_is_fallback and rollout_mtime_active(path, emit_threshold, end)
 
     def emit_current(trigger_line_no: int | None = None, trigger_timestamp: str | None = None) -> None:
         nonlocal current, current_emitted
@@ -894,7 +904,7 @@ def extract_rollout(
         if isinstance(payload, dict):
             cwd = payload.get("cwd") or cwd
             model = payload.get("model") or payload.get("model_id") or model
-        timestamp = record_timestamp_or_fallback(record, path)
+        timestamp, timestamp_is_fallback = record_timestamp_with_origin(record, path)
         parsed_timestamp = parse_time(timestamp)
         if parsed_timestamp and end and parsed_timestamp >= end:
             continue
@@ -904,13 +914,14 @@ def extract_rollout(
             assistant_text = assistant_text_from_payload(payload)
             prompt_text = meaningful_prompt_text(user_text) if user_text else ""
             if user_text and not meaningful_user_text(user_text):
-                flush_assistant()
-                current = None
-                current_emitted = False
-                assistant_bits = []
+                if current and (assistant_bits or current.issue_flags):
+                    flush_assistant()
+                    current = None
+                    current_emitted = False
+                    assistant_bits = []
                 continue
             if prompt_text and meaningful_user_text(user_text):
-                fingerprint_time = iso(parsed_timestamp.replace(microsecond=0)) if parsed_timestamp else ""
+                fingerprint_time = iso(parsed_timestamp.replace(microsecond=0)) if parsed_timestamp and not timestamp_is_fallback else ""
                 fingerprint = (prompt_text, fingerprint_time)
                 if duplicate_user_turn(prompt_text, fingerprint_time, last_user_fingerprint):
                     continue
@@ -951,17 +962,17 @@ def extract_rollout(
                     turn.prompt_improvement = "Clarify the expected outcome, scope boundary, and any prior correction before asking Codex to continue."
                 current = turn
                 current_emitted = False
-                if is_emit_record(parsed_timestamp):
+                if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current()
                 continue
-            if assistant_text and current and is_emit_record(parsed_timestamp):
+            if assistant_text and current and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                 emit_current(line_no, timestamp)
                 assistant_bits.append(assistant_text)
 
         text = record_text(record)
         _redacted_text, changed = redact(text)
         record_flags = flags_for_text(text, redacted_changed=changed)
-        if current and record_flags and is_emit_record(parsed_timestamp):
+        if current and record_flags and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
             emit_current(line_no, timestamp)
             merged = set(current.issue_flags)
             merged.update(record_flags)
@@ -1021,7 +1032,7 @@ def extract_summary_file(
                 timestamp=timestamp_value,
                 cwd=None,
                 model=None,
-                model_era=infer_model_era(None, timestamp),
+                model_era=infer_model_era(None, timestamp_value),
                 redacted_user_prompt_summary=f"category=remote_rollout_summary; summary_kind={kind}",
                 assistant_action_summary="summary_source=remote_rollout_summary",
                 issue_flags=sorted(flags),
@@ -1507,23 +1518,29 @@ def validate_retained_manifest(path: Path) -> None:
 
 def parse_sources(values: list[str] | None, *, require_default_hosts: bool = True) -> list[Source]:
     if not values:
-        return [
-            Source("local", Path("~/.codex").expanduser()),
-            *(
+        sources = [Source("local", Path("~/.codex").expanduser())]
+        if require_default_hosts:
+            sources.extend(
                 Source(
                     host,
                     DEFAULT_REMOTE_SOURCE_ROOT / host,
                     "remote_source_not_materialized",
                 )
                 for host in DEFAULT_REMOTE_HOSTS
-            ),
-        ]
+            )
+        return sources
     sources: list[Source] = []
+    seen: set[tuple[str, str]] = set()
     for value in values:
         if "=" not in value:
             raise SystemExit(f"--source must be HOST=PATH, got {value!r}")
         host, raw_path = value.split("=", 1)
-        sources.append(Source(host.strip(), Path(raw_path).expanduser()))
+        source = Source(host.strip(), Path(raw_path).expanduser())
+        key = (source.host, source.root.resolve(strict=False).as_posix())
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append(source)
     if require_default_hosts:
         present = {source.host for source in sources}
         if "local" not in present:
@@ -1574,9 +1591,35 @@ def forbidden_history_artifact(file_path: str) -> bool:
     return name.startswith("rollout") and name.endswith(".jsonl")
 
 
+def history_text_contains_sensitive(data: bytes, file_path: str) -> bool:
+    text = data.decode("utf-8", errors="replace")
+    if file_path.startswith("schemas/"):
+        text = text.replace("https://json-schema.org/draft/2020-12/schema", "")
+    return contains_unredacted_sensitive_text(text)
+
+
+def history_path_kind(file_path: str) -> str:
+    name = file_path.rsplit("/", 1)[-1]
+    if name == "episodes.jsonl" or (file_path.startswith("data/episodes/") and file_path.endswith(".jsonl")):
+        return "episodes"
+    if name == "turn_flags.jsonl" or (file_path.startswith("data/turn_flags/") and file_path.endswith(".jsonl")):
+        return "turn_flags"
+    if name == "trend_report.json" or (file_path.startswith("data/trends/") and file_path.endswith(".json")):
+        return "trend"
+    if name == "retained_manifest.json" or (file_path.startswith("data/manifests/") and file_path.endswith(".json")):
+        return "manifest"
+    if file_path in HISTORY_ROOT_FILES or file_path in {"data/README.md", "reports/README.md"}:
+        return "text"
+    if file_path.endswith(HISTORY_TEXT_EXTENSIONS) and file_path.startswith(HISTORY_TEXT_PREFIXES):
+        return "text"
+    if file_path.endswith(HISTORY_JSON_EXTENSIONS) and file_path.startswith(HISTORY_JSON_PREFIXES):
+        return "json_text"
+    raise SystemExit(f"history tree contains unexpected artifact: {file_path}")
+
+
 def history_commit_changed_files(repo: Path, commit: str) -> set[str]:
     changed = subprocess.run(
-        ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--root", "-r", "-z", "--name-only", commit],
+        ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--root", "-r", "-m", "-z", "--name-only", commit],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -1604,6 +1647,19 @@ def require_history_commit(repo: Path, commit: str) -> None:
     )
     if completed.returncode != 0:
         raise SystemExit("history ref must exist in --history-repo")
+
+
+def require_history_ancestor(repo: Path, ancestor: str, ref: str) -> None:
+    require_history_commit(repo, ancestor)
+    require_history_commit(repo, ref)
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, ref],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SystemExit("--history-ref must include --history-commit")
 
 
 def history_tree_files(repo: Path, ref: str) -> list[str]:
@@ -1641,12 +1697,21 @@ def history_json(data: bytes, label: str) -> Any:
 def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
     repo = require_history_repo(history_repo)
     files = history_tree_files(repo, history_ref)
+    parent_files: dict[str, set[str]] = defaultdict(set)
+    for file_path in files:
+        parent, _, name = file_path.rpartition("/")
+        parent_files[parent].add(name)
+    for parent, names in parent_files.items():
+        retained_names = names & set(RETAINED_OUTPUT_FILES)
+        if retained_names and names != set(RETAINED_OUTPUT_FILES):
+            label = parent or "."
+            raise SystemExit(f"history retained export directory is incomplete or has extra files: {label}")
     for file_path in files:
         if forbidden_history_artifact(file_path):
             raise SystemExit(f"history tree contains forbidden transient/raw artifact: {file_path}")
-        name = file_path.rsplit("/", 1)[-1]
+        kind = history_path_kind(file_path)
         data = history_blob(repo, history_ref, file_path)
-        if name == "episodes.jsonl" or (file_path.startswith("data/episodes/") and file_path.endswith(".jsonl")):
+        if kind == "episodes":
             sanitize_retained_jsonl_bytes(
                 data,
                 label=file_path,
@@ -1654,7 +1719,7 @@ def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
                 strict=True,
                 validator=validate_episode_row,
             )
-        elif name == "turn_flags.jsonl" or (file_path.startswith("data/turn_flags/") and file_path.endswith(".jsonl")):
+        elif kind == "turn_flags":
             sanitize_retained_jsonl_bytes(
                 data,
                 label=file_path,
@@ -1662,16 +1727,19 @@ def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
                 strict=True,
                 validator=validate_turn_flag_row,
             )
-        elif name == "trend_report.json" or (file_path.startswith("data/trends/") and file_path.endswith(".json")):
+        elif kind == "trend":
             sanitize_trend_report(history_json(data, file_path), label=file_path, strict=True)
-        elif name == "retained_manifest.json" or (file_path.startswith("data/manifests/") and file_path.endswith(".json")):
-            sanitize_retained_manifest_obj(history_json(data, file_path), label=file_path, strict=True)
-        elif file_path.startswith("reports/") and file_path.endswith((".md", ".txt")):
-            text = data.decode("utf-8", errors="replace")
-            if contains_unredacted_sensitive_text(text):
-                raise SystemExit(f"history report contains unredacted sensitive text: {file_path}")
-        elif file_path.endswith(".jsonl"):
-            raise SystemExit(f"history tree contains unexpected JSONL artifact: {file_path}")
+        elif kind == "manifest":
+            manifest = sanitize_retained_manifest_obj(history_json(data, file_path), label=file_path, strict=True)
+            if manifest.get("retention_safe") is not True:
+                raise SystemExit(f"{file_path}: retention_safe must be true")
+            if contains_raw_path_fields(manifest) or contains_path_like_text(manifest) or contains_invalid_ref(manifest):
+                raise SystemExit(f"{file_path}: retained manifest is not retention-safe")
+        elif kind in {"text", "json_text"}:
+            if kind == "json_text":
+                history_json(data, file_path)
+            if history_text_contains_sensitive(data, file_path):
+                raise SystemExit(f"history artifact contains unredacted sensitive text: {file_path}")
 
 
 def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> None:
@@ -1752,6 +1820,9 @@ def state_last_scan_at(state: dict[str, Any]) -> dt.datetime | None:
 def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
     if source.host != "local":
         return []
+    canonical_codex = Path("~/.codex").expanduser().resolve(strict=False)
+    if source.root.expanduser().resolve(strict=False) != canonical_codex and source.root.name != ".codex":
+        return []
     gaps: list[dict[str, Any]] = []
     for name in LOCAL_EVIDENCE_FILES:
         evidence = source.root / name
@@ -1767,6 +1838,10 @@ def remote_metadata_gap(source: Source, reason: str = "stale_host") -> dict[str,
     if reason not in ALLOWED_REMOTE_GAP_REASONS:
         reason = "stale_host"
     return {"host": source.host, "root_ref": path_ref(source.root), "reason": reason}
+
+
+def same_second(left: dt.datetime | None, right: dt.datetime | None) -> bool:
+    return left is not None and right is not None and left.replace(microsecond=0) == right.replace(microsecond=0)
 
 
 def remote_evidence_gaps(
@@ -1798,9 +1873,9 @@ def remote_evidence_gaps(
         return [remote_metadata_gap(source)]
     if start and window_start > start:
         return [remote_metadata_gap(source)]
-    if end and window_end != end:
+    if end and not same_second(window_end, end):
         return [remote_metadata_gap(source)]
-    if materialized_at < window_end:
+    if materialized_at.replace(microsecond=0) < window_end.replace(microsecond=0):
         return [remote_metadata_gap(source)]
     return []
 
@@ -2133,6 +2208,13 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     end = parse_manifest_window_time(window, "end")
     validate_window_bounds(start, end, "manifest window")
     rows: list[dict[str, Any]] = []
+
+    def shard_row(path: Path, **values: Any) -> dict[str, Any]:
+        row = {"host": host, "path_ref": path_ref(path), **values}
+        if getattr(args, "include_raw_paths", False):
+            row["path"] = path.as_posix()
+        return row
+
     for source in sources:
         host = source.get("host")
         if not source.get("root"):
@@ -2144,13 +2226,13 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         if status != "ready":
             continue
         if not root.exists():
-            rows.append({"host": host, "path": root.as_posix(), "path_ref": path_ref(root), "status": "missing", "coverage_gap": "source root missing"})
+            rows.append(shard_row(root, status="missing", coverage_gap="source root missing"))
             continue
         for rollout in source_rollouts(Source(str(host), root)):
             if not rollout_candidate_relevant(rollout, start, end, max_raw_bytes=args.max_raw_bytes):
                 continue
             size = rollout.stat().st_size
-            row = {"host": host, "path": rollout.as_posix(), "path_ref": path_ref(rollout), "bytes": size}
+            row = shard_row(rollout, bytes=size)
             if size <= args.max_raw_bytes:
                 error_line = first_jsonl_error(rollout)
                 if error_line is not None:
@@ -2202,6 +2284,8 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         "retained_manifest.json",
     ):
         path = run_dir / name
+        if not path.exists():
+            raise SystemExit(f"missing output: {path}")
         if path.is_symlink() or (path.exists() and not path.is_file()):
             raise SystemExit(f"unexpected output file: {path}")
     required = {
@@ -2211,8 +2295,6 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     }
     for name, keys in required.items():
         path = run_dir / name
-        if not path.exists():
-            raise SystemExit(f"missing output: {path}")
         try:
             rows = list(iter_jsonl_strict(path))
         except ValueError as exc:
@@ -2390,7 +2472,11 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
         raise SystemExit("retained export window does not match scan output window")
     if retained_manifest.get("window") != retained_export_manifest.get("window"):
         raise SystemExit("retained export manifest window does not match scan output manifest")
+    history_ref = str(args.history_ref or "HEAD")
     validate_history_commit(args.history_repo, history_commit, actual_files)
+    history_repo = require_history_repo(args.history_repo)
+    require_history_ancestor(history_repo, history_commit, history_ref)
+    validate_history_tree(args.history_repo, history_ref)
     window = trend.get("window") or {}
     last_scan_at = window.get("end")
     last_mode = window.get("mode")
@@ -2473,6 +2559,11 @@ def build_parser() -> argparse.ArgumentParser:
     shards.add_argument("--manifest", required=True)
     shards.add_argument("--output", required=True)
     shards.add_argument("--max-raw-bytes", type=int, default=512_000)
+    shards.add_argument(
+        "--include-raw-paths",
+        action="store_true",
+        help="Include local raw paths for extractor dispatch. Only use under ignored .codex-local outputs; never retain or commit shards.jsonl.",
+    )
     shards.set_defaults(func=cmd_make_shards)
 
     validate = subparsers.add_parser("validate-output")
@@ -2505,6 +2596,7 @@ def build_parser() -> argparse.ArgumentParser:
     advance.add_argument("--state", required=True)
     advance.add_argument("--history-repo", required=True)
     advance.add_argument("--history-commit", required=True)
+    advance.add_argument("--history-ref", default="HEAD")
     advance.set_defaults(func=cmd_advance_state)
 
     validate_manifest = subparsers.add_parser("validate-manifest")
