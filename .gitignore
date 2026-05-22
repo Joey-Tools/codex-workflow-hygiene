@@ -1,0 +1,5 @@
+.codex-local/
+.codex-tmp/
+__pycache__/
+*.pyc
+.DS_Store

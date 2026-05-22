@@ -30,6 +30,12 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
 
+def write_local_evidence(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "session_index.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "history.jsonl").write_text("{}\n", encoding="utf-8")
+
+
 def message(role: str, text: str, timestamp: str) -> dict:
     return {
         "type": "response_item",
@@ -84,6 +90,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIsNone(sources[0].missing_reason)
         self.assertEqual(sources[1].missing_reason, "remote_source_not_materialized")
         self.assertEqual(sources[2].missing_reason, "remote_source_not_materialized")
+
+    def test_explicit_sources_still_require_default_host_coverage(self) -> None:
+        sources = MODULE.parse_sources(["local=/tmp/local", "miku-bot-dev=/tmp/miku"])
+
+        self.assertEqual([source.host for source in sources], ["local", "miku-bot-dev", "hoteng-srv-01"])
+        self.assertEqual(sources[2].missing_reason, "remote_source_not_materialized")
+        self.assertEqual(
+            [source.host for source in MODULE.parse_sources(["local=/tmp/local"], require_default_hosts=False)],
+            ["local"],
+        )
 
     def test_ignores_wrapper_and_redacts_flagged_turns(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -310,6 +326,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(turns), 1)
         self.assertEqual(turns[0].issue_flags, [])
 
+    def test_wrapper_followup_output_does_not_pollute_previous_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-abc.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the helper.", "2026-05-22T10:01:00Z"),
+                    message("assistant", "Implemented the helper.", "2026-05-22T10:02:00Z"),
+                    message("user", "# AGENTS.md instructions\nwrapper", "2026-05-22T10:03:00Z"),
+                    message("assistant", "Failed with permission denied.", "2026-05-22T10:04:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:05:00Z",
+                        "payload": {"output": "Process exited with code 1\npermission denied"},
+                    },
+                    message("user", "Now continue the real task.", "2026-05-22T10:06:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].issue_flags, [])
+        self.assertNotIn("blocked_or_failed", turns[0].assistant_action_summary)
+        self.assertEqual(turns[1].issue_flags, [])
+
     def test_scan_does_not_skip_old_rollout_with_new_turn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -324,7 +367,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = Path(raw) / "out"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None),
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, allow_partial_hosts=True),
                 mode="weekly",
                 start=MODULE.parse_time("2026-05-15T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-23T00:00:00Z"),
@@ -355,6 +398,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     "first",
                     "--source",
                     f"local={root}",
+                    "--allow-partial-hosts",
                     "--output",
                     str(output),
                 ]
@@ -383,6 +427,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(state),
                         "--source",
                         f"local={root}",
+                        "--allow-partial-hosts",
                         "--output",
                         str(output),
                     ]
@@ -441,6 +486,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_window_outside_oversized_rollout_does_not_block_daily_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
+            write_local_evidence(root)
             old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
             old_large.parent.mkdir(parents=True, exist_ok=True)
             old_large.write_text("not-json-but-old-oversized " + ("x" * 2000), encoding="utf-8")
@@ -448,7 +494,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state = Path(raw) / "state.json"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000),
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -461,6 +507,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_old_oversized_rollout_with_in_window_tail_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
+            write_local_evidence(root)
             old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
             old_large.parent.mkdir(parents=True, exist_ok=True)
             old_large.write_text(
@@ -474,7 +521,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state = Path(raw) / "state.json"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000),
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -488,6 +535,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_old_oversized_rollout_with_large_in_window_record_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
+            write_local_evidence(root)
             old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
             old_large.parent.mkdir(parents=True, exist_ok=True)
             large_payload = "x" * (300 * 1024)
@@ -506,7 +554,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state = Path(raw) / "state.json"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000),
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -519,12 +567,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_scan_manifest_keeps_execution_path_and_redacted_ref(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
+            write_local_evidence(root)
             rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
             write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
             output = Path(raw) / "out"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000),
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -564,7 +613,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state = Path(raw) / "state.json"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"remote={missing}"], output=str(output), state=str(state), max_raw_bytes=100),
+                types.SimpleNamespace(source=[f"remote={missing}"], output=str(output), state=str(state), max_raw_bytes=100, allow_partial_hosts=True),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -575,9 +624,32 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "source_root_missing")
         self.assertNotIn(str(missing), json.dumps(trend))
 
+    def test_missing_local_index_files_report_gaps_and_block_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = Path(raw) / "out"
+            state = Path(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(
+            [gap["reason"] for gap in trend["coverage_gaps"]],
+            ["session_index_missing", "history_missing"],
+        )
+
     def test_default_remote_missing_gap_blocks_state_update(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
+            write_local_evidence(root)
             rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
             write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
             missing = Path(raw) / "remote"
@@ -593,7 +665,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 ],
             ):
                 MODULE.run_scan(
-                    types.SimpleNamespace(source=None, output=str(output), state=str(state), max_raw_bytes=1000),
+                    types.SimpleNamespace(source=None, output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
                     mode="daily",
                     start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                     end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -604,6 +676,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["coverage_gaps"][0]["host"], "miku-bot-dev")
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "remote_source_not_materialized")
         self.assertIn("path_hash:", trend["coverage_gaps"][0]["root_ref"])
+
+    def test_invalid_rollout_jsonl_reports_gap_and_blocks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n", encoding="utf-8")
+            output = Path(raw) / "out"
+            state = Path(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
+        self.assertIn("path_hash:", trend["coverage_gaps"][0]["path_ref"])
 
     def test_validate_output_rejects_invalid_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -648,7 +742,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = Path(raw) / "out"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100),
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
                 mode="weekly",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-06-01T00:00:00Z"),
@@ -677,7 +771,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = Path(raw) / "out"
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100),
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
                 mode="weekly",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-06-01T00:00:00Z"),

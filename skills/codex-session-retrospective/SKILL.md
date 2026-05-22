@@ -57,6 +57,7 @@ python3 scripts/session_retrospective.py validate-output --run-dir .codex-local/
 ```
 
 Pass repeated `--source HOST=PATH` values when remote evidence has been materialized locally. `PATH` may be a Codex home containing `sessions/` or a task-scoped directory containing copied `rollout-*.jsonl` files.
+Do not run the helper output directly into a tracked repository path unless that path ignores `.codex-local/`; the transient `shard_manifest.json` and `shards.jsonl` are execution artifacts, not history artifacts.
 
 ## Output Contract
 

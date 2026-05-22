@@ -56,6 +56,7 @@ SAFETY_PATTERN = re.compile(
 
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 DEFAULT_REMOTE_SOURCE_ROOT = Path(".codex-local/session-retrospective/remote-sources")
+LOCAL_EVIDENCE_FILES = ("session_index.jsonl", "history.jsonl")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -212,9 +213,23 @@ def rollout_date_from_path(path: Path) -> dt.datetime | None:
     return parse_time(match.group(1) + "T00:00:00Z")
 
 
+def first_jsonl_error(path: Path) -> int | None:
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                json.loads(line)
+            except json.JSONDecodeError:
+                return line_no
+    return None
+
+
 def iter_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
             try:
                 yield line_no, json.loads(line)
             except json.JSONDecodeError:
@@ -224,6 +239,8 @@ def iter_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
 def iter_jsonl_strict(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
             try:
                 yield line_no, json.loads(line)
             except json.JSONDecodeError as exc:
@@ -440,6 +457,9 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
             user_text = user_text_from_payload(payload)
             assistant_text = assistant_text_from_payload(payload)
             if user_text and not meaningful_user_text(user_text):
+                flush_assistant()
+                current = None
+                assistant_bits = []
                 continue
             if user_text and meaningful_user_text(user_text):
                 fingerprint_time = iso(parsed_timestamp.replace(microsecond=0)) if parsed_timestamp else ""
@@ -667,7 +687,7 @@ def validate_retained_manifest(path: Path) -> None:
         raise SystemExit(f"{path}: raw root/path fields are not retention-safe")
 
 
-def parse_sources(values: list[str] | None) -> list[Source]:
+def parse_sources(values: list[str] | None, *, require_default_hosts: bool = True) -> list[Source]:
     if not values:
         return [
             Source("local", Path("~/.codex").expanduser()),
@@ -686,6 +706,14 @@ def parse_sources(values: list[str] | None) -> list[Source]:
             raise SystemExit(f"--source must be HOST=PATH, got {value!r}")
         host, raw_path = value.split("=", 1)
         sources.append(Source(host.strip(), Path(raw_path).expanduser()))
+    if require_default_hosts:
+        present = {source.host for source in sources}
+        if "local" not in present:
+            sources.insert(0, Source("local", Path("~/.codex").expanduser()))
+            present.add("local")
+        for host in DEFAULT_REMOTE_HOSTS:
+            if host not in present:
+                sources.append(Source(host, DEFAULT_REMOTE_SOURCE_ROOT / host, "remote_source_not_materialized"))
     return sources
 
 
@@ -712,9 +740,23 @@ def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
     return earliest
 
 
+def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
+    if source.host != "local":
+        return []
+    gaps: list[dict[str, Any]] = []
+    for name in LOCAL_EVIDENCE_FILES:
+        evidence = source.root / name
+        stem = name.removesuffix(".jsonl")
+        if not evidence.exists():
+            gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": f"{stem}_missing"})
+        elif not evidence.is_file() or not os.access(evidence, os.R_OK):
+            gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": f"{stem}_unreadable"})
+    return gaps
+
+
 def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
     output = Path(args.output)
-    sources = parse_sources(args.source)
+    sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
     all_turns: list[TurnSummary] = []
     manifest_sources: list[dict[str, Any]] = []
     coverage_gaps: list[dict[str, Any]] = []
@@ -738,6 +780,7 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
                 }
             )
             continue
+        coverage_gaps.extend(local_evidence_gaps(source))
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         if not rollouts and not summaries:
@@ -766,8 +809,26 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
                     }
                 )
                 continue
+            if first_jsonl_error(rollout) is not None:
+                coverage_gaps.append(
+                    {
+                        "host": source.host,
+                        "path_ref": path_ref(rollout),
+                        "reason": "invalid_jsonl",
+                    }
+                )
+                continue
             all_turns.extend(extract_rollout(source, rollout, start, end))
         for summary in summaries:
+            if first_jsonl_error(summary) is not None:
+                coverage_gaps.append(
+                    {
+                        "host": source.host,
+                        "path_ref": path_ref(summary),
+                        "reason": "invalid_jsonl",
+                    }
+                )
+                continue
             all_turns.extend(extract_summary_file(source, summary, start, end))
 
     episodes = episode_records(all_turns)
@@ -895,6 +956,7 @@ def add_common_scan_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state", help="State JSON path for incremental runs.")
     parser.add_argument("--output", required=True, help="Output directory for retrospective artifacts.")
     parser.add_argument("--max-raw-bytes", type=int, default=512_000, help="Skip raw extraction for larger rollout files and report a coverage gap.")
+    parser.add_argument("--allow-partial-hosts", action="store_true", help="Allow intentionally narrowed scans without default remote-host coverage gaps.")
 
 
 def build_parser() -> argparse.ArgumentParser:
