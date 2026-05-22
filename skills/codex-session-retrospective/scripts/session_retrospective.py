@@ -32,8 +32,15 @@ WRAPPER_PREFIXES = (
 AUTOMATION_PROMPT_PATTERNS = (
     re.compile(r"^Run the (?:daily|weekly) Codex session retrospective\b", re.I),
     re.compile(r"^Use \$codex-session-retrospective to run\b", re.I),
-    re.compile(r"\bcodex-session-retrospective workflow\b", re.I),
+    re.compile(r"^Use the installed codex-session-retrospective workflow\b", re.I),
     re.compile(r"\bWrite task-local artifacts under \.codex-local/session-retrospective\b", re.I),
+)
+
+AUTOMATION_PROMPT_MARKERS = (
+    "Run a read-only daily retrospective over Joey's Codex session activity.",
+    "Run a read-only weekly retrospective over Joey's Codex session activity.",
+    "Evidence scope must match $remote-host-context's default host policy",
+    "Write task-local artifacts under .codex-local/session-retrospective/runs/",
 )
 
 SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -86,6 +93,8 @@ PATH_REF_PREFIX = "path_ref_v1"
 PATH_REF_PATTERN = re.compile(r"^path_ref_v1:[0-9a-f]{16}$")
 PATH_REF_KEY = secrets.token_bytes(32)
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
+RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
+TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -388,7 +397,10 @@ def meaningful_user_text(text: str) -> bool:
     stripped = text.strip()
     if not stripped or any(stripped.startswith(prefix) for prefix in WRAPPER_PREFIXES):
         return False
-    return not any(pattern.search(stripped) for pattern in AUTOMATION_PROMPT_PATTERNS)
+    if any(pattern.search(stripped) for pattern in AUTOMATION_PROMPT_PATTERNS):
+        return False
+    marker_count = sum(1 for marker in AUTOMATION_PROMPT_MARKERS if marker in stripped)
+    return marker_count < 2
 
 
 def dedupe_text_key(text: str) -> str:
@@ -1336,9 +1348,70 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return trend, retained_manifest
 
 
+def validate_retained_output_dir(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    for name in TRANSIENT_OUTPUT_FILES:
+        path = run_dir / name
+        if path.exists():
+            raise SystemExit(f"transient output must not be retained: {path}")
+    required = {
+        "episodes.jsonl": {"episode_id", "host", "topic", "friction_flags"},
+        "turn_flags.jsonl": {"turn_id", "episode_id", "issue_flags"},
+    }
+    for name, keys in required.items():
+        path = run_dir / name
+        if not path.exists():
+            raise SystemExit(f"missing retained output: {path}")
+        try:
+            rows = list(iter_jsonl_strict(path))
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        for line_no, obj in rows:
+            missing = keys - set(obj)
+            if missing:
+                raise SystemExit(f"{path}:{line_no}: missing keys {sorted(missing)}")
+            if contains_unredacted_sensitive_text(obj):
+                raise SystemExit(f"{path}:{line_no}: unredacted sensitive text in retained output")
+    trend_path = run_dir / "trend_report.json"
+    if not trend_path.exists():
+        raise SystemExit(f"missing retained output: {trend_path}")
+    trend = json.loads(trend_path.read_text(encoding="utf-8"))
+    if contains_unredacted_sensitive_text(trend):
+        raise SystemExit(f"{trend_path}: unredacted sensitive text in retained output")
+    manifest_path = run_dir / "retained_manifest.json"
+    if not manifest_path.exists():
+        raise SystemExit(f"missing retained output: {manifest_path}")
+    validate_retained_manifest(manifest_path)
+    retained_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if contains_unredacted_sensitive_text(retained_manifest):
+        raise SystemExit(f"{manifest_path}: unredacted sensitive text in retained output")
+    return trend, retained_manifest
+
+
 def cmd_validate_output(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir)
     validate_output_run(run_dir)
+    print(f"validated: {run_dir}")
+    return 0
+
+
+def cmd_export_retained(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir)
+    validate_output_run(run_dir)
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    for name in RETAINED_OUTPUT_FILES:
+        source = run_dir / name
+        target = output / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+    validate_retained_output_dir(output)
+    print(output)
+    return 0
+
+
+def cmd_validate_retained(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir)
+    validate_retained_output_dir(run_dir)
     print(f"validated: {run_dir}")
     return 0
 
@@ -1409,6 +1482,15 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate-output")
     validate.add_argument("--run-dir", required=True)
     validate.set_defaults(func=cmd_validate_output)
+
+    export_retained = subparsers.add_parser("export-retained")
+    export_retained.add_argument("--run-dir", required=True)
+    export_retained.add_argument("--output", required=True)
+    export_retained.set_defaults(func=cmd_export_retained)
+
+    validate_retained = subparsers.add_parser("validate-retained")
+    validate_retained.add_argument("--run-dir", required=True)
+    validate_retained.set_defaults(func=cmd_validate_retained)
 
     advance = subparsers.add_parser("advance-state")
     advance.add_argument("--run-dir", required=True)

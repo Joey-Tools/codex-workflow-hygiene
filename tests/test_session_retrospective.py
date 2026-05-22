@@ -174,6 +174,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("topic_ref=topic_ref:", turns[0].redacted_user_prompt_summary)
         self.assertNotIn("redacted_excerpt=", turns[0].redacted_user_prompt_summary)
 
+    def test_human_prompt_mentioning_retrospective_workflow_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-human.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message(
+                        "user",
+                        "You missed remote hosts in the codex-session-retrospective workflow; please fix the coverage.",
+                        "2026-05-22T10:01:00Z",
+                    )
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("user_correction", turns[0].issue_flags)
+
     def test_extract_rollout_groups_multiple_turns_into_one_episode(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -940,6 +960,62 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("root", retained["sources"][0])
         self.assertIn("path_ref_v1:", retained["sources"][0]["root_ref"])
         self.assertTrue(retained["retention_safe"])
+
+    def test_export_retained_writes_history_safe_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fix failed verification.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            retained_output = Path(raw) / "history-retained"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            MODULE.main(["export-retained", "--run-dir", str(output), "--output", str(retained_output)])
+            MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
+
+            self.assertTrue((retained_output / "episodes.jsonl").exists())
+            self.assertTrue((retained_output / "turn_flags.jsonl").exists())
+            self.assertTrue((retained_output / "trend_report.json").exists())
+            self.assertTrue((retained_output / "retained_manifest.json").exists())
+            self.assertFalse((retained_output / "turn_summaries.jsonl").exists())
+            self.assertFalse((retained_output / "shard_manifest.json").exists())
+            self.assertFalse((retained_output / "shards.jsonl").exists())
+
+    def test_validate_retained_rejects_transient_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            retained_output = Path(raw) / "history-retained"
+            retained_output.mkdir()
+            (retained_output / "turn_summaries.jsonl").write_text("", encoding="utf-8")
+            write_jsonl(retained_output / "episodes.jsonl", [])
+            write_jsonl(retained_output / "turn_flags.jsonl", [])
+            (retained_output / "trend_report.json").write_text("{}\n", encoding="utf-8")
+            (retained_output / "retained_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "retention_safe": True,
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root_ref": "path_ref_v1:0123456789abcdef",
+                                "rollout_count": 1,
+                                "summary_count": 0,
+                                "status": "ready",
+                            }
+                        ],
+                        "coverage_gaps": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(SystemExit, "transient output"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
 
     def test_discover_writes_manifest_without_turn_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
