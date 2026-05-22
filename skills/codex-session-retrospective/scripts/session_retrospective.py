@@ -663,6 +663,16 @@ def rollout_candidate_relevant(
     return True
 
 
+def rollout_mtime_active(path: Path, start: dt.datetime | None) -> bool:
+    if start is None:
+        return False
+    try:
+        mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+    except OSError:
+        return True
+    return mtime >= start
+
+
 TIMESTAMP_BYTES_PATTERN = re.compile(rb'"(?:timestamp|time|created_at|ts)"\s*:\s*"([^"]+)"')
 
 
@@ -1464,7 +1474,7 @@ def safe_state_path(raw: str | None) -> Path | None:
     return path
 
 
-def validate_history_commit(history_repo: str | None, history_commit: str) -> None:
+def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> None:
     if not history_repo:
         raise SystemExit("--history-repo is required")
     repo = Path(history_repo).expanduser()
@@ -1478,6 +1488,41 @@ def validate_history_commit(history_repo: str | None, history_commit: str) -> No
     )
     if completed.returncode != 0:
         raise SystemExit("--history-commit must exist in --history-repo")
+    tree = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "-r", "-z", "--name-only", history_commit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if tree.returncode != 0:
+        raise SystemExit("failed to inspect --history-commit tree")
+    grouped: dict[str, dict[str, str]] = defaultdict(dict)
+    for raw_name in tree.stdout.split(b"\0"):
+        if not raw_name:
+            continue
+        file_path = raw_name.decode("utf-8", errors="surrogateescape")
+        parent, _, name = file_path.rpartition("/")
+        if name in RETAINED_OUTPUT_FILES:
+            grouped[parent][name] = file_path
+    expected_digest = retained_export_digest(retained_files)
+    for paths in grouped.values():
+        if set(paths) != set(RETAINED_OUTPUT_FILES):
+            continue
+        candidate: dict[str, bytes] = {}
+        for name, file_path in paths.items():
+            blob = subprocess.run(
+                ["git", "-C", str(repo), "show", f"{history_commit}:{file_path}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if blob.returncode != 0:
+                candidate = {}
+                break
+            candidate[name] = blob.stdout
+        if candidate and retained_export_digest(candidate) == expected_digest:
+            return
+    raise SystemExit("--history-commit does not contain the retained export")
 
 
 def require_positive_window(value: int, name: str) -> None:
@@ -1653,7 +1698,11 @@ def run_scan(
             if size <= max_raw_bytes:
                 error_line = first_jsonl_error(rollout)
                 if error_line is not None:
-                    if rollout_filename_in_window(rollout, start, end) or raw_timestamp_in_window(rollout, start, end):
+                    if (
+                        rollout_filename_in_window(rollout, start, end)
+                        or raw_timestamp_in_window(rollout, start, end)
+                        or rollout_mtime_active(rollout, start)
+                    ):
                         coverage_gaps.append(
                             {
                                 "host": source.host,
@@ -1918,7 +1967,11 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             if size <= args.max_raw_bytes:
                 error_line = first_jsonl_error(rollout)
                 if error_line is not None:
-                    if rollout_filename_in_window(rollout, start, end) or raw_timestamp_in_window(rollout, start, end):
+                    if (
+                        rollout_filename_in_window(rollout, start, end)
+                        or raw_timestamp_in_window(rollout, start, end)
+                        or rollout_mtime_active(rollout, start)
+                    ):
                         row["status"] = "invalid"
                         row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"
                         rows.append(row)
@@ -2112,7 +2165,6 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
     history_commit = str(args.history_commit or "")
     if not COMMIT_SHA_PATTERN.fullmatch(history_commit):
         raise SystemExit("--history-commit must be a full 40-character hex commit SHA")
-    validate_history_commit(args.history_repo, history_commit)
     run_dir = Path(args.run_dir)
     expected_files = retained_export_files_from_run(run_dir)
     trend, retained_manifest = validate_output_run(run_dir)
@@ -2124,6 +2176,7 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
         raise SystemExit("retained export window does not match scan output window")
     if retained_manifest.get("window") != retained_export_manifest.get("window"):
         raise SystemExit("retained export manifest window does not match scan output manifest")
+    validate_history_commit(args.history_repo, history_commit, actual_files)
     window = trend.get("window") or {}
     last_scan_at = window.get("end")
     last_mode = window.get("mode")

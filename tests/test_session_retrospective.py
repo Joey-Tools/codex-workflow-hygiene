@@ -109,21 +109,28 @@ def export_retained(run_dir: Path, root: str, name: str = "history-retained") ->
     return retained_output
 
 
-def write_history_repo(root: str | Path) -> tuple[Path, str]:
+def write_history_repo(root: str | Path, retained_dir: Path | None = None) -> tuple[Path, str]:
     repo = Path(root) / "history-repo"
     repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=repo, check=True)
-    (repo / "retained.json").write_text("{}\n", encoding="utf-8")
-    subprocess.run(["git", "add", "retained.json"], cwd=repo, check=True)
+    if retained_dir is None:
+        (repo / "retained.json").write_text("{}\n", encoding="utf-8")
+        subprocess.run(["git", "add", "retained.json"], cwd=repo, check=True)
+    else:
+        target = repo / "retained" / "daily"
+        target.mkdir(parents=True, exist_ok=True)
+        for name in MODULE.RETAINED_OUTPUT_FILES:
+            (target / name).write_bytes((retained_dir / name).read_bytes())
+        subprocess.run(["git", "add", "retained"], cwd=repo, check=True)
     subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add retained export"], cwd=repo, check=True)
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
     return repo, commit
 
 
-def history_commit_args(root: str | Path) -> list[str]:
-    repo, commit = write_history_repo(root)
+def history_commit_args(root: str | Path, retained_dir: Path) -> list[str]:
+    repo, commit = write_history_repo(root, retained_dir)
     return ["--history-repo", str(repo), "--history-commit", commit]
 
 
@@ -138,7 +145,7 @@ def advance_state(run_dir: Path, state: Path, root: str) -> Path:
             str(retained_output),
             "--state",
             str(state),
-            *history_commit_args(root),
+            *history_commit_args(root, retained_output),
         ]
     )
     return retained_output
@@ -1145,6 +1152,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             old_bad = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
             old_bad.parent.mkdir(parents=True, exist_ok=True)
             old_bad.write_text("{bad json\n", encoding="utf-8")
+            old_mtime = MODULE.parse_time("2026-01-01T10:00:00Z").timestamp()
+            os.utime(old_bad, (old_mtime, old_mtime))
             manifest = Path(raw) / "manifest.json"
             manifest.write_text(
                 json.dumps(
@@ -1168,6 +1177,35 @@ class SessionRetrospectiveTests(unittest.TestCase):
             old_bad = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
             old_bad.parent.mkdir(parents=True, exist_ok=True)
             old_bad.write_text('{"timestamp":"2026-05-22T10:00:00Z", bad json\n', encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root)}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "invalid")
+        self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_reports_old_invalid_jsonl_with_active_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            old_bad = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
+            old_bad.parent.mkdir(parents=True, exist_ok=True)
+            old_bad.write_text("{bad json\n", encoding="utf-8")
+            active_mtime = MODULE.parse_time("2026-05-22T10:00:00Z").timestamp()
+            os.utime(old_bad, (active_mtime, active_mtime))
             manifest = Path(raw) / "manifest.json"
             manifest.write_text(
                 json.dumps(
@@ -1376,7 +1414,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained_output),
                         "--state",
                         str(state),
-                        *history_commit_args(raw),
+                        *history_commit_args(raw, retained_output),
                     ]
                 )
 
@@ -1783,7 +1821,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained_two),
                         "--state",
                         str(state),
-                        *history_commit_args(raw),
+                        *history_commit_args(raw, retained_two),
                     ]
                 )
 
@@ -1821,6 +1859,40 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     ]
                 )
 
+    def test_advance_state_rejects_history_commit_without_retained_export(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, commit = write_history_repo(raw)
+
+            with self.assertRaisesRegex(SystemExit, "does not contain"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        commit,
+                    ]
+                )
+
     def test_advance_state_rejects_backward_last_scan_at(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1851,7 +1923,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained),
                         "--state",
                         str(state),
-                        *history_commit_args(raw),
+                        *history_commit_args(raw, retained),
                     ]
                 )
 
@@ -1888,7 +1960,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained),
                         "--state",
                         str(state),
-                        *history_commit_args(raw),
+                        *history_commit_args(raw, retained),
                     ]
                 )
 
@@ -1934,7 +2006,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained),
                         "--state",
                         str(state),
-                        *history_commit_args(raw),
+                        *history_commit_args(raw, retained),
                     ]
                 )
 
@@ -1969,7 +2041,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained),
                         "--state",
                         str(state),
-                        *history_commit_args(raw),
+                        *history_commit_args(raw, retained),
                     ]
                 )
 
@@ -2003,7 +2075,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         str(retained),
                         "--state",
                         str(state),
-                        *history_commit_args(raw),
+                        *history_commit_args(raw, retained),
                     ]
                 )
 
@@ -2455,6 +2527,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
+
+    def test_old_invalid_rollout_with_active_mtime_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n", encoding="utf-8")
+            active_mtime = MODULE.parse_time("2026-05-01T12:00:00Z").timestamp()
+            os.utime(rollout, (active_mtime, active_mtime))
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
+        self.assertNotIn("path_ref", trend["coverage_gaps"][0])
 
     def test_window_external_invalid_rollout_does_not_block_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
