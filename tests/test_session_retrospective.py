@@ -514,6 +514,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "invalid")
         self.assertIn("coverage_gap", rows[0])
 
+    def test_make_shards_rejects_invalid_manifest_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root)}],
+                        "window": {"start": "not-a-date", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            with self.assertRaisesRegex(SystemExit, "invalid manifest window start"):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+
     def test_make_shards_ignores_window_external_invalid_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -615,6 +634,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     end=MODULE.parse_time("2026-05-02T00:00:00Z"),
                 )
 
+    def test_scan_daily_rejects_unsafe_state_before_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            unsafe_state = Path(raw) / "state.json"
+            unsafe_state.write_text("{bad json\n", encoding="utf-8")
+            output = safe_output_dir(raw)
+
+            with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")):
+                with self.assertRaisesRegex(SystemExit, "must be under .codex-local/session-retrospective"):
+                    MODULE.main(
+                        [
+                            "scan-daily",
+                            "--state",
+                            str(unsafe_state),
+                            "--source",
+                            f"local={root}",
+                            "--allow-partial-hosts",
+                            "--output",
+                            str(output),
+                        ]
+                    )
+
     def test_window_outside_oversized_rollout_does_not_block_daily_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -662,7 +704,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
-        self.assertIn("path_ref_v1:", trend["coverage_gaps"][0]["path_ref"])
+        self.assertNotIn("path_ref", trend["coverage_gaps"][0])
 
     def test_old_oversized_rollout_with_large_in_window_record_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -695,6 +737,34 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
+
+    def test_old_oversized_rollout_with_uncertain_middle_timestamp_blocks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            old_large.parent.mkdir(parents=True, exist_ok=True)
+            old_large.write_text(
+                json.dumps(message("user", "Middle continuation.", "2026-05-01T12:00:00Z"))
+                + "\n"
+                + ("x" * 1000),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with mock.patch.object(MODULE, "ROLLOUT_TIMESTAMP_SCAN_BYTES", 128):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
+        self.assertNotIn("path_ref", trend["coverage_gaps"][0])
 
     def test_scan_manifest_keeps_execution_path_and_redacted_ref(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -860,7 +930,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
-        self.assertIn("path_ref_v1:", trend["coverage_gaps"][0]["path_ref"])
+        self.assertNotIn("path_ref", trend["coverage_gaps"][0])
 
     def test_window_external_invalid_rollout_does_not_block_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1000,6 +1070,27 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("safety_privacy_flag", rows[0]["issue_flags"])
         self.assertNotIn("joey@example.com", json.dumps(rows[0]))
+
+    def test_chinese_privacy_marker_contributes_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "请检查客户数据和凭据泄露风险。", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIn("safety_privacy_flag", rows[0]["issue_flags"])
 
     def test_episode_and_trend_outputs_are_schema_shaped(self) -> None:
         turn = MODULE.TurnSummary(

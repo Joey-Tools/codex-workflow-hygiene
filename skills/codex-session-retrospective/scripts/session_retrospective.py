@@ -52,7 +52,8 @@ FLAG_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 SAFETY_PATTERN = re.compile(
-    r"\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|客户|凭据|密钥)\b",
+    r"(?:\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard)\b|"
+    r"客户|客户数据|凭据|凭证|密钥|生产|破坏性)",
     re.I,
 )
 
@@ -63,6 +64,7 @@ SAFE_OUTPUT_PARTS = (".codex-local", "session-retrospective")
 PATH_REF_PREFIX = "path_ref_v1"
 PATH_REF_PATTERN = re.compile(r"^path_ref_v1:[0-9a-f]{16}$")
 PATH_REF_KEY = secrets.token_bytes(32)
+ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -392,18 +394,25 @@ def oversized_rollout_has_timestamp_in_window(
     start: dt.datetime | None,
     end: dt.datetime | None,
     *,
-    chunk_bytes: int = 1024 * 1024,
-    max_scan_bytes: int = 1024 * 1024,
-) -> bool:
+    chunk_bytes: int | None = None,
+    max_scan_bytes: int | None = None,
+) -> tuple[bool, bool]:
+    if chunk_bytes is None:
+        chunk_bytes = ROLLOUT_TIMESTAMP_SCAN_BYTES
+    if max_scan_bytes is None:
+        max_scan_bytes = ROLLOUT_TIMESTAMP_SCAN_BYTES
     size = path.stat().st_size
+    scan_bytes = min(size, max_scan_bytes)
     with path.open("rb") as handle:
         if size > max_scan_bytes:
             handle.seek(size - max_scan_bytes)
         carry = b""
-        while True:
-            data = handle.read(min(chunk_bytes, max_scan_bytes))
+        remaining = scan_bytes
+        while remaining > 0:
+            data = handle.read(min(chunk_bytes, remaining))
             if not data:
                 break
+            remaining -= len(data)
             window = carry + data
             for match in TIMESTAMP_BYTES_PATTERN.finditer(window):
                 timestamp = parse_time(match.group(1).decode("utf-8", errors="replace"))
@@ -413,20 +422,35 @@ def oversized_rollout_has_timestamp_in_window(
                     continue
                 if end and timestamp >= end:
                     continue
-                return True
+                return True, size <= max_scan_bytes
             carry = window[-256:]
-    return False
+    return False, size <= max_scan_bytes
+
+
+def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> str:
+    if start is None and end is None:
+        return "relevant"
+    rollout_date = rollout_date_from_path(path)
+    if rollout_date and end and rollout_date >= end:
+        return "irrelevant"
+    if rollout_date and start and rollout_date < start:
+        try:
+            mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+        except OSError:
+            mtime = None
+        if mtime and mtime < start:
+            return "irrelevant"
+        found, complete = oversized_rollout_has_timestamp_in_window(path, start, end)
+        if found:
+            return "relevant"
+        if complete:
+            return "irrelevant"
+        return "unknown"
+    return "relevant"
 
 
 def oversized_rollout_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
-    if start is None and end is None:
-        return True
-    rollout_date = rollout_date_from_path(path)
-    if rollout_date and end and rollout_date >= end:
-        return False
-    if rollout_date and start and rollout_date < start:
-        return oversized_rollout_has_timestamp_in_window(path, start, end)
-    return True
+    return oversized_rollout_relevance(path, start, end) == "relevant"
 
 
 def infer_model_era(model: str | None, timestamp: str | None) -> str:
@@ -624,7 +648,7 @@ def trend_report(
         "flags": dict(sorted(flags.items())),
         "hosts": dict(sorted(hosts.items())),
         "model_eras": dict(sorted(eras.items())),
-        "coverage_gaps": coverage_gaps or [],
+        "coverage_gaps": retention_safe_coverage_gaps(coverage_gaps or []),
     }
 
 
@@ -651,6 +675,22 @@ def redacted_path_entry(key: str, value: Any) -> tuple[str, Any]:
     return ref_key, path_ref(str(value)) if value else None
 
 
+def retention_safe_coverage_gaps(gaps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    coverage_gaps: list[dict[str, Any]] = []
+    for gap in gaps:
+        retained_gap: dict[str, Any] = {}
+        for key, value in gap.items():
+            if key == "path" or key == "path_ref":
+                continue
+            if key == "root":
+                ref_key, ref_value = redacted_path_entry(key, value)
+                retained_gap[ref_key] = ref_value
+                continue
+            retained_gap[key] = value
+        coverage_gaps.append(retained_gap)
+    return coverage_gaps
+
+
 def retained_manifest_from_transient(manifest: dict[str, Any]) -> dict[str, Any]:
     sources: list[dict[str, Any]] = []
     for source in manifest.get("sources", []):
@@ -663,25 +703,12 @@ def retained_manifest_from_transient(manifest: dict[str, Any]) -> dict[str, Any]
             retained_source[key] = value
         sources.append(retained_source)
 
-    coverage_gaps: list[dict[str, Any]] = []
-    for gap in manifest.get("coverage_gaps", []):
-        retained_gap: dict[str, Any] = {}
-        for key, value in gap.items():
-            if key == "path" or key == "path_ref":
-                continue
-            if key == "root":
-                ref_key, ref_value = redacted_path_entry(key, value)
-                retained_gap[ref_key] = ref_value
-                continue
-            retained_gap[key] = value
-        coverage_gaps.append(retained_gap)
-
     return {
         "schema_version": manifest.get("schema_version", 1),
         "mode": manifest.get("mode", "unknown"),
         "window": manifest.get("window") or {},
         "sources": sources,
-        "coverage_gaps": coverage_gaps,
+        "coverage_gaps": retention_safe_coverage_gaps(manifest.get("coverage_gaps", [])),
         "redaction_policy_version": manifest.get("redaction_policy_version", 1),
         "retention_safe": True,
         "retention_note": "Derived retained manifest; raw location fields removed and opaque refs preserved.",
@@ -792,6 +819,14 @@ def save_state(path: Path | None, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def safe_state_path(raw: str | None) -> Path | None:
+    if not raw:
+        return None
+    path = Path(raw)
+    ensure_safe_output_dir(path)
+    return path
+
+
 def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
     earliest: dt.datetime | None = None
     for source in sources:
@@ -819,9 +854,7 @@ def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
 def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
     output = Path(args.output)
     ensure_safe_output_dir(output)
-    state_path = Path(args.state) if args.state else None
-    if state_path:
-        ensure_safe_output_dir(state_path)
+    state_path = safe_state_path(args.state)
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
     all_turns: list[TurnSummary] = []
     manifest_sources: list[dict[str, Any]] = []
@@ -864,7 +897,20 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
         )
         for rollout in rollouts:
             size = rollout.stat().st_size
-            if not oversized_rollout_relevant(rollout, start, end):
+            relevance = oversized_rollout_relevance(rollout, start, end)
+            if relevance == "irrelevant":
+                continue
+            if relevance == "unknown" and size <= max_raw_bytes:
+                relevance = "relevant"
+            if relevance == "unknown":
+                coverage_gaps.append(
+                    {
+                        "host": source.host,
+                        "path_ref": path_ref(rollout),
+                        "bytes": size,
+                        "reason": "oversized_rollout_skipped",
+                    }
+                )
                 continue
             if size > max_raw_bytes:
                 coverage_gaps.append(
@@ -1004,7 +1050,8 @@ def cmd_discover(args: argparse.Namespace) -> int:
 
 def cmd_scan_daily(args: argparse.Namespace) -> int:
     end = utc_now()
-    state = load_state(Path(args.state)) if args.state else {}
+    state_path = safe_state_path(args.state)
+    state = load_state(state_path) if state_path else {}
     last = parse_time(state.get("last_scan_at"))
     lookback_start = end - dt.timedelta(days=args.active_lookback_days)
     start = min(last, lookback_start) if last else lookback_start
@@ -1034,6 +1081,16 @@ def cmd_baseline(args: argparse.Namespace) -> int:
     return run_scan(args, mode=mode, start=start, end=bounded_baseline_end(start, args.window_days, now))
 
 
+def parse_manifest_window_time(window: dict[str, Any], key: str) -> dt.datetime | None:
+    value = window.get(key)
+    if value is None or value == "":
+        return None
+    parsed = parse_time(str(value))
+    if parsed is None:
+        raise SystemExit(f"invalid manifest window {key}: {value}")
+    return parsed
+
+
 def cmd_make_shards(args: argparse.Namespace) -> int:
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     if manifest.get("retention_safe") is True:
@@ -1042,8 +1099,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     ensure_safe_output_dir(output)
     sources = manifest.get("sources", [])
     window = manifest.get("window") or {}
-    start = parse_time(window.get("start"))
-    end = parse_time(window.get("end"))
+    start = parse_manifest_window_time(window, "start")
+    end = parse_manifest_window_time(window, "end")
     rows: list[dict[str, Any]] = []
     for source in sources:
         host = source.get("host")
@@ -1056,7 +1113,15 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         for rollout in source_rollouts(Source(str(host), root)):
             size = rollout.stat().st_size
             row = {"host": host, "path": rollout.as_posix(), "path_ref": path_ref(rollout), "bytes": size}
-            if not oversized_rollout_relevant(rollout, start, end):
+            relevance = oversized_rollout_relevance(rollout, start, end)
+            if relevance == "irrelevant":
+                continue
+            if relevance == "unknown" and size <= args.max_raw_bytes:
+                relevance = "relevant"
+            if relevance == "unknown":
+                row["status"] = "oversized"
+                row["coverage_gap"] = "rollout exceeds timestamp relevance scan; use bounded rollout-summary before extractor handoff"
+                rows.append(row)
                 continue
             if size > args.max_raw_bytes:
                 row["status"] = "oversized"
