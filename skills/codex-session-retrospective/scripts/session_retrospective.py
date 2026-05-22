@@ -43,6 +43,8 @@ SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED_SECRET]"),
     (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/\-]+=*", re.I), "[REDACTED_CREDENTIAL]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), "[REDACTED_CREDENTIAL]"),
+    (re.compile(r"\b(?:ssh://[^\s)>\]\"']+|git@[A-Za-z0-9_.-]+:[^\s)>\]\"']+)"), "[REDACTED_URL]"),
     (
         re.compile(
             r"\b(?:password|passwd|pwd|credential|secret|token|api[_-]?key|authorization)\s*[:=]\s*['\"]?[^'\"\s,;]+",
@@ -197,9 +199,9 @@ def prompt_topic_key(redacted_text: str) -> str:
         if len(token) > 2 and token not in TOPIC_STOPWORDS and not token.startswith("redacted")
     ]
     if meaningful:
-        return "+".join(sorted(dict.fromkeys(meaningful))[:6])
+        return "topic_ref:" + stable_hash("+".join(sorted(dict.fromkeys(meaningful))[:6]), 12)
     compacted = re.sub(r"\s+", "", redacted_text)
-    return stable_hash(compacted, 12) if compacted else "unknown"
+    return "topic_ref:" + stable_hash(compacted, 12) if compacted else "unknown"
 
 
 def safe_prompt_summary(
@@ -213,7 +215,7 @@ def safe_prompt_summary(
         f"prompt_chars={len(text)}",
     ]
     if redacted_text:
-        parts.append("topic_key=" + prompt_topic_key(redacted_text))
+        parts.append("topic_ref=" + prompt_topic_key(redacted_text))
     if issue_flags:
         parts.append("flags=" + ",".join(sorted(issue_flags)))
         if redacted_text and "safety_privacy_flag" not in issue_flags:
@@ -559,7 +561,14 @@ def infer_model_era(model: str | None, timestamp: str | None) -> str:
     return "unknown"
 
 
-def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: dt.datetime | None) -> list[TurnSummary]:
+def extract_rollout(
+    source: Source,
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    emit_start: dt.datetime | None = None,
+) -> list[TurnSummary]:
     session_id = session_id_from_path(path)
     source_hash = file_hash(path)
     cwd: str | None = None
@@ -568,12 +577,22 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
     turns: list[TurnSummary] = []
     assistant_bits: list[str] = []
     last_user_fingerprint: tuple[str, str] | None = None
+    current_emitted = False
 
     def flush_assistant() -> None:
         nonlocal assistant_bits
         if current and assistant_bits:
             current.assistant_action_summary = safe_assistant_summary(assistant_bits)
             assistant_bits = []
+
+    def is_emit_record(timestamp: dt.datetime | None) -> bool:
+        return emit_start is None or timestamp is None or timestamp >= emit_start
+
+    def emit_current() -> None:
+        nonlocal current_emitted
+        if current and not current_emitted:
+            turns.append(current)
+            current_emitted = True
 
     for line_no, record in iter_jsonl(path):
         payload = record.get("payload") or {}
@@ -593,6 +612,7 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
             if user_text and not meaningful_user_text(user_text):
                 flush_assistant()
                 current = None
+                current_emitted = False
                 assistant_bits = []
                 continue
             if user_text and meaningful_user_text(user_text):
@@ -635,16 +655,20 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
                 )
                 if "user_correction" in prompt_flags or "context_loss" in prompt_flags:
                     turn.prompt_improvement = "Clarify the expected outcome, scope boundary, and any prior correction before asking Codex to continue."
-                turns.append(turn)
                 current = turn
+                current_emitted = False
+                if is_emit_record(parsed_timestamp):
+                    emit_current()
                 continue
-            if assistant_text and current:
+            if assistant_text and current and is_emit_record(parsed_timestamp):
+                emit_current()
                 assistant_bits.append(assistant_text)
 
         text = record_text(record)
         _redacted_text, changed = redact(text)
         record_flags = flags_for_text(text, redacted_changed=changed)
-        if current and record_flags:
+        if current and record_flags and is_emit_record(parsed_timestamp):
+            emit_current()
             merged = set(current.issue_flags)
             merged.update(record_flags)
             current.issue_flags = sorted(merged)
@@ -655,7 +679,14 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
     return turns
 
 
-def extract_summary_file(source: Source, path: Path, start: dt.datetime | None, end: dt.datetime | None) -> list[TurnSummary]:
+def extract_summary_file(
+    source: Source,
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    emit_start: dt.datetime | None = None,
+) -> list[TurnSummary]:
     turns: list[TurnSummary] = []
     source_hash = file_hash(path)
     session_id = stable_hash(path.as_posix(), 20)
@@ -668,6 +699,8 @@ def extract_summary_file(source: Source, path: Path, start: dt.datetime | None, 
         if parsed_timestamp and start and parsed_timestamp < start:
             continue
         if parsed_timestamp and end and parsed_timestamp >= end:
+            continue
+        if emit_start and parsed_timestamp and parsed_timestamp < emit_start:
             continue
         text = str(record.get("text") or "")
         kind = str(record.get("kind") or "summary")
@@ -855,6 +888,16 @@ def contains_invalid_ref(value: Any) -> bool:
     return False
 
 
+def contains_unredacted_sensitive_text(value: Any) -> bool:
+    if isinstance(value, str):
+        return any(pattern.search(value) for pattern, _label in SECRET_PATTERNS)
+    if isinstance(value, dict):
+        return any(contains_unredacted_sensitive_text(child) for child in value.values())
+    if isinstance(value, list):
+        return any(contains_unredacted_sensitive_text(child) for child in value)
+    return False
+
+
 def validate_retained_manifest(path: Path) -> None:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if manifest.get("retention_safe") is not True:
@@ -955,7 +998,14 @@ def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
     return gaps
 
 
-def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
+def run_scan(
+    args: argparse.Namespace,
+    *,
+    mode: str,
+    start: dt.datetime | None,
+    end: dt.datetime,
+    emit_start: dt.datetime | None = None,
+) -> int:
     output = Path(args.output)
     ensure_safe_output_dir(output)
     state_path = safe_state_path(args.state)
@@ -1015,7 +1065,7 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
                     continue
                 if not rollout_has_record_in_window(rollout, start, end):
                     continue
-                all_turns.extend(extract_rollout(source, rollout, start, end))
+                all_turns.extend(extract_rollout(source, rollout, start, end, emit_start=emit_start))
                 continue
             relevance = oversized_rollout_relevance(rollout, start, end)
             if relevance == "irrelevant":
@@ -1052,12 +1102,12 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
                     }
                 )
                 continue
-            all_turns.extend(extract_summary_file(source, summary, start, end))
+            all_turns.extend(extract_summary_file(source, summary, start, end, emit_start=emit_start))
 
     episodes = episode_records(all_turns)
     window = {
         "mode": mode,
-        "start": iso(start) if start else None,
+        "start": iso(emit_start or start) if (emit_start or start) else None,
         "end": iso(end),
     }
     write_jsonl(output / "turn_summaries.jsonl", (asdict_turn(turn) for turn in all_turns))
@@ -1164,8 +1214,13 @@ def cmd_scan_daily(args: argparse.Namespace) -> int:
     state = load_state(state_path) if state_path else {}
     last = parse_time(state.get("last_scan_at"))
     lookback_start = end - dt.timedelta(days=args.active_lookback_days)
-    start = last if last and last <= end else lookback_start
-    return run_scan(args, mode="daily", start=start, end=end)
+    if last and last <= end:
+        start = min(last, lookback_start)
+        emit_start = last
+    else:
+        start = lookback_start
+        emit_start = None
+    return run_scan(args, mode="daily", start=start, end=end, emit_start=emit_start)
 
 
 def cmd_scan_weekly(args: argparse.Namespace) -> int:
@@ -1278,6 +1333,8 @@ def cmd_validate_output(args: argparse.Namespace) -> int:
             missing = keys - set(obj)
             if missing:
                 raise SystemExit(f"{path}:{line_no}: missing keys {sorted(missing)}")
+            if contains_unredacted_sensitive_text(obj):
+                raise SystemExit(f"{path}:{line_no}: unredacted sensitive text in retained output")
     json.loads((run_dir / "trend_report.json").read_text(encoding="utf-8"))
     validate_retained_manifest(run_dir / "retained_manifest.json")
     print(f"validated: {run_dir}")

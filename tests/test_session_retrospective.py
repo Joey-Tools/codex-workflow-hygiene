@@ -533,6 +533,52 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["turn_count"], 1)
         self.assertEqual(trend["window"]["start"], "2026-05-21T10:00:00Z")
 
+    def test_daily_existing_state_revisits_active_thread_context_without_duplicate_output(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "12" / "rollout-2026-05-12T10-00-00-active.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Debug the active deployment.", "2026-05-12T10:00:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T09:00:00Z",
+                        "payload": {"output": "Process exited with code 1"},
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(json.dumps({"last_scan_at": "2026-05-21T10:00:00Z"}), encoding="utf-8")
+
+            with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")):
+                MODULE.main(
+                    [
+                        "scan-daily",
+                        "--active-lookback-days",
+                        "14",
+                        "--state",
+                        str(state),
+                        "--source",
+                        f"local={root}",
+                        "--allow-partial-hosts",
+                        "--output",
+                        str(output),
+                    ]
+                )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("failed_command", rows[0]["issue_flags"])
+        self.assertEqual(trend["window"]["start"], "2026-05-21T10:00:00Z")
+
     def test_make_shards_respects_window_and_reports_oversized(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1105,6 +1151,52 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SystemExit, "summary_count"):
                 MODULE.main(["validate-manifest", "--manifest", str(retained)])
+
+    def test_validate_output_rejects_unredacted_sensitive_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw) / "run"
+            run_dir.mkdir()
+            row = {
+                "turn_id": "t1",
+                "episode_id": "e1",
+                "host": "local",
+                "session_id": "s1",
+                "source_path": "path_ref_v1:0123456789abcdef",
+                "source_hash": "0" * 64,
+                "timestamp": "2026-05-22T10:00:00Z",
+                "cwd": None,
+                "model": None,
+                "model_era": "unknown",
+                "redacted_user_prompt_summary": "category=debug; redacted_excerpt=/Users/hoteng/secret password=hunter2",
+                "assistant_action_summary": "",
+                "issue_flags": ["failed_command"],
+                "prompt_improvement": None,
+            }
+            write_jsonl(run_dir / "turn_summaries.jsonl", [row])
+            write_jsonl(run_dir / "turn_flags.jsonl", [row])
+            write_jsonl(run_dir / "episodes.jsonl", [])
+            (run_dir / "trend_report.json").write_text("{}\n", encoding="utf-8")
+            (run_dir / "retained_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "retention_safe": True,
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root_ref": "path_ref_v1:0123456789abcdef",
+                                "rollout_count": 1,
+                                "summary_count": 0,
+                                "status": "ready",
+                            }
+                        ],
+                        "coverage_gaps": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(SystemExit, "unredacted sensitive text"):
+                MODULE.main(["validate-output", "--run-dir", str(run_dir)])
 
     def test_rollout_summary_file_contributes_flags_without_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
