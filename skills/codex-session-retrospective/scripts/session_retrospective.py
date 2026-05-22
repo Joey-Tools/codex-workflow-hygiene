@@ -54,11 +54,15 @@ SAFETY_PATTERN = re.compile(
     re.I,
 )
 
+DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
+DEFAULT_REMOTE_SOURCE_ROOT = Path(".codex-local/session-retrospective/remote-sources")
+
 
 @dataclasses.dataclass(frozen=True)
 class Source:
     host: str
     root: Path
+    missing_reason: str | None = None
 
 
 @dataclasses.dataclass
@@ -665,7 +669,17 @@ def validate_retained_manifest(path: Path) -> None:
 
 def parse_sources(values: list[str] | None) -> list[Source]:
     if not values:
-        return [Source("local", Path("~/.codex").expanduser())]
+        return [
+            Source("local", Path("~/.codex").expanduser()),
+            *(
+                Source(
+                    host,
+                    DEFAULT_REMOTE_SOURCE_ROOT / host,
+                    "remote_source_not_materialized",
+                )
+                for host in DEFAULT_REMOTE_HOSTS
+            ),
+        ]
     sources: list[Source] = []
     for value in values:
         if "=" not in value:
@@ -707,7 +721,13 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
     max_raw_bytes = getattr(args, "max_raw_bytes", 512_000)
     for source in sources:
         if not source.root.exists():
-            coverage_gaps.append({"host": source.host, "root": path_ref(source.root), "reason": "source_root_missing"})
+            coverage_gaps.append(
+                {
+                    "host": source.host,
+                    "root_ref": path_ref(source.root),
+                    "reason": source.missing_reason or "source_root_missing",
+                }
+            )
             manifest_sources.append(
                 {
                     "host": source.host,
@@ -721,7 +741,7 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         if not rollouts and not summaries:
-            coverage_gaps.append({"host": source.host, "root": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
+            coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
         manifest_sources.append(
             {
                 "host": source.host,
@@ -740,7 +760,7 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
                 coverage_gaps.append(
                     {
                         "host": source.host,
-                        "path": path_ref(rollout),
+                        "path_ref": path_ref(rollout),
                         "bytes": size,
                         "reason": "oversized_rollout_skipped",
                     }

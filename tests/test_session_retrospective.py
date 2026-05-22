@@ -77,6 +77,14 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(MODULE.prompt_category("Review this PR."), "review")
         self.assertNotIn("git_or_pr", MODULE.safe_assistant_summary(["Improved the prompt."]))
 
+    def test_default_sources_include_remote_hosts_as_missing_until_materialized(self) -> None:
+        sources = MODULE.parse_sources(None)
+
+        self.assertEqual([source.host for source in sources], ["local", "miku-bot-dev", "hoteng-srv-01"])
+        self.assertIsNone(sources[0].missing_reason)
+        self.assertEqual(sources[1].missing_reason, "remote_source_not_materialized")
+        self.assertEqual(sources[2].missing_reason, "remote_source_not_materialized")
+
     def test_ignores_wrapper_and_redacts_flagged_turns(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -475,7 +483,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
-        self.assertIn("path_hash:", trend["coverage_gaps"][0]["path"])
+        self.assertIn("path_hash:", trend["coverage_gaps"][0]["path_ref"])
 
     def test_old_oversized_rollout_with_large_in_window_record_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -566,6 +574,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "source_root_missing")
         self.assertNotIn(str(missing), json.dumps(trend))
+
+    def test_default_remote_missing_gap_blocks_state_update(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            missing = Path(raw) / "remote"
+            output = Path(raw) / "out"
+            state = Path(raw) / "state.json"
+
+            with mock.patch.object(
+                MODULE,
+                "parse_sources",
+                return_value=[
+                    MODULE.Source("local", root),
+                    MODULE.Source("miku-bot-dev", missing, "remote_source_not_materialized"),
+                ],
+            ):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=None, output=str(output), state=str(state), max_raw_bytes=1000),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["host"], "miku-bot-dev")
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "remote_source_not_materialized")
+        self.assertIn("path_hash:", trend["coverage_gaps"][0]["root_ref"])
 
     def test_validate_output_rejects_invalid_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
