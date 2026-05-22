@@ -42,6 +42,12 @@ def message(role: str, text: str, timestamp: str) -> dict:
     }
 
 
+def message_with_cwd(role: str, text: str, timestamp: str, cwd: str) -> dict:
+    row = message(role, text, timestamp)
+    row["payload"]["cwd"] = cwd
+    return row
+
+
 def event_user_message(text: str, timestamp: str) -> dict:
     return {
         "type": "event_msg",
@@ -69,6 +75,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_prompt_category_does_not_treat_prompt_as_pr_review(self) -> None:
         self.assertEqual(MODULE.prompt_category("Improve this prompt for the project."), "general")
         self.assertEqual(MODULE.prompt_category("Review this PR."), "review")
+        self.assertNotIn("git_or_pr", MODULE.safe_assistant_summary(["Improved the prompt."]))
 
     def test_ignores_wrapper_and_redacts_flagged_turns(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -139,6 +146,43 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("category=review", turns[0].redacted_user_prompt_summary)
         self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
 
+    def test_extract_rollout_deduplicates_near_duplicate_user_message_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-event.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    event_user_message("Review the PR.", "2026-05-22T10:01:00.001Z"),
+                    message("user", "User says: Review the PR.", "2026-05-22T10:01:00.002Z"),
+                    message("assistant", "Reviewed it.", "2026-05-22T10:02:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+
+    def test_automation_prompt_is_not_treated_as_user_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-auto.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message(
+                        "user",
+                        "Run the daily Codex session retrospective. Check auth, secrets, customer data, and write task-local artifacts.",
+                        "2026-05-22T10:01:00Z",
+                    ),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(turns, [])
+
     def test_episode_splits_by_day_and_prompt_category(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -177,6 +221,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("verification", turns[0].assistant_action_summary)
         self.assertNotIn("customer", turns[0].assistant_action_summary)
         self.assertNotIn("code.py", turns[0].assistant_action_summary)
+
+    def test_paths_are_redacted_in_turn_and_episode_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-secret.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message_with_cwd(
+                        "user",
+                        "Please implement the helper.",
+                        "2026-05-22T10:01:00Z",
+                        "/Users/hoteng/Program/GitHub/customer-secret/repo",
+                    ),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+            episodes = MODULE.episode_records(turns)
+            serialized = json.dumps({"turns": [MODULE.asdict_turn(turns[0])], "episodes": episodes})
+
+        self.assertIn("path_hash:", turns[0].source_path)
+        self.assertIn("path_hash:", turns[0].cwd)
+        self.assertNotIn("customer-secret", serialized)
+        self.assertNotIn(str(root), serialized)
 
     def test_wrapper_user_message_does_not_flag_previous_turn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -281,8 +350,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             old = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-old.jsonl"
+            old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
             large = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-large.jsonl"
             write_jsonl(old, [message("user", "Old task.", "2026-01-01T10:00:00Z")])
+            old_large.parent.mkdir(parents=True, exist_ok=True)
+            old_large.write_text("not-json-but-old-oversized " + ("x" * 2000), encoding="utf-8")
             large.parent.mkdir(parents=True, exist_ok=True)
             large.write_text("not-json-but-oversized " + ("x" * 2000), encoding="utf-8")
             manifest = Path(raw) / "manifest.json"
@@ -315,6 +387,27 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "oversized")
         self.assertIn("coverage_gap", rows[0])
+        self.assertNotIn(str(root), json.dumps(rows))
+
+    def test_window_outside_oversized_rollout_does_not_block_daily_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            old_large.parent.mkdir(parents=True, exist_ok=True)
+            old_large.write_text("not-json-but-old-oversized " + ("x" * 2000), encoding="utf-8")
+            output = Path(raw) / "out"
+            state = Path(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+            self.assertTrue(state.exists())
+            self.assertEqual(trend["coverage_gaps"], [])
 
     def test_missing_source_reports_gap_and_does_not_update_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -332,6 +425,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "source_root_missing")
+        self.assertNotIn(str(missing), json.dumps(trend))
 
     def test_validate_output_rejects_invalid_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -374,6 +468,34 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["redacted_user_prompt_summary"], "category=remote_rollout_summary; summary_kind=function_call_output")
         self.assertIn("approval_auth_friction", rows[0]["issue_flags"])
         self.assertNotIn("customer", json.dumps(rows[0]))
+
+    def test_rollout_summary_privacy_marker_contributes_flag_without_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {"kind": "session_meta", "timestamp": "2026-05-22T10:00:00Z", "text": "session_id=s1"},
+                    {"kind": "summary", "timestamp": "2026-05-22T10:01:00Z", "text": "Contact joey@example.com"},
+                ],
+            )
+            output = Path(raw) / "out"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-06-01T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("safety_privacy_flag", rows[0]["issue_flags"])
+        self.assertNotIn("joey@example.com", json.dumps(rows[0]))
 
     def test_episode_and_trend_outputs_are_schema_shaped(self) -> None:
         turn = MODULE.TurnSummary(

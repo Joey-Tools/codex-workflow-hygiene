@@ -10,6 +10,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -21,6 +22,12 @@ WRAPPER_PREFIXES = (
     "<subagent_notification>",
     "# Review findings:",
     "<turn_aborted>",
+)
+
+AUTOMATION_PROMPT_PATTERNS = (
+    re.compile(r"^Run the (?:daily|weekly) Codex session retrospective\b", re.I),
+    re.compile(r"\bcodex-session-retrospective workflow\b", re.I),
+    re.compile(r"\bWrite task-local artifacts under \.codex-local/session-retrospective\b", re.I),
 )
 
 SECRET_PATTERNS = (
@@ -111,10 +118,14 @@ def redact(text: str) -> tuple[str, bool]:
     return redacted, changed
 
 
+def has_pr_intent(text: str) -> bool:
+    return bool(re.search(r"\b(?:review|pr|pull request)\b", text.lower()))
+
+
 def prompt_category(text: str) -> str:
     categories: list[str] = []
     lowered = text.lower()
-    if re.search(r"\b(?:review|pr|pull request)\b", lowered):
+    if has_pr_intent(lowered):
         categories.append("review")
     if any(word in lowered for word in ("fix", "bug", "error", "failed", "failure")):
         categories.append("debug_or_fix")
@@ -150,7 +161,7 @@ def safe_assistant_summary(texts: list[str]) -> str:
         categories.append("verification")
     if any(word in joined for word in ("implement", "add", "create", "update", "patch", "edit")):
         categories.append("implementation")
-    if any(word in joined for word in ("commit", "push", "pr", "pull request")):
+    if any(word in joined for word in ("commit", "push")) or has_pr_intent(joined):
         categories.append("git_or_pr")
     if any(word in joined for word in ("blocked", "cannot", "unable", "failed", "error")):
         categories.append("blocked_or_failed")
@@ -163,6 +174,12 @@ def safe_assistant_summary(texts: list[str]) -> str:
 
 def stable_hash(value: str, length: int = 16) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
+
+
+def path_ref(value: str | os.PathLike[str] | None, length: int = 16) -> str | None:
+    if not value:
+        return None
+    return f"path_hash:{stable_hash(os.fspath(value), length)}"
 
 
 def file_hash(path: Path) -> str:
@@ -187,15 +204,22 @@ def rollout_date_from_path(path: Path) -> dt.datetime | None:
     return parse_time(match.group(1) + "T00:00:00Z")
 
 
-def iter_jsonl(path: Path, *, strict: bool = False) -> Iterable[tuple[int, dict[str, Any]]]:
+def iter_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line_no, line in enumerate(handle, 1):
+            try:
+                yield line_no, json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def iter_jsonl_strict(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line_no, line in enumerate(handle, 1):
             try:
                 yield line_no, json.loads(line)
             except json.JSONDecodeError as exc:
-                if strict:
-                    raise ValueError(f"{path}:{line_no}: invalid JSON") from exc
-                continue
+                raise ValueError(f"{path}:{line_no}: invalid JSON") from exc
 
 
 def text_from_message_payload(payload: dict[str, Any]) -> str:
@@ -247,7 +271,25 @@ def record_text(record: dict[str, Any]) -> str:
 
 def meaningful_user_text(text: str) -> bool:
     stripped = text.strip()
-    return bool(stripped) and not any(stripped.startswith(prefix) for prefix in WRAPPER_PREFIXES)
+    if not stripped or any(stripped.startswith(prefix) for prefix in WRAPPER_PREFIXES):
+        return False
+    return not any(pattern.search(stripped) for pattern in AUTOMATION_PROMPT_PATTERNS)
+
+
+def dedupe_text_key(text: str) -> str:
+    return re.sub(r"\W+", " ", text.casefold()).strip()
+
+
+def duplicate_user_turn(current_text: str, current_time: str, previous: tuple[str, str] | None) -> bool:
+    if previous is None or current_time != previous[1]:
+        return False
+    current_key = dedupe_text_key(current_text)
+    previous_key = dedupe_text_key(previous[0])
+    if not current_key or not previous_key:
+        return False
+    if current_key == previous_key or current_key in previous_key or previous_key in current_key:
+        return True
+    return SequenceMatcher(None, current_key, previous_key).ratio() >= 0.88
 
 
 def flags_for_text(text: str, *, redacted_changed: bool = False) -> set[str]:
@@ -285,6 +327,17 @@ def rollout_has_record_in_window(path: Path, start: dt.datetime | None, end: dt.
             continue
         return True
     return False
+
+
+def rollout_filename_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    rollout_date = rollout_date_from_path(path)
+    if rollout_date is None:
+        return True
+    if start and rollout_date < start:
+        return False
+    if end and rollout_date >= end:
+        return False
+    return True
 
 
 def infer_model_era(model: str | None, timestamp: str | None) -> str:
@@ -338,7 +391,7 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
             if user_text and meaningful_user_text(user_text):
                 fingerprint_time = iso(parsed_timestamp.replace(microsecond=0)) if parsed_timestamp else ""
                 fingerprint = (user_text, fingerprint_time)
-                if fingerprint == last_user_fingerprint:
+                if duplicate_user_turn(user_text, fingerprint_time, last_user_fingerprint):
                     continue
                 last_user_fingerprint = fingerprint
                 flush_assistant()
@@ -353,10 +406,10 @@ def extract_rollout(source: Source, path: Path, start: dt.datetime | None, end: 
                     episode_id=episode_id,
                     host=source.host,
                     session_id=session_id,
-                    source_path=path.as_posix(),
+                    source_path=path_ref(path) or "",
                     source_hash=source_hash,
                     timestamp=timestamp,
-                    cwd=cwd,
+                    cwd=path_ref(cwd),
                     model=model,
                     model_era=infer_model_era(model, timestamp),
                     redacted_user_prompt_summary=prompt_summary,
@@ -404,7 +457,8 @@ def extract_summary_file(source: Source, path: Path, start: dt.datetime | None, 
             if match:
                 session_id = match.group(1)
             continue
-        flags = flags_for_text(text, redacted_changed=False)
+        _redacted_text, changed = redact(text)
+        flags = flags_for_text(text, redacted_changed=changed)
         if not flags:
             continue
         date_bucket = (parsed_timestamp or utc_now()).date().isoformat()
@@ -415,7 +469,7 @@ def extract_summary_file(source: Source, path: Path, start: dt.datetime | None, 
                 episode_id=episode_id,
                 host=source.host,
                 session_id=session_id,
-                source_path=path.as_posix(),
+                source_path=path_ref(path) or "",
                 source_hash=source_hash,
                 timestamp=timestamp,
                 cwd=None,
@@ -542,17 +596,17 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
     max_raw_bytes = getattr(args, "max_raw_bytes", 512_000)
     for source in sources:
         if not source.root.exists():
-            coverage_gaps.append({"host": source.host, "root": source.root.as_posix(), "reason": "source_root_missing"})
-            manifest_sources.append({"host": source.host, "root": source.root.as_posix(), "rollout_count": 0, "status": "missing"})
+            coverage_gaps.append({"host": source.host, "root": path_ref(source.root), "reason": "source_root_missing"})
+            manifest_sources.append({"host": source.host, "root": path_ref(source.root), "rollout_count": 0, "status": "missing"})
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         if not rollouts and not summaries:
-            coverage_gaps.append({"host": source.host, "root": source.root.as_posix(), "reason": "no_rollout_or_summary_files"})
+            coverage_gaps.append({"host": source.host, "root": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
         manifest_sources.append(
             {
                 "host": source.host,
-                "root": source.root.as_posix(),
+                "root": path_ref(source.root),
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
                 "status": "ready" if rollouts or summaries else "empty",
@@ -561,10 +615,12 @@ def run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, 
         for rollout in rollouts:
             size = rollout.stat().st_size
             if size > max_raw_bytes:
+                if not rollout_filename_in_window(rollout, start, end):
+                    continue
                 coverage_gaps.append(
                     {
                         "host": source.host,
-                        "path": rollout.as_posix(),
+                        "path": path_ref(rollout),
                         "bytes": size,
                         "reason": "oversized_rollout_skipped",
                     }
@@ -619,6 +675,10 @@ def cmd_scan_weekly(args: argparse.Namespace) -> int:
     return run_scan(args, mode="weekly", start=start, end=end)
 
 
+def bounded_baseline_end(start: dt.datetime, window_days: int, now: dt.datetime) -> dt.datetime:
+    return min(now, start + dt.timedelta(days=window_days))
+
+
 def cmd_baseline(args: argparse.Namespace) -> int:
     now = utc_now()
     sources = parse_sources(args.source)
@@ -628,8 +688,8 @@ def cmd_baseline(args: argparse.Namespace) -> int:
         start = parse_time(args.from_value)
         if start is None:
             raise SystemExit(f"invalid --from timestamp: {args.from_value}")
-    end = min(now, start + dt.timedelta(days=args.window_days))
-    return run_scan(args, mode=f"baseline-{args.window_days}d", start=start, end=end)
+    mode = f"baseline-{args.window_days}d"
+    return run_scan(args, mode=mode, start=start, end=bounded_baseline_end(start, args.window_days, now))
 
 
 def cmd_make_shards(args: argparse.Namespace) -> int:
@@ -644,14 +704,13 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         host = source.get("host")
         root = Path(source.get("root", "")).expanduser()
         if not root.exists():
-            rows.append({"host": host, "path": root.as_posix(), "status": "missing", "coverage_gap": "source root missing"})
+            rows.append({"host": host, "path": path_ref(root), "status": "missing", "coverage_gap": "source root missing"})
             continue
         for rollout in source_rollouts(Source(str(host), root)):
             size = rollout.stat().st_size
-            row = {"host": host, "path": rollout.as_posix(), "bytes": size}
+            row = {"host": host, "path": path_ref(rollout), "bytes": size}
             if size > args.max_raw_bytes:
-                rollout_date = rollout_date_from_path(rollout)
-                if rollout_date and end and rollout_date >= end:
+                if not rollout_filename_in_window(rollout, start, end):
                     continue
                 row["status"] = "oversized"
                 row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"
@@ -677,7 +736,7 @@ def cmd_validate_output(args: argparse.Namespace) -> int:
         if not path.exists():
             raise SystemExit(f"missing output: {path}")
         try:
-            rows = list(iter_jsonl(path, strict=True))
+            rows = list(iter_jsonl_strict(path))
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
         for line_no, obj in rows:
