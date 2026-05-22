@@ -402,6 +402,11 @@ def path_ref(value: str | os.PathLike[str] | None, length: int = 16) -> str | No
     return f"{PATH_REF_PREFIX}:{digest.hexdigest()[:length]}"
 
 
+def opaque_digest(value: str | os.PathLike[str], length: int = 20) -> str:
+    digest = hmac.new(path_ref_key(), os.fspath(value).encode("utf-8", errors="surrogatepass"), hashlib.sha256)
+    return digest.hexdigest()[:length]
+
+
 def file_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -422,7 +427,7 @@ def session_id_from_path(path: Path) -> str:
     match = re.search(r"^rollout-\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2})?-(.+)\.jsonl$", path.name)
     if match:
         return match.group(1)
-    return stable_hash(path.as_posix())
+    return opaque_digest(path.as_posix())
 
 
 def rollout_date_from_path(path: Path) -> dt.datetime | None:
@@ -517,7 +522,9 @@ def assistant_text_from_payload(payload: dict[str, Any]) -> str:
 def record_timestamp(record: dict[str, Any]) -> str | None:
     payload = record.get("payload") or {}
     for key in ("timestamp", "time", "created_at", "ts"):
-        value = record.get(key) or payload.get(key)
+        value = record.get(key)
+        if value is None and isinstance(payload, dict):
+            value = payload.get(key)
         if isinstance(value, str) and parse_time(value):
             return iso(parse_time(value) or utc_now())
     return None
@@ -670,7 +677,7 @@ def rollout_candidate_relevant(
             mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
         except OSError:
             return True
-        if mtime >= start:
+        if (not start or mtime >= start) and (not end or mtime < end):
             return True
         if max_raw_bytes is not None and path.stat().st_size > max_raw_bytes:
             return True
@@ -678,14 +685,18 @@ def rollout_candidate_relevant(
     return True
 
 
-def rollout_mtime_active(path: Path, start: dt.datetime | None) -> bool:
-    if start is None:
+def rollout_mtime_active(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    if start is None and end is None:
         return False
     try:
         mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
     except OSError:
         return True
-    return mtime >= start
+    if start and mtime < start:
+        return False
+    if end and mtime >= end:
+        return False
+    return True
 
 
 TIMESTAMP_BYTES_PATTERN = re.compile(rb'"(?:timestamp|time|created_at|ts)"\s*:\s*"([^"]+)"')
@@ -745,7 +756,7 @@ def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.d
             mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
         except OSError:
             mtime = None
-        if mtime and mtime < start:
+        if mtime and ((start and mtime < start) or (end and mtime >= end)):
             return "irrelevant"
         return "unknown"
     return "relevant"
@@ -846,7 +857,7 @@ def extract_rollout(
             ):
                 current = dataclasses.replace(
                     current,
-                    turn_id=stable_hash(f"{source.host}|{path}|{trigger_line_no}|{trigger_timestamp}|continuation", 20),
+                    turn_id=opaque_digest(f"{source.host}|{path_ref(path)}|{trigger_line_no}|{trigger_timestamp}|continuation", 20),
                     timestamp=trigger_timestamp or current.timestamp,
                 )
             turns.append(current)
@@ -889,15 +900,15 @@ def extract_rollout(
                     [
                         source.host,
                         session_id,
-                        (cwd or ""),
+                        (path_ref(cwd) or ""),
                         date_bucket,
                         prompt_category(prompt_text),
                         prompt_topic_key(redacted_prompt),
                     ]
                 )
-                episode_id = stable_hash(episode_seed, 20)
+                episode_id = opaque_digest(episode_seed, 20)
                 turn = TurnSummary(
-                    turn_id=stable_hash(f"{source.host}|{path}|{line_no}|{timestamp}", 20),
+                    turn_id=opaque_digest(f"{source.host}|{path_ref(path)}|{line_no}|{timestamp}", 20),
                     episode_id=episode_id,
                     host=source.host,
                     session_id=session_id,
@@ -948,7 +959,7 @@ def extract_summary_file(
 ) -> list[TurnSummary]:
     turns: list[TurnSummary] = []
     source_hash = file_hash(path)
-    session_id = stable_hash(path.as_posix(), 20)
+    session_id = opaque_digest(path.as_posix(), 20)
     fallback = summary_date_from_path(path)
     for line_no, record in iter_jsonl(path):
         timestamp = str(record.get("timestamp") or "") or None
@@ -974,10 +985,10 @@ def extract_summary_file(
             continue
         timestamp_value = timestamp if parse_time(timestamp) else (iso(parsed_timestamp) if parsed_timestamp else None)
         date_bucket = (parsed_timestamp or utc_now()).date().isoformat()
-        episode_id = stable_hash("|".join([source.host, session_id, "rollout-summary", date_bucket, kind]), 20)
+        episode_id = opaque_digest("|".join([source.host, session_id, "rollout-summary", date_bucket, kind]), 20)
         turns.append(
             TurnSummary(
-                turn_id=stable_hash(f"{source.host}|{path}|{line_no}|{timestamp}", 20),
+                turn_id=opaque_digest(f"{source.host}|{path_ref(path)}|{line_no}|{timestamp}", 20),
                 episode_id=episode_id,
                 host=source.host,
                 session_id=session_id,
@@ -1756,7 +1767,7 @@ def run_scan(
                     if (
                         rollout_filename_in_window(rollout, start, end)
                         or raw_timestamp_in_window(rollout, start, end)
-                        or rollout_mtime_active(rollout, start)
+                        or rollout_mtime_active(rollout, start, end)
                     ):
                         coverage_gaps.append(
                             {
@@ -2025,7 +2036,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     if (
                         rollout_filename_in_window(rollout, start, end)
                         or raw_timestamp_in_window(rollout, start, end)
-                        or rollout_mtime_active(rollout, start)
+                        or rollout_mtime_active(rollout, start, end)
                     ):
                         row["status"] = "invalid"
                         row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"

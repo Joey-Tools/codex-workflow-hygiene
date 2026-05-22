@@ -629,6 +629,45 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("customer-secret", serialized)
         self.assertNotIn(str(root), serialized)
 
+    def test_retained_ids_do_not_use_unsalted_raw_path_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-undated.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message_with_cwd(
+                        "user",
+                        "Please fix this permission denied failure.",
+                        "2026-05-22T10:01:00Z",
+                        "/Users/hoteng/Program/GitHub/customer-secret/repo",
+                    ),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+            episodes = MODULE.episode_records(turns)
+
+        raw_path_hash = MODULE.stable_hash(rollout.as_posix(), 20)
+        raw_turn_hash = MODULE.stable_hash(f"local|{rollout}|1|2026-05-22T10:01:00Z", 20)
+        raw_episode_hash = MODULE.stable_hash(
+            "|".join(
+                [
+                    "local",
+                    MODULE.session_id_from_path(rollout),
+                    "/Users/hoteng/Program/GitHub/customer-secret/repo",
+                    "2026-05-22",
+                    "debug_or_fix",
+                    MODULE.prompt_topic_key("Please fix this permission denied failure."),
+                ]
+            ),
+            20,
+        )
+
+        self.assertNotEqual(turns[0].session_id, raw_path_hash)
+        self.assertNotEqual(turns[0].turn_id, raw_turn_hash)
+        self.assertNotEqual(episodes[0]["episode_id"], raw_episode_hash)
+
     def test_wrapper_user_message_does_not_flag_previous_turn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1332,6 +1371,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["status"], "invalid")
         self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_ignores_old_invalid_jsonl_with_future_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            old_bad = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
+            old_bad.parent.mkdir(parents=True, exist_ok=True)
+            old_bad.write_text("{bad json\n", encoding="utf-8")
+            future_mtime = MODULE.parse_time("2026-06-15T10:00:00Z").timestamp()
+            os.utime(old_bad, (future_mtime, future_mtime))
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root)}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = list((output / "shards.jsonl").read_text(encoding="utf-8").splitlines())
+
+        self.assertEqual(rows, [])
 
     def test_make_shards_rejects_retained_or_rootless_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -2826,6 +2890,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
         self.assertNotIn("path_ref", trend["coverage_gaps"][0])
+
+    def test_old_invalid_rollout_with_future_mtime_does_not_block_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw)
+            rollout = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-bad.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n", encoding="utf-8")
+            future_mtime = MODULE.parse_time("2026-05-03T12:00:00Z").timestamp()
+            os.utime(rollout, (future_mtime, future_mtime))
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["coverage_gaps"], [])
 
     def test_window_external_invalid_rollout_does_not_block_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
