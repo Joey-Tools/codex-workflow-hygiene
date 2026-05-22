@@ -87,6 +87,8 @@ SAFETY_PATTERN = re.compile(
 
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 DEFAULT_REMOTE_SOURCE_ROOT = Path(".codex-local/session-retrospective/remote-sources")
+REMOTE_SOURCE_METADATA_FILE = "source_metadata.json"
+REMOTE_FRESHNESS_TOLERANCE = dt.timedelta(hours=2)
 LOCAL_EVIDENCE_FILES = ("session_index.jsonl", "history.jsonl")
 SAFE_OUTPUT_PARTS = (".codex-local", "session-retrospective")
 PATH_REF_PREFIX = "path_ref_v1"
@@ -96,6 +98,66 @@ PATH_REF_KEY = secrets.token_bytes(32)
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
+EPISODE_FIELDS = {
+    "episode_id",
+    "host",
+    "session_id",
+    "start",
+    "end",
+    "cwd",
+    "model_era",
+    "topic",
+    "turn_count",
+    "friction_flags",
+    "outcome",
+    "work_report_hint",
+}
+TURN_FLAG_FIELDS = {
+    "turn_id",
+    "episode_id",
+    "host",
+    "session_id",
+    "source_path",
+    "source_hash",
+    "timestamp",
+    "cwd",
+    "model",
+    "model_era",
+    "redacted_user_prompt_summary",
+    "assistant_action_summary",
+    "issue_flags",
+    "prompt_improvement",
+}
+TREND_FIELDS = {
+    "schema_version",
+    "window",
+    "turn_count",
+    "flagged_turn_count",
+    "episode_count",
+    "flags",
+    "hosts",
+    "model_eras",
+    "coverage_gaps",
+}
+MANIFEST_FIELDS = {
+    "schema_version",
+    "mode",
+    "window",
+    "sources",
+    "coverage_gaps",
+    "redaction_policy_version",
+    "retention_safe",
+    "retention_note",
+}
+MANIFEST_SOURCE_FIELDS = {"host", "root_ref", "status", "rollout_count", "summary_count"}
+MANIFEST_GAP_FIELDS = {"host", "root_ref", "reason", "bytes"}
+ALLOWED_REMOTE_GAP_REASONS = {
+    "auth_gated",
+    "host_unreachable",
+    "remote_source_not_materialized",
+    "source_root_missing",
+    "stale_host",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -819,6 +881,15 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def jsonl_bytes(rows: Iterable[dict[str, Any]]) -> bytes:
+    text = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
+    return text.encode("utf-8")
+
+
+def json_bytes(data: dict[str, Any]) -> bytes:
+    return (json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
 def redacted_path_entry(key: str, value: Any) -> tuple[str, Any]:
     ref_key = f"{key}_ref"
     if isinstance(value, str) and PATH_REF_PATTERN.fullmatch(value):
@@ -912,8 +983,140 @@ def contains_unredacted_sensitive_text(value: Any) -> bool:
     return False
 
 
+def safe_token(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9_.-]+", value))
+
+
+def ensure_retained_safe_value(label: str, value: Any) -> None:
+    if contains_unredacted_sensitive_text(value) or contains_path_like_text(value):
+        raise SystemExit(f"{label}: unredacted sensitive or path-like text in retained output")
+    if contains_raw_path_fields(value):
+        raise SystemExit(f"{label}: raw root/path fields are not retention-safe")
+    if contains_invalid_ref(value):
+        raise SystemExit(f"{label}: retained refs must use opaque {PATH_REF_PREFIX} values")
+
+
+def sanitize_mapping(
+    obj: Any,
+    *,
+    allowed: set[str],
+    required: set[str],
+    label: str,
+    strict: bool,
+) -> dict[str, Any]:
+    if not isinstance(obj, dict):
+        raise SystemExit(f"{label}: retained entry must be an object")
+    keys = set(obj)
+    missing = required - keys
+    if missing:
+        raise SystemExit(f"{label}: missing keys {sorted(missing)}")
+    extra = keys - allowed
+    if strict and extra:
+        raise SystemExit(f"{label}: unexpected keys {sorted(extra)}")
+    sanitized = {key: obj[key] for key in sorted(allowed) if key in obj}
+    ensure_retained_safe_value(label, sanitized)
+    return sanitized
+
+
+def sanitize_retained_jsonl(path: Path, *, allowed: set[str], strict: bool) -> list[dict[str, Any]]:
+    try:
+        rows = list(iter_jsonl_strict(path))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    return [
+        sanitize_mapping(obj, allowed=allowed, required=allowed, label=f"{path}:{line_no}", strict=strict)
+        for line_no, obj in rows
+    ]
+
+
+def sanitize_count_map(value: Any, *, label: str, strict: bool) -> dict[str, int]:
+    if not isinstance(value, dict):
+        raise SystemExit(f"{label}: expected count map")
+    counts: dict[str, int] = {}
+    for key, count in value.items():
+        if not safe_token(key):
+            raise SystemExit(f"{label}: retained count map key is not safe")
+        if not isinstance(count, int) or count < 0:
+            raise SystemExit(f"{label}: retained count map value must be a non-negative integer")
+        counts[key] = count
+    return counts
+
+
+def sanitize_window(value: Any, *, label: str) -> dict[str, Any]:
+    sanitized = sanitize_mapping(value, allowed={"mode", "start", "end"}, required={"mode", "start", "end"}, label=label, strict=True)
+    if not safe_token(sanitized["mode"]) or not parse_time(str(sanitized["start"])) or not parse_time(str(sanitized["end"])):
+        raise SystemExit(f"{label}: invalid retained window")
+    return sanitized
+
+
+def sanitize_coverage_gap(value: Any, *, label: str, strict: bool) -> dict[str, Any]:
+    sanitized = sanitize_mapping(value, allowed=MANIFEST_GAP_FIELDS, required={"host", "reason"}, label=label, strict=strict)
+    if not safe_token(sanitized.get("host")) or not safe_token(sanitized.get("reason")):
+        raise SystemExit(f"{label}: unsafe retained coverage gap token")
+    if "bytes" in sanitized and (not isinstance(sanitized["bytes"], int) or sanitized["bytes"] < 0):
+        raise SystemExit(f"{label}: coverage gap bytes must be a non-negative integer")
+    if "root_ref" in sanitized and not PATH_REF_PATTERN.fullmatch(str(sanitized["root_ref"])):
+        raise SystemExit(f"{label}: retained refs must use opaque {PATH_REF_PREFIX} values")
+    return sanitized
+
+
+def sanitize_trend_report(data: Any, *, label: str, strict: bool) -> dict[str, Any]:
+    sanitized = sanitize_mapping(data, allowed=TREND_FIELDS, required=TREND_FIELDS, label=label, strict=strict)
+    sanitized["window"] = sanitize_window(sanitized["window"], label=f"{label}.window")
+    for count_key in ("flags", "hosts", "model_eras"):
+        sanitized[count_key] = sanitize_count_map(sanitized[count_key], label=f"{label}.{count_key}", strict=strict)
+    gaps = sanitized.get("coverage_gaps")
+    if not isinstance(gaps, list):
+        raise SystemExit(f"{label}.coverage_gaps: expected list")
+    sanitized["coverage_gaps"] = [
+        sanitize_coverage_gap(gap, label=f"{label}.coverage_gaps[{index}]", strict=strict)
+        for index, gap in enumerate(gaps)
+    ]
+    for key in ("schema_version", "turn_count", "flagged_turn_count", "episode_count"):
+        if not isinstance(sanitized[key], int) or sanitized[key] < 0:
+            raise SystemExit(f"{label}.{key}: expected non-negative integer")
+    return sanitized
+
+
+def sanitize_retained_manifest_obj(data: Any, *, label: str, strict: bool) -> dict[str, Any]:
+    sanitized = sanitize_mapping(data, allowed=MANIFEST_FIELDS, required=MANIFEST_FIELDS, label=label, strict=strict)
+    sanitized["window"] = sanitize_window(sanitized["window"], label=f"{label}.window")
+    sources = sanitized.get("sources")
+    if not isinstance(sources, list) or not (1 <= len(sources) <= 16):
+        raise SystemExit(f"{label}.sources: retained sources must be a bounded non-empty list")
+    clean_sources: list[dict[str, Any]] = []
+    for index, source in enumerate(sources):
+        clean_source = sanitize_mapping(
+            source,
+            allowed=MANIFEST_SOURCE_FIELDS,
+            required=MANIFEST_SOURCE_FIELDS,
+            label=f"{label}.sources[{index}]",
+            strict=strict,
+        )
+        if not safe_token(clean_source.get("host")) or not safe_token(clean_source.get("status")):
+            raise SystemExit(f"{label}.sources[{index}]: unsafe retained source token")
+        for key in ("rollout_count", "summary_count"):
+            if not isinstance(clean_source[key], int) or clean_source[key] < 0:
+                raise SystemExit(f"{label}.sources[{index}].{key}: expected non-negative integer")
+        clean_sources.append(clean_source)
+    gaps = sanitized.get("coverage_gaps")
+    if not isinstance(gaps, list):
+        raise SystemExit(f"{label}.coverage_gaps: expected list")
+    sanitized["sources"] = clean_sources
+    sanitized["coverage_gaps"] = [
+        sanitize_coverage_gap(gap, label=f"{label}.coverage_gaps[{index}]", strict=strict)
+        for index, gap in enumerate(gaps)
+    ]
+    return sanitized
+
+
 def validate_retained_manifest(path: Path) -> None:
     manifest = json.loads(path.read_text(encoding="utf-8"))
+    if contains_raw_path_fields(manifest):
+        raise SystemExit(f"{path}: raw root/path fields are not retention-safe")
+    if contains_invalid_ref(manifest):
+        raise SystemExit(f"{path}: retained refs must use opaque {PATH_REF_PREFIX} values")
+    manifest = sanitize_retained_manifest_obj(manifest, label=str(path), strict=True)
     if manifest.get("retention_safe") is not True:
         raise SystemExit(f"{path}: retention_safe must be true")
     if contains_raw_path_fields(manifest):
@@ -1012,6 +1215,48 @@ def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
     return gaps
 
 
+def remote_metadata_gap(source: Source, reason: str = "stale_host") -> dict[str, Any]:
+    if reason not in ALLOWED_REMOTE_GAP_REASONS:
+        reason = "stale_host"
+    return {"host": source.host, "root_ref": path_ref(source.root), "reason": reason}
+
+
+def remote_evidence_gaps(
+    source: Source,
+    *,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    require_freshness: bool,
+) -> list[dict[str, Any]]:
+    if not require_freshness or source.host not in DEFAULT_REMOTE_HOSTS:
+        return []
+    metadata_path = source.root / REMOTE_SOURCE_METADATA_FILE
+    if not metadata_path.exists() or metadata_path.is_symlink() or not metadata_path.is_file():
+        return [remote_metadata_gap(source)]
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [remote_metadata_gap(source)]
+    if not isinstance(metadata, dict):
+        return [remote_metadata_gap(source)]
+    if metadata.get("host") != source.host:
+        return [remote_metadata_gap(source)]
+    if metadata.get("status") != "ready":
+        return [remote_metadata_gap(source, str(metadata.get("reason") or "stale_host"))]
+    materialized_at = parse_time(str(metadata.get("materialized_at") or ""))
+    window_start = parse_time(str(metadata.get("window_start") or ""))
+    window_end = parse_time(str(metadata.get("window_end") or ""))
+    if materialized_at is None or window_start is None or window_end is None:
+        return [remote_metadata_gap(source)]
+    if start and window_start > start + REMOTE_FRESHNESS_TOLERANCE:
+        return [remote_metadata_gap(source)]
+    if end and window_end + REMOTE_FRESHNESS_TOLERANCE < end:
+        return [remote_metadata_gap(source)]
+    if end and materialized_at + REMOTE_FRESHNESS_TOLERANCE < end:
+        return [remote_metadata_gap(source)]
+    return []
+
+
 def run_scan(
     args: argparse.Namespace,
     *,
@@ -1049,6 +1294,14 @@ def run_scan(
             )
             continue
         coverage_gaps.extend(local_evidence_gaps(source))
+        coverage_gaps.extend(
+            remote_evidence_gaps(
+                source,
+                start=start,
+                end=end,
+                require_freshness=not getattr(args, "allow_partial_hosts", False),
+            )
+        )
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         if not rollouts and not summaries:
@@ -1171,6 +1424,14 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             )
             continue
         coverage_gaps.extend(local_evidence_gaps(source))
+        coverage_gaps.extend(
+            remote_evidence_gaps(
+                source,
+                start=start,
+                end=end,
+                require_freshness=not getattr(args, "allow_partial_hosts", False),
+            )
+        )
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         if not rollouts and not summaries:
@@ -1349,44 +1610,65 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return trend, retained_manifest
 
 
+def retained_export_files_from_run(run_dir: Path) -> dict[str, bytes]:
+    validate_output_run(run_dir)
+    episodes = sanitize_retained_jsonl(run_dir / "episodes.jsonl", allowed=EPISODE_FIELDS, strict=False)
+    turn_flags = sanitize_retained_jsonl(run_dir / "turn_flags.jsonl", allowed=TURN_FLAG_FIELDS, strict=False)
+    trend = sanitize_trend_report(
+        json.loads((run_dir / "trend_report.json").read_text(encoding="utf-8")),
+        label=str(run_dir / "trend_report.json"),
+        strict=False,
+    )
+    manifest = sanitize_retained_manifest_obj(
+        json.loads((run_dir / "retained_manifest.json").read_text(encoding="utf-8")),
+        label=str(run_dir / "retained_manifest.json"),
+        strict=False,
+    )
+    return {
+        "episodes.jsonl": jsonl_bytes(episodes),
+        "turn_flags.jsonl": jsonl_bytes(turn_flags),
+        "trend_report.json": json_bytes(trend),
+        "retained_manifest.json": json_bytes(manifest),
+    }
+
+
+def retained_export_digest(files: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(files):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(files[name])
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def retained_export_files_from_dir(run_dir: Path) -> dict[str, bytes]:
+    return {name: (run_dir / name).read_bytes() for name in RETAINED_OUTPUT_FILES}
+
+
 def validate_retained_output_dir(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     if not run_dir.is_dir():
         raise SystemExit(f"retained output directory not found: {run_dir}")
     allowed = set(RETAINED_OUTPUT_FILES)
     for path in run_dir.iterdir():
-        if path.name not in allowed or not path.is_file():
+        if path.name not in allowed or path.is_symlink() or not path.is_file():
             raise SystemExit(f"unexpected retained output: {path}")
-    required = {
-        "episodes.jsonl": {"episode_id", "host", "topic", "friction_flags"},
-        "turn_flags.jsonl": {"turn_id", "episode_id", "issue_flags"},
-    }
-    for name, keys in required.items():
-        path = run_dir / name
+    episodes_path = run_dir / "episodes.jsonl"
+    turn_flags_path = run_dir / "turn_flags.jsonl"
+    for path in (episodes_path, turn_flags_path):
         if not path.exists():
             raise SystemExit(f"missing retained output: {path}")
-        try:
-            rows = list(iter_jsonl_strict(path))
-        except ValueError as exc:
-            raise SystemExit(str(exc)) from exc
-        for line_no, obj in rows:
-            missing = keys - set(obj)
-            if missing:
-                raise SystemExit(f"{path}:{line_no}: missing keys {sorted(missing)}")
-            if contains_unredacted_sensitive_text(obj):
-                raise SystemExit(f"{path}:{line_no}: unredacted sensitive text in retained output")
+    sanitize_retained_jsonl(episodes_path, allowed=EPISODE_FIELDS, strict=True)
+    sanitize_retained_jsonl(turn_flags_path, allowed=TURN_FLAG_FIELDS, strict=True)
     trend_path = run_dir / "trend_report.json"
     if not trend_path.exists():
         raise SystemExit(f"missing retained output: {trend_path}")
-    trend = json.loads(trend_path.read_text(encoding="utf-8"))
-    if contains_unredacted_sensitive_text(trend):
-        raise SystemExit(f"{trend_path}: unredacted sensitive text in retained output")
+    trend = sanitize_trend_report(json.loads(trend_path.read_text(encoding="utf-8")), label=str(trend_path), strict=True)
     manifest_path = run_dir / "retained_manifest.json"
     if not manifest_path.exists():
         raise SystemExit(f"missing retained output: {manifest_path}")
     validate_retained_manifest(manifest_path)
-    retained_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if contains_unredacted_sensitive_text(retained_manifest):
-        raise SystemExit(f"{manifest_path}: unredacted sensitive text in retained output")
+    retained_manifest = sanitize_retained_manifest_obj(json.loads(manifest_path.read_text(encoding="utf-8")), label=str(manifest_path), strict=True)
     return trend, retained_manifest
 
 
@@ -1399,18 +1681,21 @@ def cmd_validate_output(args: argparse.Namespace) -> int:
 
 def cmd_export_retained(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir)
-    validate_output_run(run_dir)
+    files = retained_export_files_from_run(run_dir)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     allowed = set(RETAINED_OUTPUT_FILES)
     for path in output.iterdir():
-        if path.name not in allowed or not path.is_file():
+        if path.name not in allowed or path.is_symlink() or not path.is_file():
             raise SystemExit(f"refusing to export into directory with unexpected retained output: {path}")
-    for name in RETAINED_OUTPUT_FILES:
-        source = run_dir / name
+    for name, content in files.items():
         target = output / name
+        if target.exists() and (target.is_symlink() or not target.is_file()):
+            raise SystemExit(f"refusing to overwrite unexpected retained output: {target}")
+        temp = output / f".{name}.tmp"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(source.read_bytes())
+        temp.write_bytes(content)
+        os.replace(temp, target)
     validate_retained_output_dir(output)
     print(output)
     return 0
@@ -1431,8 +1716,12 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
     if not COMMIT_SHA_PATTERN.fullmatch(history_commit):
         raise SystemExit("--history-commit must be a full 40-character hex commit SHA")
     run_dir = Path(args.run_dir)
+    expected_files = retained_export_files_from_run(run_dir)
     trend, retained_manifest = validate_output_run(run_dir)
     retained_trend, retained_export_manifest = validate_retained_output_dir(Path(args.retained_run_dir))
+    actual_files = retained_export_files_from_dir(Path(args.retained_run_dir))
+    if actual_files != expected_files:
+        raise SystemExit("retained export does not match scan output")
     if trend.get("window") != retained_trend.get("window"):
         raise SystemExit("retained export window does not match scan output window")
     if retained_manifest.get("window") != retained_export_manifest.get("window"):
@@ -1447,6 +1736,7 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
         raise SystemExit("trend_report.json window must include mode and end")
     state = load_state(state_path)
     state["last_scan_at"] = last_scan_at
+    state["last_retained_export_sha256"] = retained_export_digest(actual_files)
     state["last_history_commit"] = history_commit
     state["last_mode"] = last_mode
     save_state(state_path, state)
@@ -1455,7 +1745,11 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
 
 
 def add_common_scan_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--source", action="append", help="Source in HOST=PATH form. Defaults to local=~/.codex.")
+    parser.add_argument(
+        "--source",
+        action="append",
+        help="Source in HOST=PATH form. Defaults to local=~/.codex plus materialized miku-bot-dev and hoteng-srv-01 sources.",
+    )
     parser.add_argument("--state", help="State JSON path for incremental runs.")
     parser.add_argument("--output", required=True, help="Output directory for retrospective artifacts.")
     parser.add_argument("--max-raw-bytes", type=int, default=512_000, help="Skip raw extraction for larger rollout files and report a coverage gap.")

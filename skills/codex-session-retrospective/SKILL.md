@@ -16,6 +16,7 @@ The workflow is read-only against Codex history and remote hosts. It produces re
 - Local sources are `~/.codex/session_index.jsonl`, `~/.codex/history.jsonl`, and `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 - Remote evidence must be collected through `$remote-host-context` preflight plus `remote_codex_probe.py` bounded reads.
 - Once remote rollout data is copied or summarized locally, use this skill's helper for extraction and aggregation.
+- Each materialized default remote source root must include `source_metadata.json` with `host`, `status`, `window_start`, `window_end`, and `materialized_at`; missing or stale metadata is a coverage gap and blocks state advancement.
 - Never modify `~/.codex`, remote hosts, Apple Notes, or raw rollout files during retrospective collection.
 
 ## Workflow

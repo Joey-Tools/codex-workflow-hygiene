@@ -38,6 +38,52 @@ def write_local_evidence(root: Path) -> None:
     (root / "history.jsonl").write_text("{}\n", encoding="utf-8")
 
 
+def write_remote_metadata(
+    root: Path,
+    host: str,
+    *,
+    window_start: str = "2026-05-01T00:00:00Z",
+    window_end: str = "2026-05-02T00:00:00Z",
+    materialized_at: str = "2026-05-02T00:00:00Z",
+) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / MODULE.REMOTE_SOURCE_METADATA_FILE).write_text(
+        json.dumps(
+            {
+                "host": host,
+                "status": "ready",
+                "window_start": window_start,
+                "window_end": window_end,
+                "materialized_at": materialized_at,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def manifest_fixture(**overrides: object) -> dict:
+    manifest = {
+        "schema_version": 1,
+        "mode": "daily",
+        "window": {"mode": "daily", "start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+        "sources": [
+            {
+                "host": "local",
+                "root_ref": "path_ref_v1:0123456789abcdef",
+                "rollout_count": 1,
+                "summary_count": 0,
+                "status": "ready",
+            }
+        ],
+        "coverage_gaps": [],
+        "redaction_policy_version": 1,
+        "retention_safe": True,
+        "retention_note": "Derived retained manifest; raw location fields removed and opaque refs preserved.",
+    }
+    manifest.update(overrides)
+    return manifest
+
+
 def safe_output_dir(root: str, name: str = "out") -> Path:
     return Path(root) / ".codex-local" / "session-retrospective" / name
 
@@ -1078,6 +1124,115 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "unexpected retained output"):
                 MODULE.main(["export-retained", "--run-dir", str(output), "--output", str(retained_output)])
 
+    def test_validate_retained_rejects_extra_jsonl_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fix failed verification.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained_output = export_retained(output, raw)
+            rows = [json.loads(line) for line in (retained_output / "turn_flags.jsonl").read_text(encoding="utf-8").splitlines()]
+            rows[0]["raw_prompt"] = "proprietary snippet"
+            write_jsonl(retained_output / "turn_flags.jsonl", rows)
+
+            with self.assertRaisesRegex(SystemExit, "unexpected keys"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
+
+    def test_validate_retained_rejects_path_like_allowed_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained_output = export_retained(output, raw)
+            rows = [json.loads(line) for line in (retained_output / "episodes.jsonl").read_text(encoding="utf-8").splitlines()]
+            rows[0]["topic"] = "src/private.py"
+            write_jsonl(retained_output / "episodes.jsonl", rows)
+
+            with self.assertRaisesRegex(SystemExit, "path-like"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
+
+    def test_validate_retained_rejects_symlink_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained_output = export_retained(output, raw)
+            symlink_target = Path(raw) / "episodes-copy.jsonl"
+            symlink_target.write_text((retained_output / "episodes.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+            (retained_output / "episodes.jsonl").unlink()
+            (retained_output / "episodes.jsonl").symlink_to(symlink_target)
+
+            with self.assertRaisesRegex(SystemExit, "unexpected retained output"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
+
+    def test_advance_state_rejects_retained_export_from_different_run(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            first = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-first.jsonl"
+            second = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T11-00-00-second.jsonl"
+            write_jsonl(first, [message("user", "First task.", "2026-05-01T10:00:00Z")])
+            output_one = safe_output_dir(raw, "out-one")
+            output_two = safe_output_dir(raw, "out-two")
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output_one), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            first.unlink()
+            write_jsonl(second, [message("user", "Second task.", "2026-05-01T11:00:00Z")])
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output_two), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained_two = export_retained(output_two, raw, "history-retained-two")
+
+            with self.assertRaisesRegex(SystemExit, "does not match"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output_one),
+                        "--retained-run-dir",
+                        str(retained_two),
+                        "--state",
+                        str(state),
+                        "--history-commit",
+                        HISTORY_COMMIT,
+                    ]
+                )
+
     def test_discover_writes_manifest_without_turn_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1197,6 +1352,72 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "remote_source_not_materialized")
         self.assertIn("path_ref_v1:", trend["coverage_gaps"][0]["root_ref"])
 
+    def test_default_remote_without_fresh_metadata_blocks_state_update(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            local = Path(raw) / ".codex"
+            remote = Path(raw) / "miku-bot-dev"
+            write_local_evidence(local)
+            local_rollout = local / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-local.jsonl"
+            remote_rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            write_jsonl(local_rollout, [message("user", "Local task.", "2026-05-01T10:00:00Z")])
+            write_jsonl(remote_rollout, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with mock.patch.object(
+                MODULE,
+                "parse_sources",
+                return_value=[
+                    MODULE.Source("local", local),
+                    MODULE.Source("miku-bot-dev", remote),
+                ],
+            ):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=None, output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["host"], "miku-bot-dev")
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "stale_host")
+
+    def test_default_remote_with_fresh_metadata_can_advance_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            local = Path(raw) / ".codex"
+            remote = Path(raw) / "miku-bot-dev"
+            write_local_evidence(local)
+            write_remote_metadata(remote, "miku-bot-dev")
+            local_rollout = local / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-local.jsonl"
+            remote_rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            write_jsonl(local_rollout, [message("user", "Local task.", "2026-05-01T10:00:00Z")])
+            write_jsonl(remote_rollout, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with mock.patch.object(
+                MODULE,
+                "parse_sources",
+                return_value=[
+                    MODULE.Source("local", local),
+                    MODULE.Source("miku-bot-dev", remote),
+                ],
+            ):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=None, output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            advance_state(output, state, raw)
+            state_exists = state.exists()
+
+        self.assertEqual(trend["coverage_gaps"], [])
+        self.assertTrue(state_exists)
+
     def test_invalid_rollout_jsonl_reports_gap_and_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1265,7 +1486,20 @@ class SessionRetrospectiveTests(unittest.TestCase):
             (run_dir / "turn_flags.jsonl").write_text("", encoding="utf-8")
             (run_dir / "trend_report.json").write_text("{}\n", encoding="utf-8")
             (run_dir / "retained_manifest.json").write_text(
-                json.dumps({"retention_safe": True, "sources": [{"host": "local", "root": "/secret/.codex"}]}),
+                json.dumps(
+                    manifest_fixture(
+                        sources=[
+                            {
+                                "host": "local",
+                                "root": "/secret/.codex",
+                                "root_ref": "path_ref_v1:0123456789abcdef",
+                                "rollout_count": 1,
+                                "summary_count": 0,
+                                "status": "ready",
+                            }
+                        ]
+                    )
+                ),
                 encoding="utf-8",
             )
 
@@ -1277,10 +1511,17 @@ class SessionRetrospectiveTests(unittest.TestCase):
             retained = Path(raw) / "retained_manifest.json"
             retained.write_text(
                 json.dumps(
-                    {
-                        "retention_safe": True,
-                        "sources": [{"host": "local", "root_ref": "path_hash:0123456789abcdef", "status": "ready"}],
-                    }
+                    manifest_fixture(
+                        sources=[
+                            {
+                                "host": "local",
+                                "root_ref": "path_hash:0123456789abcdef",
+                                "rollout_count": 1,
+                                "summary_count": 0,
+                                "status": "ready",
+                            }
+                        ]
+                    )
                 ),
                 encoding="utf-8",
             )
@@ -1293,10 +1534,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
             retained = Path(raw) / "retained_manifest.json"
             retained.write_text(
                 json.dumps(
-                    {
-                        "retention_safe": True,
-                        "sources": [{"host": "local", "root_ref": "path_ref_v1:0123456789abcdef", "rollout_count": 1, "status": "ready"}],
-                    }
+                    manifest_fixture(
+                        sources=[
+                            {
+                                "host": "local",
+                                "root_ref": "path_ref_v1:0123456789abcdef",
+                                "rollout_count": 1,
+                                "status": "ready",
+                            }
+                        ]
+                    )
                 ),
                 encoding="utf-8",
             )
