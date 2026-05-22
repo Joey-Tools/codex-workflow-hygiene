@@ -105,7 +105,7 @@ PATH_REF_KEY: bytes | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
-HISTORY_FORBIDDEN_FILENAMES = frozenset((*TRANSIENT_OUTPUT_FILES, REMOTE_SOURCE_METADATA_FILE))
+HISTORY_FORBIDDEN_FILENAMES = frozenset((*TRANSIENT_OUTPUT_FILES, *LOCAL_EVIDENCE_FILES, REMOTE_SOURCE_METADATA_FILE))
 HISTORY_FORBIDDEN_COMPONENTS = frozenset((".codex", ".codex-local"))
 EPISODE_FIELDS = {
     "episode_id",
@@ -505,6 +505,8 @@ def user_text_from_payload(payload: dict[str, Any]) -> str:
 def assistant_text_from_payload(payload: dict[str, Any]) -> str:
     if payload.get("type") == "message" and payload.get("role") == "assistant":
         return text_from_message_payload(payload)
+    if payload.get("type") == "task_complete":
+        return str(payload.get("last_agent_message") or "").strip()
     return ""
 
 
@@ -596,9 +598,13 @@ def safe_source_file(path: Path, root: Path) -> bool:
 
 def source_rollouts(source: Source) -> list[Path]:
     sessions = source.root / "sessions"
-    search_root = sessions if sessions.exists() else source.root
+    search_roots = [sessions] if sessions.exists() else [source.root]
+    archived = source.root / "archived_sessions"
+    if archived.exists():
+        search_roots.append(archived)
     return sorted(
         path
+        for search_root in search_roots
         for path in search_root.rglob("rollout-*.jsonl")
         if safe_source_file(path, source.root) and not path.name.startswith("rollout-summary")
     )

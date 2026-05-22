@@ -281,6 +281,20 @@ class SessionRetrospectiveTests(unittest.TestCase):
             source = MODULE.Source("local", root)
             self.assertEqual(MODULE.source_rollouts(source), [])
 
+    def test_source_rollouts_includes_archived_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            active = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-active.jsonl"
+            archived = root / "archived_sessions" / "2026" / "04" / "01" / "rollout-2026-04-01T10-00-00-archived.jsonl"
+            summary = root / "archived_sessions" / "2026" / "04" / "01" / "rollout-summary-2026-04-01.jsonl"
+            write_jsonl(active, [message("user", "Active task.", "2026-05-01T10:00:00Z")])
+            write_jsonl(archived, [message("user", "Archived task.", "2026-04-01T10:00:00Z")])
+            write_jsonl(summary, [message("user", "Summary.", "2026-04-01T10:00:00Z")])
+
+            paths = MODULE.source_rollouts(MODULE.Source("local", root))
+
+        self.assertEqual({path.name for path in paths}, {active.name, archived.name})
+
     def test_ignores_wrapper_and_redacts_flagged_turns(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -658,6 +672,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(turns[0].issue_flags, [])
         self.assertNotIn("blocked_or_failed", turns[0].assistant_action_summary)
         self.assertEqual(turns[1].issue_flags, [])
+
+    def test_task_complete_last_agent_message_updates_assistant_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-abc.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the helper.", "2026-05-22T10:01:00Z"),
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:04:00Z",
+                        "payload": {
+                            "type": "task_complete",
+                            "last_agent_message": "Implemented the helper and ran tests.",
+                        },
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("implementation", turns[0].assistant_action_summary)
+        self.assertIn("verification", turns[0].assistant_action_summary)
 
     def test_scan_does_not_skip_old_rollout_with_new_turn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -2013,6 +2052,46 @@ class SessionRetrospectiveTests(unittest.TestCase):
             transient.write_text("{}\n", encoding="utf-8")
             subprocess.run(["git", "add", "raw/turn_summaries.jsonl"], cwd=history_repo, check=True)
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add transient artifact"], cwd=history_repo, check=True)
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        commit,
+                    ]
+                )
+
+    def test_advance_state_rejects_history_commit_with_raw_evidence_file_elsewhere(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, _commit = write_history_repo(raw, retained)
+            raw_evidence = history_repo / "raw" / "history.jsonl"
+            raw_evidence.parent.mkdir(parents=True)
+            raw_evidence.write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "raw/history.jsonl"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add raw evidence"], cwd=history_repo, check=True)
             commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
 
             with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
