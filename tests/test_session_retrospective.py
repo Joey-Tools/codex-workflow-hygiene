@@ -5037,6 +5037,77 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "episode.episode_id: expected opaque keyed digest"):
             MODULE.validate_episode_row(episode, label="episode")
 
+    def test_retained_validators_reject_private_model_identifiers(self) -> None:
+        turn = {
+            "turn_id": VALID_TURN_ID,
+            "episode_id": VALID_EPISODE_ID,
+            "host": "local",
+            "session_id": VALID_SESSION_ID,
+            "source_path": "path_ref_v1:0123456789abcdef",
+            "source_hash": "0" * 64,
+            "timestamp": "2026-05-22T10:00:00Z",
+            "cwd": None,
+            "model": "customer_acme_model",
+            "model_era": "unknown",
+            "redacted_user_prompt_summary": "category=debug",
+            "assistant_action_summary": "",
+            "issue_flags": ["failed_command"],
+            "prompt_improvement": None,
+        }
+
+        with self.assertRaisesRegex(SystemExit, "retained model id"):
+            MODULE.validate_turn_flag_row(turn, label="turn")
+
+    def test_retained_validators_reject_private_model_eras(self) -> None:
+        turn = {
+            "turn_id": VALID_TURN_ID,
+            "episode_id": VALID_EPISODE_ID,
+            "host": "local",
+            "session_id": VALID_SESSION_ID,
+            "source_path": "path_ref_v1:0123456789abcdef",
+            "source_hash": "0" * 64,
+            "timestamp": "2026-05-22T10:00:00Z",
+            "cwd": None,
+            "model": None,
+            "model_era": "customer_acme_model",
+            "redacted_user_prompt_summary": "category=debug",
+            "assistant_action_summary": "",
+            "issue_flags": ["failed_command"],
+            "prompt_improvement": None,
+        }
+        episode = {
+            "episode_id": VALID_EPISODE_ID,
+            "host": "local",
+            "session_id": VALID_SESSION_ID,
+            "start": "2026-05-22T10:00:00Z",
+            "end": "2026-05-22T10:00:00Z",
+            "cwd": None,
+            "model_era": "customer_acme_model",
+            "topic": "category=debug",
+            "turn_count": 1,
+            "friction_flags": ["failed_command"],
+            "outcome": "needs_review",
+            "work_report_hint": None,
+        }
+        trend = {
+            "schema_version": 1,
+            "window": {"mode": "daily", "start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+            "turn_count": 1,
+            "flagged_turn_count": 1,
+            "episode_count": 1,
+            "flags": {"failed_command": 1},
+            "hosts": {"local": 1},
+            "model_eras": {"customer_acme_model": 1},
+            "coverage_gaps": [],
+        }
+
+        with self.assertRaisesRegex(SystemExit, "retained model era"):
+            MODULE.validate_turn_flag_row(turn, label="turn")
+        with self.assertRaisesRegex(SystemExit, "retained model era"):
+            MODULE.validate_episode_row(episode, label="episode")
+        with self.assertRaisesRegex(SystemExit, "retained model era"):
+            MODULE.sanitize_trend_report(trend, label="trend", strict=True)
+
     def test_custom_source_host_is_bucketed_in_retained_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

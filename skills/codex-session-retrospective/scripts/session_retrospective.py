@@ -121,6 +121,8 @@ OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 RETAINED_SUMMARY_KINDS = frozenset(("summary", "function_call_output"))
+RETAINED_MODEL_IDS = frozenset(("gpt-5.5", "gpt-5.4", "gpt-5.3-codex"))
+RETAINED_MODEL_ERAS = frozenset((*RETAINED_MODEL_IDS, "other-model", "pre-gpt-5.3-codex", "unknown"))
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
 HISTORY_FORBIDDEN_FILENAMES = frozenset((*TRANSIENT_OUTPUT_FILES, *LOCAL_EVIDENCE_FILES, REMOTE_SOURCE_METADATA_FILE))
@@ -1502,6 +1504,22 @@ def require_path_ref_or_none(value: Any, *, label: str) -> str | None:
     return text
 
 
+def require_retained_model_id_or_none(value: Any, *, label: str) -> str | None:
+    if value is None:
+        return None
+    text = require_string(value, label=label)
+    if text not in RETAINED_MODEL_IDS:
+        raise SystemExit(f"{label}: retained model id is not allowed")
+    return text
+
+
+def require_retained_model_era_string(value: Any, *, label: str) -> str:
+    text = require_string(value, label=label)
+    if text not in RETAINED_MODEL_ERAS:
+        raise SystemExit(f"{label}: retained model era is not allowed")
+    return text
+
+
 def require_token_list(value: Any, *, label: str) -> list[str]:
     if not isinstance(value, list):
         raise SystemExit(f"{label}: expected list")
@@ -1524,7 +1542,7 @@ def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
     require_timestamp_or_none(row["start"], label=f"{label}.start")
     require_timestamp_or_none(row["end"], label=f"{label}.end")
     require_path_ref_or_none(row["cwd"], label=f"{label}.cwd")
-    require_safe_token_string(row["model_era"], label=f"{label}.model_era")
+    require_retained_model_era_string(row["model_era"], label=f"{label}.model_era")
     require_string(row["topic"], label=f"{label}.topic")
     turn_count = require_non_negative_int(row["turn_count"], label=f"{label}.turn_count")
     if turn_count == 0:
@@ -1547,8 +1565,8 @@ def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
         raise SystemExit(f"{label}.source_hash: expected keyed hex digest")
     require_timestamp_or_none(row["timestamp"], label=f"{label}.timestamp")
     require_path_ref_or_none(row["cwd"], label=f"{label}.cwd")
-    require_optional_string(row["model"], label=f"{label}.model")
-    require_safe_token_string(row["model_era"], label=f"{label}.model_era")
+    require_retained_model_id_or_none(row["model"], label=f"{label}.model")
+    require_retained_model_era_string(row["model_era"], label=f"{label}.model_era")
     require_string(row["redacted_user_prompt_summary"], label=f"{label}.redacted_user_prompt_summary")
     require_string(row["assistant_action_summary"], label=f"{label}.assistant_action_summary", allow_empty=True)
     issue_flags = require_token_list(row["issue_flags"], label=f"{label}.issue_flags")
@@ -1619,6 +1637,12 @@ def require_retained_host_count_map(value: dict[str, int], *, label: str) -> Non
             raise SystemExit(f"{label}: retained host label is not allowed")
 
 
+def require_retained_model_era_count_map(value: dict[str, int], *, label: str) -> None:
+    for key in value:
+        if key not in RETAINED_MODEL_ERAS:
+            raise SystemExit(f"{label}: retained model era is not allowed")
+
+
 def sanitize_window(value: Any, *, label: str) -> dict[str, Any]:
     sanitized = sanitize_mapping(value, allowed={"mode", "start", "end"}, required={"mode", "start", "end"}, label=label, strict=True)
     start = parse_time(str(sanitized["start"]))
@@ -1646,6 +1670,7 @@ def sanitize_trend_report(data: Any, *, label: str, strict: bool) -> dict[str, A
     for count_key in ("flags", "hosts", "model_eras"):
         sanitized[count_key] = sanitize_count_map(sanitized[count_key], label=f"{label}.{count_key}", strict=strict)
     require_retained_host_count_map(sanitized["hosts"], label=f"{label}.hosts")
+    require_retained_model_era_count_map(sanitized["model_eras"], label=f"{label}.model_eras")
     gaps = sanitized.get("coverage_gaps")
     if not isinstance(gaps, list):
         raise SystemExit(f"{label}.coverage_gaps: expected list")
