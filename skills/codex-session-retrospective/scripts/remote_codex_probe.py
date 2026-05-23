@@ -466,21 +466,23 @@ def normalize_text(text, max_chars):
     return collapsed
 
 
-def message_text_from_payload(payload):
-    if str(payload.get("role", "")) != "assistant":
-        return None
+def message_summary_from_payload(payload):
+    role = str(payload.get("role", ""))
+    if role not in ("assistant", "user"):
+        return None, None
     parts = []
     for item in payload.get("content", []):
         if not isinstance(item, dict):
             continue
-        if item.get("type") != "output_text":
+        if item.get("type") not in ("input_text", "output_text", "text"):
             continue
         text = item.get("text")
         if text:
             parts.append(str(text))
     if not parts:
-        return None
-    return "\\n".join(parts)
+        return None, None
+    kind = "user_message" if role == "user" else "assistant_message"
+    return kind, "\\n".join(parts)
 
 
 def summary_record(kind, text, *, line_no, timestamp):
@@ -518,6 +520,7 @@ def summarize_rollout():
     tail = collections.deque(maxlen=SUMMARY_TAIL_RECORDS)
     session_meta_record = None
     last_assistant_record = None
+    last_user_record = None
     last_task_complete_record = None
 
     with open_rollout_text(target) as handle:
@@ -542,10 +545,13 @@ def summarize_rollout():
                 payload = obj.get("payload", {{}})
                 payload_type = str(payload.get("type", ""))
                 if payload_type == "message":
-                    text = message_text_from_payload(payload)
+                    kind, text = message_summary_from_payload(payload)
                     if text:
-                        record = summary_record("assistant_message", text, line_no=line_no, timestamp=timestamp)
-                        last_assistant_record = record
+                        record = summary_record(kind, text, line_no=line_no, timestamp=timestamp)
+                        if kind == "assistant_message":
+                            last_assistant_record = record
+                        elif kind == "user_message":
+                            last_user_record = record
                 elif payload_type == "function_call_output":
                     output = payload.get("output")
                     if isinstance(output, str) and output.strip():
@@ -588,6 +594,7 @@ def summarize_rollout():
     if not keywords:
         for record in tail:
             emit(record)
+    emit(last_user_record)
     emit(last_assistant_record)
     if last_assistant_record is None:
         emit(last_task_complete_record)
@@ -1128,19 +1135,21 @@ def _normalize_summary_text(value: str, *, max_text_chars: int) -> str:
     return collapsed
 
 
-def _assistant_message_text(payload: dict[str, Any]) -> str:
-    if str(payload.get("role", "")) != "assistant":
-        return ""
+def _message_summary(payload: dict[str, Any]) -> tuple[str, str]:
+    role = str(payload.get("role", ""))
+    if role not in {"assistant", "user"}:
+        return "", ""
     parts: list[str] = []
     for item in payload.get("content", []):
         if not isinstance(item, dict):
             continue
-        if item.get("type") != "output_text":
+        if item.get("type") not in {"input_text", "output_text", "text"}:
             continue
         text = item.get("text")
         if text:
             parts.append(str(text))
-    return "\n".join(parts).strip()
+    kind = "user_message" if role == "user" else "assistant_message"
+    return kind, "\n".join(parts).strip()
 
 
 def _build_summary_record(
@@ -1176,6 +1185,7 @@ def _summarize_rollout_records(
     tail: collections.deque[dict[str, Any]] = collections.deque(maxlen=tail_records)
     session_meta_record: dict[str, Any] | None = None
     last_assistant_record: dict[str, Any] | None = None
+    last_user_record: dict[str, Any] | None = None
     last_task_complete_record: dict[str, Any] | None = None
 
     for line_no, line in enumerate(lines, 1):
@@ -1202,16 +1212,19 @@ def _summarize_rollout_records(
             payload = obj.get("payload", {})
             payload_type = str(payload.get("type", ""))
             if payload_type == "message":
-                text = _assistant_message_text(payload)
+                kind, text = _message_summary(payload)
                 if text:
                     record = _build_summary_record(
-                        kind="assistant_message",
+                        kind=kind,
                         text=text,
                         line_no=line_no,
                         timestamp=timestamp,
                         max_text_chars=max_text_chars,
                     )
-                    last_assistant_record = record
+                    if kind == "assistant_message":
+                        last_assistant_record = record
+                    elif kind == "user_message":
+                        last_user_record = record
             elif payload_type == "function_call_output":
                 output = payload.get("output")
                 if isinstance(output, str) and output.strip():
@@ -1268,6 +1281,7 @@ def _summarize_rollout_records(
     if not search_keywords:
         for record in tail:
             append(record)
+    append(last_user_record)
     append(last_assistant_record)
     if last_assistant_record is None:
         append(last_task_complete_record)

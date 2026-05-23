@@ -122,7 +122,7 @@ INTERNAL_HOSTNAME_PATTERN = re.compile(
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
-RETAINED_SUMMARY_KINDS = frozenset(("summary", "function_call_output"))
+RETAINED_SUMMARY_KINDS = frozenset(("summary", "function_call_output", "user_message"))
 RETAINED_MODEL_IDS = frozenset(("gpt-5.5", "gpt-5.4", "gpt-5.3-codex"))
 RETAINED_MODEL_ERAS = frozenset((*RETAINED_MODEL_IDS, "other-model", "pre-gpt-5.3-codex", "unknown"))
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
@@ -255,6 +255,7 @@ class Source:
     host: str
     root: Path
     missing_reason: str | None = None
+    explicit: bool = False
 
 
 @dataclasses.dataclass
@@ -1788,7 +1789,7 @@ def parse_sources(values: list[str] | None, *, require_default_hosts: bool = Tru
         host, raw_path = value.split("=", 1)
         if not raw_path.strip():
             raise SystemExit("--source PATH must be non-empty")
-        source = Source(retained_source_host(host), Path(raw_path).expanduser())
+        source = Source(retained_source_host(host), Path(raw_path).expanduser(), explicit=True)
         key = (source.host, source.root.resolve(strict=False).as_posix())
         if key in seen:
             continue
@@ -2399,9 +2400,19 @@ def validate_window_bounds(start: dt.datetime | None, end: dt.datetime | None, l
 def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
     earliest: dt.datetime | None = None
     for source in sources:
+        metadata_window = remote_metadata_window(source)
+
+        def metadata_covers(parsed: dt.datetime | None) -> bool:
+            if parsed is None:
+                return False
+            if source.host not in DEFAULT_REMOTE_HOSTS or metadata_window is None:
+                return True
+            window_start, window_end = metadata_window
+            return window_start <= parsed < window_end
+
         for rollout in source_rollouts(source):
             parsed = dated_path_from_parts(rollout) or rollout_date_from_path(rollout)
-            if parsed and (earliest is None or parsed < earliest):
+            if metadata_covers(parsed) and (earliest is None or parsed < earliest):
                 earliest = parsed
         for summary in source_summary_files(source):
             parsed = summary_date_from_path(summary)
@@ -2412,7 +2423,7 @@ def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
                         parsed = timestamp
             except ValueError:
                 pass
-            if parsed and (earliest is None or parsed < earliest):
+            if metadata_covers(parsed) and (earliest is None or parsed < earliest):
                 earliest = parsed
     return earliest
 
@@ -2429,7 +2440,16 @@ def state_last_scan_at(state: dict[str, Any]) -> dt.datetime | None:
     return parsed
 
 
-def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
+def local_source_is_canonical(source: Source) -> bool:
+    if source.host != "local":
+        return False
+    canonical_codex = Path("~/.codex").expanduser().resolve(strict=False)
+    return source.root.expanduser().resolve(strict=False) == canonical_codex
+
+
+def local_evidence_gaps(source: Source, *, require_canonical: bool) -> list[dict[str, Any]]:
+    if source.host == "local" and source.explicit and require_canonical and not local_source_is_canonical(source):
+        return [{"host": "scope", "root_ref": path_ref(source.root), "reason": "partial_host_scope"}]
     if not local_source_requires_index_files(source):
         return []
     gaps: list[dict[str, Any]] = []
@@ -2444,23 +2464,41 @@ def local_evidence_gaps(source: Source) -> list[dict[str, Any]]:
 
 
 def local_source_requires_index_files(source: Source) -> bool:
-    if source.host != "local":
-        return False
-    canonical_codex = Path("~/.codex").expanduser().resolve(strict=False)
-    return source.root.expanduser().resolve(strict=False) == canonical_codex
+    return source.host == "local" and local_source_is_canonical(source)
 
 
 def source_allows_mtime_fallback(source: Source) -> bool:
-    if source.host != "local":
-        return False
-    canonical_codex = Path("~/.codex").expanduser().resolve(strict=False)
-    return source.root.expanduser().resolve(strict=False) == canonical_codex
+    return source.host == "local" and local_source_is_canonical(source)
 
 
 def remote_metadata_gap(source: Source, reason: str = "stale_host") -> dict[str, Any]:
     if reason not in ALLOWED_REMOTE_GAP_REASONS:
         reason = "stale_host"
     return {"host": source.host, "root_ref": path_ref(source.root), "reason": reason}
+
+
+def remote_metadata_window(source: Source) -> tuple[dt.datetime, dt.datetime] | None:
+    if source.host not in DEFAULT_REMOTE_HOSTS:
+        return None
+    metadata_path = source.root / REMOTE_SOURCE_METADATA_FILE
+    if not metadata_path.exists() or metadata_path.is_symlink() or not metadata_path.is_file():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("host") != source.host or metadata.get("status") != "ready":
+        return None
+    materialized_at = parse_time(str(metadata.get("materialized_at") or ""))
+    window_start = parse_time(str(metadata.get("window_start") or ""))
+    window_end = parse_time(str(metadata.get("window_end") or ""))
+    if materialized_at is None or window_start is None or window_end is None:
+        return None
+    if materialized_at.replace(microsecond=0) < window_end.replace(microsecond=0):
+        return None
+    return window_start, window_end
 
 
 def same_second(left: dt.datetime | None, right: dt.datetime | None) -> bool:
@@ -2537,6 +2575,7 @@ def run_scan(
     manifest_sources: list[dict[str, Any]] = []
     coverage_gaps: list[dict[str, Any]] = []
     max_raw_bytes = require_positive_window(getattr(args, "max_raw_bytes", 512_000), "--max-raw-bytes")
+    allow_partial_hosts = getattr(args, "allow_partial_hosts", False)
 
     def append_oversized_rollout_gap(path: Path, size: int) -> None:
         coverage_gaps.append(
@@ -2578,7 +2617,7 @@ def run_scan(
                 }
             )
             continue
-        coverage_gaps.extend(local_evidence_gaps(source))
+        coverage_gaps.extend(local_evidence_gaps(source, require_canonical=not allow_partial_hosts))
         source_remote_gaps = remote_evidence_gaps(
             source,
             start=start,
@@ -2685,7 +2724,7 @@ def run_scan(
                     )
                 continue
             all_turns.extend(extract_summary_file(source, summary, start, end, emit_start=emit_start))
-    if getattr(args, "allow_partial_hosts", False):
+    if allow_partial_hosts:
         coverage_gaps.append({"host": "scope", "reason": "partial_host_scope"})
 
     episodes = episode_records(all_turns)
@@ -2720,6 +2759,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
     manifest_sources: list[dict[str, Any]] = []
     coverage_gaps: list[dict[str, Any]] = []
+    allow_partial_hosts = getattr(args, "allow_partial_hosts", False)
     for source in sources:
         if not source.root.exists():
             coverage_gaps.append(
@@ -2740,7 +2780,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                 }
             )
             continue
-        coverage_gaps.extend(local_evidence_gaps(source))
+        coverage_gaps.extend(local_evidence_gaps(source, require_canonical=not allow_partial_hosts))
         source_remote_gaps = remote_evidence_gaps(
             source,
             start=start,

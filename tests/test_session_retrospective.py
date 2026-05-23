@@ -484,6 +484,21 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             self.assertIn("private-output-session", output.read_text(encoding="utf-8"))
 
+    def test_remote_probe_rollout_summary_preserves_bounded_user_signal(self) -> None:
+        records = REMOTE_PROBE._summarize_rollout_records(
+            lines=[
+                json.dumps(message("user", "You forgot the verification step and assumed success.", "2026-05-01T10:00:00Z")),
+                json.dumps(message("assistant", "I will check it.", "2026-05-01T10:01:00Z")),
+            ],
+            keywords=[],
+            limit=10,
+            tail_records=0,
+            max_text_chars=80,
+        )
+
+        self.assertEqual([record["kind"] for record in records], ["user_message", "assistant_message"])
+        self.assertIn("forgot", records[0]["text"])
+
     def test_explicit_sources_still_require_default_host_coverage(self) -> None:
         sources = MODULE.parse_sources(["local=/tmp/local", "miku-bot-dev=/tmp/miku"])
 
@@ -509,6 +524,32 @@ class SessionRetrospectiveTests(unittest.TestCase):
             MODULE.parse_sources(["local="], require_default_hosts=False)
         with self.assertRaisesRegex(SystemExit, "PATH must be non-empty"):
             MODULE.parse_sources(["local=   "], require_default_hosts=False)
+
+    def test_explicit_noncanonical_local_source_blocks_shared_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "local-copy"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-local.jsonl"
+            write_jsonl(rollout, [message("user", "Local copied task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    state=str(state),
+                    max_raw_bytes=1000,
+                    allow_partial_hosts=False,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertIn("partial_host_scope", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_parse_sources_buckets_custom_host_labels(self) -> None:
         sources = MODULE.parse_sources(["customer-acme=/tmp/acme"], require_default_hosts=False)
@@ -1366,6 +1407,40 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["window"]["start"], "2026-05-01T00:00:00Z")
         self.assertIn("stale_host", [gap["reason"] for gap in trend["coverage_gaps"]])
 
+    def test_baseline_from_first_ignores_remote_rollouts_outside_metadata_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            local = Path(raw) / ".codex"
+            write_local_evidence(local)
+            local_rollout = local / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-local.jsonl"
+            write_jsonl(local_rollout, [message("user", "Fresh local baseline task.", "2026-05-01T10:00:00Z")])
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            old_remote = remote / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-remote.jsonl"
+            write_jsonl(old_remote, [message("user", "Old remote baseline task.", "2026-01-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.main(
+                [
+                    "baseline",
+                    "--window-days",
+                    "90",
+                    "--from",
+                    "first",
+                    "--end",
+                    "2026-06-01T00:00:00Z",
+                    "--source",
+                    f"local={local}",
+                    "--source",
+                    f"miku-bot-dev={remote}",
+                    "--allow-partial-hosts",
+                    "--output",
+                    str(output),
+                ]
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["window"]["start"], "2026-05-01T00:00:00Z")
+
     def test_daily_first_run_uses_active_lookback_days(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1374,7 +1449,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
-            with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")):
+            with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")), mock.patch.object(
+                MODULE, "local_source_is_canonical", return_value=True
+            ):
                 MODULE.main(
                     [
                         "scan-daily",
@@ -1507,7 +1584,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state.parent.mkdir(parents=True, exist_ok=True)
             state.write_text(json.dumps({"last_scan_at": "2026-05-21T10:00:00Z"}), encoding="utf-8")
 
-            with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")):
+            with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")), mock.patch.object(
+                MODULE, "local_source_is_canonical", return_value=True
+            ):
                 MODULE.main(
                     [
                         "scan-daily",
@@ -1665,7 +1744,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state.parent.mkdir(parents=True, exist_ok=True)
             state.write_text(json.dumps({"last_scan_at": "2026-05-21T10:00:00Z"}), encoding="utf-8")
 
-            with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")):
+            with (
+                mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")),
+                mock.patch.object(MODULE, "local_source_is_canonical", return_value=True),
+            ):
                 MODULE.main(
                     [
                         "scan-daily",
@@ -1715,7 +1797,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state.parent.mkdir(parents=True, exist_ok=True)
             state.write_text(json.dumps({"last_scan_at": "2026-05-21T10:00:00Z"}), encoding="utf-8")
 
-            with mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")):
+            with (
+                mock.patch.object(MODULE, "utc_now", return_value=MODULE.parse_time("2026-05-22T10:00:00Z")),
+                mock.patch.object(MODULE, "local_source_is_canonical", return_value=True),
+            ):
                 MODULE.main(
                     [
                         "scan-daily",
@@ -2613,12 +2698,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
             self.assertFalse(state.exists())
@@ -3241,12 +3327,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             retained = export_retained(output, raw)
             history_repo, commit = write_history_repo(raw, retained)
             raw_artifact = history_repo / "turn_summaries.jsonl"
@@ -3894,12 +3981,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             retained = export_retained(output, raw)
             history_repo, retained_commit = write_history_repo(raw, retained)
             raw_log = history_repo / "raw" / "tool-output.log"
@@ -3934,12 +4022,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             retained = export_retained(output, raw)
             history_repo, retained_commit = write_history_repo(raw, retained)
             raw_log = history_repo / "raw" / "tool-output.log"
@@ -3977,12 +4066,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             retained = export_retained(output, raw)
             history_repo, retained_commit = write_history_repo(raw, retained)
             subprocess.run(["git", "checkout", "-q", "-b", "unsafe-follow-on"], cwd=history_repo, check=True)
@@ -4397,12 +4487,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state.parent.mkdir(parents=True, exist_ok=True)
             state.write_text(json.dumps({"last_scan_at": "2026-05-03T00:00:00Z"}), encoding="utf-8")
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             retained = export_retained(output, raw)
 
             with self.assertRaisesRegex(SystemExit, "backwards"):
@@ -4434,12 +4525,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state.parent.mkdir(parents=True, exist_ok=True)
             state.write_text(json.dumps({"last_scan_at": "not-a-date"}), encoding="utf-8")
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             retained = export_retained(output, raw)
 
             with self.assertRaisesRegex(SystemExit, "state last_scan_at"):
@@ -4480,12 +4572,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state.parent.mkdir(parents=True, exist_ok=True)
             state.write_text(json.dumps({"last_scan_at": "2026-05-10T00:00:00Z"}), encoding="utf-8")
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-15T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-16T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-15T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-16T00:00:00Z"),
+                )
             retained = export_retained(output, raw)
 
             with self.assertRaisesRegex(SystemExit, "does not cover previous state"):
@@ -4515,12 +4608,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="weekly",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="weekly",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             retained = export_retained(output, raw)
 
             with self.assertRaisesRegex(SystemExit, "only supports daily"):
@@ -5201,12 +5295,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertEqual(trend["coverage_gaps"], [])
@@ -5224,12 +5319,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
             self.assertFalse(state.exists())
@@ -5812,6 +5908,39 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("approval_auth_friction", rows[0]["issue_flags"])
         self.assertNotIn("customer", json.dumps(rows[0]))
 
+    def test_rollout_summary_user_message_contributes_prompt_flags_without_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {"kind": "session_meta", "timestamp": "2026-05-22T10:00:00Z", "text": "session_id=s1"},
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-22T10:01:00Z",
+                        "text": "You forgot the verification step and assumed success in /customer/code.py",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-06-01T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["redacted_user_prompt_summary"], "category=remote_rollout_summary; summary_kind=user_message")
+        self.assertIn("user_correction", rows[0]["issue_flags"])
+        self.assertNotIn("customer", json.dumps(rows[0]))
+
     def test_oversized_rollout_summary_file_reports_gap_without_reading(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "remote"
@@ -5916,12 +6045,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
-            MODULE.run_scan(
-                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
-                mode="daily",
-                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
-            )
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
             state_exists_after_scan = state.exists()
             advance_state(output, state, raw)
