@@ -554,16 +554,19 @@ def summary_date_from_path(path: Path) -> dt.datetime | None:
 
 
 def first_jsonl_error(path: Path) -> int | None:
-    with path.open(encoding="utf-8", errors="replace") as handle:
-        for line_no, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                return line_no
-            if not isinstance(record, dict):
-                return line_no
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    return line_no
+                if not isinstance(record, dict):
+                    return line_no
+    except UnicodeDecodeError:
+        return 1
     return None
 
 
@@ -572,21 +575,28 @@ def iter_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
 
 
 def iter_jsonl_strict(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
-    with path.open(encoding="utf-8", errors="replace") as handle:
-        for line_no, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{path}:{line_no}: invalid JSON") from exc
-            if not isinstance(record, dict):
-                raise ValueError(f"{path}:{line_no}: JSONL record must be an object")
-            yield line_no, record
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{path}:{line_no}: invalid JSON") from exc
+                if not isinstance(record, dict):
+                    raise ValueError(f"{path}:{line_no}: JSONL record must be an object")
+                yield line_no, record
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{path}: invalid UTF-8") from exc
 
 
 def iter_jsonl_strict_bytes(data: bytes, label: str) -> Iterable[tuple[int, dict[str, Any]]]:
-    for line_no, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label}: invalid UTF-8") from exc
+    for line_no, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
         try:
@@ -720,7 +730,7 @@ def safe_source_file(path: Path, root: Path) -> bool:
     return path.is_file()
 
 
-def source_rollouts(source: Source) -> list[Path]:
+def source_rollout_candidates(source: Source) -> list[Path]:
     sessions = source.root / "sessions"
     search_roots = [sessions] if sessions.exists() else [source.root]
     archived = source.root / "archived_sessions"
@@ -730,8 +740,16 @@ def source_rollouts(source: Source) -> list[Path]:
         path
         for search_root in search_roots
         for path in search_root.rglob("rollout-*.jsonl")
-        if safe_source_file(path, source.root) and not path.name.startswith("rollout-summary")
+        if not path.name.startswith("rollout-summary")
     )
+
+
+def source_rollouts(source: Source) -> list[Path]:
+    return sorted(path for path in source_rollout_candidates(source) if safe_source_file(path, source.root))
+
+
+def unsafe_source_rollouts(source: Source) -> list[Path]:
+    return sorted(path for path in source_rollout_candidates(source) if not safe_source_file(path, source.root))
 
 
 def source_summary_files(source: Source) -> list[Path]:
@@ -1603,8 +1621,11 @@ def require_retained_host_count_map(value: dict[str, int], *, label: str) -> Non
 
 def sanitize_window(value: Any, *, label: str) -> dict[str, Any]:
     sanitized = sanitize_mapping(value, allowed={"mode", "start", "end"}, required={"mode", "start", "end"}, label=label, strict=True)
-    if not safe_token(sanitized["mode"]) or not parse_time(str(sanitized["start"])) or not parse_time(str(sanitized["end"])):
+    start = parse_time(str(sanitized["start"]))
+    end = parse_time(str(sanitized["end"]))
+    if not safe_token(sanitized["mode"]) or not start or not end:
         raise SystemExit(f"{label}: invalid retained window")
+    validate_window_bounds(start, end, label)
     return sanitized
 
 
@@ -1815,14 +1836,14 @@ def forbidden_history_artifact(file_path: str) -> bool:
 
 
 def history_text_contains_sensitive(data: bytes, file_path: str) -> bool:
-    text = data.decode("utf-8", errors="replace")
+    text = history_text(data, file_path)
     if file_path.startswith("schemas/"):
         text = text.replace("https://json-schema.org/draft/2020-12/schema", "")
     return contains_unredacted_sensitive_text(text) or bool(BARE_64_HEX_PATTERN.search(text))
 
 
 def history_text_contains_retention_risk(data: bytes, file_path: str) -> bool:
-    text = data.decode("utf-8", errors="replace")
+    text = history_text(data, file_path)
     if file_path.startswith("schemas/"):
         text = text.replace("https://json-schema.org/draft/2020-12/schema", "")
     if contains_unredacted_sensitive_text(text) or BARE_64_HEX_PATTERN.search(text):
@@ -1831,6 +1852,13 @@ def history_text_contains_retention_risk(data: bytes, file_path: str) -> bool:
         return False
     generated_follow_on = history_path_kind(file_path) in {"text", "json_text"}
     return generated_follow_on and contains_path_like_text(text)
+
+
+def history_text(data: bytes, label: str) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SystemExit(f"{label}: invalid UTF-8") from exc
 
 
 def history_safe_year_month(parts: tuple[str, ...], start: int) -> bool:
@@ -2105,7 +2133,7 @@ def history_blob(repo: Path, ref: str, file_path: str) -> bytes:
 
 def history_json(data: bytes, label: str) -> Any:
     try:
-        return json.loads(data.decode("utf-8", errors="replace"))
+        return json.loads(history_text(data, label))
     except json.JSONDecodeError as exc:
         raise SystemExit(f"{label}: invalid JSON") from exc
 
@@ -2355,6 +2383,23 @@ def remote_evidence_gaps(
     return []
 
 
+def remote_materialization_gaps(source: Source) -> list[dict[str, Any]]:
+    if source.host not in DEFAULT_REMOTE_HOSTS:
+        return []
+    if not unsafe_source_rollouts(source):
+        return []
+    return [remote_metadata_gap(source, "remote_source_not_materialized")]
+
+
+def earliest_rollout_sources(sources: list[Source]) -> list[Source]:
+    eligible: list[Source] = []
+    for source in sources:
+        if source.host in DEFAULT_REMOTE_HOSTS and remote_evidence_gaps(source, start=None, end=None):
+            continue
+        eligible.append(source)
+    return eligible
+
+
 def run_scan(
     args: argparse.Namespace,
     *,
@@ -2424,6 +2469,8 @@ def run_scan(
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
+        source_materialization_gaps = remote_materialization_gaps(source)
+        coverage_gaps.extend(source_materialization_gaps)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
@@ -2434,7 +2481,7 @@ def run_scan(
                 "root_ref": path_ref(source.root),
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
-                "status": "ready" if rollouts or summaries else "empty",
+                "status": "ready" if rollouts or summaries else "stale" if source_materialization_gaps else "empty",
             }
         )
         for rollout in rollouts:
@@ -2659,7 +2706,7 @@ def cmd_baseline(args: argparse.Namespace) -> int:
     now = scan_end(args)
     sources = parse_sources(args.source, require_default_hosts=not args.allow_partial_hosts)
     if args.from_value == "first":
-        start = earliest_rollout_date(sources) or (now - dt.timedelta(days=window_days))
+        start = earliest_rollout_date(earliest_rollout_sources(sources)) or (now - dt.timedelta(days=window_days))
     else:
         start = parse_time(args.from_value)
         if start is None:
@@ -2821,8 +2868,8 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 raise SystemExit(f"{path}:{line_no}: missing keys {sorted(missing)}")
             if contains_unredacted_sensitive_text(obj):
                 raise SystemExit(f"{path}:{line_no}: unredacted sensitive text in retained output")
-    sanitize_retained_jsonl(run_dir / "episodes.jsonl", allowed=EPISODE_FIELDS, strict=False, validator=validate_episode_row)
-    sanitize_retained_jsonl(run_dir / "turn_flags.jsonl", allowed=TURN_FLAG_FIELDS, strict=False, validator=validate_turn_flag_row)
+    sanitize_retained_jsonl(run_dir / "episodes.jsonl", allowed=EPISODE_FIELDS, strict=True, validator=validate_episode_row)
+    sanitize_retained_jsonl(run_dir / "turn_flags.jsonl", allowed=TURN_FLAG_FIELDS, strict=True, validator=validate_turn_flag_row)
     trend_path = run_dir / "trend_report.json"
     trend = sanitize_trend_report(history_json(trend_path.read_bytes(), str(trend_path)), label=str(trend_path), strict=True)
     validate_retained_manifest(run_dir / "retained_manifest.json")
