@@ -87,6 +87,8 @@ FLAG_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("verification_gap", re.compile(r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)", re.I)),
     ("user_correction", re.compile(r"(?:you missed|you forgot|wrong|incorrect|not what I asked|漏了|忘了|不对|错了)", re.I)),
     ("context_loss", re.compile(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", re.I)),
+    ("over_exploration", re.compile(r"(?:over[-_ ]?explor|over[-_ ]?investigat|over[-_ ]?search|explored too much|too much exploration|unrelated files|unrelated paths)", re.I)),
+    ("under_asking", re.compile(r"(?:under[-_ ]?ask|did not ask|didn't ask|should have asked|without asking|missing clarification|needed clarification)", re.I)),
 )
 
 SAFETY_PATTERN = re.compile(
@@ -2557,15 +2559,27 @@ def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
     validate_history_tree_ref(repo, history_ref)
 
 
-def validate_history_commit_merge_side_history(repo: Path, history_commit: str, allowed_paths: set[str]) -> None:
+def validate_history_commit_merge_side_history(
+    repo: Path,
+    history_commit: str,
+    allowed_paths: set[str],
+    retained_parent: str,
+    retained_files: dict[str, bytes],
+) -> None:
     for side_commit in history_commit_non_first_parent_commits(repo, history_commit):
         try:
             validate_history_tree_ref(repo, side_commit)
         except SystemExit as exc:
             raise SystemExit(f"--history-commit merge side history is not retention-safe: {exc}") from exc
-        unexpected = sorted(history_commit_changed_files(repo, side_commit) - allowed_paths)
+        changed_files = history_commit_changed_files(repo, side_commit)
+        unexpected = sorted(changed_files - allowed_paths)
         if unexpected:
             raise SystemExit(f"--history-commit merge side history changes unexpected artifact: {unexpected[0]}")
+        if changed_files & allowed_paths:
+            try:
+                require_retained_export_in_history_ref(repo, side_commit, retained_parent, retained_files)
+            except SystemExit as exc:
+                raise SystemExit(f"--history-commit merge side history is not retention-safe: {exc}") from exc
 
 
 def validate_history_follow_on_history(
@@ -2601,7 +2615,13 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
     tree_files = set(entries)
     changed_files = history_commit_changed_files(repo, history_commit)
     expected_parent = validate_retained_export_parent(retained_files)
-    validate_history_commit_merge_side_history(repo, history_commit, set(retained_export_paths(expected_parent).values()))
+    validate_history_commit_merge_side_history(
+        repo,
+        history_commit,
+        set(retained_export_paths(expected_parent).values()),
+        expected_parent,
+        retained_files,
+    )
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
     parent_files: dict[str, set[str]] = defaultdict(set)
     for file_path in tree_files:

@@ -771,6 +771,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("approval_auth_friction", turns[0].issue_flags)
         self.assertIn("safety_privacy_flag", turns[0].issue_flags)
 
+    def test_flags_for_text_detects_collaboration_friction_categories(self) -> None:
+        over_flags = MODULE.flags_for_text("Codex over-explored unrelated files and searched too broadly.")
+        under_flags = MODULE.flags_for_text("Codex should have asked for clarification before proceeding.")
+
+        self.assertIn("over_exploration", over_flags)
+        self.assertIn("under_asking", under_flags)
+
     def test_sensitive_prompt_excerpt_and_topic_are_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -3852,6 +3859,68 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 (target / name).write_bytes((retained / name).read_bytes())
             subprocess.run(["git", "add", "retained"], cwd=history_repo, check=True)
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add retained export"], cwd=history_repo, check=True)
+            subprocess.run(["git", "checkout", "-q", default_branch], cwd=history_repo, check=True)
+            subprocess.run(["git", "merge", "--no-ff", "-m", "Merge retained export", "retained-export"], cwd=history_repo, check=True)
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            with self.assertRaisesRegex(SystemExit, "merge side history is not retention-safe"):
+                MODULE.main(
+                    [
+                        "validate-history-commit",
+                        "--retained-run-dir",
+                        str(retained),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        commit,
+                    ]
+                )
+
+    def test_validate_history_commit_rejects_merge_side_restored_export_change(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-08T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo = Path(raw) / "history-merge-restored-export"
+            history_repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-q"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=history_repo, check=True)
+            add_expected_history_origin(history_repo)
+            (history_repo / "README.md").write_text("# History\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Initial history"], cwd=history_repo, check=True)
+            default_branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=history_repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(["git", "checkout", "-q", "-b", "retained-export"], cwd=history_repo, check=True)
+            target = history_repo / retained_parent_for_dir(retained)
+            target.mkdir(parents=True)
+            for name in MODULE.RETAINED_OUTPUT_FILES:
+                (target / name).write_bytes((retained / name).read_bytes())
+            manifest_path = target / "retained_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["sources"][0]["summary_count"] = manifest["sources"][0]["summary_count"] + 1
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+            subprocess.run(["git", "add", "retained"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add different retained export"], cwd=history_repo, check=True)
+            for name in MODULE.RETAINED_OUTPUT_FILES:
+                (target / name).write_bytes((retained / name).read_bytes())
+            subprocess.run(["git", "add", "retained"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Restore retained export"], cwd=history_repo, check=True)
             subprocess.run(["git", "checkout", "-q", default_branch], cwd=history_repo, check=True)
             subprocess.run(["git", "merge", "--no-ff", "-m", "Merge retained export", "retained-export"], cwd=history_repo, check=True)
             commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
