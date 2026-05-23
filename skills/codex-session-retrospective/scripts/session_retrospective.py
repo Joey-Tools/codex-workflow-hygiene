@@ -1210,8 +1210,13 @@ def extract_summary_file(
             continue
         if emit_start and parsed_timestamp < emit_start:
             continue
-        _redacted_text, changed = redact(text)
-        flags = flags_for_text(text, redacted_changed=changed)
+        flag_text = text
+        if kind == "user_message":
+            flag_text = meaningful_prompt_text(text)
+            if not flag_text or not meaningful_user_text(text):
+                continue
+        _redacted_text, changed = redact(flag_text)
+        flags = flags_for_text(flag_text, redacted_changed=changed)
         if not flags:
             continue
         timestamp_value = timestamp if parse_time(timestamp) else (iso(parsed_timestamp) if parsed_timestamp else None)

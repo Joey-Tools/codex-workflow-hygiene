@@ -6058,6 +6058,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("user_correction", rows[0]["issue_flags"])
         self.assertNotIn("customer", json.dumps(rows[0]))
 
+    def test_rollout_summary_user_message_ignores_wrapper_only_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {"kind": "session_meta", "timestamp": "2026-05-22T10:00:00Z", "text": "session_id=s1"},
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-22T10:01:00Z",
+                        "text": "Persistent internal Codex readonly review contract:\nRun approval and verification checks.",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-06-01T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertEqual(trend["turn_count"], 0)
+
     def test_oversized_rollout_summary_file_reports_gap_without_reading(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "remote"
