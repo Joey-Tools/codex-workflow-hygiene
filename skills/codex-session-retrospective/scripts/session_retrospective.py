@@ -90,7 +90,7 @@ FLAG_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 SAFETY_PATTERN = re.compile(
-    r"(?:\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard)\b|"
+    r"(?:\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|privacy|pii)\b|"
     r"客户|客户数据|凭据|凭证|密钥|生产|破坏性)",
     re.I,
 )
@@ -98,7 +98,8 @@ SAFETY_PATTERN = re.compile(
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 RETAINED_CUSTOM_SOURCE_HOST = "custom_source"
 RETAINED_DIRECT_SOURCE_HOSTS = frozenset(("local", *DEFAULT_REMOTE_HOSTS))
-RETAINED_HOSTS = frozenset((*RETAINED_DIRECT_SOURCE_HOSTS, RETAINED_CUSTOM_SOURCE_HOST, "scope"))
+RETAINED_EVIDENCE_HOSTS = frozenset((*RETAINED_DIRECT_SOURCE_HOSTS, RETAINED_CUSTOM_SOURCE_HOST))
+RETAINED_HOSTS = frozenset((*RETAINED_EVIDENCE_HOSTS, "scope"))
 EXPECTED_HISTORY_REPO = "Joey-Tools/codex-session-retrospective-history"
 DEFAULT_REMOTE_SOURCE_ROOT = Path(".codex-local/session-retrospective/remote-sources")
 REMOTE_SOURCE_METADATA_FILE = "source_metadata.json"
@@ -1135,7 +1136,15 @@ def extract_summary_file(
     turns: list[TurnSummary] = []
     source_hash = file_source_hash(path)
     session_id = opaque_session_id(path.as_posix())
-    for line_no, record in iter_jsonl(path):
+    records = list(iter_jsonl(path))
+    for _line_no, record in records:
+        if str(record.get("kind") or "summary") != "session_meta":
+            continue
+        match = re.search(r"session_id=([^\s]+)", str(record.get("text") or ""))
+        if match:
+            session_id = opaque_session_id(match.group(1))
+            break
+    for line_no, record in records:
         timestamp = str(record.get("timestamp") or "") or None
         parsed_timestamp = summary_timestamp_with_fallback(record, path)
         text = str(record.get("text") or "")
@@ -1382,6 +1391,10 @@ def retained_source_host(host: str) -> str:
 
 
 def retained_host_token(value: Any) -> bool:
+    return isinstance(value, str) and value in RETAINED_EVIDENCE_HOSTS
+
+
+def retained_coverage_host_token(value: Any) -> bool:
     return isinstance(value, str) and value in RETAINED_HOSTS
 
 
@@ -1597,7 +1610,7 @@ def sanitize_window(value: Any, *, label: str) -> dict[str, Any]:
 
 def sanitize_coverage_gap(value: Any, *, label: str, strict: bool) -> dict[str, Any]:
     sanitized = sanitize_mapping(value, allowed=MANIFEST_GAP_FIELDS, required={"host", "reason"}, label=label, strict=strict)
-    if not retained_host_token(sanitized.get("host")) or not safe_token(sanitized.get("reason")):
+    if not retained_coverage_host_token(sanitized.get("host")) or not safe_token(sanitized.get("reason")):
         raise SystemExit(f"{label}: unsafe retained coverage gap token")
     if "bytes" in sanitized and (not isinstance(sanitized["bytes"], int) or sanitized["bytes"] < 0):
         raise SystemExit(f"{label}: coverage gap bytes must be a non-negative integer")
@@ -1873,10 +1886,25 @@ def retained_export_expected_parent(retained_files: dict[str, bytes]) -> str:
         label="retained_manifest.json",
         strict=True,
     )
-    mode = (trend.get("window") or {}).get("mode")
-    if manifest.get("mode") != mode or (manifest.get("window") or {}).get("mode") != mode:
+    return retained_export_parent_for_records(trend, manifest)
+
+
+def retained_export_parent_for_records(trend: dict[str, Any], manifest: dict[str, Any]) -> str:
+    trend_window = trend.get("window") or {}
+    manifest_window = manifest.get("window") or {}
+    mode = trend_window.get("mode")
+    if manifest.get("mode") != mode or manifest_window.get("mode") != mode:
         raise SystemExit("retained export mode does not match retained manifest")
+    if manifest_window != trend_window:
+        raise SystemExit("retained export window does not match retained manifest")
     return retained_export_parent_for_mode(mode)
+
+
+def validate_retained_export_parent(retained_files: dict[str, bytes], parent: str | None = None) -> str:
+    expected_parent = retained_export_expected_parent(retained_files)
+    if parent is not None and parent != expected_parent:
+        raise SystemExit("retained export directory does not match export mode")
+    return expected_parent
 
 
 def history_path_kind(file_path: str) -> str:
@@ -2087,6 +2115,8 @@ def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
             if names != set(RETAINED_OUTPUT_FILES):
                 label = parent or "."
                 raise SystemExit(f"history retained export directory is incomplete or has extra files: {label}")
+            retained_files = {name: history_blob(repo, history_ref, f"{parent}/{name}") for name in RETAINED_OUTPUT_FILES}
+            validate_retained_export_parent(retained_files, parent)
         elif parent.startswith("retained/"):
             raise SystemExit(f"history retained export directory is not allowed: {parent}")
     for file_path in files:
@@ -2130,7 +2160,7 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
     require_history_commit(repo, history_commit)
     tree_files = set(history_tree_files(repo, history_commit))
     changed_files = history_commit_changed_files(repo, history_commit)
-    expected_parent = retained_export_expected_parent(retained_files)
+    expected_parent = validate_retained_export_parent(retained_files)
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
     parent_files: dict[str, set[str]] = defaultdict(set)
     for file_path in tree_files:
@@ -2721,13 +2751,14 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
 def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     if run_dir.is_symlink():
         raise SystemExit(f"refusing symlinked output directory: {run_dir}")
-    for name in (
-        "turn_summaries.jsonl",
-        "episodes.jsonl",
-        "turn_flags.jsonl",
-        "trend_report.json",
-        "retained_manifest.json",
-    ):
+    if not run_dir.is_dir():
+        raise SystemExit(f"output directory not found: {run_dir}")
+    required_files = ("turn_summaries.jsonl", *RETAINED_OUTPUT_FILES)
+    allowed = set(TRANSIENT_OUTPUT_FILES) | set(RETAINED_OUTPUT_FILES) | {"state.json"}
+    for path in run_dir.iterdir():
+        if path.name not in allowed or path.is_symlink() or not path.is_file():
+            raise SystemExit(f"unexpected output file: {path}")
+    for name in required_files:
         path = run_dir / name
         if not path.exists():
             raise SystemExit(f"missing output: {path}")
@@ -2758,7 +2789,8 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     trend = sanitize_trend_report(history_json(trend_path.read_bytes(), str(trend_path)), label=str(trend_path), strict=True)
     validate_retained_manifest(run_dir / "retained_manifest.json")
     manifest_path = run_dir / "retained_manifest.json"
-    retained_manifest = history_json(manifest_path.read_bytes(), str(manifest_path))
+    retained_manifest = sanitize_retained_manifest_obj(history_json(manifest_path.read_bytes(), str(manifest_path)), label=str(manifest_path), strict=True)
+    retained_export_parent_for_records(trend, retained_manifest)
     return trend, retained_manifest
 
 
@@ -2833,6 +2865,7 @@ def validate_retained_output_dir(run_dir: Path) -> tuple[dict[str, Any], dict[st
         raise SystemExit(f"missing retained output: {manifest_path}")
     validate_retained_manifest(manifest_path)
     retained_manifest = sanitize_retained_manifest_obj(json.loads(manifest_path.read_text(encoding="utf-8")), label=str(manifest_path), strict=True)
+    retained_export_parent_for_records(trend, retained_manifest)
     return trend, retained_manifest
 
 

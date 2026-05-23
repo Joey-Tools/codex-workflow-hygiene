@@ -817,6 +817,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertRegex(turns[0].session_id, r"^session_ref_v1:[0-9a-f]{20}$")
         self.assertNotEqual(turns[0].session_id, "customer-incident-123")
 
+    def test_late_summary_session_meta_backfills_prior_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {"kind": "summary", "timestamp": "2026-05-22T10:01:00Z", "text": "permission denied"},
+                    {"kind": "session_meta", "timestamp": "2026-05-22T10:02:00Z", "text": "session_id=late-session cwd=/secret/repo"},
+                    {"kind": "summary", "timestamp": "2026-05-22T10:03:00Z", "text": "failed command"},
+                ],
+            )
+
+            turns = MODULE.extract_summary_file(MODULE.Source("remote", root), summary, None, None)
+
+        expected_session = MODULE.opaque_session_id("late-session")
+        self.assertEqual([turn.session_id for turn in turns], [expected_session, expected_session])
+        self.assertEqual(len({turn.episode_id for turn in turns}), 1)
+
     def test_wrapper_user_message_does_not_flag_previous_turn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2686,6 +2705,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "path-like"):
                 MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
 
+    def test_validate_retained_rejects_mode_or_window_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-08T00:00:00Z"),
+            )
+            retained_output = export_retained(output, raw)
+            manifest = json.loads((retained_output / "retained_manifest.json").read_text(encoding="utf-8"))
+            manifest["mode"] = "daily"
+            (retained_output / "retained_manifest.json").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "mode does not match"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
+
+            retained_output = export_retained(output, raw, "history-retained-window-mismatch")
+            manifest = json.loads((retained_output / "retained_manifest.json").read_text(encoding="utf-8"))
+            manifest["window"]["end"] = "2026-05-09T00:00:00Z"
+            (retained_output / "retained_manifest.json").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "window does not match"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
+
     def test_validate_retained_rejects_symlink_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -3339,6 +3388,27 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Break retained manifest"], cwd=history_repo, check=True)
 
             with self.assertRaisesRegex(SystemExit, "retention_safe"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_retained_parent_mode_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-08T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, _commit = write_history_repo(raw, retained)
+            subprocess.run(["git", "mv", "retained/weekly", "retained/daily"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Move retained export"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "directory does not match export mode"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
     def test_validate_history_tree_rejects_incomplete_retained_directory(self) -> None:
@@ -4560,6 +4630,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "unexpected output file"):
                 MODULE.main(["validate-output", "--run-dir", str(output)])
 
+    def test_validate_output_rejects_unexpected_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            (output / "raw-debug.jsonl").write_text('{"path": "/secret/raw-rollout.jsonl"}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "unexpected output file"):
+                MODULE.main(["validate-output", "--run-dir", str(output)])
+
     def test_validate_output_rejects_raw_retained_manifest_paths(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             run_dir = Path(raw) / "run"
@@ -4856,6 +4945,46 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "retained host label"):
                 MODULE.main(["validate-retained", "--run-dir", str(retained)])
 
+    def test_validate_retained_rejects_scope_as_evidence_host(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            episode_path = retained / "episodes.jsonl"
+            episode = json.loads(episode_path.read_text(encoding="utf-8").splitlines()[0])
+            episode["host"] = "scope"
+            episode_path.write_text(json.dumps(episode) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "retained host label"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained)])
+
+            retained = export_retained(output, raw, "history-retained-scope-trend")
+            trend_path = retained / "trend_report.json"
+            trend = json.loads(trend_path.read_text(encoding="utf-8"))
+            trend["hosts"] = {"scope": 1}
+            trend_path.write_text(json.dumps(trend) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "retained host label"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained)])
+
+            retained = export_retained(output, raw, "history-retained-scope-source")
+            manifest_path = retained / "retained_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["sources"][0]["host"] = "scope"
+            manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "unsafe retained source token"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained)])
+
     def test_validate_history_tree_rejects_raw_host_label(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -5071,6 +5200,27 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_local_evidence(root)
             rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
             write_jsonl(rollout, [message("user", "请检查客户数据和凭据泄露风险。", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=10000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIn("safety_privacy_flag", rows[0]["issue_flags"])
+
+    def test_english_privacy_marker_contributes_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Please check customer data and PII privacy risk.", "2026-05-01T10:00:00Z")])
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
