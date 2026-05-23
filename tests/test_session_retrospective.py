@@ -2411,6 +2411,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "invalid")
         self.assertIn("coverage_gap", rows[0])
 
+    def test_make_shards_skips_window_external_invalid_rollout_summary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text("{bad json\n", encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = list((output / "shards.jsonl").read_text(encoding="utf-8").splitlines())
+
+        self.assertEqual(rows, [])
+
     def test_make_shards_skips_non_ready_manifest_sources(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "miku-bot-dev"

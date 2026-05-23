@@ -3283,12 +3283,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             row["coverage_gap"] = "summary exceeds max raw shard bytes; regenerate bounded rollout-summary before extractor handoff"
             rows.append(row)
             return
-        if first_jsonl_error(summary) is not None:
-            row["status"] = "invalid"
-            row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
-            rows.append(row)
-            return
-        if summary_file_has_truncated_scan(summary):
+        jsonl_error = first_jsonl_error(summary)
+        if jsonl_error is None and summary_file_has_truncated_scan(summary):
             if not summary_file_maybe_relevant_without_read(summary, start, end):
                 return
             row["status"] = "partial"
@@ -3296,6 +3292,11 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             rows.append(row)
             return
         if not summary_file_relevant(summary, start, end):
+            return
+        if jsonl_error is not None:
+            row["status"] = "invalid"
+            row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
+            rows.append(row)
             return
         row["status"] = "ready"
         rows.append(row)
