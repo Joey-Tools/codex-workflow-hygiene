@@ -164,7 +164,7 @@ def _resolve_output_path(
     output: str, *, workspace_root: pathlib.Path | None = None
 ) -> pathlib.Path:
     raw_path = pathlib.Path(output).expanduser()
-    task_output_root = _task_output_root(workspace_root)
+    task_output_root = _task_output_root(workspace_root).resolve()
     candidate = (task_output_root / raw_path) if not raw_path.is_absolute() else raw_path
     resolved = candidate.resolve()
     tmp_root = pathlib.Path("/tmp").resolve()
@@ -251,6 +251,46 @@ def _read_local_rollout_bytes(
     finally:
         if fd != -1:
             os.close(fd)
+
+
+def _write_private_bytes(output: pathlib.Path, data: bytes) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target_stat = output.lstat()
+    except FileNotFoundError:
+        target_stat = None
+    if target_stat is not None and not stat.S_ISREG(target_stat.st_mode):
+        raise ValueError("output path exists and is not a regular file")
+
+    last_error: FileExistsError | None = None
+    for attempt in range(100):
+        temp_path = output.with_name(f".{output.name}.tmp-{os.getpid()}-{attempt}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(str(temp_path), flags, 0o600)
+        except FileExistsError as error:
+            last_error = error
+            continue
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, output)
+            os.chmod(output, 0o600)
+            return
+        except Exception:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+    raise FileExistsError(f"could not create private temporary output for {output}") from last_error
+
+
+def _flat_archived_rollout_matches_date(
+    rollout_path: pathlib.Path, date_value: dt.date
+) -> bool:
+    return rollout_path.name.startswith(f"rollout-{date_value.strftime('%Y-%m-%d')}")
 
 
 def _parse_kv_lines(text: str) -> dict[str, str]:
@@ -415,6 +455,10 @@ def read_rollout_bytes(target, max_bytes):
             os.close(fd)
 
 
+def flat_archived_rollout_matches_date(rollout, date_text):
+    return rollout.name.startswith("rollout-" + date_text.replace("/", "-"))
+
+
 def normalize_text(text, max_chars):
     collapsed = " ".join(str(text).replace("\\r", "\\n").split())
     if max_chars and max_chars > 3 and len(collapsed) > max_chars:
@@ -554,35 +598,44 @@ def iter_session_meta():
     print(SESSION_META_BEGIN)
     count = 0
     for date_text in reversed(DATE_STRINGS):
+        rollout_paths = []
         for date_dir in (ROOT / "sessions" / date_text, ROOT / "archived_sessions" / date_text):
             if not date_dir.is_dir():
                 continue
-            for rollout in sorted(date_dir.glob("rollout-*.jsonl"), reverse=True):
-                rel = pathlib.PurePosixPath(rollout.relative_to(ROOT).as_posix())
-                session_id = ""
-                cwd = ""
-                try:
-                    target = safe_rollout_path(rel)
-                except (FileNotFoundError, ValueError):
-                    continue
-                with open_rollout_text(target) as handle:
-                    for line in handle:
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if obj.get("type") != "session_meta":
-                            continue
-                        payload = obj.get("payload", {{}})
-                        session_id = str(payload.get("id", ""))
-                        cwd = str(payload.get("cwd", ""))
-                        break
-                if session_id:
-                    print(json.dumps({{"date": date_text, "session_id": session_id, "cwd": cwd, "rollout": rollout.relative_to(ROOT).as_posix()}}, separators=(",", ":"), sort_keys=True))
-                    count += 1
-                    if LIMIT and count >= LIMIT:
-                        print(SESSION_META_END)
-                        return
+            rollout_paths.extend(sorted(date_dir.glob("rollout-*.jsonl"), reverse=True))
+        flat_archived_dir = ROOT / "archived_sessions"
+        if flat_archived_dir.is_dir():
+            rollout_paths.extend(
+                rollout
+                for rollout in sorted(flat_archived_dir.glob("rollout-*.jsonl"), reverse=True)
+                if flat_archived_rollout_matches_date(rollout, date_text)
+            )
+        for rollout in rollout_paths:
+            rel = pathlib.PurePosixPath(rollout.relative_to(ROOT).as_posix())
+            session_id = ""
+            cwd = ""
+            try:
+                target = safe_rollout_path(rel)
+            except (FileNotFoundError, ValueError):
+                continue
+            with open_rollout_text(target) as handle:
+                for line in handle:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") != "session_meta":
+                        continue
+                    payload = obj.get("payload", {{}})
+                    session_id = str(payload.get("id", ""))
+                    cwd = str(payload.get("cwd", ""))
+                    break
+            if session_id:
+                print(json.dumps({{"date": date_text, "session_id": session_id, "cwd": cwd, "rollout": rollout.relative_to(ROOT).as_posix()}}, separators=(",", ":"), sort_keys=True))
+                count += 1
+                if LIMIT and count >= LIMIT:
+                    print(SESSION_META_END)
+                    return
     print(SESSION_META_END)
 
 
@@ -653,44 +706,53 @@ def _iter_session_meta_records(
     rows: list[dict[str, str]] = []
     for date_value in reversed(dates):
         date_text = date_value.strftime(DATE_FORMAT)
+        rollout_paths: list[pathlib.Path] = []
         for date_dir in (codex_root / "sessions" / date_text, codex_root / "archived_sessions" / date_text):
             if not date_dir.is_dir():
                 continue
-            for rollout_path in sorted(date_dir.glob("rollout-*.jsonl"), reverse=True):
-                rollout_relative_path = pathlib.PurePosixPath(
-                    rollout_path.relative_to(codex_root).as_posix()
-                )
-                session_id = ""
-                cwd = ""
-                try:
-                    handle = _open_local_rollout_text(codex_root, rollout_relative_path)
-                except (FileNotFoundError, ValueError):
-                    continue
-                with handle:
-                    for line in handle:
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if obj.get("type") != "session_meta":
-                            continue
-                        payload = obj.get("payload", {})
-                        session_id = str(payload.get("id", ""))
-                        cwd = str(payload.get("cwd", ""))
-                        break
-                if not session_id:
-                    continue
-                rows.append(
-                    {
-                        "host": host,
-                        "date": date_value.strftime(DATE_FORMAT),
-                        "session_id": session_id,
-                        "cwd": cwd,
-                        "rollout": rollout_path.relative_to(codex_root).as_posix(),
-                    }
-                )
-                if limit and len(rows) >= limit:
-                    return rows
+            rollout_paths.extend(sorted(date_dir.glob("rollout-*.jsonl"), reverse=True))
+        flat_archived_dir = codex_root / "archived_sessions"
+        if flat_archived_dir.is_dir():
+            rollout_paths.extend(
+                rollout_path
+                for rollout_path in sorted(flat_archived_dir.glob("rollout-*.jsonl"), reverse=True)
+                if _flat_archived_rollout_matches_date(rollout_path, date_value)
+            )
+        for rollout_path in rollout_paths:
+            rollout_relative_path = pathlib.PurePosixPath(
+                rollout_path.relative_to(codex_root).as_posix()
+            )
+            session_id = ""
+            cwd = ""
+            try:
+                handle = _open_local_rollout_text(codex_root, rollout_relative_path)
+            except (FileNotFoundError, ValueError):
+                continue
+            with handle:
+                for line in handle:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") != "session_meta":
+                        continue
+                    payload = obj.get("payload", {})
+                    session_id = str(payload.get("id", ""))
+                    cwd = str(payload.get("cwd", ""))
+                    break
+            if not session_id:
+                continue
+            rows.append(
+                {
+                    "host": host,
+                    "date": date_value.strftime(DATE_FORMAT),
+                    "session_id": session_id,
+                    "cwd": cwd,
+                    "rollout": rollout_path.relative_to(codex_root).as_posix(),
+                }
+            )
+            if limit and len(rows) >= limit:
+                return rows
     return rows
 
 
@@ -1045,8 +1107,13 @@ def cmd_fetch_rollout(args: argparse.Namespace) -> int:
         print(f"error={error}", file=sys.stderr)
         return 1
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_bytes(data)
+    try:
+        _write_private_bytes(output, data)
+    except (OSError, ValueError) as error:
+        print(f"host={alias}", file=sys.stderr)
+        print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+        print(f"error={error}", file=sys.stderr)
+        return 1
     print(f"host={alias}")
     print(f"rollout={rollout_relative_path.as_posix()}")
     print(f"output={output}")

@@ -407,6 +407,83 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "archived_sessions/2026/05/01/rollout-2026-05-01T10-00-00-archived.jsonl",
             )
 
+    def test_remote_probe_session_meta_includes_flat_archived_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            archived = root / "archived_sessions" / "rollout-2026-05-01T10-00-00-flat.jsonl"
+            write_jsonl(
+                archived,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "flat-archived-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            write_jsonl(
+                root / "archived_sessions" / "rollout-2026-05-02T10-00-00-flat.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-02T10:00:00Z",
+                        "payload": {"id": "other-date-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+
+            rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+            )
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["session_id"], "flat-archived-session")
+            self.assertEqual(
+                rows[0]["rollout"],
+                "archived_sessions/rollout-2026-05-01T10-00-00-flat.jsonl",
+            )
+
+    def test_remote_probe_fetch_rollout_writes_private_output(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "private-output-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            task_output_root = Path(raw) / "task-output"
+            output = task_output_root / "rollout.jsonl"
+            output.parent.mkdir(parents=True)
+            output.write_text("old\n", encoding="utf-8")
+            os.chmod(output, 0o644)
+
+            def fake_task_output_root(workspace_root: Path | None = None) -> Path:
+                return task_output_root.resolve()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                REMOTE_PROBE, "_task_output_root", fake_task_output_root
+            ):
+                result = REMOTE_PROBE.cmd_fetch_rollout(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout="sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                        output="rollout.jsonl",
+                    )
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertIn("private-output-session", output.read_text(encoding="utf-8"))
+
     def test_explicit_sources_still_require_default_host_coverage(self) -> None:
         sources = MODULE.parse_sources(["local=/tmp/local", "miku-bot-dev=/tmp/miku"])
 
