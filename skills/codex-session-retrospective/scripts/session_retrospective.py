@@ -2828,8 +2828,6 @@ def run_scan(
                 if summary_file_maybe_relevant_without_read(summary, gap_start, end):
                     append_oversized_summary_gap(summary, size)
                 continue
-            if not summary_file_relevant(summary, start, end):
-                continue
             if first_jsonl_error(summary) is not None:
                 if summary_file_relevant(summary, gap_start, end):
                     coverage_gaps.append(
@@ -2848,6 +2846,8 @@ def run_scan(
                         "reason": "truncated_rollout_summary",
                     }
                 )
+            if not summary_file_relevant(summary, start, end):
+                continue
             all_turns.extend(extract_summary_file(source, summary, start, end, emit_start=emit_start))
     if allow_partial_hosts:
         coverage_gaps.append({"host": "scope", "reason": "partial_host_scope"})
@@ -3094,12 +3094,17 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             row["coverage_gap"] = "summary exceeds max raw shard bytes; regenerate bounded rollout-summary before extractor handoff"
             rows.append(row)
             return
-        if not summary_file_relevant(summary, start, end):
-            return
         if first_jsonl_error(summary) is not None:
             row["status"] = "invalid"
             row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
             rows.append(row)
+            return
+        if summary_file_has_truncated_scan(summary):
+            row["status"] = "partial"
+            row["coverage_gap"] = "summary scan truncated; regenerate complete bounded evidence before extractor handoff"
+            rows.append(row)
+            return
+        if not summary_file_relevant(summary, start, end):
             return
         row["status"] = "ready"
         rows.append(row)

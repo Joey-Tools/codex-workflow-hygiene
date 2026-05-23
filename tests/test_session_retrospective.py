@@ -549,7 +549,35 @@ class SessionRetrospectiveTests(unittest.TestCase):
             max_text_chars=80,
         )
 
-        self.assertEqual([record["text"] for record in records], ["user prompt present"])
+        self.assertEqual([record["text"] for record in records], ["user message present"])
+
+    def test_remote_probe_rollout_summary_redacts_non_user_text(self) -> None:
+        records = REMOTE_PROBE._summarize_rollout_records(
+            lines=[
+                json.dumps(message("assistant", "Use Bearer abc.def.ghi in /Users/hoteng/customer/repo", "2026-05-01T10:00:00Z")),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": "Traceback with token=secret123 in /customer/code.py",
+                        },
+                    }
+                ),
+            ],
+            keywords=["Bearer", "token"],
+            limit=10,
+            tail_records=0,
+            max_text_chars=80,
+        )
+
+        serialized = json.dumps(records)
+        self.assertIn("secret", serialized)
+        self.assertIn("error:", serialized)
+        self.assertNotIn("Bearer", serialized)
+        self.assertNotIn("secret123", serialized)
+        self.assertNotIn("/customer", serialized)
 
     def test_remote_probe_session_meta_uses_bounded_input_scan(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -6456,6 +6484,73 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertIn("truncated_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_old_truncated_rollout_summary_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "scan_meta",
+                        "timestamp": "",
+                        "text": "scan_truncated=true scan_bytes=2097152 source_bytes=3000000",
+                        "scan_truncated": True,
+                    }
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = list((output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines())
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertIn("truncated_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_make_shards_marks_truncated_rollout_summary_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "scan_meta",
+                        "timestamp": "",
+                        "text": "scan_truncated=true scan_bytes=2097152 source_bytes=3000000",
+                        "scan_truncated": True,
+                    }
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "partial")
+        self.assertIn("coverage_gap", rows[0])
 
     def test_unknown_rollout_summary_kind_is_bucketed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

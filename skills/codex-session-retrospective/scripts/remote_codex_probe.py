@@ -491,7 +491,7 @@ def message_summary_from_payload(payload):
     return kind, "\\n".join(parts)
 
 
-def user_prompt_signal_text(text):
+def summary_signal_text(kind, text):
     signals = []
     if re.search(r"(?:exit(?:ed)?(?: with)? code [1-9]\\d*|failed|traceback|error:|permission denied)", text, re.I):
         signals.append("error:")
@@ -505,13 +505,11 @@ def user_prompt_signal_text(text):
         signals.append("assumed")
     if re.search(r"(?:\\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|privacy|pii)\\b|客户|客户数据|凭据|凭证|密钥|生产|破坏性)", text, re.I):
         signals.append("secret")
-    return " ".join(signals) if signals else "user prompt present"
+    return " ".join(signals) if signals else kind.replace("_", " ") + " present"
 
 
 def safe_summary_text(kind, text):
-    if kind == "user_message":
-        return user_prompt_signal_text(str(text))
-    return str(text)
+    return summary_signal_text(kind, str(text))
 
 
 def event_user_message_text(payload):
@@ -534,7 +532,7 @@ def summary_record(kind, text, *, line_no, timestamp):
         return None
     record = {{"kind": kind, "line": line_no, "text": value, "timestamp": timestamp or ""}}
     match_text = normalize_text(text, SUMMARY_MAX_TEXT_CHARS)
-    if kind == "user_message" and match_text and match_text != value:
+    if match_text and match_text != value:
         record["_match_text"] = match_text
     return record
 
@@ -1246,7 +1244,7 @@ def _message_summary(payload: dict[str, Any]) -> tuple[str, str]:
     return kind, "\n".join(parts).strip()
 
 
-def _user_prompt_signal_text(text: str) -> str:
+def _summary_signal_text(kind: str, text: str) -> str:
     signals: list[str] = []
     if re.search(r"(?:exit(?:ed)?(?: with)? code [1-9]\d*|failed|traceback|error:|permission denied)", text, re.I):
         signals.append("error:")
@@ -1264,13 +1262,11 @@ def _user_prompt_signal_text(text: str) -> str:
         re.I,
     ):
         signals.append("secret")
-    return " ".join(signals) if signals else "user prompt present"
+    return " ".join(signals) if signals else f"{kind.replace('_', ' ')} present"
 
 
 def _safe_summary_text(kind: str, text: str) -> str:
-    if kind == "user_message":
-        return _user_prompt_signal_text(text)
-    return text
+    return _summary_signal_text(kind, text)
 
 
 def _event_user_message_text(payload: dict[str, Any]) -> str:
@@ -1305,7 +1301,7 @@ def _build_summary_record(
         "timestamp": timestamp,
     }
     match_text = _normalize_summary_text(text, max_text_chars=max_text_chars)
-    if kind == "user_message" and match_text and match_text != normalized:
+    if match_text and match_text != normalized:
         record["_match_text"] = match_text
     return record
 
@@ -1620,7 +1616,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rollout_summary = subparsers.add_parser(
         "rollout-summary",
-        help="Read a bounded structured summary from one rollout without copying the full file.",
+        help="Read a bounded redacted prefix summary from one rollout without copying the full file.",
     )
     rollout_summary.add_argument("--host", required=True)
     rollout_summary.add_argument(
