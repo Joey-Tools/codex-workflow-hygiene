@@ -132,7 +132,7 @@ def write_history_repo(root: str | Path, retained_dir: Path | None = None) -> tu
         (repo / "retained.json").write_text("{}\n", encoding="utf-8")
         subprocess.run(["git", "add", "retained.json"], cwd=repo, check=True)
     else:
-        target = repo / "retained" / "daily"
+        target = repo / retained_parent_for_dir(retained_dir)
         target.mkdir(parents=True, exist_ok=True)
         for name in MODULE.RETAINED_OUTPUT_FILES:
             (target / name).write_bytes((retained_dir / name).read_bytes())
@@ -140,6 +140,11 @@ def write_history_repo(root: str | Path, retained_dir: Path | None = None) -> tu
     subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add retained export"], cwd=repo, check=True)
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
     return repo, commit
+
+
+def retained_parent_for_dir(retained_dir: Path) -> str:
+    manifest = json.loads((retained_dir / "retained_manifest.json").read_text(encoding="utf-8"))
+    return MODULE.retained_export_parent_for_mode(manifest["mode"])
 
 
 def history_commit_args(root: str | Path, retained_dir: Path) -> list[str]:
@@ -2920,7 +2925,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 text=True,
             ).stdout.strip()
             subprocess.run(["git", "checkout", "-q", "-b", "retained-export"], cwd=history_repo, check=True)
-            target = history_repo / "retained" / "daily"
+            target = history_repo / retained_parent_for_dir(retained)
             target.mkdir(parents=True)
             for name in MODULE.RETAINED_OUTPUT_FILES:
                 (target / name).write_bytes((retained / name).read_bytes())
@@ -2983,6 +2988,47 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     ]
                 )
 
+    def test_validate_history_commit_rejects_mode_mismatched_retained_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-08T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo = Path(raw) / "history-mode-mismatch"
+            history_repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-q"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=history_repo, check=True)
+            add_expected_history_origin(history_repo)
+            target = history_repo / "retained" / "daily"
+            target.mkdir(parents=True)
+            for name in MODULE.RETAINED_OUTPUT_FILES:
+                (target / name).write_bytes((retained / name).read_bytes())
+            subprocess.run(["git", "add", "retained"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add retained export"], cwd=history_repo, check=True)
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            with self.assertRaisesRegex(SystemExit, "does not match export mode"):
+                MODULE.main(
+                    [
+                        "validate-history-commit",
+                        "--retained-run-dir",
+                        str(retained),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        commit,
+                    ]
+                )
+
     def test_validate_history_tree_accepts_clean_follow_on_report_commit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -3009,8 +3055,14 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_validate_history_tree_rejects_unexpected_retained_paths(self) -> None:
         for relative_path in (
             "reports/customer-acme/summary.md",
+            "reports/baseline/90-day-windows/customer-acme.md",
             "data/episodes/customer-acme/episodes.jsonl",
+            "data/episodes/2026/05/customer-acme.jsonl",
+            "data/turn_flags/2026/05/session_id-rawabcdef123456.jsonl",
             "data/trends/customer-acme/trend_report.json",
+            "data/trends/2026/05/customer-acme.json",
+            "data/manifests/2026/05/customer-acme.json",
+            "schemas/customer-acme.schema.json",
         ):
             with self.subTest(relative_path=relative_path):
                 with tempfile.TemporaryDirectory() as raw:
@@ -3219,11 +3271,12 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             retained = export_retained(output, raw)
             history_repo, _commit = write_history_repo(raw, retained)
-            manifest_path = history_repo / "retained" / "daily" / "retained_manifest.json"
+            retained_parent = retained_parent_for_dir(retained)
+            manifest_path = history_repo / retained_parent / "retained_manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["retention_safe"] = False
             manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
-            subprocess.run(["git", "add", "retained/daily/retained_manifest.json"], cwd=history_repo, check=True)
+            subprocess.run(["git", "add", f"{retained_parent}/retained_manifest.json"], cwd=history_repo, check=True)
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Break retained manifest"], cwd=history_repo, check=True)
 
             with self.assertRaisesRegex(SystemExit, "retention_safe"):
@@ -3244,7 +3297,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             retained = export_retained(output, raw)
             history_repo, _commit = write_history_repo(raw, retained)
-            subprocess.run(["git", "rm", "-q", "retained/daily/turn_flags.jsonl"], cwd=history_repo, check=True)
+            retained_parent = retained_parent_for_dir(retained)
+            subprocess.run(["git", "rm", "-q", f"{retained_parent}/turn_flags.jsonl"], cwd=history_repo, check=True)
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Remove retained file"], cwd=history_repo, check=True)
 
             with self.assertRaisesRegex(SystemExit, "incomplete"):

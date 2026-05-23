@@ -176,6 +176,7 @@ HISTORY_JSON_EXTENSIONS = (".json",)
 HISTORY_STRIPPABLE_NAME_SUFFIXES = frozenset((*HISTORY_TEXT_EXTENSIONS, *HISTORY_JSON_EXTENSIONS, ".jsonl"))
 HISTORY_ROOT_FILES = frozenset((".gitignore", "AGENTS.md", "README.md"))
 HISTORY_FLAT_RETAINED_EXPORT_PARENTS = frozenset(("retained/daily", "retained/weekly", "retained/baseline"))
+HISTORY_SCHEMA_FILES = frozenset(("retained-manifest-v1.schema.json", "session-retrospective-v1.schema.json"))
 EPISODE_FIELDS = {
     "episode_id",
     "host",
@@ -1798,7 +1799,11 @@ def history_report_path_allowed(parts: tuple[str, ...]) -> bool:
             and parts[4].endswith(".md")
             and re.fullmatch(r"\d{2}", Path(parts[4]).stem)
         )
-    return len(parts) == 4 and parts[:3] == ("reports", "baseline", "90-day-windows") and parts[3].endswith(".md")
+    return bool(
+        len(parts) == 4
+        and parts[:3] == ("reports", "baseline", "90-day-windows")
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}_to_\d{4}-\d{2}-\d{2}\.md", parts[3])
+    )
 
 
 def history_flat_retained_export_parent_allowed(parent: str) -> bool:
@@ -1819,6 +1824,29 @@ def history_flat_retained_export_kind(parent: str, name: str) -> str | None:
     return None
 
 
+def retained_export_parent_for_mode(mode: Any) -> str:
+    if mode == "daily":
+        return "retained/daily"
+    if mode == "weekly":
+        return "retained/weekly"
+    if isinstance(mode, str) and mode.startswith("baseline-"):
+        return "retained/baseline"
+    raise SystemExit("retained export mode is not supported")
+
+
+def retained_export_expected_parent(retained_files: dict[str, bytes]) -> str:
+    trend = sanitize_trend_report(history_json(retained_files["trend_report.json"], "trend_report.json"), label="trend_report.json", strict=True)
+    manifest = sanitize_retained_manifest_obj(
+        history_json(retained_files["retained_manifest.json"], "retained_manifest.json"),
+        label="retained_manifest.json",
+        strict=True,
+    )
+    mode = (trend.get("window") or {}).get("mode")
+    if manifest.get("mode") != mode or (manifest.get("window") or {}).get("mode") != mode:
+        raise SystemExit("retained export mode does not match retained manifest")
+    return retained_export_parent_for_mode(mode)
+
+
 def history_path_kind(file_path: str) -> str:
     parts = tuple(file_path.split("/"))
     name = file_path.rsplit("/", 1)[-1]
@@ -1826,19 +1854,19 @@ def history_path_kind(file_path: str) -> str:
     flat_kind = history_flat_retained_export_kind(parent, name)
     if flat_kind:
         return flat_kind
-    if len(parts) == 5 and parts[:2] == ("data", "episodes") and history_safe_year_month(parts, 2) and name.endswith(".jsonl"):
+    if len(parts) == 5 and parts[:2] == ("data", "episodes") and history_safe_year_month(parts, 2) and name == "episodes.jsonl":
         return "episodes"
-    if len(parts) == 5 and parts[:2] == ("data", "turn_flags") and history_safe_year_month(parts, 2) and name.endswith(".jsonl"):
+    if len(parts) == 5 and parts[:2] == ("data", "turn_flags") and history_safe_year_month(parts, 2) and name == "turn_flags.jsonl":
         return "turn_flags"
-    if len(parts) == 5 and parts[:2] == ("data", "trends") and history_safe_year_month(parts, 2) and name.endswith(".json"):
+    if len(parts) == 5 and parts[:2] == ("data", "trends") and history_safe_year_month(parts, 2) and name == "trend_report.json":
         return "trend"
-    if len(parts) == 5 and parts[:2] == ("data", "manifests") and history_safe_year_month(parts, 2) and name.endswith(".json"):
+    if len(parts) == 5 and parts[:2] == ("data", "manifests") and history_safe_year_month(parts, 2) and name == "retained_manifest.json":
         return "manifest"
     if file_path in HISTORY_ROOT_FILES or file_path in {"data/README.md", "reports/README.md"}:
         return "text"
     if history_report_path_allowed(parts):
         return "text"
-    if len(parts) == 2 and parts[0] == "schemas" and parts[1].endswith(".schema.json"):
+    if len(parts) == 2 and parts[0] == "schemas" and parts[1] in HISTORY_SCHEMA_FILES:
         return "json_text"
     raise SystemExit(f"history tree contains unexpected artifact: {file_path}")
 
@@ -2070,6 +2098,7 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
     require_history_commit(repo, history_commit)
     tree_files = set(history_tree_files(repo, history_commit))
     changed_files = history_commit_changed_files(repo, history_commit)
+    expected_parent = retained_export_expected_parent(retained_files)
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
     parent_files: dict[str, set[str]] = defaultdict(set)
     for file_path in tree_files:
@@ -2096,6 +2125,8 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
         for name, file_path in paths.items():
             candidate[name] = history_blob(repo, history_commit, file_path)
         if candidate and retained_export_digest(candidate) == expected_digest and changed_files == set(paths.values()):
+            if parent != expected_parent:
+                raise SystemExit("--history-commit retained export directory does not match export mode")
             return parent
     raise SystemExit("--history-commit does not contain exactly one retained export and no other changed files")
 
