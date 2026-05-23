@@ -846,6 +846,35 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("blocked_or_failed", turns[0].assistant_action_summary)
         self.assertEqual(turns[1].issue_flags, [])
 
+    def test_wrapper_after_tool_output_does_not_pollute_previous_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-abc.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the helper.", "2026-05-22T10:01:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:02:00Z",
+                        "payload": {"output": "Process exited with code 0"},
+                    },
+                    message("user", "# AGENTS.md instructions\nwrapper", "2026-05-22T10:03:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:04:00Z",
+                        "payload": {"output": "Process exited with code 1\npermission denied"},
+                    },
+                    message("user", "Now continue the real task.", "2026-05-22T10:05:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].issue_flags, [])
+        self.assertEqual(turns[1].issue_flags, [])
+
     def test_task_complete_last_agent_message_updates_assistant_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2939,6 +2968,21 @@ class SessionRetrospectiveTests(unittest.TestCase):
             report.write_text("Investigation mentioned jira.cisco.example but no raw URLs.\n", encoding="utf-8")
             subprocess.run(["git", "add", "reports/weekly/2026/05/08.md"], cwd=history_repo, check=True)
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add internal hostname"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "sensitive text"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_private_key_in_follow_on_report(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            report = history_repo / "reports" / "weekly" / "2026" / "05" / "08.md"
+            report.parent.mkdir(parents=True)
+            report.write_text(
+                "Mistaken retained text:\n-----BEGIN PRIVATE KEY-----\nredacted\n-----END PRIVATE KEY-----\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "reports/weekly/2026/05/08.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add private key"], cwd=history_repo, check=True)
 
             with self.assertRaisesRegex(SystemExit, "sensitive text"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])

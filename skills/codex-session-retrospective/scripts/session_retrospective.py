@@ -51,6 +51,11 @@ AUTOMATION_PROMPT_MARKERS = (
 
 SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
+        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.I),
+        "[REDACTED_PRIVATE_KEY]",
+    ),
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.I), "[REDACTED_PRIVATE_KEY]"),
+    (
         re.compile(r"\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b"),
         "[REDACTED_SECRET]",
     ),
@@ -1088,6 +1093,12 @@ def extract_rollout(
             if assistant_text and current and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                 emit_current(line_no, timestamp)
                 assistant_bits.append(assistant_text)
+                current_has_post_prompt_evidence = True
+            if (
+                current
+                and not user_text
+                and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback)
+            ):
                 current_has_post_prompt_evidence = True
 
         text = record_text(record)
