@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -532,6 +533,20 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual([record["kind"] for record in records], ["user_message"])
         self.assertIn("context-loss", records[0]["text"])
+
+    def test_remote_probe_rollout_summary_uses_bounded_input_scan(self) -> None:
+        first = json.dumps(message("user", "First bounded signal.", "2026-05-01T10:00:00Z")) + "\n"
+        second = json.dumps(message("user", "You missed the late unbounded signal.", "2026-05-01T10:01:00Z")) + "\n"
+
+        records = REMOTE_PROBE._summarize_rollout_records(
+            lines=REMOTE_PROBE._bounded_text_lines(io.StringIO(first + second), len(first)),
+            keywords=["missed"],
+            limit=10,
+            tail_records=0,
+            max_text_chars=80,
+        )
+
+        self.assertEqual([record["text"] for record in records], ["First bounded signal."])
 
     def test_explicit_sources_still_require_default_host_coverage(self) -> None:
         sources = MODULE.parse_sources(["local=/tmp/local", "miku-bot-dev=/tmp/miku"])
@@ -2670,6 +2685,27 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output_exists = (home / ".codex-local" / "session-retrospective" / "out" / "turn_summaries.jsonl").exists()
 
         self.assertTrue(output_exists)
+
+    def test_transient_output_rejects_symlink_ancestors(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            outside = Path(raw) / "outside-cache"
+            outside.mkdir()
+            symlink_root = Path(raw) / ".codex-local"
+            symlink_root.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(SystemExit, "symlink ancestors"):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(symlink_root / "session-retrospective" / "out"), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+
+            self.assertFalse((outside / "session-retrospective" / "out").exists())
 
     def test_transient_output_rejects_child_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -5070,6 +5106,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
         self.assertEqual(manifest["sources"][0]["status"], "stale")
         self.assertEqual(manifest["sources"][0]["summary_count"], 0)
+
+    def test_default_remote_symlink_search_roots_report_materialization_gap(self) -> None:
+        for search_root_name in ("sessions", "archived_sessions"):
+            with self.subTest(search_root=search_root_name):
+                with tempfile.TemporaryDirectory() as raw:
+                    remote = Path(raw) / "miku-bot-dev"
+                    write_remote_metadata(remote, "miku-bot-dev")
+                    outside = Path(raw) / "outside-sessions"
+                    rollout = outside / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+                    write_jsonl(rollout, [message("user", "Unsafe search root task.", "2026-05-01T10:00:00Z")])
+                    if search_root_name == "archived_sessions":
+                        (remote / "sessions").mkdir(parents=True)
+                    unsafe_root = remote / search_root_name
+                    unsafe_root.symlink_to(outside, target_is_directory=True)
+                    output = safe_output_dir(raw)
+                    state = safe_output_dir(raw) / "state.json"
+
+                    MODULE.run_scan(
+                        types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                        mode="daily",
+                        start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                        end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    )
+                    trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+                    rows = list((output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines())
+                    manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+                    state_exists = state.exists()
+
+                self.assertFalse(state_exists)
+                self.assertEqual(rows, [])
+                self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+                self.assertEqual(manifest["sources"][0]["status"], "stale")
 
     def test_partial_remote_materialization_skips_direct_scan_data(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

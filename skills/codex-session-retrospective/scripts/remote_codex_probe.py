@@ -23,6 +23,7 @@ MAX_SESSION_META_LIMIT = 500
 MAX_SESSION_META_DATE_COUNT = 31
 MAX_FETCH_ROLLOUT_BYTES = 16 * 1024 * 1024
 MAX_ROLLOUT_SUMMARY_LIMIT = 200
+MAX_ROLLOUT_SUMMARY_SCAN_BYTES = 2 * 1024 * 1024
 MAX_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 MAX_ROLLOUT_SUMMARY_TEXT_CHARS = 1200
 REMOTE_PREFLIGHT_TIMEOUT_SECONDS = 15
@@ -389,6 +390,7 @@ LIMIT = int(CONFIG.get("limit", 0))
 ROOT = pathlib.Path(CONFIG["codex_root"]).expanduser()
 MAX_FETCH_ROLLOUT_BYTES = int(CONFIG.get("max_fetch_rollout_bytes", 0))
 SUMMARY_LIMIT = int(CONFIG.get("summary_limit", 0))
+SUMMARY_SCAN_BYTES = int(CONFIG.get("summary_scan_bytes", 0))
 SUMMARY_TAIL_RECORDS = int(CONFIG.get("summary_tail_records", 0))
 SUMMARY_MAX_TEXT_CHARS = int(CONFIG.get("summary_max_text_chars", 0))
 SUMMARY_MAX_TEXT_CHARS_LIMIT = {MAX_ROLLOUT_SUMMARY_TEXT_CHARS}
@@ -508,6 +510,22 @@ def summary_record(kind, text, *, line_no, timestamp):
     return {{"kind": kind, "line": line_no, "text": value, "timestamp": timestamp or ""}}
 
 
+def bounded_text_lines(handle, max_scan_bytes):
+    scanned = 0
+    while True:
+        if max_scan_bytes and scanned >= max_scan_bytes:
+            return
+        remaining = max_scan_bytes - scanned if max_scan_bytes else 0
+        line = handle.readline(remaining + 1 if remaining else -1)
+        if not line:
+            return
+        encoded_len = len(line.encode("utf-8", "surrogatepass"))
+        if max_scan_bytes and encoded_len > remaining:
+            return
+        scanned += encoded_len
+        yield line
+
+
 def summarize_rollout():
     rel = pathlib.PurePosixPath(str(CONFIG["rollout"]))
     normalized = rel.as_posix()
@@ -544,7 +562,7 @@ def summarize_rollout():
     last_task_complete_record = None
 
     with open_rollout_text(target) as handle:
-        for line_no, line in enumerate(handle, 1):
+        for line_no, line in enumerate(bounded_text_lines(handle, SUMMARY_SCAN_BYTES), 1):
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
@@ -1211,6 +1229,22 @@ def _build_summary_record(
     }
 
 
+def _bounded_text_lines(handle: Any, max_scan_bytes: int) -> Iterable[str]:
+    scanned = 0
+    while True:
+        if max_scan_bytes and scanned >= max_scan_bytes:
+            return
+        remaining = max_scan_bytes - scanned if max_scan_bytes else 0
+        line = handle.readline(remaining + 1 if remaining else -1)
+        if not line:
+            return
+        encoded_len = len(line.encode("utf-8", "surrogatepass"))
+        if max_scan_bytes and encoded_len > remaining:
+            return
+        scanned += encoded_len
+        yield line
+
+
 def _summarize_rollout_records(
     *,
     lines: Iterable[str],
@@ -1366,7 +1400,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
         if HOSTS[alias]["kind"] == "local":
             with _open_local_rollout_text(_local_codex_root(), rollout_relative_path) as handle:
                 records = _summarize_rollout_records(
-                    lines=handle,
+                    lines=_bounded_text_lines(handle, MAX_ROLLOUT_SUMMARY_SCAN_BYTES),
                     keywords=args.keyword,
                     limit=args.limit,
                     tail_records=args.tail_records,
@@ -1379,6 +1413,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                 "codex_root": HOSTS[alias]["codex_root"],
                 "summary_keywords": list(args.keyword),
                 "summary_limit": args.limit,
+                "summary_scan_bytes": MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
                 "summary_tail_records": args.tail_records,
                 "summary_max_text_chars": args.max_text_chars,
             }

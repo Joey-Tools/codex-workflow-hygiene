@@ -521,6 +521,26 @@ def file_source_hash(path: Path) -> str:
 
 def ensure_safe_output_dir(path: Path) -> Path:
     expanded = path.expanduser()
+    raw_parts = expanded.parts
+    raw_index = next(
+        (
+            index
+            for index in range(len(raw_parts) - len(SAFE_OUTPUT_PARTS) + 1)
+            if raw_parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS
+        ),
+        None,
+    )
+    if raw_index is None:
+        raise SystemExit("output directory for transient artifacts must be under .codex-local/session-retrospective")
+    current = Path(expanded.anchor) if expanded.is_absolute() else Path(".")
+    parts_to_check = raw_parts[1:] if expanded.is_absolute() else raw_parts
+    absolute_offset = 1 if expanded.is_absolute() else 0
+    for part_index, part in enumerate(parts_to_check):
+        current = current / part
+        if part_index + absolute_offset < raw_index:
+            continue
+        if os.path.lexists(current) and current.is_symlink():
+            raise SystemExit("output directory for transient artifacts must not use symlink ancestors")
     parts = expanded.resolve(strict=False).parts
     for index in range(len(parts) - len(SAFE_OUTPUT_PARTS) + 1):
         if parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS:
@@ -742,9 +762,13 @@ def source_rollout_candidates(source: Source) -> list[Path]:
     if source.root.is_symlink():
         return []
     sessions = source.root / "sessions"
-    search_roots = [sessions] if sessions.exists() else [source.root]
+    unsafe_roots = set(unsafe_source_search_roots(source))
+    if os.path.lexists(sessions):
+        search_roots = [] if sessions in unsafe_roots else [sessions]
+    else:
+        search_roots = [source.root]
     archived = source.root / "archived_sessions"
-    if archived.exists() and sessions.exists():
+    if os.path.lexists(archived) and os.path.lexists(sessions) and archived not in unsafe_roots:
         search_roots.append(archived)
     return sorted(
         path
@@ -774,6 +798,28 @@ def source_summary_candidates(source: Source) -> list[Path]:
 
 def unsafe_source_summaries(source: Source) -> list[Path]:
     return sorted(path for path in source_summary_candidates(source) if not safe_source_file(path, source.root))
+
+
+def unsafe_source_search_roots(source: Source) -> list[Path]:
+    if not source.root.exists() or source.root.is_symlink():
+        return []
+    unsafe_roots: list[Path] = []
+    try:
+        resolved_root = source.root.resolve(strict=True)
+    except OSError:
+        return []
+    for name in ("sessions", "archived_sessions"):
+        child = source.root / name
+        if not os.path.lexists(child):
+            continue
+        if child.is_symlink() or not child.is_dir():
+            unsafe_roots.append(child)
+            continue
+        try:
+            child.resolve(strict=True).relative_to(resolved_root)
+        except (OSError, ValueError):
+            unsafe_roots.append(child)
+    return sorted(unsafe_roots)
 
 
 def rollout_window_date(path: Path) -> dt.datetime | None:
@@ -1840,7 +1886,9 @@ def save_state(path: Path | None, data: dict[str, Any]) -> None:
 def safe_state_path(raw: str | None) -> Path | None:
     if not raw:
         return None
-    return ensure_safe_output_dir(Path(raw))
+    expanded = Path(raw).expanduser()
+    safe_parent = ensure_safe_output_dir(expanded.parent)
+    return safe_parent / expanded.name
 
 
 def history_artifact_name_tokens(name: str) -> list[str]:
@@ -2563,7 +2611,7 @@ def remote_evidence_gaps(
 
 
 def materialization_gaps_for_source(source: Source) -> list[dict[str, Any]]:
-    if not unsafe_source_rollouts(source) and not unsafe_source_summaries(source):
+    if not unsafe_source_search_roots(source) and not unsafe_source_rollouts(source) and not unsafe_source_summaries(source):
         return []
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return [{"host": source.host, "root_ref": path_ref(source.root), "reason": "unsafe_source_artifact"}]
