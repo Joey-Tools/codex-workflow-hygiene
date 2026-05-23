@@ -1003,7 +1003,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(turns), 2)
 
-    def test_wrapper_only_user_message_keeps_active_turn(self) -> None:
+    def test_wrapper_only_user_message_detaches_followup_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-wrapper.jsonl"
@@ -1019,9 +1019,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
 
         self.assertEqual(len(turns), 1)
-        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+        self.assertEqual(turns[0].issue_flags, [])
+        self.assertEqual(turns[0].assistant_action_summary, "")
 
-    def test_wrapper_only_user_message_keeps_prompt_flagged_active_turn(self) -> None:
+    def test_wrapper_only_user_message_keeps_prompt_flags_without_followup_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-wrapper.jsonl"
@@ -1038,7 +1039,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(turns), 1)
         self.assertIn("failed_command", turns[0].issue_flags)
-        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+        self.assertEqual(turns[0].assistant_action_summary, "")
 
     def test_automation_prompt_is_not_treated_as_user_episode(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -6609,6 +6610,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "retained host label"):
                 MODULE.main(["validate-retained", "--run-dir", str(retained)])
 
+    def test_validate_retained_rejects_bare_64_hex_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fix failed deployment.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            turn_flags_path = retained / "turn_flags.jsonl"
+            row = json.loads(turn_flags_path.read_text(encoding="utf-8").splitlines()[0])
+            row["prompt_improvement"] = "a" * 64
+            turn_flags_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "unredacted sensitive or path-like text"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained)])
+
     def test_validate_retained_rejects_scope_as_evidence_host(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -7112,12 +7135,39 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "Open https://internal.example/ticket",
             "Inspect /Users/hoteng/customer/repo",
             "customer_id=AcmeCorp",
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+            "Use sk-proj-abcdefghijklmnop123456",
+            "github_pat_abcdefghijklmnop1234567890",
+            "AKIAABCDEFGHIJKLMNOP",
+            "eyJabcdefghijkl.eyJmnopqrstuv.eyJwxyzabcdef",
+            "a" * 64,
         ]
         for sample in samples:
             with self.subTest(sample=sample):
                 signal = REMOTE_PROBE._safe_summary_text("user_message", sample)
                 self.assertIn("secret", signal)
                 self.assertNotIn(sample, signal)
+
+    def test_remote_probe_generated_script_preserves_regex_quantifiers(self) -> None:
+        script = REMOTE_PROBE._remote_python_script(
+            {
+                "codex_root": "/tmp/codex",
+                "dates": [],
+                "limit": 1,
+                "max_fetch_rollout_bytes": 1,
+                "session_meta_scan_bytes": 1,
+                "summary_limit": 1,
+                "summary_scan_bytes": 1,
+                "summary_tail_records": 1,
+                "summary_max_text_chars": 100,
+                "summary_keywords": [],
+            }
+        )
+
+        self.assertIn(r"[A-Za-z]{2,}", script)
+        self.assertIn(r"[A-Za-z0-9_-]{16,}", script)
+        self.assertNotIn("(2,)", script)
+        self.assertNotIn("(16,)", script)
 
     def test_out_of_window_summary_meta_still_sets_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

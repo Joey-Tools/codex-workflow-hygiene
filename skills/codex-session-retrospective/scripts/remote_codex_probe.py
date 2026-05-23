@@ -505,7 +505,12 @@ def summary_signal_text(kind, text):
         signals.append("assumed")
     if re.search(
         r"(?:\\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|privacy|pii)\\b|"
-        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}|https?://[^\\s)>\\]\"']+|"
+        r"\\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{{16,}}|gh[pousr]_[A-Za-z0-9_]{{16,}}|github_pat_[A-Za-z0-9_]{{16,}})\\b|"
+        r"\\bAKIA[0-9A-Z]{{16}}\\b|\\bBearer\\s+[A-Za-z0-9._~+/\\-]+=*|"
+        r"\\b(?:authorization|password|passwd|pwd|credential|secret(?:[\\s_-]?key)?|token|api[\\s_-]?key|private[\\s_-]?key)\\s*[:=]\\s*['\"]?[^'\"\\s,;]+|"
+        r"\\beyJ[A-Za-z0-9_-]{{10,}}\\.[A-Za-z0-9_-]{{10,}}\\.[A-Za-z0-9_-]{{10,}}\\b|"
+        r"(?<![0-9a-fA-F])[0-9a-fA-F]{{64}}(?![0-9a-fA-F])|"
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{{2,}}|https?://[^\\s)>\\]\"']+|"
         r"\\b(?:ssh://[^\\s)>\\]\"']+|git@[A-Za-z0-9_.-]+:[^\\s)>\\]\"']+)|"
         r"(?<!\\w)(?:~|/(?:Users|home|root|private|tmp|var|etc|opt|Volumes|workspace|workspaces))/[^\\s,;:)>\\]\"']+|"
         r"\\b(?:customer|client|account|tenant|org|repo|repository)[_-]?(?:id|name)?\\s*[:=]\\s*['\"]?[A-Za-z0-9_.-]+|"
@@ -1270,6 +1275,11 @@ def _summary_signal_text(kind: str, text: str) -> str:
         signals.append("assumed")
     if re.search(
         r"(?:\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|privacy|pii)\b|"
+        r"\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b|"
+        r"\bAKIA[0-9A-Z]{16}\b|\bBearer\s+[A-Za-z0-9._~+/\-]+=*|"
+        r"\b(?:authorization|password|passwd|pwd|credential|secret(?:[\s_-]?key)?|token|api[\s_-]?key|private[\s_-]?key)\s*[:=]\s*['\"]?[^'\"\s,;]+|"
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b|"
+        r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])|"
         r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|https?://[^\s)>\]\"']+|"
         r"\b(?:ssh://[^\s)>\]\"']+|git@[A-Za-z0-9_.-]+:[^\s)>\]\"']+)|"
         r"(?<!\w)(?:~|/(?:Users|home|root|private|tmp|var|etc|opt|Volumes|workspace|workspaces))/[^\s,;:)>\]\"']+|"

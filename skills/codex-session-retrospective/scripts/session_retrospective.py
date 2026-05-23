@@ -1294,7 +1294,7 @@ def extract_rollout(
             assistant_text = assistant_text_from_payload(payload)
             prompt_text = meaningful_prompt_text(user_text) if user_text else ""
             if user_text and not meaningful_user_text(user_text):
-                if current and (assistant_bits or current_has_post_prompt_evidence):
+                if current:
                     flush_assistant()
                     current = None
                     current_emitted = False
@@ -1624,7 +1624,11 @@ def contains_invalid_ref(value: Any) -> bool:
 
 def contains_unredacted_sensitive_text(value: Any) -> bool:
     if isinstance(value, str):
-        return any(pattern.search(value) for pattern, _label in SECRET_PATTERNS) or bool(INTERNAL_HOSTNAME_PATTERN.search(value))
+        return (
+            any(pattern.search(value) for pattern, _label in SECRET_PATTERNS)
+            or bool(INTERNAL_HOSTNAME_PATTERN.search(value))
+            or bool(BARE_64_HEX_PATTERN.search(value))
+        )
     if isinstance(value, dict):
         return any(contains_unredacted_sensitive_text(child) for child in value.values())
     if isinstance(value, list):
