@@ -4679,6 +4679,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("safety_privacy_flag", rows[0]["issue_flags"])
         self.assertNotIn("joey@example.com", json.dumps(rows[0]))
 
+    def test_out_of_window_summary_meta_still_sets_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {"kind": "session_meta", "timestamp": "2026-04-30T23:59:00Z", "text": "session_id=session-from-header"},
+                    {"kind": "summary", "timestamp": "2026-05-01T00:01:00Z", "text": "permission denied"},
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["session_id"], MODULE.opaque_session_id("session-from-header"))
+
     def test_old_invalid_summary_outside_window_does_not_block_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

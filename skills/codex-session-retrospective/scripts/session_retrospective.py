@@ -1130,6 +1130,13 @@ def extract_summary_file(
     for line_no, record in iter_jsonl(path):
         timestamp = str(record.get("timestamp") or "") or None
         parsed_timestamp = summary_timestamp_with_fallback(record, path)
+        text = str(record.get("text") or "")
+        kind = str(record.get("kind") or "summary")
+        if kind == "session_meta" and text:
+            match = re.search(r"session_id=([^\s]+)", text)
+            if match:
+                session_id = opaque_session_id(match.group(1))
+            continue
         if parsed_timestamp is None:
             continue
         if start and parsed_timestamp < start:
@@ -1137,13 +1144,6 @@ def extract_summary_file(
         if end and parsed_timestamp >= end:
             continue
         if emit_start and parsed_timestamp < emit_start:
-            continue
-        text = str(record.get("text") or "")
-        kind = str(record.get("kind") or "summary")
-        if kind == "session_meta" and text:
-            match = re.search(r"session_id=([^\s]+)", text)
-            if match:
-                session_id = opaque_session_id(match.group(1))
             continue
         _redacted_text, changed = redact(text)
         flags = flags_for_text(text, redacted_changed=changed)
