@@ -772,7 +772,7 @@ def safe_source_file(path: Path, root: Path) -> bool:
     return path.is_file()
 
 
-def source_rollout_candidates(source: Source) -> list[Path]:
+def source_rollout_search_roots(source: Source) -> list[Path]:
     if source.root.is_symlink():
         return []
     sessions = source.root / "sessions"
@@ -784,6 +784,11 @@ def source_rollout_candidates(source: Source) -> list[Path]:
     archived = source.root / "archived_sessions"
     if os.path.lexists(archived) and os.path.lexists(sessions) and archived not in unsafe_roots:
         search_roots.append(archived)
+    return search_roots
+
+
+def source_rollout_candidates(source: Source) -> list[Path]:
+    search_roots = source_rollout_search_roots(source)
     return sorted(
         path
         for search_root in search_roots
@@ -812,6 +817,37 @@ def source_summary_candidates(source: Source) -> list[Path]:
 
 def unsafe_source_summaries(source: Source) -> list[Path]:
     return sorted(path for path in source_summary_candidates(source) if not safe_source_file(path, source.root))
+
+
+def unsafe_source_tree_entries(source: Source) -> list[Path]:
+    if not source.root.exists() or source.root.is_symlink():
+        return []
+    try:
+        resolved_root = source.root.resolve(strict=True)
+    except OSError:
+        return []
+    unsafe: set[Path] = set()
+    for search_root in source_rollout_search_roots(source):
+        if not search_root.exists() or search_root.is_symlink():
+            continue
+        for dirpath, dirnames, filenames in os.walk(search_root, followlinks=False):
+            current = Path(dirpath)
+            for dirname in list(dirnames):
+                child = current / dirname
+                if child.is_symlink():
+                    unsafe.add(child)
+                    dirnames.remove(dirname)
+                    continue
+                try:
+                    child.resolve(strict=True).relative_to(resolved_root)
+                except (OSError, ValueError):
+                    unsafe.add(child)
+                    dirnames.remove(dirname)
+            for filename in filenames:
+                child = current / filename
+                if child.is_symlink() and (filename.startswith("rollout-") or filename.startswith("rollout-summary")):
+                    unsafe.add(child)
+    return sorted(unsafe)
 
 
 def unsafe_source_search_roots(source: Source) -> list[Path]:
@@ -1045,6 +1081,16 @@ def summary_file_has_truncated_scan(path: Path) -> bool:
     return False
 
 
+def summary_session_id(record: dict[str, Any]) -> str | None:
+    structured = record.get("session_id")
+    if isinstance(structured, str) and structured:
+        return structured
+    match = re.search(r"session_id=([^\s]+)", str(record.get("text") or ""))
+    if match:
+        return match.group(1)
+    return None
+
+
 def summary_timestamp_with_fallback(record: dict[str, Any], path: Path) -> dt.datetime | None:
     return parse_time(str(record.get("timestamp") or "")) or summary_date_from_path(path)
 
@@ -1259,9 +1305,9 @@ def extract_summary_file(
     for _line_no, record in records:
         if str(record.get("kind") or "summary") != "session_meta":
             continue
-        match = re.search(r"session_id=([^\s]+)", str(record.get("text") or ""))
-        if match:
-            session_id = opaque_session_id(match.group(1))
+        record_session_id = summary_session_id(record)
+        if record_session_id:
+            session_id = opaque_session_id(record_session_id)
             break
     for line_no, record in records:
         timestamp = str(record.get("timestamp") or "") or None
@@ -1270,9 +1316,9 @@ def extract_summary_file(
         kind = str(record.get("kind") or "summary")
         retained_kind = retained_summary_kind(kind)
         if kind == "session_meta" and text:
-            match = re.search(r"session_id=([^\s]+)", text)
-            if match:
-                session_id = opaque_session_id(match.group(1))
+            record_session_id = summary_session_id(record)
+            if record_session_id:
+                session_id = opaque_session_id(record_session_id)
             continue
         if parsed_timestamp is None:
             continue
@@ -2637,7 +2683,12 @@ def remote_evidence_gaps(
 
 
 def materialization_gaps_for_source(source: Source) -> list[dict[str, Any]]:
-    if not unsafe_source_search_roots(source) and not unsafe_source_rollouts(source) and not unsafe_source_summaries(source):
+    if (
+        not unsafe_source_search_roots(source)
+        and not unsafe_source_tree_entries(source)
+        and not unsafe_source_rollouts(source)
+        and not unsafe_source_summaries(source)
+    ):
         return []
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return [{"host": source.host, "root_ref": path_ref(source.root), "reason": "unsafe_source_artifact"}]
@@ -2838,7 +2889,7 @@ def run_scan(
                         }
                     )
                 continue
-            if summary_file_has_truncated_scan(summary):
+            if summary_file_has_truncated_scan(summary) and summary_file_maybe_relevant_without_read(summary, gap_start, end):
                 coverage_gaps.append(
                     {
                         "host": source.host,
@@ -3100,6 +3151,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             rows.append(row)
             return
         if summary_file_has_truncated_scan(summary):
+            if not summary_file_maybe_relevant_without_read(summary, start, end):
+                return
             row["status"] = "partial"
             row["coverage_gap"] = "summary scan truncated; regenerate complete bounded evidence before extractor handoff"
             rows.append(row)

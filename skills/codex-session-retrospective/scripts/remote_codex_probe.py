@@ -526,11 +526,13 @@ def event_user_message_text(payload):
     return ""
 
 
-def summary_record(kind, text, *, line_no, timestamp):
+def summary_record(kind, text, *, line_no, timestamp, session_id=""):
     value = normalize_text(safe_summary_text(kind, text), SUMMARY_MAX_TEXT_CHARS)
     if not value:
         return None
     record = {{"kind": kind, "line": line_no, "text": value, "timestamp": timestamp or ""}}
+    if session_id:
+        record["session_id"] = str(session_id)
     match_text = normalize_text(text, SUMMARY_MAX_TEXT_CHARS)
     if match_text and match_text != value:
         record["_match_text"] = match_text
@@ -607,6 +609,7 @@ def summarize_rollout():
                     + str(bool(payload.get("cwd", ""))).lower(),
                     line_no=line_no,
                     timestamp=timestamp,
+                    session_id=str(payload.get("id", "")),
                 )
                 session_meta_record = record
             elif record_type == "response_item":
@@ -1290,6 +1293,7 @@ def _build_summary_record(
     line_no: int,
     timestamp: str,
     max_text_chars: int,
+    session_id: str = "",
 ) -> dict[str, Any] | None:
     normalized = _normalize_summary_text(_safe_summary_text(kind, text), max_text_chars=max_text_chars)
     if not normalized:
@@ -1300,6 +1304,8 @@ def _build_summary_record(
         "text": normalized,
         "timestamp": timestamp,
     }
+    if session_id:
+        record["session_id"] = session_id
     match_text = _normalize_summary_text(text, max_text_chars=max_text_chars)
     if match_text and match_text != normalized:
         record["_match_text"] = match_text
@@ -1356,6 +1362,7 @@ def _summarize_rollout_records(
                 line_no=line_no,
                 timestamp=timestamp,
                 max_text_chars=max_text_chars,
+                session_id=str(payload.get("id", "")),
             )
             continue
 

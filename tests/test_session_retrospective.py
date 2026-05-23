@@ -579,6 +579,46 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("secret123", serialized)
         self.assertNotIn("/customer", serialized)
 
+    def test_remote_probe_rollout_summary_keeps_structured_session_id(self) -> None:
+        raw_session = "session-raw-abc123456"
+        records = REMOTE_PROBE._summarize_rollout_records(
+            lines=[
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T09:59:00Z",
+                        "payload": {"id": raw_session, "cwd": "/Users/hoteng/secret/repo"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"type": "function_call_output", "output": "permission denied"},
+                    }
+                ),
+            ],
+            keywords=["permission"],
+            limit=10,
+            tail_records=0,
+            max_text_chars=80,
+        )
+
+        self.assertEqual(records[0]["kind"], "session_meta")
+        self.assertEqual(records[0]["session_id"], raw_session)
+        self.assertEqual(records[0]["text"], "session meta present")
+        self.assertNotIn(raw_session, records[0]["text"])
+        self.assertNotIn("/Users", json.dumps(records))
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-structured-session.jsonl"
+            write_jsonl(summary, records)
+
+            turns = MODULE.extract_summary_file(MODULE.Source("remote", root), summary, None, None)
+
+        self.assertEqual(turns[0].session_id, MODULE.opaque_session_id(raw_session))
+
     def test_remote_probe_session_meta_uses_bounded_input_scan(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -5235,6 +5275,34 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
                 self.assertEqual(manifest["sources"][0]["status"], "stale")
 
+    def test_default_remote_nested_symlink_directory_reports_materialization_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            outside = Path(raw) / "outside-day"
+            rollout = outside / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            write_jsonl(rollout, [message("user", "Hidden remote task.", "2026-05-01T10:00:00Z")])
+            link = remote / "sessions" / "2026" / "05" / "01"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(outside, target_is_directory=True)
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            rows = list((output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines())
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(rows, [])
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+
     def test_partial_remote_materialization_skips_direct_scan_data(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
@@ -5295,6 +5363,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(manifest["sources"][0]["host"], "custom_source")
         self.assertEqual(manifest["sources"][0]["status"], "stale")
         self.assertEqual(manifest["sources"][0]["rollout_count"], 1)
+
+    def test_custom_source_nested_symlink_directory_blocks_state_advancement(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            outside = Path(raw) / "outside-day"
+            rollout = outside / "rollout-2026-05-01T10-00-00-hidden.jsonl"
+            write_jsonl(rollout, [message("user", "Hidden custom task.", "2026-05-01T10:00:00Z")])
+            link = root / "sessions" / "2026" / "05" / "01"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(outside, target_is_directory=True)
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with mock.patch.object(MODULE, "parse_sources", return_value=[MODULE.Source("custom_source", root)]):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=None, output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            rows = list((output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines())
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(rows, [])
+        self.assertIn("unsafe_source_artifact", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["host"], "custom_source")
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+        self.assertEqual(manifest["sources"][0]["rollout_count"], 0)
 
     def test_discover_reports_default_remote_materialization_gaps(self) -> None:
         for filename in ("rollout-2026-05-01T10-00-00-remote.jsonl", "rollout-summary-remote.jsonl"):
@@ -6514,6 +6612,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertIn("truncated_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
 
+    def test_future_truncated_rollout_summary_does_not_report_current_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-future.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "scan_meta",
+                        "timestamp": "",
+                        "text": "scan_truncated=true scan_bytes=2097152 source_bytes=3000000",
+                        "scan_truncated": True,
+                    }
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("truncated_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_make_shards_marks_truncated_rollout_summary_partial(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -6551,6 +6676,41 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "partial")
         self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_skips_future_truncated_rollout_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-future.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "scan_meta",
+                        "timestamp": "",
+                        "text": "scan_truncated=true scan_bytes=2097152 source_bytes=3000000",
+                        "scan_truncated": True,
+                    }
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows, [])
 
     def test_unknown_rollout_summary_kind_is_bucketed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
