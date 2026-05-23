@@ -522,6 +522,23 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("assumed", records[0]["text"])
         self.assertNotIn("verification step", records[0]["text"])
 
+    def test_remote_probe_rollout_summary_preserves_early_signal_outside_tail(self) -> None:
+        lines = [json.dumps(message("user", "permission denied while fetching remote logs", "2026-05-01T10:00:00Z"))]
+        for index in range(10):
+            lines.append(json.dumps(message("assistant", f"Ordinary update {index}", "2026-05-01T10:01:00Z")))
+
+        records = REMOTE_PROBE._summarize_rollout_records(
+            lines=lines,
+            keywords=[],
+            limit=10,
+            tail_records=2,
+            max_text_chars=80,
+        )
+
+        self.assertIn("error:", records[0]["text"])
+        self.assertIn("approval", records[0]["text"])
+        self.assertNotIn("permission denied", json.dumps(records))
+
     def test_remote_probe_rollout_summary_preserves_event_user_message_signal(self) -> None:
         records = REMOTE_PROBE._summarize_rollout_records(
             lines=[
@@ -663,6 +680,14 @@ class SessionRetrospectiveTests(unittest.TestCase):
             [source.host for source in MODULE.parse_sources(["local=/tmp/local"], require_default_hosts=False)],
             ["local"],
         )
+
+    def test_parse_sources_canonicalizes_default_remote_aliases(self) -> None:
+        sources = MODULE.parse_sources(["miku-server-dev=/tmp/miku"])
+
+        self.assertEqual([source.host for source in sources], ["local", "miku-bot-dev", "hoteng-srv-01"])
+        self.assertTrue(sources[1].explicit)
+        self.assertIsNone(sources[1].missing_reason)
+        self.assertEqual(sources[2].missing_reason, "remote_source_not_materialized")
 
     def test_partial_host_default_sources_use_local_only(self) -> None:
         sources = MODULE.parse_sources(None, require_default_hosts=False)

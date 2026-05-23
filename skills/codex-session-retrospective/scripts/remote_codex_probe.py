@@ -75,6 +75,7 @@ AUTOMATION_PROMPT_MARKERS = (
     "When reconstructing the real user task from rollouts, ignore injected wrapper content",
     "Write task-local artifacts under .codex-local/session-retrospective/runs/",
 )
+SUMMARY_SIGNAL_MARKERS = ("error:", "approval", "could not run", "you missed", "assumed", "secret")
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
 REMOTE_FETCH_ROLLOUT_BEGIN = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_BEGIN__"
@@ -446,6 +447,7 @@ WRAPPER_END_MARKERS = {WRAPPER_END_MARKERS!r}
 AUTOMATION_PROMPT_PATTERN_TEXTS = {AUTOMATION_PROMPT_PATTERN_TEXTS!r}
 AUTOMATION_PROMPT_PATTERNS = tuple(re.compile(pattern, re.I) for pattern in AUTOMATION_PROMPT_PATTERN_TEXTS)
 AUTOMATION_PROMPT_MARKERS = {AUTOMATION_PROMPT_MARKERS!r}
+SUMMARY_SIGNAL_MARKERS = {SUMMARY_SIGNAL_MARKERS!r}
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
 SESSION_META_END = {REMOTE_SESSION_META_END!r}
 FETCH_ROLLOUT_BEGIN = {REMOTE_FETCH_ROLLOUT_BEGIN!r}
@@ -634,6 +636,13 @@ def summary_record(kind, text, *, line_no, timestamp, session_id=""):
     return record
 
 
+def summary_record_has_signal(record):
+    if record is None or str(record.get("kind", "")) in ("session_meta", "scan_meta"):
+        return False
+    text = str(record.get("text", ""))
+    return any(marker in text for marker in SUMMARY_SIGNAL_MARKERS)
+
+
 def bounded_text_lines(handle, max_scan_bytes):
     scanned = 0
     while True:
@@ -679,6 +688,8 @@ def summarize_rollout():
     keywords = [value.casefold() for value in SUMMARY_KEYWORDS if value]
     matched = []
     matched_seen = set()
+    signal_records = []
+    signal_seen = set()
     tail = collections.deque(maxlen=SUMMARY_TAIL_RECORDS)
     session_meta_record = None
     last_assistant_record = None
@@ -739,6 +750,12 @@ def summarize_rollout():
             if not record or record.get("kind") == "session_meta":
                 continue
 
+            if summary_record_has_signal(record):
+                key = (str(record.get("kind", "")), int(record.get("line", 0)))
+                if key not in signal_seen and (not SUMMARY_LIMIT or len(signal_records) < SUMMARY_LIMIT):
+                    signal_records.append(record)
+                    signal_seen.add(key)
+
             text_value = str(record.get("_match_text") or record.get("text", ""))
             if keywords and any(keyword in text_value.casefold() for keyword in keywords):
                 key = (str(record.get("kind", "")), int(record.get("line", 0)))
@@ -778,6 +795,8 @@ def summarize_rollout():
         emitted.add(key)
 
     emit(session_meta_record)
+    for record in signal_records:
+        emit(record)
     for record in matched:
         emit(record)
     if not keywords:
@@ -1406,6 +1425,13 @@ def _safe_summary_text(kind: str, text: str) -> str:
     return _summary_signal_text(kind, text)
 
 
+def _summary_record_has_signal(record: dict[str, Any] | None) -> bool:
+    if record is None or str(record.get("kind", "")) in {"session_meta", "scan_meta"}:
+        return False
+    text = str(record.get("text", ""))
+    return any(marker in text for marker in SUMMARY_SIGNAL_MARKERS)
+
+
 def _event_user_message_text(payload: dict[str, Any]) -> str:
     message = payload.get("message")
     if isinstance(message, str):
@@ -1478,6 +1504,8 @@ def _summarize_rollout_records(
     search_keywords = [value.casefold() for value in keywords if value]
     matched: list[dict[str, Any]] = []
     matched_seen: set[tuple[str, int]] = set()
+    signal_records: list[dict[str, Any]] = []
+    signal_seen: set[tuple[str, int]] = set()
     tail: collections.deque[dict[str, Any]] = collections.deque(maxlen=tail_records)
     session_meta_record: dict[str, Any] | None = None
     last_assistant_record: dict[str, Any] | None = None
@@ -1561,6 +1589,12 @@ def _summarize_rollout_records(
         if record is None:
             continue
 
+        if _summary_record_has_signal(record):
+            key = (str(record.get("kind", "")), int(record.get("line", 0)))
+            if key not in signal_seen and (limit <= 0 or len(signal_records) < limit):
+                signal_records.append(record)
+                signal_seen.add(key)
+
         if search_keywords:
             text_value = str(record.get("_match_text") or record.get("text", "")).casefold()
             if any(keyword in text_value for keyword in search_keywords):
@@ -1587,6 +1621,8 @@ def _summarize_rollout_records(
         result.append(safe_record)
 
     append(session_meta_record)
+    for record in signal_records:
+        append(record)
     for record in matched:
         append(record)
     if not search_keywords:

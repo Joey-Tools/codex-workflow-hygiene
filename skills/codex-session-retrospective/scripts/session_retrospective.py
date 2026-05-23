@@ -96,12 +96,20 @@ SAFETY_PATTERN = re.compile(
     r"客户|客户数据|凭据|凭证|密钥|生产|破坏性)",
     re.I,
 )
+RETAINED_SENSITIVE_TEXT_PATTERN = re.compile(
+    r"(?:\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|pii)\b|"
+    r"客户|客户数据|凭据|凭证|密钥|生产|破坏性)",
+    re.I,
+)
 RETAINED_ISSUE_FLAGS = frozenset(name for name, _pattern in FLAG_PATTERNS) | frozenset({"safety_privacy_flag"})
 RETAINED_OUTCOMES = frozenset({"needs_review", "no_issue_observed"})
 RETAINED_FIXED_MODES = frozenset({"daily", "weekly"})
 BASELINE_MODE_PATTERN = re.compile(r"^baseline-[1-9][0-9]{0,3}d$")
 
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
+RETAINED_SOURCE_HOST_ALIASES = {
+    "miku-server-dev": "miku-bot-dev",
+}
 RETAINED_CUSTOM_SOURCE_HOST = "custom_source"
 RETAINED_DIRECT_SOURCE_HOSTS = frozenset(("local", *DEFAULT_REMOTE_HOSTS))
 RETAINED_EVIDENCE_HOSTS = frozenset((*RETAINED_DIRECT_SOURCE_HOSTS, RETAINED_CUSTOM_SOURCE_HOST))
@@ -1649,7 +1657,7 @@ def contains_unredacted_sensitive_text(value: Any, *, include_safety_markers: bo
             or bool(PRIVATE_IPV4_PATTERN.search(value))
             or bool(PRIVATE_IPV6_PATTERN.search(value))
             or bool(BARE_64_HEX_PATTERN.search(value))
-            or (include_safety_markers and bool(SAFETY_PATTERN.search(value)))
+            or (include_safety_markers and bool(RETAINED_SENSITIVE_TEXT_PATTERN.search(value)))
         )
     if isinstance(value, dict):
         return any(contains_unredacted_sensitive_text(child, include_safety_markers=include_safety_markers) for child in value.values())
@@ -1666,6 +1674,7 @@ def retained_source_host(host: str) -> str:
     label = host.strip()
     if not label:
         raise SystemExit("--source HOST must be non-empty")
+    label = RETAINED_SOURCE_HOST_ALIASES.get(label, label)
     if label in RETAINED_DIRECT_SOURCE_HOSTS:
         return label
     return RETAINED_CUSTOM_SOURCE_HOST
