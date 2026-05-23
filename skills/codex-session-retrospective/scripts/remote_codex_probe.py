@@ -59,6 +59,22 @@ WRAPPER_PREFIXES = (
     "Review the code changes against the base branch",
 )
 WRAPPER_END_MARKERS = ("</INSTRUCTIONS>", "</environment_context>", "</skill>", "</subagent_notification>", "</turn_aborted>")
+AUTOMATION_PROMPT_PATTERN_TEXTS = (
+    r"^Run the (?:daily|weekly) Codex session retrospective\b",
+    r"^Run a read-only (?:daily|weekly) retrospective over Joey's Codex session activity\b",
+    r"^Run inside the dedicated worktree provisioned for this automation\b",
+    r"^Use \$codex-session-retrospective to run\b",
+    r"^Use the installed codex-session-retrospective workflow\b",
+)
+AUTOMATION_PROMPT_PATTERNS = tuple(re.compile(pattern, re.I) for pattern in AUTOMATION_PROMPT_PATTERN_TEXTS)
+AUTOMATION_PROMPT_MARKERS = (
+    "Run a read-only daily retrospective over Joey's Codex session activity.",
+    "Run a read-only weekly retrospective over Joey's Codex session activity.",
+    "Evidence scope must match $remote-host-context's default host policy",
+    "Use the automation's configured model and reasoning effort",
+    "When reconstructing the real user task from rollouts, ignore injected wrapper content",
+    "Write task-local artifacts under .codex-local/session-retrospective/runs/",
+)
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
 REMOTE_FETCH_ROLLOUT_BEGIN = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_BEGIN__"
@@ -427,6 +443,9 @@ PRIVATE_IPV6_SIGNAL_RE = re.compile({PRIVATE_IPV6_SIGNAL_RE.pattern!r}, re.I)
 INTERNAL_HOSTNAME_SIGNAL_RE = re.compile({INTERNAL_HOSTNAME_SIGNAL_RE.pattern!r}, re.I)
 WRAPPER_PREFIXES = {WRAPPER_PREFIXES!r}
 WRAPPER_END_MARKERS = {WRAPPER_END_MARKERS!r}
+AUTOMATION_PROMPT_PATTERN_TEXTS = {AUTOMATION_PROMPT_PATTERN_TEXTS!r}
+AUTOMATION_PROMPT_PATTERNS = tuple(re.compile(pattern, re.I) for pattern in AUTOMATION_PROMPT_PATTERN_TEXTS)
+AUTOMATION_PROMPT_MARKERS = {AUTOMATION_PROMPT_MARKERS!r}
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
 SESSION_META_END = {REMOTE_SESSION_META_END!r}
 FETCH_ROLLOUT_BEGIN = {REMOTE_FETCH_ROLLOUT_BEGIN!r}
@@ -519,7 +538,7 @@ def message_summary_from_payload(payload):
     return kind, "\\n".join(parts)
 
 
-def meaningful_user_message_text(text):
+def meaningful_prompt_text(text):
     stripped = str(text).strip()
     if not stripped:
         return ""
@@ -530,6 +549,18 @@ def meaningful_user_message_text(text):
                 candidate = stripped[index + len(marker):].strip()
                 if candidate and not any(candidate.startswith(prefix) for prefix in WRAPPER_PREFIXES):
                     return candidate
+        return ""
+    return stripped
+
+
+def meaningful_user_message_text(text):
+    stripped = meaningful_prompt_text(text)
+    if not stripped:
+        return ""
+    if any(pattern.search(stripped) for pattern in AUTOMATION_PROMPT_PATTERNS):
+        return ""
+    marker_count = sum(1 for marker in AUTOMATION_PROMPT_MARKERS if marker in stripped)
+    if marker_count >= 2:
         return ""
     return stripped
 
@@ -1311,7 +1342,7 @@ def _message_summary(payload: dict[str, Any]) -> tuple[str, str]:
     return kind, "\n".join(parts).strip()
 
 
-def _meaningful_user_message_text(text: str) -> str:
+def _meaningful_prompt_text(text: str) -> str:
     stripped = str(text).strip()
     if not stripped:
         return ""
@@ -1322,6 +1353,18 @@ def _meaningful_user_message_text(text: str) -> str:
                 candidate = stripped[index + len(marker) :].strip()
                 if candidate and not any(candidate.startswith(prefix) for prefix in WRAPPER_PREFIXES):
                     return candidate
+        return ""
+    return stripped
+
+
+def _meaningful_user_message_text(text: str) -> str:
+    stripped = _meaningful_prompt_text(text)
+    if not stripped:
+        return ""
+    if any(pattern.search(stripped) for pattern in AUTOMATION_PROMPT_PATTERNS):
+        return ""
+    marker_count = sum(1 for marker in AUTOMATION_PROMPT_MARKERS if marker in stripped)
+    if marker_count >= 2:
         return ""
     return stripped
 

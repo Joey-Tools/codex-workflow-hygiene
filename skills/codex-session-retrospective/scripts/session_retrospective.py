@@ -1641,7 +1641,7 @@ def contains_invalid_ref(value: Any) -> bool:
     return False
 
 
-def contains_unredacted_sensitive_text(value: Any) -> bool:
+def contains_unredacted_sensitive_text(value: Any, *, include_safety_markers: bool = True) -> bool:
     if isinstance(value, str):
         return (
             any(pattern.search(value) for pattern, _label in SECRET_PATTERNS)
@@ -1649,11 +1649,12 @@ def contains_unredacted_sensitive_text(value: Any) -> bool:
             or bool(PRIVATE_IPV4_PATTERN.search(value))
             or bool(PRIVATE_IPV6_PATTERN.search(value))
             or bool(BARE_64_HEX_PATTERN.search(value))
+            or (include_safety_markers and bool(SAFETY_PATTERN.search(value)))
         )
     if isinstance(value, dict):
-        return any(contains_unredacted_sensitive_text(child) for child in value.values())
+        return any(contains_unredacted_sensitive_text(child, include_safety_markers=include_safety_markers) for child in value.values())
     if isinstance(value, list):
-        return any(contains_unredacted_sensitive_text(child) for child in value)
+        return any(contains_unredacted_sensitive_text(child, include_safety_markers=include_safety_markers) for child in value)
     return False
 
 
@@ -2179,10 +2180,10 @@ def history_text_contains_retention_risk(data: bytes, file_path: str) -> bool:
     text = history_text(data, file_path)
     if file_path.startswith("schemas/"):
         text = text.replace("https://json-schema.org/draft/2020-12/schema", "")
+    if file_path in HISTORY_ROOT_FILES or file_path in {"data/README.md", "reports/README.md"}:
+        return contains_unredacted_sensitive_text(text, include_safety_markers=False) or bool(BARE_64_HEX_PATTERN.search(text))
     if contains_unredacted_sensitive_text(text) or BARE_64_HEX_PATTERN.search(text):
         return True
-    if file_path in HISTORY_ROOT_FILES or file_path in {"data/README.md", "reports/README.md"}:
-        return False
     generated_follow_on = history_path_kind(file_path) in {"text", "json_text"}
     return generated_follow_on and contains_path_like_text(text)
 

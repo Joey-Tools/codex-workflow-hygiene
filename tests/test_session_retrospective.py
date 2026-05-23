@@ -281,6 +281,12 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(
             MODULE.meaningful_user_text("Run a read-only daily retrospective over Joey's Codex session activity.")
         )
+        self.assertFalse(
+            MODULE.meaningful_user_text(
+                "Run inside the dedicated worktree provisioned for this automation.\n"
+                "Check approval/auth, secrets, customer data, and verification gaps."
+            )
+        )
         self.assertTrue(
             MODULE.meaningful_user_text(
                 "The retrospective failed after writing to .codex-local/session-retrospective/runs/latest."
@@ -6786,6 +6792,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(MODULE.contains_unredacted_sensitive_text(text))
 
+    def test_retained_validators_reject_safety_privacy_markers(self) -> None:
+        for text in ("customer data", "PII", "production", "destructive", "客户数据"):
+            with self.subTest(text=text):
+                self.assertTrue(MODULE.contains_unredacted_sensitive_text(text))
+        with self.assertRaisesRegex(SystemExit, "unredacted sensitive"):
+            MODULE.ensure_retained_safe_value("retained", {"prompt_improvement": "Mentions customer data directly."})
+
     def test_custom_source_host_is_bucketed_in_retained_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -7184,6 +7197,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
         )
 
         self.assertIsNone(record)
+
+    def test_remote_probe_ignores_automation_prompt_before_signaling(self) -> None:
+        records = REMOTE_PROBE._summarize_rollout_records(
+            lines=[
+                json.dumps(
+                    message(
+                        "user",
+                        "Run inside the dedicated worktree provisioned for this automation.\n"
+                        "Check approval/auth, secrets, customer data, and verification gaps.",
+                        "2026-05-22T10:01:00Z",
+                    )
+                )
+            ],
+            keywords=[],
+            limit=10,
+            tail_records=0,
+            max_text_chars=1200,
+        )
+
+        self.assertEqual(records, [])
 
     def test_oversized_rollout_summary_file_reports_gap_without_reading(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
