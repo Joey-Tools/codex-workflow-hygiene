@@ -27,6 +27,8 @@ The goal is to locate the smallest relevant set of rollout files, extract only t
 2. Locate the smallest file set before reading content.
 - For an exact session ID or thread ID, start with `session_index.jsonl`, `history.jsonl`, or a filename search for `rollout-*<id>*.jsonl`; do not append the whole `~/.codex/sessions` tree to the same raw `rg` command.
 - For broad keyword, prompt-shape, or review-lane searches in `history.jsonl`, `session_index.jsonl`, `sessions/**/rollout-*.jsonl`, or `archived_sessions/*.jsonl`, do not use raw `rg -n` to print matching JSONL records. A single matching line can contain an injected wrapper or nested tool output; use `rg -l` / counts to find candidate files, then parse JSON and print selected fields plus short snippets.
+- Treat unbounded `rg -l` / `rg -o` over all `~/.codex/sessions` as a high-output risk too: one matching path or timestamp per rollout can still produce tens of thousands of lines. For all-history retrospectives or broad audits, first enumerate date shards, count matches per day/month, and print only a capped sample of candidate paths before deciding which shards to parse.
+- In review-only tasks for session/history tooling, do not mine `~/.codex/sessions` merely because the code under review touches transcripts. Review the repo diff, tests, and supplied artifacts first; if historical evidence is actually needed, switch to this skill's bounded date-shard and capped-extraction workflow instead of raw transcript searches.
 - For a bounded date range, prefer the date-tree layout under `~/.codex/sessions/YYYY/MM/DD/` and filename timestamps over filesystem mtime alone.
 - Do not trust `find -mtime` as the only date filter when precision matters; copies, indexing, or later metadata updates can give older rollout files a fresh mtime.
 - If a stale path such as `~/.codex/archived_sessions/...` is mentioned, verify it against the current host before using it.
@@ -61,6 +63,7 @@ The goal is to locate the smallest relevant set of rollout files, extract only t
 - Do not dump full JSONL files into the answer when a few key lines will do.
 - Do not dump full per-record inventories of large rollout files; a structured `jq` command can still produce tens of thousands of tokens if it emits every timestamp or tool call.
 - Do not use `sed`, `head`, or raw `rg -n` as an orientation step on rollout/history JSONL records; the first few records often contain full instructions, and a keyword hit can print a whole nested tool output. Count shapes or emit selected JSON fields instead.
+- Do not assume `rg -l` is safe when the candidate set is the whole sessions tree; cap printed paths and summarize by date shard before listing individual rollouts.
 - Do not scan all of `~/.codex` when the task is already bounded by session ID, repo, or date.
 - Do not combine `session_index.jsonl`, `history.jsonl`, and `~/.codex/sessions` in one raw `rg`; if the ID appears inside a nested tool output, the match can dump an entire rollout JSON record back into context.
 - Do not confuse local transcript evidence with current repo truth; once the session points to a live file, repo, or remote artifact, that source becomes authoritative for the underlying technical question.

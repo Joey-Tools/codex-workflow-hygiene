@@ -64,6 +64,44 @@ for path in paths:
 PY
 ```
 
+For all-history retrospectives, do not run unbounded `rg -l` or `rg -o` across the whole sessions tree and print every matching rollout path or timestamp. `--max-count` limits matches per file, not the number of files printed. Count by date shard first, then print a small sample:
+
+```bash
+python3 - <<'PY'
+from collections import Counter
+from pathlib import Path
+
+root = Path('~/.codex/sessions').expanduser()
+needle = b'"user_message"'
+counts = Counter()
+samples = []
+sample_limit = 40
+
+for path in sorted(root.glob('20[0-9][0-9]/*/*/rollout-*.jsonl')):
+    try:
+        matched = needle in path.read_bytes()
+    except OSError:
+        continue
+    if not matched:
+        continue
+    shard = '/'.join(path.parts[-4:-1])
+    counts[shard] += 1
+    if len(samples) < sample_limit:
+        samples.append(path)
+
+for shard, count in counts.most_common(30):
+    print(f'{shard}: {count}')
+if samples:
+    print(f'candidate samples, capped at {sample_limit}:')
+    for path in samples:
+        print(path)
+if len(counts) > 30:
+    print(f'... {len(counts) - 30} more shards; narrow by date, cwd, or user phrase before parsing')
+PY
+```
+
+If this count pass is still too slow or too broad, stop and add a date, repo/cwd, thread title, or user-phrase bound. Do not "just list the matches" as a shortcut.
+
 ## 2. Extract Only The Relevant Parts
 
 Before printing details from a large rollout, count record shapes and then filter:

@@ -16,6 +16,18 @@ class SkillStructureTests(unittest.TestCase):
             self.assertIn("\nname:", frontmatter, path)
             self.assertIn("\ndescription:", frontmatter, path)
 
+    def test_session_mining_caps_unbounded_candidate_lists(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("unbounded `rg -l`", skill)
+        self.assertIn("one matching path or timestamp per rollout", skill)
+        self.assertIn("Count by date shard first", workflow)
+        self.assertIn("candidate samples, capped", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
