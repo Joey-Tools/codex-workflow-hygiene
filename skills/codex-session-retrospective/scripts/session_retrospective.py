@@ -2570,6 +2570,14 @@ def remote_materialization_gaps(source: Source) -> list[dict[str, Any]]:
     return [remote_metadata_gap(source, "remote_source_not_materialized")]
 
 
+def remote_summary_only_gaps(source: Source, rollouts: list[Path], summaries: list[Path]) -> list[dict[str, Any]]:
+    if source.host not in DEFAULT_REMOTE_HOSTS:
+        return []
+    if rollouts or not summaries:
+        return []
+    return [remote_metadata_gap(source, "remote_source_not_materialized")]
+
+
 def earliest_rollout_sources(sources: list[Source]) -> list[Source]:
     eligible: list[Source] = []
     for source in sources:
@@ -2674,7 +2682,9 @@ def run_scan(
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         source_materialization_gaps = remote_materialization_gaps(source)
+        source_summary_only_gaps = remote_summary_only_gaps(source, rollouts, summaries)
         coverage_gaps.extend(source_materialization_gaps)
+        coverage_gaps.extend(source_summary_only_gaps)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
@@ -2686,7 +2696,7 @@ def run_scan(
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
                 "status": "stale"
-                if source_materialization_gaps
+                if source_materialization_gaps or source_summary_only_gaps
                 else "ready"
                 if rollouts or summaries
                 else "empty",
@@ -2739,8 +2749,6 @@ def run_scan(
             append_oversized_rollout_gap(rollout, size)
             continue
         for summary in summaries:
-            if not summary_file_maybe_relevant_without_read(summary, start, end):
-                continue
             size = summary.stat().st_size
             if size > max_raw_bytes:
                 if summary_file_maybe_relevant_without_read(summary, gap_start, end):
@@ -2851,7 +2859,9 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         source_materialization_gaps = remote_materialization_gaps(source)
+        source_summary_only_gaps = remote_summary_only_gaps(source, rollouts, summaries)
         coverage_gaps.extend(source_materialization_gaps)
+        coverage_gaps.extend(source_summary_only_gaps)
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
         manifest_sources.append(
@@ -2861,7 +2871,11 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                 "root_ref": path_ref(source.root),
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
-                "status": "stale" if source_materialization_gaps else "ready" if rollouts or summaries else "empty",
+                "status": "stale"
+                if source_materialization_gaps or source_summary_only_gaps
+                else "ready"
+                if rollouts or summaries
+                else "empty",
             }
         )
     if getattr(args, "allow_partial_hosts", False):
@@ -2990,10 +3004,10 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         return row
 
     def append_summary_shard(summary: Path) -> None:
-        if not summary_file_maybe_relevant_without_read(summary, start, end):
-            return
         row = shard_row(summary, bytes=summary.stat().st_size, kind="summary")
         if row["bytes"] > max_raw_bytes:
+            if not summary_file_maybe_relevant_without_read(summary, start, end):
+                return
             row["status"] = "oversized"
             row["coverage_gap"] = "summary exceeds max raw shard bytes; regenerate bounded rollout-summary before extractor handoff"
             rows.append(row)

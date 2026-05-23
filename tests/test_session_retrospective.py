@@ -341,6 +341,20 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             self.assertEqual(result, 1)
 
+    def test_remote_probe_rollout_summary_rejects_unbounded_text_limit(self) -> None:
+        result = REMOTE_PROBE.cmd_rollout_summary(
+            types.SimpleNamespace(
+                host="local",
+                rollout="sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                keyword=[],
+                limit=40,
+                tail_records=8,
+                max_text_chars=10_000,
+            )
+        )
+
+        self.assertEqual(result, 2)
+
     def test_remote_probe_session_meta_skips_symlink_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2020,6 +2034,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "oversized")
         self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_scans_old_dated_summary_for_current_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-22T10:00:00Z", "text": "permission denied"}])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "ready")
 
     def test_make_shards_omits_raw_paths_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -5258,6 +5299,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(manifest["coverage_gaps"], [])
         self.assertTrue(state_exists)
 
+    def test_default_remote_summary_only_blocks_state_but_keeps_bounded_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-remote.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["host"], "miku-bot-dev")
+        self.assertIn("failed_command", rows[0]["issue_flags"])
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+        self.assertEqual(manifest["sources"][0]["summary_count"], 1)
+
     def test_invalid_rollout_jsonl_reports_gap_and_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -6226,6 +6297,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
             rows = list((output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines())
 
         self.assertEqual(rows, [])
+
+    def test_old_dated_summary_with_current_timestamp_is_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], "2026-05-01T10:00:00Z")
+        self.assertIn("failed_command", rows[0]["issue_flags"])
 
     def test_summary_with_invalid_timestamp_uses_path_date_for_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -24,6 +24,7 @@ MAX_SESSION_META_DATE_COUNT = 31
 MAX_FETCH_ROLLOUT_BYTES = 16 * 1024 * 1024
 MAX_ROLLOUT_SUMMARY_LIMIT = 200
 MAX_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
+MAX_ROLLOUT_SUMMARY_TEXT_CHARS = 1200
 REMOTE_PREFLIGHT_TIMEOUT_SECONDS = 15
 REMOTE_COMMAND_TIMEOUT_SECONDS = 60
 TASK_OUTPUT_RELATIVE_DIR = pathlib.Path(".codex-tmp/remote-host-context")
@@ -390,6 +391,7 @@ MAX_FETCH_ROLLOUT_BYTES = int(CONFIG.get("max_fetch_rollout_bytes", 0))
 SUMMARY_LIMIT = int(CONFIG.get("summary_limit", 0))
 SUMMARY_TAIL_RECORDS = int(CONFIG.get("summary_tail_records", 0))
 SUMMARY_MAX_TEXT_CHARS = int(CONFIG.get("summary_max_text_chars", 0))
+SUMMARY_MAX_TEXT_CHARS_LIMIT = {MAX_ROLLOUT_SUMMARY_TEXT_CHARS}
 SUMMARY_KEYWORDS = [str(value) for value in CONFIG.get("summary_keywords", [])]
 ACTIVE_ROLLOUT_RELATIVE_RE = re.compile({ACTIVE_ROLLOUT_RELATIVE_RE.pattern!r})
 ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile({ARCHIVED_ROLLOUT_RELATIVE_RE.pattern!r})
@@ -496,6 +498,10 @@ def summarize_rollout():
     rel = pathlib.PurePosixPath(str(CONFIG["rollout"]))
     normalized = rel.as_posix()
     print(ROLLOUT_SUMMARY_BEGIN)
+    if SUMMARY_MAX_TEXT_CHARS < 40 or SUMMARY_MAX_TEXT_CHARS > SUMMARY_MAX_TEXT_CHARS_LIMIT:
+        print(json.dumps({{"ok": False, "error": "summary max text chars out of range"}}, separators=(",", ":"), sort_keys=True))
+        print(ROLLOUT_SUMMARY_END)
+        return
     if not (
         ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
         or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
@@ -1303,6 +1309,10 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
             )
         if args.max_text_chars < 40:
             raise ValueError("--max-text-chars must be at least 40")
+        if args.max_text_chars > MAX_ROLLOUT_SUMMARY_TEXT_CHARS:
+            raise ValueError(
+                f"--max-text-chars must stay at or below {MAX_ROLLOUT_SUMMARY_TEXT_CHARS}"
+            )
     except ValueError as error:
         return _error(str(error))
 
