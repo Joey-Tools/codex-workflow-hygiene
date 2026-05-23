@@ -956,6 +956,17 @@ def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetim
     return True
 
 
+def summary_file_maybe_relevant_without_read(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    if start is None and end is None:
+        return True
+    summary_date = summary_date_from_path(path)
+    if summary_date and start and summary_date < start:
+        return summary_date + dt.timedelta(days=1) > start
+    if summary_date and end and summary_date >= end:
+        return False
+    return True
+
+
 def summary_timestamp_with_fallback(record: dict[str, Any], path: Path) -> dt.datetime | None:
     return parse_time(str(record.get("timestamp") or "")) or summary_date_from_path(path)
 
@@ -2310,7 +2321,7 @@ def validate_history_commit_merge_side_history(repo: Path, history_commit: str, 
 
 def validate_history_follow_on_history(repo: Path, history_commit: str, history_ref: str) -> None:
     result = subprocess.run(
-        ["git", "-C", str(repo), "rev-list", "--first-parent", "--reverse", f"{history_commit}..{history_ref}"],
+        ["git", "-C", str(repo), "rev-list", "--reverse", f"{history_commit}..{history_ref}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -2537,6 +2548,16 @@ def run_scan(
             }
         )
 
+    def append_oversized_summary_gap(path: Path, size: int) -> None:
+        coverage_gaps.append(
+            {
+                "host": source.host,
+                "path_ref": path_ref(path),
+                "bytes": size,
+                "reason": "oversized_summary_skipped",
+            }
+        )
+
     for source in sources:
         if not source.root.exists():
             coverage_gaps.append(
@@ -2644,6 +2665,13 @@ def run_scan(
             append_oversized_rollout_gap(rollout, size)
             continue
         for summary in summaries:
+            if not summary_file_maybe_relevant_without_read(summary, start, end):
+                continue
+            size = summary.stat().st_size
+            if size > max_raw_bytes:
+                if summary_file_maybe_relevant_without_read(summary, gap_start, end):
+                    append_oversized_summary_gap(summary, size)
+                continue
             if not summary_file_relevant(summary, start, end):
                 continue
             if first_jsonl_error(summary) is not None:
@@ -2871,9 +2899,16 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         return row
 
     def append_summary_shard(summary: Path) -> None:
-        if not summary_file_relevant(summary, start, end):
+        if not summary_file_maybe_relevant_without_read(summary, start, end):
             return
         row = shard_row(summary, bytes=summary.stat().st_size, kind="summary")
+        if row["bytes"] > max_raw_bytes:
+            row["status"] = "oversized"
+            row["coverage_gap"] = "summary exceeds max raw shard bytes; regenerate bounded rollout-summary before extractor handoff"
+            rows.append(row)
+            return
+        if not summary_file_relevant(summary, start, end):
+            return
         if first_jsonl_error(summary) is not None:
             row["status"] = "invalid"
             row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 import hashlib
 import json
@@ -20,12 +21,19 @@ SCRIPT = (
     / "scripts"
     / "session_retrospective.py"
 )
+REMOTE_PROBE_SCRIPT = SCRIPT.parent / "remote_codex_probe.py"
 SPEC = importlib.util.spec_from_file_location("session_retrospective", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC is not None
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+REMOTE_PROBE_SPEC = importlib.util.spec_from_file_location("remote_codex_probe", REMOTE_PROBE_SCRIPT)
+REMOTE_PROBE = importlib.util.module_from_spec(REMOTE_PROBE_SPEC)
+assert REMOTE_PROBE_SPEC is not None
+assert REMOTE_PROBE_SPEC.loader is not None
+sys.modules[REMOTE_PROBE_SPEC.name] = REMOTE_PROBE
+REMOTE_PROBE_SPEC.loader.exec_module(REMOTE_PROBE)
 
 VALID_TURN_ID = f"{MODULE.TURN_REF_PREFIX}:{'a' * 20}"
 VALID_EPISODE_ID = f"{MODULE.EPISODE_REF_PREFIX}:{'b' * 20}"
@@ -292,6 +300,112 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertTrue(helper.is_file())
         self.assertIn("scripts/remote_codex_probe.py", skill.read_text(encoding="utf-8"))
+
+    def test_remote_probe_fetch_rejects_symlink_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            outside = Path(raw) / "outside-secret.txt"
+            outside.write_text("SECRET\n", encoding="utf-8")
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-link.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.symlink_to(outside)
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                REMOTE_PROBE._fetch_local_rollout(
+                    root,
+                    REMOTE_PROBE.pathlib.PurePosixPath(
+                        "sessions/2026/05/01/rollout-2026-05-01T10-00-00-link.jsonl"
+                    ),
+                )
+
+    def test_remote_probe_summary_rejects_symlink_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            outside = Path(raw) / "outside-rollout.jsonl"
+            write_jsonl(outside, [message("user", "Leaked task.", "2026-05-01T10:00:00Z")])
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-link.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.symlink_to(outside)
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root):
+                result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout="sessions/2026/05/01/rollout-2026-05-01T10-00-00-link.jsonl",
+                        keyword=[],
+                        limit=40,
+                        tail_records=8,
+                        max_text_chars=400,
+                    )
+                )
+
+            self.assertEqual(result, 1)
+
+    def test_remote_probe_session_meta_skips_symlink_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            outside = Path(raw) / "outside-rollout.jsonl"
+            write_jsonl(
+                outside,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "leaked-session", "cwd": "/secret/repo"},
+                    }
+                ],
+            )
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-link.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.symlink_to(outside)
+
+            rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+            )
+
+            self.assertEqual(rows, [])
+
+    def test_remote_probe_supports_dated_archived_rollout_paths(self) -> None:
+        path = REMOTE_PROBE._resolve_rollout_relative_path(
+            "archived_sessions/2026/05/01/rollout-2026-05-01T10-00-00-archived.jsonl"
+        )
+
+        self.assertEqual(
+            path.as_posix(),
+            "archived_sessions/2026/05/01/rollout-2026-05-01T10-00-00-archived.jsonl",
+        )
+
+    def test_remote_probe_session_meta_includes_dated_archived_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            archived = root / "archived_sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-archived.jsonl"
+            write_jsonl(
+                archived,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "archived-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+
+            rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+            )
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["session_id"], "archived-session")
+            self.assertEqual(
+                rows[0]["rollout"],
+                "archived_sessions/2026/05/01/rollout-2026-05-01T10-00-00-archived.jsonl",
+            )
 
     def test_explicit_sources_still_require_default_host_coverage(self) -> None:
         sources = MODULE.parse_sources(["local=/tmp/local", "miku-bot-dev=/tmp/miku"])
@@ -1708,6 +1822,45 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("coverage_gap", rows[0])
         self.assertEqual(rows[0]["path"], str(large))
         self.assertIn("path_ref_v1:", rows[0]["path_ref"])
+
+    def test_make_shards_marks_oversized_summary_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "05" / "22" / "rollout-summary-large.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text("summary " + ("x" * 2000), encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(manifest),
+                    "--output",
+                    str(output),
+                    "--max-raw-bytes",
+                    "1000",
+                ]
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "oversized")
+        self.assertIn("coverage_gap", rows[0])
 
     def test_make_shards_omits_raw_paths_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3738,6 +3891,52 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     ]
                 )
 
+    def test_advance_state_validates_non_first_parent_follow_on_history(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, retained_commit = write_history_repo(raw, retained)
+            subprocess.run(["git", "checkout", "-q", "-b", "unsafe-follow-on"], cwd=history_repo, check=True)
+            raw_log = history_repo / "raw" / "tool-output.log"
+            raw_log.parent.mkdir(parents=True)
+            raw_log.write_text("raw output\n", encoding="utf-8")
+            subprocess.run(["git", "add", "raw/tool-output.log"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add raw side artifact"], cwd=history_repo, check=True)
+            raw_log.unlink()
+            subprocess.run(["git", "add", "raw/tool-output.log"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Remove raw side artifact"], cwd=history_repo, check=True)
+            subprocess.run(["git", "checkout", "-q", "master"], cwd=history_repo, check=True)
+            subprocess.run(["git", "merge", "--no-ff", "-m", "Merge side report", "unsafe-follow-on"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "history follow-on commit is not retention-safe"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        retained_commit,
+                    ]
+                )
+
     def test_advance_state_requires_history_ref_to_be_current_head(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -5521,7 +5720,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
                 mode="weekly",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-06-01T00:00:00Z"),
@@ -5535,6 +5734,27 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["redacted_user_prompt_summary"], "category=remote_rollout_summary; summary_kind=function_call_output")
         self.assertIn("approval_auth_friction", rows[0]["issue_flags"])
         self.assertNotIn("customer", json.dumps(rows[0]))
+
+    def test_oversized_rollout_summary_file_reports_gap_without_reading(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "sessions" / "2026" / "05" / "22" / "rollout-summary-large.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text("summary " + ("x" * 2000), encoding="utf-8")
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-06-01T00:00:00Z"),
+            )
+            rows = list((output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines())
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_summary_skipped")
+        self.assertNotIn("path_ref", trend["coverage_gaps"][0])
 
     def test_unknown_rollout_summary_kind_is_bucketed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -5567,7 +5787,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
                 mode="weekly",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-06-01T00:00:00Z"),
@@ -5595,7 +5815,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -5642,7 +5862,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -5661,7 +5881,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -5682,7 +5902,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=100, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
                 mode="weekly",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-08T00:00:00Z"),

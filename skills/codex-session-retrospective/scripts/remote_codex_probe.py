@@ -13,6 +13,7 @@ import pathlib
 import re
 import socket
 import subprocess
+import stat
 import sys
 from collections.abc import Iterable
 from typing import Any
@@ -30,7 +31,7 @@ ACTIVE_ROLLOUT_RELATIVE_RE = re.compile(
     r"^sessions/\d{4}/\d{2}/\d{2}/rollout-[^/]+\.jsonl$"
 )
 ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile(
-    r"^archived_sessions/rollout-[^/]+\.jsonl$"
+    r"^archived_sessions/(?:\d{4}/\d{2}/\d{2}/)?rollout-[^/]+\.jsonl$"
 )
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
@@ -187,6 +188,71 @@ def _resolve_rollout_relative_path(value: str) -> pathlib.PurePosixPath:
     return candidate
 
 
+def _path_is_relative_to(path: pathlib.Path, root: pathlib.Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _safe_rollout_path(
+    codex_root: pathlib.Path, rollout_relative_path: pathlib.PurePosixPath
+) -> pathlib.Path:
+    root = codex_root.expanduser().resolve(strict=True)
+    target = root.joinpath(*rollout_relative_path.parts)
+    target_stat = target.lstat()
+    if stat.S_ISLNK(target_stat.st_mode):
+        raise ValueError("rollout path is a symlink")
+    if not stat.S_ISREG(target_stat.st_mode):
+        raise ValueError("rollout path is not a regular file")
+    target_resolved = target.resolve(strict=True)
+    if not _path_is_relative_to(target_resolved, root):
+        raise ValueError("rollout path escapes Codex root")
+    return target_resolved
+
+
+def _open_local_rollout_text(
+    codex_root: pathlib.Path, rollout_relative_path: pathlib.PurePosixPath
+):
+    target = _safe_rollout_path(codex_root, rollout_relative_path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(target), flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("rollout path is not a regular file")
+        handle = os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+        fd = -1
+        return handle
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def _read_local_rollout_bytes(
+    codex_root: pathlib.Path,
+    rollout_relative_path: pathlib.PurePosixPath,
+    *,
+    max_bytes: int,
+) -> bytes:
+    target = _safe_rollout_path(codex_root, rollout_relative_path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(target), flags)
+    try:
+        stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise ValueError("rollout path is not a regular file")
+        size = stat_result.st_size
+        if max_bytes and size > max_bytes:
+            raise ValueError(f"rollout too large: {size} bytes > {max_bytes}")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            return handle.read()
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
 def _parse_kv_lines(text: str) -> dict[str, str]:
     result: dict[str, str] = {}
     for line in text.splitlines():
@@ -270,8 +336,10 @@ def _remote_python_script(payload: dict[str, object]) -> str:
 import base64
 import collections
 import json
+import os
 import pathlib
 import re
+import stat
 import sys
 
 CONFIG = json.loads({encoded!r})
@@ -291,6 +359,60 @@ FETCH_ROLLOUT_BEGIN = {REMOTE_FETCH_ROLLOUT_BEGIN!r}
 FETCH_ROLLOUT_END = {REMOTE_FETCH_ROLLOUT_END!r}
 ROLLOUT_SUMMARY_BEGIN = {REMOTE_ROLLOUT_SUMMARY_BEGIN!r}
 ROLLOUT_SUMMARY_END = {REMOTE_ROLLOUT_SUMMARY_END!r}
+
+
+def path_is_relative_to(path, root):
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def safe_rollout_path(rel):
+    root = ROOT.resolve(strict=True)
+    target = root.joinpath(*rel.parts)
+    target_stat = target.lstat()
+    if stat.S_ISLNK(target_stat.st_mode):
+        raise ValueError("rollout path is a symlink")
+    if not stat.S_ISREG(target_stat.st_mode):
+        raise ValueError("rollout path is not a regular file")
+    target_resolved = target.resolve(strict=True)
+    if not path_is_relative_to(target_resolved, root):
+        raise ValueError("rollout path escapes Codex root")
+    return target_resolved
+
+
+def open_rollout_text(target):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(target), flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("rollout path is not a regular file")
+        handle = os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+        fd = -1
+        return handle
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def read_rollout_bytes(target, max_bytes):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(target), flags)
+    try:
+        stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise ValueError("rollout path is not a regular file")
+        size = stat_result.st_size
+        if max_bytes and size > max_bytes:
+            raise ValueError("rollout too large: " + str(size) + " bytes > " + str(max_bytes))
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            return size, handle.read()
+    finally:
+        if fd != -1:
+            os.close(fd)
 
 
 def normalize_text(text, max_chars):
@@ -335,11 +457,14 @@ def summarize_rollout():
         print(json.dumps({{"ok": False, "error": "invalid rollout path"}}, separators=(",", ":"), sort_keys=True))
         print(ROLLOUT_SUMMARY_END)
         return
-    target = ROOT.joinpath(*rel.parts)
     try:
-        target.stat()
+        target = safe_rollout_path(rel)
     except FileNotFoundError:
         print(json.dumps({{"ok": False, "error": "rollout not found"}}, separators=(",", ":"), sort_keys=True))
+        print(ROLLOUT_SUMMARY_END)
+        return
+    except ValueError as error:
+        print(json.dumps({{"ok": False, "error": str(error)}}, separators=(",", ":"), sort_keys=True))
         print(ROLLOUT_SUMMARY_END)
         return
 
@@ -351,7 +476,7 @@ def summarize_rollout():
     last_assistant_record = None
     last_task_complete_record = None
 
-    with target.open("r", encoding="utf-8", errors="replace") as handle:
+    with open_rollout_text(target) as handle:
         for line_no, line in enumerate(handle, 1):
             try:
                 obj = json.loads(line)
@@ -429,30 +554,35 @@ def iter_session_meta():
     print(SESSION_META_BEGIN)
     count = 0
     for date_text in reversed(DATE_STRINGS):
-        date_dir = ROOT / "sessions" / date_text
-        if not date_dir.is_dir():
-            continue
-        for rollout in sorted(date_dir.glob("rollout-*.jsonl"), reverse=True):
-            session_id = ""
-            cwd = ""
-            with rollout.open("r", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if obj.get("type") != "session_meta":
-                        continue
-                    payload = obj.get("payload", {{}})
-                    session_id = str(payload.get("id", ""))
-                    cwd = str(payload.get("cwd", ""))
-                    break
-            if session_id:
-                print(json.dumps({{"date": date_text, "session_id": session_id, "cwd": cwd, "rollout": rollout.relative_to(ROOT).as_posix()}}, separators=(",", ":"), sort_keys=True))
-                count += 1
-                if LIMIT and count >= LIMIT:
-                    print(SESSION_META_END)
-                    return
+        for date_dir in (ROOT / "sessions" / date_text, ROOT / "archived_sessions" / date_text):
+            if not date_dir.is_dir():
+                continue
+            for rollout in sorted(date_dir.glob("rollout-*.jsonl"), reverse=True):
+                rel = pathlib.PurePosixPath(rollout.relative_to(ROOT).as_posix())
+                session_id = ""
+                cwd = ""
+                try:
+                    target = safe_rollout_path(rel)
+                except (FileNotFoundError, ValueError):
+                    continue
+                with open_rollout_text(target) as handle:
+                    for line in handle:
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if obj.get("type") != "session_meta":
+                            continue
+                        payload = obj.get("payload", {{}})
+                        session_id = str(payload.get("id", ""))
+                        cwd = str(payload.get("cwd", ""))
+                        break
+                if session_id:
+                    print(json.dumps({{"date": date_text, "session_id": session_id, "cwd": cwd, "rollout": rollout.relative_to(ROOT).as_posix()}}, separators=(",", ":"), sort_keys=True))
+                    count += 1
+                    if LIMIT and count >= LIMIT:
+                        print(SESSION_META_END)
+                        return
     print(SESSION_META_END)
 
 
@@ -467,18 +597,18 @@ def fetch_rollout():
         print(json.dumps({{"ok": False, "error": "invalid rollout path"}}, separators=(",", ":"), sort_keys=True))
         print(FETCH_ROLLOUT_END)
         return
-    target = ROOT.joinpath(*rel.parts)
     try:
-        size = target.stat().st_size
+        target = safe_rollout_path(rel)
+        size, data = read_rollout_bytes(target, MAX_FETCH_ROLLOUT_BYTES)
     except FileNotFoundError:
         print(json.dumps({{"ok": False, "error": "rollout not found"}}, separators=(",", ":"), sort_keys=True))
         print(FETCH_ROLLOUT_END)
         return
-    if MAX_FETCH_ROLLOUT_BYTES and size > MAX_FETCH_ROLLOUT_BYTES:
-        print(json.dumps({{"ok": False, "error": "rollout too large: " + str(size) + " bytes > " + str(MAX_FETCH_ROLLOUT_BYTES)}}, separators=(",", ":"), sort_keys=True))
+    except ValueError as error:
+        print(json.dumps({{"ok": False, "error": str(error)}}, separators=(",", ":"), sort_keys=True))
         print(FETCH_ROLLOUT_END)
         return
-    payload = base64.b64encode(target.read_bytes()).decode("ascii")
+    payload = base64.b64encode(data).decode("ascii")
     print(json.dumps({{"ok": True, "bytes": size}}, separators=(",", ":"), sort_keys=True))
     print(payload)
     print(FETCH_ROLLOUT_END)
@@ -522,48 +652,54 @@ def _iter_session_meta_records(
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for date_value in reversed(dates):
-        date_dir = codex_root / "sessions" / date_value.strftime(DATE_FORMAT)
-        if not date_dir.is_dir():
-            continue
-        for rollout_path in sorted(date_dir.glob("rollout-*.jsonl"), reverse=True):
-            session_id = ""
-            cwd = ""
-            with rollout_path.open("r", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if obj.get("type") != "session_meta":
-                        continue
-                    payload = obj.get("payload", {})
-                    session_id = str(payload.get("id", ""))
-                    cwd = str(payload.get("cwd", ""))
-                    break
-            if not session_id:
+        date_text = date_value.strftime(DATE_FORMAT)
+        for date_dir in (codex_root / "sessions" / date_text, codex_root / "archived_sessions" / date_text):
+            if not date_dir.is_dir():
                 continue
-            rows.append(
-                {
-                    "host": host,
-                    "date": date_value.strftime(DATE_FORMAT),
-                    "session_id": session_id,
-                    "cwd": cwd,
-                    "rollout": rollout_path.relative_to(codex_root).as_posix(),
-                }
-            )
-            if limit and len(rows) >= limit:
-                return rows
+            for rollout_path in sorted(date_dir.glob("rollout-*.jsonl"), reverse=True):
+                rollout_relative_path = pathlib.PurePosixPath(
+                    rollout_path.relative_to(codex_root).as_posix()
+                )
+                session_id = ""
+                cwd = ""
+                try:
+                    handle = _open_local_rollout_text(codex_root, rollout_relative_path)
+                except (FileNotFoundError, ValueError):
+                    continue
+                with handle:
+                    for line in handle:
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if obj.get("type") != "session_meta":
+                            continue
+                        payload = obj.get("payload", {})
+                        session_id = str(payload.get("id", ""))
+                        cwd = str(payload.get("cwd", ""))
+                        break
+                if not session_id:
+                    continue
+                rows.append(
+                    {
+                        "host": host,
+                        "date": date_value.strftime(DATE_FORMAT),
+                        "session_id": session_id,
+                        "cwd": cwd,
+                        "rollout": rollout_path.relative_to(codex_root).as_posix(),
+                    }
+                )
+                if limit and len(rows) >= limit:
+                    return rows
     return rows
 
 
 def _fetch_local_rollout(codex_root: pathlib.Path, rollout_relative_path: pathlib.PurePosixPath) -> bytes:
-    target = codex_root.joinpath(*rollout_relative_path.parts)
-    size = target.stat().st_size
-    if size > MAX_FETCH_ROLLOUT_BYTES:
-        raise ValueError(
-            f"rollout too large: {size} bytes > {MAX_FETCH_ROLLOUT_BYTES}"
-        )
-    return target.read_bytes()
+    return _read_local_rollout_bytes(
+        codex_root,
+        rollout_relative_path,
+        max_bytes=MAX_FETCH_ROLLOUT_BYTES,
+    )
 
 
 def _print_tsv(rows: list[dict[str, str]], columns: list[str]) -> None:
@@ -1091,8 +1227,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
 
     try:
         if HOSTS[alias]["kind"] == "local":
-            target = _local_codex_root().joinpath(*rollout_relative_path.parts)
-            with target.open("r", encoding="utf-8", errors="replace") as handle:
+            with _open_local_rollout_text(_local_codex_root(), rollout_relative_path) as handle:
                 records = _summarize_rollout_records(
                     lines=handle,
                     keywords=args.keyword,
@@ -1149,6 +1284,11 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
         print(f"host={alias}", file=sys.stderr)
         print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
         print("error=rollout not found", file=sys.stderr)
+        return 1
+    except ValueError as error:
+        print(f"host={alias}", file=sys.stderr)
+        print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+        print(f"error={error}", file=sys.stderr)
         return 1
 
     for record in records:
