@@ -96,6 +96,8 @@ SAFETY_PATTERN = re.compile(
 )
 RETAINED_ISSUE_FLAGS = frozenset(name for name, _pattern in FLAG_PATTERNS) | frozenset({"safety_privacy_flag"})
 RETAINED_OUTCOMES = frozenset({"needs_review", "no_issue_observed"})
+RETAINED_FIXED_MODES = frozenset({"daily", "weekly"})
+BASELINE_MODE_PATTERN = re.compile(r"^baseline-[1-9][0-9]{0,3}d$")
 
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 RETAINED_CUSTOM_SOURCE_HOST = "custom_source"
@@ -1098,6 +1100,30 @@ def raw_timestamp_in_window(path: Path, start: dt.datetime | None, end: dt.datet
     return found
 
 
+def summary_file_relevant_with_scan_cap(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    if start is None and end is None:
+        return True
+    summary_date = summary_date_from_path(path)
+    if summary_date and start and summary_date < start:
+        if summary_date + dt.timedelta(days=1) > start:
+            return True
+        try:
+            if path.stat().st_size > max_scan_bytes:
+                return False
+        except OSError:
+            return False
+        return raw_timestamp_in_window(path, start, end, max_scan_bytes=max_scan_bytes)
+    if summary_date and end and summary_date >= end:
+        return False
+    return True
+
+
 def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
     if start is None and end is None:
         return True
@@ -1624,6 +1650,10 @@ def retained_coverage_host_token(value: Any) -> bool:
     return isinstance(value, str) and value in RETAINED_HOSTS
 
 
+def retained_mode_token(value: Any) -> bool:
+    return isinstance(value, str) and (value in RETAINED_FIXED_MODES or BASELINE_MODE_PATTERN.fullmatch(value) is not None)
+
+
 def ensure_retained_safe_value(label: str, value: Any) -> None:
     if contains_unredacted_sensitive_text(value) or contains_path_like_text(value):
         raise SystemExit(f"{label}: unredacted sensitive or path-like text in retained output")
@@ -1873,7 +1903,7 @@ def sanitize_window(value: Any, *, label: str) -> dict[str, Any]:
     sanitized = sanitize_mapping(value, allowed={"mode", "start", "end"}, required={"mode", "start", "end"}, label=label, strict=True)
     start = parse_time(str(sanitized["start"]))
     end = parse_time(str(sanitized["end"]))
-    if not safe_token(sanitized["mode"]) or not start or not end:
+    if not retained_mode_token(sanitized["mode"]) or not start or not end:
         raise SystemExit(f"{label}: invalid retained window")
     validate_window_bounds(start, end, label)
     return sanitized
@@ -2162,7 +2192,7 @@ def retained_export_parent_for_mode(mode: Any) -> str:
         return "retained/daily"
     if mode == "weekly":
         return "retained/weekly"
-    if isinstance(mode, str) and mode.startswith("baseline-"):
+    if isinstance(mode, str) and BASELINE_MODE_PATTERN.fullmatch(mode):
         return "retained/baseline"
     raise SystemExit("retained export mode is not supported")
 
@@ -2782,10 +2812,12 @@ def remote_summary_only_gaps(
     summaries: list[Path],
     start: dt.datetime | None,
     end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
 ) -> list[dict[str, Any]]:
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return []
-    if not any(summary_file_relevant(summary, start, end) for summary in summaries):
+    if not any(summary_file_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_scan_bytes) for summary in summaries):
         return []
     return [remote_metadata_gap(source, "remote_source_not_materialized")]
 
@@ -2894,7 +2926,14 @@ def run_scan(
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         source_materialization_gaps = materialization_gaps_for_source(source)
-        source_summary_only_gaps = remote_summary_only_gaps(source, rollouts, summaries, start, end)
+        source_summary_only_gaps = remote_summary_only_gaps(
+            source,
+            rollouts,
+            summaries,
+            start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+        )
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
@@ -3018,6 +3057,7 @@ def run_scan(
 
 def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
     validate_window_bounds(start, end, "discover")
+    max_raw_bytes = require_positive_window(getattr(args, "max_raw_bytes", 512_000), "--max-raw-bytes")
     output = ensure_safe_output_dir(Path(args.output))
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
     manifest_sources: list[dict[str, Any]] = []
@@ -3079,7 +3119,14 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         source_materialization_gaps = materialization_gaps_for_source(source)
-        source_summary_only_gaps = remote_summary_only_gaps(source, rollouts, summaries, start, end)
+        source_summary_only_gaps = remote_summary_only_gaps(
+            source,
+            rollouts,
+            summaries,
+            start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+        )
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
@@ -3223,6 +3270,10 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             row["path"] = path.as_posix()
         return row
 
+    def append_source_gap_shards(gaps: list[dict[str, Any]], root: Path) -> None:
+        for gap in gaps:
+            rows.append(shard_row(root, status="stale", coverage_gap=str(gap.get("reason") or "unsafe_source_artifact")))
+
     def append_summary_shard(summary: Path) -> None:
         row = shard_row(summary, bytes=summary.stat().st_size, kind="summary")
         if row["bytes"] > max_raw_bytes:
@@ -3263,6 +3314,18 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not root.exists():
             rows.append(shard_row(root, status="missing", coverage_gap="source root missing"))
+            continue
+        symlink_gap = source_root_symlink_gap(source)
+        if symlink_gap:
+            append_source_gap_shards([symlink_gap], root)
+            continue
+        source_remote_gaps = remote_evidence_gaps(source, start=start, end=end)
+        if source_remote_gaps:
+            append_source_gap_shards(source_remote_gaps, root)
+            continue
+        source_materialization_gaps = materialization_gaps_for_source(source)
+        if source_materialization_gaps:
+            append_source_gap_shards(source_materialization_gaps, root)
             continue
         for rollout in source_rollouts(source):
             if not rollout_candidate_relevant(

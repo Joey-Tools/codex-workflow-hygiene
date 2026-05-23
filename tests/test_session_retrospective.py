@@ -2206,6 +2206,47 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "oversized")
         self.assertIn("coverage_gap", rows[0])
 
+    def test_make_shards_revalidates_source_materialization_before_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            safe_rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-safe.jsonl"
+            write_jsonl(safe_rollout, [message("user", "Safe custom task.", "2026-05-01T10:00:00Z")])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "custom_source", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            outside = Path(raw) / "outside.jsonl"
+            write_jsonl(outside, [message("user", "Unsafe custom task.", "2026-05-01T11:00:00Z")])
+            unsafe_rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T11-00-00-unsafe.jsonl"
+            unsafe_rollout.symlink_to(outside)
+            output = safe_output_dir(raw)
+
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(manifest),
+                    "--output",
+                    str(output),
+                    "--include-raw-paths",
+                ]
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path"], str(root))
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "unsafe_source_artifact")
+
     def test_make_shards_scans_old_dated_summary_for_current_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -5726,6 +5767,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
         self.assertEqual(manifest["sources"][0]["status"], "ready")
 
+    def test_default_remote_old_oversized_summary_relevance_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            write_jsonl(rollout, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
+            summary = remote / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text("summary " + ("x" * 2000), encoding="utf-8")
+            output = safe_output_dir(raw)
+
+            with mock.patch.object(MODULE, "raw_timestamp_in_window", side_effect=AssertionError("unbounded scan")):
+                MODULE.run_discover(
+                    types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in manifest["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "ready")
+
     def test_default_remote_mixed_summary_fallback_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
@@ -6372,6 +6436,24 @@ class SessionRetrospectiveTests(unittest.TestCase):
             MODULE.validate_episode_row(episode, label="episode")
         with self.assertRaisesRegex(SystemExit, "known flag allowlist"):
             MODULE.sanitize_trend_report(trend, label="trend", strict=True)
+
+    def test_retained_validators_reject_private_window_modes(self) -> None:
+        trend = {
+            "schema_version": 1,
+            "window": {"mode": "baseline-customer_acme", "start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+            "turn_count": 0,
+            "flagged_turn_count": 0,
+            "episode_count": 0,
+            "flags": {},
+            "hosts": {},
+            "model_eras": {},
+            "coverage_gaps": [],
+        }
+
+        with self.assertRaisesRegex(SystemExit, "invalid retained window"):
+            MODULE.sanitize_trend_report(trend, label="trend", strict=True)
+        with self.assertRaisesRegex(SystemExit, "retained export mode is not supported"):
+            MODULE.retained_export_parent_for_mode("baseline-customer_acme")
 
     def test_custom_source_host_is_bucketed_in_retained_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
