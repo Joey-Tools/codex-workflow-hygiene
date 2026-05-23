@@ -2899,6 +2899,46 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 ]
             )
 
+    def test_validate_history_commit_accepts_retained_export_subset_change(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-08T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, _commit = write_history_repo(raw, retained)
+            second_retained = Path(raw) / "history-retained-second"
+            second_retained.mkdir()
+            for name in MODULE.RETAINED_OUTPUT_FILES:
+                (second_retained / name).write_bytes((retained / name).read_bytes())
+            trend = json.loads((second_retained / "trend_report.json").read_text(encoding="utf-8"))
+            trend["flags"]["verification_gap"] = 1
+            (second_retained / "trend_report.json").write_text(json.dumps(trend) + "\n", encoding="utf-8")
+            parent = retained_parent_for_dir(second_retained)
+            (history_repo / parent / "trend_report.json").write_text((second_retained / "trend_report.json").read_text(encoding="utf-8"), encoding="utf-8")
+            subprocess.run(["git", "add", f"{parent}/trend_report.json"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Update retained trend"], cwd=history_repo, check=True)
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            MODULE.main(
+                [
+                    "validate-history-commit",
+                    "--retained-run-dir",
+                    str(second_retained),
+                    "--history-repo",
+                    str(history_repo),
+                    "--history-commit",
+                    commit,
+                ]
+            )
+
     def test_validate_history_commit_accepts_retained_export_merge_commit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -3092,6 +3132,20 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SystemExit, "sensitive text"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_accepts_root_gitignore_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo = Path(raw) / "history-gitignore"
+            history_repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-q"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=history_repo, check=True)
+            add_expected_history_origin(history_repo)
+            (history_repo / ".gitignore").write_text(".codex-local/\nretained/\n*.jsonl\n", encoding="utf-8")
+            subprocess.run(["git", "add", ".gitignore"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add ignore rules"], cwd=history_repo, check=True)
+
+            MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
     def test_validate_history_tree_rejects_private_key_in_follow_on_report(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

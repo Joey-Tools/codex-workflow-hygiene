@@ -1814,6 +1814,8 @@ def history_text_contains_retention_risk(data: bytes, file_path: str) -> bool:
         text = text.replace("https://json-schema.org/draft/2020-12/schema", "")
     if contains_unredacted_sensitive_text(text) or BARE_64_HEX_PATTERN.search(text):
         return True
+    if file_path in HISTORY_ROOT_FILES or file_path in {"data/README.md", "reports/README.md"}:
+        return False
     generated_follow_on = history_path_kind(file_path) in {"text", "json_text"}
     return generated_follow_on and contains_path_like_text(text)
 
@@ -2154,7 +2156,13 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
         candidate: dict[str, bytes] = {}
         for name, file_path in paths.items():
             candidate[name] = history_blob(repo, history_commit, file_path)
-        if candidate and retained_export_digest(candidate) == expected_digest and changed_files == set(paths.values()):
+        changed_retained_paths = set(paths.values())
+        if (
+            candidate
+            and retained_export_digest(candidate) == expected_digest
+            and changed_files
+            and changed_files <= changed_retained_paths
+        ):
             if parent != expected_parent:
                 raise SystemExit("--history-commit retained export directory does not match export mode")
             return parent
