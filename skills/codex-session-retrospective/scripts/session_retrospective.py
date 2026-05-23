@@ -642,11 +642,25 @@ def text_from_message_payload(payload: dict[str, Any]) -> str:
     return "\n".join(texts).strip()
 
 
+def event_user_message_text(payload: dict[str, Any]) -> str:
+    message = payload.get("message")
+    if isinstance(message, str):
+        return message.strip()
+    if isinstance(message, dict):
+        if message.get("role") == "user":
+            return text_from_message_payload(message)
+        return ""
+    text = payload.get("text")
+    if isinstance(text, str):
+        return text.strip()
+    return ""
+
+
 def user_text_from_payload(payload: dict[str, Any]) -> str:
     if payload.get("type") == "message" and payload.get("role") == "user":
         return text_from_message_payload(payload)
     if payload.get("type") == "user_message":
-        return str(payload.get("message") or "").strip()
+        return event_user_message_text(payload)
     return ""
 
 
@@ -686,7 +700,7 @@ def record_text(record: dict[str, Any]) -> str:
     payload = record.get("payload") or {}
     if isinstance(payload, dict) and payload.get("type") in {"message", "user_message"}:
         if payload.get("type") == "user_message":
-            return str(payload.get("message") or "")
+            return event_user_message_text(payload)
         return text_from_message_payload(payload)
     try:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -1012,11 +1026,23 @@ def summary_file_maybe_relevant_without_read(path: Path, start: dt.datetime | No
     if start is None and end is None:
         return True
     summary_date = summary_date_from_path(path)
-    if summary_date and start and summary_date < start:
-        return summary_date + dt.timedelta(days=1) > start
     if summary_date and end and summary_date >= end:
         return False
+    if summary_date and start and summary_date < start:
+        return True
     return True
+
+
+def summary_file_has_truncated_scan(path: Path) -> bool:
+    for _line_no, record in iter_jsonl(path):
+        if str(record.get("kind") or "") != "scan_meta":
+            continue
+        if record.get("scan_truncated") is True:
+            return True
+        text = str(record.get("text") or "")
+        if "scan_truncated=true" in text:
+            return True
+    return False
 
 
 def summary_timestamp_with_fallback(record: dict[str, Any], path: Path) -> dt.datetime | None:
@@ -2621,7 +2647,7 @@ def materialization_gaps_for_source(source: Source) -> list[dict[str, Any]]:
 def remote_summary_only_gaps(source: Source, rollouts: list[Path], summaries: list[Path]) -> list[dict[str, Any]]:
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return []
-    if rollouts or not summaries:
+    if not summaries:
         return []
     return [remote_metadata_gap(source, "remote_source_not_materialized")]
 
@@ -2814,6 +2840,14 @@ def run_scan(
                         }
                     )
                 continue
+            if summary_file_has_truncated_scan(summary):
+                coverage_gaps.append(
+                    {
+                        "host": source.host,
+                        "path_ref": path_ref(summary),
+                        "reason": "truncated_rollout_summary",
+                    }
+                )
             all_turns.extend(extract_summary_file(source, summary, start, end, emit_start=emit_start))
     if allow_partial_hosts:
         coverage_gaps.append({"host": "scope", "reason": "partial_host_scope"})

@@ -512,7 +512,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
         )
 
         self.assertEqual([record["kind"] for record in records], ["user_message", "assistant_message"])
-        self.assertIn("forgot", records[0]["text"])
+        self.assertIn("you missed", records[0]["text"])
+        self.assertIn("assumed", records[0]["text"])
+        self.assertNotIn("verification step", records[0]["text"])
 
     def test_remote_probe_rollout_summary_preserves_event_user_message_signal(self) -> None:
         records = REMOTE_PROBE._summarize_rollout_records(
@@ -532,7 +534,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
         )
 
         self.assertEqual([record["kind"] for record in records], ["user_message"])
-        self.assertIn("context-loss", records[0]["text"])
+        self.assertIn("you missed", records[0]["text"])
+        self.assertNotIn("context-loss", records[0]["text"])
 
     def test_remote_probe_rollout_summary_uses_bounded_input_scan(self) -> None:
         first = json.dumps(message("user", "First bounded signal.", "2026-05-01T10:00:00Z")) + "\n"
@@ -546,7 +549,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
             max_text_chars=80,
         )
 
-        self.assertEqual([record["text"] for record in records], ["First bounded signal."])
+        self.assertEqual([record["text"] for record in records], ["user prompt present"])
+
+    def test_remote_probe_session_meta_uses_bounded_input_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout.parent.mkdir(parents=True)
+            first = json.dumps({"type": "response_item", "payload": {"type": "function_call_output", "output": "x" * 256}}) + "\n"
+            rollout.write_text(
+                first
+                + json.dumps(
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "late-session", "cwd": "/redacted/repo"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(REMOTE_PROBE, "MAX_SESSION_META_SCAN_BYTES", len(first) - 1):
+                rows = REMOTE_PROBE._iter_session_meta_records(
+                    codex_root=root,
+                    dates=[dt.date(2026, 5, 1)],
+                    limit=10,
+                    host="local",
+                )
+
+        self.assertEqual(rows, [])
 
     def test_explicit_sources_still_require_default_host_coverage(self) -> None:
         sources = MODULE.parse_sources(["local=/tmp/local", "miku-bot-dev=/tmp/miku"])
@@ -819,6 +851,39 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(turns), 1)
         self.assertIn("category=review", turns[0].redacted_user_prompt_summary)
         self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+
+    def test_extract_rollout_reads_structured_event_msg_user_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-structured.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:00Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": "You forgot the verification step and assumed success.",
+                                    }
+                                ],
+                            },
+                        },
+                    }
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("user_correction", turns[0].issue_flags)
+        self.assertIn("context_loss", turns[0].issue_flags)
+        self.assertNotIn("role", turns[0].redacted_user_prompt_summary)
 
     def test_extract_rollout_deduplicates_near_duplicate_user_message_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -2025,11 +2090,14 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["status"], "oversized")
-        self.assertIn("coverage_gap", rows[0])
-        self.assertEqual(rows[0]["path"], str(large))
-        self.assertIn("path_ref_v1:", rows[0]["path_ref"])
+        self.assertEqual(len(rows), 2)
+        by_path = {row["path"]: row for row in rows}
+        self.assertEqual(by_path[str(summary)]["kind"], "summary")
+        self.assertEqual(by_path[str(summary)]["status"], "oversized")
+        self.assertIn("coverage_gap", by_path[str(summary)])
+        self.assertEqual(by_path[str(large)]["status"], "oversized")
+        self.assertIn("coverage_gap", by_path[str(large)])
+        self.assertIn("path_ref_v1:", by_path[str(large)]["path_ref"])
 
     def test_make_shards_marks_oversized_summary_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -5450,6 +5518,39 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(manifest["sources"][0]["status"], "stale")
         self.assertEqual(manifest["sources"][0]["summary_count"], 1)
 
+    def test_default_remote_mixed_summary_fallback_blocks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            write_jsonl(
+                remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl",
+                [message("user", "Remote raw task.", "2026-05-01T10:00:00Z")],
+            )
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-remote.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T11:00:00Z", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(len(rows), 2)
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+        self.assertEqual(manifest["sources"][0]["rollout_count"], 1)
+        self.assertEqual(manifest["sources"][0]["summary_count"], 1)
+
     def test_invalid_rollout_jsonl_reports_gap_and_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -6302,6 +6403,59 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_summary_skipped")
         self.assertNotIn("path_ref", trend["coverage_gaps"][0])
+
+    def test_old_oversized_rollout_summary_reports_gap_without_reading(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text("summary " + ("x" * 2000), encoding="utf-8")
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = list((output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines())
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_summary_skipped")
+
+    def test_truncated_rollout_summary_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "sessions" / "2026" / "05" / "22" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "scan_meta",
+                        "timestamp": "",
+                        "text": "scan_truncated=true scan_bytes=2097152 source_bytes=3000000",
+                        "scan_truncated": True,
+                    },
+                    {"kind": "summary", "timestamp": "2026-05-22T10:00:00Z", "text": "permission denied"},
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-06-01T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("truncated_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_unknown_rollout_summary_kind_is_bucketed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
