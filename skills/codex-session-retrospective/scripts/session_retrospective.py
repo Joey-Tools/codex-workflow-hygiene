@@ -1994,7 +1994,7 @@ def history_path_kind(file_path: str) -> str:
     raise SystemExit(f"history tree contains unexpected artifact: {file_path}")
 
 
-def history_commit_changed_files(repo: Path, commit: str) -> set[str]:
+def history_commit_parents(repo: Path, commit: str) -> list[str]:
     parents = subprocess.run(
         ["git", "-C", str(repo), "rev-list", "--parents", "-n", "1", commit],
         stdout=subprocess.PIPE,
@@ -2004,7 +2004,14 @@ def history_commit_changed_files(repo: Path, commit: str) -> set[str]:
     )
     if parents.returncode != 0:
         raise SystemExit("failed to inspect --history-commit parents")
-    parent_commits = parents.stdout.strip().split()[1:]
+    fields = parents.stdout.strip().split()
+    if not fields:
+        raise SystemExit("failed to inspect --history-commit parents")
+    return fields[1:]
+
+
+def history_commit_changed_files(repo: Path, commit: str) -> set[str]:
+    parent_commits = history_commit_parents(repo, commit)
     if parent_commits:
         command = ["git", "-C", str(repo), "diff", "--name-only", "-z", parent_commits[0], commit]
     else:
@@ -2018,6 +2025,22 @@ def history_commit_changed_files(repo: Path, commit: str) -> set[str]:
     if changed.returncode != 0:
         raise SystemExit("failed to inspect --history-commit changed files")
     return {raw_name.decode("utf-8", errors="surrogateescape") for raw_name in changed.stdout.split(b"\0") if raw_name}
+
+
+def history_commit_non_first_parent_commits(repo: Path, commit: str) -> list[str]:
+    parents = history_commit_parents(repo, commit)
+    if len(parents) <= 1:
+        return []
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--reverse", commit, f"^{parents[0]}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit("failed to inspect --history-commit merge side history")
+    return [oid for oid in result.stdout.splitlines() if oid and oid != commit]
 
 
 def require_history_repo(history_repo: str | None) -> Path:
@@ -2211,8 +2234,7 @@ def require_retained_export_in_history_ref(repo: Path, ref: str, parent: str, re
         raise SystemExit("--history-ref retained export content changed after --history-commit")
 
 
-def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
-    repo = require_history_repo(history_repo)
+def validate_history_tree_ref(repo: Path, history_ref: str) -> None:
     entries = history_tree_entries(repo, history_ref)
     files = list(entries)
     parent_files: dict[str, set[str]] = defaultdict(set)
@@ -2268,6 +2290,22 @@ def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
                 raise SystemExit(f"history artifact contains unredacted sensitive text or path-like text: {file_path}")
 
 
+def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
+    repo = require_history_repo(history_repo)
+    validate_history_tree_ref(repo, history_ref)
+
+
+def validate_history_commit_merge_side_history(repo: Path, history_commit: str, allowed_paths: set[str]) -> None:
+    for side_commit in history_commit_non_first_parent_commits(repo, history_commit):
+        try:
+            validate_history_tree_ref(repo, side_commit)
+        except SystemExit as exc:
+            raise SystemExit(f"--history-commit merge side history is not retention-safe: {exc}") from exc
+        unexpected = sorted(history_commit_changed_files(repo, side_commit) - allowed_paths)
+        if unexpected:
+            raise SystemExit(f"--history-commit merge side history changes unexpected artifact: {unexpected[0]}")
+
+
 def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> str:
     repo = require_history_repo(history_repo)
     require_history_commit(repo, history_commit)
@@ -2275,6 +2313,7 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
     tree_files = set(entries)
     changed_files = history_commit_changed_files(repo, history_commit)
     expected_parent = validate_retained_export_parent(retained_files)
+    validate_history_commit_merge_side_history(repo, history_commit, set(retained_export_paths(expected_parent).values()))
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
     parent_files: dict[str, set[str]] = defaultdict(set)
     for file_path in tree_files:
@@ -2530,7 +2569,7 @@ def run_scan(
                 "root_ref": path_ref(source.root),
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
-                "status": "ready" if rollouts or summaries else "stale" if source_materialization_gaps else "empty",
+                "status": "stale" if source_materialization_gaps else "ready" if rollouts or summaries else "empty",
             }
         )
         for rollout in rollouts:
@@ -2678,7 +2717,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                 "root_ref": path_ref(source.root),
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
-                "status": "ready" if rollouts or summaries else "stale" if source_materialization_gaps else "empty",
+                "status": "stale" if source_materialization_gaps else "ready" if rollouts or summaries else "empty",
             }
         )
     if getattr(args, "allow_partial_hosts", False):
