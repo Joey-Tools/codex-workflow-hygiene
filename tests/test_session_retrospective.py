@@ -3272,6 +3272,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
             self.assertEqual(list(real_output.iterdir()), [])
 
+    def test_export_retained_rejects_symlink_output_ancestors(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fix failed verification.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            real_parent = Path(raw) / "real-retained"
+            real_parent.mkdir()
+            history = Path(raw) / "history"
+            history.mkdir()
+            symlink_parent = history / "retained"
+            symlink_parent.symlink_to(real_parent, target_is_directory=True)
+            retained_output = symlink_parent / "daily"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+
+            with self.assertRaisesRegex(SystemExit, "symlink ancestors"):
+                MODULE.main(["export-retained", "--run-dir", str(output), "--output", str(retained_output)])
+            self.assertEqual(list(real_parent.iterdir()), [])
+
+            export_retained(output, real_parent, "daily")
+            with self.assertRaisesRegex(SystemExit, "symlink ancestors"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
+
     def test_validate_retained_rejects_extra_jsonl_fields(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -4096,6 +4126,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SystemExit, "path-like text"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_allows_schema_refs_in_follow_on_report_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-08T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, _commit = write_history_repo(raw, retained)
+            report = history_repo / "reports" / "daily" / "2026" / "05" / "01.md"
+            report.parent.mkdir(parents=True)
+            report.write_text("Schema reference `#/$defs/retained_text` stayed aligned.\n", encoding="utf-8")
+            subprocess.run(["git", "add", "reports/daily/2026/05/01.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add schema ref report"], cwd=history_repo, check=True)
+
+            MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
     def test_validate_history_tree_rejects_raw_follow_on_directory(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -5644,6 +5697,35 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(manifest["sources"][0]["status"], "stale")
         self.assertEqual(manifest["sources"][0]["summary_count"], 1)
 
+    def test_default_remote_ignores_irrelevant_summary_when_rollouts_cover_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            write_jsonl(rollout, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
+            summary = remote / "sessions" / "2026" / "06" / "01" / "rollout-summary-future.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-06-01T10:00:00Z", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+            discover_output = safe_output_dir(raw, "discover")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            MODULE.run_discover(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(discover_output), allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((discover_output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "ready")
+
     def test_default_remote_mixed_summary_fallback_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
@@ -6238,6 +6320,59 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "retained model era"):
             MODULE.sanitize_trend_report(trend, label="trend", strict=True)
 
+    def test_retained_validators_reject_private_flag_tokens(self) -> None:
+        turn = {
+            "turn_id": VALID_TURN_ID,
+            "episode_id": VALID_EPISODE_ID,
+            "host": "local",
+            "session_id": VALID_SESSION_ID,
+            "source_path": "path_ref_v1:0123456789abcdef",
+            "source_hash": VALID_SOURCE_HASH,
+            "timestamp": "2026-05-22T10:00:00Z",
+            "cwd": None,
+            "model": None,
+            "model_era": "unknown",
+            "redacted_user_prompt_summary": "category=debug",
+            "assistant_action_summary": "",
+            "issue_flags": ["customer_acme"],
+            "prompt_improvement": None,
+        }
+        episode = {
+            "episode_id": VALID_EPISODE_ID,
+            "host": "local",
+            "session_id": VALID_SESSION_ID,
+            "start": "2026-05-22T10:00:00Z",
+            "end": "2026-05-22T10:00:00Z",
+            "cwd": None,
+            "model_era": "unknown",
+            "topic": "category=debug",
+            "turn_count": 1,
+            "friction_flags": ["incident_123"],
+            "outcome": "customer_state",
+            "work_report_hint": None,
+        }
+        trend = {
+            "schema_version": 1,
+            "window": {"mode": "daily", "start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+            "turn_count": 1,
+            "flagged_turn_count": 1,
+            "episode_count": 1,
+            "flags": {"customer_acme": 1},
+            "hosts": {"local": 1},
+            "model_eras": {"unknown": 1},
+            "coverage_gaps": [],
+        }
+
+        with self.assertRaisesRegex(SystemExit, "known flag allowlist"):
+            MODULE.validate_turn_flag_row(turn, label="turn")
+        with self.assertRaisesRegex(SystemExit, "known flag allowlist"):
+            MODULE.validate_episode_row(episode, label="episode")
+        episode["friction_flags"] = ["failed_command"]
+        with self.assertRaisesRegex(SystemExit, "known outcome allowlist"):
+            MODULE.validate_episode_row(episode, label="episode")
+        with self.assertRaisesRegex(SystemExit, "known flag allowlist"):
+            MODULE.sanitize_trend_report(trend, label="trend", strict=True)
+
     def test_custom_source_host_is_bucketed_in_retained_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -6443,6 +6578,27 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["redacted_user_prompt_summary"], "category=remote_rollout_summary; summary_kind=function_call_output")
         self.assertIn("approval_auth_friction", rows[0]["issue_flags"])
         self.assertNotIn("customer", json.dumps(rows[0]))
+
+    def test_rollout_summary_timestamps_are_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-offset.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {"kind": "session_meta", "timestamp": "2026-05-22T09:00:00Z", "session_id": "s1"},
+                    {"kind": "summary", "timestamp": "2026-05-22T09:30:00+01:00", "text": "permission denied"},
+                ],
+            )
+
+            rows = MODULE.extract_summary_file(
+                MODULE.Source("remote", root),
+                summary,
+                MODULE.parse_time("2026-05-22T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+            )
+
+        self.assertEqual(rows[0].timestamp, "2026-05-22T08:30:00Z")
 
     def test_rollout_summary_user_message_contributes_prompt_flags_without_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -7012,6 +7168,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(episodes[0]["friction_flags"], ["verification_gap"])
         self.assertEqual(trend["flagged_turn_count"], 1)
         self.assertEqual(trend["model_eras"]["gpt-5.5"], 1)
+
+    def test_episode_records_order_timestamps_by_instant(self) -> None:
+        base = dict(
+            turn_id="t1",
+            episode_id=VALID_EPISODE_ID,
+            host="local",
+            session_id=VALID_SESSION_ID,
+            source_path="path_ref_v1:0123456789abcdef",
+            source_hash=VALID_SOURCE_HASH,
+            cwd=None,
+            model=None,
+            model_era="unknown",
+            redacted_user_prompt_summary="category=debug",
+            assistant_action_summary="",
+            issue_flags=["verification_gap"],
+            prompt_improvement=None,
+        )
+        later = MODULE.TurnSummary(timestamp="2026-05-22T08:45:00Z", **base)
+        earlier = MODULE.TurnSummary(timestamp="2026-05-22T09:30:00+01:00", **(base | {"turn_id": "t2"}))
+
+        episodes = MODULE.episode_records([later, earlier])
+
+        self.assertEqual(episodes[0]["start"], "2026-05-22T08:30:00Z")
+        self.assertEqual(episodes[0]["end"], "2026-05-22T08:45:00Z")
 
 
 if __name__ == "__main__":

@@ -64,7 +64,7 @@ SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:ssh://[^\s)>\]\"']+|git@[A-Za-z0-9_.-]+:[^\s)>\]\"']+)"), "[REDACTED_URL]"),
     (
         re.compile(
-            r"\b(?:password|passwd|pwd|credential|secret|token|api[_-]?key|authorization)\s*[:=]\s*['\"]?[^'\"\s,;]+",
+            r"\b(?:password|passwd|pwd|credential|secret(?:[\s_-]?key)?|token|api[\s_-]?key|authorization|private[\s_-]?key)\s*[:=]\s*['\"]?[^'\"\s,;]+",
             re.I,
         ),
         "[REDACTED_CREDENTIAL]",
@@ -94,6 +94,8 @@ SAFETY_PATTERN = re.compile(
     r"客户|客户数据|凭据|凭证|密钥|生产|破坏性)",
     re.I,
 )
+RETAINED_ISSUE_FLAGS = frozenset(name for name, _pattern in FLAG_PATTERNS) | frozenset({"safety_privacy_flag"})
+RETAINED_OUTCOMES = frozenset({"needs_review", "no_issue_observed"})
 
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 RETAINED_CUSTOM_SOURCE_HOST = "custom_source"
@@ -117,6 +119,15 @@ COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 BARE_64_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
 INTERNAL_HOSTNAME_PATTERN = re.compile(
     r"\b(?:[A-Za-z0-9-]+\.)+(?:internal|corp|local|lan|example|invalid|test)\b",
+    re.I,
+)
+PATH_LIKE_TEXT_PATTERN = re.compile(
+    r"(?:"
+    r"\b(?:https?|ssh)://|"
+    r"(?<![A-Za-z0-9_])(?:~|/(?:Users|home|root|private|tmp|var|etc|opt|Volumes|workspace|workspaces))/|"
+    r"\b[A-Za-z]:\\|"
+    r"(?<![#A-Za-z0-9_])(?:\.{1,2}/)?[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,8}\b"
+    r")",
     re.I,
 )
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
@@ -238,6 +249,31 @@ MANIFEST_FIELDS = {
 }
 MANIFEST_SOURCE_FIELDS = {"host", "root_ref", "status", "rollout_count", "summary_count"}
 MANIFEST_GAP_FIELDS = {"host", "root_ref", "reason", "bytes"}
+RETAINED_SOURCE_STATUSES = frozenset({"empty", "missing", "ready", "stale"})
+RETAINED_COVERAGE_GAP_REASONS = frozenset(
+    {
+        "auth_gated",
+        "codex_missing",
+        "history_missing",
+        "history_unreadable",
+        "host_unreachable",
+        "invalid_jsonl",
+        "missing_codex",
+        "no_rollout_or_summary_files",
+        "oversized_rollout_skipped",
+        "oversized_summary_skipped",
+        "partial_host_scope",
+        "remote_source_not_materialized",
+        "session_index_missing",
+        "session_index_unreadable",
+        "source_root_missing",
+        "source_root_symlink",
+        "stale_host",
+        "truncated_rollout_summary",
+        "unreachable",
+        "unsafe_source_artifact",
+    }
+)
 ALLOWED_REMOTE_GAP_REASONS = {
     "auth_gated",
     "codex_missing",
@@ -546,6 +582,23 @@ def ensure_safe_output_dir(path: Path) -> Path:
         if parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS:
             return expanded
     raise SystemExit("output directory for transient artifacts must be under .codex-local/session-retrospective")
+
+
+def reject_symlink_ancestors(path: Path, *, label: str) -> None:
+    expanded = path.expanduser()
+    current = Path(expanded.anchor) if expanded.is_absolute() else Path(".")
+    parts_to_check = expanded.parts[1:] if expanded.is_absolute() else expanded.parts
+    allowed_system_symlinks = {Path("/etc"), Path("/tmp"), Path("/var")}
+    for part in parts_to_check:
+        current = current / part
+        if os.path.lexists(current) and current.is_symlink():
+            if current in allowed_system_symlinks:
+                try:
+                    current.resolve(strict=True).relative_to(Path("/private"))
+                    continue
+                except (OSError, ValueError):
+                    pass
+            raise SystemExit(f"{label} must not use symlink ancestors")
 
 
 def session_id_from_path(path: Path) -> str:
@@ -1167,6 +1220,8 @@ def extract_rollout(
             active_mtime = rollout_active_mtime(path, emit_threshold, end)
             if active_mtime is not None:
                 return iso(active_mtime), active_mtime
+        if parsed is not None:
+            return iso(parsed), parsed
         return raw_timestamp, parsed
 
     def emit_current(trigger_line_no: int | None = None, trigger_timestamp: str | None = None) -> None:
@@ -1337,7 +1392,7 @@ def extract_summary_file(
         flags = flags_for_text(flag_text, redacted_changed=changed)
         if not flags:
             continue
-        timestamp_value = timestamp if parse_time(timestamp) else (iso(parsed_timestamp) if parsed_timestamp else None)
+        timestamp_value = iso(parsed_timestamp)
         date_bucket = parsed_timestamp.date().isoformat()
         episode_id = opaque_episode_id("|".join([source.host, session_id, "rollout-summary", date_bucket, retained_kind]))
         turns.append(
@@ -1368,9 +1423,10 @@ def episode_records(turns: list[TurnSummary]) -> list[dict[str, Any]]:
     episodes: list[dict[str, Any]] = []
     for episode_id, items in sorted(grouped.items()):
         flags = sorted({flag for item in items for flag in item.issue_flags})
-        timestamps = [item.timestamp for item in items if item.timestamp]
-        first = min(timestamps) if timestamps else None
-        last = max(timestamps) if timestamps else None
+        timestamps = [parse_time(item.timestamp) for item in items if item.timestamp]
+        parsed_timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
+        first = iso(min(parsed_timestamps)) if parsed_timestamps else None
+        last = iso(max(parsed_timestamps)) if parsed_timestamps else None
         first_turn = items[0]
         episodes.append(
             {
@@ -1515,7 +1571,7 @@ def contains_raw_path_fields(value: Any) -> bool:
 
 def contains_path_like_text(value: Any) -> bool:
     if isinstance(value, str):
-        return "/" in value or "\\" in value or "://" in value
+        return bool(PATH_LIKE_TEXT_PATTERN.search(value))
     if isinstance(value, dict):
         return any(contains_path_like_text(child) for child in value.values())
     if isinstance(value, list):
@@ -1679,6 +1735,14 @@ def require_token_list(value: Any, *, label: str) -> list[str]:
     return tokens
 
 
+def require_issue_flag_list(value: Any, *, label: str) -> list[str]:
+    flags = require_token_list(value, label=label)
+    for flag in flags:
+        if flag not in RETAINED_ISSUE_FLAGS:
+            raise SystemExit(f"{label}: retained issue flags must use the known flag allowlist")
+    return flags
+
+
 def require_non_negative_int(value: Any, *, label: str) -> int:
     if not isinstance(value, int) or value < 0:
         raise SystemExit(f"{label}: expected non-negative integer")
@@ -1689,16 +1753,22 @@ def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
     require_opaque_digest_string(row["episode_id"], label=f"{label}.episode_id", prefix=EPISODE_REF_PREFIX)
     require_retained_host_string(row["host"], label=f"{label}.host")
     require_opaque_digest_string(row["session_id"], label=f"{label}.session_id", prefix=SESSION_REF_PREFIX)
-    require_timestamp_or_none(row["start"], label=f"{label}.start")
-    require_timestamp_or_none(row["end"], label=f"{label}.end")
+    start = require_timestamp_or_none(row["start"], label=f"{label}.start")
+    end = require_timestamp_or_none(row["end"], label=f"{label}.end")
+    start_time = parse_time(start)
+    end_time = parse_time(end)
+    if start_time is not None and end_time is not None and start_time > end_time:
+        raise SystemExit(f"{label}: episode start must not be after end")
     require_path_ref_or_none(row["cwd"], label=f"{label}.cwd")
     require_retained_model_era_string(row["model_era"], label=f"{label}.model_era")
     require_string(row["topic"], label=f"{label}.topic")
     turn_count = require_non_negative_int(row["turn_count"], label=f"{label}.turn_count")
     if turn_count == 0:
         raise SystemExit(f"{label}.turn_count: expected positive integer")
-    require_token_list(row["friction_flags"], label=f"{label}.friction_flags")
-    require_safe_token_string(row["outcome"], label=f"{label}.outcome")
+    require_issue_flag_list(row["friction_flags"], label=f"{label}.friction_flags")
+    outcome = require_safe_token_string(row["outcome"], label=f"{label}.outcome")
+    if outcome not in RETAINED_OUTCOMES:
+        raise SystemExit(f"{label}.outcome: retained outcome must use the known outcome allowlist")
     require_optional_string(row["work_report_hint"], label=f"{label}.work_report_hint")
 
 
@@ -1719,7 +1789,7 @@ def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
     require_retained_model_era_string(row["model_era"], label=f"{label}.model_era")
     require_string(row["redacted_user_prompt_summary"], label=f"{label}.redacted_user_prompt_summary")
     require_string(row["assistant_action_summary"], label=f"{label}.assistant_action_summary", allow_empty=True)
-    issue_flags = require_token_list(row["issue_flags"], label=f"{label}.issue_flags")
+    issue_flags = require_issue_flag_list(row["issue_flags"], label=f"{label}.issue_flags")
     if not issue_flags:
         raise SystemExit(f"{label}.issue_flags: expected non-empty list")
     require_optional_string(row["prompt_improvement"], label=f"{label}.prompt_improvement")
@@ -1781,6 +1851,12 @@ def sanitize_count_map(value: Any, *, label: str, strict: bool) -> dict[str, int
     return counts
 
 
+def require_issue_flag_count_map(value: dict[str, int], *, label: str) -> None:
+    for key in value:
+        if key not in RETAINED_ISSUE_FLAGS:
+            raise SystemExit(f"{label}: retained issue flags must use the known flag allowlist")
+
+
 def require_retained_host_count_map(value: dict[str, int], *, label: str) -> None:
     for key in value:
         if not retained_host_token(key):
@@ -1805,8 +1881,10 @@ def sanitize_window(value: Any, *, label: str) -> dict[str, Any]:
 
 def sanitize_coverage_gap(value: Any, *, label: str, strict: bool) -> dict[str, Any]:
     sanitized = sanitize_mapping(value, allowed=MANIFEST_GAP_FIELDS, required={"host", "reason"}, label=label, strict=strict)
-    if not retained_coverage_host_token(sanitized.get("host")) or not safe_token(sanitized.get("reason")):
+    if not retained_coverage_host_token(sanitized.get("host")):
         raise SystemExit(f"{label}: unsafe retained coverage gap token")
+    if sanitized.get("reason") not in RETAINED_COVERAGE_GAP_REASONS:
+        raise SystemExit(f"{label}.reason: retained coverage gap reason is not allowed")
     if "bytes" in sanitized and (not isinstance(sanitized["bytes"], int) or sanitized["bytes"] < 0):
         raise SystemExit(f"{label}: coverage gap bytes must be a non-negative integer")
     if "root_ref" in sanitized and not PATH_REF_PATTERN.fullmatch(str(sanitized["root_ref"])):
@@ -1819,6 +1897,7 @@ def sanitize_trend_report(data: Any, *, label: str, strict: bool) -> dict[str, A
     sanitized["window"] = sanitize_window(sanitized["window"], label=f"{label}.window")
     for count_key in ("flags", "hosts", "model_eras"):
         sanitized[count_key] = sanitize_count_map(sanitized[count_key], label=f"{label}.{count_key}", strict=strict)
+    require_issue_flag_count_map(sanitized["flags"], label=f"{label}.flags")
     require_retained_host_count_map(sanitized["hosts"], label=f"{label}.hosts")
     require_retained_model_era_count_map(sanitized["model_eras"], label=f"{label}.model_eras")
     gaps = sanitized.get("coverage_gaps")
@@ -1849,8 +1928,10 @@ def sanitize_retained_manifest_obj(data: Any, *, label: str, strict: bool) -> di
             label=f"{label}.sources[{index}]",
             strict=strict,
         )
-        if not retained_host_token(clean_source.get("host")) or not safe_token(clean_source.get("status")):
+        if not retained_host_token(clean_source.get("host")):
             raise SystemExit(f"{label}.sources[{index}]: unsafe retained source token")
+        if clean_source.get("status") not in RETAINED_SOURCE_STATUSES:
+            raise SystemExit(f"{label}.sources[{index}].status: retained source status is not allowed")
         for key in ("rollout_count", "summary_count"):
             if not isinstance(clean_source[key], int) or clean_source[key] < 0:
                 raise SystemExit(f"{label}.sources[{index}].{key}: expected non-negative integer")
@@ -2695,10 +2776,16 @@ def materialization_gaps_for_source(source: Source) -> list[dict[str, Any]]:
     return [remote_metadata_gap(source, "remote_source_not_materialized")]
 
 
-def remote_summary_only_gaps(source: Source, rollouts: list[Path], summaries: list[Path]) -> list[dict[str, Any]]:
+def remote_summary_only_gaps(
+    source: Source,
+    rollouts: list[Path],
+    summaries: list[Path],
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> list[dict[str, Any]]:
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return []
-    if not summaries:
+    if not any(summary_file_relevant(summary, start, end) for summary in summaries):
         return []
     return [remote_metadata_gap(source, "remote_source_not_materialized")]
 
@@ -2807,7 +2894,7 @@ def run_scan(
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         source_materialization_gaps = materialization_gaps_for_source(source)
-        source_summary_only_gaps = remote_summary_only_gaps(source, rollouts, summaries)
+        source_summary_only_gaps = remote_summary_only_gaps(source, rollouts, summaries, start, end)
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
@@ -2992,7 +3079,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         source_materialization_gaps = materialization_gaps_for_source(source)
-        source_summary_only_gaps = remote_summary_only_gaps(source, rollouts, summaries)
+        source_summary_only_gaps = remote_summary_only_gaps(source, rollouts, summaries, start, end)
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
@@ -3233,6 +3320,7 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
 def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     if run_dir.is_symlink():
         raise SystemExit(f"refusing symlinked output directory: {run_dir}")
+    reject_symlink_ancestors(run_dir, label="output directory")
     if not run_dir.is_dir():
         raise SystemExit(f"output directory not found: {run_dir}")
     required_files = ("turn_summaries.jsonl", *RETAINED_OUTPUT_FILES)
@@ -3325,6 +3413,7 @@ def retained_export_files_from_dir(run_dir: Path) -> dict[str, bytes]:
 def validate_retained_output_dir(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     if run_dir.is_symlink():
         raise SystemExit(f"refusing symlinked retained output directory: {run_dir}")
+    reject_symlink_ancestors(run_dir, label="retained output directory")
     if not run_dir.is_dir():
         raise SystemExit(f"retained output directory not found: {run_dir}")
     allowed = set(RETAINED_OUTPUT_FILES)
@@ -3364,6 +3453,7 @@ def cmd_export_retained(args: argparse.Namespace) -> int:
     output = Path(args.output)
     if output.is_symlink():
         raise SystemExit(f"refusing symlinked retained output directory: {output}")
+    reject_symlink_ancestors(output, label="retained output directory")
     output.mkdir(parents=True, exist_ok=True)
     allowed = set(RETAINED_OUTPUT_FILES)
     for path in output.iterdir():
