@@ -14,7 +14,7 @@ The workflow is read-only against Codex history and remote hosts. It produces re
 
 - Default host scope follows `$remote-host-context`: local machine, `miku-bot-dev`, and `hoteng-srv-01`.
 - Local sources are `~/.codex/session_index.jsonl`, `~/.codex/history.jsonl`, and `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
-- Remote evidence must be collected through `$remote-host-context` preflight plus `remote_codex_probe.py` bounded reads.
+- Remote evidence must be collected through `$remote-host-context` preflight plus this skill's bundled `scripts/remote_codex_probe.py` bounded reads.
 - Once remote rollout data is copied or summarized locally, use this skill's helper for extraction and aggregation.
 - Each materialized default remote source root must include `source_metadata.json` with `host`, `status`, `window_start`, `window_end`, and `materialized_at`; missing or stale metadata is a coverage gap and blocks state advancement.
 - Choose the scan `--end` timestamp before materializing remote evidence, use that same timestamp as the remote metadata `window_end`, and pass it to `scan-daily`, `scan-weekly`, or `baseline`.
@@ -69,6 +69,8 @@ python3 scripts/session_retrospective.py validate-output --run-dir .codex-local/
 python3 scripts/session_retrospective.py export-retained --run-dir .codex-local/session-retrospective/runs/20260522/weekly --output .codex-local/session-retrospective/retained/20260522/weekly
 python3 scripts/session_retrospective.py validate-retained --run-dir .codex-local/session-retrospective/retained/20260522/weekly
 ```
+
+Use `scripts/remote_codex_probe.py` only for read-only remote materialization after `$remote-host-context` identifies the same default host scope. Keep its output in task-scoped ignored directories and pass the materialized roots back through `--source HOST=PATH`; do not let extractor subagents connect to remote hosts directly.
 
 Use `discover` before map-reduce shard work. `make-shards` only emits sources marked `ready` by the transient manifest; stale, missing, empty, or otherwise non-ready sources stay as coverage gaps and must not be handed to extractor subagents. Add `--include-raw-paths` only for local extractor dispatch inside ignored `.codex-local/session-retrospective` run directories; never retain or commit `shards.jsonl`. `scan-*` remains the compact local extraction path for bounded windows and final retained outputs.
 Pass repeated `--source HOST=PATH` values when remote evidence has been materialized locally. `PATH` may be a Codex home containing `sessions/` or a task-scoped directory containing copied `rollout-*.jsonl` files. Retained host labels are restricted to `local`, the two default remote hosts, and `custom_source`; any other `HOST` label is bucketed as `custom_source` before retained artifacts are written.

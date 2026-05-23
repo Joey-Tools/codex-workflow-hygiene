@@ -1775,6 +1775,8 @@ def parse_sources(values: list[str] | None, *, require_default_hosts: bool = Tru
         if "=" not in value:
             raise SystemExit(f"--source must be HOST=PATH, got {value!r}")
         host, raw_path = value.split("=", 1)
+        if not raw_path.strip():
+            raise SystemExit("--source PATH must be non-empty")
         source = Source(retained_source_host(host), Path(raw_path).expanduser())
         key = (source.host, source.root.resolve(strict=False).as_posix())
         if key in seen:
@@ -2080,7 +2082,7 @@ def history_remote_urls(repo: Path, *, push: bool) -> list[str]:
 
 
 def history_remote_matches_expected(remote_url: str) -> bool:
-    value = remote_url.strip().removesuffix(".git").removesuffix("/")
+    value = remote_url.strip().rstrip("/").removesuffix(".git").rstrip("/")
     if value == f"git@github.com:{EXPECTED_HISTORY_REPO}":
         return True
     for prefix in ("https://github.com/", "ssh://git@github.com/"):
@@ -2304,6 +2306,25 @@ def validate_history_commit_merge_side_history(repo: Path, history_commit: str, 
         unexpected = sorted(history_commit_changed_files(repo, side_commit) - allowed_paths)
         if unexpected:
             raise SystemExit(f"--history-commit merge side history changes unexpected artifact: {unexpected[0]}")
+
+
+def validate_history_follow_on_history(repo: Path, history_commit: str, history_ref: str) -> None:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--first-parent", "--reverse", f"{history_commit}..{history_ref}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit("failed to inspect history follow-on commits")
+    for follow_on_commit in result.stdout.splitlines():
+        if not follow_on_commit:
+            continue
+        try:
+            validate_history_tree_ref(repo, follow_on_commit)
+        except SystemExit as exc:
+            raise SystemExit(f"history follow-on commit is not retention-safe: {exc}") from exc
 
 
 def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> str:
@@ -2569,9 +2590,15 @@ def run_scan(
                 "root_ref": path_ref(source.root),
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
-                "status": "stale" if source_materialization_gaps else "ready" if rollouts or summaries else "empty",
+                "status": "stale"
+                if source_materialization_gaps
+                else "ready"
+                if rollouts or summaries
+                else "empty",
             }
         )
+        if source_materialization_gaps:
+            continue
         for rollout in rollouts:
             if not rollout_candidate_relevant(
                 rollout,
@@ -3134,6 +3161,7 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
     require_history_ancestor(history_repo, history_commit, history_ref)
     require_history_ref_current_head(history_repo, history_ref)
     require_history_worktree_clean(history_repo)
+    validate_history_follow_on_history(history_repo, history_commit, history_ref)
     validate_history_tree(args.history_repo, history_ref)
     require_retained_export_in_history_ref(history_repo, history_ref, retained_parent, actual_files)
     window = trend.get("window") or {}

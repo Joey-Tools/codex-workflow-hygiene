@@ -286,6 +286,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(sources[1].missing_reason, "remote_source_not_materialized")
         self.assertEqual(sources[2].missing_reason, "remote_source_not_materialized")
 
+    def test_remote_probe_helper_is_bundled_with_skill(self) -> None:
+        helper = SCRIPT.parent / "remote_codex_probe.py"
+        skill = SCRIPT.parents[1] / "SKILL.md"
+
+        self.assertTrue(helper.is_file())
+        self.assertIn("scripts/remote_codex_probe.py", skill.read_text(encoding="utf-8"))
+
     def test_explicit_sources_still_require_default_host_coverage(self) -> None:
         sources = MODULE.parse_sources(["local=/tmp/local", "miku-bot-dev=/tmp/miku"])
 
@@ -305,6 +312,12 @@ class SessionRetrospectiveTests(unittest.TestCase):
         sources = MODULE.parse_sources(["local=/tmp/local", "local=/tmp/local"], require_default_hosts=False)
 
         self.assertEqual(len(sources), 1)
+
+    def test_parse_sources_rejects_empty_path(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "PATH must be non-empty"):
+            MODULE.parse_sources(["local="], require_default_hosts=False)
+        with self.assertRaisesRegex(SystemExit, "PATH must be non-empty"):
+            MODULE.parse_sources(["local=   "], require_default_hosts=False)
 
     def test_parse_sources_buckets_custom_host_labels(self) -> None:
         sources = MODULE.parse_sources(["customer-acme=/tmp/acme"], require_default_hosts=False)
@@ -2985,6 +2998,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "origin must be"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
+    def test_history_remote_accepts_trailing_git_slash(self) -> None:
+        self.assertTrue(MODULE.history_remote_matches_expected("https://github.com/Joey-Tools/codex-session-retrospective-history.git/"))
+        self.assertTrue(MODULE.history_remote_matches_expected("ssh://git@github.com/Joey-Tools/codex-session-retrospective-history.git/"))
+
     def test_advance_state_rejects_dirty_history_worktree_before_saving_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -3662,6 +3679,49 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add raw follow-on"], cwd=history_repo, check=True)
 
             with self.assertRaisesRegex(SystemExit, "forbidden transient/raw artifact"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        retained_commit,
+                    ]
+                )
+
+    def test_advance_state_validates_deleted_follow_on_history(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, retained_commit = write_history_repo(raw, retained)
+            raw_log = history_repo / "raw" / "tool-output.log"
+            raw_log.parent.mkdir(parents=True)
+            raw_log.write_text("raw output\n", encoding="utf-8")
+            subprocess.run(["git", "add", "raw/tool-output.log"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add raw follow-on"], cwd=history_repo, check=True)
+            raw_log.unlink()
+            subprocess.run(["git", "add", "raw/tool-output.log"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Remove raw follow-on"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "history follow-on commit is not retention-safe"):
                 MODULE.main(
                     [
                         "advance-state",
@@ -4512,6 +4572,34 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
         self.assertEqual(manifest["sources"][0]["status"], "stale")
         self.assertEqual(manifest["sources"][0]["summary_count"], 0)
+
+    def test_partial_remote_materialization_skips_direct_scan_data(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            safe_rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-safe.jsonl"
+            write_jsonl(safe_rollout, [message("user", "Safe remote task.", "2026-05-01T10:00:00Z")])
+            outside = Path(raw) / "outside.jsonl"
+            write_jsonl(outside, [message("user", "Unsafe remote task.", "2026-05-01T11:00:00Z")])
+            unsafe_rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T11-00-00-unsafe.jsonl"
+            unsafe_rollout.symlink_to(outside)
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            rows = [json.loads(line) for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()]
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertEqual(trend["hosts"], {})
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+        self.assertEqual(manifest["sources"][0]["rollout_count"], 1)
 
     def test_discover_reports_default_remote_materialization_gaps(self) -> None:
         for filename in ("rollout-2026-05-01T10-00-00-remote.jsonl", "rollout-summary-remote.jsonl"):
