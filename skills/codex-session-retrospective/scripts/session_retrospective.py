@@ -2771,7 +2771,7 @@ def cmd_scan_daily(args: argparse.Namespace) -> int:
     state = load_state(state_path) if state_path else {}
     last = state_last_scan_at(state)
     lookback_start = end - dt.timedelta(days=active_lookback_days)
-    if last and last <= end:
+    if last and last < end:
         start = min(last, lookback_start)
         emit_start = last
     else:

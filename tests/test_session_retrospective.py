@@ -1325,6 +1325,42 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["window"]["start"], "2026-05-21T10:00:00Z")
         self.assertEqual(state_after_scan["last_scan_at"], "2026-05-21T10:00:00Z")
 
+    def test_daily_existing_state_at_end_writes_valid_lookback_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "12" / "rollout-2026-05-12T10-00-00-active.jsonl"
+            write_jsonl(rollout, [message("user", "Active lookback work.", "2026-05-12T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(json.dumps({"last_scan_at": "2026-05-22T10:00:00Z"}), encoding="utf-8")
+
+            MODULE.main(
+                [
+                    "scan-daily",
+                    "--active-lookback-days",
+                    "14",
+                    "--end",
+                    "2026-05-22T10:00:00Z",
+                    "--state",
+                    str(state),
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--output",
+                    str(output),
+                ]
+            )
+            MODULE.main(["validate-output", "--run-dir", str(output)])
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            state_after_scan = json.loads(state.read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["turn_count"], 1)
+        self.assertEqual(trend["window"]["start"], "2026-05-08T10:00:00Z")
+        self.assertEqual(trend["window"]["end"], "2026-05-22T10:00:00Z")
+        self.assertEqual(state_after_scan["last_scan_at"], "2026-05-22T10:00:00Z")
+
     def test_daily_existing_state_rejects_invalid_last_scan_at(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
