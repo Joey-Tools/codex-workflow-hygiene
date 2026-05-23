@@ -1324,12 +1324,14 @@ def extract_rollout(
                 prompt_flags = flags_for_text(prompt_text, redacted_changed=prompt_changed)
                 prompt_summary = safe_prompt_summary(prompt_text, prompt_flags, prompt_changed, redacted_prompt)
                 date_bucket = (parse_time(timestamp) or rollout_date_from_path(path) or utc_now()).date().isoformat()
+                model_era = infer_model_era(model, timestamp)
                 episode_seed = "|".join(
                     [
                         source.host,
                         session_id,
                         (path_ref(cwd) or ""),
                         date_bucket,
+                        model_era,
                         prompt_category(prompt_text),
                         prompt_topic_key(redacted_prompt),
                     ]
@@ -1345,7 +1347,7 @@ def extract_rollout(
                     timestamp=timestamp,
                     cwd=path_ref(cwd),
                     model=retained_model_id(model),
-                    model_era=infer_model_era(model, timestamp),
+                    model_era=model_era,
                     redacted_user_prompt_summary=prompt_summary,
                     assistant_action_summary="",
                     issue_flags=sorted(prompt_flags),
@@ -1435,7 +1437,8 @@ def extract_summary_file(
             continue
         timestamp_value = iso(parsed_timestamp)
         date_bucket = parsed_timestamp.date().isoformat()
-        episode_id = opaque_episode_id("|".join([source.host, session_id, "rollout-summary", date_bucket, retained_kind]))
+        model_era = infer_model_era(None, timestamp_value)
+        episode_id = opaque_episode_id("|".join([source.host, session_id, "rollout-summary", date_bucket, model_era, retained_kind]))
         turns.append(
             TurnSummary(
                 turn_id=opaque_turn_id(f"{source.host}|{path_ref(path)}|{line_no}|{timestamp}"),
@@ -1447,7 +1450,7 @@ def extract_summary_file(
                 timestamp=timestamp_value,
                 cwd=None,
                 model=None,
-                model_era=infer_model_era(None, timestamp_value),
+                model_era=model_era,
                 redacted_user_prompt_summary=f"category=remote_rollout_summary; summary_kind={retained_kind}",
                 assistant_action_summary="summary_source=remote_rollout_summary",
                 issue_flags=sorted(flags),
@@ -1795,9 +1798,14 @@ def require_issue_flag_list(value: Any, *, label: str) -> list[str]:
 
 
 def require_non_negative_int(value: Any, *, label: str) -> int:
-    if not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         raise SystemExit(f"{label}: expected non-negative integer")
     return value
+
+
+def require_schema_version_one(value: Any, *, label: str) -> None:
+    if type(value) is not int or value != 1:
+        raise SystemExit(f"{label}: retained schema_version must be 1")
 
 
 def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
@@ -1896,7 +1904,7 @@ def sanitize_count_map(value: Any, *, label: str, strict: bool) -> dict[str, int
     for key, count in value.items():
         if not safe_token(key):
             raise SystemExit(f"{label}: retained count map key is not safe")
-        if not isinstance(count, int) or count < 0:
+        if type(count) is not int or count < 0:
             raise SystemExit(f"{label}: retained count map value must be a non-negative integer")
         counts[key] = count
     return counts
@@ -1936,7 +1944,7 @@ def sanitize_coverage_gap(value: Any, *, label: str, strict: bool) -> dict[str, 
         raise SystemExit(f"{label}: unsafe retained coverage gap token")
     if sanitized.get("reason") not in RETAINED_COVERAGE_GAP_REASONS:
         raise SystemExit(f"{label}.reason: retained coverage gap reason is not allowed")
-    if "bytes" in sanitized and (not isinstance(sanitized["bytes"], int) or sanitized["bytes"] < 0):
+    if "bytes" in sanitized and (type(sanitized["bytes"]) is not int or sanitized["bytes"] < 0):
         raise SystemExit(f"{label}: coverage gap bytes must be a non-negative integer")
     if "root_ref" in sanitized and not PATH_REF_PATTERN.fullmatch(str(sanitized["root_ref"])):
         raise SystemExit(f"{label}: retained refs must use opaque {PATH_REF_PREFIX} values")
@@ -1945,8 +1953,7 @@ def sanitize_coverage_gap(value: Any, *, label: str, strict: bool) -> dict[str, 
 
 def sanitize_trend_report(data: Any, *, label: str, strict: bool) -> dict[str, Any]:
     sanitized = sanitize_mapping(data, allowed=TREND_FIELDS, required=TREND_FIELDS, label=label, strict=strict)
-    if sanitized["schema_version"] != 1:
-        raise SystemExit(f"{label}.schema_version: retained schema_version must be 1")
+    require_schema_version_one(sanitized["schema_version"], label=f"{label}.schema_version")
     sanitized["window"] = sanitize_window(sanitized["window"], label=f"{label}.window")
     for count_key in ("flags", "hosts", "model_eras"):
         sanitized[count_key] = sanitize_count_map(sanitized[count_key], label=f"{label}.{count_key}", strict=strict)
@@ -1961,15 +1968,14 @@ def sanitize_trend_report(data: Any, *, label: str, strict: bool) -> dict[str, A
         for index, gap in enumerate(gaps)
     ]
     for key in ("turn_count", "flagged_turn_count", "episode_count"):
-        if not isinstance(sanitized[key], int) or sanitized[key] < 0:
+        if type(sanitized[key]) is not int or sanitized[key] < 0:
             raise SystemExit(f"{label}.{key}: expected non-negative integer")
     return sanitized
 
 
 def sanitize_retained_manifest_obj(data: Any, *, label: str, strict: bool) -> dict[str, Any]:
     sanitized = sanitize_mapping(data, allowed=MANIFEST_FIELDS, required=MANIFEST_FIELDS, label=label, strict=strict)
-    if sanitized["schema_version"] != 1:
-        raise SystemExit(f"{label}.schema_version: retained schema_version must be 1")
+    require_schema_version_one(sanitized["schema_version"], label=f"{label}.schema_version")
     sanitized["window"] = sanitize_window(sanitized["window"], label=f"{label}.window")
     sources = sanitized.get("sources")
     if not isinstance(sources, list) or not (1 <= len(sources) <= 16):
@@ -1988,7 +1994,7 @@ def sanitize_retained_manifest_obj(data: Any, *, label: str, strict: bool) -> di
         if clean_source.get("status") not in RETAINED_SOURCE_STATUSES:
             raise SystemExit(f"{label}.sources[{index}].status: retained source status is not allowed")
         for key in ("rollout_count", "summary_count"):
-            if not isinstance(clean_source[key], int) or clean_source[key] < 0:
+            if type(clean_source[key]) is not int or clean_source[key] < 0:
                 raise SystemExit(f"{label}.sources[{index}].{key}: expected non-negative integer")
         clean_sources.append(clean_source)
     gaps = sanitized.get("coverage_gaps")
@@ -2025,7 +2031,7 @@ def validate_retained_manifest(path: Path) -> None:
             raise SystemExit(f"{path}: retained source entries must be objects")
         for key in ("rollout_count", "summary_count"):
             count = source.get(key)
-            if not isinstance(count, int) or count < 0:
+            if type(count) is not int or count < 0:
                 raise SystemExit(f"{path}: retained source {key} must be a non-negative integer")
     for gap in manifest.get("coverage_gaps", []):
         if isinstance(gap, dict) and "path_ref" in gap:

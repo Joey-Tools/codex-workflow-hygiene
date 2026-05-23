@@ -36,6 +36,13 @@ ACTIVE_ROLLOUT_RELATIVE_RE = re.compile(
 ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile(
     r"^archived_sessions/(?:\d{4}/\d{2}/\d{2}/)?rollout-[^/]+\.jsonl$"
 )
+PRIVATE_IPV4_SIGNAL_RE = re.compile(
+    r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|127(?:\.\d{1,3}){3}|169\.254(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})(?![\d.])"
+)
+PRIVATE_IPV6_SIGNAL_RE = re.compile(
+    r"(?<![0-9A-Fa-f:])(?:::1|f[cd][0-9A-Fa-f]{0,2}(?::[0-9A-Fa-f]{0,4}){1,7}|fe[89abAB][0-9A-Fa-f]?(?::[0-9A-Fa-f]{0,4}){1,7})(?![0-9A-Fa-f:])",
+    re.I,
+)
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
 REMOTE_FETCH_ROLLOUT_BEGIN = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_BEGIN__"
@@ -399,6 +406,8 @@ SUMMARY_MAX_TEXT_CHARS_LIMIT = {MAX_ROLLOUT_SUMMARY_TEXT_CHARS}
 SUMMARY_KEYWORDS = [str(value) for value in CONFIG.get("summary_keywords", [])]
 ACTIVE_ROLLOUT_RELATIVE_RE = re.compile({ACTIVE_ROLLOUT_RELATIVE_RE.pattern!r})
 ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile({ARCHIVED_ROLLOUT_RELATIVE_RE.pattern!r})
+PRIVATE_IPV4_SIGNAL_RE = re.compile({PRIVATE_IPV4_SIGNAL_RE.pattern!r})
+PRIVATE_IPV6_SIGNAL_RE = re.compile({PRIVATE_IPV6_SIGNAL_RE.pattern!r}, re.I)
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
 SESSION_META_END = {REMOTE_SESSION_META_END!r}
 FETCH_ROLLOUT_BEGIN = {REMOTE_FETCH_ROLLOUT_BEGIN!r}
@@ -503,7 +512,9 @@ def summary_signal_text(kind, text):
         signals.append("you missed")
     if re.search(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", text, re.I):
         signals.append("assumed")
-    if re.search(
+    if PRIVATE_IPV4_SIGNAL_RE.search(text) or PRIVATE_IPV6_SIGNAL_RE.search(text):
+        signals.append("secret")
+    elif re.search(
         r"(?:\\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|privacy|pii)\\b|"
         r"\\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{{16,}}|gh[pousr]_[A-Za-z0-9_]{{16,}}|github_pat_[A-Za-z0-9_]{{16,}})\\b|"
         r"\\bAKIA[0-9A-Z]{{16}}\\b|\\bBearer\\s+[A-Za-z0-9._~+/\\-]+=*|"
@@ -1273,7 +1284,9 @@ def _summary_signal_text(kind: str, text: str) -> str:
         signals.append("you missed")
     if re.search(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", text, re.I):
         signals.append("assumed")
-    if re.search(
+    if PRIVATE_IPV4_SIGNAL_RE.search(text) or PRIVATE_IPV6_SIGNAL_RE.search(text):
+        signals.append("secret")
+    elif re.search(
         r"(?:\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|privacy|pii)\b|"
         r"\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b|"
         r"\bAKIA[0-9A-Z]{16}\b|\bBearer\s+[A-Za-z0-9._~+/\-]+=*|"

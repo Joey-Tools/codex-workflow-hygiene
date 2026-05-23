@@ -889,6 +889,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(episodes), 1)
         self.assertEqual(episodes[0]["turn_count"], 2)
 
+    def test_extract_rollout_splits_same_topic_across_model_eras(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-abc.jsonl"
+            first = message("user", "Permission denied while updating helper.", "2026-05-22T10:01:00Z")
+            first["payload"]["model"] = "openai/gpt-5.5"
+            second = message("user", "Permission denied while updating helper.", "2026-05-22T10:03:00Z")
+            second["payload"]["model"] = "openai/gpt-5.4"
+            write_jsonl(rollout, [first, second])
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+            episodes = MODULE.episode_records(turns)
+            trend = MODULE.trend_report(turns, episodes, {"mode": "daily"})
+
+        self.assertEqual(len(turns), 2)
+        self.assertNotEqual(turns[0].episode_id, turns[1].episode_id)
+        self.assertEqual(len(episodes), 2)
+        self.assertEqual(trend["model_eras"], {"gpt-5.4": 1, "gpt-5.5": 1})
+        MODULE.validate_retained_export_consistency(episodes, [MODULE.asdict_turn(turn) for turn in turns], trend, label="test")
+
     def test_extract_rollout_splits_unrelated_same_category_topics(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -3296,6 +3316,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SystemExit, "schema_version must be 1"):
                 MODULE.main(["validate-retained", "--run-dir", str(bad_manifest)])
+
+    def test_validate_retained_rejects_non_integer_schema_versions(self) -> None:
+        trend = {
+            "schema_version": 1,
+            "window": {"mode": "daily", "start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+            "turn_count": 0,
+            "flagged_turn_count": 0,
+            "episode_count": 0,
+            "flags": {},
+            "hosts": {},
+            "model_eras": {},
+            "coverage_gaps": [],
+        }
+        manifest = manifest_fixture()
+        for bad_value in (True, "1", 2):
+            with self.subTest(bad_value=bad_value):
+                bad_trend = dict(trend, schema_version=bad_value)
+                bad_manifest = dict(manifest, schema_version=bad_value)
+                with self.assertRaisesRegex(SystemExit, "schema_version must be 1"):
+                    MODULE.sanitize_trend_report(bad_trend, label="trend", strict=True)
+                with self.assertRaisesRegex(SystemExit, "schema_version must be 1"):
+                    MODULE.sanitize_retained_manifest_obj(bad_manifest, label="manifest", strict=True)
 
     def test_validate_retained_rejects_cross_file_inconsistency(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -7008,6 +7050,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("user_correction", rows[0]["issue_flags"])
         self.assertNotIn("customer", json.dumps(rows[0]))
 
+    def test_rollout_summary_private_network_address_contributes_safety_flag(self) -> None:
+        for sample in ("169.254.169.254", "100.64.0.1", "fc00::1", "::1", "fe80::1"):
+            with self.subTest(sample=sample):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw) / "remote"
+                    summary = root / "rollout-summary-large.jsonl"
+                    write_jsonl(
+                        summary,
+                        [
+                            {"kind": "session_meta", "timestamp": "2026-05-22T10:00:00Z", "text": "session_id=s1"},
+                            {"kind": "user_message", "timestamp": "2026-05-22T10:01:00Z", "text": "Investigate " + sample},
+                        ],
+                    )
+                    output = safe_output_dir(raw)
+
+                    MODULE.run_scan(
+                        types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                        mode="weekly",
+                        start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                        end=MODULE.parse_time("2026-06-01T00:00:00Z"),
+                    )
+                    rows = [
+                        json.loads(line)
+                        for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+                    ]
+
+                self.assertEqual(len(rows), 1)
+                self.assertIn("safety_privacy_flag", rows[0]["issue_flags"])
+                self.assertNotIn(sample, json.dumps(rows[0]))
+
     def test_rollout_summary_user_message_ignores_wrapper_only_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "remote"
@@ -7369,6 +7441,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "AKIAABCDEFGHIJKLMNOP",
             "eyJabcdefghijkl.eyJmnopqrstuv.eyJwxyzabcdef",
             "a" * 64,
+            "169.254.169.254",
+            "100.64.0.1",
+            "fc00::1",
+            "::1",
+            "fe80::1",
         ]
         for sample in samples:
             with self.subTest(sample=sample):
@@ -7394,6 +7471,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertIn(r"[A-Za-z]{2,}", script)
         self.assertIn(r"[A-Za-z0-9_-]{16,}", script)
+        self.assertIn("169\\\\.254", script)
+        self.assertIn("fe[89abAB]", script)
         self.assertNotIn("(2,)", script)
         self.assertNotIn("(16,)", script)
 
