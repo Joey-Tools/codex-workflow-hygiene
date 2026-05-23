@@ -121,6 +121,13 @@ OPAQUE_ID_PATTERN = re.compile(r"^(?:session_ref_v1|episode_ref_v1|turn_ref_v1):
 SOURCE_HASH_PATTERN = re.compile(r"^source_hash_v1:[0-9a-f]{20}$")
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 BARE_64_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
+PRIVATE_IPV4_PATTERN = re.compile(
+    r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|127(?:\.\d{1,3}){3}|169\.254(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})(?![\d.])"
+)
+PRIVATE_IPV6_PATTERN = re.compile(
+    r"(?<![0-9A-Fa-f:])(?:::1|f[cd][0-9A-Fa-f]{0,2}(?::[0-9A-Fa-f]{0,4}){1,7}|fe[89abAB][0-9A-Fa-f]?(?::[0-9A-Fa-f]{0,4}){1,7})(?![0-9A-Fa-f:])",
+    re.I,
+)
 INTERNAL_HOSTNAME_PATTERN = re.compile(
     r"\b(?:[A-Za-z0-9-]+\.)+(?:internal|corp|local|lan|example|invalid|test)\b",
     re.I,
@@ -356,6 +363,9 @@ def redact(text: str) -> tuple[str, bool]:
     sensitive_redacted = False
     for pattern, label in SECRET_PATTERNS:
         redacted, count = pattern.subn(label, redacted)
+        sensitive_redacted = sensitive_redacted or count > 0
+    for pattern in (PRIVATE_IPV4_PATTERN, PRIVATE_IPV6_PATTERN):
+        redacted, count = pattern.subn("[REDACTED_INTERNAL_ADDRESS]", redacted)
         sensitive_redacted = sensitive_redacted or count > 0
     if len(redacted) > 1200:
         redacted = redacted[:1200].rstrip() + " [TRUNCATED]"
@@ -1629,6 +1639,8 @@ def contains_unredacted_sensitive_text(value: Any) -> bool:
         return (
             any(pattern.search(value) for pattern, _label in SECRET_PATTERNS)
             or bool(INTERNAL_HOSTNAME_PATTERN.search(value))
+            or bool(PRIVATE_IPV4_PATTERN.search(value))
+            or bool(PRIVATE_IPV6_PATTERN.search(value))
             or bool(BARE_64_HEX_PATTERN.search(value))
         )
     if isinstance(value, dict):
@@ -1933,6 +1945,8 @@ def sanitize_coverage_gap(value: Any, *, label: str, strict: bool) -> dict[str, 
 
 def sanitize_trend_report(data: Any, *, label: str, strict: bool) -> dict[str, Any]:
     sanitized = sanitize_mapping(data, allowed=TREND_FIELDS, required=TREND_FIELDS, label=label, strict=strict)
+    if sanitized["schema_version"] != 1:
+        raise SystemExit(f"{label}.schema_version: retained schema_version must be 1")
     sanitized["window"] = sanitize_window(sanitized["window"], label=f"{label}.window")
     for count_key in ("flags", "hosts", "model_eras"):
         sanitized[count_key] = sanitize_count_map(sanitized[count_key], label=f"{label}.{count_key}", strict=strict)
@@ -1946,7 +1960,7 @@ def sanitize_trend_report(data: Any, *, label: str, strict: bool) -> dict[str, A
         sanitize_coverage_gap(gap, label=f"{label}.coverage_gaps[{index}]", strict=strict)
         for index, gap in enumerate(gaps)
     ]
-    for key in ("schema_version", "turn_count", "flagged_turn_count", "episode_count"):
+    for key in ("turn_count", "flagged_turn_count", "episode_count"):
         if not isinstance(sanitized[key], int) or sanitized[key] < 0:
             raise SystemExit(f"{label}.{key}: expected non-negative integer")
     return sanitized
@@ -1954,6 +1968,8 @@ def sanitize_trend_report(data: Any, *, label: str, strict: bool) -> dict[str, A
 
 def sanitize_retained_manifest_obj(data: Any, *, label: str, strict: bool) -> dict[str, Any]:
     sanitized = sanitize_mapping(data, allowed=MANIFEST_FIELDS, required=MANIFEST_FIELDS, label=label, strict=strict)
+    if sanitized["schema_version"] != 1:
+        raise SystemExit(f"{label}.schema_version: retained schema_version must be 1")
     sanitized["window"] = sanitize_window(sanitized["window"], label=f"{label}.window")
     sources = sanitized.get("sources")
     if not isinstance(sources, list) or not (1 <= len(sources) <= 16):
@@ -2227,8 +2243,97 @@ def retained_export_parent_for_records(trend: dict[str, Any], manifest: dict[str
     return retained_export_parent_for_mode(mode)
 
 
+def validate_retained_export_consistency(
+    episodes: list[dict[str, Any]],
+    turn_flags: list[dict[str, Any]],
+    trend: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    episodes_by_id: dict[str, dict[str, Any]] = {}
+    episode_flag_sets: dict[str, set[str]] = defaultdict(set)
+    flagged_turns_by_episode = Counter[str]()
+    for index, episode in enumerate(episodes, 1):
+        episode_id = episode["episode_id"]
+        if episode_id in episodes_by_id:
+            raise SystemExit(f"{label}: duplicate episode_id in episodes.jsonl at row {index}")
+        episodes_by_id[episode_id] = episode
+    turn_ids: set[str] = set()
+    for index, turn in enumerate(turn_flags, 1):
+        turn_id = turn["turn_id"]
+        if turn_id in turn_ids:
+            raise SystemExit(f"{label}: duplicate turn_id in turn_flags.jsonl at row {index}")
+        turn_ids.add(turn_id)
+        episode = episodes_by_id.get(turn["episode_id"])
+        if episode is None:
+            raise SystemExit(f"{label}: turn_flags.jsonl row {index} references a missing episode_id")
+        if turn["host"] != episode["host"]:
+            raise SystemExit(f"{label}: turn_flags.jsonl row {index} host must match referenced episode")
+        if turn["session_id"] != episode["session_id"]:
+            raise SystemExit(f"{label}: turn_flags.jsonl row {index} session_id must match referenced episode")
+        episode_flag_sets[turn["episode_id"]].update(turn["issue_flags"])
+        flagged_turns_by_episode[turn["episode_id"]] += 1
+    for episode_id, episode in episodes_by_id.items():
+        if flagged_turns_by_episode[episode_id] > episode["turn_count"]:
+            raise SystemExit(f"{label}: flagged turn count must not exceed episode turn_count")
+        expected_flags = sorted(episode_flag_sets.get(episode_id, set()))
+        if episode["friction_flags"] != expected_flags:
+            raise SystemExit(f"{label}: episode friction_flags must match turn_flags.jsonl issue_flags")
+        expected_outcome = "needs_review" if expected_flags else "no_issue_observed"
+        if episode["outcome"] != expected_outcome:
+            raise SystemExit(f"{label}: episode outcome must match retained issue flags")
+    expected_turn_count = sum(episode["turn_count"] for episode in episodes)
+    expected_flagged_turn_count = len(turn_flags)
+    expected_flags = Counter(flag for turn in turn_flags for flag in turn["issue_flags"])
+    expected_hosts = Counter[str]()
+    expected_model_eras = Counter[str]()
+    for episode in episodes:
+        expected_hosts[episode["host"]] += episode["turn_count"]
+        expected_model_eras[episode["model_era"]] += episode["turn_count"]
+    if trend["episode_count"] != len(episodes):
+        raise SystemExit(f"{label}: episode_count must match episodes.jsonl")
+    if trend["turn_count"] != expected_turn_count:
+        raise SystemExit(f"{label}: turn_count must match episodes.jsonl turn_count total")
+    if trend["flagged_turn_count"] != expected_flagged_turn_count:
+        raise SystemExit(f"{label}: flagged_turn_count must match turn_flags.jsonl")
+    if trend["flags"] != dict(sorted(expected_flags.items())):
+        raise SystemExit(f"{label}: flags must match turn_flags.jsonl issue_flags")
+    if trend["hosts"] != dict(sorted(expected_hosts.items())):
+        raise SystemExit(f"{label}: hosts must match episodes.jsonl turn_count totals")
+    if trend["model_eras"] != dict(sorted(expected_model_eras.items())):
+        raise SystemExit(f"{label}: model_eras must match episodes.jsonl turn_count totals")
+
+
+def retained_export_records_from_files(
+    retained_files: dict[str, bytes],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    episodes = sanitize_retained_jsonl_bytes(
+        retained_files["episodes.jsonl"],
+        label="episodes.jsonl",
+        allowed=EPISODE_FIELDS,
+        strict=True,
+        validator=validate_episode_row,
+    )
+    turn_flags = sanitize_retained_jsonl_bytes(
+        retained_files["turn_flags.jsonl"],
+        label="turn_flags.jsonl",
+        allowed=TURN_FLAG_FIELDS,
+        strict=True,
+        validator=validate_turn_flag_row,
+    )
+    trend = sanitize_trend_report(history_json(retained_files["trend_report.json"], "trend_report.json"), label="trend_report.json", strict=True)
+    manifest = sanitize_retained_manifest_obj(
+        history_json(retained_files["retained_manifest.json"], "retained_manifest.json"),
+        label="retained_manifest.json",
+        strict=True,
+    )
+    return episodes, turn_flags, trend, manifest
+
+
 def validate_retained_export_parent(retained_files: dict[str, bytes], parent: str | None = None) -> str:
-    expected_parent = retained_export_expected_parent(retained_files)
+    episodes, turn_flags, trend, manifest = retained_export_records_from_files(retained_files)
+    validate_retained_export_consistency(episodes, turn_flags, trend, label="retained export")
+    expected_parent = retained_export_parent_for_records(trend, manifest)
     if parent is not None and parent != expected_parent:
         raise SystemExit("retained export directory does not match export mode")
     return expected_parent
@@ -2305,6 +2410,19 @@ def history_commit_non_first_parent_commits(repo: Path, commit: str) -> list[str
     if result.returncode != 0:
         raise SystemExit("failed to inspect --history-commit merge side history")
     return [oid for oid in result.stdout.splitlines() if oid and oid != commit]
+
+
+def history_commit_reachable_commits(repo: Path, commit: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--reverse", commit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit("failed to inspect --history-commit reachable history")
+    return [oid for oid in result.stdout.splitlines() if oid]
 
 
 def require_history_repo(history_repo: str | None) -> Path:
@@ -2582,6 +2700,16 @@ def validate_history_commit_merge_side_history(
                 raise SystemExit(f"--history-commit merge side history is not retention-safe: {exc}") from exc
 
 
+def validate_history_commit_reachable_history(repo: Path, history_commit: str) -> None:
+    for reachable_commit in history_commit_reachable_commits(repo, history_commit):
+        if reachable_commit == history_commit:
+            continue
+        try:
+            validate_history_tree_ref(repo, reachable_commit)
+        except SystemExit as exc:
+            raise SystemExit(f"--history-commit reachable history is not retention-safe: {exc}") from exc
+
+
 def validate_history_follow_on_history(
     repo: Path,
     history_commit: str,
@@ -2622,6 +2750,7 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
         expected_parent,
         retained_files,
     )
+    validate_history_commit_reachable_history(repo, history_commit)
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
     parent_files: dict[str, set[str]] = defaultdict(set)
     for file_path in tree_files:
@@ -3487,6 +3616,8 @@ def retained_export_files_from_run(run_dir: Path) -> dict[str, bytes]:
         label=str(run_dir / "retained_manifest.json"),
         strict=False,
     )
+    validate_retained_export_consistency(episodes, turn_flags, trend, label=str(run_dir / "trend_report.json"))
+    retained_export_parent_for_records(trend, manifest)
     return {
         "episodes.jsonl": jsonl_bytes(episodes),
         "turn_flags.jsonl": jsonl_bytes(turn_flags),
@@ -3524,8 +3655,8 @@ def validate_retained_output_dir(run_dir: Path) -> tuple[dict[str, Any], dict[st
     for path in (episodes_path, turn_flags_path):
         if not path.exists():
             raise SystemExit(f"missing retained output: {path}")
-    sanitize_retained_jsonl(episodes_path, allowed=EPISODE_FIELDS, strict=True, validator=validate_episode_row)
-    sanitize_retained_jsonl(turn_flags_path, allowed=TURN_FLAG_FIELDS, strict=True, validator=validate_turn_flag_row)
+    episodes = sanitize_retained_jsonl(episodes_path, allowed=EPISODE_FIELDS, strict=True, validator=validate_episode_row)
+    turn_flags = sanitize_retained_jsonl(turn_flags_path, allowed=TURN_FLAG_FIELDS, strict=True, validator=validate_turn_flag_row)
     trend_path = run_dir / "trend_report.json"
     if not trend_path.exists():
         raise SystemExit(f"missing retained output: {trend_path}")
@@ -3536,6 +3667,7 @@ def validate_retained_output_dir(run_dir: Path) -> tuple[dict[str, Any], dict[st
     validate_retained_manifest(manifest_path)
     retained_manifest = sanitize_retained_manifest_obj(json.loads(manifest_path.read_text(encoding="utf-8")), label=str(manifest_path), strict=True)
     retained_export_parent_for_records(trend, retained_manifest)
+    validate_retained_export_consistency(episodes, turn_flags, trend, label=str(trend_path))
     return trend, retained_manifest
 
 

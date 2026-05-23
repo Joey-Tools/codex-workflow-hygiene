@@ -3268,6 +3268,64 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertFalse((retained_output / "shard_manifest.json").exists())
             self.assertFalse((retained_output / "shards.jsonl").exists())
 
+    def test_validate_retained_rejects_unknown_schema_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fix failed verification.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            bad_trend = export_retained(output, raw, "bad-trend-schema")
+            trend = json.loads((bad_trend / "trend_report.json").read_text(encoding="utf-8"))
+            trend["schema_version"] = 2
+            (bad_trend / "trend_report.json").write_text(json.dumps(trend) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "schema_version must be 1"):
+                MODULE.main(["validate-retained", "--run-dir", str(bad_trend)])
+
+            bad_manifest = export_retained(output, raw, "bad-manifest-schema")
+            manifest = json.loads((bad_manifest / "retained_manifest.json").read_text(encoding="utf-8"))
+            manifest["schema_version"] = 2
+            (bad_manifest / "retained_manifest.json").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "schema_version must be 1"):
+                MODULE.main(["validate-retained", "--run-dir", str(bad_manifest)])
+
+    def test_validate_retained_rejects_cross_file_inconsistency(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fix failed verification.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            bad_trend = export_retained(output, raw, "bad-trend-consistency")
+            trend = json.loads((bad_trend / "trend_report.json").read_text(encoding="utf-8"))
+            trend["flags"] = {}
+            (bad_trend / "trend_report.json").write_text(json.dumps(trend) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "flags must match turn_flags"):
+                MODULE.main(["validate-retained", "--run-dir", str(bad_trend)])
+
+            bad_episode = export_retained(output, raw, "bad-episode-consistency")
+            episodes = [json.loads(line) for line in (bad_episode / "episodes.jsonl").read_text(encoding="utf-8").splitlines()]
+            episodes[0]["friction_flags"] = []
+            write_jsonl(bad_episode / "episodes.jsonl", episodes)
+
+            with self.assertRaisesRegex(SystemExit, "episode friction_flags must match"):
+                MODULE.main(["validate-retained", "--run-dir", str(bad_episode)])
+
     def test_validate_retained_rejects_unexpected_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             retained_output = Path(raw) / "history-retained"
@@ -3738,7 +3796,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             for name in MODULE.RETAINED_OUTPUT_FILES:
                 (second_retained / name).write_bytes((retained / name).read_bytes())
             trend = json.loads((second_retained / "trend_report.json").read_text(encoding="utf-8"))
-            trend["flags"]["verification_gap"] = 1
+            trend["coverage_gaps"] = [{"host": "local", "reason": "history_missing"}]
             (second_retained / "trend_report.json").write_text(json.dumps(trend) + "\n", encoding="utf-8")
             parent = retained_parent_for_dir(second_retained)
             (history_repo / parent / "trend_report.json").write_text((second_retained / "trend_report.json").read_text(encoding="utf-8"), encoding="utf-8")
@@ -3926,6 +3984,54 @@ class SessionRetrospectiveTests(unittest.TestCase):
             commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
 
             with self.assertRaisesRegex(SystemExit, "merge side history is not retention-safe"):
+                MODULE.main(
+                    [
+                        "validate-history-commit",
+                        "--retained-run-dir",
+                        str(retained),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        commit,
+                    ]
+                )
+
+    def test_validate_history_commit_rejects_reachable_raw_artifact_history(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-08T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo = Path(raw) / "history-linear-raw"
+            history_repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-q"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=history_repo, check=True)
+            add_expected_history_origin(history_repo)
+            raw_artifact = history_repo / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-raw.jsonl"
+            raw_artifact.parent.mkdir(parents=True)
+            raw_artifact.write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "sessions"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Accidentally add raw rollout"], cwd=history_repo, check=True)
+            subprocess.run(["git", "rm", "-q", "-r", "sessions"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Remove raw rollout"], cwd=history_repo, check=True)
+            target = history_repo / retained_parent_for_dir(retained)
+            target.mkdir(parents=True)
+            for name in MODULE.RETAINED_OUTPUT_FILES:
+                (target / name).write_bytes((retained / name).read_bytes())
+            subprocess.run(["git", "add", "retained"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add retained export"], cwd=history_repo, check=True)
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            with self.assertRaisesRegex(SystemExit, "reachable history is not retention-safe"):
                 MODULE.main(
                     [
                         "validate-history-commit",
@@ -6566,6 +6672,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
             MODULE.sanitize_trend_report(trend, label="trend", strict=True)
         with self.assertRaisesRegex(SystemExit, "retained export mode is not supported"):
             MODULE.retained_export_parent_for_mode("baseline-customer_acme")
+
+    def test_private_network_addresses_are_redacted_and_rejected(self) -> None:
+        redacted, changed = MODULE.redact("Inspect 169.254.169.254 and fc00::1 before continuing.")
+
+        self.assertTrue(changed)
+        self.assertNotIn("169.254.169.254", redacted)
+        self.assertNotIn("fc00::1", redacted)
+        for text in ("169.254.169.254", "100.64.0.1", "fc00::1", "::1", "fe80::1"):
+            with self.subTest(text=text):
+                self.assertTrue(MODULE.contains_unredacted_sensitive_text(text))
 
     def test_custom_source_host_is_bucketed_in_retained_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
