@@ -110,7 +110,9 @@ PATH_REF_PATTERN = re.compile(r"^path_ref_v1:[0-9a-f]{16}$")
 SESSION_REF_PREFIX = "session_ref_v1"
 EPISODE_REF_PREFIX = "episode_ref_v1"
 TURN_REF_PREFIX = "turn_ref_v1"
+SOURCE_HASH_PREFIX = "source_hash_v1"
 OPAQUE_ID_PATTERN = re.compile(r"^(?:session_ref_v1|episode_ref_v1|turn_ref_v1):[0-9a-f]{20}$")
+SOURCE_HASH_PATTERN = re.compile(r"^source_hash_v1:[0-9a-f]{20}$")
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 BARE_64_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
 INTERNAL_HOSTNAME_PATTERN = re.compile(
@@ -512,7 +514,7 @@ def file_source_hash(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+    return f"{SOURCE_HASH_PREFIX}:{digest.hexdigest()[:20]}"
 
 
 def ensure_safe_output_dir(path: Path) -> Path:
@@ -755,9 +757,17 @@ def unsafe_source_rollouts(source: Source) -> list[Path]:
 
 
 def source_summary_files(source: Source) -> list[Path]:
+    return sorted(path for path in source_summary_candidates(source) if safe_source_file(path, source.root))
+
+
+def source_summary_candidates(source: Source) -> list[Path]:
     if not source.root.exists():
         return []
-    return sorted(path for path in source.root.rglob("rollout-summary*.jsonl") if safe_source_file(path, source.root))
+    return sorted(source.root.rglob("rollout-summary*.jsonl"))
+
+
+def unsafe_source_summaries(source: Source) -> list[Path]:
+    return sorted(path for path in source_summary_candidates(source) if not safe_source_file(path, source.root))
 
 
 def rollout_window_date(path: Path) -> dt.datetime | None:
@@ -1561,8 +1571,8 @@ def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
     if not PATH_REF_PATTERN.fullmatch(row["source_path"]):
         raise SystemExit(f"{label}.source_path: retained refs must use opaque {PATH_REF_PREFIX} values")
     source_hash = require_string(row["source_hash"], label=f"{label}.source_hash")
-    if not re.fullmatch(r"[0-9a-f]{64}", source_hash):
-        raise SystemExit(f"{label}.source_hash: expected keyed hex digest")
+    if not SOURCE_HASH_PATTERN.fullmatch(source_hash):
+        raise SystemExit(f"{label}.source_hash: expected opaque keyed source hash")
     require_timestamp_or_none(row["timestamp"], label=f"{label}.timestamp")
     require_path_ref_or_none(row["cwd"], label=f"{label}.cwd")
     require_retained_model_id_or_none(row["model"], label=f"{label}.model")
@@ -1985,8 +1995,22 @@ def history_path_kind(file_path: str) -> str:
 
 
 def history_commit_changed_files(repo: Path, commit: str) -> set[str]:
+    parents = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--parents", "-n", "1", commit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if parents.returncode != 0:
+        raise SystemExit("failed to inspect --history-commit parents")
+    parent_commits = parents.stdout.strip().split()[1:]
+    if parent_commits:
+        command = ["git", "-C", str(repo), "diff", "--name-only", "-z", parent_commits[0], commit]
+    else:
+        command = ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--root", "-r", "-z", "--name-only", commit]
     changed = subprocess.run(
-        ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--root", "-r", "-m", "-z", "--name-only", commit],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -2411,7 +2435,7 @@ def remote_evidence_gaps(
 def remote_materialization_gaps(source: Source) -> list[dict[str, Any]]:
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return []
-    if not unsafe_source_rollouts(source):
+    if not unsafe_source_rollouts(source) and not unsafe_source_summaries(source):
         return []
     return [remote_metadata_gap(source, "remote_source_not_materialized")]
 
@@ -2643,6 +2667,8 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
+        source_materialization_gaps = remote_materialization_gaps(source)
+        coverage_gaps.extend(source_materialization_gaps)
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
         manifest_sources.append(
@@ -2652,7 +2678,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                 "root_ref": path_ref(source.root),
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
-                "status": "ready" if rollouts or summaries else "empty",
+                "status": "ready" if rollouts or summaries else "stale" if source_materialization_gaps else "empty",
             }
         )
     if getattr(args, "allow_partial_hosts", False):

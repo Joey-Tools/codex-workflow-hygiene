@@ -30,6 +30,7 @@ SPEC.loader.exec_module(MODULE)
 VALID_TURN_ID = f"{MODULE.TURN_REF_PREFIX}:{'a' * 20}"
 VALID_EPISODE_ID = f"{MODULE.EPISODE_REF_PREFIX}:{'b' * 20}"
 VALID_SESSION_ID = f"{MODULE.SESSION_REF_PREFIX}:{'c' * 20}"
+VALID_SOURCE_HASH = f"{MODULE.SOURCE_HASH_PREFIX}:{'d' * 20}"
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -797,7 +798,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
             plain_hash = MODULE.file_hash(rollout)
 
-        self.assertRegex(turns[0].source_hash, r"^[0-9a-f]{64}$")
+        self.assertRegex(turns[0].source_hash, r"^source_hash_v1:[0-9a-f]{20}$")
         self.assertNotEqual(turns[0].source_hash, plain_hash)
 
     def test_summary_session_id_is_opaque(self) -> None:
@@ -3087,6 +3088,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "add", "retained"], cwd=history_repo, check=True)
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add retained export"], cwd=history_repo, check=True)
             subprocess.run(["git", "checkout", "-q", default_branch], cwd=history_repo, check=True)
+            (history_repo / "README.md").write_text("# History\n\nLocal documentation update.\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Update docs"], cwd=history_repo, check=True)
             subprocess.run(["git", "merge", "--no-ff", "-m", "Merge retained export", "retained-export"], cwd=history_repo, check=True)
             commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
 
@@ -4381,6 +4385,54 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
         self.assertEqual(manifest["sources"][0]["status"], "stale")
 
+    def test_default_remote_symlink_summary_reports_materialization_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            target = Path(raw) / "outside-summary.jsonl"
+            write_jsonl(target, [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"}])
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-remote.jsonl"
+            summary.parent.mkdir(parents=True)
+            summary.symlink_to(target)
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+        self.assertEqual(manifest["sources"][0]["summary_count"], 0)
+
+    def test_discover_reports_default_remote_materialization_gaps(self) -> None:
+        for filename in ("rollout-2026-05-01T10-00-00-remote.jsonl", "rollout-summary-remote.jsonl"):
+            with self.subTest(filename=filename):
+                with tempfile.TemporaryDirectory() as raw:
+                    remote = Path(raw) / "miku-bot-dev"
+                    write_remote_metadata(remote, "miku-bot-dev")
+                    target = Path(raw) / f"outside-{filename}"
+                    write_jsonl(target, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
+                    unsafe = remote / "sessions" / "2026" / "05" / "01" / filename
+                    unsafe.parent.mkdir(parents=True)
+                    unsafe.symlink_to(target)
+                    output = safe_output_dir(raw)
+
+                    MODULE.run_discover(
+                        types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), allow_partial_hosts=True),
+                        mode="daily",
+                        start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                        end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    )
+                    manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+                self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in manifest["coverage_gaps"]])
+                self.assertEqual(manifest["sources"][0]["status"], "stale")
+
     def test_default_remote_non_ready_metadata_preserves_common_gap_reasons(self) -> None:
         for reason in ("missing_codex", "codex_missing", "unreachable", "host_unreachable"):
             with self.subTest(reason=reason):
@@ -4927,7 +4979,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "host": "local",
                 "session_id": VALID_SESSION_ID,
                 "source_path": "path_ref_v1:0123456789abcdef",
-                "source_hash": "0" * 64,
+                "source_hash": VALID_SOURCE_HASH,
                 "timestamp": "2026-05-22T10:00:00Z",
                 "cwd": None,
                 "model": None,
@@ -4970,7 +5022,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "host": "local",
             "session_id": "customer-incident-123",
             "source_path": "path_ref_v1:0123456789abcdef",
-            "source_hash": "0" * 64,
+            "source_hash": VALID_SOURCE_HASH,
             "timestamp": "2026-05-22T10:00:00Z",
             "cwd": None,
             "model": None,
@@ -5007,7 +5059,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "host": "local",
             "session_id": VALID_SESSION_ID,
             "source_path": "path_ref_v1:0123456789abcdef",
-            "source_hash": "0" * 64,
+            "source_hash": VALID_SOURCE_HASH,
             "timestamp": "2026-05-22T10:00:00Z",
             "cwd": None,
             "model": None,
@@ -5044,7 +5096,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "host": "local",
             "session_id": VALID_SESSION_ID,
             "source_path": "path_ref_v1:0123456789abcdef",
-            "source_hash": "0" * 64,
+            "source_hash": VALID_SOURCE_HASH,
             "timestamp": "2026-05-22T10:00:00Z",
             "cwd": None,
             "model": "customer_acme_model",
@@ -5065,7 +5117,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "host": "local",
             "session_id": VALID_SESSION_ID,
             "source_path": "path_ref_v1:0123456789abcdef",
-            "source_hash": "0" * 64,
+            "source_hash": VALID_SOURCE_HASH,
             "timestamp": "2026-05-22T10:00:00Z",
             "cwd": None,
             "model": None,
@@ -5523,7 +5575,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             host="miku-bot-dev",
             session_id="s1",
             source_path="/tmp/rollout.jsonl",
-            source_hash="hash",
+            source_hash=VALID_SOURCE_HASH,
             timestamp="2026-05-22T10:00:00Z",
             cwd="/repo",
             model="gpt-5.5",
