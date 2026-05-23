@@ -2942,6 +2942,47 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 ]
             )
 
+    def test_validate_history_commit_rejects_identifier_retained_export_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-08T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo = Path(raw) / "history-identifier-parent"
+            history_repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-q"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=history_repo, check=True)
+            subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=history_repo, check=True)
+            add_expected_history_origin(history_repo)
+            target = history_repo / "customer-acme"
+            target.mkdir(parents=True)
+            for name in MODULE.RETAINED_OUTPUT_FILES:
+                (target / name).write_bytes((retained / name).read_bytes())
+            subprocess.run(["git", "add", "customer-acme"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add retained export"], cwd=history_repo, check=True)
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=history_repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            with self.assertRaisesRegex(SystemExit, "does not contain exactly one retained export"):
+                MODULE.main(
+                    [
+                        "validate-history-commit",
+                        "--retained-run-dir",
+                        str(retained),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        commit,
+                    ]
+                )
+
     def test_validate_history_tree_accepts_clean_follow_on_report_commit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2964,6 +3005,24 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add redacted report"], cwd=history_repo, check=True)
 
             MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_unexpected_retained_paths(self) -> None:
+        for relative_path in (
+            "reports/customer-acme/summary.md",
+            "data/episodes/customer-acme/episodes.jsonl",
+            "data/trends/customer-acme/trend_report.json",
+        ):
+            with self.subTest(relative_path=relative_path):
+                with tempfile.TemporaryDirectory() as raw:
+                    history_repo, _commit = write_history_repo(raw)
+                    artifact = history_repo / relative_path
+                    artifact.parent.mkdir(parents=True)
+                    artifact.write_text("\n", encoding="utf-8")
+                    subprocess.run(["git", "add", relative_path], cwd=history_repo, check=True)
+                    subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add unexpected path"], cwd=history_repo, check=True)
+
+                    with self.assertRaisesRegex(SystemExit, "unexpected artifact"):
+                        MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
     def test_validate_history_tree_rejects_internal_hostname_in_follow_on_report(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -4651,6 +4710,23 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("approval_auth_friction", rows[0]["issue_flags"])
         self.assertNotIn("customer", json.dumps(rows[0]))
 
+    def test_unknown_rollout_summary_kind_is_bucketed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {"kind": "session_meta", "timestamp": "2026-05-22T10:00:00Z", "text": "session_id=s1"},
+                    {"kind": "acme_incident_123", "timestamp": "2026-05-22T10:01:00Z", "text": "permission denied"},
+                ],
+            )
+
+            turns = MODULE.extract_summary_file(MODULE.Source("remote", root), summary, None, None)
+
+        self.assertEqual(turns[0].redacted_user_prompt_summary, "category=remote_rollout_summary; summary_kind=other_summary")
+        self.assertNotIn("acme", json.dumps(MODULE.asdict_turn(turns[0])))
+
     def test_rollout_summary_privacy_marker_contributes_flag_without_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "remote"
@@ -4834,6 +4910,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("redactions=applied", rows[0]["redacted_user_prompt_summary"])
 
     def test_unsafe_model_id_is_bucketed_for_retained_outputs(self) -> None:
+        self.assertIsNone(MODULE.retained_model_id("customer_acme_model"))
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)

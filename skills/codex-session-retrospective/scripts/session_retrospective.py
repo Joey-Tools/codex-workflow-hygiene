@@ -116,6 +116,7 @@ INTERNAL_HOSTNAME_PATTERN = re.compile(
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
+RETAINED_SUMMARY_KINDS = frozenset(("summary", "function_call_output"))
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
 HISTORY_FORBIDDEN_FILENAMES = frozenset((*TRANSIENT_OUTPUT_FILES, *LOCAL_EVIDENCE_FILES, REMOTE_SOURCE_METADATA_FILE))
@@ -174,8 +175,7 @@ HISTORY_TEXT_EXTENSIONS = (".md", ".txt")
 HISTORY_JSON_EXTENSIONS = (".json",)
 HISTORY_STRIPPABLE_NAME_SUFFIXES = frozenset((*HISTORY_TEXT_EXTENSIONS, *HISTORY_JSON_EXTENSIONS, ".jsonl"))
 HISTORY_ROOT_FILES = frozenset((".gitignore", "AGENTS.md", "README.md"))
-HISTORY_TEXT_PREFIXES = ("annotations/", "indexes/", "reports/")
-HISTORY_JSON_PREFIXES = ("annotations/", "indexes/", "schemas/")
+HISTORY_FLAT_RETAINED_EXPORT_PARENTS = frozenset(("retained/daily", "retained/weekly", "retained/baseline"))
 EPISODE_FIELDS = {
     "episode_id",
     "host",
@@ -946,9 +946,13 @@ def retained_model_id(model: str | None) -> str | None:
     era = infer_model_era(model, None)
     if era != "other-model":
         return era
-    if safe_token(model):
-        return model
     return None
+
+
+def retained_summary_kind(kind: str) -> str:
+    if kind in RETAINED_SUMMARY_KINDS:
+        return kind
+    return "other_summary"
 
 
 def extract_rollout(
@@ -1132,6 +1136,7 @@ def extract_summary_file(
         parsed_timestamp = summary_timestamp_with_fallback(record, path)
         text = str(record.get("text") or "")
         kind = str(record.get("kind") or "summary")
+        retained_kind = retained_summary_kind(kind)
         if kind == "session_meta" and text:
             match = re.search(r"session_id=([^\s]+)", text)
             if match:
@@ -1151,7 +1156,7 @@ def extract_summary_file(
             continue
         timestamp_value = timestamp if parse_time(timestamp) else (iso(parsed_timestamp) if parsed_timestamp else None)
         date_bucket = parsed_timestamp.date().isoformat()
-        episode_id = opaque_episode_id("|".join([source.host, session_id, "rollout-summary", date_bucket, kind]))
+        episode_id = opaque_episode_id("|".join([source.host, session_id, "rollout-summary", date_bucket, retained_kind]))
         turns.append(
             TurnSummary(
                 turn_id=opaque_turn_id(f"{source.host}|{path_ref(path)}|{line_no}|{timestamp}"),
@@ -1164,7 +1169,7 @@ def extract_summary_file(
                 cwd=None,
                 model=None,
                 model_era=infer_model_era(None, timestamp_value),
-                redacted_user_prompt_summary=f"category=remote_rollout_summary; summary_kind={kind}",
+                redacted_user_prompt_summary=f"category=remote_rollout_summary; summary_kind={retained_kind}",
                 assistant_action_summary="summary_source=remote_rollout_summary",
                 issue_flags=sorted(flags),
                 prompt_improvement=None,
@@ -1778,25 +1783,62 @@ def history_text_contains_retention_risk(data: bytes, file_path: str) -> bool:
         text = text.replace("https://json-schema.org/draft/2020-12/schema", "")
     if contains_unredacted_sensitive_text(text) or BARE_64_HEX_PATTERN.search(text):
         return True
-    generated_follow_on = file_path.startswith(HISTORY_TEXT_PREFIXES) or file_path.startswith(HISTORY_JSON_PREFIXES)
+    generated_follow_on = history_path_kind(file_path) in {"text", "json_text"}
     return generated_follow_on and contains_path_like_text(text)
 
 
-def history_path_kind(file_path: str) -> str:
-    name = file_path.rsplit("/", 1)[-1]
-    if name == "episodes.jsonl" or (file_path.startswith("data/episodes/") and file_path.endswith(".jsonl")):
+def history_safe_year_month(parts: tuple[str, ...], start: int) -> bool:
+    return len(parts) > start + 1 and bool(re.fullmatch(r"\d{4}", parts[start]) and re.fullmatch(r"\d{2}", parts[start + 1]))
+
+
+def history_report_path_allowed(parts: tuple[str, ...]) -> bool:
+    if len(parts) == 5 and parts[0] == "reports" and parts[1] in {"daily", "weekly"}:
+        return bool(
+            history_safe_year_month(parts, 2)
+            and parts[4].endswith(".md")
+            and re.fullmatch(r"\d{2}", Path(parts[4]).stem)
+        )
+    return len(parts) == 4 and parts[:3] == ("reports", "baseline", "90-day-windows") and parts[3].endswith(".md")
+
+
+def history_flat_retained_export_parent_allowed(parent: str) -> bool:
+    return parent in HISTORY_FLAT_RETAINED_EXPORT_PARENTS
+
+
+def history_flat_retained_export_kind(parent: str, name: str) -> str | None:
+    if not history_flat_retained_export_parent_allowed(parent):
+        return None
+    if name == "episodes.jsonl":
         return "episodes"
-    if name == "turn_flags.jsonl" or (file_path.startswith("data/turn_flags/") and file_path.endswith(".jsonl")):
+    if name == "turn_flags.jsonl":
         return "turn_flags"
-    if name == "trend_report.json" or (file_path.startswith("data/trends/") and file_path.endswith(".json")):
+    if name == "trend_report.json":
         return "trend"
-    if name == "retained_manifest.json" or (file_path.startswith("data/manifests/") and file_path.endswith(".json")):
+    if name == "retained_manifest.json":
+        return "manifest"
+    return None
+
+
+def history_path_kind(file_path: str) -> str:
+    parts = tuple(file_path.split("/"))
+    name = file_path.rsplit("/", 1)[-1]
+    parent = file_path.rpartition("/")[0]
+    flat_kind = history_flat_retained_export_kind(parent, name)
+    if flat_kind:
+        return flat_kind
+    if len(parts) == 5 and parts[:2] == ("data", "episodes") and history_safe_year_month(parts, 2) and name.endswith(".jsonl"):
+        return "episodes"
+    if len(parts) == 5 and parts[:2] == ("data", "turn_flags") and history_safe_year_month(parts, 2) and name.endswith(".jsonl"):
+        return "turn_flags"
+    if len(parts) == 5 and parts[:2] == ("data", "trends") and history_safe_year_month(parts, 2) and name.endswith(".json"):
+        return "trend"
+    if len(parts) == 5 and parts[:2] == ("data", "manifests") and history_safe_year_month(parts, 2) and name.endswith(".json"):
         return "manifest"
     if file_path in HISTORY_ROOT_FILES or file_path in {"data/README.md", "reports/README.md"}:
         return "text"
-    if file_path.endswith(HISTORY_TEXT_EXTENSIONS) and file_path.startswith(HISTORY_TEXT_PREFIXES):
+    if history_report_path_allowed(parts):
         return "text"
-    if file_path.endswith(HISTORY_JSON_EXTENSIONS) and file_path.startswith(HISTORY_JSON_PREFIXES):
+    if len(parts) == 2 and parts[0] == "schemas" and parts[1].endswith(".schema.json"):
         return "json_text"
     raise SystemExit(f"history tree contains unexpected artifact: {file_path}")
 
@@ -1979,9 +2021,14 @@ def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
         parent_files[parent].add(name)
     for parent, names in parent_files.items():
         retained_names = names & set(RETAINED_OUTPUT_FILES)
-        if retained_names and names != set(RETAINED_OUTPUT_FILES):
-            label = parent or "."
-            raise SystemExit(f"history retained export directory is incomplete or has extra files: {label}")
+        if not retained_names:
+            continue
+        if history_flat_retained_export_parent_allowed(parent):
+            if names != set(RETAINED_OUTPUT_FILES):
+                label = parent or "."
+                raise SystemExit(f"history retained export directory is incomplete or has extra files: {label}")
+        elif parent.startswith("retained/"):
+            raise SystemExit(f"history retained export directory is not allowed: {parent}")
     for file_path in files:
         if forbidden_history_artifact(file_path):
             raise SystemExit(f"history tree contains forbidden transient/raw artifact: {file_path}")
@@ -2030,7 +2077,7 @@ def validate_history_commit(history_repo: str | None, history_commit: str, retai
             raise SystemExit(f"--history-commit contains forbidden transient/raw artifact: {file_path}")
         parent, _, name = file_path.rpartition("/")
         parent_files[parent].add(name)
-        if name in RETAINED_OUTPUT_FILES:
+        if name in RETAINED_OUTPUT_FILES and history_flat_retained_export_parent_allowed(parent):
             grouped[parent][name] = file_path
     expected_digest = retained_export_digest(retained_files)
     for parent, paths in grouped.items():
