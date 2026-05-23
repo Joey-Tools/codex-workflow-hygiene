@@ -266,6 +266,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(
             MODULE.meaningful_user_text("Run a read-only daily retrospective over Joey's Codex session activity.")
         )
+        self.assertTrue(
+            MODULE.meaningful_user_text(
+                "The retrospective failed after writing to .codex-local/session-retrospective/runs/latest."
+            )
+        )
 
     def test_default_sources_include_remote_hosts_as_missing_until_materialized(self) -> None:
         sources = MODULE.parse_sources(None)
@@ -2983,6 +2988,21 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             subprocess.run(["git", "add", "reports/weekly/2026/05/08.md"], cwd=history_repo, check=True)
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add private key"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "sensitive text"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_pgp_private_key_in_follow_on_report(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            report = history_repo / "reports" / "weekly" / "2026" / "05" / "08.md"
+            report.parent.mkdir(parents=True)
+            report.write_text(
+                "Mistaken retained text:\n-----BEGIN PGP PRIVATE KEY BLOCK-----\nredacted\n-----END PGP PRIVATE KEY BLOCK-----\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "reports/weekly/2026/05/08.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add PGP private key"], cwd=history_repo, check=True)
 
             with self.assertRaisesRegex(SystemExit, "sensitive text"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])

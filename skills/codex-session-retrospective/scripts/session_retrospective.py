@@ -37,7 +37,6 @@ AUTOMATION_PROMPT_PATTERNS = (
     re.compile(r"^Run inside the dedicated worktree provisioned for this automation\b", re.I),
     re.compile(r"^Use \$codex-session-retrospective to run\b", re.I),
     re.compile(r"^Use the installed codex-session-retrospective workflow\b", re.I),
-    re.compile(r"\bWrite task-local artifacts under \.codex-local/session-retrospective\b", re.I),
 )
 
 AUTOMATION_PROMPT_MARKERS = (
@@ -51,10 +50,10 @@ AUTOMATION_PROMPT_MARKERS = (
 
 SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
-        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.I),
+        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----", re.I),
         "[REDACTED_PRIVATE_KEY]",
     ),
-    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.I), "[REDACTED_PRIVATE_KEY]"),
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----", re.I), "[REDACTED_PRIVATE_KEY]"),
     (
         re.compile(r"\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b"),
         "[REDACTED_SECRET]",
