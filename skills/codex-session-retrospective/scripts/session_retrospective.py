@@ -2047,17 +2047,48 @@ def require_history_worktree_clean(repo: Path) -> None:
         raise SystemExit("--history-repo worktree must be clean before advancing state")
 
 
-def history_tree_files(repo: Path, ref: str) -> list[str]:
+@dataclasses.dataclass(frozen=True)
+class HistoryTreeEntry:
+    mode: str
+    object_type: str
+    path: str
+
+
+def history_tree_entries(repo: Path, ref: str) -> dict[str, HistoryTreeEntry]:
     require_history_commit(repo, ref)
     tree = subprocess.run(
-        ["git", "-C", str(repo), "ls-tree", "-r", "-z", "--name-only", ref],
+        ["git", "-C", str(repo), "ls-tree", "-r", "-z", ref],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
     )
     if tree.returncode != 0:
         raise SystemExit("failed to inspect history tree")
-    return [raw_name.decode("utf-8", errors="surrogateescape") for raw_name in tree.stdout.split(b"\0") if raw_name]
+    entries: dict[str, HistoryTreeEntry] = {}
+    for raw_entry in tree.stdout.split(b"\0"):
+        if not raw_entry:
+            continue
+        raw_meta, separator, raw_path = raw_entry.partition(b"\t")
+        if not separator:
+            raise SystemExit("failed to parse history tree")
+        meta = raw_meta.decode("utf-8", errors="replace").split()
+        if len(meta) < 3:
+            raise SystemExit("failed to parse history tree")
+        file_path = raw_path.decode("utf-8", errors="surrogateescape")
+        entries[file_path] = HistoryTreeEntry(mode=meta[0], object_type=meta[1], path=file_path)
+    return entries
+
+
+def require_regular_history_blob(entries: dict[str, HistoryTreeEntry], file_path: str) -> None:
+    entry = entries.get(file_path)
+    if entry is None:
+        raise SystemExit(f"missing history artifact: {file_path}")
+    if entry.object_type != "blob" or entry.mode not in {"100644", "100755"}:
+        raise SystemExit(f"history artifact is not a regular file: {file_path}")
+
+
+def history_tree_files(repo: Path, ref: str) -> list[str]:
+    return list(history_tree_entries(repo, ref))
 
 
 def history_blob(repo: Path, ref: str, file_path: str) -> bytes:
@@ -2084,7 +2115,8 @@ def retained_export_paths(parent: str) -> dict[str, str]:
 
 
 def require_retained_export_in_history_ref(repo: Path, ref: str, parent: str, retained_files: dict[str, bytes]) -> None:
-    tree_files = set(history_tree_files(repo, ref))
+    entries = history_tree_entries(repo, ref)
+    tree_files = set(entries)
     expected_paths = retained_export_paths(parent)
     missing = [path for path in expected_paths.values() if path not in tree_files]
     if missing:
@@ -2095,6 +2127,8 @@ def require_retained_export_in_history_ref(repo: Path, ref: str, parent: str, re
         descendant_paths = {file_path for file_path in tree_files if "/" not in file_path}
     if descendant_paths != set(expected_paths.values()):
         raise SystemExit("--history-ref retained export directory changed after --history-commit")
+    for file_path in expected_paths.values():
+        require_regular_history_blob(entries, file_path)
     actual = {name: history_blob(repo, ref, file_path) for name, file_path in expected_paths.items()}
     if actual != retained_files:
         raise SystemExit("--history-ref retained export content changed after --history-commit")
@@ -2102,7 +2136,8 @@ def require_retained_export_in_history_ref(repo: Path, ref: str, parent: str, re
 
 def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
     repo = require_history_repo(history_repo)
-    files = history_tree_files(repo, history_ref)
+    entries = history_tree_entries(repo, history_ref)
+    files = list(entries)
     parent_files: dict[str, set[str]] = defaultdict(set)
     for file_path in files:
         parent, _, name = file_path.rpartition("/")
@@ -2120,6 +2155,7 @@ def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
         elif parent.startswith("retained/"):
             raise SystemExit(f"history retained export directory is not allowed: {parent}")
     for file_path in files:
+        require_regular_history_blob(entries, file_path)
         if forbidden_history_artifact(file_path):
             raise SystemExit(f"history tree contains forbidden transient/raw artifact: {file_path}")
         kind = history_path_kind(file_path)
@@ -2158,12 +2194,14 @@ def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
 def validate_history_commit(history_repo: str | None, history_commit: str, retained_files: dict[str, bytes]) -> str:
     repo = require_history_repo(history_repo)
     require_history_commit(repo, history_commit)
-    tree_files = set(history_tree_files(repo, history_commit))
+    entries = history_tree_entries(repo, history_commit)
+    tree_files = set(entries)
     changed_files = history_commit_changed_files(repo, history_commit)
     expected_parent = validate_retained_export_parent(retained_files)
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
     parent_files: dict[str, set[str]] = defaultdict(set)
     for file_path in tree_files:
+        require_regular_history_blob(entries, file_path)
         if forbidden_history_artifact(file_path):
             raise SystemExit(f"--history-commit contains forbidden transient/raw artifact: {file_path}")
         parent, _, name = file_path.rpartition("/")

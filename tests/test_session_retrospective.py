@@ -3196,6 +3196,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
+    def test_validate_history_tree_rejects_symlink_report_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="weekly",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-08T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, _commit = write_history_repo(raw, retained)
+            report = history_repo / "reports" / "weekly" / "2026" / "05" / "08.md"
+            report.parent.mkdir(parents=True)
+            os.symlink("safe-summary.md", report)
+            subprocess.run(["git", "add", "reports/weekly/2026/05/08.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add symlink report"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "not a regular file"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
     def test_validate_history_tree_rejects_private_key_in_follow_on_report(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             history_repo, _commit = write_history_repo(raw)
