@@ -1149,14 +1149,17 @@ def summary_file_maybe_relevant_without_read(path: Path, start: dt.datetime | No
 
 
 def summary_file_has_truncated_scan(path: Path) -> bool:
-    for _line_no, record in iter_jsonl(path):
-        if str(record.get("kind") or "") != "scan_meta":
-            continue
-        if record.get("scan_truncated") is True:
-            return True
-        text = str(record.get("text") or "")
-        if "scan_truncated=true" in text:
-            return True
+    try:
+        for _line_no, record in iter_jsonl(path):
+            if str(record.get("kind") or "") != "scan_meta":
+                continue
+            if record.get("scan_truncated") is True:
+                return True
+            text = str(record.get("text") or "")
+            if "scan_truncated=true" in text:
+                return True
+    except ValueError:
+        return False
     return False
 
 
@@ -2930,7 +2933,7 @@ def run_scan(
             source,
             rollouts,
             summaries,
-            start,
+            gap_start,
             end,
             max_scan_bytes=max_raw_bytes,
         )
@@ -3005,7 +3008,16 @@ def run_scan(
                 if summary_file_maybe_relevant_without_read(summary, gap_start, end):
                     append_oversized_summary_gap(summary, size)
                 continue
-            if first_jsonl_error(summary) is not None:
+            jsonl_error = first_jsonl_error(summary)
+            if summary_file_has_truncated_scan(summary) and summary_file_maybe_relevant_without_read(summary, gap_start, end):
+                coverage_gaps.append(
+                    {
+                        "host": source.host,
+                        "path_ref": path_ref(summary),
+                        "reason": "truncated_rollout_summary",
+                    }
+                )
+            if jsonl_error is not None:
                 if summary_file_relevant(summary, gap_start, end):
                     coverage_gaps.append(
                         {
@@ -3015,14 +3027,6 @@ def run_scan(
                         }
                     )
                 continue
-            if summary_file_has_truncated_scan(summary) and summary_file_maybe_relevant_without_read(summary, gap_start, end):
-                coverage_gaps.append(
-                    {
-                        "host": source.host,
-                        "path_ref": path_ref(summary),
-                        "reason": "truncated_rollout_summary",
-                    }
-                )
             if not summary_file_relevant(summary, start, end):
                 continue
             all_turns.extend(extract_summary_file(source, summary, start, end, emit_start=emit_start))
@@ -3284,7 +3288,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             rows.append(row)
             return
         jsonl_error = first_jsonl_error(summary)
-        if jsonl_error is None and summary_file_has_truncated_scan(summary):
+        if summary_file_has_truncated_scan(summary):
             if not summary_file_maybe_relevant_without_read(summary, start, end):
                 return
             row["status"] = "partial"

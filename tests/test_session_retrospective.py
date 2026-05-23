@@ -4431,7 +4431,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             raw_log.unlink()
             subprocess.run(["git", "add", "raw/tool-output.log"], cwd=history_repo, check=True)
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Remove raw side artifact"], cwd=history_repo, check=True)
-            subprocess.run(["git", "checkout", "-q", "master"], cwd=history_repo, check=True)
+            subprocess.run(["git", "checkout", "-q", retained_commit], cwd=history_repo, check=True)
             subprocess.run(["git", "merge", "--no-ff", "-m", "Merge side report", "unsafe-follow-on"], cwd=history_repo, check=True)
 
             with self.assertRaisesRegex(SystemExit, "history follow-on commit is not retention-safe"):
@@ -5790,6 +5790,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
         self.assertEqual(manifest["sources"][0]["status"], "ready")
 
+    def test_default_remote_incremental_summary_gap_uses_emit_start(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-old.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-03T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_default_remote_old_oversized_summary_relevance_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
@@ -6873,6 +6892,35 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertIn("truncated_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
 
+    def test_old_truncated_rollout_summary_with_later_bad_json_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text(
+                json.dumps(
+                    {
+                        "kind": "scan_meta",
+                        "timestamp": "",
+                        "text": "scan_truncated=true scan_bytes=2097152 source_bytes=3000000",
+                        "scan_truncated": True,
+                    }
+                )
+                + "\n{bad json\n",
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("truncated_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_future_truncated_rollout_summary_does_not_report_current_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "remote"
@@ -6914,6 +6962,46 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         "scan_truncated": True,
                     }
                 ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "partial")
+        self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_marks_truncated_summary_with_later_bad_json_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text(
+                json.dumps(
+                    {
+                        "kind": "scan_meta",
+                        "timestamp": "",
+                        "text": "scan_truncated=true scan_bytes=2097152 source_bytes=3000000",
+                        "scan_truncated": True,
+                    }
+                )
+                + "\n{bad json\n",
+                encoding="utf-8",
             )
             manifest = Path(raw) / "manifest.json"
             manifest.write_text(
@@ -7017,6 +7105,19 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("safety_privacy_flag", rows[0]["issue_flags"])
         self.assertNotIn("joey@example.com", json.dumps(rows[0]))
+
+    def test_remote_probe_redaction_only_sensitive_text_contributes_signal(self) -> None:
+        samples = [
+            "Contact joey@example.com",
+            "Open https://internal.example/ticket",
+            "Inspect /Users/hoteng/customer/repo",
+            "customer_id=AcmeCorp",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                signal = REMOTE_PROBE._safe_summary_text("user_message", sample)
+                self.assertIn("secret", signal)
+                self.assertNotIn(sample, signal)
 
     def test_out_of_window_summary_meta_still_sets_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
