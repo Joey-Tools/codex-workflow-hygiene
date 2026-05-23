@@ -245,6 +245,7 @@ ALLOWED_REMOTE_GAP_REASONS = {
     "missing_codex",
     "remote_source_not_materialized",
     "source_root_missing",
+    "source_root_symlink",
     "stale_host",
     "unreachable",
 }
@@ -724,6 +725,8 @@ def flags_for_text(text: str, *, redacted_changed: bool = False) -> set[str]:
 
 
 def safe_source_file(path: Path, root: Path) -> bool:
+    if root.is_symlink():
+        return False
     if path.is_symlink():
         return False
     try:
@@ -736,6 +739,8 @@ def safe_source_file(path: Path, root: Path) -> bool:
 
 
 def source_rollout_candidates(source: Source) -> list[Path]:
+    if source.root.is_symlink():
+        return []
     sessions = source.root / "sessions"
     search_roots = [sessions] if sessions.exists() else [source.root]
     archived = source.root / "archived_sessions"
@@ -762,7 +767,7 @@ def source_summary_files(source: Source) -> list[Path]:
 
 
 def source_summary_candidates(source: Source) -> list[Path]:
-    if not source.root.exists():
+    if not source.root.exists() or source.root.is_symlink():
         return []
     return sorted(source.root.rglob("rollout-summary*.jsonl"))
 
@@ -2471,6 +2476,12 @@ def source_allows_mtime_fallback(source: Source) -> bool:
     return source.host == "local" and local_source_is_canonical(source)
 
 
+def source_root_symlink_gap(source: Source) -> dict[str, Any] | None:
+    if source.root.is_symlink():
+        return {"host": source.host, "root_ref": path_ref(source.root), "reason": "source_root_symlink"}
+    return None
+
+
 def remote_metadata_gap(source: Source, reason: str = "stale_host") -> dict[str, Any]:
     if reason not in ALLOWED_REMOTE_GAP_REASONS:
         reason = "stale_host"
@@ -2479,6 +2490,8 @@ def remote_metadata_gap(source: Source, reason: str = "stale_host") -> dict[str,
 
 def remote_metadata_window(source: Source) -> tuple[dt.datetime, dt.datetime] | None:
     if source.host not in DEFAULT_REMOTE_HOSTS:
+        return None
+    if source.root.is_symlink():
         return None
     metadata_path = source.root / REMOTE_SOURCE_METADATA_FILE
     if not metadata_path.exists() or metadata_path.is_symlink() or not metadata_path.is_file():
@@ -2513,6 +2526,9 @@ def remote_evidence_gaps(
 ) -> list[dict[str, Any]]:
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return []
+    symlink_gap = source_root_symlink_gap(source)
+    if symlink_gap:
+        return [symlink_gap]
     metadata_path = source.root / REMOTE_SOURCE_METADATA_FILE
     if not metadata_path.exists() or metadata_path.is_symlink() or not metadata_path.is_file():
         return [remote_metadata_gap(source)]
@@ -2614,6 +2630,20 @@ def run_scan(
                     "rollout_count": 0,
                     "summary_count": 0,
                     "status": "missing",
+                }
+            )
+            continue
+        symlink_gap = source_root_symlink_gap(source)
+        if symlink_gap:
+            coverage_gaps.append(symlink_gap)
+            manifest_sources.append(
+                {
+                    "host": source.host,
+                    "root": source.root.as_posix(),
+                    "root_ref": path_ref(source.root),
+                    "rollout_count": 0,
+                    "summary_count": 0,
+                    "status": "stale",
                 }
             )
             continue
@@ -2780,6 +2810,20 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                 }
             )
             continue
+        symlink_gap = source_root_symlink_gap(source)
+        if symlink_gap:
+            coverage_gaps.append(symlink_gap)
+            manifest_sources.append(
+                {
+                    "host": source.host,
+                    "root": source.root.as_posix(),
+                    "root_ref": path_ref(source.root),
+                    "rollout_count": 0,
+                    "summary_count": 0,
+                    "status": "stale",
+                }
+            )
+            continue
         coverage_gaps.extend(local_evidence_gaps(source, require_canonical=not allow_partial_hosts))
         source_remote_gaps = remote_evidence_gaps(
             source,
@@ -2869,6 +2913,8 @@ def cmd_scan_daily(args: argparse.Namespace) -> int:
     if last and last < end:
         start = min(last, lookback_start)
         emit_start = last
+    elif last and last >= end:
+        raise SystemExit("retrospective state is already at or after scan end")
     else:
         start = lookback_start
         emit_start = None
@@ -3201,7 +3247,17 @@ def cmd_validate_history_commit(args: argparse.Namespace) -> int:
         raise SystemExit("--history-commit must be a full 40-character hex commit SHA")
     retained_run_dir = Path(args.retained_run_dir)
     validate_retained_output_dir(retained_run_dir)
-    validate_history_commit(args.history_repo, history_commit, retained_export_files_from_dir(retained_run_dir))
+    retained_files = retained_export_files_from_dir(retained_run_dir)
+    retained_parent = validate_history_commit(args.history_repo, history_commit, retained_files)
+    history_ref = str(args.history_ref or "")
+    if history_ref:
+        history_repo = require_history_repo(args.history_repo)
+        require_history_ancestor(history_repo, history_commit, history_ref)
+        require_history_ref_current_head(history_repo, history_ref)
+        require_history_worktree_clean(history_repo)
+        validate_history_follow_on_history(history_repo, history_commit, history_ref)
+        validate_history_tree(args.history_repo, history_ref)
+        require_retained_export_in_history_ref(history_repo, history_ref, retained_parent, retained_files)
     print(f"validated history commit: {history_commit}")
     return 0
 
@@ -3256,6 +3312,8 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
         raise SystemExit("trend_report.json window end must be a valid timestamp")
     if previous_scan_at and new_scan_at < previous_scan_at:
         raise SystemExit("refusing to move retrospective state backwards")
+    if previous_scan_at and new_scan_at == previous_scan_at:
+        raise SystemExit("refusing to advance retrospective state without a newer scan end")
     if previous_scan_at:
         window_start_at = parse_time(str(window.get("start") or ""))
         if window_start_at is None:
@@ -3345,6 +3403,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_history.add_argument("--retained-run-dir", required=True)
     validate_history.add_argument("--history-repo", required=True)
     validate_history.add_argument("--history-commit", required=True)
+    validate_history.add_argument("--history-ref")
     validate_history.set_defaults(func=cmd_validate_history_commit)
 
     validate_history_tree_parser = subparsers.add_parser("validate-history-tree")

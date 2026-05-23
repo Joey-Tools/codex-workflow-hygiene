@@ -1608,7 +1608,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["window"]["start"], "2026-05-21T10:00:00Z")
         self.assertEqual(state_after_scan["last_scan_at"], "2026-05-21T10:00:00Z")
 
-    def test_daily_existing_state_at_end_writes_valid_lookback_window(self) -> None:
+    def test_daily_existing_state_at_end_rejects_replay(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
@@ -1619,29 +1619,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state.parent.mkdir(parents=True, exist_ok=True)
             state.write_text(json.dumps({"last_scan_at": "2026-05-22T10:00:00Z"}), encoding="utf-8")
 
-            MODULE.main(
-                [
-                    "scan-daily",
-                    "--active-lookback-days",
-                    "14",
-                    "--end",
-                    "2026-05-22T10:00:00Z",
-                    "--state",
-                    str(state),
-                    "--source",
-                    f"local={root}",
-                    "--allow-partial-hosts",
-                    "--output",
-                    str(output),
-                ]
-            )
-            MODULE.main(["validate-output", "--run-dir", str(output)])
-            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            with self.assertRaisesRegex(SystemExit, "already at or after scan end"):
+                MODULE.main(
+                    [
+                        "scan-daily",
+                        "--active-lookback-days",
+                        "14",
+                        "--end",
+                        "2026-05-22T10:00:00Z",
+                        "--state",
+                        str(state),
+                        "--source",
+                        f"local={root}",
+                        "--allow-partial-hosts",
+                        "--output",
+                        str(output),
+                    ]
+                )
             state_after_scan = json.loads(state.read_text(encoding="utf-8"))
 
-        self.assertEqual(trend["turn_count"], 1)
-        self.assertEqual(trend["window"]["start"], "2026-05-08T10:00:00Z")
-        self.assertEqual(trend["window"]["end"], "2026-05-22T10:00:00Z")
+        self.assertFalse(output.exists())
         self.assertEqual(state_after_scan["last_scan_at"], "2026-05-22T10:00:00Z")
 
     def test_daily_existing_state_rejects_invalid_last_scan_at(self) -> None:
@@ -4513,6 +4510,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
             state_data = json.loads(state.read_text(encoding="utf-8"))
             self.assertEqual(state_data["last_scan_at"], "2026-05-03T00:00:00Z")
 
+    def test_advance_state_rejects_same_last_scan_at(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            remote_sources = write_default_remote_sources(raw)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Daily task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(json.dumps({"last_scan_at": "2026-05-02T00:00:00Z"}), encoding="utf-8")
+
+            with mock.patch.object(MODULE, "local_source_is_canonical", return_value=True):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}", *remote_sources], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            retained = export_retained(output, raw)
+
+            with self.assertRaisesRegex(SystemExit, "newer scan end"):
+                MODULE.main(
+                    [
+                        "advance-state",
+                        "--run-dir",
+                        str(output),
+                        "--retained-run-dir",
+                        str(retained),
+                        "--state",
+                        str(state),
+                        *history_commit_args(raw, retained),
+                    ]
+                )
+
+            state_data = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(state_data["last_scan_at"], "2026-05-02T00:00:00Z")
+
     def test_advance_state_rejects_invalid_previous_last_scan_at(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -4895,6 +4930,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
 
         self.assertEqual(gaps[0]["reason"], "auth_gated")
+
+    def test_default_remote_symlink_source_root_is_not_trusted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            target_remote = Path(raw) / "target-remote"
+            write_remote_metadata(target_remote, "miku-bot-dev")
+            rollout = target_remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            write_jsonl(rollout, [message("user", "Symlinked root task.", "2026-05-01T10:00:00Z")])
+            remote = Path(raw) / "miku-bot-dev"
+            remote.symlink_to(target_remote, target_is_directory=True)
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+            gaps = MODULE.remote_evidence_gaps(
+                MODULE.Source("miku-bot-dev", remote),
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["turn_count"], 0)
+        self.assertEqual(gaps[0]["reason"], "source_root_symlink")
+        self.assertIn("source_root_symlink", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+        self.assertEqual(manifest["sources"][0]["rollout_count"], 0)
 
     def test_default_remote_symlink_rollout_reports_materialization_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -5791,6 +5858,56 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 ]
             )
             MODULE.main(["validate-history-tree", "--history-repo", str(history_repo), "--history-ref", "HEAD"])
+
+    def test_validate_history_commit_with_history_ref_requires_unchanged_export(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, retained_commit = write_history_repo(raw, retained)
+            MODULE.main(
+                [
+                    "validate-history-commit",
+                    "--retained-run-dir",
+                    str(retained),
+                    "--history-repo",
+                    str(history_repo),
+                    "--history-commit",
+                    retained_commit,
+                    "--history-ref",
+                    "HEAD",
+                ]
+            )
+            manifest_path = history_repo / retained_parent_for_dir(retained) / "retained_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["retention_note"] = "Different retained export"
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+            subprocess.run(["git", "add", str(manifest_path.relative_to(history_repo))], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Modify retained export"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "content changed"):
+                MODULE.main(
+                    [
+                        "validate-history-commit",
+                        "--retained-run-dir",
+                        str(retained),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        retained_commit,
+                        "--history-ref",
+                        "HEAD",
+                    ]
+                )
 
     def test_validate_retained_rejects_raw_host_label(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
