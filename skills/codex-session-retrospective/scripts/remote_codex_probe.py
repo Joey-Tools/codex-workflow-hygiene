@@ -47,6 +47,18 @@ INTERNAL_HOSTNAME_SIGNAL_RE = re.compile(
     r"\b(?:[A-Za-z0-9-]+\.)+(?:internal|corp|local|lan|example|invalid|test)\b",
     re.I,
 )
+WRAPPER_PREFIXES = (
+    "# AGENTS.md instructions",
+    "<skill>",
+    "<environment_context>",
+    "<subagent_notification>",
+    "# Review findings:",
+    "<turn_aborted>",
+    "Persistent internal Codex readonly review contract:",
+    "Review discipline:",
+    "Review the code changes against the base branch",
+)
+WRAPPER_END_MARKERS = ("</INSTRUCTIONS>", "</environment_context>", "</skill>", "</subagent_notification>", "</turn_aborted>")
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
 REMOTE_FETCH_ROLLOUT_BEGIN = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_BEGIN__"
@@ -413,6 +425,8 @@ ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile({ARCHIVED_ROLLOUT_RELATIVE_RE.pattern!
 PRIVATE_IPV4_SIGNAL_RE = re.compile({PRIVATE_IPV4_SIGNAL_RE.pattern!r})
 PRIVATE_IPV6_SIGNAL_RE = re.compile({PRIVATE_IPV6_SIGNAL_RE.pattern!r}, re.I)
 INTERNAL_HOSTNAME_SIGNAL_RE = re.compile({INTERNAL_HOSTNAME_SIGNAL_RE.pattern!r}, re.I)
+WRAPPER_PREFIXES = {WRAPPER_PREFIXES!r}
+WRAPPER_END_MARKERS = {WRAPPER_END_MARKERS!r}
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
 SESSION_META_END = {REMOTE_SESSION_META_END!r}
 FETCH_ROLLOUT_BEGIN = {REMOTE_FETCH_ROLLOUT_BEGIN!r}
@@ -505,6 +519,21 @@ def message_summary_from_payload(payload):
     return kind, "\\n".join(parts)
 
 
+def meaningful_user_message_text(text):
+    stripped = str(text).strip()
+    if not stripped:
+        return ""
+    if any(stripped.startswith(prefix) for prefix in WRAPPER_PREFIXES):
+        for marker in WRAPPER_END_MARKERS:
+            index = stripped.rfind(marker)
+            if index >= 0:
+                candidate = stripped[index + len(marker):].strip()
+                if candidate and not any(candidate.startswith(prefix) for prefix in WRAPPER_PREFIXES):
+                    return candidate
+        return ""
+    return stripped
+
+
 def summary_signal_text(kind, text):
     signals = []
     if re.search(r"(?:exit(?:ed)?(?: with)? code [1-9]\\d*|failed|traceback|error:|permission denied)", text, re.I):
@@ -557,13 +586,18 @@ def event_user_message_text(payload):
 
 
 def summary_record(kind, text, *, line_no, timestamp, session_id=""):
-    value = normalize_text(safe_summary_text(kind, text), SUMMARY_MAX_TEXT_CHARS)
+    signal_text = text
+    if kind == "user_message":
+        signal_text = meaningful_user_message_text(text)
+        if not signal_text:
+            return None
+    value = normalize_text(safe_summary_text(kind, signal_text), SUMMARY_MAX_TEXT_CHARS)
     if not value:
         return None
     record = {{"kind": kind, "line": line_no, "text": value, "timestamp": timestamp or ""}}
     if session_id:
         record["session_id"] = str(session_id)
-    match_text = normalize_text(text, SUMMARY_MAX_TEXT_CHARS)
+    match_text = normalize_text(signal_text, SUMMARY_MAX_TEXT_CHARS)
     if match_text and match_text != value:
         record["_match_text"] = match_text
     return record
@@ -1277,6 +1311,21 @@ def _message_summary(payload: dict[str, Any]) -> tuple[str, str]:
     return kind, "\n".join(parts).strip()
 
 
+def _meaningful_user_message_text(text: str) -> str:
+    stripped = str(text).strip()
+    if not stripped:
+        return ""
+    if any(stripped.startswith(prefix) for prefix in WRAPPER_PREFIXES):
+        for marker in WRAPPER_END_MARKERS:
+            index = stripped.rfind(marker)
+            if index >= 0:
+                candidate = stripped[index + len(marker) :].strip()
+                if candidate and not any(candidate.startswith(prefix) for prefix in WRAPPER_PREFIXES):
+                    return candidate
+        return ""
+    return stripped
+
+
 def _summary_signal_text(kind: str, text: str) -> str:
     signals: list[str] = []
     if re.search(r"(?:exit(?:ed)?(?: with)? code [1-9]\d*|failed|traceback|error:|permission denied)", text, re.I):
@@ -1337,7 +1386,12 @@ def _build_summary_record(
     max_text_chars: int,
     session_id: str = "",
 ) -> dict[str, Any] | None:
-    normalized = _normalize_summary_text(_safe_summary_text(kind, text), max_text_chars=max_text_chars)
+    signal_text = text
+    if kind == "user_message":
+        signal_text = _meaningful_user_message_text(text)
+        if not signal_text:
+            return None
+    normalized = _normalize_summary_text(_safe_summary_text(kind, signal_text), max_text_chars=max_text_chars)
     if not normalized:
         return None
     record = {
@@ -1348,7 +1402,7 @@ def _build_summary_record(
     }
     if session_id:
         record["session_id"] = session_id
-    match_text = _normalize_summary_text(text, max_text_chars=max_text_chars)
+    match_text = _normalize_summary_text(signal_text, max_text_chars=max_text_chars)
     if match_text and match_text != normalized:
         record["_match_text"] = match_text
     return record

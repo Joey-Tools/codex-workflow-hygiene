@@ -771,6 +771,20 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("approval_auth_friction", turns[0].issue_flags)
         self.assertIn("safety_privacy_flag", turns[0].issue_flags)
 
+    def test_local_rollout_internal_hostname_is_redacted_and_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-internal.jsonl"
+            write_jsonl(rollout, [message("user", "Investigate db01.internal routing.", "2026-05-22T10:01:00Z")])
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+            serialized = json.dumps(MODULE.asdict_turn(turns[0]))
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("safety_privacy_flag", turns[0].issue_flags)
+        self.assertIn("redactions=applied", turns[0].redacted_user_prompt_summary)
+        self.assertNotIn("db01.internal", serialized)
+
     def test_flags_for_text_detects_collaboration_friction_categories(self) -> None:
         over_flags = MODULE.flags_for_text("Codex over-explored unrelated files and searched too broadly.")
         under_flags = MODULE.flags_for_text("Codex should have asked for clarification before proceeding.")
@@ -3378,6 +3392,20 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SystemExit, "model_era must match referenced episode"):
                 MODULE.main(["validate-retained", "--run-dir", str(bad_model_era)])
+
+            bad_scan = safe_output_dir(raw, "bad-scan-consistency")
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(bad_scan), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [json.loads(line) for line in (bad_scan / "turn_flags.jsonl").read_text(encoding="utf-8").splitlines()]
+            rows[0]["model_era"] = "gpt-5.5"
+            write_jsonl(bad_scan / "turn_flags.jsonl", rows)
+
+            with self.assertRaisesRegex(SystemExit, "model_era must match referenced episode"):
+                MODULE.main(["validate-output", "--run-dir", str(bad_scan)])
 
     def test_validate_retained_rejects_unexpected_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -7084,7 +7112,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("customer", json.dumps(rows[0]))
 
     def test_rollout_summary_private_network_address_contributes_safety_flag(self) -> None:
-        for sample in ("169.254.169.254", "100.64.0.1", "fc00::1", "::1", "fe80::1"):
+        for sample in ("169.254.169.254", "100.64.0.1", "fc00::1", "::1", "fe80::1", "db01.internal"):
             with self.subTest(sample=sample):
                 with tempfile.TemporaryDirectory() as raw:
                     root = Path(raw) / "remote"
@@ -7144,6 +7172,18 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
         self.assertEqual(trend["turn_count"], 0)
+
+    def test_remote_probe_ignores_wrapper_only_user_message_before_signaling(self) -> None:
+        record = REMOTE_PROBE._build_summary_record(
+            kind="user_message",
+            text="Persistent internal Codex readonly review contract:\nCheck approval, secrets, privacy, and verification.",
+            line_no=1,
+            timestamp="2026-05-22T10:01:00Z",
+            max_text_chars=1200,
+            session_id="s1",
+        )
+
+        self.assertIsNone(record)
 
     def test_oversized_rollout_summary_file_reports_gap_without_reading(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -7509,6 +7549,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("169\\\\.254", script)
         self.assertIn("fe[89abAB]", script)
         self.assertIn("internal|corp|local|lan|example|invalid|test", script)
+        self.assertIn("meaningful_user_message_text", script)
+        self.assertIn("Persistent internal Codex readonly review contract", script)
         self.assertNotIn("(2,)", script)
         self.assertNotIn("(16,)", script)
 

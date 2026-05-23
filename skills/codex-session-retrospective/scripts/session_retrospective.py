@@ -364,8 +364,12 @@ def redact(text: str) -> tuple[str, bool]:
     for pattern, label in SECRET_PATTERNS:
         redacted, count = pattern.subn(label, redacted)
         sensitive_redacted = sensitive_redacted or count > 0
-    for pattern in (PRIVATE_IPV4_PATTERN, PRIVATE_IPV6_PATTERN):
-        redacted, count = pattern.subn("[REDACTED_INTERNAL_ADDRESS]", redacted)
+    for pattern, label in (
+        (PRIVATE_IPV4_PATTERN, "[REDACTED_INTERNAL_ADDRESS]"),
+        (PRIVATE_IPV6_PATTERN, "[REDACTED_INTERNAL_ADDRESS]"),
+        (INTERNAL_HOSTNAME_PATTERN, "[REDACTED_INTERNAL_HOST]"),
+    ):
+        redacted, count = pattern.subn(label, redacted)
         sensitive_redacted = sensitive_redacted or count > 0
     if len(redacted) > 1200:
         redacted = redacted[:1200].rstrip() + " [TRUNCATED]"
@@ -3597,13 +3601,14 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 raise SystemExit(f"{path}:{line_no}: missing keys {sorted(missing)}")
             if contains_unredacted_sensitive_text(obj):
                 raise SystemExit(f"{path}:{line_no}: unredacted sensitive text in retained output")
-    sanitize_retained_jsonl(run_dir / "episodes.jsonl", allowed=EPISODE_FIELDS, strict=True, validator=validate_episode_row)
-    sanitize_retained_jsonl(run_dir / "turn_flags.jsonl", allowed=TURN_FLAG_FIELDS, strict=True, validator=validate_turn_flag_row)
+    episodes = sanitize_retained_jsonl(run_dir / "episodes.jsonl", allowed=EPISODE_FIELDS, strict=True, validator=validate_episode_row)
+    turn_flags = sanitize_retained_jsonl(run_dir / "turn_flags.jsonl", allowed=TURN_FLAG_FIELDS, strict=True, validator=validate_turn_flag_row)
     trend_path = run_dir / "trend_report.json"
     trend = sanitize_trend_report(history_json(trend_path.read_bytes(), str(trend_path)), label=str(trend_path), strict=True)
     validate_retained_manifest(run_dir / "retained_manifest.json")
     manifest_path = run_dir / "retained_manifest.json"
     retained_manifest = sanitize_retained_manifest_obj(history_json(manifest_path.read_bytes(), str(manifest_path)), label=str(manifest_path), strict=True)
+    validate_retained_export_consistency(episodes, turn_flags, trend, label=str(trend_path))
     retained_export_parent_for_records(trend, retained_manifest)
     return trend, retained_manifest
 
