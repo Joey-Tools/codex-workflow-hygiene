@@ -1808,6 +1808,11 @@ def require_schema_version_one(value: Any, *, label: str) -> None:
         raise SystemExit(f"{label}: retained schema_version must be 1")
 
 
+def require_redaction_policy_version_one(value: Any, *, label: str) -> None:
+    if type(value) is not int or value != 1:
+        raise SystemExit(f"{label}: retained redaction_policy_version must be 1")
+
+
 def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
     require_opaque_digest_string(row["episode_id"], label=f"{label}.episode_id", prefix=EPISODE_REF_PREFIX)
     require_retained_host_string(row["host"], label=f"{label}.host")
@@ -1844,8 +1849,10 @@ def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
         raise SystemExit(f"{label}.source_hash: expected opaque keyed source hash")
     require_timestamp_or_none(row["timestamp"], label=f"{label}.timestamp")
     require_path_ref_or_none(row["cwd"], label=f"{label}.cwd")
-    require_retained_model_id_or_none(row["model"], label=f"{label}.model")
-    require_retained_model_era_string(row["model_era"], label=f"{label}.model_era")
+    model = require_retained_model_id_or_none(row["model"], label=f"{label}.model")
+    model_era = require_retained_model_era_string(row["model_era"], label=f"{label}.model_era")
+    if model is not None and model != model_era:
+        raise SystemExit(f"{label}: retained model must match model_era")
     require_string(row["redacted_user_prompt_summary"], label=f"{label}.redacted_user_prompt_summary")
     require_string(row["assistant_action_summary"], label=f"{label}.assistant_action_summary", allow_empty=True)
     issue_flags = require_issue_flag_list(row["issue_flags"], label=f"{label}.issue_flags")
@@ -1976,6 +1983,7 @@ def sanitize_trend_report(data: Any, *, label: str, strict: bool) -> dict[str, A
 def sanitize_retained_manifest_obj(data: Any, *, label: str, strict: bool) -> dict[str, Any]:
     sanitized = sanitize_mapping(data, allowed=MANIFEST_FIELDS, required=MANIFEST_FIELDS, label=label, strict=strict)
     require_schema_version_one(sanitized["schema_version"], label=f"{label}.schema_version")
+    require_redaction_policy_version_one(sanitized["redaction_policy_version"], label=f"{label}.redaction_policy_version")
     sanitized["window"] = sanitize_window(sanitized["window"], label=f"{label}.window")
     sources = sanitized.get("sources")
     if not isinstance(sources, list) or not (1 <= len(sources) <= 16):
@@ -2277,6 +2285,8 @@ def validate_retained_export_consistency(
             raise SystemExit(f"{label}: turn_flags.jsonl row {index} host must match referenced episode")
         if turn["session_id"] != episode["session_id"]:
             raise SystemExit(f"{label}: turn_flags.jsonl row {index} session_id must match referenced episode")
+        if turn["model_era"] != episode["model_era"]:
+            raise SystemExit(f"{label}: turn_flags.jsonl row {index} model_era must match referenced episode")
         episode_flag_sets[turn["episode_id"]].update(turn["issue_flags"])
         flagged_turns_by_episode[turn["episode_id"]] += 1
     for episode_id, episode in episodes_by_id.items():

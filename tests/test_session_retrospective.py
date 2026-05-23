@@ -3338,6 +3338,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     MODULE.sanitize_trend_report(bad_trend, label="trend", strict=True)
                 with self.assertRaisesRegex(SystemExit, "schema_version must be 1"):
                     MODULE.sanitize_retained_manifest_obj(bad_manifest, label="manifest", strict=True)
+                bad_policy_manifest = dict(manifest, redaction_policy_version=bad_value)
+                with self.assertRaisesRegex(SystemExit, "redaction_policy_version must be 1"):
+                    MODULE.sanitize_retained_manifest_obj(bad_policy_manifest, label="manifest", strict=True)
 
     def test_validate_retained_rejects_cross_file_inconsistency(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3367,6 +3370,14 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SystemExit, "episode friction_flags must match"):
                 MODULE.main(["validate-retained", "--run-dir", str(bad_episode)])
+
+            bad_model_era = export_retained(output, raw, "bad-model-era-consistency")
+            rows = [json.loads(line) for line in (bad_model_era / "turn_flags.jsonl").read_text(encoding="utf-8").splitlines()]
+            rows[0]["model_era"] = "gpt-5.5"
+            write_jsonl(bad_model_era / "turn_flags.jsonl", rows)
+
+            with self.assertRaisesRegex(SystemExit, "model_era must match referenced episode"):
+                MODULE.main(["validate-retained", "--run-dir", str(bad_model_era)])
 
     def test_validate_retained_rejects_unexpected_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -6536,6 +6547,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "opaque keyed digest"):
             MODULE.validate_episode_row(episode, label="episode")
 
+    def test_retained_validators_require_model_to_match_model_era(self) -> None:
+        turn = {
+            "turn_id": VALID_TURN_ID,
+            "episode_id": VALID_EPISODE_ID,
+            "host": "local",
+            "session_id": VALID_SESSION_ID,
+            "source_path": "path_ref_v1:0123456789abcdef",
+            "source_hash": VALID_SOURCE_HASH,
+            "timestamp": "2026-05-22T10:00:00Z",
+            "cwd": None,
+            "model": "gpt-5.4",
+            "model_era": "gpt-5.5",
+            "redacted_user_prompt_summary": "category=debug",
+            "assistant_action_summary": "",
+            "issue_flags": ["failed_command"],
+            "prompt_improvement": None,
+        }
+
+        with self.assertRaisesRegex(SystemExit, "model must match model_era"):
+            MODULE.validate_turn_flag_row(turn, label="turn")
+
+
     def test_retained_validators_reject_raw_turn_and_episode_ids(self) -> None:
         turn = {
             "turn_id": "customer-turn-123",
@@ -7446,6 +7479,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "fc00::1",
             "::1",
             "fe80::1",
+            "db01.internal",
+            "svc.corp",
         ]
         for sample in samples:
             with self.subTest(sample=sample):
@@ -7473,6 +7508,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn(r"[A-Za-z0-9_-]{16,}", script)
         self.assertIn("169\\\\.254", script)
         self.assertIn("fe[89abAB]", script)
+        self.assertIn("internal|corp|local|lan|example|invalid|test", script)
         self.assertNotIn("(2,)", script)
         self.assertNotIn("(16,)", script)
 
