@@ -2568,7 +2568,13 @@ def validate_history_commit_merge_side_history(repo: Path, history_commit: str, 
             raise SystemExit(f"--history-commit merge side history changes unexpected artifact: {unexpected[0]}")
 
 
-def validate_history_follow_on_history(repo: Path, history_commit: str, history_ref: str) -> None:
+def validate_history_follow_on_history(
+    repo: Path,
+    history_commit: str,
+    history_ref: str,
+    retained_parent: str,
+    retained_files: dict[str, bytes],
+) -> None:
     result = subprocess.run(
         ["git", "-C", str(repo), "rev-list", "--reverse", f"{history_commit}..{history_ref}"],
         stdout=subprocess.PIPE,
@@ -2583,6 +2589,7 @@ def validate_history_follow_on_history(repo: Path, history_commit: str, history_
             continue
         try:
             validate_history_tree_ref(repo, follow_on_commit)
+            require_retained_export_in_history_ref(repo, follow_on_commit, retained_parent, retained_files)
         except SystemExit as exc:
             raise SystemExit(f"history follow-on commit is not retention-safe: {exc}") from exc
 
@@ -3576,7 +3583,7 @@ def cmd_validate_history_commit(args: argparse.Namespace) -> int:
         require_history_ancestor(history_repo, history_commit, history_ref)
         require_history_ref_current_head(history_repo, history_ref)
         require_history_worktree_clean(history_repo)
-        validate_history_follow_on_history(history_repo, history_commit, history_ref)
+        validate_history_follow_on_history(history_repo, history_commit, history_ref, retained_parent, retained_files)
         validate_history_tree(args.history_repo, history_ref)
         require_retained_export_in_history_ref(history_repo, history_ref, retained_parent, retained_files)
     print(f"validated history commit: {history_commit}")
@@ -3613,7 +3620,7 @@ def cmd_advance_state(args: argparse.Namespace) -> int:
     require_history_ancestor(history_repo, history_commit, history_ref)
     require_history_ref_current_head(history_repo, history_ref)
     require_history_worktree_clean(history_repo)
-    validate_history_follow_on_history(history_repo, history_commit, history_ref)
+    validate_history_follow_on_history(history_repo, history_commit, history_ref, retained_parent, actual_files)
     validate_history_tree(args.history_repo, history_ref)
     require_retained_export_in_history_ref(history_repo, history_ref, retained_parent, actual_files)
     window = trend.get("window") or {}

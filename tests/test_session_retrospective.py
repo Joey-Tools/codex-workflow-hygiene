@@ -6588,6 +6588,49 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     ]
                 )
 
+    def test_validate_history_commit_with_history_ref_rejects_restored_export_change(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, retained_commit = write_history_repo(raw, retained)
+            parent = retained_parent_for_dir(retained)
+            manifest_path = history_repo / parent / "retained_manifest.json"
+            original_manifest = manifest_path.read_bytes()
+
+            manifest = json.loads(original_manifest.decode("utf-8"))
+            manifest["sources"][0]["summary_count"] = manifest["sources"][0]["summary_count"] + 1
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+            subprocess.run(["git", "add", str(manifest_path.relative_to(history_repo))], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Modify retained export"], cwd=history_repo, check=True)
+            manifest_path.write_bytes(original_manifest)
+            subprocess.run(["git", "add", str(manifest_path.relative_to(history_repo))], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Restore retained export"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "history follow-on commit is not retention-safe"):
+                MODULE.main(
+                    [
+                        "validate-history-commit",
+                        "--retained-run-dir",
+                        str(retained),
+                        "--history-repo",
+                        str(history_repo),
+                        "--history-commit",
+                        retained_commit,
+                        "--history-ref",
+                        "HEAD",
+                    ]
+                )
+
     def test_validate_retained_rejects_raw_host_label(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
