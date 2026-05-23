@@ -71,15 +71,15 @@ python3 scripts/session_retrospective.py validate-retained --run-dir .codex-loca
 ```
 
 Use `discover` before map-reduce shard work. `make-shards` only emits sources marked `ready` by the transient manifest; stale, missing, empty, or otherwise non-ready sources stay as coverage gaps and must not be handed to extractor subagents. Add `--include-raw-paths` only for local extractor dispatch inside ignored `.codex-local/session-retrospective` run directories; never retain or commit `shards.jsonl`. `scan-*` remains the compact local extraction path for bounded windows and final retained outputs.
-Pass repeated `--source HOST=PATH` values when remote evidence has been materialized locally. `PATH` may be a Codex home containing `sessions/` or a task-scoped directory containing copied `rollout-*.jsonl` files.
+Pass repeated `--source HOST=PATH` values when remote evidence has been materialized locally. `PATH` may be a Codex home containing `sessions/` or a task-scoped directory containing copied `rollout-*.jsonl` files. Retained host labels are restricted to `local`, the two default remote hosts, and `custom_source`; any other `HOST` label is bucketed as `custom_source` before retained artifacts are written.
 `scan-daily --state` reads the last completed scan but does not advance it. Run `advance-state` only for the same daily run dir and retained export after `validate-output`, `export-retained`, `validate-retained`, `validate-history-commit`, and final `validate-history-tree --history-ref HEAD` pass. Pass the history repository with `--history-repo`, the dedicated retained-export commit SHA with `--history-commit`, and the final audited history ref with `--history-ref HEAD`; `advance-state` verifies the retained export commit, requires the audited ref to resolve to the current history worktree `HEAD`, revalidates the final history tree, and confirms the same retained export still exists unchanged at the same path before moving the scan cursor. Commit reports, schemas, indexes, or annotations separately from the state-advancing retained export commit, then rerun `validate-history-tree` after those follow-on commits and before `advance-state`.
 Do not run `scan-*`, `discover`, or `make-shards` output directly into a tracked repository path unless that path ignores `.codex-local/`; those commands write transient execution artifacts. `export-retained` is the safe path for materializing files that may be copied into or written inside the private history worktree.
 
 ## Output Contract
 
 - `turn_summaries.jsonl`: transient redacted meaningful turns plus flags and source pointers. Do not retain in history.
-- `episodes.jsonl`: episode/topic summaries with host, session, cwd/repo hints, outcome, and friction flags.
-- `trend_report.json`: aggregate counts by host, model era, issue flag, and scan window.
+- `episodes.jsonl`: episode/topic summaries with retained host bucket, session, cwd/repo hints, outcome, and friction flags.
+- `trend_report.json`: aggregate counts by retained host bucket, model era, issue flag, and scan window.
 - `shard_manifest.json`: transient bounded source manifest for map-reduce orchestration. Do not retain it in history.
 - `shards.jsonl`: transient shard worklist for extractor-redactor scheduling. Do not retain it in history.
 - `retained_manifest.json`: retention-safe manifest with raw path fields removed and opaque refs preserved.

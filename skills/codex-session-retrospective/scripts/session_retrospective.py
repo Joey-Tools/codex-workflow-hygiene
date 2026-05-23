@@ -96,6 +96,9 @@ SAFETY_PATTERN = re.compile(
 )
 
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
+RETAINED_CUSTOM_SOURCE_HOST = "custom_source"
+RETAINED_DIRECT_SOURCE_HOSTS = frozenset(("local", *DEFAULT_REMOTE_HOSTS))
+RETAINED_HOSTS = frozenset((*RETAINED_DIRECT_SOURCE_HOSTS, RETAINED_CUSTOM_SOURCE_HOST, "scope"))
 EXPECTED_HISTORY_REPO = "Joey-Tools/codex-session-retrospective-history"
 DEFAULT_REMOTE_SOURCE_ROOT = Path(".codex-local/session-retrospective/remote-sources")
 REMOTE_SOURCE_METADATA_FILE = "source_metadata.json"
@@ -1369,6 +1372,19 @@ def safe_token(value: Any) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9_.-]+", value))
 
 
+def retained_source_host(host: str) -> str:
+    label = host.strip()
+    if not label:
+        raise SystemExit("--source HOST must be non-empty")
+    if label in RETAINED_DIRECT_SOURCE_HOSTS:
+        return label
+    return RETAINED_CUSTOM_SOURCE_HOST
+
+
+def retained_host_token(value: Any) -> bool:
+    return isinstance(value, str) and value in RETAINED_HOSTS
+
+
 def ensure_retained_safe_value(label: str, value: Any) -> None:
     if contains_unredacted_sensitive_text(value) or contains_path_like_text(value):
         raise SystemExit(f"{label}: unredacted sensitive or path-like text in retained output")
@@ -1428,6 +1444,13 @@ def require_safe_token_string(value: Any, *, label: str) -> str:
     return text
 
 
+def require_retained_host_string(value: Any, *, label: str) -> str:
+    text = require_safe_token_string(value, label=label)
+    if not retained_host_token(text):
+        raise SystemExit(f"{label}: retained host label is not allowed")
+    return text
+
+
 def require_opaque_digest_string(value: Any, *, label: str, prefix: str | None = None) -> str:
     text = require_string(value, label=label)
     if prefix is None:
@@ -1465,7 +1488,7 @@ def require_non_negative_int(value: Any, *, label: str) -> int:
 
 def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
     require_opaque_digest_string(row["episode_id"], label=f"{label}.episode_id", prefix=EPISODE_REF_PREFIX)
-    require_safe_token_string(row["host"], label=f"{label}.host")
+    require_retained_host_string(row["host"], label=f"{label}.host")
     require_opaque_digest_string(row["session_id"], label=f"{label}.session_id", prefix=SESSION_REF_PREFIX)
     require_timestamp_or_none(row["start"], label=f"{label}.start")
     require_timestamp_or_none(row["end"], label=f"{label}.end")
@@ -1483,7 +1506,7 @@ def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
 def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
     require_opaque_digest_string(row["turn_id"], label=f"{label}.turn_id", prefix=TURN_REF_PREFIX)
     require_opaque_digest_string(row["episode_id"], label=f"{label}.episode_id", prefix=EPISODE_REF_PREFIX)
-    require_safe_token_string(row["host"], label=f"{label}.host")
+    require_retained_host_string(row["host"], label=f"{label}.host")
     require_opaque_digest_string(row["session_id"], label=f"{label}.session_id", prefix=SESSION_REF_PREFIX)
     require_string(row["source_path"], label=f"{label}.source_path")
     if not PATH_REF_PATTERN.fullmatch(row["source_path"]):
@@ -1559,6 +1582,12 @@ def sanitize_count_map(value: Any, *, label: str, strict: bool) -> dict[str, int
     return counts
 
 
+def require_retained_host_count_map(value: dict[str, int], *, label: str) -> None:
+    for key in value:
+        if not retained_host_token(key):
+            raise SystemExit(f"{label}: retained host label is not allowed")
+
+
 def sanitize_window(value: Any, *, label: str) -> dict[str, Any]:
     sanitized = sanitize_mapping(value, allowed={"mode", "start", "end"}, required={"mode", "start", "end"}, label=label, strict=True)
     if not safe_token(sanitized["mode"]) or not parse_time(str(sanitized["start"])) or not parse_time(str(sanitized["end"])):
@@ -1568,7 +1597,7 @@ def sanitize_window(value: Any, *, label: str) -> dict[str, Any]:
 
 def sanitize_coverage_gap(value: Any, *, label: str, strict: bool) -> dict[str, Any]:
     sanitized = sanitize_mapping(value, allowed=MANIFEST_GAP_FIELDS, required={"host", "reason"}, label=label, strict=strict)
-    if not safe_token(sanitized.get("host")) or not safe_token(sanitized.get("reason")):
+    if not retained_host_token(sanitized.get("host")) or not safe_token(sanitized.get("reason")):
         raise SystemExit(f"{label}: unsafe retained coverage gap token")
     if "bytes" in sanitized and (not isinstance(sanitized["bytes"], int) or sanitized["bytes"] < 0):
         raise SystemExit(f"{label}: coverage gap bytes must be a non-negative integer")
@@ -1582,6 +1611,7 @@ def sanitize_trend_report(data: Any, *, label: str, strict: bool) -> dict[str, A
     sanitized["window"] = sanitize_window(sanitized["window"], label=f"{label}.window")
     for count_key in ("flags", "hosts", "model_eras"):
         sanitized[count_key] = sanitize_count_map(sanitized[count_key], label=f"{label}.{count_key}", strict=strict)
+    require_retained_host_count_map(sanitized["hosts"], label=f"{label}.hosts")
     gaps = sanitized.get("coverage_gaps")
     if not isinstance(gaps, list):
         raise SystemExit(f"{label}.coverage_gaps: expected list")
@@ -1610,7 +1640,7 @@ def sanitize_retained_manifest_obj(data: Any, *, label: str, strict: bool) -> di
             label=f"{label}.sources[{index}]",
             strict=strict,
         )
-        if not safe_token(clean_source.get("host")) or not safe_token(clean_source.get("status")):
+        if not retained_host_token(clean_source.get("host")) or not safe_token(clean_source.get("status")):
             raise SystemExit(f"{label}.sources[{index}]: unsafe retained source token")
         for key in ("rollout_count", "summary_count"):
             if not isinstance(clean_source[key], int) or clean_source[key] < 0:
@@ -1676,7 +1706,7 @@ def parse_sources(values: list[str] | None, *, require_default_hosts: bool = Tru
         if "=" not in value:
             raise SystemExit(f"--source must be HOST=PATH, got {value!r}")
         host, raw_path = value.split("=", 1)
-        source = Source(host.strip(), Path(raw_path).expanduser())
+        source = Source(retained_source_host(host), Path(raw_path).expanduser())
         key = (source.host, source.root.resolve(strict=False).as_posix())
         if key in seen:
             continue

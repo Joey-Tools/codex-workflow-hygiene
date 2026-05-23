@@ -305,6 +305,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(sources), 1)
 
+    def test_parse_sources_buckets_custom_host_labels(self) -> None:
+        sources = MODULE.parse_sources(["customer-acme=/tmp/acme"], require_default_hosts=False)
+
+        self.assertEqual([source.host for source in sources], [MODULE.RETAINED_CUSTOM_SOURCE_HOST])
+
     def test_source_file_discovery_rejects_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -4734,6 +4739,93 @@ class SessionRetrospectiveTests(unittest.TestCase):
             MODULE.validate_turn_flag_row(turn, label="turn")
         with self.assertRaisesRegex(SystemExit, "episode.episode_id: expected opaque keyed digest"):
             MODULE.validate_episode_row(episode, label="episode")
+
+    def test_custom_source_host_is_bucketed_in_retained_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"customer-acme={root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=1000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+
+            retained_text = "\n".join(path.read_text(encoding="utf-8") for path in retained.iterdir())
+            self.assertNotIn("customer-acme", retained_text)
+            self.assertIn(MODULE.RETAINED_CUSTOM_SOURCE_HOST, retained_text)
+            MODULE.main(["validate-retained", "--run-dir", str(retained)])
+            history_repo, commit = write_history_repo(raw, retained)
+            MODULE.main(
+                [
+                    "validate-history-commit",
+                    "--retained-run-dir",
+                    str(retained),
+                    "--history-repo",
+                    str(history_repo),
+                    "--history-commit",
+                    commit,
+                ]
+            )
+            MODULE.main(["validate-history-tree", "--history-repo", str(history_repo), "--history-ref", "HEAD"])
+
+    def test_validate_retained_rejects_raw_host_label(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            episode_path = retained / "episodes.jsonl"
+            episode = json.loads(episode_path.read_text(encoding="utf-8").splitlines()[0])
+            episode["host"] = "customer-acme"
+            episode_path.write_text(json.dumps(episode) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "retained host label"):
+                MODULE.main(["validate-retained", "--run-dir", str(retained)])
+
+    def test_validate_history_tree_rejects_raw_host_label(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, _commit = write_history_repo(raw, retained)
+            trend_path = history_repo / retained_parent_for_dir(retained) / "trend_report.json"
+            trend = json.loads(trend_path.read_text(encoding="utf-8"))
+            trend["hosts"] = {"customer-acme": 1}
+            trend_path.write_text(json.dumps(trend) + "\n", encoding="utf-8")
+            subprocess.run(["git", "add", str(trend_path.relative_to(history_repo))], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Break retained host"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "retained host label"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo), "--history-ref", "HEAD"])
 
     def test_rollout_summary_file_contributes_flags_without_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
