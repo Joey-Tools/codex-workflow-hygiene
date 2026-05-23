@@ -2562,11 +2562,11 @@ def remote_evidence_gaps(
     return []
 
 
-def remote_materialization_gaps(source: Source) -> list[dict[str, Any]]:
-    if source.host not in DEFAULT_REMOTE_HOSTS:
-        return []
+def materialization_gaps_for_source(source: Source) -> list[dict[str, Any]]:
     if not unsafe_source_rollouts(source) and not unsafe_source_summaries(source):
         return []
+    if source.host not in DEFAULT_REMOTE_HOSTS:
+        return [{"host": source.host, "root_ref": path_ref(source.root), "reason": "unsafe_source_artifact"}]
     return [remote_metadata_gap(source, "remote_source_not_materialized")]
 
 
@@ -2681,7 +2681,7 @@ def run_scan(
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
-        source_materialization_gaps = remote_materialization_gaps(source)
+        source_materialization_gaps = materialization_gaps_for_source(source)
         source_summary_only_gaps = remote_summary_only_gaps(source, rollouts, summaries)
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
@@ -2858,7 +2858,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
-        source_materialization_gaps = remote_materialization_gaps(source)
+        source_materialization_gaps = materialization_gaps_for_source(source)
         source_summary_only_gaps = remote_summary_only_gaps(source, rollouts, summaries)
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)

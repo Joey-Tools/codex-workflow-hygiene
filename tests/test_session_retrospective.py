@@ -513,6 +513,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual([record["kind"] for record in records], ["user_message", "assistant_message"])
         self.assertIn("forgot", records[0]["text"])
 
+    def test_remote_probe_rollout_summary_preserves_event_user_message_signal(self) -> None:
+        records = REMOTE_PROBE._summarize_rollout_records(
+            lines=[
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"type": "user_message", "message": "You missed the context-loss follow-up."},
+                    }
+                )
+            ],
+            keywords=[],
+            limit=10,
+            tail_records=0,
+            max_text_chars=80,
+        )
+
+        self.assertEqual([record["kind"] for record in records], ["user_message"])
+        self.assertIn("context-loss", records[0]["text"])
+
     def test_explicit_sources_still_require_default_host_coverage(self) -> None:
         sources = MODULE.parse_sources(["local=/tmp/local", "miku-bot-dev=/tmp/miku"])
 
@@ -5076,6 +5096,39 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(trend["hosts"], {})
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+        self.assertEqual(manifest["sources"][0]["rollout_count"], 1)
+
+    def test_custom_source_unsafe_artifact_blocks_state_advancement(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            safe_rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-safe.jsonl"
+            write_jsonl(safe_rollout, [message("user", "Safe custom task.", "2026-05-01T10:00:00Z")])
+            outside = Path(raw) / "outside.jsonl"
+            write_jsonl(outside, [message("user", "Unsafe custom task.", "2026-05-01T11:00:00Z")])
+            unsafe_rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T11-00-00-unsafe.jsonl"
+            unsafe_rollout.symlink_to(outside)
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with mock.patch.object(MODULE, "parse_sources", return_value=[MODULE.Source("custom_source", root)]):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=None, output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=False),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            rows = [json.loads(line) for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()]
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+            with self.assertRaisesRegex(SystemExit, "coverage gaps"):
+                advance_state(output, state, raw)
+
+        self.assertEqual(rows, [])
+        self.assertEqual(trend["hosts"], {})
+        self.assertIn("unsafe_source_artifact", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["host"], "custom_source")
         self.assertEqual(manifest["sources"][0]["status"], "stale")
         self.assertEqual(manifest["sources"][0]["rollout_count"], 1)
 

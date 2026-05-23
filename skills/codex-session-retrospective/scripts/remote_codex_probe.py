@@ -487,6 +487,20 @@ def message_summary_from_payload(payload):
     return kind, "\\n".join(parts)
 
 
+def event_user_message_text(payload):
+    message = payload.get("message")
+    if isinstance(message, str):
+        return message.strip()
+    if isinstance(message, dict):
+        kind, text = message_summary_from_payload(message)
+        if kind == "user_message" and text:
+            return text.strip()
+    text = payload.get("text")
+    if isinstance(text, str):
+        return text.strip()
+    return ""
+
+
 def summary_record(kind, text, *, line_no, timestamp):
     value = normalize_text(text, SUMMARY_MAX_TEXT_CHARS)
     if not value:
@@ -564,11 +578,17 @@ def summarize_rollout():
                         record = summary_record("function_call_output", output, line_no=line_no, timestamp=timestamp)
             elif record_type == "event_msg":
                 payload = obj.get("payload", {{}})
-                if str(payload.get("type", "")) == "task_complete":
+                payload_type = str(payload.get("type", ""))
+                if payload_type == "task_complete":
                     text = payload.get("last_agent_message")
                     if text:
                         record = summary_record("task_complete", text, line_no=line_no, timestamp=timestamp)
                         last_task_complete_record = record
+                elif payload_type == "user_message":
+                    text = event_user_message_text(payload)
+                    if text:
+                        record = summary_record("user_message", text, line_no=line_no, timestamp=timestamp)
+                        last_user_record = record
 
             if not record or record.get("kind") == "session_meta":
                 continue
@@ -1158,6 +1178,20 @@ def _message_summary(payload: dict[str, Any]) -> tuple[str, str]:
     return kind, "\n".join(parts).strip()
 
 
+def _event_user_message_text(payload: dict[str, Any]) -> str:
+    message = payload.get("message")
+    if isinstance(message, str):
+        return message.strip()
+    if isinstance(message, dict):
+        kind, text = _message_summary(message)
+        if kind == "user_message" and text:
+            return text.strip()
+    text = payload.get("text")
+    if isinstance(text, str):
+        return text.strip()
+    return ""
+
+
 def _build_summary_record(
     *,
     kind: str,
@@ -1243,7 +1277,8 @@ def _summarize_rollout_records(
                     )
         elif record_type == "event_msg":
             payload = obj.get("payload", {})
-            if str(payload.get("type", "")) == "task_complete":
+            payload_type = str(payload.get("type", ""))
+            if payload_type == "task_complete":
                 text = payload.get("last_agent_message")
                 if text:
                     record = _build_summary_record(
@@ -1254,6 +1289,17 @@ def _summarize_rollout_records(
                         max_text_chars=max_text_chars,
                     )
                     last_task_complete_record = record
+            elif payload_type == "user_message":
+                text = _event_user_message_text(payload)
+                if text:
+                    record = _build_summary_record(
+                        kind="user_message",
+                        text=text,
+                        line_no=line_no,
+                        timestamp=timestamp,
+                        max_text_chars=max_text_chars,
+                    )
+                    last_user_record = record
 
         if record is None:
             continue
