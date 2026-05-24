@@ -481,6 +481,22 @@ def safe_assistant_summary(texts: list[str]) -> str:
     return f"assistant_messages={len(texts)}; action_categories={','.join(sorted(set(categories)))}"
 
 
+def assistant_terminal_evidence(text: str) -> bool:
+    lowered = text.lower()
+    if re.search(
+        r"\b(?:implemented|updated|patched|created|added|fixed|resolved|completed|finished|done|ran|validated|verified|tested|committed|pushed|merged|wrote|generated)\b",
+        lowered,
+    ):
+        return True
+    if re.search(r"\b(?:command|test|tests|verification|build|lint|check)\s+failed\b", lowered):
+        return True
+    if re.search(r"\bfailed\s+(?:with|because|after|during)\b", lowered):
+        return True
+    if "process exited with code" in lowered or "permission denied" in lowered:
+        return True
+    return False
+
+
 def stable_hash(value: str, length: int = 16) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 
@@ -1296,6 +1312,8 @@ def extract_rollout(
     last_user_fingerprint: tuple[str, str] | None = None
     current_emitted = False
     current_detach_on_wrapper = False
+    wrapper_pending_new_window_activity = False
+    wrapper_pending_assistant_bits: list[str] = []
     emit_threshold = emit_start or start
 
     def flush_assistant() -> None:
@@ -1373,12 +1391,17 @@ def extract_rollout(
                     and current_timestamp < emit_threshold
                     and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback)
                 )
-                if current and (current_detach_on_wrapper or wrapper_starts_new_window_activity):
+                if current and current_detach_on_wrapper:
                     flush_assistant()
                     current = None
                     current_emitted = False
                     current_detach_on_wrapper = False
+                    wrapper_pending_new_window_activity = False
+                    wrapper_pending_assistant_bits = []
                     assistant_bits = []
+                elif current and wrapper_starts_new_window_activity:
+                    wrapper_pending_new_window_activity = True
+                    wrapper_pending_assistant_bits = []
                 continue
             if prompt_text and meaningful_user_text(user_text):
                 fingerprint_time = iso(parsed_timestamp.replace(microsecond=0)) if parsed_timestamp and not timestamp_is_fallback else ""
@@ -1425,17 +1448,26 @@ def extract_rollout(
                 current = turn
                 current_emitted = False
                 current_detach_on_wrapper = False
+                wrapper_pending_new_window_activity = False
+                wrapper_pending_assistant_bits = []
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current()
                 continue
             if assistant_text and current:
-                assistant_summary = safe_assistant_summary([assistant_text])
-                if any(category in assistant_summary for category in ("implementation", "verification", "git_or_pr", "blocked_or_failed")):
+                if wrapper_pending_new_window_activity:
+                    if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
+                        wrapper_pending_assistant_bits.append(assistant_text)
+                    continue
+                if assistant_terminal_evidence(assistant_text):
                     current_detach_on_wrapper = True
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current(line_no, timestamp)
                     assistant_bits.append(assistant_text)
             if current and tool_output_payload_text(record, payload):
+                if wrapper_pending_new_window_activity:
+                    assistant_bits.extend(wrapper_pending_assistant_bits)
+                    wrapper_pending_assistant_bits = []
+                    wrapper_pending_new_window_activity = False
                 current_detach_on_wrapper = True
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current(line_no, timestamp)

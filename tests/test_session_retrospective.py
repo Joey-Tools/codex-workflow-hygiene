@@ -1794,6 +1794,68 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(turns, [])
 
+    def test_wrapper_after_lookback_prompt_preserves_tool_failure_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-active.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Debug the long-running deployment.", "2026-05-20T10:01:00Z"),
+                    message("user", "# AGENTS.md instructions\nwrapper", "2026-05-22T10:03:00Z"),
+                    message("assistant", "Verification failed with permission denied.", "2026-05-22T10:04:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:05:00Z",
+                        "payload": {"output": "Process exited with code 1\npermission denied"},
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].timestamp, "2026-05-22T10:05:00Z")
+        self.assertIn("failed_command", turns[0].issue_flags)
+        self.assertIn("blocked_or_failed", turns[0].assistant_action_summary)
+        self.assertIn("verification", turns[0].assistant_action_summary)
+
+    def test_wrapper_after_assistant_preamble_preserves_active_turn_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-preamble.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Debug the long-running deployment.", "2026-05-20T10:01:00Z"),
+                    message("assistant", "I'll implement the update and check the failed test.", "2026-05-20T10:02:00Z"),
+                    message("user", "# AGENTS.md instructions\nwrapper", "2026-05-22T10:03:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:05:00Z",
+                        "payload": {"output": "Process exited with code 1\npermission denied"},
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].timestamp, "2026-05-22T10:05:00Z")
+        self.assertIn("failed_command", turns[0].issue_flags)
+
     def test_task_complete_last_agent_message_updates_assistant_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
