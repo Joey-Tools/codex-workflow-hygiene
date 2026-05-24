@@ -151,6 +151,8 @@ PATH_LIKE_TEXT_PATTERN = re.compile(
     r")",
     re.I,
 )
+RAW_ROLLOUT_FILENAME_TEXT_PATTERN = re.compile(r"\brollout-\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2})?-[A-Za-z0-9_.-]+\.jsonl\b")
+RAW_SESSION_ID_TEXT_PATTERN = re.compile(r"\bsession_id\s*=\s*(?!session_ref_v1:)[^\s`'\",<>)]+")
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
@@ -1101,6 +1103,40 @@ def rollout_candidate_relevant(
     return True
 
 
+def rollout_has_materialized_window_coverage(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_raw_bytes: int | None = None,
+    allow_mtime_fallback: bool = False,
+) -> bool:
+    if start is None and end is None:
+        return True
+    rollout_date = rollout_window_date(path)
+    if rollout_date and end and rollout_date >= end:
+        return False
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if max_raw_bytes is not None and size > max_raw_bytes:
+        return oversized_rollout_relevance(path, start, end) == "relevant"
+    if rollout_date and start and rollout_date < start:
+        if allow_mtime_fallback and rollout_mtime_active(path, start, end):
+            return True
+        try:
+            return raw_timestamp_in_window(path, start, end)
+        except OSError:
+            return False
+    if rollout_date is None:
+        try:
+            return raw_timestamp_in_window(path, start, end)
+        except OSError:
+            return False
+    return True
+
+
 def rollout_mtime_active(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
     return rollout_active_mtime(path, start, end) is not None
 
@@ -1408,6 +1444,12 @@ def extract_rollout(
     def wrapper_pending_assistant_releasable(text: str) -> bool:
         lowered = text.lower()
         if re.search(r"\b(?:lgtm|looks good to me|no actionable findings|no findings)\b", lowered):
+            return True
+        completion_terms = re.search(
+            r"\b(?:implemented|updated|patched|created|added|fixed|resolved|completed|finished|done|wrote|generated|committed|pushed|merged)\b",
+            lowered,
+        )
+        if completion_terms and assistant_terminal_evidence(text):
             return True
         verification_terms = re.search(r"\b(?:verification|verify|verified|validate|validated|test|tests|build|lint|check|smoke)\b", lowered)
         return bool(verification_terms and assistant_terminal_evidence(text))
@@ -2435,7 +2477,11 @@ def history_text_contains_retention_risk(data: bytes, file_path: str) -> bool:
     if contains_unredacted_sensitive_text(text) or BARE_64_HEX_PATTERN.search(text):
         return True
     generated_follow_on = history_path_kind(file_path) in {"text", "json_text"}
-    return generated_follow_on and contains_path_like_text(text)
+    return generated_follow_on and (
+        contains_path_like_text(text)
+        or bool(RAW_ROLLOUT_FILENAME_TEXT_PATTERN.search(text))
+        or bool(RAW_SESSION_ID_TEXT_PATTERN.search(text))
+    )
 
 
 def history_text(data: bytes, label: str) -> str:
@@ -2970,7 +3016,9 @@ def validate_history_tree_ref(repo: Path, history_ref: str) -> None:
             if kind == "json_text":
                 history_json(data, file_path)
             if history_text_contains_retention_risk(data, file_path):
-                raise SystemExit(f"history artifact contains unredacted sensitive text or path-like text: {file_path}")
+                raise SystemExit(
+                    f"history artifact contains unredacted sensitive text, path-like text, or raw identifier: {file_path}"
+                )
 
 
 def validate_history_tree(history_repo: str | None, history_ref: str) -> None:
@@ -3278,7 +3326,7 @@ def remote_summary_only_gaps(
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return []
     if any(
-        rollout_candidate_relevant(
+        rollout_has_materialized_window_coverage(
             rollout,
             start,
             end,

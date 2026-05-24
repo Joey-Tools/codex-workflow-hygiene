@@ -2439,6 +2439,32 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("failed_command", turns[0].issue_flags)
         self.assertIn("response", turns[0].assistant_action_summary)
 
+    def test_wrapper_pending_implementation_final_emits_at_eof(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-pending-implementation.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Implement the helper.", "2026-05-20T10:01:00Z"),
+                    message("user", "# AGENTS.md instructions\nRepository policy only.", "2026-05-22T10:01:01Z"),
+                    message("assistant", "Implemented the change.", "2026-05-22T10:03:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].timestamp, "2026-05-22T10:03:00Z")
+        self.assertNotIn("failed_command", turns[0].issue_flags)
+        self.assertIn("implementation", turns[0].assistant_action_summary)
+
     def test_wrapper_pending_verification_gap_final_emits_at_eof(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -5987,6 +6013,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "path-like text"):
                 MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
+    def test_validate_history_tree_rejects_raw_rollout_filename_follow_on_report_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            report = history_repo / "reports" / "daily" / "2026" / "05" / "01.md"
+            report.parent.mkdir(parents=True)
+            report.write_text("Investigated rollout-2026-05-22T10-00-00-abc123.jsonl.\n", encoding="utf-8")
+            subprocess.run(["git", "add", "reports/daily/2026/05/01.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add raw rollout report"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "raw identifier"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_raw_session_id_follow_on_report_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            history_repo, _commit = write_history_repo(raw)
+            report = history_repo / "reports" / "daily" / "2026" / "05" / "01.md"
+            report.parent.mkdir(parents=True)
+            report.write_text("Matched session_id=abc123-def456 before redaction.\n", encoding="utf-8")
+            subprocess.run(["git", "add", "reports/daily/2026/05/01.md"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add raw session report"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "raw identifier"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
     def test_validate_history_tree_allows_schema_refs_in_follow_on_report_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -7712,6 +7762,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_old_oversized_rollout_does_not_cover_current_summary_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            old_rollout = remote / "sessions" / "2026" / "04" / "01" / "rollout-2026-04-01T10-00-00-remote.jsonl"
+            old_rollout.parent.mkdir(parents=True, exist_ok=True)
+            old_rollout.write_text(json.dumps(message("user", "Old remote task.", "2026-04-01T10:00:00Z")) + "\n" + ("x" * 1500), encoding="utf-8")
+            old_mtime = MODULE.parse_time("2026-04-01T11:00:00Z").timestamp()
+            os.utime(old_rollout, (old_mtime, old_mtime))
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:01:00Z", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_default_remote_incremental_summary_gap_uses_emit_start(self) -> None:
