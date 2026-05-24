@@ -528,6 +528,35 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("error=rollout unreadable", stderr.getvalue())
         self.assertNotIn("blocked path", stderr.getvalue())
 
+    def test_remote_probe_session_meta_reports_unreadable_local_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            date_dir = root / "sessions" / "2026" / "05" / "01"
+            date_dir.mkdir(parents=True)
+            resolved_date_dir = date_dir.resolve()
+            real_glob = Path.glob
+
+            def glob_or_raise(self: Path, pattern: str):
+                if self == resolved_date_dir:
+                    raise PermissionError("blocked /home/hoteng/.codex/sessions/2026/05/01")
+                return real_glob(self, pattern)
+
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                Path, "glob", glob_or_raise
+            ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(sys, "stdout", stdout):
+                result = REMOTE_PROBE.cmd_session_meta(
+                    types.SimpleNamespace(host=["local"], date=["2026/05/01"], from_date=None, to_date=None, limit=10)
+                )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("host=local", stderr.getvalue())
+        self.assertIn("error=session directory unreadable", stderr.getvalue())
+        self.assertNotIn("/home/hoteng/.codex", stderr.getvalue())
+        self.assertNotIn("blocked", stderr.getvalue())
+
     def test_remote_probe_session_meta_reports_unreadable_remote_rollout_without_remote_path(self) -> None:
         marker = json.dumps(
             {
@@ -559,6 +588,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("host=miku-bot-dev", stderr.getvalue())
         self.assertIn("rollout=sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl", stderr.getvalue())
         self.assertIn("error=rollout unreadable", stderr.getvalue())
+        self.assertNotIn("/home/hoteng/.codex", stderr.getvalue())
+
+    def test_remote_probe_session_meta_hides_unframed_remote_failure_stderr(self) -> None:
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            REMOTE_PROBE,
+            "_run_remote_python",
+            return_value=subprocess.CompletedProcess(
+                args=["ssh"],
+                returncode=1,
+                stdout="",
+                stderr="Traceback: /home/hoteng/.codex/sessions/2026/05/01",
+            ),
+        ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(sys, "stdout", stdout):
+            result = REMOTE_PROBE.cmd_session_meta(
+                types.SimpleNamespace(host=["miku-bot-dev"], date=["2026/05/01"], from_date=None, to_date=None, limit=10)
+            )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("host=miku-bot-dev", stderr.getvalue())
+        self.assertIn("error=remote session-meta failed", stderr.getvalue())
         self.assertNotIn("/home/hoteng/.codex", stderr.getvalue())
 
     def test_remote_probe_session_meta_rejects_symlink_date_dir(self) -> None:
@@ -10165,6 +10218,41 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertNotIn(str(root), result.stderr)
         self.assertNotIn("hidden-session", result.stdout)
+
+    def test_remote_probe_generated_session_meta_marks_unreadable_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            date_dir = root / "sessions" / "2026" / "05" / "01"
+            date_dir.mkdir(parents=True)
+            os.chmod(date_dir, 0)
+            try:
+                script = REMOTE_PROBE._remote_python_script(
+                    {
+                        "mode": "session-meta",
+                        "codex_root": str(root),
+                        "dates": ["2026/05/01"],
+                        "limit": 10,
+                        "session_meta_scan_bytes": 1024,
+                    }
+                )
+
+                result = subprocess.run(
+                    [sys.executable, "-"],
+                    input=script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+            finally:
+                os.chmod(date_dir, 0o700)
+
+        if '"error":"session directory unreadable"' not in result.stdout:
+            self.skipTest("chmod(0) did not make the session directory unreadable in this environment")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"kind":"error"', result.stdout)
+        self.assertIn('"error":"session directory unreadable"', result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn(str(root), result.stderr)
 
     def test_out_of_window_summary_meta_still_sets_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -968,6 +968,18 @@ def iter_session_meta():
         print(SESSION_META_END)
         return
     print(SESSION_META_BEGIN)
+
+    def session_directory_unreadable():
+        print(json.dumps({{"kind": "error", "error": "session directory unreadable"}}, separators=(",", ":"), sort_keys=True))
+        print(SESSION_META_END)
+        raise SystemExit(0)
+
+    def sorted_rollout_paths(directory):
+        try:
+            return sorted(directory.glob("rollout-*.jsonl"), reverse=True)
+        except OSError:
+            session_directory_unreadable()
+
     count = 0
     seen_session_ids = set()
     for date_text in reversed(DATE_STRINGS):
@@ -977,20 +989,24 @@ def iter_session_meta():
                 date_dir = safe_directory_path(rel_dir)
             except FileNotFoundError:
                 continue
+            except OSError:
+                session_directory_unreadable()
             rollout_paths.extend(
                 rollout
-                for rollout in sorted(date_dir.glob("rollout-*.jsonl"), reverse=True)
+                for rollout in sorted_rollout_paths(date_dir)
                 if is_raw_rollout_file(rollout)
             )
         try:
             flat_archived_dir = safe_directory_path(pathlib.PurePosixPath("archived_sessions"))
             rollout_paths.extend(
                 rollout
-                for rollout in sorted(flat_archived_dir.glob("rollout-*.jsonl"), reverse=True)
+                for rollout in sorted_rollout_paths(flat_archived_dir)
                 if is_raw_rollout_file(rollout) and flat_archived_rollout_matches_date(rollout, date_text)
             )
         except FileNotFoundError:
             pass
+        except OSError:
+            session_directory_unreadable()
         seen_rollout_paths = set()
         for rollout in rollout_paths:
             rel = pathlib.PurePosixPath(rollout.relative_to(root).as_posix())
@@ -1113,6 +1129,13 @@ def _scan_session_meta_records(
         return SessionMetaScan(rows=[], truncated=False)
     rows: list[dict[str, str]] = []
     seen_session_ids: set[str] = set()
+
+    def sorted_rollout_paths(directory: pathlib.Path) -> list[pathlib.Path]:
+        try:
+            return sorted(directory.glob("rollout-*.jsonl"), reverse=True)
+        except OSError as exc:
+            raise SessionMetaRolloutError("session directory unreadable") from exc
+
     for date_value in reversed(dates):
         date_text = date_value.strftime(DATE_FORMAT)
         rollout_paths: list[pathlib.Path] = []
@@ -1124,20 +1147,24 @@ def _scan_session_meta_records(
                 date_dir = _safe_directory_path(resolved_root, relative_dir)
             except FileNotFoundError:
                 continue
+            except OSError as exc:
+                raise SessionMetaRolloutError("session directory unreadable") from exc
             rollout_paths.extend(
                 rollout_path
-                for rollout_path in sorted(date_dir.glob("rollout-*.jsonl"), reverse=True)
+                for rollout_path in sorted_rollout_paths(date_dir)
                 if _is_raw_rollout_file(rollout_path)
             )
         try:
             flat_archived_dir = _safe_directory_path(resolved_root, pathlib.PurePosixPath("archived_sessions"))
             rollout_paths.extend(
                 rollout_path
-                for rollout_path in sorted(flat_archived_dir.glob("rollout-*.jsonl"), reverse=True)
+                for rollout_path in sorted_rollout_paths(flat_archived_dir)
                 if _is_raw_rollout_file(rollout_path) and _flat_archived_rollout_matches_date(rollout_path, date_value)
             )
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            raise SessionMetaRolloutError("session directory unreadable") from exc
         seen_rollout_paths: set[str] = set()
         for rollout_path in rollout_paths:
             rollout_relative_path = pathlib.PurePosixPath(
@@ -1495,9 +1522,8 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
                 print(f"error={error}", file=sys.stderr)
                 return 1
             if result.returncode != 0:
-                message = result.stderr.strip() or result.stdout.strip() or "remote session-meta failed"
                 print(f"host={alias}", file=sys.stderr)
-                print(f"error={message}", file=sys.stderr)
+                print("error=remote session-meta failed", file=sys.stderr)
                 return 1
             host_rows = []
             try:
