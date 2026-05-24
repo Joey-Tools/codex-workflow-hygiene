@@ -914,12 +914,13 @@ def iter_session_meta():
         return
     print(SESSION_META_BEGIN)
     count = 0
+    seen_session_ids = set()
     for date_text in reversed(DATE_STRINGS):
         rollout_paths = []
         for rel_dir in (pathlib.PurePosixPath("sessions") / date_text, pathlib.PurePosixPath("archived_sessions") / date_text):
             try:
                 date_dir = safe_directory_path(rel_dir)
-            except (FileNotFoundError, ValueError):
+            except FileNotFoundError:
                 continue
             rollout_paths.extend(sorted(date_dir.glob("rollout-*.jsonl"), reverse=True))
         try:
@@ -929,15 +930,20 @@ def iter_session_meta():
                 for rollout in sorted(flat_archived_dir.glob("rollout-*.jsonl"), reverse=True)
                 if flat_archived_rollout_matches_date(rollout, date_text)
             )
-        except (FileNotFoundError, ValueError):
+        except FileNotFoundError:
             pass
+        seen_rollout_paths = set()
         for rollout in rollout_paths:
             rel = pathlib.PurePosixPath(rollout.relative_to(root).as_posix())
+            rel_key = rel.as_posix()
+            if rel_key in seen_rollout_paths:
+                continue
+            seen_rollout_paths.add(rel_key)
             session_id = ""
             cwd = ""
             try:
                 target = safe_rollout_path(rel)
-            except (FileNotFoundError, ValueError):
+            except FileNotFoundError:
                 continue
             with open_rollout_text(target) as handle:
                 for line in bounded_text_lines(handle, SESSION_META_SCAN_BYTES):
@@ -952,6 +958,9 @@ def iter_session_meta():
                     cwd = str(payload.get("cwd", ""))
                     break
             if session_id:
+                if session_id in seen_session_ids:
+                    continue
+                seen_session_ids.add(session_id)
                 print(json.dumps({{"date": date_text, "session_id": session_id, "cwd": cwd, "rollout": rollout.relative_to(root).as_posix()}}, separators=(",", ":"), sort_keys=True))
                 count += 1
                 if LIMIT and count >= LIMIT:
@@ -1033,6 +1042,7 @@ def _iter_session_meta_records(
     except OSError:
         return []
     rows: list[dict[str, str]] = []
+    seen_session_ids: set[str] = set()
     for date_value in reversed(dates):
         date_text = date_value.strftime(DATE_FORMAT)
         rollout_paths: list[pathlib.Path] = []
@@ -1042,7 +1052,7 @@ def _iter_session_meta_records(
         ):
             try:
                 date_dir = _safe_directory_path(resolved_root, relative_dir)
-            except (FileNotFoundError, ValueError):
+            except FileNotFoundError:
                 continue
             rollout_paths.extend(sorted(date_dir.glob("rollout-*.jsonl"), reverse=True))
         try:
@@ -1052,17 +1062,22 @@ def _iter_session_meta_records(
                 for rollout_path in sorted(flat_archived_dir.glob("rollout-*.jsonl"), reverse=True)
                 if _flat_archived_rollout_matches_date(rollout_path, date_value)
             )
-        except (FileNotFoundError, ValueError):
+        except FileNotFoundError:
             pass
+        seen_rollout_paths: set[str] = set()
         for rollout_path in rollout_paths:
             rollout_relative_path = pathlib.PurePosixPath(
                 rollout_path.relative_to(resolved_root).as_posix()
             )
+            rollout_relative_key = rollout_relative_path.as_posix()
+            if rollout_relative_key in seen_rollout_paths:
+                continue
+            seen_rollout_paths.add(rollout_relative_key)
             session_id = ""
             cwd = ""
             try:
                 handle = _open_local_rollout_text(resolved_root, rollout_relative_path)
-            except (FileNotFoundError, ValueError):
+            except FileNotFoundError:
                 continue
             with handle:
                 for line in _bounded_text_lines(handle, MAX_SESSION_META_SCAN_BYTES):
@@ -1078,6 +1093,9 @@ def _iter_session_meta_records(
                     break
             if not session_id:
                 continue
+            if session_id in seen_session_ids:
+                continue
+            seen_session_ids.add(session_id)
             rows.append(
                 {
                     "host": host,

@@ -1360,7 +1360,14 @@ def extract_rollout(
             prompt_text = meaningful_prompt_text(user_text) if user_text else ""
             if user_text and not meaningful_user_text(user_text):
                 # Runtime wrappers immediately after a user prompt belong to that active turn.
-                if current and current_has_post_prompt_evidence:
+                current_timestamp = parse_time(current.timestamp) if current else None
+                wrapper_starts_new_window_activity = (
+                    emit_threshold is not None
+                    and current_timestamp is not None
+                    and current_timestamp < emit_threshold
+                    and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback)
+                )
+                if current and (current_has_post_prompt_evidence or wrapper_starts_new_window_activity):
                     flush_assistant()
                     current = None
                     current_emitted = False

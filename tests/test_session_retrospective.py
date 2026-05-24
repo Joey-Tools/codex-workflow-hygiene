@@ -430,7 +430,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(result, 2)
 
-    def test_remote_probe_session_meta_skips_symlink_rollout(self) -> None:
+    def test_remote_probe_session_meta_rejects_symlink_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             outside = Path(raw) / "outside-rollout.jsonl"
@@ -448,14 +448,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             rollout.parent.mkdir(parents=True)
             rollout.symlink_to(outside)
 
-            rows = REMOTE_PROBE._iter_session_meta_records(
-                codex_root=root,
-                dates=[dt.date(2026, 5, 1)],
-                limit=10,
-                host="local",
-            )
-
-            self.assertEqual(rows, [])
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                REMOTE_PROBE._iter_session_meta_records(
+                    codex_root=root,
+                    dates=[dt.date(2026, 5, 1)],
+                    limit=10,
+                    host="local",
+                )
 
     def test_remote_probe_session_meta_missing_codex_root_returns_empty(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -468,7 +467,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
 
-    def test_remote_probe_session_meta_skips_symlink_date_dir(self) -> None:
+    def test_remote_probe_session_meta_rejects_symlink_date_dir(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             target_dir = root / "other-date"
@@ -486,14 +485,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             link_dir.parent.mkdir(parents=True)
             link_dir.symlink_to(target_dir, target_is_directory=True)
 
-            rows = REMOTE_PROBE._iter_session_meta_records(
-                codex_root=root,
-                dates=[dt.date(2026, 5, 1)],
-                limit=10,
-                host="local",
-            )
-
-            self.assertEqual(rows, [])
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                REMOTE_PROBE._iter_session_meta_records(
+                    codex_root=root,
+                    dates=[dt.date(2026, 5, 1)],
+                    limit=10,
+                    host="local",
+                )
 
     def test_remote_probe_supports_dated_archived_rollout_paths(self) -> None:
         path = REMOTE_PROBE._resolve_rollout_relative_path(
@@ -572,6 +570,42 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 rows[0]["rollout"],
                 "archived_sessions/rollout-2026-05-01T10-00-00-flat.jsonl",
             )
+
+    def test_remote_probe_session_meta_deduplicates_archived_session_ids_before_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            dated_duplicate = root / "archived_sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T12-00-00-dup.jsonl"
+            flat_duplicate = root / "archived_sessions" / "rollout-2026-05-01T12-00-00-dup.jsonl"
+            flat_unique = root / "archived_sessions" / "rollout-2026-05-01T11-00-00-unique.jsonl"
+            duplicate_row = {
+                "type": "session_meta",
+                "timestamp": "2026-05-01T12:00:00Z",
+                "payload": {"id": "duplicate-session", "cwd": "/redacted/repo"},
+            }
+            write_jsonl(dated_duplicate, [duplicate_row])
+            write_jsonl(flat_duplicate, [duplicate_row])
+            write_jsonl(
+                flat_unique,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T11:00:00Z",
+                        "payload": {"id": "unique-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+
+            rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=2,
+                host="local",
+            )
+
+        self.assertEqual([row["session_id"] for row in rows], ["duplicate-session", "unique-session"])
+
+    def test_remote_probe_script_is_executable(self) -> None:
+        self.assertTrue(os.access(REMOTE_PROBE_SCRIPT, os.X_OK))
 
     def test_remote_probe_fetch_rollout_writes_private_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1653,6 +1687,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 [
                     message("user", "Please implement the helper.", "2026-05-20T10:01:00Z"),
                     message("assistant", "Implemented the helper.", "2026-05-20T10:02:00Z"),
+                    message("user", "# AGENTS.md instructions\nwrapper", "2026-05-22T10:03:00Z"),
+                    message("assistant", "Failed with permission denied.", "2026-05-22T10:04:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(turns, [])
+
+    def test_wrapper_after_lookback_prompt_without_evidence_does_not_emit_old_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-abc.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the helper.", "2026-05-20T10:01:00Z"),
                     message("user", "# AGENTS.md instructions\nwrapper", "2026-05-22T10:03:00Z"),
                     message("assistant", "Failed with permission denied.", "2026-05-22T10:04:00Z"),
                 ],
