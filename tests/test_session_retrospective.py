@@ -5141,6 +5141,49 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "path-like"):
                 MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
 
+    def test_validate_retained_rejects_raw_identifiers_in_retained_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fix failed deployment.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained_output = export_retained(output, raw)
+            originals = {
+                name: (retained_output / name).read_text(encoding="utf-8")
+                for name in MODULE.RETAINED_OUTPUT_FILES
+            }
+            cases = [
+                ("episodes.jsonl", lambda rows: rows[0].__setitem__("topic", "rollout-2026-05-22T10-00-00-abc123.jsonl")),
+                ("turn_flags.jsonl", lambda rows: rows[0].__setitem__("redacted_user_prompt_summary", "session_id=abc123-def456")),
+                ("trend_report.json", lambda obj: obj["window"].__setitem__("mode", "session_id=abc123-def456")),
+                ("retained_manifest.json", lambda obj: obj["window"].__setitem__("mode", "rollout-2026-05-22T10-00-00-abc123.jsonl")),
+            ]
+
+            for file_name, mutate in cases:
+                with self.subTest(file_name=file_name):
+                    for original_name, original_text in originals.items():
+                        (retained_output / original_name).write_text(original_text, encoding="utf-8")
+                    target = retained_output / file_name
+                    if file_name.endswith(".jsonl"):
+                        rows = [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()]
+                        mutate(rows)
+                        write_jsonl(target, rows)
+                    else:
+                        obj = json.loads(target.read_text(encoding="utf-8"))
+                        mutate(obj)
+                        target.write_text(json.dumps(obj) + "\n", encoding="utf-8")
+
+                    with self.assertRaisesRegex(SystemExit, "raw identifier"):
+                        MODULE.main(["validate-retained", "--run-dir", str(retained_output)])
+
     def test_validate_retained_rejects_mode_or_window_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -7820,10 +7863,21 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
             write_remote_metadata(remote, "miku-bot-dev")
-            rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-remote.jsonl"
+            rollout = remote / rollout_ref
             write_jsonl(rollout, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
             summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
-            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:01:00Z", "text": "permission denied"}])
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied",
+                    }
+                ],
+            )
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
@@ -7835,6 +7889,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_relevant_summary_requires_valid_backing_rollout_ref(self) -> None:
+        cases = [
+            {"kind": "summary", "timestamp": "2026-05-01T10:01:00Z", "text": "permission denied"},
+            {
+                "kind": "summary",
+                "timestamp": "2026-05-01T10:01:00Z",
+                "rollout": "../rollout-2026-05-01T10-00-00-remote.jsonl",
+                "text": "permission denied",
+            },
+        ]
+        for record in cases:
+            with self.subTest(record=record):
+                with tempfile.TemporaryDirectory() as raw:
+                    remote = Path(raw) / "miku-bot-dev"
+                    write_remote_metadata(remote, "miku-bot-dev")
+                    rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-remote.jsonl"
+                    rollout = remote / rollout_ref
+                    write_jsonl(rollout, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
+                    summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+                    write_jsonl(summary, [record])
+                    output = safe_output_dir(raw)
+
+                    MODULE.run_scan(
+                        types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                        mode="daily",
+                        start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                        end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    )
+                    trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+                self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_default_remote_mixed_summary_backing_requires_each_materialized_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -8041,12 +8127,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
             write_remote_metadata(remote, "miku-bot-dev")
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-remote.jsonl"
             write_jsonl(
-                remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl",
+                remote / rollout_ref,
                 [message("user", "Remote raw task.", "2026-05-01T10:00:00Z")],
             )
             summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-remote.jsonl"
-            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T11:00:00Z", "text": "permission denied"}])
+            write_jsonl(
+                summary,
+                [{"kind": "summary", "timestamp": "2026-05-01T11:00:00Z", "rollout": rollout_ref, "text": "permission denied"}],
+            )
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
@@ -8074,12 +8164,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
             write_remote_metadata(remote, "miku-bot-dev")
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-remote.jsonl"
             write_jsonl(
-                remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl",
+                remote / rollout_ref,
                 [message("user", "Remote raw task.", "2026-05-01T10:00:00Z")],
             )
             summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-remote.jsonl"
-            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T11:00:00Z", "text": "permission denied"}])
+            write_jsonl(
+                summary,
+                [{"kind": "summary", "timestamp": "2026-05-01T11:00:00Z", "rollout": rollout_ref, "text": "permission denied"}],
+            )
             output = safe_output_dir(raw)
             shard_output = safe_output_dir(raw, "shards")
 

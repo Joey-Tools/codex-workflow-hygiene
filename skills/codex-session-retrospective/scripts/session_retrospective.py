@@ -1331,41 +1331,48 @@ def summary_backing_rollout_refs(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
-) -> tuple[set[str], bool, bool]:
+) -> tuple[set[str], bool, bool, bool]:
     refs: set[str] = set()
     try:
         with path.open("rb") as handle:
             data = handle.read(max_scan_bytes + 1)
     except OSError:
-        return refs, False, True
+        return refs, False, True, True
     complete = len(data) <= max_scan_bytes
     if not complete:
         data = data[:max_scan_bytes].rsplit(b"\n", 1)[0]
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        return refs, False, True
+        return refs, False, True, True
     relevant_record_seen = False
+    unbacked_record_seen = False
     for line in text.splitlines():
         if not line.strip():
             continue
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
-            return refs, False, True
+            return refs, False, True, True
         if not isinstance(record, dict):
-            return refs, False, True
+            return refs, False, True, True
+        if str(record.get("kind") or "summary") == "session_meta":
+            continue
         if not summary_record_in_window(record, path, start, end):
             continue
         relevant_record_seen = True
         rollout_ref = record.get("rollout")
-        if isinstance(rollout_ref, str):
-            safe_ref = safe_relative_summary_ref(rollout_ref)
-            if safe_ref is not None:
-                refs.add(safe_ref)
+        if not isinstance(rollout_ref, str):
+            unbacked_record_seen = True
+            continue
+        safe_ref = safe_relative_summary_ref(rollout_ref)
+        if safe_ref is None:
+            unbacked_record_seen = True
+            continue
+        refs.add(safe_ref)
     if not complete:
-        return refs, False, True
-    return refs, True, relevant_record_seen
+        return refs, False, True, True
+    return refs, True, relevant_record_seen, unbacked_record_seen
 
 
 def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
@@ -2025,6 +2032,16 @@ def contains_unredacted_sensitive_text(value: Any, *, include_safety_markers: bo
     return False
 
 
+def contains_raw_identifier_text(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(RAW_ROLLOUT_FILENAME_TEXT_PATTERN.search(value) or RAW_SESSION_ID_TEXT_PATTERN.search(value))
+    if isinstance(value, dict):
+        return any(contains_raw_identifier_text(child) for child in value.values())
+    if isinstance(value, list):
+        return any(contains_raw_identifier_text(child) for child in value)
+    return False
+
+
 def safe_token(value: Any) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9_.-]+", value))
 
@@ -2054,6 +2071,8 @@ def retained_mode_token(value: Any) -> bool:
 def ensure_retained_safe_value(label: str, value: Any) -> None:
     if contains_unredacted_sensitive_text(value) or contains_path_like_text(value):
         raise SystemExit(f"{label}: unredacted sensitive or path-like text in retained output")
+    if contains_raw_identifier_text(value):
+        raise SystemExit(f"{label}: raw identifier in retained output")
     if contains_raw_path_fields(value):
         raise SystemExit(f"{label}: raw root/path fields are not retention-safe")
     if contains_invalid_ref(value):
@@ -3425,9 +3444,16 @@ def remote_summary_only_gaps(
     for summary in summaries:
         if not summary_file_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_scan_bytes):
             continue
-        backing_refs, complete, relevant_record_seen = summary_backing_rollout_refs(summary, start, end, max_scan_bytes=max_scan_bytes)
+        backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+            summary,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+        )
         if not relevant_record_seen:
             continue
+        if unbacked_record_seen:
+            return [remote_metadata_gap(source, "remote_source_not_materialized")]
         if backing_refs:
             if not complete or not backing_refs.issubset(covered_rollout_refs):
                 return [remote_metadata_gap(source, "remote_source_not_materialized")]
