@@ -1270,9 +1270,15 @@ def summary_file_relevant_with_scan_cap(
     summary_date = summary_date_from_path(path)
     if summary_date is None:
         try:
-            return raw_timestamp_in_window(path, start, end, max_scan_bytes=max_scan_bytes)
+            found, complete = oversized_rollout_has_timestamp_in_window(
+                path,
+                start,
+                end,
+                max_scan_bytes=max_scan_bytes,
+            )
         except OSError:
             return False
+        return found or not complete
     if summary_date and start and summary_date < start:
         if summary_date + dt.timedelta(days=1) > start:
             return True

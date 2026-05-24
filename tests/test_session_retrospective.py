@@ -3747,7 +3747,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "oversized")
         self.assertIn("coverage_gap", rows[0])
 
-    def test_make_shards_skips_old_undated_oversized_summary(self) -> None:
+    def test_make_shards_marks_old_undated_oversized_summary_conservative(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             summary = root / "rollout-summary-undated.jsonl"
@@ -3786,7 +3786,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertEqual(rows, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "oversized")
+        self.assertIn("coverage_gap", rows[0])
 
     def test_make_shards_revalidates_source_materialization_before_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -9552,7 +9555,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_summary_skipped")
 
-    def test_old_undated_oversized_rollout_summary_does_not_report_current_gap(self) -> None:
+    def test_old_undated_oversized_rollout_summary_reports_conservative_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "remote"
             summary = root / "rollout-summary-undated.jsonl"
@@ -9573,7 +9576,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
-        self.assertNotIn("oversized_summary_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertIn("oversized_summary_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_undated_oversized_rollout_summary_with_late_current_record_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-undated.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text(
+                json.dumps({"kind": "summary", "timestamp": "2026-04-01T10:00:00Z", "text": "old"})
+                + "\n"
+                + ("x" * 1500)
+                + "\n"
+                + json.dumps({"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"})
+                + "\n",
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("oversized_summary_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_truncated_rollout_summary_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -9797,6 +9826,43 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "partial")
+        self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_marks_undated_oversized_summary_with_late_current_record(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "rollout-summary-undated.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text(
+                json.dumps({"kind": "summary", "timestamp": "2026-04-01T10:00:00Z", "text": "old"})
+                + "\n"
+                + ("x" * 1500)
+                + "\n"
+                + json.dumps({"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"})
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "oversized")
         self.assertIn("coverage_gap", rows[0])
 
     def test_make_shards_skips_future_truncated_rollout_summary(self) -> None:
