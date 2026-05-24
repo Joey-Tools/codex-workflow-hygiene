@@ -1175,6 +1175,11 @@ def summary_file_relevant_with_scan_cap(
     if start is None and end is None:
         return True
     summary_date = summary_date_from_path(path)
+    if summary_date is None:
+        try:
+            return raw_timestamp_in_window(path, start, end, max_scan_bytes=max_scan_bytes)
+        except OSError:
+            return False
     if summary_date and start and summary_date < start:
         if summary_date + dt.timedelta(days=1) > start:
             return True
@@ -1290,7 +1295,7 @@ def extract_rollout(
     assistant_bits: list[str] = []
     last_user_fingerprint: tuple[str, str] | None = None
     current_emitted = False
-    current_has_post_prompt_evidence = False
+    current_detach_on_wrapper = False
     emit_threshold = emit_start or start
 
     def flush_assistant() -> None:
@@ -1359,7 +1364,8 @@ def extract_rollout(
             assistant_text = assistant_text_from_payload(payload)
             prompt_text = meaningful_prompt_text(user_text) if user_text else ""
             if user_text and not meaningful_user_text(user_text):
-                # Runtime wrappers immediately after a user prompt belong to that active turn.
+                # Runtime wrappers do not start a user turn. Keep still-active prompts,
+                # but detach once the prior turn already has terminal evidence.
                 current_timestamp = parse_time(current.timestamp) if current else None
                 wrapper_starts_new_window_activity = (
                     emit_threshold is not None
@@ -1367,11 +1373,11 @@ def extract_rollout(
                     and current_timestamp < emit_threshold
                     and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback)
                 )
-                if current and (current_has_post_prompt_evidence or wrapper_starts_new_window_activity):
+                if current and (current_detach_on_wrapper or wrapper_starts_new_window_activity):
                     flush_assistant()
                     current = None
                     current_emitted = False
-                    current_has_post_prompt_evidence = False
+                    current_detach_on_wrapper = False
                     assistant_bits = []
                 continue
             if prompt_text and meaningful_user_text(user_text):
@@ -1418,17 +1424,19 @@ def extract_rollout(
                     turn.prompt_improvement = "Clarify the expected outcome, scope boundary, and any prior correction before asking Codex to continue."
                 current = turn
                 current_emitted = False
-                current_has_post_prompt_evidence = False
+                current_detach_on_wrapper = False
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current()
                 continue
             if assistant_text and current:
-                current_has_post_prompt_evidence = True
+                assistant_summary = safe_assistant_summary([assistant_text])
+                if any(category in assistant_summary for category in ("implementation", "verification", "git_or_pr", "blocked_or_failed")):
+                    current_detach_on_wrapper = True
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current(line_no, timestamp)
                     assistant_bits.append(assistant_text)
             if current and tool_output_payload_text(record, payload):
-                current_has_post_prompt_evidence = True
+                current_detach_on_wrapper = True
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current(line_no, timestamp)
 
@@ -1436,7 +1444,6 @@ def extract_rollout(
         _redacted_text, changed = redact(text)
         record_flags = flags_for_text(text, redacted_changed=changed)
         if current and record_flags:
-            current_has_post_prompt_evidence = True
             if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                 emit_current(line_no, timestamp)
                 merged = set(current.issue_flags)

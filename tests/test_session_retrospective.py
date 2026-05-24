@@ -2559,6 +2559,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(continuation[0].timestamp, "2026-05-22T09:00:00Z")
         self.assertIn("failed_command", continuation[0].issue_flags)
 
+    def test_wrapper_only_message_preserves_active_turn_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-wrapper.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Fix the deployment verification.", "2026-05-22T10:00:00Z"),
+                    message("assistant", "I will inspect the failing check.", "2026-05-22T10:00:01Z"),
+                    message(
+                        "user",
+                        "# AGENTS.md instructions\n"
+                        "<INSTRUCTIONS>Repository policy.</INSTRUCTIONS>\n"
+                        "<environment_context>Runtime metadata.</environment_context>",
+                        "2026-05-22T10:00:02Z",
+                    ),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:00:03Z",
+                        "payload": {"output": "Process exited with code 1\nverification failed"},
+                    },
+                    message("assistant", "Verification failed after the command exited.", "2026-05-22T10:00:04Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("failed_command", turns[0].issue_flags)
+        self.assertIn("blocked_or_failed", turns[0].assistant_action_summary)
+        self.assertIn("verification", turns[0].assistant_action_summary)
+
     def test_active_thread_with_fallback_timestamp_emits_when_mtime_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -6717,6 +6749,42 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_undated_summary_gap_uses_timestamp_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            summary = remote / "rollout-summary-undated.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-04-01T10:00:00Z", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_undated_current_summary_still_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            summary = remote / "rollout-summary-undated.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_default_remote_old_oversized_summary_relevance_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
