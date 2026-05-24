@@ -152,7 +152,7 @@ PATH_LIKE_TEXT_PATTERN = re.compile(
     re.I,
 )
 RAW_ROLLOUT_FILENAME_TEXT_PATTERN = re.compile(r"\brollout-\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2})?-[A-Za-z0-9_.-]+\.jsonl\b")
-RAW_SESSION_ID_TEXT_PATTERN = re.compile(r"\bsession_id\s*=\s*(?!session_ref_v1:)[^\s`'\",<>)]+")
+RAW_SESSION_ID_TEXT_PATTERN = re.compile(r"\bsession_id[\"']?\s*(?:=|:)\s*[\"']?(?!session_ref_v1:)[^\s`'\",<>)\]}]+")
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
@@ -1292,6 +1292,54 @@ def summary_file_relevant_with_scan_cap(
     return True
 
 
+def source_relative_path_ref(path: Path, root: Path) -> str | None:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+
+def safe_relative_summary_ref(value: str) -> str | None:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return None
+    parts = candidate.parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        return None
+    return candidate.as_posix()
+
+
+def summary_backing_rollout_refs(path: Path, *, max_scan_bytes: int) -> tuple[set[str], bool]:
+    refs: set[str] = set()
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(max_scan_bytes + 1)
+    except OSError:
+        return refs, False
+    complete = len(data) <= max_scan_bytes
+    if not complete:
+        data = data[:max_scan_bytes].rsplit(b"\n", 1)[0]
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return refs, False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return refs, False
+        if not isinstance(record, dict):
+            return refs, False
+        rollout_ref = record.get("rollout")
+        if isinstance(rollout_ref, str):
+            safe_ref = safe_relative_summary_ref(rollout_ref)
+            if safe_ref is not None:
+                refs.add(safe_ref)
+    return refs, complete
+
+
 def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
     if start is None and end is None:
         return True
@@ -1444,6 +1492,10 @@ def extract_rollout(
     def wrapper_pending_assistant_releasable(text: str) -> bool:
         lowered = text.lower()
         if re.search(r"\b(?:lgtm|looks good to me|no actionable findings|no findings)\b", lowered):
+            return True
+        if re.search(r"(?im)^\s*(?:findings?|issues?|defects?|bugs?|regressions?)\s*:", text):
+            return True
+        if re.search(r"(?im)^\s*(?:[-*]|\d+[.)])?\s*\[?P[0-3]\]?\b", text):
             return True
         completion_terms = re.search(
             r"\b(?:implemented|updated|patched|created|added|fixed|resolved|completed|finished|done|wrote|generated|committed|pushed|merged)\b",
@@ -3325,20 +3377,32 @@ def remote_summary_only_gaps(
 ) -> list[dict[str, Any]]:
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return []
-    if any(
-        rollout_has_materialized_window_coverage(
+    covered_rollout_refs: set[str] = set()
+    has_covered_rollout = False
+    for rollout in rollouts:
+        if not rollout_has_materialized_window_coverage(
             rollout,
             start,
             end,
             max_raw_bytes=max_scan_bytes,
             allow_mtime_fallback=source_allows_mtime_fallback(source),
-        )
-        for rollout in rollouts
-    ):
-        return []
-    if not any(summary_file_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_scan_bytes) for summary in summaries):
-        return []
-    return [remote_metadata_gap(source, "remote_source_not_materialized")]
+        ):
+            continue
+        has_covered_rollout = True
+        rollout_ref = source_relative_path_ref(rollout, source.root)
+        if rollout_ref is not None:
+            covered_rollout_refs.add(rollout_ref)
+    for summary in summaries:
+        if not summary_file_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_scan_bytes):
+            continue
+        backing_refs, complete = summary_backing_rollout_refs(summary, max_scan_bytes=max_scan_bytes)
+        if backing_refs:
+            if not complete or not backing_refs.issubset(covered_rollout_refs):
+                return [remote_metadata_gap(source, "remote_source_not_materialized")]
+            continue
+        if not complete or not has_covered_rollout:
+            return [remote_metadata_gap(source, "remote_source_not_materialized")]
+    return []
 
 
 def earliest_rollout_sources(sources: list[Source]) -> list[Source]:
