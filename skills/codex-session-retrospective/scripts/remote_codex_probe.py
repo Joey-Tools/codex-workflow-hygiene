@@ -823,7 +823,7 @@ def summarize_rollout():
                         record = summary_record(kind, text, line_no=line_no, timestamp=timestamp)
                         if kind == "assistant_message":
                             last_assistant_record = record
-                        elif kind == "user_message":
+                        elif kind == "user_message" and record is not None:
                             last_user_record = record
                 elif payload_type == "function_call_output":
                     output = payload.get("output")
@@ -841,7 +841,8 @@ def summarize_rollout():
                     text = event_user_message_text(payload)
                     if text:
                         record = summary_record("user_message", text, line_no=line_no, timestamp=timestamp)
-                        last_user_record = record
+                        if record is not None:
+                            last_user_record = record
 
             if not record or record.get("kind") == "session_meta":
                 continue
@@ -1692,7 +1693,7 @@ def _summarize_rollout_records(
                     )
                     if kind == "assistant_message":
                         last_assistant_record = record
-                    elif kind == "user_message":
+                    elif kind == "user_message" and record is not None:
                         last_user_record = record
             elif payload_type == "function_call_output":
                 output = payload.get("output")
@@ -1728,7 +1729,8 @@ def _summarize_rollout_records(
                         timestamp=timestamp,
                         max_text_chars=max_text_chars,
                     )
-                    last_user_record = record
+                    if record is not None:
+                        last_user_record = record
 
         if record is None:
             continue

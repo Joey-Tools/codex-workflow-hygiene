@@ -736,6 +736,75 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("assumed", records[0]["text"])
         self.assertNotIn("verification step", records[0]["text"])
 
+    def test_remote_probe_rollout_summary_preserves_real_user_before_wrapper(self) -> None:
+        records = REMOTE_PROBE._summarize_rollout_records(
+            lines=[
+                json.dumps(message("user", "Review the deployment.", "2026-05-01T10:00:00Z")),
+                json.dumps(
+                    message(
+                        "user",
+                        "Persistent internal Codex readonly review contract:\nCheck approval, secrets, privacy, and verification.",
+                        "2026-05-01T10:01:00Z",
+                    )
+                ),
+            ],
+            keywords=[],
+            limit=10,
+            tail_records=0,
+            max_text_chars=80,
+        )
+
+        self.assertEqual([record["kind"] for record in records], ["user_message"])
+        self.assertEqual(records[0]["text"], "user message present")
+
+    def test_remote_probe_generated_rollout_summary_preserves_real_user_before_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Review the deployment.", "2026-05-01T10:00:00Z"),
+                    message(
+                        "user",
+                        "Persistent internal Codex readonly review contract:\nCheck approval, secrets, privacy, and verification.",
+                        "2026-05-01T10:01:00Z",
+                    ),
+                ],
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                    "summary_limit": 10,
+                    "summary_scan_bytes": 4096,
+                    "summary_tail_records": 0,
+                    "summary_max_text_chars": 80,
+                    "summary_keywords": [],
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [
+            row
+            for line in result.stdout.splitlines()
+            if line.startswith("{")
+            for row in [json.loads(line)]
+            if "kind" in row
+            if row["kind"] != "scan_meta"
+        ]
+        self.assertEqual([row["kind"] for row in rows], ["user_message"])
+        self.assertEqual(rows[0]["text"], "user message present")
+
     def test_remote_probe_rollout_summary_preserves_early_signal_outside_tail(self) -> None:
         lines = [json.dumps(message("user", "permission denied while fetching remote logs", "2026-05-01T10:00:00Z"))]
         for index in range(10):
