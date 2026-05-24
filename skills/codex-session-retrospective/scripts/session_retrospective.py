@@ -483,23 +483,24 @@ def safe_assistant_summary(texts: list[str]) -> str:
 
 def assistant_terminal_evidence(text: str) -> bool:
     lowered = text.lower()
-    terminal_match = re.search(
+    terminal_patterns = [
         r"\b(?:implemented|updated|patched|created|added|fixed|resolved|completed|finished|done|ran|validated|verified|tested|committed|pushed|merged|wrote|generated)\b",
-        lowered,
-    )
-    if terminal_match:
+        r"\b(?:command|test|tests|verification|build|lint|check)\s+failed\b",
+        r"\bfailed\s+(?:with|because|after|during)\b",
+        r"\b(?:lgtm|looks good to me|no actionable findings|no findings)\b",
+        r"process exited with code",
+        r"permission denied",
+    ]
+    for pattern in terminal_patterns:
+        terminal_match = re.search(pattern, lowered)
+        if not terminal_match:
+            continue
         future_intent = re.search(
             r"\b(?:i'?ll|i will|i am going to|i'm going to|we'?ll|we will|we are going to|let me)\b",
             lowered[: terminal_match.start()],
         )
         if future_intent:
-            return False
-        return True
-    if re.search(r"\b(?:command|test|tests|verification|build|lint|check)\s+failed\b", lowered):
-        return True
-    if re.search(r"\bfailed\s+(?:with|because|after|during)\b", lowered):
-        return True
-    if "process exited with code" in lowered or "permission denied" in lowered:
+            continue
         return True
     return False
 
