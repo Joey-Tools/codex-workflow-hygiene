@@ -422,6 +422,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             self.assertEqual(result, 1)
 
+    def test_remote_probe_rollout_summary_reports_unreadable_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(rollout, [message("user", "Unreadable task.", "2026-05-01T10:00:00Z")])
+            stderr = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                REMOTE_PROBE, "_open_local_rollout_text", side_effect=PermissionError("blocked")
+            ), mock.patch.object(sys, "stderr", stderr):
+                result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout="sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                        keyword=[],
+                        limit=40,
+                        tail_records=8,
+                        max_text_chars=400,
+                    )
+                )
+
+        self.assertEqual(result, 1)
+        self.assertIn("error=rollout unreadable", stderr.getvalue())
+
     def test_remote_probe_rollout_summary_rejects_unbounded_text_limit(self) -> None:
         result = REMOTE_PROBE.cmd_rollout_summary(
             types.SimpleNamespace(
@@ -577,19 +601,32 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "archived_sessions/rollout-2026-05-01T10-00-00-flat.jsonl",
             )
 
-    def test_remote_probe_session_meta_deduplicates_archived_session_ids_before_limit(self) -> None:
+    def test_remote_probe_session_meta_deduplicates_archived_rollout_names_before_limit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             dated_duplicate = root / "archived_sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T12-00-00-dup.jsonl"
             flat_duplicate = root / "archived_sessions" / "rollout-2026-05-01T12-00-00-dup.jsonl"
             flat_unique = root / "archived_sessions" / "rollout-2026-05-01T11-00-00-unique.jsonl"
-            duplicate_row = {
-                "type": "session_meta",
-                "timestamp": "2026-05-01T12:00:00Z",
-                "payload": {"id": "duplicate-session", "cwd": "/redacted/repo"},
-            }
-            write_jsonl(dated_duplicate, [duplicate_row])
-            write_jsonl(flat_duplicate, [duplicate_row])
+            write_jsonl(
+                dated_duplicate,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T12:00:00Z",
+                        "payload": {"id": "duplicate-dated-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            write_jsonl(
+                flat_duplicate,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T12:00:00Z",
+                        "payload": {"id": "duplicate-flat-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
             write_jsonl(
                 flat_unique,
                 [
@@ -608,7 +645,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 host="local",
             )
 
-        self.assertEqual([row["session_id"] for row in rows], ["duplicate-session", "unique-session"])
+        self.assertEqual([row["session_id"] for row in rows], ["duplicate-dated-session", "unique-session"])
 
     def test_remote_probe_session_meta_rejects_local_limit_truncation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -748,6 +785,32 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             self.assertIn("private-output-session", output.read_text(encoding="utf-8"))
+
+    def test_remote_probe_fetch_rollout_reports_unreadable_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            task_output_root = Path(raw) / "task-output"
+            task_output_root.mkdir(parents=True)
+            stderr = io.StringIO()
+
+            def fake_task_output_root(workspace_root: Path | None = None) -> Path:
+                return task_output_root.resolve()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                REMOTE_PROBE, "_fetch_local_rollout", side_effect=PermissionError("blocked")
+            ), mock.patch.object(REMOTE_PROBE, "_task_output_root", fake_task_output_root), mock.patch.object(
+                sys, "stderr", stderr
+            ):
+                result = REMOTE_PROBE.cmd_fetch_rollout(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout="sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                        output="rollout.jsonl",
+                    )
+                )
+
+        self.assertEqual(result, 1)
+        self.assertIn("error=rollout unreadable", stderr.getvalue())
 
     def test_remote_probe_fetch_rollout_rejects_symlink_output_parent(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -7392,6 +7455,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_old_rollout_does_not_cover_current_summary_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            old_rollout = remote / "sessions" / "2026" / "04" / "01" / "rollout-2026-04-01T10-00-00-remote.jsonl"
+            write_jsonl(old_rollout, [message("user", "Old remote task.", "2026-04-01T10:00:00Z")])
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:01:00Z", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_default_remote_incremental_summary_gap_uses_emit_start(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

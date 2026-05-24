@@ -1362,6 +1362,7 @@ def extract_rollout(
     wrapper_pending_trigger_line_no: int | None = None
     wrapper_pending_trigger_timestamp: str | None = None
     wrapper_pending_release_ready = False
+    wrapper_detached_followup = False
     emit_threshold = emit_start or start
 
     def flush_assistant() -> None:
@@ -1473,6 +1474,7 @@ def extract_rollout(
             user_text = user_text_from_payload(payload)
             assistant_text = assistant_text_from_payload(payload)
             prompt_text = meaningful_prompt_text(user_text) if user_text else ""
+            tool_text = tool_output_payload_text(record, payload)
             if user_text and not meaningful_user_text(user_text):
                 # Runtime wrappers do not start a user turn. Keep still-active prompts,
                 # but detach once the prior turn already has terminal evidence.
@@ -1485,8 +1487,7 @@ def extract_rollout(
                 )
                 if current and current_detach_on_wrapper:
                     flush_assistant()
-                    current = None
-                    current_emitted = False
+                    wrapper_detached_followup = True
                     current_detach_on_wrapper = False
                     clear_wrapper_pending_assistant()
                     assistant_bits = []
@@ -1499,6 +1500,7 @@ def extract_rollout(
                     wrapper_pending_release_ready = False
                 continue
             if prompt_text and meaningful_user_text(user_text):
+                wrapper_detached_followup = False
                 if wrapper_pending_new_window_activity and wrapper_pending_assistant_bits:
                     if wrapper_pending_release_ready:
                         pending_line_no, pending_timestamp = release_wrapper_pending_assistant()
@@ -1556,6 +1558,8 @@ def extract_rollout(
                     emit_current()
                 continue
             if assistant_text and current:
+                if wrapper_detached_followup:
+                    continue
                 if wrapper_pending_new_window_activity:
                     if (
                         payload.get("type") == "task_complete"
@@ -1582,7 +1586,9 @@ def extract_rollout(
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current(line_no, timestamp)
                     assistant_bits.append(assistant_text)
-            if current and tool_output_payload_text(record, payload):
+            if current and tool_text:
+                if wrapper_detached_followup:
+                    continue
                 if wrapper_pending_new_window_activity:
                     release_wrapper_pending_assistant()
                 current_detach_on_wrapper = True
@@ -3246,7 +3252,16 @@ def remote_summary_only_gaps(
 ) -> list[dict[str, Any]]:
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return []
-    if rollouts:
+    if any(
+        rollout_candidate_relevant(
+            rollout,
+            start,
+            end,
+            max_raw_bytes=max_scan_bytes,
+            allow_mtime_fallback=source_allows_mtime_fallback(source),
+        )
+        for rollout in rollouts
+    ):
         return []
     if not any(summary_file_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_scan_bytes) for summary in summaries):
         return []

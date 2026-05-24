@@ -412,6 +412,13 @@ def _flat_archived_rollout_matches_date(
     return rollout_path.name.startswith(f"rollout-{date_value.strftime('%Y-%m-%d')}")
 
 
+def _session_meta_rollout_dedupe_key(relative_path: pathlib.PurePosixPath) -> str:
+    parts = relative_path.parts
+    if len(parts) >= 2 and parts[0] == "archived_sessions":
+        return f"archived_sessions/{relative_path.name}"
+    return relative_path.as_posix()
+
+
 def _parse_kv_lines(text: str) -> dict[str, str]:
     result: dict[str, str] = {}
     for line in text.splitlines():
@@ -619,6 +626,13 @@ def flat_archived_rollout_matches_date(rollout, date_text):
     return rollout.name.startswith("rollout-" + date_text.replace("/", "-"))
 
 
+def session_meta_rollout_dedupe_key(rel):
+    parts = rel.parts
+    if len(parts) >= 2 and parts[0] == "archived_sessions":
+        return "archived_sessions/" + rel.name
+    return rel.as_posix()
+
+
 def normalize_text(text, max_chars):
     collapsed = " ".join(str(text).replace("\\r", "\\n").split())
     if max_chars and max_chars > 3 and len(collapsed) > max_chars:
@@ -801,8 +815,14 @@ def summarize_rollout():
     last_user_record = None
     last_task_complete_record = None
 
-    target_size = target.stat().st_size
-    with open_rollout_text(target) as handle:
+    try:
+        target_size = target.stat().st_size
+        handle = open_rollout_text(target)
+    except OSError:
+        print(json.dumps({{"ok": False, "error": "rollout unreadable"}}, separators=(",", ":"), sort_keys=True))
+        print(ROLLOUT_SUMMARY_END)
+        return
+    with handle:
         for line_no, line in enumerate(bounded_text_lines(handle, SUMMARY_SCAN_BYTES), 1):
             try:
                 obj = json.loads(line)
@@ -945,7 +965,7 @@ def iter_session_meta():
         seen_rollout_paths = set()
         for rollout in rollout_paths:
             rel = pathlib.PurePosixPath(rollout.relative_to(root).as_posix())
-            rel_key = rel.as_posix()
+            rel_key = session_meta_rollout_dedupe_key(rel)
             if rel_key in seen_rollout_paths:
                 continue
             seen_rollout_paths.add(rel_key)
@@ -996,6 +1016,10 @@ def fetch_rollout():
         size, data = read_rollout_bytes(target, MAX_FETCH_ROLLOUT_BYTES)
     except FileNotFoundError:
         print(json.dumps({{"ok": False, "error": "rollout not found"}}, separators=(",", ":"), sort_keys=True))
+        print(FETCH_ROLLOUT_END)
+        return
+    except OSError:
+        print(json.dumps({{"ok": False, "error": "rollout unreadable"}}, separators=(",", ":"), sort_keys=True))
         print(FETCH_ROLLOUT_END)
         return
     except ValueError as error:
@@ -1080,7 +1104,7 @@ def _scan_session_meta_records(
             rollout_relative_path = pathlib.PurePosixPath(
                 rollout_path.relative_to(resolved_root).as_posix()
             )
-            rollout_relative_key = rollout_relative_path.as_posix()
+            rollout_relative_key = _session_meta_rollout_dedupe_key(rollout_relative_path)
             if rollout_relative_key in seen_rollout_paths:
                 continue
             seen_rollout_paths.add(rollout_relative_key)
@@ -1510,6 +1534,11 @@ def cmd_fetch_rollout(args: argparse.Namespace) -> int:
         print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
         print("error=rollout not found", file=sys.stderr)
         return 1
+    except OSError:
+        print(f"host={alias}", file=sys.stderr)
+        print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+        print("error=rollout unreadable", file=sys.stderr)
+        return 1
     except ValueError as error:
         print(f"host={alias}", file=sys.stderr)
         print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
@@ -1934,6 +1963,11 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
         print(f"host={alias}", file=sys.stderr)
         print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
         print("error=rollout not found", file=sys.stderr)
+        return 1
+    except OSError:
+        print(f"host={alias}", file=sys.stderr)
+        print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+        print("error=rollout unreadable", file=sys.stderr)
         return 1
     except ValueError as error:
         print(f"host={alias}", file=sys.stderr)
