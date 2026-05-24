@@ -999,7 +999,10 @@ def _iter_session_meta_records(
     limit: int,
     host: str,
 ) -> list[dict[str, str]]:
-    resolved_root = codex_root.expanduser().resolve(strict=True)
+    try:
+        resolved_root = codex_root.expanduser().resolve(strict=True)
+    except OSError:
+        return []
     rows: list[dict[str, str]] = []
     for date_value in reversed(dates):
         date_text = date_value.strftime(DATE_FORMAT)

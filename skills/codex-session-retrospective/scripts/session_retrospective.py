@@ -3206,7 +3206,7 @@ def run_scan(
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
                 "status": "stale"
-                if source_materialization_gaps or source_summary_only_gaps
+                if source_materialization_gaps
                 else "ready"
                 if rollouts or summaries
                 else "empty",
@@ -3406,7 +3406,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
                 "status": "stale"
-                if source_materialization_gaps or source_summary_only_gaps
+                if source_materialization_gaps
                 else "ready"
                 if rollouts or summaries
                 else "empty",
@@ -3582,6 +3582,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         status = source.get("status")
         if status is None:
             raise SystemExit("make-shards requires transient manifest sources with status=ready")
+        if status != "ready":
+            continue
         source = Source(str(host), root)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not root.exists():
@@ -3593,15 +3595,11 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             continue
         source_remote_gaps = remote_evidence_gaps(source, start=start, end=end)
         if source_remote_gaps:
-            if status == "ready":
-                append_source_gap_shards(source_remote_gaps, root)
+            append_source_gap_shards(source_remote_gaps, root)
             continue
         source_materialization_gaps = materialization_gaps_for_source(source)
         if source_materialization_gaps:
-            if status == "ready":
-                append_source_gap_shards(source_materialization_gaps, root)
-            continue
-        if status not in {"ready", "stale"}:
+            append_source_gap_shards(source_materialization_gaps, root)
             continue
         for rollout in source_rollouts(source):
             if not rollout_candidate_relevant(
