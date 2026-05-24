@@ -1337,6 +1337,9 @@ def extract_rollout(
     wrapper_pending_new_window_activity = False
     wrapper_pending_assistant_bits: list[str] = []
     wrapper_pending_issue_flags: set[str] = set()
+    wrapper_pending_trigger_line_no: int | None = None
+    wrapper_pending_trigger_timestamp: str | None = None
+    wrapper_pending_release_ready = False
     emit_threshold = emit_start or start
 
     def flush_assistant() -> None:
@@ -1357,13 +1360,37 @@ def extract_rollout(
         _redacted_text, changed = redact(text)
         return flags_for_text(text, redacted_changed=changed)
 
-    def release_wrapper_pending_assistant() -> None:
+    def wrapper_pending_assistant_releasable(text: str) -> bool:
+        lowered = text.lower()
+        if re.search(r"\b(?:lgtm|looks good to me|no actionable findings|no findings)\b", lowered):
+            return True
+        verification_terms = re.search(r"\b(?:verification|verify|verified|validate|validated|test|tests|build|lint|check|smoke)\b", lowered)
+        return bool(verification_terms and assistant_terminal_evidence(text))
+
+    def clear_wrapper_pending_assistant() -> None:
+        nonlocal wrapper_pending_assistant_bits, wrapper_pending_issue_flags, wrapper_pending_new_window_activity
+        nonlocal wrapper_pending_trigger_line_no, wrapper_pending_trigger_timestamp, wrapper_pending_release_ready
+        wrapper_pending_assistant_bits = []
+        wrapper_pending_issue_flags = set()
+        wrapper_pending_new_window_activity = False
+        wrapper_pending_trigger_line_no = None
+        wrapper_pending_trigger_timestamp = None
+        wrapper_pending_release_ready = False
+
+    def release_wrapper_pending_assistant() -> tuple[int | None, str | None]:
         nonlocal assistant_bits, wrapper_pending_assistant_bits, wrapper_pending_issue_flags, wrapper_pending_new_window_activity
+        nonlocal wrapper_pending_trigger_line_no, wrapper_pending_trigger_timestamp, wrapper_pending_release_ready
+        trigger_line_no = wrapper_pending_trigger_line_no
+        trigger_timestamp = wrapper_pending_trigger_timestamp
         assistant_bits.extend(wrapper_pending_assistant_bits)
         wrapper_pending_assistant_bits = []
         merge_current_flags(wrapper_pending_issue_flags)
         wrapper_pending_issue_flags = set()
         wrapper_pending_new_window_activity = False
+        wrapper_pending_trigger_line_no = None
+        wrapper_pending_trigger_timestamp = None
+        wrapper_pending_release_ready = False
+        return trigger_line_no, trigger_timestamp
 
     def is_emit_record(timestamp: dt.datetime | None, *, timestamp_is_fallback: bool) -> bool:
         if emit_threshold is None or timestamp is None or timestamp >= emit_threshold:
@@ -1439,16 +1466,25 @@ def extract_rollout(
                     current = None
                     current_emitted = False
                     current_detach_on_wrapper = False
-                    wrapper_pending_new_window_activity = False
-                    wrapper_pending_assistant_bits = []
-                    wrapper_pending_issue_flags = set()
+                    clear_wrapper_pending_assistant()
                     assistant_bits = []
                 elif current and wrapper_starts_new_window_activity:
                     wrapper_pending_new_window_activity = True
                     wrapper_pending_assistant_bits = []
                     wrapper_pending_issue_flags = set()
+                    wrapper_pending_trigger_line_no = None
+                    wrapper_pending_trigger_timestamp = None
+                    wrapper_pending_release_ready = False
                 continue
             if prompt_text and meaningful_user_text(user_text):
+                if wrapper_pending_new_window_activity and wrapper_pending_assistant_bits:
+                    if wrapper_pending_release_ready:
+                        pending_line_no, pending_timestamp = release_wrapper_pending_assistant()
+                        current_detach_on_wrapper = True
+                        emit_current(pending_line_no, pending_timestamp)
+                        flush_assistant()
+                    else:
+                        clear_wrapper_pending_assistant()
                 fingerprint_time = iso(parsed_timestamp.replace(microsecond=0)) if parsed_timestamp and not timestamp_is_fallback else ""
                 fingerprint = (prompt_text, fingerprint_time)
                 if duplicate_user_turn(prompt_text, fingerprint_time, last_user_fingerprint):
@@ -1493,9 +1529,7 @@ def extract_rollout(
                 current = turn
                 current_emitted = False
                 current_detach_on_wrapper = False
-                wrapper_pending_new_window_activity = False
-                wrapper_pending_assistant_bits = []
-                wrapper_pending_issue_flags = set()
+                clear_wrapper_pending_assistant()
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current()
                 continue
@@ -1512,8 +1546,12 @@ def extract_rollout(
                         assistant_bits.append(assistant_text)
                         continue
                     elif is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
+                        if wrapper_pending_trigger_line_no is None:
+                            wrapper_pending_trigger_line_no = line_no
+                            wrapper_pending_trigger_timestamp = timestamp
                         wrapper_pending_assistant_bits.append(assistant_text)
                         wrapper_pending_issue_flags.update(flags_from_raw_text(assistant_text))
+                        wrapper_pending_release_ready = wrapper_pending_release_ready or wrapper_pending_assistant_releasable(assistant_text)
                         continue
                     else:
                         continue
@@ -1536,6 +1574,10 @@ def extract_rollout(
                 emit_current(line_no, timestamp)
                 merge_current_flags(record_flags)
 
+    if wrapper_pending_new_window_activity and wrapper_pending_assistant_bits and wrapper_pending_release_ready:
+        pending_line_no, pending_timestamp = release_wrapper_pending_assistant()
+        current_detach_on_wrapper = True
+        emit_current(pending_line_no, pending_timestamp)
     flush_assistant()
     return turns
 

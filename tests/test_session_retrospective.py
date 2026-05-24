@@ -2059,6 +2059,60 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("failed_command", turns[0].issue_flags)
         self.assertIn("verification", turns[0].assistant_action_summary)
 
+    def test_wrapper_pending_assistant_final_emits_at_eof(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-pending-eof.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Review the proposed change.", "2026-05-20T10:01:00Z"),
+                    message("user", "# AGENTS.md instructions\nRepository policy only.", "2026-05-22T10:01:01Z"),
+                    message("assistant", "LGTM / no actionable findings.", "2026-05-22T10:03:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].timestamp, "2026-05-22T10:03:00Z")
+        self.assertNotIn("failed_command", turns[0].issue_flags)
+        self.assertIn("response", turns[0].assistant_action_summary)
+
+    def test_wrapper_pending_assistant_final_emits_before_next_user(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-pending-next-user.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Verify the deployment.", "2026-05-20T10:01:00Z"),
+                    message("user", "# AGENTS.md instructions\nRepository policy only.", "2026-05-22T10:01:01Z"),
+                    message("assistant", "Verification failed during smoke test.", "2026-05-22T10:03:00Z"),
+                    message("user", "Now inspect the logs.", "2026-05-22T10:04:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].timestamp, "2026-05-22T10:03:00Z")
+        self.assertIn("failed_command", turns[0].issue_flags)
+        self.assertIn("verification", turns[0].assistant_action_summary)
+        self.assertEqual(turns[1].timestamp, "2026-05-22T10:04:00Z")
+
     def test_future_intent_preamble_does_not_detach_active_turn_on_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
