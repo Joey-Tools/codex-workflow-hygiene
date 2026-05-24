@@ -1603,6 +1603,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(turns[0].issue_flags, [])
         self.assertEqual(turns[1].issue_flags, [])
 
+    def test_wrapper_after_lookback_assistant_does_not_emit_old_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-abc.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the helper.", "2026-05-20T10:01:00Z"),
+                    message("assistant", "Implemented the helper.", "2026-05-20T10:02:00Z"),
+                    message("user", "# AGENTS.md instructions\nwrapper", "2026-05-22T10:03:00Z"),
+                    message("assistant", "Failed with permission denied.", "2026-05-22T10:04:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(turns, [])
+
     def test_task_complete_last_agent_message_updates_assistant_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

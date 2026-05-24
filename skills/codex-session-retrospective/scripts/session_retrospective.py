@@ -1407,29 +1407,31 @@ def extract_rollout(
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current()
                 continue
-            if assistant_text and current and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
-                emit_current(line_no, timestamp)
-                assistant_bits.append(assistant_text)
+            if assistant_text and current:
                 current_has_post_prompt_evidence = True
+                if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
+                    emit_current(line_no, timestamp)
+                    assistant_bits.append(assistant_text)
             if (
                 current
                 and not user_text
-                and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback)
             ):
-                emit_current(line_no, timestamp)
                 current_has_post_prompt_evidence = True
+                if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
+                    emit_current(line_no, timestamp)
 
         text = record_text(record)
         _redacted_text, changed = redact(text)
         record_flags = flags_for_text(text, redacted_changed=changed)
-        if current and record_flags and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
-            emit_current(line_no, timestamp)
+        if current and record_flags:
             current_has_post_prompt_evidence = True
-            merged = set(current.issue_flags)
-            merged.update(record_flags)
-            current.issue_flags = sorted(merged)
-            if not current.prompt_improvement and ("verification_gap" in merged or "failed_command" in merged):
-                current.prompt_improvement = "Ask Codex to report the exact verification run and stop if it cannot complete the requested check."
+            if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
+                emit_current(line_no, timestamp)
+                merged = set(current.issue_flags)
+                merged.update(record_flags)
+                current.issue_flags = sorted(merged)
+                if not current.prompt_improvement and ("verification_gap" in merged or "failed_command" in merged):
+                    current.prompt_improvement = "Ask Codex to report the exact verification run and stop if it cannot complete the requested check."
 
     flush_assistant()
     return turns
