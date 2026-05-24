@@ -1940,6 +1940,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("failed_command", turns[0].issue_flags)
         self.assertIn("blocked_or_failed", turns[0].assistant_action_summary)
 
+    def test_wrapper_after_lookback_prompt_preserves_neutral_task_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-neutral.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Review the proposed change.", "2026-05-20T10:01:00Z"),
+                    message("user", "# AGENTS.md instructions\nRepository policy only.", "2026-05-22T10:01:01Z"),
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:04:00Z",
+                        "payload": {
+                            "type": "task_complete",
+                            "last_agent_message": "All set.",
+                        },
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].timestamp, "2026-05-22T10:04:00Z")
+        self.assertIn("response", turns[0].assistant_action_summary)
+
     def test_future_intent_preamble_does_not_detach_active_turn_on_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

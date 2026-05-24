@@ -1480,7 +1480,6 @@ def extract_rollout(
                     if (
                         payload.get("type") == "task_complete"
                         and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback)
-                        and assistant_terminal_evidence(assistant_text)
                     ):
                         release_wrapper_pending_assistant()
                         current_detach_on_wrapper = True
