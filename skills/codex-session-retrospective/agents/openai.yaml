@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Session Retrospective"
+  short_description: "Review Codex collaboration history with redacted episode and turn summaries."
+  default_prompt: "Use $codex-session-retrospective to run a read-only retrospective over Codex session history and produce redacted episode, turn, and trend artifacts."
