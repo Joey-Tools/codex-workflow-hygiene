@@ -487,6 +487,7 @@ def assistant_terminal_evidence(text: str) -> bool:
         r"\b(?:implemented|updated|patched|created|added|fixed|resolved|completed|finished|done|ran|validated|verified|tested|committed|pushed|merged|wrote|generated)\b",
         r"\b(?:command|test|tests|verification|build|lint|check)\s+failed\b",
         r"\bfailed\s+(?:with|because|after|during)\b",
+        r"\b(?:could not run|couldn't run|unable to run|did not run|not run|untested)\b",
         r"\b(?:lgtm|looks good to me|no actionable findings|no findings)\b",
         r"process exited with code",
         r"permission denied",
