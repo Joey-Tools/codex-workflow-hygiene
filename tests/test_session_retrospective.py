@@ -1972,6 +1972,69 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(turns[0].timestamp, "2026-05-22T10:04:00Z")
         self.assertIn("response", turns[0].assistant_action_summary)
 
+    def test_neutral_task_complete_detaches_before_runtime_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-neutral.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Review the proposed change.", "2026-05-22T10:01:00Z"),
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:02:00Z",
+                        "payload": {
+                            "type": "task_complete",
+                            "last_agent_message": "All set.",
+                        },
+                    },
+                    message("user", "# AGENTS.md instructions\nRepository policy only.", "2026-05-22T10:03:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:04:00Z",
+                        "payload": {"output": "Process exited with code 1\npermission denied"},
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertNotIn("failed_command", turns[0].issue_flags)
+        self.assertIn("response", turns[0].assistant_action_summary)
+
+    def test_wrapper_pending_assistant_flags_survive_neutral_tool_output(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-pending-flags.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Verify the deployment.", "2026-05-20T10:01:00Z"),
+                    message("user", "# AGENTS.md instructions\nRepository policy only.", "2026-05-22T10:01:01Z"),
+                    message("assistant", "Could not run tests.", "2026-05-22T10:02:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:04:00Z",
+                        "payload": {"output": "Process exited with code 0\nOK"},
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].timestamp, "2026-05-22T10:04:00Z")
+        self.assertIn("verification_gap", turns[0].issue_flags)
+        self.assertNotIn("failed_command", turns[0].issue_flags)
+        self.assertIn("verification", turns[0].assistant_action_summary)
+
     def test_future_intent_preamble_does_not_detach_active_turn_on_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

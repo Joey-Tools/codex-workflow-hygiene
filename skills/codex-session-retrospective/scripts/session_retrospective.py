@@ -1330,6 +1330,7 @@ def extract_rollout(
     current_detach_on_wrapper = False
     wrapper_pending_new_window_activity = False
     wrapper_pending_assistant_bits: list[str] = []
+    wrapper_pending_issue_flags: set[str] = set()
     emit_threshold = emit_start or start
 
     def flush_assistant() -> None:
@@ -1338,10 +1339,24 @@ def extract_rollout(
             current.assistant_action_summary = safe_assistant_summary(assistant_bits)
             assistant_bits = []
 
+    def merge_current_flags(flags: set[str]) -> None:
+        if current and flags:
+            merged = set(current.issue_flags)
+            merged.update(flags)
+            current.issue_flags = sorted(merged)
+            if not current.prompt_improvement and ("verification_gap" in merged or "failed_command" in merged):
+                current.prompt_improvement = "Ask Codex to report the exact verification run and stop if it cannot complete the requested check."
+
+    def flags_from_raw_text(text: str) -> set[str]:
+        _redacted_text, changed = redact(text)
+        return flags_for_text(text, redacted_changed=changed)
+
     def release_wrapper_pending_assistant() -> None:
-        nonlocal assistant_bits, wrapper_pending_assistant_bits, wrapper_pending_new_window_activity
+        nonlocal assistant_bits, wrapper_pending_assistant_bits, wrapper_pending_issue_flags, wrapper_pending_new_window_activity
         assistant_bits.extend(wrapper_pending_assistant_bits)
         wrapper_pending_assistant_bits = []
+        merge_current_flags(wrapper_pending_issue_flags)
+        wrapper_pending_issue_flags = set()
         wrapper_pending_new_window_activity = False
 
     def is_emit_record(timestamp: dt.datetime | None, *, timestamp_is_fallback: bool) -> bool:
@@ -1420,10 +1435,12 @@ def extract_rollout(
                     current_detach_on_wrapper = False
                     wrapper_pending_new_window_activity = False
                     wrapper_pending_assistant_bits = []
+                    wrapper_pending_issue_flags = set()
                     assistant_bits = []
                 elif current and wrapper_starts_new_window_activity:
                     wrapper_pending_new_window_activity = True
                     wrapper_pending_assistant_bits = []
+                    wrapper_pending_issue_flags = set()
                 continue
             if prompt_text and meaningful_user_text(user_text):
                 fingerprint_time = iso(parsed_timestamp.replace(microsecond=0)) if parsed_timestamp and not timestamp_is_fallback else ""
@@ -1472,6 +1489,7 @@ def extract_rollout(
                 current_detach_on_wrapper = False
                 wrapper_pending_new_window_activity = False
                 wrapper_pending_assistant_bits = []
+                wrapper_pending_issue_flags = set()
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current()
                 continue
@@ -1482,15 +1500,18 @@ def extract_rollout(
                         and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback)
                     ):
                         release_wrapper_pending_assistant()
+                        merge_current_flags(flags_from_raw_text(assistant_text))
                         current_detach_on_wrapper = True
                         emit_current(line_no, timestamp)
                         assistant_bits.append(assistant_text)
+                        continue
                     elif is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                         wrapper_pending_assistant_bits.append(assistant_text)
+                        wrapper_pending_issue_flags.update(flags_from_raw_text(assistant_text))
                         continue
                     else:
                         continue
-                elif assistant_terminal_evidence(assistant_text):
+                elif payload.get("type") == "task_complete" or assistant_terminal_evidence(assistant_text):
                     current_detach_on_wrapper = True
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current(line_no, timestamp)
@@ -1503,16 +1524,11 @@ def extract_rollout(
                     emit_current(line_no, timestamp)
 
         text = record_text(record)
-        _redacted_text, changed = redact(text)
-        record_flags = flags_for_text(text, redacted_changed=changed)
+        record_flags = flags_from_raw_text(text)
         if current and record_flags:
             if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                 emit_current(line_no, timestamp)
-                merged = set(current.issue_flags)
-                merged.update(record_flags)
-                current.issue_flags = sorted(merged)
-                if not current.prompt_improvement and ("verification_gap" in merged or "failed_command" in merged):
-                    current.prompt_improvement = "Ask Codex to report the exact verification run and stop if it cannot complete the requested check."
+                merge_current_flags(record_flags)
 
     flush_assistant()
     return turns
