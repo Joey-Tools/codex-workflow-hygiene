@@ -3461,6 +3461,18 @@ def remote_summary_only_gaps(
     return []
 
 
+def source_manifest_status(
+    rollouts: list[Path],
+    summaries: list[Path],
+    blocking_gaps: list[dict[str, Any]],
+) -> str:
+    if blocking_gaps:
+        return "stale"
+    if rollouts or summaries:
+        return "ready"
+    return "empty"
+
+
 def earliest_rollout_sources(sources: list[Source]) -> list[Source]:
     eligible: list[Source] = []
     for source in sources:
@@ -3576,6 +3588,7 @@ def run_scan(
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
+        blocking_gaps = source_materialization_gaps + source_summary_only_gaps
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
         manifest_sources.append(
@@ -3585,11 +3598,7 @@ def run_scan(
                 "root_ref": path_ref(source.root),
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
-                "status": "stale"
-                if source_materialization_gaps
-                else "ready"
-                if rollouts or summaries
-                else "empty",
+                "status": source_manifest_status(rollouts, summaries, blocking_gaps),
             }
         )
         if source_materialization_gaps:
@@ -3781,6 +3790,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         )
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
+        blocking_gaps = source_materialization_gaps + source_summary_only_gaps
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
         manifest_sources.append(
@@ -3790,11 +3800,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                 "root_ref": path_ref(source.root),
                 "rollout_count": len(rollouts),
                 "summary_count": len(summaries),
-                "status": "stale"
-                if source_materialization_gaps
-                else "ready"
-                if rollouts or summaries
-                else "empty",
+                "status": source_manifest_status(rollouts, summaries, blocking_gaps),
             }
         )
     if getattr(args, "allow_partial_hosts", False):
@@ -3988,7 +3994,20 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         if source_materialization_gaps:
             append_source_gap_shards(source_materialization_gaps, root)
             continue
-        for rollout in source_rollouts(source):
+        rollouts = source_rollouts(source)
+        summaries = source_summary_files(source)
+        source_summary_only_gaps = remote_summary_only_gaps(
+            source,
+            rollouts,
+            summaries,
+            start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+        )
+        if source_summary_only_gaps:
+            append_source_gap_shards(source_summary_only_gaps, root)
+            continue
+        for rollout in rollouts:
             if not rollout_candidate_relevant(
                 rollout,
                 start,
@@ -4031,7 +4050,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"
                 rows.append(row)
                 continue
-        for summary in source_summary_files(Source(str(host), root)):
+        for summary in summaries:
             append_summary_shard(summary)
     write_jsonl(output / "shards.jsonl", rows)
     print(output / "shards.jsonl")

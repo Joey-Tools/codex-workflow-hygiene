@@ -3829,6 +3829,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "unsafe_source_artifact")
 
+    def test_make_shards_revalidates_remote_summary_backing_before_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"}])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(manifest),
+                    "--output",
+                    str(output),
+                    "--include-raw-paths",
+                ]
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path"], str(root))
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "remote_source_not_materialized")
+
     def test_make_shards_scans_old_dated_summary_for_current_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -7891,8 +7929,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["host"], "miku-bot-dev")
         self.assertIn("failed_command", rows[0]["issue_flags"])
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
-        self.assertEqual(manifest["sources"][0]["status"], "ready")
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
         self.assertEqual(manifest["sources"][0]["summary_count"], 1)
+
+    def test_discover_marks_unbacked_remote_summary_stale_before_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-remote.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+            shard_output = safe_output_dir(raw, "shards")
+
+            MODULE.run_discover(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            MODULE.main(["make-shards", "--manifest", str(output / "shard_manifest.json"), "--output", str(shard_output)])
+            rows = [json.loads(line) for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in manifest["coverage_gaps"]])
+        self.assertEqual(rows, [])
 
     def test_default_remote_ignores_irrelevant_summary_when_rollouts_cover_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
