@@ -239,20 +239,47 @@ def _path_is_relative_to(path: pathlib.Path, root: pathlib.Path) -> bool:
     return True
 
 
+def _safe_relative_path(
+    codex_root: pathlib.Path,
+    relative_path: pathlib.PurePosixPath,
+    *,
+    expect_directory: bool = False,
+    expect_regular_file: bool = False,
+) -> pathlib.Path:
+    root = codex_root.expanduser().resolve(strict=True)
+    target = root
+    parts = relative_path.parts
+    for index, part in enumerate(parts):
+        if part in ("", ".", ".."):
+            raise ValueError("path must stay under Codex root")
+        target = target / part
+        target_stat = target.lstat()
+        if stat.S_ISLNK(target_stat.st_mode):
+            raise ValueError("path uses a symlink ancestor")
+        is_last = index == len(parts) - 1
+        if not is_last:
+            if not stat.S_ISDIR(target_stat.st_mode):
+                raise ValueError("path ancestor is not a directory")
+        elif expect_directory and not stat.S_ISDIR(target_stat.st_mode):
+            raise ValueError("path is not a directory")
+        elif expect_regular_file and not stat.S_ISREG(target_stat.st_mode):
+            raise ValueError("rollout path is not a regular file")
+    target_resolved = target.resolve(strict=True)
+    if not _path_is_relative_to(target_resolved, root):
+        raise ValueError("path escapes Codex root")
+    return target_resolved
+
+
 def _safe_rollout_path(
     codex_root: pathlib.Path, rollout_relative_path: pathlib.PurePosixPath
 ) -> pathlib.Path:
-    root = codex_root.expanduser().resolve(strict=True)
-    target = root.joinpath(*rollout_relative_path.parts)
-    target_stat = target.lstat()
-    if stat.S_ISLNK(target_stat.st_mode):
-        raise ValueError("rollout path is a symlink")
-    if not stat.S_ISREG(target_stat.st_mode):
-        raise ValueError("rollout path is not a regular file")
-    target_resolved = target.resolve(strict=True)
-    if not _path_is_relative_to(target_resolved, root):
-        raise ValueError("rollout path escapes Codex root")
-    return target_resolved
+    return _safe_relative_path(codex_root, rollout_relative_path, expect_regular_file=True)
+
+
+def _safe_directory_path(
+    codex_root: pathlib.Path, relative_path: pathlib.PurePosixPath
+) -> pathlib.Path:
+    return _safe_relative_path(codex_root, relative_path, expect_directory=True)
 
 
 def _open_local_rollout_text(
@@ -464,18 +491,37 @@ def path_is_relative_to(path, root):
     return True
 
 
-def safe_rollout_path(rel):
+def safe_relative_path(rel, *, expect_directory=False, expect_regular_file=False):
     root = ROOT.resolve(strict=True)
-    target = root.joinpath(*rel.parts)
-    target_stat = target.lstat()
-    if stat.S_ISLNK(target_stat.st_mode):
-        raise ValueError("rollout path is a symlink")
-    if not stat.S_ISREG(target_stat.st_mode):
-        raise ValueError("rollout path is not a regular file")
+    target = root
+    parts = rel.parts
+    for index, part in enumerate(parts):
+        if part in ("", ".", ".."):
+            raise ValueError("path must stay under Codex root")
+        target = target / part
+        target_stat = target.lstat()
+        if stat.S_ISLNK(target_stat.st_mode):
+            raise ValueError("path uses a symlink ancestor")
+        is_last = index == len(parts) - 1
+        if not is_last:
+            if not stat.S_ISDIR(target_stat.st_mode):
+                raise ValueError("path ancestor is not a directory")
+        elif expect_directory and not stat.S_ISDIR(target_stat.st_mode):
+            raise ValueError("path is not a directory")
+        elif expect_regular_file and not stat.S_ISREG(target_stat.st_mode):
+            raise ValueError("rollout path is not a regular file")
     target_resolved = target.resolve(strict=True)
     if not path_is_relative_to(target_resolved, root):
-        raise ValueError("rollout path escapes Codex root")
+        raise ValueError("path escapes Codex root")
     return target_resolved
+
+
+def safe_rollout_path(rel):
+    return safe_relative_path(rel, expect_regular_file=True)
+
+
+def safe_directory_path(rel):
+    return safe_relative_path(rel, expect_directory=True)
 
 
 def open_rollout_text(target):
@@ -814,17 +860,21 @@ def iter_session_meta():
     count = 0
     for date_text in reversed(DATE_STRINGS):
         rollout_paths = []
-        for date_dir in (ROOT / "sessions" / date_text, ROOT / "archived_sessions" / date_text):
-            if not date_dir.is_dir():
+        for rel_dir in (pathlib.PurePosixPath("sessions") / date_text, pathlib.PurePosixPath("archived_sessions") / date_text):
+            try:
+                date_dir = safe_directory_path(rel_dir)
+            except (FileNotFoundError, ValueError):
                 continue
             rollout_paths.extend(sorted(date_dir.glob("rollout-*.jsonl"), reverse=True))
-        flat_archived_dir = ROOT / "archived_sessions"
-        if flat_archived_dir.is_dir():
+        try:
+            flat_archived_dir = safe_directory_path(pathlib.PurePosixPath("archived_sessions"))
             rollout_paths.extend(
                 rollout
                 for rollout in sorted(flat_archived_dir.glob("rollout-*.jsonl"), reverse=True)
                 if flat_archived_rollout_matches_date(rollout, date_text)
             )
+        except (FileNotFoundError, ValueError):
+            pass
         for rollout in rollout_paths:
             rel = pathlib.PurePosixPath(rollout.relative_to(ROOT).as_posix())
             session_id = ""
@@ -918,29 +968,37 @@ def _iter_session_meta_records(
     limit: int,
     host: str,
 ) -> list[dict[str, str]]:
+    resolved_root = codex_root.expanduser().resolve(strict=True)
     rows: list[dict[str, str]] = []
     for date_value in reversed(dates):
         date_text = date_value.strftime(DATE_FORMAT)
         rollout_paths: list[pathlib.Path] = []
-        for date_dir in (codex_root / "sessions" / date_text, codex_root / "archived_sessions" / date_text):
-            if not date_dir.is_dir():
+        for relative_dir in (
+            pathlib.PurePosixPath("sessions") / date_text,
+            pathlib.PurePosixPath("archived_sessions") / date_text,
+        ):
+            try:
+                date_dir = _safe_directory_path(resolved_root, relative_dir)
+            except (FileNotFoundError, ValueError):
                 continue
             rollout_paths.extend(sorted(date_dir.glob("rollout-*.jsonl"), reverse=True))
-        flat_archived_dir = codex_root / "archived_sessions"
-        if flat_archived_dir.is_dir():
+        try:
+            flat_archived_dir = _safe_directory_path(resolved_root, pathlib.PurePosixPath("archived_sessions"))
             rollout_paths.extend(
                 rollout_path
                 for rollout_path in sorted(flat_archived_dir.glob("rollout-*.jsonl"), reverse=True)
                 if _flat_archived_rollout_matches_date(rollout_path, date_value)
             )
+        except (FileNotFoundError, ValueError):
+            pass
         for rollout_path in rollout_paths:
             rollout_relative_path = pathlib.PurePosixPath(
-                rollout_path.relative_to(codex_root).as_posix()
+                rollout_path.relative_to(resolved_root).as_posix()
             )
             session_id = ""
             cwd = ""
             try:
-                handle = _open_local_rollout_text(codex_root, rollout_relative_path)
+                handle = _open_local_rollout_text(resolved_root, rollout_relative_path)
             except (FileNotFoundError, ValueError):
                 continue
             with handle:
@@ -963,7 +1021,7 @@ def _iter_session_meta_records(
                     "date": date_value.strftime(DATE_FORMAT),
                     "session_id": session_id,
                     "cwd": cwd,
-                    "rollout": rollout_path.relative_to(codex_root).as_posix(),
+                    "rollout": rollout_path.relative_to(resolved_root).as_posix(),
                 }
             )
             if limit and len(rows) >= limit:

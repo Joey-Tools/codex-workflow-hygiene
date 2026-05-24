@@ -672,7 +672,13 @@ def summary_date_from_path(path: Path) -> dt.datetime | None:
     return dated_path_from_parts(path)
 
 
-def first_jsonl_error(path: Path) -> int | None:
+@dataclasses.dataclass(frozen=True)
+class JsonlReadIssue:
+    line_no: int
+    unreadable: bool = False
+
+
+def first_jsonl_error(path: Path) -> JsonlReadIssue | None:
     try:
         with path.open(encoding="utf-8") as handle:
             for line_no, line in enumerate(handle, 1):
@@ -681,11 +687,13 @@ def first_jsonl_error(path: Path) -> int | None:
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
-                    return line_no
+                    return JsonlReadIssue(line_no)
                 if not isinstance(record, dict):
-                    return line_no
+                    return JsonlReadIssue(line_no)
     except UnicodeDecodeError:
-        return 1
+        return JsonlReadIssue(1)
+    except OSError:
+        return JsonlReadIssue(1, unreadable=True)
     return None
 
 
@@ -1095,6 +1103,30 @@ def oversized_rollout_has_timestamp_in_window(
     return False, complete
 
 
+def earliest_timestamp_in_file(path: Path, *, max_scan_bytes: int) -> dt.datetime | None:
+    try:
+        size = path.stat().st_size
+        scan_bytes = min(size, max_scan_bytes)
+        with path.open("rb") as handle:
+            carry = b""
+            remaining = scan_bytes
+            earliest: dt.datetime | None = None
+            while remaining > 0:
+                data = handle.read(min(ROLLOUT_TIMESTAMP_SCAN_BYTES, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                window = carry + data
+                for match in TIMESTAMP_BYTES_PATTERN.finditer(window):
+                    timestamp = parse_time(match.group(1).decode("utf-8", errors="replace"))
+                    if timestamp is not None and (earliest is None or timestamp < earliest):
+                        earliest = timestamp
+                carry = window[-256:]
+            return earliest
+    except OSError:
+        return None
+
+
 def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> str:
     if start is None and end is None:
         return "relevant"
@@ -1196,7 +1228,7 @@ def summary_file_has_truncated_scan(path: Path) -> bool:
             text = str(record.get("text") or "")
             if "scan_truncated=true" in text:
                 return True
-    except ValueError:
+    except (OSError, ValueError):
         return False
     return False
 
@@ -1396,6 +1428,7 @@ def extract_rollout(
                 and not user_text
                 and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback)
             ):
+                emit_current(line_no, timestamp)
                 current_has_post_prompt_evidence = True
 
         text = record_text(record)
@@ -2870,13 +2903,9 @@ def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
                 earliest = parsed
         for summary in source_summary_files(source):
             parsed = summary_date_from_path(summary)
-            try:
-                for _line_no, record in iter_jsonl(summary):
-                    timestamp = parse_time(record_timestamp(record))
-                    if timestamp and (parsed is None or timestamp < parsed):
-                        parsed = timestamp
-            except ValueError:
-                pass
+            timestamp = earliest_timestamp_in_file(summary, max_scan_bytes=ROLLOUT_TIMESTAMP_SCAN_BYTES)
+            if timestamp and (parsed is None or timestamp < parsed):
+                parsed = timestamp
             if metadata_covers(parsed) and (earliest is None or parsed < earliest):
                 earliest = parsed
     return earliest
@@ -3179,13 +3208,16 @@ def run_scan(
                 continue
             size = rollout.stat().st_size
             if size <= max_raw_bytes:
-                error_line = first_jsonl_error(rollout)
-                if error_line is not None:
-                    if (
-                        rollout_filename_in_window(rollout, gap_start, end)
-                        or raw_timestamp_in_window(rollout, gap_start, end)
-                        or (allow_mtime_fallback and rollout_mtime_active(rollout, gap_start, end))
-                    ):
+                jsonl_error = first_jsonl_error(rollout)
+                if jsonl_error is not None:
+                    relevant_invalid_rollout = rollout_filename_in_window(rollout, gap_start, end) or (
+                        allow_mtime_fallback and rollout_mtime_active(rollout, gap_start, end)
+                    )
+                    if not jsonl_error.unreadable:
+                        relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
+                            rollout, gap_start, end
+                        )
+                    if relevant_invalid_rollout:
                         coverage_gaps.append(
                             {
                                 "host": source.host,
@@ -3228,7 +3260,11 @@ def run_scan(
                     }
                 )
             if jsonl_error is not None:
-                if summary_file_relevant(summary, gap_start, end):
+                if (
+                    summary_file_maybe_relevant_without_read(summary, gap_start, end)
+                    if jsonl_error.unreadable
+                    else summary_file_relevant(summary, gap_start, end)
+                ):
                     coverage_gaps.append(
                         {
                             "host": source.host,
@@ -3505,12 +3541,18 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             row["coverage_gap"] = "summary scan truncated; regenerate complete bounded evidence before extractor handoff"
             rows.append(row)
             return
-        if not summary_file_relevant(summary, start, end):
-            return
         if jsonl_error is not None:
+            if not (
+                summary_file_maybe_relevant_without_read(summary, start, end)
+                if jsonl_error.unreadable
+                else summary_file_relevant(summary, start, end)
+            ):
+                return
             row["status"] = "invalid"
             row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
             rows.append(row)
+            return
+        if not summary_file_relevant(summary, start, end):
             return
         row["status"] = "ready"
         rows.append(row)
@@ -3554,13 +3596,16 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             size = rollout.stat().st_size
             row = shard_row(rollout, bytes=size)
             if size <= max_raw_bytes:
-                error_line = first_jsonl_error(rollout)
-                if error_line is not None:
-                    if (
-                        rollout_filename_in_window(rollout, start, end)
-                        or raw_timestamp_in_window(rollout, start, end)
-                        or (allow_mtime_fallback and rollout_mtime_active(rollout, start, end))
-                    ):
+                jsonl_error = first_jsonl_error(rollout)
+                if jsonl_error is not None:
+                    relevant_invalid_rollout = rollout_filename_in_window(rollout, start, end) or (
+                        allow_mtime_fallback and rollout_mtime_active(rollout, start, end)
+                    )
+                    if not jsonl_error.unreadable:
+                        relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
+                            rollout, start, end
+                        )
+                    if relevant_invalid_rollout:
                         row["status"] = "invalid"
                         row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"
                         rows.append(row)

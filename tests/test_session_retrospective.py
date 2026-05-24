@@ -47,6 +47,17 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
 
+def blocked_path_open(target: Path):
+    real_open = Path.open
+
+    def open_or_raise(self: Path, *args, **kwargs):
+        if self == target:
+            raise PermissionError("blocked test path")
+        return real_open(self, *args, **kwargs)
+
+    return mock.patch.object(Path, "open", open_or_raise)
+
+
 def write_local_evidence(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "session_index.jsonl").write_text("{}\n", encoding="utf-8")
@@ -325,6 +336,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     ),
                 )
 
+    def test_remote_probe_fetch_rejects_symlink_rollout_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            target_dir = root / "other-date"
+            rollout_name = "rollout-2026-05-01T10-00-00-link.jsonl"
+            write_jsonl(target_dir / rollout_name, [message("user", "Wrong window.", "2026-05-01T10:00:00Z")])
+            link_dir = root / "sessions" / "2026" / "05" / "01"
+            link_dir.parent.mkdir(parents=True)
+            link_dir.symlink_to(target_dir, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                REMOTE_PROBE._fetch_local_rollout(
+                    root,
+                    REMOTE_PROBE.pathlib.PurePosixPath(f"sessions/2026/05/01/{rollout_name}"),
+                )
+
     def test_remote_probe_summary_rejects_symlink_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -379,6 +406,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
             rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-link.jsonl"
             rollout.parent.mkdir(parents=True)
             rollout.symlink_to(outside)
+
+            rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+            )
+
+            self.assertEqual(rows, [])
+
+    def test_remote_probe_session_meta_skips_symlink_date_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            target_dir = root / "other-date"
+            write_jsonl(
+                target_dir / "rollout-2026-05-01T10-00-00-link.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "wrong-session", "cwd": "/secret/repo"},
+                    }
+                ],
+            )
+            link_dir = root / "sessions" / "2026" / "05" / "01"
+            link_dir.parent.mkdir(parents=True)
+            link_dir.symlink_to(target_dir, target_is_directory=True)
 
             rows = REMOTE_PROBE._iter_session_meta_records(
                 codex_root=root,
@@ -1637,6 +1691,17 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["window"]["start"], "2026-01-01T00:00:00Z")
         self.assertEqual(trend["window"]["end"], "2026-04-01T00:00:00Z")
 
+    def test_earliest_rollout_date_scans_summaries_with_bounded_timestamp_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "01" / "01" / "rollout-summary-old.jsonl"
+            write_jsonl(summary, [{"timestamp": "2025-12-31T23:00:00Z", "kind": "summary", "text": "earlier"}])
+
+            with mock.patch.object(MODULE, "iter_jsonl", side_effect=AssertionError("unbounded scan")):
+                earliest = MODULE.earliest_rollout_date([MODULE.Source("local", root)])
+
+        self.assertEqual(MODULE.iso(earliest), "2025-12-31T23:00:00Z")
+
     def test_baseline_from_first_ignores_malformed_summary_when_deriving_start(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2233,6 +2298,34 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["timestamp"], "2026-05-22T09:00:00Z")
         self.assertIn("failed_command", rows[0]["issue_flags"])
 
+    def test_pre_window_user_with_in_window_successful_tool_output_is_not_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T10-00-00-success.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Continue the long-running migration.", "2026-01-01T10:00:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T09:00:00Z",
+                        "payload": {"output": "Processed 42 records successfully"},
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-01-01T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T10:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].timestamp, "2026-05-22T09:00:00Z")
+        self.assertEqual(turns[0].issue_flags, [])
+
     def test_make_shards_respects_window_and_reports_oversized(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2438,6 +2531,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "invalid")
+        self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_reports_in_window_unreadable_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            blocked = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-blocked.jsonl"
+            write_jsonl(blocked, [message("user", "Blocked shard.", "2026-05-22T10:00:00Z")])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            with blocked_path_open(blocked):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
             rows = [
                 json.loads(line)
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
@@ -6215,6 +6335,50 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
             )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
+        self.assertNotIn("path_ref", trend["coverage_gaps"][0])
+
+    def test_unreadable_rollout_jsonl_reports_gap_and_blocks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Unreadable task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with blocked_path_open(rollout):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
+        self.assertNotIn("path_ref", trend["coverage_gaps"][0])
+
+    def test_unreadable_rollout_summary_reports_gap_and_blocks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "Unreadable summary"}])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with blocked_path_open(summary):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertFalse(state.exists())
