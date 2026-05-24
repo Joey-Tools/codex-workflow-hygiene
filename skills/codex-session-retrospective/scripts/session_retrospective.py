@@ -1351,7 +1351,8 @@ def extract_rollout(
             assistant_text = assistant_text_from_payload(payload)
             prompt_text = meaningful_prompt_text(user_text) if user_text else ""
             if user_text and not meaningful_user_text(user_text):
-                if current:
+                # Runtime wrappers immediately after a user prompt belong to that active turn.
+                if current and current_has_post_prompt_evidence:
                     flush_assistant()
                     current = None
                     current_emitted = False

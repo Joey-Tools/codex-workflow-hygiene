@@ -1260,7 +1260,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(turns), 2)
 
-    def test_wrapper_only_user_message_detaches_followup_output(self) -> None:
+    def test_wrapper_only_user_message_preserves_initial_followup_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-wrapper.jsonl"
@@ -1276,8 +1276,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
             turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
 
         self.assertEqual(len(turns), 1)
-        self.assertEqual(turns[0].issue_flags, [])
-        self.assertEqual(turns[0].assistant_action_summary, "")
+        self.assertIn("failed_command", turns[0].issue_flags)
+        self.assertIn("blocked_or_failed", turns[0].assistant_action_summary)
+        self.assertIn("verification", turns[0].assistant_action_summary)
 
     def test_wrapper_only_user_message_keeps_prompt_flags_without_followup_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1296,7 +1297,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(turns), 1)
         self.assertIn("failed_command", turns[0].issue_flags)
-        self.assertEqual(turns[0].assistant_action_summary, "")
+        self.assertIn("blocked_or_failed", turns[0].assistant_action_summary)
+        self.assertIn("verification", turns[0].assistant_action_summary)
 
     def test_automation_prompt_is_not_treated_as_user_episode(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1625,6 +1627,32 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(turns), 1)
         self.assertIn("implementation", turns[0].assistant_action_summary)
         self.assertIn("verification", turns[0].assistant_action_summary)
+
+    def test_wrapper_before_task_complete_preserves_active_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-abc.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please fix the deployment.", "2026-05-22T10:01:00Z"),
+                    message("user", "# AGENTS.md instructions\nRepository policy only.", "2026-05-22T10:01:01Z"),
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:04:00Z",
+                        "payload": {
+                            "type": "task_complete",
+                            "last_agent_message": "The command failed with exit code 1.",
+                        },
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("failed_command", turns[0].issue_flags)
+        self.assertIn("blocked_or_failed", turns[0].assistant_action_summary)
 
     def test_scan_does_not_skip_old_rollout_with_new_turn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
