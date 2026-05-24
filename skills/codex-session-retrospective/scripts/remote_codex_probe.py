@@ -242,10 +242,14 @@ def _resolve_output_path(
     raw_path = pathlib.Path(output).expanduser()
     if any(part == ".." for part in raw_path.parts):
         raise ValueError("output path must not contain ..")
+    workspace = workspace_root.resolve() if workspace_root is not None else pathlib.Path.cwd().resolve()
     task_output_root = _task_output_root(workspace_root)
     tmp_alias_root = pathlib.Path("/tmp")
     tmp_root = pathlib.Path("/tmp").resolve()
     if not raw_path.is_absolute():
+        task_output_parts = TASK_OUTPUT_RELATIVE_DIR.parts
+        if raw_path.parts[: len(task_output_parts)] == task_output_parts:
+            return _validate_output_path(workspace / raw_path, task_output_root)
         return _validate_output_path(task_output_root / raw_path, task_output_root)
     if _path_is_relative_to(raw_path, tmp_alias_root):
         raw_path = tmp_root / raw_path.relative_to(tmp_alias_root)

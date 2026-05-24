@@ -827,6 +827,50 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             self.assertIn("private-output-session", output.read_text(encoding="utf-8"))
 
+    def test_remote_probe_fetch_rollout_accepts_task_output_relative_path(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "task-output-relative-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            workspace = Path(raw) / "workspace"
+            task_output_root = workspace / REMOTE_PROBE.TASK_OUTPUT_RELATIVE_DIR
+            output = task_output_root / "rollout.jsonl"
+            workspace.mkdir(parents=True)
+
+            def fake_task_output_root(workspace_root: Path | None = None) -> Path:
+                return task_output_root.resolve()
+
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(workspace)
+                with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                    REMOTE_PROBE, "_task_output_root", fake_task_output_root
+                ):
+                    result = REMOTE_PROBE.cmd_fetch_rollout(
+                        types.SimpleNamespace(
+                            host="local",
+                            rollout="sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                            output=(REMOTE_PROBE.TASK_OUTPUT_RELATIVE_DIR / "rollout.jsonl").as_posix(),
+                        )
+                    )
+            finally:
+                os.chdir(previous_cwd)
+
+            nested = task_output_root / REMOTE_PROBE.TASK_OUTPUT_RELATIVE_DIR / "rollout.jsonl"
+            self.assertEqual(result, 0)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertIn("task-output-relative-session", output.read_text(encoding="utf-8"))
+            self.assertFalse(nested.exists())
+
     def test_remote_probe_fetch_rollout_reports_unreadable_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
