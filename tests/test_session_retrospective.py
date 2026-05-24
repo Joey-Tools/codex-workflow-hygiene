@@ -2170,6 +2170,42 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("failed_command", turns[0].issue_flags)
         self.assertIn("response", turns[0].assistant_action_summary)
 
+    def test_runtime_wrapper_followup_function_call_does_not_merge_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-wrapper-call.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Review the proposed change.", "2026-05-22T10:01:00Z"),
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:02:00Z",
+                        "payload": {
+                            "type": "task_complete",
+                            "last_agent_message": "All set.",
+                        },
+                    },
+                    message("user", "# AGENTS.md instructions\nRepository policy only.", "2026-05-22T10:03:00Z"),
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:04:00Z",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "arguments": "{\"cmd\":\"cat secret.txt\",\"sandbox_permissions\":\"require_escalated\"}",
+                        },
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertNotIn("approval_auth_friction", turns[0].issue_flags)
+        self.assertNotIn("safety_privacy_flag", turns[0].issue_flags)
+        self.assertIn("response", turns[0].assistant_action_summary)
+
     def test_neutral_assistant_final_detaches_before_runtime_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

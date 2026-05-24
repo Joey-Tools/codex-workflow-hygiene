@@ -1595,6 +1595,9 @@ def extract_rollout(
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current(line_no, timestamp)
 
+        if wrapper_detached_followup:
+            continue
+
         text = record_text(record)
         record_flags = flags_from_raw_text(text)
         if current and record_flags:
