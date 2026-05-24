@@ -203,18 +203,49 @@ def _task_output_root(workspace_root: pathlib.Path | None = None) -> pathlib.Pat
     return root / TASK_OUTPUT_RELATIVE_DIR
 
 
+def _reject_symlink_components(path: pathlib.Path) -> None:
+    if not path.is_absolute():
+        raise ValueError("output path must be absolute after normalization")
+    current = pathlib.Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise ValueError("output path uses a symlink component")
+        if current != path and not stat.S_ISDIR(current_stat.st_mode):
+            raise ValueError("output path ancestor is not a directory")
+
+
+def _validate_output_path(candidate: pathlib.Path, root: pathlib.Path) -> pathlib.Path:
+    resolved_root = root.resolve(strict=False)
+    resolved_candidate = candidate.resolve(strict=False)
+    if not _path_is_relative_to(resolved_candidate, resolved_root):
+        raise ValueError(f"output path must stay under {resolved_root}")
+    _reject_symlink_components(candidate)
+    return resolved_candidate
+
+
 def _resolve_output_path(
     output: str, *, workspace_root: pathlib.Path | None = None
 ) -> pathlib.Path:
     raw_path = pathlib.Path(output).expanduser()
-    task_output_root = _task_output_root(workspace_root).resolve()
-    candidate = (task_output_root / raw_path) if not raw_path.is_absolute() else raw_path
-    resolved = candidate.resolve()
+    if any(part == ".." for part in raw_path.parts):
+        raise ValueError("output path must not contain ..")
+    task_output_root = _task_output_root(workspace_root)
+    tmp_alias_root = pathlib.Path("/tmp")
     tmp_root = pathlib.Path("/tmp").resolve()
-    if resolved.is_relative_to(task_output_root) or resolved.is_relative_to(tmp_root):
-        return resolved
+    if not raw_path.is_absolute():
+        return _validate_output_path(task_output_root / raw_path, task_output_root)
+    if _path_is_relative_to(raw_path, tmp_alias_root):
+        raw_path = tmp_root / raw_path.relative_to(tmp_alias_root)
+    for root in (task_output_root, tmp_root):
+        if _path_is_relative_to(raw_path.resolve(strict=False), root.resolve(strict=False)):
+            return _validate_output_path(raw_path, root)
     raise ValueError(
-        f"output path must stay under {task_output_root} or {tmp_root}"
+        f"output path must stay under {task_output_root.resolve(strict=False)} or {tmp_root}"
     )
 
 
@@ -335,7 +366,7 @@ def _write_private_bytes(output: pathlib.Path, data: bytes) -> None:
     last_error: FileExistsError | None = None
     for attempt in range(100):
         temp_path = output.with_name(f".{output.name}.tmp-{os.getpid()}-{attempt}")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(str(temp_path), flags, 0o600)
         except FileExistsError as error:

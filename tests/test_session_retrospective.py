@@ -559,6 +559,80 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             self.assertIn("private-output-session", output.read_text(encoding="utf-8"))
 
+    def test_remote_probe_fetch_rollout_rejects_symlink_output_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "symlink-parent-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            task_output_root = Path(raw) / "task-output"
+            outside = Path(raw) / "outside"
+            task_output_root.mkdir(parents=True)
+            outside.mkdir()
+            os.symlink(outside, task_output_root / "link")
+
+            def fake_task_output_root(workspace_root: Path | None = None) -> Path:
+                return task_output_root
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                REMOTE_PROBE, "_task_output_root", fake_task_output_root
+            ):
+                result = REMOTE_PROBE.cmd_fetch_rollout(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout="sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                        output="link/rollout.jsonl",
+                    )
+                )
+
+            self.assertNotEqual(result, 0)
+            self.assertFalse((outside / "rollout.jsonl").exists())
+
+    def test_remote_probe_fetch_rollout_rejects_symlink_output_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "symlink-output-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            task_output_root = Path(raw) / "task-output"
+            outside = Path(raw) / "outside"
+            task_output_root.mkdir(parents=True)
+            outside.mkdir()
+            os.symlink(outside / "rollout.jsonl", task_output_root / "rollout.jsonl")
+
+            def fake_task_output_root(workspace_root: Path | None = None) -> Path:
+                return task_output_root
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                REMOTE_PROBE, "_task_output_root", fake_task_output_root
+            ):
+                result = REMOTE_PROBE.cmd_fetch_rollout(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout="sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                        output="rollout.jsonl",
+                    )
+                )
+
+            self.assertNotEqual(result, 0)
+            self.assertFalse((outside / "rollout.jsonl").exists())
+
     def test_remote_probe_rollout_summary_preserves_bounded_user_signal(self) -> None:
         records = REMOTE_PROBE._summarize_rollout_records(
             lines=[
@@ -3915,7 +3989,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
             )
             retained = export_retained(output, raw)
-            history_repo, _commit = write_history_repo(raw)
+            history_repo, _commit = write_history_repo(raw, retained)
 
             with self.assertRaisesRegex(SystemExit, "must exist"):
                 MODULE.main(
@@ -4426,6 +4500,70 @@ class SessionRetrospectiveTests(unittest.TestCase):
             subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add redacted report"], cwd=history_repo, check=True)
 
             MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_validates_legacy_data_export_consistency(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, _commit = write_history_repo(raw, retained)
+            legacy_paths = {
+                "episodes.jsonl": "data/episodes/2026/05/episodes.jsonl",
+                "turn_flags.jsonl": "data/turn_flags/2026/05/turn_flags.jsonl",
+                "trend_report.json": "data/trends/2026/05/trend_report.json",
+                "retained_manifest.json": "data/manifests/2026/05/retained_manifest.json",
+            }
+            for name, relative_path in legacy_paths.items():
+                target = history_repo / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((retained / name).read_bytes())
+            subprocess.run(["git", "add", "data"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add legacy data export"], cwd=history_repo, check=True)
+
+            MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+            trend_path = history_repo / legacy_paths["trend_report.json"]
+            trend = json.loads(trend_path.read_text(encoding="utf-8"))
+            trend["turn_count"] = trend["turn_count"] + 1
+            trend_path.write_text(json.dumps(trend) + "\n", encoding="utf-8")
+            subprocess.run(["git", "add", str(trend_path.relative_to(history_repo))], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Break legacy data export"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "turn_count must match"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
+
+    def test_validate_history_tree_rejects_incomplete_legacy_data_export(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            retained = export_retained(output, raw)
+            history_repo, _commit = write_history_repo(raw, retained)
+            target = history_repo / "data" / "episodes" / "2026" / "05" / "episodes.jsonl"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((retained / "episodes.jsonl").read_bytes())
+            subprocess.run(["git", "add", "data"], cwd=history_repo, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Add incomplete legacy data export"], cwd=history_repo, check=True)
+
+            with self.assertRaisesRegex(SystemExit, "legacy data export is incomplete"):
+                MODULE.main(["validate-history-tree", "--history-repo", str(history_repo)])
 
     def test_validate_history_tree_rejects_unexpected_retained_paths(self) -> None:
         for relative_path in (

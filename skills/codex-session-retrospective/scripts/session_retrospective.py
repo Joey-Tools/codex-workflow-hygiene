@@ -2422,6 +2422,27 @@ def validate_retained_export_parent(retained_files: dict[str, bytes], parent: st
     return expected_parent
 
 
+HISTORY_LEGACY_DATA_ARTIFACTS = {
+    "episodes": ("episodes.jsonl", "episodes"),
+    "turn_flags": ("turn_flags.jsonl", "turn_flags"),
+    "trends": ("trend_report.json", "trend"),
+    "manifests": ("retained_manifest.json", "manifest"),
+}
+
+
+def history_legacy_data_artifact(file_path: str) -> tuple[str, str, str] | None:
+    parts = tuple(file_path.split("/"))
+    if len(parts) != 5 or parts[0] != "data" or not history_safe_year_month(parts, 2):
+        return None
+    expected = HISTORY_LEGACY_DATA_ARTIFACTS.get(parts[1])
+    if expected is None:
+        return None
+    expected_name, kind = expected
+    if parts[4] != expected_name:
+        return None
+    return f"{parts[2]}/{parts[3]}", expected_name, kind
+
+
 def history_path_kind(file_path: str) -> str:
     parts = tuple(file_path.split("/"))
     name = file_path.rsplit("/", 1)[-1]
@@ -2429,14 +2450,9 @@ def history_path_kind(file_path: str) -> str:
     flat_kind = history_flat_retained_export_kind(parent, name)
     if flat_kind:
         return flat_kind
-    if len(parts) == 5 and parts[:2] == ("data", "episodes") and history_safe_year_month(parts, 2) and name == "episodes.jsonl":
-        return "episodes"
-    if len(parts) == 5 and parts[:2] == ("data", "turn_flags") and history_safe_year_month(parts, 2) and name == "turn_flags.jsonl":
-        return "turn_flags"
-    if len(parts) == 5 and parts[:2] == ("data", "trends") and history_safe_year_month(parts, 2) and name == "trend_report.json":
-        return "trend"
-    if len(parts) == 5 and parts[:2] == ("data", "manifests") and history_safe_year_month(parts, 2) and name == "retained_manifest.json":
-        return "manifest"
+    legacy = history_legacy_data_artifact(file_path)
+    if legacy is not None:
+        return legacy[2]
     if file_path in HISTORY_ROOT_FILES or file_path in {"data/README.md", "reports/README.md"}:
         return "text"
     if history_report_path_allowed(parts):
@@ -2718,6 +2734,20 @@ def validate_history_tree_ref(repo: Path, history_ref: str) -> None:
             validate_retained_export_parent(retained_files, parent)
         elif parent.startswith("retained/"):
             raise SystemExit(f"history retained export directory is not allowed: {parent}")
+    legacy_exports: dict[str, dict[str, str]] = defaultdict(dict)
+    for file_path in files:
+        legacy = history_legacy_data_artifact(file_path)
+        if legacy is None:
+            continue
+        window, output_name, _kind = legacy
+        legacy_exports[window][output_name] = file_path
+    for window, paths in legacy_exports.items():
+        if set(paths) != set(RETAINED_OUTPUT_FILES):
+            raise SystemExit(f"history legacy data export is incomplete: data/*/{window}")
+        for file_path in paths.values():
+            require_regular_history_blob(entries, file_path)
+        retained_files = {name: history_blob(repo, history_ref, paths[name]) for name in RETAINED_OUTPUT_FILES}
+        validate_retained_export_parent(retained_files)
     for file_path in files:
         require_regular_history_blob(entries, file_path)
         if forbidden_history_artifact(file_path):
