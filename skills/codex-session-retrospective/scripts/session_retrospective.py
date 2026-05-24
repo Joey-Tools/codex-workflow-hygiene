@@ -152,7 +152,7 @@ PATH_LIKE_TEXT_PATTERN = re.compile(
     re.I,
 )
 RAW_ROLLOUT_FILENAME_TEXT_PATTERN = re.compile(r"\brollout-\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2})?-[A-Za-z0-9_.-]+\.jsonl\b")
-RAW_SESSION_ID_TEXT_PATTERN = re.compile(r"\bsession_id[\"']?\s*(?:=|:)\s*[\"']?(?!session_ref_v1:)[^\s`'\",<>)\]}]+")
+RAW_SESSION_ID_TEXT_PATTERN = re.compile(r"\bsession_id[\"']?\s*(?:=|:)\s*[\"']?(?!session_ref_v1:)[A-Za-z0-9][A-Za-z0-9_.:-]*")
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
@@ -1309,35 +1309,63 @@ def safe_relative_summary_ref(value: str) -> str | None:
     return candidate.as_posix()
 
 
-def summary_backing_rollout_refs(path: Path, *, max_scan_bytes: int) -> tuple[set[str], bool]:
+def summary_record_in_window(
+    record: dict[str, Any],
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> bool:
+    parsed_timestamp = summary_timestamp_with_fallback(record, path)
+    if parsed_timestamp is None:
+        return False
+    if start and parsed_timestamp < start:
+        return False
+    if end and parsed_timestamp >= end:
+        return False
+    return True
+
+
+def summary_backing_rollout_refs(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> tuple[set[str], bool, bool]:
     refs: set[str] = set()
     try:
         with path.open("rb") as handle:
             data = handle.read(max_scan_bytes + 1)
     except OSError:
-        return refs, False
+        return refs, False, True
     complete = len(data) <= max_scan_bytes
     if not complete:
         data = data[:max_scan_bytes].rsplit(b"\n", 1)[0]
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        return refs, False
+        return refs, False, True
+    relevant_record_seen = False
     for line in text.splitlines():
         if not line.strip():
             continue
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
-            return refs, False
+            return refs, False, True
         if not isinstance(record, dict):
-            return refs, False
+            return refs, False, True
+        if not summary_record_in_window(record, path, start, end):
+            continue
+        relevant_record_seen = True
         rollout_ref = record.get("rollout")
         if isinstance(rollout_ref, str):
             safe_ref = safe_relative_summary_ref(rollout_ref)
             if safe_ref is not None:
                 refs.add(safe_ref)
-    return refs, complete
+    if not complete:
+        return refs, False, True
+    return refs, True, relevant_record_seen
 
 
 def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
@@ -1496,6 +1524,8 @@ def extract_rollout(
         if re.search(r"(?im)^\s*(?:findings?|issues?|defects?|bugs?|regressions?)\s*:", text):
             return True
         if re.search(r"(?im)^\s*(?:[-*]|\d+[.)])?\s*\[?P[0-3]\]?\b", text):
+            return True
+        if re.search(r"(?im)^\s*(?:[-*]|\d+[.)])\s+`?[\w./-]+\.[A-Za-z0-9]+`?:\d+\b", text):
             return True
         completion_terms = re.search(
             r"\b(?:implemented|updated|patched|created|added|fixed|resolved|completed|finished|done|wrote|generated|committed|pushed|merged)\b",
@@ -2524,15 +2554,15 @@ def history_text_contains_retention_risk(data: bytes, file_path: str) -> bool:
     text = history_text(data, file_path)
     if file_path.startswith("schemas/"):
         text = text.replace("https://json-schema.org/draft/2020-12/schema", "")
+    raw_identifier = bool(RAW_ROLLOUT_FILENAME_TEXT_PATTERN.search(text)) or bool(RAW_SESSION_ID_TEXT_PATTERN.search(text))
     if file_path in HISTORY_ROOT_FILES or file_path in {"data/README.md", "reports/README.md"}:
-        return contains_unredacted_sensitive_text(text, include_safety_markers=False) or bool(BARE_64_HEX_PATTERN.search(text))
+        return raw_identifier or contains_unredacted_sensitive_text(text, include_safety_markers=False) or bool(BARE_64_HEX_PATTERN.search(text))
     if contains_unredacted_sensitive_text(text) or BARE_64_HEX_PATTERN.search(text):
         return True
     generated_follow_on = history_path_kind(file_path) in {"text", "json_text"}
     return generated_follow_on and (
         contains_path_like_text(text)
-        or bool(RAW_ROLLOUT_FILENAME_TEXT_PATTERN.search(text))
-        or bool(RAW_SESSION_ID_TEXT_PATTERN.search(text))
+        or raw_identifier
     )
 
 
@@ -3395,7 +3425,9 @@ def remote_summary_only_gaps(
     for summary in summaries:
         if not summary_file_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_scan_bytes):
             continue
-        backing_refs, complete = summary_backing_rollout_refs(summary, max_scan_bytes=max_scan_bytes)
+        backing_refs, complete, relevant_record_seen = summary_backing_rollout_refs(summary, start, end, max_scan_bytes=max_scan_bytes)
+        if not relevant_record_seen:
+            continue
         if backing_refs:
             if not complete or not backing_refs.issubset(covered_rollout_refs):
                 return [remote_metadata_gap(source, "remote_source_not_materialized")]
