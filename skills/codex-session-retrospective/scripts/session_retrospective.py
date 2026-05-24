@@ -483,12 +483,17 @@ def safe_assistant_summary(texts: list[str]) -> str:
 
 def assistant_terminal_evidence(text: str) -> bool:
     lowered = text.lower()
-    if re.match(r"\s*(?:i'?ll|i will|i am going to|i'm going to|we'?ll|we will|we are going to|let me)\b", lowered):
-        return False
-    if re.search(
+    terminal_match = re.search(
         r"\b(?:implemented|updated|patched|created|added|fixed|resolved|completed|finished|done|ran|validated|verified|tested|committed|pushed|merged|wrote|generated)\b",
         lowered,
-    ):
+    )
+    if terminal_match:
+        future_intent = re.search(
+            r"\b(?:i'?ll|i will|i am going to|i'm going to|we'?ll|we will|we are going to|let me)\b",
+            lowered[: terminal_match.start()],
+        )
+        if future_intent:
+            return False
         return True
     if re.search(r"\b(?:command|test|tests|verification|build|lint|check)\s+failed\b", lowered):
         return True
