@@ -277,7 +277,13 @@ def _safe_relative_path(
     expect_directory: bool = False,
     expect_regular_file: bool = False,
 ) -> pathlib.Path:
-    root = codex_root.expanduser().resolve(strict=True)
+    expanded_root = codex_root.expanduser()
+    root_stat = expanded_root.lstat()
+    if stat.S_ISLNK(root_stat.st_mode):
+        raise ValueError("Codex root is a symlink")
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise ValueError("Codex root is not a directory")
+    root = expanded_root.resolve(strict=True)
     target = root
     parts = relative_path.parts
     for index, part in enumerate(parts):
@@ -523,6 +529,11 @@ def path_is_relative_to(path, root):
 
 
 def safe_relative_path(rel, *, expect_directory=False, expect_regular_file=False):
+    root_stat = ROOT.lstat()
+    if stat.S_ISLNK(root_stat.st_mode):
+        raise ValueError("Codex root is a symlink")
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise ValueError("Codex root is not a directory")
     root = ROOT.resolve(strict=True)
     target = root
     parts = rel.parts

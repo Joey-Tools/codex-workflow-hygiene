@@ -760,6 +760,14 @@ def assistant_text_from_payload(payload: dict[str, Any]) -> str:
     return ""
 
 
+def tool_output_payload_text(record: dict[str, Any], payload: dict[str, Any]) -> str:
+    record_type = str(record.get("type") or "")
+    payload_type = str(payload.get("type") or "")
+    if record_type == "function_call_output" or payload_type == "function_call_output":
+        return str(payload.get("output") or payload.get("text") or "").strip()
+    return ""
+
+
 def record_timestamp(record: dict[str, Any]) -> str | None:
     payload = record.get("payload") or {}
     for key in ("timestamp", "time", "created_at", "ts"):
@@ -1412,10 +1420,7 @@ def extract_rollout(
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current(line_no, timestamp)
                     assistant_bits.append(assistant_text)
-            if (
-                current
-                and not user_text
-            ):
+            if current and tool_output_payload_text(record, payload):
                 current_has_post_prompt_evidence = True
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current(line_no, timestamp)
