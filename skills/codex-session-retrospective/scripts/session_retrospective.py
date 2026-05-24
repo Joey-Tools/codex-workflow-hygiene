@@ -29,7 +29,6 @@ WRAPPER_PREFIXES = (
     "<turn_aborted>",
     "Persistent internal Codex readonly review contract:",
     "Review discipline:",
-    "Review the code changes against the base branch",
 )
 
 AUTOMATION_PROMPT_PATTERNS = (
@@ -483,6 +482,10 @@ def safe_assistant_summary(texts: list[str]) -> str:
 
 def assistant_terminal_evidence(text: str) -> bool:
     lowered = text.lower()
+    future_continuation = re.search(
+        r"\b(?:i'?ll|i will|i am going to|i'm going to|we'?ll|we will|we are going to|let me|will|going to|next|then)\b",
+        lowered,
+    )
     terminal_patterns = [
         r"\b(?:implemented|updated|patched|created|added|fixed|resolved|completed|finished|done|ran|validated|verified|tested|committed|pushed|merged|wrote|generated)\b",
         r"\b(?:command|test|tests|verification|build|lint|check)\s+failed\b",
@@ -501,6 +504,8 @@ def assistant_terminal_evidence(text: str) -> bool:
             lowered[: terminal_match.start()],
         )
         if future_intent:
+            continue
+        if future_continuation and terminal_match.start() < future_continuation.start():
             continue
         return True
     return False
@@ -1061,9 +1066,16 @@ def rollout_candidate_relevant(
             return True
         if allow_mtime_fallback and (not start or mtime >= start) and (not end or mtime < end):
             return True
-        if max_raw_bytes is not None and path.stat().st_size > max_raw_bytes:
+        try:
+            size = path.stat().st_size
+        except OSError:
             return True
-        return raw_timestamp_in_window(path, start, end)
+        if max_raw_bytes is not None and size > max_raw_bytes:
+            return True
+        try:
+            return raw_timestamp_in_window(path, start, end)
+        except OSError:
+            return True
     return True
 
 
@@ -1213,7 +1225,10 @@ def summary_file_relevant_with_scan_cap(
                 return False
         except OSError:
             return False
-        return raw_timestamp_in_window(path, start, end, max_scan_bytes=max_scan_bytes)
+        try:
+            return raw_timestamp_in_window(path, start, end, max_scan_bytes=max_scan_bytes)
+        except OSError:
+            return False
     if summary_date and end and summary_date >= end:
         return False
     return True
@@ -1224,11 +1239,17 @@ def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetim
         return True
     summary_date = summary_date_from_path(path)
     if summary_date is None:
-        return raw_timestamp_in_window(path, start, end)
+        try:
+            return raw_timestamp_in_window(path, start, end)
+        except OSError:
+            return False
     if summary_date and start and summary_date < start:
         if summary_date + dt.timedelta(days=1) > start:
             return True
-        return raw_timestamp_in_window(path, start, end)
+        try:
+            return raw_timestamp_in_window(path, start, end)
+        except OSError:
+            return False
     if summary_date and end and summary_date >= end:
         return False
     return True
@@ -3224,6 +3245,8 @@ def remote_summary_only_gaps(
     max_scan_bytes: int,
 ) -> list[dict[str, Any]]:
     if source.host not in DEFAULT_REMOTE_HOSTS:
+        return []
+    if rollouts:
         return []
     if not any(summary_file_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_scan_bytes) for summary in summaries):
         return []

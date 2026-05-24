@@ -304,6 +304,12 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
         )
 
+    def test_meaningful_prompt_text_keeps_normal_review_request(self) -> None:
+        prompt = "Review the code changes against the base branch and report only actionable findings."
+
+        self.assertEqual(MODULE.meaningful_prompt_text(prompt), prompt)
+        self.assertTrue(MODULE.meaningful_user_text(prompt))
+
     def test_default_sources_include_remote_hosts_as_missing_until_materialized(self) -> None:
         sources = MODULE.parse_sources(None)
 
@@ -2300,6 +2306,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 [
                     message("user", "Debug the long-running deployment.", "2026-05-20T10:01:00Z"),
                     message("assistant", "I'll get this fixed and verified.", "2026-05-20T10:02:00Z"),
+                    message("user", "# AGENTS.md instructions\nwrapper", "2026-05-22T10:03:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:05:00Z",
+                        "payload": {"output": "Process exited with code 1\npermission denied"},
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].timestamp, "2026-05-22T10:05:00Z")
+        self.assertIn("failed_command", turns[0].issue_flags)
+
+    def test_future_intent_after_progress_does_not_detach_active_turn_on_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-progress-preamble.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Debug the long-running deployment.", "2026-05-20T10:01:00Z"),
+                    message("assistant", "I updated the helper and will run the tests next.", "2026-05-20T10:02:00Z"),
                     message("user", "# AGENTS.md instructions\nwrapper", "2026-05-22T10:03:00Z"),
                     {
                         "type": "function_call_output",
@@ -4334,6 +4370,35 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "partial_host_scope")
+
+    def test_old_file_relevance_prefilters_handle_unreadable_timestamp_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            old_rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old.jsonl"
+            old_summary = root / "sessions" / "2026" / "01" / "02" / "rollout-summary-old.jsonl"
+            write_jsonl(old_rollout, [message("user", "Old task.", "2026-01-02T10:00:00Z")])
+            write_jsonl(old_summary, [{"kind": "summary", "timestamp": "2026-01-02T10:00:00Z", "text": "Old summary."}])
+            start = MODULE.parse_time("2026-05-01T00:00:00Z")
+            end = MODULE.parse_time("2026-05-02T00:00:00Z")
+
+            with mock.patch.object(MODULE, "raw_timestamp_in_window", side_effect=PermissionError("blocked")):
+                self.assertTrue(
+                    MODULE.rollout_candidate_relevant(
+                        old_rollout,
+                        start,
+                        end,
+                        max_raw_bytes=1000,
+                    )
+                )
+                self.assertFalse(
+                    MODULE.summary_file_relevant_with_scan_cap(
+                        old_summary,
+                        start,
+                        end,
+                        max_scan_bytes=1000,
+                    )
+                )
+                self.assertFalse(MODULE.summary_file_relevant(old_summary, start, end))
 
     def test_old_oversized_rollout_relevance_uses_bounded_timestamp_scan(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -7308,6 +7373,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
         self.assertEqual(manifest["sources"][0]["status"], "ready")
 
+    def test_default_remote_ignores_relevant_summary_when_rollouts_cover_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            write_jsonl(rollout, [message("user", "Remote task.", "2026-05-01T10:00:00Z")])
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:01:00Z", "text": "permission denied"}])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_default_remote_incremental_summary_gap_uses_emit_start(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
@@ -7414,7 +7499,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertEqual(len(rows), 2)
-        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
         self.assertEqual(manifest["sources"][0]["status"], "ready")
         self.assertEqual(manifest["sources"][0]["rollout_count"], 1)
         self.assertEqual(manifest["sources"][0]["summary_count"], 1)
@@ -8559,6 +8644,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
         )
 
         self.assertIsNone(record)
+
+    def test_remote_probe_keeps_normal_review_prompt_before_signaling(self) -> None:
+        prompt = "Review the code changes against the base branch and report only actionable findings."
+
+        record = REMOTE_PROBE._build_summary_record(
+            kind="user_message",
+            text=prompt,
+            line_no=1,
+            timestamp="2026-05-22T10:01:00Z",
+            max_text_chars=1200,
+            session_id="s1",
+        )
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["_match_text"], prompt)
 
     def test_remote_probe_ignores_automation_prompt_before_signaling(self) -> None:
         records = REMOTE_PROBE._summarize_rollout_records(

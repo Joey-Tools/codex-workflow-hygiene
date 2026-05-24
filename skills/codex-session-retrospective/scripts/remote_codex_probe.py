@@ -57,7 +57,6 @@ WRAPPER_PREFIXES = (
     "<turn_aborted>",
     "Persistent internal Codex readonly review contract:",
     "Review discipline:",
-    "Review the code changes against the base branch",
 )
 WRAPPER_END_MARKERS = ("</INSTRUCTIONS>", "</environment_context>", "</skill>", "</subagent_notification>", "</turn_aborted>")
 AUTOMATION_PROMPT_PATTERN_TEXTS = (
