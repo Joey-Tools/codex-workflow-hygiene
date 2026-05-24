@@ -483,7 +483,9 @@ def safe_assistant_summary(texts: list[str]) -> str:
 def assistant_terminal_evidence(text: str) -> bool:
     lowered = text.lower()
     future_continuation = re.search(
-        r"\b(?:i'?ll|i will|i am going to|i'm going to|we'?ll|we will|we are going to|let me|will|going to|next|then)\b",
+        r"\b(?:i'?ll|i will|i am going to|i'm going to|we'?ll|we will|we are going to|let me)\b"
+        r"|(?:\bwill\b|\bgoing to\b)\s+(?:run|check|verify|test|inspect|review|look|continue|follow|try|fix|update|commit|push|merge|open|rerun)"
+        r"|\b(?:next|then)[:,]?\s+(?:i'?ll|i will|i am going to|i'm going to|we'?ll|we will|we are going to|let me|need to|i need to|we need to|will|run|check|verify|test|inspect|review|look|continue|follow|try|fix|update|commit|push|merge|open|rerun)\b",
         lowered,
     )
     terminal_patterns = [

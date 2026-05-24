@@ -2271,6 +2271,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("failed_command", turns[0].issue_flags)
         self.assertIn("response", turns[0].assistant_action_summary)
 
+    def test_past_tense_then_assistant_final_detaches_before_runtime_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-then-final.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Review and verify the proposed change.", "2026-05-22T10:01:00Z"),
+                    message("assistant", "Ran tests, then updated docs.", "2026-05-22T10:02:00Z"),
+                    message("user", "# AGENTS.md instructions\nRepository policy only.", "2026-05-22T10:03:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:04:00Z",
+                        "payload": {"output": "Process exited with code 1\npermission denied"},
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertNotIn("failed_command", turns[0].issue_flags)
+        self.assertIn("implementation", turns[0].assistant_action_summary)
+        self.assertIn("verification", turns[0].assistant_action_summary)
+
     def test_verification_gap_assistant_final_detaches_before_runtime_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
