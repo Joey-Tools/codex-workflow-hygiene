@@ -601,6 +601,47 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "archived_sessions/rollout-2026-05-01T10-00-00-flat.jsonl",
             )
 
+    def test_remote_probe_session_meta_ignores_rollout_summary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            raw_rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-raw.jsonl"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01.jsonl"
+            write_jsonl(
+                raw_rollout,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "shared-session", "cwd": "/raw/repo"},
+                    }
+                ],
+            )
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "session_meta",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "session_id": "shared-session",
+                        "cwd": "/summary/repo",
+                    }
+                ],
+            )
+
+            rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["cwd"], "/raw/repo")
+        self.assertEqual(
+            rows[0]["rollout"],
+            "sessions/2026/05/01/rollout-2026-05-01T10-00-00-raw.jsonl",
+        )
+
     def test_remote_probe_session_meta_deduplicates_archived_rollout_names_before_limit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

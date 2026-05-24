@@ -412,6 +412,10 @@ def _flat_archived_rollout_matches_date(
     return rollout_path.name.startswith(f"rollout-{date_value.strftime('%Y-%m-%d')}")
 
 
+def _is_raw_rollout_file(path: pathlib.Path) -> bool:
+    return path.name.startswith("rollout-") and not path.name.startswith("rollout-summary")
+
+
 def _session_meta_rollout_dedupe_key(relative_path: pathlib.PurePosixPath) -> str:
     parts = relative_path.parts
     if len(parts) >= 2 and parts[0] == "archived_sessions":
@@ -624,6 +628,10 @@ def read_rollout_bytes(target, max_bytes):
 
 def flat_archived_rollout_matches_date(rollout, date_text):
     return rollout.name.startswith("rollout-" + date_text.replace("/", "-"))
+
+
+def is_raw_rollout_file(path):
+    return path.name.startswith("rollout-") and not path.name.startswith("rollout-summary")
 
 
 def session_meta_rollout_dedupe_key(rel):
@@ -952,13 +960,17 @@ def iter_session_meta():
                 date_dir = safe_directory_path(rel_dir)
             except FileNotFoundError:
                 continue
-            rollout_paths.extend(sorted(date_dir.glob("rollout-*.jsonl"), reverse=True))
+            rollout_paths.extend(
+                rollout
+                for rollout in sorted(date_dir.glob("rollout-*.jsonl"), reverse=True)
+                if is_raw_rollout_file(rollout)
+            )
         try:
             flat_archived_dir = safe_directory_path(pathlib.PurePosixPath("archived_sessions"))
             rollout_paths.extend(
                 rollout
                 for rollout in sorted(flat_archived_dir.glob("rollout-*.jsonl"), reverse=True)
-                if flat_archived_rollout_matches_date(rollout, date_text)
+                if is_raw_rollout_file(rollout) and flat_archived_rollout_matches_date(rollout, date_text)
             )
         except FileNotFoundError:
             pass
@@ -1089,13 +1101,17 @@ def _scan_session_meta_records(
                 date_dir = _safe_directory_path(resolved_root, relative_dir)
             except FileNotFoundError:
                 continue
-            rollout_paths.extend(sorted(date_dir.glob("rollout-*.jsonl"), reverse=True))
+            rollout_paths.extend(
+                rollout_path
+                for rollout_path in sorted(date_dir.glob("rollout-*.jsonl"), reverse=True)
+                if _is_raw_rollout_file(rollout_path)
+            )
         try:
             flat_archived_dir = _safe_directory_path(resolved_root, pathlib.PurePosixPath("archived_sessions"))
             rollout_paths.extend(
                 rollout_path
                 for rollout_path in sorted(flat_archived_dir.glob("rollout-*.jsonl"), reverse=True)
-                if _flat_archived_rollout_matches_date(rollout_path, date_value)
+                if _is_raw_rollout_file(rollout_path) and _flat_archived_rollout_matches_date(rollout_path, date_value)
             )
         except FileNotFoundError:
             pass
