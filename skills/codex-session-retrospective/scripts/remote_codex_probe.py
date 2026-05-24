@@ -354,7 +354,7 @@ def _open_local_rollout_text(
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError("rollout path is not a regular file")
-        handle = os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+        handle = os.fdopen(fd, "rb")
         fd = -1
         return handle
     finally:
@@ -614,7 +614,7 @@ def open_rollout_text(target):
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError("rollout path is not a regular file")
-        handle = os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+        handle = os.fdopen(fd, "rb")
         fd = -1
         return handle
     finally:
@@ -790,14 +790,17 @@ def bounded_text_lines(handle, max_scan_bytes):
         if max_scan_bytes and scanned >= max_scan_bytes:
             return
         remaining = max_scan_bytes - scanned if max_scan_bytes else 0
-        line = handle.readline(remaining + 1 if remaining else -1)
-        if not line:
+        raw_line = handle.readline(remaining + 1 if remaining else -1)
+        if not raw_line:
             return
-        encoded_len = len(line.encode("utf-8", "surrogatepass"))
-        if max_scan_bytes and encoded_len > remaining:
+        if isinstance(raw_line, str):
+            raw_bytes = raw_line.encode("utf-8", "surrogatepass")
+        else:
+            raw_bytes = bytes(raw_line)
+        if max_scan_bytes and len(raw_bytes) > remaining:
             return
-        scanned += encoded_len
-        yield line
+        scanned += len(raw_bytes)
+        yield raw_bytes.decode("utf-8", "replace")
 
 
 def summarize_rollout():
@@ -1768,14 +1771,17 @@ def _bounded_text_lines(handle: Any, max_scan_bytes: int) -> Iterable[str]:
         if max_scan_bytes and scanned >= max_scan_bytes:
             return
         remaining = max_scan_bytes - scanned if max_scan_bytes else 0
-        line = handle.readline(remaining + 1 if remaining else -1)
-        if not line:
+        raw_line = handle.readline(remaining + 1 if remaining else -1)
+        if not raw_line:
             return
-        encoded_len = len(line.encode("utf-8", "surrogatepass"))
-        if max_scan_bytes and encoded_len > remaining:
+        if isinstance(raw_line, str):
+            raw_bytes = raw_line.encode("utf-8", "surrogatepass")
+        else:
+            raw_bytes = bytes(raw_line)
+        if max_scan_bytes and len(raw_bytes) > remaining:
             return
-        scanned += encoded_len
-        yield line
+        scanned += len(raw_bytes)
+        yield raw_bytes.decode("utf-8", "replace")
 
 
 def _summarize_rollout_records(

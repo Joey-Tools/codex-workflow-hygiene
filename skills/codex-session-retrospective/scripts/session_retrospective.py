@@ -1360,7 +1360,7 @@ def summary_backing_rollout_refs(
             return refs, False, True, True
         if not isinstance(record, dict):
             return refs, False, True, True
-        if str(record.get("kind") or "summary") == "session_meta":
+        if str(record.get("kind") or "summary") in {"session_meta", "scan_meta"}:
             continue
         if not summary_record_in_window(record, path, start, end):
             continue

@@ -1180,7 +1180,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         second = json.dumps(message("user", "You missed the late unbounded signal.", "2026-05-01T10:01:00Z")) + "\n"
 
         records = REMOTE_PROBE._summarize_rollout_records(
-            lines=REMOTE_PROBE._bounded_text_lines(io.StringIO(first + second), len(first)),
+            lines=REMOTE_PROBE._bounded_text_lines(io.BytesIO((first + second).encode("utf-8")), len(first.encode("utf-8"))),
             keywords=["missed"],
             limit=10,
             tail_records=0,
@@ -1188,6 +1188,17 @@ class SessionRetrospectiveTests(unittest.TestCase):
         )
 
         self.assertEqual([record["text"] for record in records], ["user message present"])
+
+    def test_remote_probe_bounded_text_lines_counts_multibyte_bytes(self) -> None:
+        first = json.dumps(message("user", "多字节任务 needle", "2026-05-01T10:00:00Z"), ensure_ascii=False) + "\n"
+        second = json.dumps(message("user", "Second bounded signal.", "2026-05-01T10:01:00Z")) + "\n"
+        payload = (first + second).encode("utf-8")
+
+        self.assertEqual(list(REMOTE_PROBE._bounded_text_lines(io.BytesIO(payload), len(first))), [])
+        self.assertEqual(
+            list(REMOTE_PROBE._bounded_text_lines(io.BytesIO(payload), len(first.encode("utf-8")))),
+            [first],
+        )
 
     def test_remote_probe_rollout_summary_redacts_non_user_text(self) -> None:
         records = REMOTE_PROBE._summarize_rollout_records(
@@ -8018,6 +8029,40 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
 
+    def test_default_remote_scan_meta_summary_does_not_require_backing_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "scan_meta",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "scan_truncated": False,
+                        "text": "scan_truncated=false scan_bytes=1000 source_bytes=200",
+                    },
+                    {
+                        "kind": "session_meta",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "text": "session_id=remote-session cwd_present=true",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_discover(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in manifest["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "ready")
+
     def test_default_remote_relevant_summary_requires_valid_backing_rollout_ref(self) -> None:
         cases = [
             {"kind": "summary", "timestamp": "2026-05-01T10:01:00Z", "text": "permission denied"},
@@ -9996,6 +10041,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("Persistent internal Codex readonly review contract", script)
         self.assertIn("ROOT.lstat()", script)
         self.assertIn("Codex root is a symlink", script)
+        self.assertIn('os.fdopen(fd, "rb")', script)
+        self.assertIn('raw_bytes.decode("utf-8", "replace")', script)
         self.assertNotIn("(2,)", script)
         self.assertNotIn("(16,)", script)
 
