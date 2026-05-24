@@ -598,25 +598,12 @@ def file_source_hash(path: Path) -> str:
 def ensure_safe_output_dir(path: Path) -> Path:
     expanded = path.expanduser()
     raw_parts = expanded.parts
-    raw_index = next(
-        (
-            index
-            for index in range(len(raw_parts) - len(SAFE_OUTPUT_PARTS) + 1)
-            if raw_parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS
-        ),
-        None,
-    )
-    if raw_index is None:
+    if not any(
+        raw_parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS
+        for index in range(len(raw_parts) - len(SAFE_OUTPUT_PARTS) + 1)
+    ):
         raise SystemExit("output directory for transient artifacts must be under .codex-local/session-retrospective")
-    current = Path(expanded.anchor) if expanded.is_absolute() else Path(".")
-    parts_to_check = raw_parts[1:] if expanded.is_absolute() else raw_parts
-    absolute_offset = 1 if expanded.is_absolute() else 0
-    for part_index, part in enumerate(parts_to_check):
-        current = current / part
-        if part_index + absolute_offset < raw_index:
-            continue
-        if os.path.lexists(current) and current.is_symlink():
-            raise SystemExit("output directory for transient artifacts must not use symlink ancestors")
+    reject_symlink_ancestors(expanded, label="output directory for transient artifacts")
     parts = expanded.resolve(strict=False).parts
     for index in range(len(parts) - len(SAFE_OUTPUT_PARTS) + 1):
         if parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS:
@@ -3022,8 +3009,8 @@ def remote_metadata_window(source: Source) -> tuple[dt.datetime, dt.datetime] | 
     return window_start, window_end
 
 
-def same_second(left: dt.datetime | None, right: dt.datetime | None) -> bool:
-    return left is not None and right is not None and left.replace(microsecond=0) == right.replace(microsecond=0)
+def at_or_after_second(left: dt.datetime | None, right: dt.datetime | None) -> bool:
+    return left is not None and right is not None and left.replace(microsecond=0) >= right.replace(microsecond=0)
 
 
 def remote_evidence_gaps(
@@ -3058,7 +3045,7 @@ def remote_evidence_gaps(
         return [remote_metadata_gap(source)]
     if start and window_start > start:
         return [remote_metadata_gap(source)]
-    if end and not same_second(window_end, end):
+    if end and not at_or_after_second(window_end, end):
         return [remote_metadata_gap(source)]
     if materialized_at.replace(microsecond=0) < window_end.replace(microsecond=0):
         return [remote_metadata_gap(source)]
@@ -3595,8 +3582,6 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         status = source.get("status")
         if status is None:
             raise SystemExit("make-shards requires transient manifest sources with status=ready")
-        if status != "ready":
-            continue
         source = Source(str(host), root)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not root.exists():
@@ -3608,11 +3593,15 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             continue
         source_remote_gaps = remote_evidence_gaps(source, start=start, end=end)
         if source_remote_gaps:
-            append_source_gap_shards(source_remote_gaps, root)
+            if status == "ready":
+                append_source_gap_shards(source_remote_gaps, root)
             continue
         source_materialization_gaps = materialization_gaps_for_source(source)
         if source_materialization_gaps:
-            append_source_gap_shards(source_materialization_gaps, root)
+            if status == "ready":
+                append_source_gap_shards(source_materialization_gaps, root)
+            continue
+        if status not in {"ready", "stale"}:
             continue
         for rollout in source_rollouts(source):
             if not rollout_candidate_relevant(
