@@ -150,8 +150,8 @@ def write_history_repo(root: str | Path, retained_dir: Path | None = None) -> tu
     subprocess.run(["git", "config", "user.email", "codex@example.com"], cwd=repo, check=True)
     add_expected_history_origin(repo)
     if retained_dir is None:
-        (repo / "retained.json").write_text("{}\n", encoding="utf-8")
-        subprocess.run(["git", "add", "retained.json"], cwd=repo, check=True)
+        (repo / "README.md").write_text("Session retrospective history fixture.\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
     else:
         target = repo / retained_parent_for_dir(retained_dir)
         target.mkdir(parents=True, exist_ok=True)
@@ -788,6 +788,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_remote_probe_script_is_executable(self) -> None:
         self.assertTrue(os.access(REMOTE_PROBE_SCRIPT, os.X_OK))
+
+    def test_remote_probe_preflight_uses_configured_remote_codex_root(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout="hostname=remote\nuser=hoteng\nhome=/home/other\ncodex_root=/home/hoteng/.codex\ncodex=present\nrg=present\npython3=present\n",
+            stderr="",
+        )
+        with mock.patch.object(REMOTE_PROBE, "_run_subprocess_text", return_value=completed) as run:
+            row = REMOTE_PROBE._remote_preflight_row("miku-bot-dev")
+
+        command = run.call_args.args[0]
+        self.assertIn("CODEX_REMOTE_ROOT=/home/hoteng/.codex", command[-1])
+        self.assertIn('[ -d "$codex_root" ]', command[-1])
+        self.assertEqual(row["codex_root"], "/home/hoteng/.codex")
+        self.assertEqual(row["codex"], "present")
 
     def test_remote_probe_fetch_rollout_writes_private_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3002,6 +3018,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         "baseline",
                         "--window-days",
                         "0",
+                        "--source",
+                        f"local={root}",
+                        "--allow-partial-hosts",
+                        "--output",
+                        str(output),
+                        "--end",
+                        "2026-05-22T10:00:00Z",
+                    ]
+                )
+
+    def test_baseline_rejects_window_days_above_retained_schema_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            output = safe_output_dir(raw)
+
+            with self.assertRaisesRegex(SystemExit, "--window-days.*9999"):
+                MODULE.main(
+                    [
+                        "baseline",
+                        "--window-days",
+                        "10000",
                         "--source",
                         f"local={root}",
                         "--allow-partial-hosts",
@@ -7071,6 +7109,34 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(manifest["sources"][0]["status"], "stale")
         self.assertEqual(manifest["sources"][0]["rollout_count"], 0)
 
+    def test_default_remote_symlink_source_root_parent_is_not_trusted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            real_parent = Path(raw) / "real-cache"
+            link_parent = Path(raw) / "linked-cache"
+            real_parent.mkdir()
+            link_parent.symlink_to(real_parent, target_is_directory=True)
+            remote = link_parent / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-remote.jsonl"
+            write_jsonl(rollout, [message("user", "Symlinked parent task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["turn_count"], 0)
+        self.assertIn("source_root_symlink", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+        self.assertEqual(manifest["sources"][0]["rollout_count"], 0)
+
     def test_default_remote_symlink_rollout_reports_materialization_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
@@ -7114,6 +7180,32 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
             manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
 
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+        self.assertEqual(manifest["sources"][0]["summary_count"], 0)
+
+    def test_default_remote_symlink_summary_directory_reports_materialization_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            outside = Path(raw) / "outside-summaries"
+            summary = outside / "rollout-summary-remote.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"}])
+            unsafe_root = remote / "summaries-link"
+            unsafe_root.symlink_to(outside, target_is_directory=True)
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
         self.assertEqual(manifest["sources"][0]["status"], "stale")
         self.assertEqual(manifest["sources"][0]["summary_count"], 0)

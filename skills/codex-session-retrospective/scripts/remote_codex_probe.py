@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import socket
 import subprocess
 import stat
@@ -119,7 +120,9 @@ user_value="$(id -un 2>/dev/null || printf unknown)"
 printf 'hostname=%s\n' "$hostname_value"
 printf 'user=%s\n' "$user_value"
 printf 'home=%s\n' "$HOME"
-if [ -d "$HOME/.codex" ]; then
+codex_root="${CODEX_REMOTE_ROOT:-$HOME/.codex}"
+printf 'codex_root=%s\n' "$codex_root"
+if [ -d "$codex_root" ]; then
   echo 'codex=present'
 else
   echo 'codex=missing'
@@ -492,7 +495,7 @@ def _remote_preflight_row(alias: str) -> dict[str, str]:
             "-o",
             "ConnectTimeout=10",
             ssh_target,
-            REMOTE_PREFLIGHT_SCRIPT,
+            f"CODEX_REMOTE_ROOT={shlex.quote(HOSTS[alias]['codex_root'])} {REMOTE_PREFLIGHT_SCRIPT}",
         ],
         timeout_seconds=REMOTE_PREFLIGHT_TIMEOUT_SECONDS,
     )

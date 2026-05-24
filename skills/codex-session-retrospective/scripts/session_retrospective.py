@@ -106,6 +106,7 @@ RETAINED_ISSUE_FLAGS = frozenset(name for name, _pattern in FLAG_PATTERNS) | fro
 RETAINED_OUTCOMES = frozenset({"needs_review", "no_issue_observed"})
 RETAINED_FIXED_MODES = frozenset({"daily", "weekly"})
 BASELINE_MODE_PATTERN = re.compile(r"^baseline-[1-9][0-9]{0,3}d$")
+MAX_BASELINE_WINDOW_DAYS = 9999
 
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 RETAINED_SOURCE_HOST_ALIASES = {
@@ -660,6 +661,24 @@ def reject_symlink_ancestors(path: Path, *, label: str) -> None:
             raise SystemExit(f"{label} must not use symlink ancestors")
 
 
+def path_has_disallowed_symlink_component(path: Path) -> bool:
+    expanded = path.expanduser()
+    current = Path(expanded.anchor) if expanded.is_absolute() else Path(".")
+    parts_to_check = expanded.parts[1:] if expanded.is_absolute() else expanded.parts
+    allowed_system_symlinks = {Path("/etc"), Path("/tmp"), Path("/var")}
+    for part in parts_to_check:
+        current = current / part
+        if os.path.lexists(current) and current.is_symlink():
+            if current in allowed_system_symlinks:
+                try:
+                    current.resolve(strict=True).relative_to(Path("/private"))
+                    continue
+                except (OSError, ValueError):
+                    pass
+            return True
+    return False
+
+
 def session_id_from_path(path: Path) -> str:
     match = re.search(r"^rollout-\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2})?-(.+)\.jsonl$", path.name)
     if match:
@@ -887,7 +906,7 @@ def flags_for_text(text: str, *, redacted_changed: bool = False) -> set[str]:
 
 
 def safe_source_file(path: Path, root: Path) -> bool:
-    if root.is_symlink():
+    if path_has_disallowed_symlink_component(root):
         return False
     if path.is_symlink():
         return False
@@ -955,7 +974,8 @@ def unsafe_source_tree_entries(source: Source) -> list[Path]:
     except OSError:
         return []
     unsafe: set[Path] = set()
-    for search_root in source_rollout_search_roots(source):
+    search_roots = [source.root] if source.host in DEFAULT_REMOTE_HOSTS else source_rollout_search_roots(source)
+    for search_root in search_roots:
         if not search_root.exists() or search_root.is_symlink():
             continue
         for dirpath, dirnames, filenames in os.walk(search_root, followlinks=False):
@@ -3153,7 +3173,7 @@ def source_allows_mtime_fallback(source: Source) -> bool:
 
 
 def source_root_symlink_gap(source: Source) -> dict[str, Any] | None:
-    if source.root.is_symlink():
+    if path_has_disallowed_symlink_component(source.root):
         return {"host": source.host, "root_ref": path_ref(source.root), "reason": "source_root_symlink"}
     return None
 
@@ -3167,7 +3187,7 @@ def remote_metadata_gap(source: Source, reason: str = "stale_host") -> dict[str,
 def remote_metadata_window(source: Source) -> tuple[dt.datetime, dt.datetime] | None:
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return None
-    if source.root.is_symlink():
+    if source_root_symlink_gap(source):
         return None
     metadata_path = source.root / REMOTE_SOURCE_METADATA_FILE
     if not metadata_path.exists() or metadata_path.is_symlink() or not metadata_path.is_file():
@@ -3684,6 +3704,8 @@ def bounded_baseline_end(start: dt.datetime, window_days: int, now: dt.datetime)
 
 def cmd_baseline(args: argparse.Namespace) -> int:
     window_days = require_positive_window(args.window_days, "--window-days")
+    if window_days > MAX_BASELINE_WINDOW_DAYS:
+        raise SystemExit(f"--window-days must stay at or below {MAX_BASELINE_WINDOW_DAYS}")
     now = scan_end(args)
     sources = parse_sources(args.source, require_default_hosts=not args.allow_partial_hosts)
     if args.from_value == "first":
