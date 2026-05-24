@@ -699,6 +699,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(sources), 1)
 
+    def test_parse_sources_rejects_multiple_default_roots_for_same_host(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "multiple roots for miku-bot-dev"):
+            MODULE.parse_sources(
+                ["miku-bot-dev=/tmp/miku-one", "miku-server-dev=/tmp/miku-two"],
+                require_default_hosts=False,
+            )
+
     def test_parse_sources_rejects_empty_path(self) -> None:
         with self.assertRaisesRegex(SystemExit, "PATH must be non-empty"):
             MODULE.parse_sources(["local="], require_default_hosts=False)
@@ -816,6 +823,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("redactions=applied", turns[0].redacted_user_prompt_summary)
         self.assertNotIn("db01.internal", serialized)
 
+    def test_local_rollout_bare_64_hex_is_redacted_and_flagged(self) -> None:
+        token = "a" * 64
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-token.jsonl"
+            write_jsonl(rollout, [message("user", "Investigate opaque token " + token, "2026-05-22T10:01:00Z")])
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+            serialized = json.dumps(MODULE.asdict_turn(turns[0]))
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("safety_privacy_flag", turns[0].issue_flags)
+        self.assertIn("redactions=applied", turns[0].redacted_user_prompt_summary)
+        self.assertNotIn(token, serialized)
+        self.assertIn("safety_privacy_flag", MODULE.flags_for_text(token))
+
     def test_flags_for_text_detects_collaboration_friction_categories(self) -> None:
         over_flags = MODULE.flags_for_text("Codex over-explored unrelated files and searched too broadly.")
         under_flags = MODULE.flags_for_text("Codex should have asked for clarification before proceeding.")
@@ -892,6 +915,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertTrue(first.startswith("path_ref_v1:"))
+
+    def test_opaque_ref_key_file_rejects_symlink_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            outside = Path(raw) / "outside-cache"
+            outside.mkdir()
+            symlink_parent = Path(raw) / ".codex-local"
+            symlink_parent.symlink_to(outside, target_is_directory=True)
+            key_file = symlink_parent / "session-retrospective" / "opaque_ref_key"
+
+            with self.assertRaisesRegex(SystemExit, "opaque ref key file must not use symlink ancestors"):
+                MODULE.create_or_read_opaque_ref_key(key_file)
+
+        self.assertFalse((outside / "session-retrospective" / "opaque_ref_key").exists())
+
+    def test_opaque_ref_key_file_rejects_group_readable_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            key_file = Path(raw) / ".codex-local" / "session-retrospective" / "opaque_ref_key"
+            key_file.parent.mkdir(parents=True)
+            key_file.write_text("a" * 64 + "\n", encoding="utf-8")
+            os.chmod(key_file, 0o644)
+
+            with self.assertRaisesRegex(SystemExit, "owner-only"):
+                MODULE.create_or_read_opaque_ref_key(key_file)
 
     def test_human_prompt_mentioning_retrospective_workflow_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

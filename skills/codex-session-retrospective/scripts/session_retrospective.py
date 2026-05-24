@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,7 @@ SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b"),
         "[REDACTED_SECRET]",
     ),
+    (re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])"), "[REDACTED_SECRET]"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED_SECRET]"),
     (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/\-]+=*", re.I), "[REDACTED_CREDENTIAL]"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), "[REDACTED_CREDENTIAL]"),
@@ -491,6 +493,7 @@ def parse_opaque_ref_key(raw: str, *, label: str) -> bytes:
 
 
 def read_opaque_ref_key_file(path: Path) -> bytes:
+    reject_symlink_ancestors(path, label="opaque ref key file")
     if path.is_symlink():
         raise SystemExit(f"refusing symlinked opaque ref key file: {path}")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -500,11 +503,22 @@ def read_opaque_ref_key_file(path: Path) -> bytes:
         if exc.errno == errno.ELOOP:
             raise SystemExit(f"refusing symlinked opaque ref key file: {path}") from exc
         raise
-    with os.fdopen(fd, "r", encoding="utf-8") as handle:
-        return parse_opaque_ref_key(handle.read(), label=str(path))
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            raise SystemExit(f"refusing non-regular opaque ref key file: {path}")
+        if stat.S_IMODE(mode) & 0o077:
+            raise SystemExit(f"opaque ref key file must be owner-only: {path}")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            return parse_opaque_ref_key(handle.read(), label=str(path))
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def create_or_read_opaque_ref_key(path: Path) -> bytes:
+    reject_symlink_ancestors(path, label="opaque ref key file")
     path.parent.mkdir(parents=True, exist_ok=True)
     key_hex = secrets.token_hex(32)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -832,7 +846,7 @@ def duplicate_user_turn(current_text: str, current_time: str, previous: tuple[st
 
 def flags_for_text(text: str, *, redacted_changed: bool = False) -> set[str]:
     flags = {name for name, pattern in FLAG_PATTERNS if pattern.search(text)}
-    if redacted_changed or SAFETY_PATTERN.search(text):
+    if redacted_changed or SAFETY_PATTERN.search(text) or BARE_64_HEX_PATTERN.search(text):
         flags.add("safety_privacy_flag")
     return flags
 
@@ -2075,6 +2089,7 @@ def parse_sources(values: list[str] | None, *, require_default_hosts: bool = Tru
         return sources
     sources: list[Source] = []
     seen: set[tuple[str, str]] = set()
+    default_host_roots: dict[str, str] = {}
     for value in values:
         if "=" not in value:
             raise SystemExit(f"--source must be HOST=PATH, got {value!r}")
@@ -2085,6 +2100,11 @@ def parse_sources(values: list[str] | None, *, require_default_hosts: bool = Tru
         key = (source.host, source.root.resolve(strict=False).as_posix())
         if key in seen:
             continue
+        if source.host in RETAINED_DIRECT_SOURCE_HOSTS:
+            previous_root = default_host_roots.get(source.host)
+            if previous_root is not None and previous_root != key[1]:
+                raise SystemExit(f"--source must not specify multiple roots for {source.host}")
+            default_host_roots[source.host] = key[1]
         seen.add(key)
         sources.append(source)
     if require_default_hosts:
