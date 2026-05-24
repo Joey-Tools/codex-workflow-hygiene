@@ -1907,6 +1907,69 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("failed_command", turns[0].issue_flags)
         self.assertIn("blocked_or_failed", turns[0].assistant_action_summary)
 
+    def test_wrapper_after_lookback_prompt_preserves_task_complete_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-lookback.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please fix the deployment.", "2026-05-20T10:01:00Z"),
+                    message("user", "# AGENTS.md instructions\nRepository policy only.", "2026-05-22T10:01:01Z"),
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:04:00Z",
+                        "payload": {
+                            "type": "task_complete",
+                            "last_agent_message": "The command failed with exit code 1.",
+                        },
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].timestamp, "2026-05-22T10:04:00Z")
+        self.assertIn("failed_command", turns[0].issue_flags)
+        self.assertIn("blocked_or_failed", turns[0].assistant_action_summary)
+
+    def test_future_intent_preamble_does_not_detach_active_turn_on_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T10-00-00-preamble.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Debug the long-running deployment.", "2026-05-20T10:01:00Z"),
+                    message("assistant", "I'll get this fixed and verified.", "2026-05-20T10:02:00Z"),
+                    message("user", "# AGENTS.md instructions\nwrapper", "2026-05-22T10:03:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:05:00Z",
+                        "payload": {"output": "Process exited with code 1\npermission denied"},
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                MODULE.parse_time("2026-05-20T00:00:00Z"),
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+                emit_start=MODULE.parse_time("2026-05-21T00:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].timestamp, "2026-05-22T10:05:00Z")
+        self.assertIn("failed_command", turns[0].issue_flags)
+
     def test_harmless_event_before_wrapper_preserves_active_turn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2846,6 +2909,47 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "oversized")
         self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_skips_old_undated_oversized_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "rollout-summary-undated.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text(
+                json.dumps({"kind": "summary", "timestamp": "2026-04-01T10:00:00Z", "text": "permission denied"})
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(manifest),
+                    "--output",
+                    str(output),
+                    "--max-raw-bytes",
+                    "1000",
+                ]
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows, [])
 
     def test_make_shards_revalidates_source_materialization_before_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -8106,6 +8210,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_summary_skipped")
 
+    def test_old_undated_oversized_rollout_summary_does_not_report_current_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-undated.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text(
+                json.dumps({"kind": "summary", "timestamp": "2026-04-01T10:00:00Z", "text": "permission denied"})
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("oversized_summary_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_truncated_rollout_summary_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "remote"
@@ -8167,6 +8294,34 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
         self.assertIn("truncated_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_old_undated_truncated_rollout_summary_does_not_report_current_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-undated.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "scan_meta",
+                        "timestamp": "",
+                        "text": "scan_truncated=true scan_bytes=2097152 source_bytes=3000000",
+                        "scan_truncated": True,
+                    },
+                    {"kind": "summary", "timestamp": "2026-04-01T10:00:00Z", "text": "permission denied"},
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("truncated_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_old_truncated_rollout_summary_with_later_bad_json_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -8606,6 +8761,27 @@ class SessionRetrospectiveTests(unittest.TestCase):
             rows = list((output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines())
 
         self.assertEqual(rows, [])
+
+    def test_old_undated_invalid_rollout_summary_does_not_report_current_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-undated.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text(
+                '{"kind":"summary","timestamp":"2026-04-01T10:00:00Z","text":"permission denied"\n',
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("invalid_jsonl", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_chinese_privacy_marker_contributes_flag(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

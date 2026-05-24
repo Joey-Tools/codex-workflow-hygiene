@@ -483,6 +483,8 @@ def safe_assistant_summary(texts: list[str]) -> str:
 
 def assistant_terminal_evidence(text: str) -> bool:
     lowered = text.lower()
+    if re.match(r"\s*(?:i'?ll|i will|i am going to|i'm going to|we'?ll|we will|we are going to|let me)\b", lowered):
+        return False
     if re.search(
         r"\b(?:implemented|updated|patched|created|added|fixed|resolved|completed|finished|done|ran|validated|verified|tested|committed|pushed|merged|wrote|generated)\b",
         lowered,
@@ -1214,6 +1216,8 @@ def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetim
     if start is None and end is None:
         return True
     summary_date = summary_date_from_path(path)
+    if summary_date is None:
+        return raw_timestamp_in_window(path, start, end)
     if summary_date and start and summary_date < start:
         if summary_date + dt.timedelta(days=1) > start:
             return True
@@ -1232,6 +1236,18 @@ def summary_file_maybe_relevant_without_read(path: Path, start: dt.datetime | No
     if summary_date and start and summary_date < start:
         return True
     return True
+
+
+def summary_file_maybe_relevant_with_scan_cap(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    if summary_date_from_path(path) is None:
+        return summary_file_relevant_with_scan_cap(path, start, end, max_scan_bytes=max_scan_bytes)
+    return summary_file_maybe_relevant_without_read(path, start, end)
 
 
 def summary_file_has_truncated_scan(path: Path) -> bool:
@@ -1321,6 +1337,12 @@ def extract_rollout(
         if current and assistant_bits:
             current.assistant_action_summary = safe_assistant_summary(assistant_bits)
             assistant_bits = []
+
+    def release_wrapper_pending_assistant() -> None:
+        nonlocal assistant_bits, wrapper_pending_assistant_bits, wrapper_pending_new_window_activity
+        assistant_bits.extend(wrapper_pending_assistant_bits)
+        wrapper_pending_assistant_bits = []
+        wrapper_pending_new_window_activity = False
 
     def is_emit_record(timestamp: dt.datetime | None, *, timestamp_is_fallback: bool) -> bool:
         if emit_threshold is None or timestamp is None or timestamp >= emit_threshold:
@@ -1455,19 +1477,28 @@ def extract_rollout(
                 continue
             if assistant_text and current:
                 if wrapper_pending_new_window_activity:
-                    if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
+                    if (
+                        payload.get("type") == "task_complete"
+                        and is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback)
+                        and assistant_terminal_evidence(assistant_text)
+                    ):
+                        release_wrapper_pending_assistant()
+                        current_detach_on_wrapper = True
+                        emit_current(line_no, timestamp)
+                        assistant_bits.append(assistant_text)
+                    elif is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                         wrapper_pending_assistant_bits.append(assistant_text)
-                    continue
-                if assistant_terminal_evidence(assistant_text):
+                        continue
+                    else:
+                        continue
+                elif assistant_terminal_evidence(assistant_text):
                     current_detach_on_wrapper = True
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current(line_no, timestamp)
                     assistant_bits.append(assistant_text)
             if current and tool_output_payload_text(record, payload):
                 if wrapper_pending_new_window_activity:
-                    assistant_bits.extend(wrapper_pending_assistant_bits)
-                    wrapper_pending_assistant_bits = []
-                    wrapper_pending_new_window_activity = False
+                    release_wrapper_pending_assistant()
                 current_detach_on_wrapper = True
                 if is_emit_record(parsed_timestamp, timestamp_is_fallback=timestamp_is_fallback):
                     emit_current(line_no, timestamp)
@@ -3318,11 +3349,16 @@ def run_scan(
         for summary in summaries:
             size = summary.stat().st_size
             if size > max_raw_bytes:
-                if summary_file_maybe_relevant_without_read(summary, gap_start, end):
+                if summary_file_maybe_relevant_with_scan_cap(summary, gap_start, end, max_scan_bytes=max_raw_bytes):
                     append_oversized_summary_gap(summary, size)
                 continue
             jsonl_error = first_jsonl_error(summary)
-            if summary_file_has_truncated_scan(summary) and summary_file_maybe_relevant_without_read(summary, gap_start, end):
+            if summary_file_has_truncated_scan(summary) and summary_file_maybe_relevant_with_scan_cap(
+                summary,
+                gap_start,
+                end,
+                max_scan_bytes=max_raw_bytes,
+            ):
                 coverage_gaps.append(
                     {
                         "host": source.host,
@@ -3332,7 +3368,7 @@ def run_scan(
                 )
             if jsonl_error is not None:
                 if (
-                    summary_file_maybe_relevant_without_read(summary, gap_start, end)
+                    summary_file_maybe_relevant_with_scan_cap(summary, gap_start, end, max_scan_bytes=max_raw_bytes)
                     if jsonl_error.unreadable
                     else summary_file_relevant(summary, gap_start, end)
                 ):
@@ -3598,7 +3634,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     def append_summary_shard(summary: Path) -> None:
         row = shard_row(summary, bytes=summary.stat().st_size, kind="summary")
         if row["bytes"] > max_raw_bytes:
-            if not summary_file_maybe_relevant_without_read(summary, start, end):
+            if not summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_raw_bytes):
                 return
             row["status"] = "oversized"
             row["coverage_gap"] = "summary exceeds max raw shard bytes; regenerate bounded rollout-summary before extractor handoff"
@@ -3606,7 +3642,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             return
         jsonl_error = first_jsonl_error(summary)
         if summary_file_has_truncated_scan(summary):
-            if not summary_file_maybe_relevant_without_read(summary, start, end):
+            if not summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_raw_bytes):
                 return
             row["status"] = "partial"
             row["coverage_gap"] = "summary scan truncated; regenerate complete bounded evidence before extractor handoff"
@@ -3614,7 +3650,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             return
         if jsonl_error is not None:
             if not (
-                summary_file_maybe_relevant_without_read(summary, start, end)
+                summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_raw_bytes)
                 if jsonl_error.unreadable
                 else summary_file_relevant(summary, start, end)
             ):
