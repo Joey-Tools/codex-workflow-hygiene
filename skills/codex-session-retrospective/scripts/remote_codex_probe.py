@@ -114,6 +114,13 @@ class SessionMetaScan:
     truncated: bool
 
 
+class SessionMetaRolloutError(ValueError):
+    def __init__(self, error: str, *, rollout: str | None = None) -> None:
+        super().__init__(error)
+        self.error = error
+        self.rollout = rollout
+
+
 REMOTE_PREFLIGHT_SCRIPT = r"""
 hostname_value="$(hostname 2>/dev/null || printf unknown)"
 user_value="$(id -un 2>/dev/null || printf unknown)"
@@ -994,7 +1001,13 @@ def iter_session_meta():
                 target = safe_rollout_path(rel)
             except FileNotFoundError:
                 continue
-            with open_rollout_text(target) as handle:
+            try:
+                handle = open_rollout_text(target)
+            except OSError:
+                print(json.dumps({{"kind": "error", "error": "rollout unreadable", "rollout": rel.as_posix()}}, separators=(",", ":"), sort_keys=True))
+                print(SESSION_META_END)
+                return
+            with handle:
                 for line in bounded_text_lines(handle, SESSION_META_SCAN_BYTES):
                     try:
                         obj = json.loads(line)
@@ -1137,6 +1150,11 @@ def _scan_session_meta_records(
                 handle = _open_local_rollout_text(resolved_root, rollout_relative_path)
             except FileNotFoundError:
                 continue
+            except OSError as exc:
+                raise SessionMetaRolloutError(
+                    "rollout unreadable",
+                    rollout=rollout_relative_path.as_posix(),
+                ) from exc
             with handle:
                 for line in _bounded_text_lines(handle, MAX_SESSION_META_SCAN_BYTES):
                     try:
@@ -1374,6 +1392,15 @@ def _is_session_meta_truncation_item(item: dict[str, Any]) -> bool:
     )
 
 
+def _session_meta_error_from_item(item: dict[str, Any]) -> SessionMetaRolloutError | None:
+    if item.get("kind") != "error":
+        return None
+    error = str(item.get("error", "")).strip() or "remote session-meta failed"
+    rollout = item.get("rollout")
+    rollout_text = str(rollout) if isinstance(rollout, str) and rollout else None
+    return SessionMetaRolloutError(error, rollout=rollout_text)
+
+
 def _session_meta_limit_error(host: str, limit: int) -> int:
     print(f"host={host}", file=sys.stderr)
     print(
@@ -1437,6 +1464,12 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
                     limit=args.limit,
                     host=alias,
                 )
+            except SessionMetaRolloutError as error:
+                print(f"host={alias}", file=sys.stderr)
+                if error.rollout:
+                    print(f"rollout={error.rollout}", file=sys.stderr)
+                print(f"error={error.error}", file=sys.stderr)
+                return 1
             except ValueError as error:
                 print(f"host={alias}", file=sys.stderr)
                 print(f"error={error}", file=sys.stderr)
@@ -1487,6 +1520,13 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
                     return 1
                 if _is_session_meta_truncation_item(item):
                     return _session_meta_limit_error(alias, args.limit)
+                session_meta_error = _session_meta_error_from_item(item)
+                if session_meta_error is not None:
+                    print(f"host={alias}", file=sys.stderr)
+                    if session_meta_error.rollout:
+                        print(f"rollout={session_meta_error.rollout}", file=sys.stderr)
+                    print(f"error={session_meta_error.error}", file=sys.stderr)
+                    return 1
                 try:
                     host_rows.append(_session_meta_row_from_item(item, host=alias))
                 except ValueError as error:

@@ -497,6 +497,70 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
 
+    def test_remote_probe_session_meta_reports_unreadable_local_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "blocked-session", "cwd": "/secret/repo"},
+                    }
+                ],
+            )
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                REMOTE_PROBE, "_open_local_rollout_text", side_effect=PermissionError("blocked path")
+            ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(sys, "stdout", stdout):
+                result = REMOTE_PROBE.cmd_session_meta(
+                    types.SimpleNamespace(host=["local"], date=["2026/05/01"], from_date=None, to_date=None, limit=10)
+                )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("host=local", stderr.getvalue())
+        self.assertIn("rollout=sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl", stderr.getvalue())
+        self.assertIn("error=rollout unreadable", stderr.getvalue())
+        self.assertNotIn("blocked path", stderr.getvalue())
+
+    def test_remote_probe_session_meta_reports_unreadable_remote_rollout_without_remote_path(self) -> None:
+        marker = json.dumps(
+            {
+                "kind": "error",
+                "error": "rollout unreadable",
+                "rollout": "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+            }
+        )
+        remote_output = f"{REMOTE_PROBE.REMOTE_SESSION_META_BEGIN}\n{marker}\n{REMOTE_PROBE.REMOTE_SESSION_META_END}\n"
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            REMOTE_PROBE,
+            "_run_remote_python",
+            return_value=subprocess.CompletedProcess(
+                args=["ssh"],
+                returncode=0,
+                stdout=remote_output,
+                stderr="Traceback: /home/hoteng/.codex/private-rollout.jsonl",
+            ),
+        ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(sys, "stdout", stdout):
+            result = REMOTE_PROBE.cmd_session_meta(
+                types.SimpleNamespace(host=["miku-bot-dev"], date=["2026/05/01"], from_date=None, to_date=None, limit=10)
+            )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("host=miku-bot-dev", stderr.getvalue())
+        self.assertIn("rollout=sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl", stderr.getvalue())
+        self.assertIn("error=rollout unreadable", stderr.getvalue())
+        self.assertNotIn("/home/hoteng/.codex", stderr.getvalue())
+
     def test_remote_probe_session_meta_rejects_symlink_date_dir(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -7922,6 +7986,51 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
                 self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
 
+    def test_default_remote_summary_backing_requires_materialized_window_record(self) -> None:
+        cases = [
+            ("empty", []),
+            ("stale", [message("user", "Old remote task.", "2026-04-01T10:00:00Z")]),
+        ]
+        for name, rollout_rows in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as raw:
+                    remote = Path(raw) / "miku-bot-dev"
+                    write_remote_metadata(remote, "miku-bot-dev")
+                    rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-remote.jsonl"
+                    rollout = remote / rollout_ref
+                    write_jsonl(rollout, rollout_rows)
+                    summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+                    write_jsonl(
+                        summary,
+                        [
+                            {
+                                "kind": "summary",
+                                "timestamp": "2026-05-01T10:01:00Z",
+                                "rollout": rollout_ref,
+                                "text": "permission denied",
+                            }
+                        ],
+                    )
+                    output = safe_output_dir(raw)
+                    state = safe_output_dir(raw) / "state.json"
+
+                    MODULE.run_scan(
+                        types.SimpleNamespace(
+                            source=[f"miku-bot-dev={remote}"],
+                            output=str(output),
+                            state=str(state),
+                            max_raw_bytes=1000,
+                            allow_partial_hosts=True,
+                        ),
+                        mode="daily",
+                        start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                        end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    )
+                    trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+                self.assertFalse(state.exists())
+                self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_default_remote_mixed_summary_backing_requires_each_materialized_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
@@ -9837,6 +9946,51 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn(REMOTE_PROBE.SESSION_META_LIMIT_TRUNCATED_REASON, result.stdout)
         self.assertIn('"kind":"truncation"', result.stdout)
+
+    def test_remote_probe_generated_session_meta_marks_unreadable_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "hidden-session", "cwd": "/secret/repo"},
+                    }
+                ],
+            )
+            os.chmod(rollout, 0)
+            try:
+                script = REMOTE_PROBE._remote_python_script(
+                    {
+                        "mode": "session-meta",
+                        "codex_root": str(root),
+                        "dates": ["2026/05/01"],
+                        "limit": 10,
+                        "session_meta_scan_bytes": 1024,
+                    }
+                )
+
+                result = subprocess.run(
+                    [sys.executable, "-"],
+                    input=script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+            finally:
+                os.chmod(rollout, 0o600)
+
+        if '"kind":"error"' not in result.stdout:
+            self.skipTest("chmod(0) did not make the rollout unreadable in this environment")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"error":"rollout unreadable"', result.stdout)
+        self.assertIn('"rollout":"sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl"', result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn(str(root), result.stderr)
+        self.assertNotIn("hidden-session", result.stdout)
 
     def test_out_of_window_summary_meta_still_sets_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

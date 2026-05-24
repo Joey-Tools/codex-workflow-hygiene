@@ -1129,12 +1129,10 @@ def rollout_has_materialized_window_coverage(
             return raw_timestamp_in_window(path, start, end)
         except OSError:
             return False
-    if rollout_date is None:
-        try:
-            return raw_timestamp_in_window(path, start, end)
-        except OSError:
-            return False
-    return True
+    try:
+        return rollout_has_record_in_window(path, start, end, allow_mtime_fallback=allow_mtime_fallback)
+    except (OSError, ValueError):
+        return False
 
 
 def rollout_mtime_active(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
