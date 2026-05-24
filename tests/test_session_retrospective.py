@@ -604,6 +604,104 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual([row["session_id"] for row in rows], ["duplicate-session", "unique-session"])
 
+    def test_remote_probe_session_meta_rejects_local_limit_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            for index in range(3):
+                rollout = root / "sessions" / "2026" / "05" / "01" / f"rollout-2026-05-01T10-0{index}-00-{index}.jsonl"
+                write_jsonl(
+                    rollout,
+                    [
+                        {
+                            "type": "session_meta",
+                            "timestamp": f"2026-05-01T10:0{index}:00Z",
+                            "payload": {"id": f"session-{index}", "cwd": "/redacted/repo"},
+                        }
+                    ],
+                )
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                sys, "stderr", stderr
+            ), mock.patch.object(sys, "stdout", stdout):
+                result = REMOTE_PROBE.cmd_session_meta(
+                    types.SimpleNamespace(host=["local"], date=["2026/05/01"], from_date=None, to_date=None, limit=2)
+                )
+
+        self.assertEqual(result, 1)
+        self.assertIn("session-meta result exceeded --limit=2", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_remote_probe_session_meta_rejects_remote_limit_marker(self) -> None:
+        row = json.dumps(
+            {"date": "2026/05/01", "session_id": "session-1", "cwd": "/redacted/repo", "rollout": "sessions/2026/05/01/rollout-1.jsonl"}
+        )
+        marker = json.dumps({"kind": "truncation", "reason": REMOTE_PROBE.SESSION_META_LIMIT_TRUNCATED_REASON, "date": "2026/05/01", "limit": 1})
+        remote_output = f"{REMOTE_PROBE.REMOTE_SESSION_META_BEGIN}\n{row}\n{marker}\n{REMOTE_PROBE.REMOTE_SESSION_META_END}\n"
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            REMOTE_PROBE,
+            "_run_remote_python",
+            return_value=subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout=remote_output, stderr=""),
+        ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(sys, "stdout", stdout):
+            result = REMOTE_PROBE.cmd_session_meta(
+                types.SimpleNamespace(host=["miku-bot-dev"], date=["2026/05/01"], from_date=None, to_date=None, limit=1)
+            )
+
+        self.assertEqual(result, 1)
+        self.assertIn("host=miku-bot-dev", stderr.getvalue())
+        self.assertIn("session-meta result exceeded --limit=1", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_remote_probe_session_meta_rejects_global_limit_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-local.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "local-session", "cwd": "/redacted/local"},
+                    }
+                ],
+            )
+            remote_row = json.dumps(
+                {
+                    "date": "2026/05/01",
+                    "session_id": "remote-session",
+                    "cwd": "/redacted/remote",
+                    "rollout": "sessions/2026/05/01/rollout-remote.jsonl",
+                }
+            )
+            remote_output = f"{REMOTE_PROBE.REMOTE_SESSION_META_BEGIN}\n{remote_row}\n{REMOTE_PROBE.REMOTE_SESSION_META_END}\n"
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                REMOTE_PROBE,
+                "_run_remote_python",
+                return_value=subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout=remote_output, stderr=""),
+            ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(sys, "stdout", stdout):
+                result = REMOTE_PROBE.cmd_session_meta(
+                    types.SimpleNamespace(
+                        host=["local", "miku-bot-dev"],
+                        date=["2026/05/01"],
+                        from_date=None,
+                        to_date=None,
+                        limit=1,
+                    )
+                )
+
+        self.assertEqual(result, 1)
+        self.assertIn("host=all", stderr.getvalue())
+        self.assertIn("session-meta result exceeded --limit=1", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+
     def test_remote_probe_script_is_executable(self) -> None:
         self.assertTrue(os.access(REMOTE_PROBE_SCRIPT, os.X_OK))
 
@@ -8941,6 +9039,43 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Codex root is a symlink", result.stderr)
         self.assertNotIn("hidden-session", result.stdout)
+
+    def test_remote_probe_generated_session_meta_marks_limit_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            for index in range(2):
+                rollout = root / "sessions" / "2026" / "05" / "01" / f"rollout-2026-05-01T10-0{index}-00-{index}.jsonl"
+                write_jsonl(
+                    rollout,
+                    [
+                        {
+                            "type": "session_meta",
+                            "timestamp": f"2026-05-01T10:0{index}:00Z",
+                            "payload": {"id": f"session-{index}", "cwd": "/redacted/repo"},
+                        }
+                    ],
+                )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "session-meta",
+                    "codex_root": str(root),
+                    "dates": ["2026/05/01"],
+                    "limit": 1,
+                    "session_meta_scan_bytes": 1024,
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(REMOTE_PROBE.SESSION_META_LIMIT_TRUNCATED_REASON, result.stdout)
+        self.assertIn('"kind":"truncation"', result.stdout)
 
     def test_out_of_window_summary_meta_still_sets_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

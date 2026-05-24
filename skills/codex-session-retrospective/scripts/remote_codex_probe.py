@@ -6,6 +6,7 @@ import argparse
 import base64
 import binascii
 import collections
+import dataclasses
 import datetime as dt
 import json
 import os
@@ -78,6 +79,7 @@ AUTOMATION_PROMPT_MARKERS = (
 SUMMARY_SIGNAL_MARKERS = ("error:", "approval", "could not run", "you missed", "assumed", "secret")
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
+SESSION_META_LIMIT_TRUNCATED_REASON = "session_meta_limit_truncated"
 REMOTE_FETCH_ROLLOUT_BEGIN = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_BEGIN__"
 REMOTE_FETCH_ROLLOUT_END = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_END__"
 REMOTE_ROLLOUT_SUMMARY_BEGIN = "__REMOTE_CODEX_PROBE_ROLLOUT_SUMMARY_BEGIN__"
@@ -104,6 +106,13 @@ HOSTS: dict[str, dict[str, str]] = {
         "codex_root": "/home/hoteng/.codex",
     },
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class SessionMetaScan:
+    rows: list[dict[str, str]]
+    truncated: bool
+
 
 REMOTE_PREFLIGHT_SCRIPT = r"""
 hostname_value="$(hostname 2>/dev/null || printf unknown)"
@@ -518,6 +527,7 @@ AUTOMATION_PROMPT_MARKERS = {AUTOMATION_PROMPT_MARKERS!r}
 SUMMARY_SIGNAL_MARKERS = {SUMMARY_SIGNAL_MARKERS!r}
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
 SESSION_META_END = {REMOTE_SESSION_META_END!r}
+SESSION_META_LIMIT_TRUNCATED_REASON = {SESSION_META_LIMIT_TRUNCATED_REASON!r}
 FETCH_ROLLOUT_BEGIN = {REMOTE_FETCH_ROLLOUT_BEGIN!r}
 FETCH_ROLLOUT_END = {REMOTE_FETCH_ROLLOUT_END!r}
 ROLLOUT_SUMMARY_BEGIN = {REMOTE_ROLLOUT_SUMMARY_BEGIN!r}
@@ -962,11 +972,12 @@ def iter_session_meta():
                 if session_id in seen_session_ids:
                     continue
                 seen_session_ids.add(session_id)
-                print(json.dumps({{"date": date_text, "session_id": session_id, "cwd": cwd, "rollout": rollout.relative_to(root).as_posix()}}, separators=(",", ":"), sort_keys=True))
                 count += 1
-                if LIMIT and count >= LIMIT:
+                if LIMIT and count > LIMIT:
+                    print(json.dumps({{"kind": "truncation", "reason": SESSION_META_LIMIT_TRUNCATED_REASON, "date": date_text, "limit": LIMIT}}, separators=(",", ":"), sort_keys=True))
                     print(SESSION_META_END)
                     return
+                print(json.dumps({{"date": date_text, "session_id": session_id, "cwd": cwd, "rollout": rollout.relative_to(root).as_posix()}}, separators=(",", ":"), sort_keys=True))
     print(SESSION_META_END)
 
 
@@ -1031,17 +1042,17 @@ def _run_remote_python(alias: str, payload: dict[str, object]) -> subprocess.Com
     )
 
 
-def _iter_session_meta_records(
+def _scan_session_meta_records(
     *,
     codex_root: pathlib.Path,
     dates: list[dt.date],
     limit: int,
     host: str,
-) -> list[dict[str, str]]:
+) -> SessionMetaScan:
     try:
         resolved_root = _resolve_safe_codex_root(codex_root)
     except OSError:
-        return []
+        return SessionMetaScan(rows=[], truncated=False)
     rows: list[dict[str, str]] = []
     seen_session_ids: set[str] = set()
     for date_value in reversed(dates):
@@ -1106,9 +1117,24 @@ def _iter_session_meta_records(
                     "rollout": rollout_path.relative_to(resolved_root).as_posix(),
                 }
             )
-            if limit and len(rows) >= limit:
-                return rows
-    return rows
+            if limit and len(rows) > limit:
+                return SessionMetaScan(rows=rows[:limit], truncated=True)
+    return SessionMetaScan(rows=rows, truncated=False)
+
+
+def _iter_session_meta_records(
+    *,
+    codex_root: pathlib.Path,
+    dates: list[dt.date],
+    limit: int,
+    host: str,
+) -> list[dict[str, str]]:
+    return _scan_session_meta_records(
+        codex_root=codex_root,
+        dates=dates,
+        limit=limit,
+        host=host,
+    ).rows
 
 
 def _fetch_local_rollout(codex_root: pathlib.Path, rollout_relative_path: pathlib.PurePosixPath) -> bytes:
@@ -1295,6 +1321,22 @@ def _session_meta_row_from_item(item: dict[str, Any], *, host: str) -> dict[str,
     }
 
 
+def _is_session_meta_truncation_item(item: dict[str, Any]) -> bool:
+    return (
+        item.get("kind") == "truncation"
+        and item.get("reason") == SESSION_META_LIMIT_TRUNCATED_REASON
+    )
+
+
+def _session_meta_limit_error(host: str, limit: int) -> int:
+    print(f"host={host}", file=sys.stderr)
+    print(
+        f"error=session-meta result exceeded --limit={limit}; narrow the date/host scope or raise --limit up to {MAX_SESSION_META_LIMIT}",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     try:
         hosts = _resolve_hosts(args.host)
@@ -1343,7 +1385,7 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
     for alias in hosts:
         if HOSTS[alias]["kind"] == "local":
             try:
-                host_rows = _iter_session_meta_records(
+                scan = _scan_session_meta_records(
                     codex_root=_local_codex_root(),
                     dates=dates,
                     limit=args.limit,
@@ -1353,6 +1395,9 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
                 print(f"host={alias}", file=sys.stderr)
                 print(f"error={error}", file=sys.stderr)
                 return 1
+            if scan.truncated:
+                return _session_meta_limit_error(alias, args.limit)
+            host_rows = scan.rows
         else:
             payload = {
                 "mode": "session-meta",
@@ -1394,6 +1439,8 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
                     print(f"host={alias}", file=sys.stderr)
                     print(f"error={error}", file=sys.stderr)
                     return 1
+                if _is_session_meta_truncation_item(item):
+                    return _session_meta_limit_error(alias, args.limit)
                 try:
                     host_rows.append(_session_meta_row_from_item(item, host=alias))
                 except ValueError as error:
@@ -1401,7 +1448,9 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
                     print(f"error={error}", file=sys.stderr)
                     return 1
         rows.extend(host_rows)
-    rows = _sort_session_meta_rows(rows)[: args.limit]
+        if len(rows) > args.limit:
+            return _session_meta_limit_error("all", args.limit)
+    rows = _sort_session_meta_rows(rows)
 
     _print_tsv(rows, ["host", "date", "session_id", "cwd", "rollout"])
     return 0
