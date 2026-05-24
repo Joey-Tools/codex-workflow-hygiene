@@ -270,6 +270,16 @@ def _path_is_relative_to(path: pathlib.Path, root: pathlib.Path) -> bool:
     return True
 
 
+def _resolve_safe_codex_root(codex_root: pathlib.Path) -> pathlib.Path:
+    expanded_root = codex_root.expanduser()
+    root_stat = expanded_root.lstat()
+    if stat.S_ISLNK(root_stat.st_mode):
+        raise ValueError("Codex root is a symlink")
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise ValueError("Codex root is not a directory")
+    return expanded_root.resolve(strict=True)
+
+
 def _safe_relative_path(
     codex_root: pathlib.Path,
     relative_path: pathlib.PurePosixPath,
@@ -277,13 +287,7 @@ def _safe_relative_path(
     expect_directory: bool = False,
     expect_regular_file: bool = False,
 ) -> pathlib.Path:
-    expanded_root = codex_root.expanduser()
-    root_stat = expanded_root.lstat()
-    if stat.S_ISLNK(root_stat.st_mode):
-        raise ValueError("Codex root is a symlink")
-    if not stat.S_ISDIR(root_stat.st_mode):
-        raise ValueError("Codex root is not a directory")
-    root = expanded_root.resolve(strict=True)
+    root = _resolve_safe_codex_root(codex_root)
     target = root
     parts = relative_path.parts
     for index, part in enumerate(parts):
@@ -528,13 +532,17 @@ def path_is_relative_to(path, root):
     return True
 
 
-def safe_relative_path(rel, *, expect_directory=False, expect_regular_file=False):
+def safe_codex_root():
     root_stat = ROOT.lstat()
     if stat.S_ISLNK(root_stat.st_mode):
         raise ValueError("Codex root is a symlink")
     if not stat.S_ISDIR(root_stat.st_mode):
         raise ValueError("Codex root is not a directory")
-    root = ROOT.resolve(strict=True)
+    return ROOT.resolve(strict=True)
+
+
+def safe_relative_path(rel, *, expect_directory=False, expect_regular_file=False):
+    root = safe_codex_root()
     target = root
     parts = rel.parts
     for index, part in enumerate(parts):
@@ -673,13 +681,13 @@ def summary_signal_text(kind, text):
         r"(?:\\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|privacy|pii)\\b|"
         r"\\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{{16,}}|gh[pousr]_[A-Za-z0-9_]{{16,}}|github_pat_[A-Za-z0-9_]{{16,}})\\b|"
         r"\\bAKIA[0-9A-Z]{{16}}\\b|\\bBearer\\s+[A-Za-z0-9._~+/\\-]+=*|"
-        r"\\b(?:authorization|password|passwd|pwd|credential|secret(?:[\\s_-]?key)?|token|api[\\s_-]?key|private[\\s_-]?key)\\s*[:=]\\s*['\"]?[^'\"\\s,;]+|"
+        r"\\b(?:authorization|password|passwd|pwd|credential|secret(?:[\\s_-]?key)?|token|api[\\s_-]?key|private[\\s_-]?key)\\s*[:=]\\s*['\\\"]?[^'\\\"\\s,;]+|"
         r"\\beyJ[A-Za-z0-9_-]{{10,}}\\.[A-Za-z0-9_-]{{10,}}\\.[A-Za-z0-9_-]{{10,}}\\b|"
         r"(?<![0-9a-fA-F])[0-9a-fA-F]{{64}}(?![0-9a-fA-F])|"
-        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{{2,}}|https?://[^\\s)>\\]\"']+|"
-        r"\\b(?:ssh://[^\\s)>\\]\"']+|git@[A-Za-z0-9_.-]+:[^\\s)>\\]\"']+)|"
-        r"(?<!\\w)(?:~|/(?:Users|home|root|private|tmp|var|etc|opt|Volumes|workspace|workspaces))/[^\\s,;:)>\\]\"']+|"
-        r"\\b(?:customer|client|account|tenant|org|repo|repository)[_-]?(?:id|name)?\\s*[:=]\\s*['\"]?[A-Za-z0-9_.-]+|"
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{{2,}}|https?://[^\\s)>\\]\\\"']+|"
+        r"\\b(?:ssh://[^\\s)>\\]\\\"']+|git@[A-Za-z0-9_.-]+:[^\\s)>\\]\\\"']+)|"
+        r"(?<!\\w)(?:~|/(?:Users|home|root|private|tmp|var|etc|opt|Volumes|workspace|workspaces))/[^\\s,;:)>\\]\\\"']+|"
+        r"\\b(?:customer|client|account|tenant|org|repo|repository)[_-]?(?:id|name)?\\s*[:=]\\s*['\\\"]?[A-Za-z0-9_.-]+|"
         r"客户|客户数据|凭据|凭证|密钥|生产|破坏性)",
         text,
         re.I,
@@ -898,6 +906,12 @@ def summarize_rollout():
 
 
 def iter_session_meta():
+    try:
+        root = safe_codex_root()
+    except FileNotFoundError:
+        print(SESSION_META_BEGIN)
+        print(SESSION_META_END)
+        return
     print(SESSION_META_BEGIN)
     count = 0
     for date_text in reversed(DATE_STRINGS):
@@ -918,7 +932,7 @@ def iter_session_meta():
         except (FileNotFoundError, ValueError):
             pass
         for rollout in rollout_paths:
-            rel = pathlib.PurePosixPath(rollout.relative_to(ROOT).as_posix())
+            rel = pathlib.PurePosixPath(rollout.relative_to(root).as_posix())
             session_id = ""
             cwd = ""
             try:
@@ -938,7 +952,7 @@ def iter_session_meta():
                     cwd = str(payload.get("cwd", ""))
                     break
             if session_id:
-                print(json.dumps({{"date": date_text, "session_id": session_id, "cwd": cwd, "rollout": rollout.relative_to(ROOT).as_posix()}}, separators=(",", ":"), sort_keys=True))
+                print(json.dumps({{"date": date_text, "session_id": session_id, "cwd": cwd, "rollout": rollout.relative_to(root).as_posix()}}, separators=(",", ":"), sort_keys=True))
                 count += 1
                 if LIMIT and count >= LIMIT:
                     print(SESSION_META_END)
@@ -975,7 +989,11 @@ def fetch_rollout():
 
 
 if CONFIG["mode"] == "session-meta":
-    iter_session_meta()
+    try:
+        iter_session_meta()
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(1)
 elif CONFIG["mode"] == "fetch-rollout":
     fetch_rollout()
 elif CONFIG["mode"] == "rollout-summary":
@@ -1011,7 +1029,7 @@ def _iter_session_meta_records(
     host: str,
 ) -> list[dict[str, str]]:
     try:
-        resolved_root = codex_root.expanduser().resolve(strict=True)
+        resolved_root = _resolve_safe_codex_root(codex_root)
     except OSError:
         return []
     rows: list[dict[str, str]] = []
@@ -1305,12 +1323,17 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
     rows: list[dict[str, str]] = []
     for alias in hosts:
         if HOSTS[alias]["kind"] == "local":
-            host_rows = _iter_session_meta_records(
-                codex_root=_local_codex_root(),
-                dates=dates,
-                limit=args.limit,
-                host=alias,
-            )
+            try:
+                host_rows = _iter_session_meta_records(
+                    codex_root=_local_codex_root(),
+                    dates=dates,
+                    limit=args.limit,
+                    host=alias,
+                )
+            except ValueError as error:
+                print(f"host={alias}", file=sys.stderr)
+                print(f"error={error}", file=sys.stderr)
+                return 1
         else:
             payload = {
                 "mode": "session-meta",

@@ -368,6 +368,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     ),
                 )
 
+    def test_remote_probe_session_meta_rejects_symlink_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            real_root = Path(raw) / "real-codex"
+            rollout = real_root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "hidden-session", "cwd": "/secret/repo"},
+                    }
+                ],
+            )
+            link_root = Path(raw) / ".codex"
+            link_root.symlink_to(real_root, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "Codex root is a symlink"):
+                REMOTE_PROBE._iter_session_meta_records(
+                    codex_root=link_root,
+                    dates=[dt.date(2026, 5, 1)],
+                    limit=10,
+                    host="local",
+                )
+
     def test_remote_probe_summary_rejects_symlink_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -8154,6 +8179,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("Codex root is a symlink", script)
         self.assertNotIn("(2,)", script)
         self.assertNotIn("(16,)", script)
+
+    def test_remote_probe_generated_session_meta_rejects_symlink_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            real_root = Path(raw) / "real-codex"
+            rollout = real_root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "hidden-session", "cwd": "/secret/repo"},
+                    }
+                ],
+            )
+            link_root = Path(raw) / ".codex"
+            link_root.symlink_to(real_root, target_is_directory=True)
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "session-meta",
+                    "codex_root": str(link_root),
+                    "dates": ["2026/05/01"],
+                    "limit": 10,
+                    "session_meta_scan_bytes": 1024,
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Codex root is a symlink", result.stderr)
+        self.assertNotIn("hidden-session", result.stdout)
 
     def test_out_of_window_summary_meta_still_sets_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
