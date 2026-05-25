@@ -1091,6 +1091,7 @@ def summarize_rollout():
             "line": 0,
             "matched_record_limit_reached": matched_record_limit_reached,
             "record_limit_reached": record_limit_reached,
+            "rollout": normalized,
             "scan_bytes": SUMMARY_SCAN_BYTES,
             "scan_truncated": bool(SUMMARY_SCAN_BYTES and target_size > SUMMARY_SCAN_BYTES),
             "signal_record_limit_reached": signal_record_limit_reached,
@@ -1126,6 +1127,7 @@ def summarize_rollout():
             return
         payload = dict(record)
         payload.pop("_match_text", None)
+        payload["rollout"] = normalized
         print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
         emitted.add(key)
 

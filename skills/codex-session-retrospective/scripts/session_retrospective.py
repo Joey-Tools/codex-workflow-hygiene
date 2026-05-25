@@ -3649,10 +3649,12 @@ def remote_summary_only_gaps(
             source_root=source.root,
             max_scan_bytes=max_scan_bytes,
         )
-    covered_rollout_refs: set[str] = set(complete_summary_refs)
-    has_covered_rollout = bool(complete_summary_refs)
+    covered_rollout_refs: set[str] = set()
+    has_covered_rollout = False
     for rollout in rollouts:
-        if not rollout_has_materialized_window_coverage(
+        rollout_ref = source_relative_path_ref(rollout, source.root)
+        summary_backed_materialized = rollout_ref is not None and rollout_ref in complete_summary_refs
+        if not summary_backed_materialized and not rollout_has_materialized_window_coverage(
             rollout,
             start,
             end,
@@ -3661,7 +3663,6 @@ def remote_summary_only_gaps(
         ):
             continue
         has_covered_rollout = True
-        rollout_ref = source_relative_path_ref(rollout, source.root)
         if rollout_ref is not None:
             covered_rollout_refs.add(rollout_ref)
     for summary in summaries:
