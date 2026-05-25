@@ -1467,13 +1467,7 @@ def summary_file_has_stale_backing_source(
         return False
     if not summary_file_relevant_with_scan_cap(path, start, end, max_scan_bytes=max_scan_bytes):
         return False
-    if (
-        summary_file_has_truncated_scan(path)
-        or summary_file_has_record_limit_gap(path)
-        or first_jsonl_error(path) is not None
-    ):
-        return False
-    source_bytes = summary_file_complete_backing_source_bytes(path)
+    source_bytes = summary_file_declared_source_bytes(path)
     if source_bytes is None:
         return False
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
@@ -1599,6 +1593,23 @@ def summary_file_has_record_limit_gap(path: Path) -> bool:
 
 def summary_file_has_complete_backing_scan_meta(path: Path) -> bool:
     return summary_file_complete_backing_source_bytes(path) is not None
+
+
+def summary_file_declared_source_bytes(path: Path) -> int | None:
+    source_bytes_seen: set[int] = set()
+    try:
+        for _line_no, record in iter_jsonl(path):
+            if str(record.get("kind") or "") != "scan_meta":
+                continue
+            source_bytes = record.get("source_bytes")
+            if type(source_bytes) is not int or source_bytes < 0:
+                return None
+            source_bytes_seen.add(source_bytes)
+    except (OSError, ValueError):
+        return None
+    if len(source_bytes_seen) != 1:
+        return None
+    return next(iter(source_bytes_seen))
 
 
 def summary_file_complete_backing_source_bytes(path: Path) -> int | None:

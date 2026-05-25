@@ -5402,6 +5402,55 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("stale_rollout_summary", reasons)
         self.assertEqual(rows, [])
 
+    def test_truncated_stale_rollout_summary_does_not_extract_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        source_bytes=rollout.stat().st_size - 1,
+                        scan_truncated=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertIn("oversized_rollout_skipped", reasons)
+        self.assertIn("stale_rollout_summary", reasons)
+        self.assertIn("truncated_rollout_summary", reasons)
+        self.assertEqual(rows, [])
+
     def test_json_error_rollout_summary_does_not_cover_oversized_rollout_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
