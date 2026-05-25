@@ -15,6 +15,7 @@ The goal is to locate the smallest relevant set of rollout files, extract only t
 - `~/.codex/session_index.jsonl` for fast lookup by session ID, thread name, and sometimes path hints.
 - `~/.codex/history.jsonl` for higher-level prompt or thread recovery when the exact rollout file is not known yet.
 - `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` as the canonical transcript store on this machine.
+- Session-derived retained or report JSONL artifacts, such as retrospective `turn_flags.jsonl`, when the user explicitly scopes the task to those artifacts instead of raw rollouts.
 - Older exports or some other hosts may still expose `~/.codex/archived_sessions/`, but do not assume that layout on the current host without checking.
 
 ## Workflow
@@ -38,6 +39,7 @@ The goal is to locate the smallest relevant set of rollout files, extract only t
 - Use `response_item` messages for user intent, assistant decisions, and explicit skill mentions.
 - Prefer `jq` or a short Python snippet that filters on `.type` / `.payload.type` over raw `rg` against whole rollout files when the question is about user intent, tool failures, or skill usage.
 - For large rollouts, do not start by printing one row for every record, even with `jq` or a structured Python extractor. First count records by `.type` / `.payload.type` or line count, then print only the narrowed selector with a small explicit row cap and short snippets.
+- For JSONL schema or key checks, do not run a per-line key dump such as `jq -R 'fromjson | keys' file.jsonl`; it prints the same key list once per record. Count lines and inspect one parsed record, or aggregate unique keys in a short Python snippet.
 - When inferring user intent, filter out wrapper-only user messages that mirror injected context rather than real requests. In the current rollout format, common noise includes leading `# AGENTS.md instructions ...`, pasted `<skill>` blocks, `<environment_context>`, `<subagent_notification>`, and repeated `# Review findings:` payloads.
 - Do not treat skill names that appear only inside those wrappers or pasted `SKILL.md` bodies as proof that the skill was actually invoked or even relevant to the user's real request.
 - When a session continues another thread, pick the first meaningful user request after that wrapper noise instead of blindly classifying the first user message.
@@ -60,6 +62,7 @@ The goal is to locate the smallest relevant set of rollout files, extract only t
 - Keep the work read-only unless the user explicitly asks to modify `~/.codex`.
 - Do not dump full JSONL files into the answer when a few key lines will do.
 - Do not dump full per-record inventories of large rollout files; a structured `jq` command can still produce tens of thousands of tokens if it emits every timestamp or tool call.
+- Do not use JSONL schema probes that print keys for every record. Inspect one record or aggregate unique keys once per file.
 - Do not use `sed`, `head`, or raw `rg -n` as an orientation step on rollout/history JSONL records; the first few records often contain full instructions, and a keyword hit can print a whole nested tool output. Count shapes or emit selected JSON fields instead.
 - Do not scan all of `~/.codex` when the task is already bounded by session ID, repo, or date.
 - Do not combine `session_index.jsonl`, `history.jsonl`, and `~/.codex/sessions` in one raw `rg`; if the ID appears inside a nested tool output, the match can dump an entire rollout JSON record back into context.
