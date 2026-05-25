@@ -949,12 +949,19 @@ def source_rollout_search_roots(source: Source) -> list[Path]:
 
 def source_rollout_candidates(source: Source) -> list[Path]:
     search_roots = source_rollout_search_roots(source)
-    return sorted(
+    candidates = {
         path
         for search_root in search_roots
         for path in search_root.rglob("rollout-*.jsonl")
         if not path.name.startswith("rollout-summary")
-    )
+    }
+    if source.root not in search_roots:
+        candidates.update(
+            path
+            for path in source.root.glob("rollout-*.jsonl")
+            if not path.name.startswith("rollout-summary")
+        )
+    return sorted(candidates)
 
 
 def source_rollouts(source: Source) -> list[Path]:
@@ -1328,11 +1335,8 @@ def safe_rollout_backing_ref(value: str) -> str | None:
     ref = safe_relative_summary_ref(value)
     if ref is None:
         return None
-    if (
-        ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(ref)
-        or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(ref)
-        or ROOT_ROLLOUT_RELATIVE_RE.fullmatch(ref)
-    ):
+    name = Path(ref).name
+    if name.startswith("rollout-") and not name.startswith("rollout-summary") and name.endswith(".jsonl"):
         return ref
     return None
 
@@ -1357,6 +1361,19 @@ def rollout_ref_in_window(ref: str, start: dt.datetime | None, end: dt.datetime 
     if start is None and end is None:
         return True
     ref_path = Path(ref)
+    match = re.search(
+        r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)",
+        ref_path.name,
+    )
+    if match and match.group(2):
+        rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+        if rollout_time is None:
+            return False
+        if start and rollout_time < start:
+            return False
+        if end and rollout_time >= end:
+            return False
+        return True
     rollout_date = rollout_date_from_path(ref_path) or dated_path_from_parts(ref_path)
     if rollout_date is None:
         return False
@@ -1486,7 +1503,7 @@ def summary_backing_rollout_refs(
             if safe_ref is None:
                 unbacked_record_seen = True
                 continue
-            if not summary_record_in_window(record, path, start, end) and not rollout_ref_in_window(safe_ref, start, end):
+            if not rollout_ref_in_window(safe_ref, start, end):
                 continue
             relevant_record_seen = True
             refs.add(safe_ref)
@@ -1563,7 +1580,7 @@ def complete_scan_meta_backing_source_bytes_by_ref(
             if safe_ref is None:
                 return None
             has_rollout_ref = True
-            if not summary_record_in_window(record, path, start, end) and not rollout_ref_in_window(safe_ref, start, end):
+            if not rollout_ref_in_window(safe_ref, start, end):
                 continue
             previous = source_bytes_by_ref.get(safe_ref)
             if previous is not None and previous != source_bytes:
@@ -1662,6 +1679,8 @@ def backing_ref_has_direct_materialized_window_coverage(
     allow_mtime_fallback: bool = False,
 ) -> bool:
     rollout = source_root / ref
+    if not rollout_ref_is_direct_candidate(source_root, ref):
+        return False
     if not safe_source_file(rollout, source_root):
         return False
     try:
@@ -1676,6 +1695,28 @@ def backing_ref_has_direct_materialized_window_coverage(
         max_raw_bytes=max_scan_bytes,
         allow_mtime_fallback=allow_mtime_fallback,
     )
+
+
+def rollout_ref_is_direct_candidate(source_root: Path, ref: str) -> bool:
+    rollout = source_root / ref
+    try:
+        relative = rollout.relative_to(source_root)
+    except ValueError:
+        return False
+    if len(relative.parts) == 1:
+        return True
+    sessions = source_root / "sessions"
+    if not os.path.lexists(sessions):
+        return True
+    for candidate_root in (sessions, source_root / "archived_sessions"):
+        if not os.path.lexists(candidate_root):
+            continue
+        try:
+            rollout.relative_to(candidate_root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def summary_file_has_stale_backing_source(
@@ -4271,7 +4312,7 @@ def run_scan(
                 continue
             if summary in stale_summary_paths:
                 continue
-            if not summary_file_relevant(summary, start, end):
+            if not summary_file_relevant_or_backing_ref_relevant(summary, gap_start, end, max_scan_bytes=max_raw_bytes):
                 continue
             all_turns.extend(extract_summary_file(source, summary, start, end, emit_start=emit_start))
     if allow_partial_hosts:

@@ -33,10 +33,10 @@ REMOTE_PREFLIGHT_TIMEOUT_SECONDS = 15
 REMOTE_COMMAND_TIMEOUT_SECONDS = 60
 TASK_OUTPUT_RELATIVE_DIR = pathlib.Path(".codex-tmp/remote-host-context")
 ACTIVE_ROLLOUT_RELATIVE_RE = re.compile(
-    r"^sessions/\d{4}/\d{2}/\d{2}/rollout-[^/]+\.jsonl$"
+    r"^sessions/\d{4}/\d{2}/\d{2}/rollout-(?!summary)[^/]+\.jsonl$"
 )
 ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile(
-    r"^archived_sessions/(?:\d{4}/\d{2}/\d{2}/)?rollout-[^/]+\.jsonl$"
+    r"^archived_sessions/(?:\d{4}/\d{2}/\d{2}/)?rollout-(?!summary)[^/]+\.jsonl$"
 )
 ROLLOUT_FILENAME_TIME_RE = re.compile(
     r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)"
@@ -1741,23 +1741,25 @@ def _auto_split_host_session_meta(
     dates: list[dt.date],
     limit: int,
 ) -> SessionMetaScan:
-    unknown_scan = _scan_host_session_meta(
-        alias,
-        dates=dates,
-        limit=limit,
-        rollout_start=None,
-        rollout_end=None,
-        rollout_filename_mode="unknown",
-    )
-    if unknown_scan.truncated:
-        return unknown_scan
+    rows: list[dict[str, str]] = []
+    for date_value in reversed(dates):
+        unknown_scan = _scan_host_session_meta(
+            alias,
+            dates=[date_value],
+            limit=limit,
+            rollout_start=None,
+            rollout_end=None,
+            rollout_filename_mode="unknown",
+        )
+        rows.extend(unknown_scan.rows)
+        if unknown_scan.truncated:
+            return SessionMetaScan(rows=_dedupe_session_meta_rows(rows), truncated=True)
 
     pending: list[tuple[dt.date, dt.datetime, dt.datetime]] = []
     for date_value in reversed(dates):
         day_start = dt.datetime.combine(date_value, dt.time.min, tzinfo=dt.timezone.utc)
         pending.append((date_value, day_start, day_start + dt.timedelta(days=1)))
 
-    rows: list[dict[str, str]] = list(unknown_scan.rows)
     for step in (dt.timedelta(hours=1), dt.timedelta(minutes=15), dt.timedelta(minutes=1)):
         next_pending: list[tuple[dt.date, dt.datetime, dt.datetime]] = []
         for date_value, rollout_start, rollout_end in _session_meta_split_windows(pending, step):
