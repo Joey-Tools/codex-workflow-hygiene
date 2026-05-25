@@ -1399,6 +1399,8 @@ def summary_file_has_relevant_scan_meta_backing_ref(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    source_root: Path | None = None,
+    allow_mtime_fallback: bool = False,
 ) -> bool:
     try:
         with path.open("rb") as handle:
@@ -1406,7 +1408,9 @@ def summary_file_has_relevant_scan_meta_backing_ref(
     except OSError:
         return False
     if len(data) > max_scan_bytes:
-        return False
+        data = data[:max_scan_bytes]
+        before_last_newline, separator, _partial = data.rpartition(b"\n")
+        data = before_last_newline if separator else b""
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -1424,7 +1428,19 @@ def summary_file_has_relevant_scan_meta_backing_ref(
         if not isinstance(rollout_ref, str):
             continue
         safe_ref = safe_rollout_backing_ref(rollout_ref)
-        if safe_ref is not None and rollout_ref_in_window(safe_ref, start, end):
+        if safe_ref is None:
+            continue
+        if rollout_ref_in_window(safe_ref, start, end) or (
+            source_root is not None
+            and backing_ref_has_materialized_window_coverage(
+                source_root,
+                safe_ref,
+                start,
+                end,
+                max_scan_bytes=max_scan_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+            )
+        ):
             return True
     return False
 
@@ -1435,6 +1451,8 @@ def summary_file_relevant_or_backing_ref_relevant(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    source_root: Path | None = None,
+    allow_mtime_fallback: bool = False,
 ) -> bool:
     return summary_file_relevant_with_scan_cap(
         path,
@@ -1446,6 +1464,8 @@ def summary_file_relevant_or_backing_ref_relevant(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
+        allow_mtime_fallback=allow_mtime_fallback,
     )
 
 
@@ -1455,6 +1475,8 @@ def summary_file_maybe_relevant_or_backing_ref_relevant(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    source_root: Path | None = None,
+    allow_mtime_fallback: bool = False,
 ) -> bool:
     return summary_file_maybe_relevant_with_scan_cap(
         path,
@@ -1466,6 +1488,8 @@ def summary_file_maybe_relevant_or_backing_ref_relevant(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
+        allow_mtime_fallback=allow_mtime_fallback,
     )
 
 
@@ -1662,8 +1686,6 @@ def complete_summary_backing_rollout_refs(
             continue
         if size > max_scan_bytes:
             continue
-        if not summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_scan_bytes):
-            continue
         if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
             continue
         source_bytes_by_ref = complete_summary_backing_source_bytes_by_ref(
@@ -1778,7 +1800,13 @@ def summary_file_has_stale_backing_source(
         return False
     if size > max_scan_bytes:
         return False
-    if not summary_file_relevant_or_backing_ref_relevant(path, start, end, max_scan_bytes=max_scan_bytes):
+    if not summary_file_relevant_or_backing_ref_relevant(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
+    ):
         return False
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
         path,
@@ -1951,8 +1979,20 @@ def summary_file_maybe_relevant_with_scan_cap(
     *,
     max_scan_bytes: int,
 ) -> bool:
-    if summary_date_from_path(path) is None:
+    summary_date = summary_date_from_path(path)
+    if summary_date is None:
         return summary_file_relevant_with_scan_cap(path, start, end, max_scan_bytes=max_scan_bytes)
+    if summary_date and end and summary_date >= end:
+        try:
+            found, complete = oversized_rollout_has_timestamp_in_window(
+                path,
+                start,
+                end,
+                max_scan_bytes=max_scan_bytes,
+            )
+        except OSError:
+            return False
+        return found or not complete
     return summary_file_maybe_relevant_without_read(path, start, end)
 
 
@@ -4077,7 +4117,14 @@ def remote_summary_only_gaps(
         if rollout_ref is not None:
             covered_rollout_refs.add(rollout_ref)
     for summary in summaries:
-        if not summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_scan_bytes):
+        if not summary_file_relevant_or_backing_ref_relevant(
+            summary,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+            source_root=source.root,
+            allow_mtime_fallback=source_allows_mtime_fallback(source),
+        ):
             continue
         backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
             summary,
@@ -4326,7 +4373,14 @@ def run_scan(
         for summary in summaries:
             size = summary.stat().st_size
             if size > max_raw_bytes:
-                if summary_file_maybe_relevant_with_scan_cap(summary, gap_start, end, max_scan_bytes=max_raw_bytes):
+                if summary_file_maybe_relevant_or_backing_ref_relevant(
+                    summary,
+                    gap_start,
+                    end,
+                    max_scan_bytes=max_raw_bytes,
+                    source_root=source.root,
+                    allow_mtime_fallback=allow_mtime_fallback,
+                ):
                     append_oversized_summary_gap(summary, size)
                 continue
             if summary in stale_summary_paths and summary not in stale_summary_gap_paths:
@@ -4340,6 +4394,8 @@ def run_scan(
                 gap_start,
                 end,
                 max_scan_bytes=max_raw_bytes,
+                source_root=source.root,
+                allow_mtime_fallback=allow_mtime_fallback,
             ):
                 coverage_gaps.append(
                     {
@@ -4352,7 +4408,14 @@ def run_scan(
                 if (
                     summary_file_maybe_relevant_with_scan_cap(summary, gap_start, end, max_scan_bytes=max_raw_bytes)
                     if jsonl_error.unreadable
-                    else summary_file_relevant_or_backing_ref_relevant(summary, gap_start, end, max_scan_bytes=max_raw_bytes)
+                    else summary_file_relevant_or_backing_ref_relevant(
+                        summary,
+                        gap_start,
+                        end,
+                        max_scan_bytes=max_raw_bytes,
+                        source_root=source.root,
+                        allow_mtime_fallback=allow_mtime_fallback,
+                    )
                 ):
                     coverage_gaps.append(
                         {
@@ -4364,7 +4427,14 @@ def run_scan(
                 continue
             if summary in stale_summary_paths:
                 continue
-            if not summary_file_relevant_or_backing_ref_relevant(summary, gap_start, end, max_scan_bytes=max_raw_bytes):
+            if not summary_file_relevant_or_backing_ref_relevant(
+                summary,
+                gap_start,
+                end,
+                max_scan_bytes=max_raw_bytes,
+                source_root=source.root,
+                allow_mtime_fallback=allow_mtime_fallback,
+            ):
                 continue
             all_turns.extend(extract_summary_file(source, summary, start, end, emit_start=emit_start))
     if allow_partial_hosts:
@@ -4650,7 +4720,14 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     def append_summary_shard(summary: Path) -> None:
         row = shard_row(summary, bytes=summary.stat().st_size, kind="summary")
         if row["bytes"] > max_raw_bytes:
-            if not summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_raw_bytes):
+            if not summary_file_maybe_relevant_or_backing_ref_relevant(
+                summary,
+                start,
+                end,
+                max_scan_bytes=max_raw_bytes,
+                source_root=root,
+                allow_mtime_fallback=allow_mtime_fallback,
+            ):
                 return
             row["status"] = "oversized"
             row["coverage_gap"] = "summary exceeds max raw shard bytes; regenerate bounded rollout-summary before extractor handoff"
@@ -4677,7 +4754,14 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             return
         jsonl_error = first_jsonl_error(summary)
         if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(summary):
-            if not summary_file_maybe_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes):
+            if not summary_file_maybe_relevant_or_backing_ref_relevant(
+                summary,
+                start,
+                end,
+                max_scan_bytes=max_raw_bytes,
+                source_root=root,
+                allow_mtime_fallback=allow_mtime_fallback,
+            ):
                 return
             row["status"] = "partial"
             row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
@@ -4687,14 +4771,28 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             if not (
                 summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_raw_bytes)
                 if jsonl_error.unreadable
-                else summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes)
+                else summary_file_relevant_or_backing_ref_relevant(
+                    summary,
+                    start,
+                    end,
+                    max_scan_bytes=max_raw_bytes,
+                    source_root=root,
+                    allow_mtime_fallback=allow_mtime_fallback,
+                )
             ):
                 return
             row["status"] = "invalid"
             row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
             rows.append(row)
             return
-        if not summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes):
+        if not summary_file_relevant_or_backing_ref_relevant(
+            summary,
+            start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+            source_root=root,
+            allow_mtime_fallback=allow_mtime_fallback,
+        ):
             return
         row["status"] = "ready"
         rows.append(row)
