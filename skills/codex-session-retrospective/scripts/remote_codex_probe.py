@@ -33,10 +33,14 @@ REMOTE_PREFLIGHT_TIMEOUT_SECONDS = 15
 REMOTE_COMMAND_TIMEOUT_SECONDS = 60
 TASK_OUTPUT_RELATIVE_DIR = pathlib.Path(".codex-tmp/remote-host-context")
 ACTIVE_ROLLOUT_RELATIVE_RE = re.compile(
-    r"^sessions/\d{4}/\d{2}/\d{2}/rollout-[^/]+\.jsonl$"
+    r"^sessions/\d{4}/\d{2}/\d{2}/rollout-(?!summary)[^/]+\.jsonl$"
 )
 ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile(
-    r"^archived_sessions/(?:\d{4}/\d{2}/\d{2}/)?rollout-[^/]+\.jsonl$"
+    r"^archived_sessions/(?:\d{4}/\d{2}/\d{2}/)?rollout-(?!summary)[^/]+\.jsonl$"
+)
+ROOT_ROLLOUT_RELATIVE_RE = re.compile(r"^rollout-(?!summary)[^/]+\.jsonl$")
+ROLLOUT_FILENAME_TIME_RE = re.compile(
+    r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)"
 )
 PRIVATE_IPV4_SIGNAL_RE = re.compile(
     r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|127(?:\.\d{1,3}){3}|169\.254(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})(?![\d.])"
@@ -192,6 +196,90 @@ def _resolve_dates(args: argparse.Namespace) -> list[dt.date]:
     raise ValueError("at least one --date or a --from/--to range is required")
 
 
+def _parse_rollout_bound(value: str | None, option: str) -> dt.datetime | None:
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        raise ValueError(f"{option} must not be empty")
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid {option}: {value}; expected ISO timestamp such as 2026-05-21T10:00:00Z"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc).replace(microsecond=0)
+
+
+def _resolve_rollout_bounds(args: argparse.Namespace) -> tuple[dt.datetime | None, dt.datetime | None]:
+    rollout_start = _parse_rollout_bound(getattr(args, "rollout_start", None), "--rollout-start")
+    rollout_end = _parse_rollout_bound(getattr(args, "rollout_end", None), "--rollout-end")
+    if rollout_start and rollout_end and rollout_end <= rollout_start:
+        raise ValueError("--rollout-end must be after --rollout-start")
+    if getattr(args, "auto_split", False) and (rollout_start or rollout_end):
+        raise ValueError("--auto-split cannot be combined with --rollout-start/--rollout-end")
+    return rollout_start, rollout_end
+
+
+def _iso_utc(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _rollout_filename_window(path: pathlib.Path) -> tuple[dt.datetime, dt.datetime, bool] | None:
+    match = ROLLOUT_FILENAME_TIME_RE.search(path.name)
+    if not match:
+        return None
+    try:
+        if match.group(2):
+            timestamp = dt.datetime(
+                int(match.group(1)[0:4]),
+                int(match.group(1)[5:7]),
+                int(match.group(1)[8:10]),
+                int(match.group(2)),
+                int(match.group(3)),
+                int(match.group(4)),
+                tzinfo=dt.timezone.utc,
+            )
+            return timestamp, timestamp + dt.timedelta(seconds=1), True
+        day_start = dt.datetime(
+            int(match.group(1)[0:4]),
+            int(match.group(1)[5:7]),
+            int(match.group(1)[8:10]),
+            tzinfo=dt.timezone.utc,
+        )
+        return day_start, day_start + dt.timedelta(days=1), False
+    except ValueError:
+        return None
+
+
+def _rollout_matches_bounds(
+    path: pathlib.Path,
+    rollout_start: dt.datetime | None,
+    rollout_end: dt.datetime | None,
+    *,
+    filename_mode: str = "all",
+) -> bool:
+    window = _rollout_filename_window(path)
+    if filename_mode == "unknown":
+        return window is None or not window[2]
+    if filename_mode == "known" and (window is None or not window[2]):
+        return False
+    if rollout_start is None and rollout_end is None:
+        return True
+    if window is None:
+        return False
+    window_start, window_end, _has_exact_time = window
+    if rollout_start and window_end <= rollout_start:
+        return False
+    if rollout_end and window_start >= rollout_end:
+        return False
+    return True
+
+
 def _resolve_hosts(values: Iterable[str]) -> list[str]:
     seen: set[str] = set()
     hosts: list[str] = []
@@ -277,9 +365,10 @@ def _resolve_rollout_relative_path(value: str) -> pathlib.PurePosixPath:
     if not (
         ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
         or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
+        or ROOT_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
     ):
         raise ValueError(
-            "rollout path must match sessions/YYYY/MM/DD/rollout-*.jsonl or archived_sessions/rollout-*.jsonl"
+            "rollout path must match sessions/YYYY/MM/DD/rollout-*.jsonl, archived_sessions/rollout-*.jsonl, or rollout-*.jsonl"
         )
     return candidate
 
@@ -519,6 +608,7 @@ def _remote_python_script(payload: dict[str, object]) -> str:
     return f"""
 import base64
 import collections
+import datetime
 import json
 import os
 import pathlib
@@ -538,8 +628,13 @@ SUMMARY_TAIL_RECORDS = int(CONFIG.get("summary_tail_records", 0))
 SUMMARY_MAX_TEXT_CHARS = int(CONFIG.get("summary_max_text_chars", 0))
 SUMMARY_MAX_TEXT_CHARS_LIMIT = {MAX_ROLLOUT_SUMMARY_TEXT_CHARS}
 SUMMARY_KEYWORDS = [str(value) for value in CONFIG.get("summary_keywords", [])]
+ROLLOUT_START = CONFIG.get("rollout_start")
+ROLLOUT_END = CONFIG.get("rollout_end")
+ROLLOUT_FILENAME_MODE = str(CONFIG.get("rollout_filename_mode", "all"))
 ACTIVE_ROLLOUT_RELATIVE_RE = re.compile({ACTIVE_ROLLOUT_RELATIVE_RE.pattern!r})
 ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile({ARCHIVED_ROLLOUT_RELATIVE_RE.pattern!r})
+ROOT_ROLLOUT_RELATIVE_RE = re.compile({ROOT_ROLLOUT_RELATIVE_RE.pattern!r})
+ROLLOUT_FILENAME_TIME_RE = re.compile({ROLLOUT_FILENAME_TIME_RE.pattern!r})
 PRIVATE_IPV4_SIGNAL_RE = re.compile({PRIVATE_IPV4_SIGNAL_RE.pattern!r})
 PRIVATE_IPV6_SIGNAL_RE = re.compile({PRIVATE_IPV6_SIGNAL_RE.pattern!r}, re.I)
 INTERNAL_HOSTNAME_SIGNAL_RE = re.compile({INTERNAL_HOSTNAME_SIGNAL_RE.pattern!r}, re.I)
@@ -606,6 +701,67 @@ def safe_rollout_path(rel):
 
 def safe_directory_path(rel):
     return safe_relative_path(rel, expect_directory=True)
+
+
+def parse_config_time(value):
+    if value in (None, ""):
+        return None
+    text = str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc).replace(microsecond=0)
+
+
+ROLLOUT_START_TIME = parse_config_time(ROLLOUT_START)
+ROLLOUT_END_TIME = parse_config_time(ROLLOUT_END)
+
+
+def rollout_filename_window(path):
+    match = ROLLOUT_FILENAME_TIME_RE.search(path.name)
+    if not match:
+        return None
+    try:
+        if match.group(2):
+            timestamp = datetime.datetime(
+                int(match.group(1)[0:4]),
+                int(match.group(1)[5:7]),
+                int(match.group(1)[8:10]),
+                int(match.group(2)),
+                int(match.group(3)),
+                int(match.group(4)),
+                tzinfo=datetime.timezone.utc,
+            )
+            return timestamp, timestamp + datetime.timedelta(seconds=1), True
+        day_start = datetime.datetime(
+            int(match.group(1)[0:4]),
+            int(match.group(1)[5:7]),
+            int(match.group(1)[8:10]),
+            tzinfo=datetime.timezone.utc,
+        )
+        return day_start, day_start + datetime.timedelta(days=1), False
+    except ValueError:
+        return None
+
+
+def rollout_matches_bounds(path):
+    window = rollout_filename_window(path)
+    if ROLLOUT_FILENAME_MODE == "unknown":
+        return window is None or not window[2]
+    if ROLLOUT_FILENAME_MODE == "known" and (window is None or not window[2]):
+        return False
+    if ROLLOUT_START_TIME is None and ROLLOUT_END_TIME is None:
+        return True
+    if window is None:
+        return False
+    window_start, window_end, _has_exact_time = window
+    if ROLLOUT_START_TIME is not None and window_end <= ROLLOUT_START_TIME:
+        return False
+    if ROLLOUT_END_TIME is not None and window_start >= ROLLOUT_END_TIME:
+        return False
+    return True
 
 
 def open_rollout_text(target):
@@ -814,6 +970,7 @@ def summarize_rollout():
     if not (
         ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
         or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
+        or ROOT_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
     ):
         print(json.dumps({{"ok": False, "error": "invalid rollout path"}}, separators=(",", ":"), sort_keys=True))
         print(ROLLOUT_SUMMARY_END)
@@ -834,6 +991,10 @@ def summarize_rollout():
     matched_seen = set()
     signal_records = []
     signal_seen = set()
+    signal_record_limit_reached = False
+    matched_record_limit_reached = False
+    json_error_count = 0
+    summary_record_count = 0
     tail = collections.deque(maxlen=SUMMARY_TAIL_RECORDS)
     session_meta_record = None
     last_assistant_record = None
@@ -852,6 +1013,7 @@ def summarize_rollout():
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
+                json_error_count += 1
                 continue
             timestamp = str(obj.get("timestamp", ""))
             record = None
@@ -901,31 +1063,82 @@ def summarize_rollout():
             if not record or record.get("kind") == "session_meta":
                 continue
 
+            summary_record_count += 1
             if summary_record_has_signal(record):
                 key = (str(record.get("kind", "")), int(record.get("line", 0)))
-                if key not in signal_seen and (not SUMMARY_LIMIT or len(signal_records) < SUMMARY_LIMIT):
-                    signal_records.append(record)
-                    signal_seen.add(key)
+                if key not in signal_seen:
+                    if not SUMMARY_LIMIT or len(signal_records) < SUMMARY_LIMIT:
+                        signal_records.append(record)
+                        signal_seen.add(key)
+                    else:
+                        signal_record_limit_reached = True
 
             text_value = str(record.get("_match_text") or record.get("text", ""))
             if keywords and any(keyword in text_value.casefold() for keyword in keywords):
                 key = (str(record.get("kind", "")), int(record.get("line", 0)))
-                if key not in matched_seen and (not SUMMARY_LIMIT or len(matched) < SUMMARY_LIMIT):
-                    matched.append(record)
-                    matched_seen.add(key)
+                if key not in matched_seen:
+                    if not SUMMARY_LIMIT or len(matched) < SUMMARY_LIMIT:
+                        matched.append(record)
+                        matched_seen.add(key)
+                    else:
+                        matched_record_limit_reached = True
             if SUMMARY_TAIL_RECORDS:
                 tail.append(record)
 
     print(json.dumps({{"ok": True}}, separators=(",", ":"), sort_keys=True))
+    keyword_filter_applied = bool(keywords)
+    record_limit_reached = bool(signal_record_limit_reached or matched_record_limit_reached)
+    planned_emitted = set()
+
+    def mark_planned(record):
+        if not record:
+            return
+        planned_emitted.add((str(record.get("kind", "")), int(record.get("line", 0))))
+
+    mark_planned(session_meta_record)
+    for record in signal_records:
+        mark_planned(record)
+    for record in matched:
+        mark_planned(record)
+    if not keywords:
+        for record in tail:
+            mark_planned(record)
+    mark_planned(last_user_record)
+    mark_planned(last_assistant_record)
+    if last_assistant_record is None:
+        mark_planned(last_task_complete_record)
+    emitted_summary_record_count = sum(1 for kind, _line in planned_emitted if kind != "session_meta")
+    tail_record_limit_reached = bool(
+        not keyword_filter_applied and summary_record_count > emitted_summary_record_count
+    )
     print(json.dumps(
         {{
+            "keyword_filter_applied": keyword_filter_applied,
             "kind": "scan_meta",
+            "json_error_count": json_error_count,
             "line": 0,
+            "matched_record_limit_reached": matched_record_limit_reached,
+            "record_limit_reached": record_limit_reached,
+            "rollout": normalized,
             "scan_bytes": SUMMARY_SCAN_BYTES,
             "scan_truncated": bool(SUMMARY_SCAN_BYTES and target_size > SUMMARY_SCAN_BYTES),
+            "signal_record_limit_reached": signal_record_limit_reached,
             "source_bytes": target_size,
+            "summary_limit": SUMMARY_LIMIT,
+            "summary_record_count": summary_record_count,
+            "tail_record_limit_reached": tail_record_limit_reached,
+            "tail_records": SUMMARY_TAIL_RECORDS,
             "text": "scan_truncated=" + str(bool(SUMMARY_SCAN_BYTES and target_size > SUMMARY_SCAN_BYTES)).lower()
+                + " keyword_filter_applied=" + str(keyword_filter_applied).lower()
+                + " record_limit_reached=" + str(record_limit_reached).lower()
+                + " signal_record_limit_reached=" + str(signal_record_limit_reached).lower()
+                + " matched_record_limit_reached=" + str(matched_record_limit_reached).lower()
+                + " tail_record_limit_reached=" + str(tail_record_limit_reached).lower()
                 + " scan_bytes=" + str(SUMMARY_SCAN_BYTES)
+                + " json_error_count=" + str(json_error_count)
+                + " summary_limit=" + str(SUMMARY_LIMIT)
+                + " tail_records=" + str(SUMMARY_TAIL_RECORDS)
+                + " summary_record_count=" + str(summary_record_count)
                 + " source_bytes=" + str(target_size),
             "timestamp": "",
         }},
@@ -942,6 +1155,7 @@ def summarize_rollout():
             return
         payload = dict(record)
         payload.pop("_match_text", None)
+        payload["rollout"] = normalized
         print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
         emitted.add(key)
 
@@ -994,19 +1208,28 @@ def iter_session_meta():
             rollout_paths.extend(
                 rollout
                 for rollout in sorted_rollout_paths(date_dir)
-                if is_raw_rollout_file(rollout)
+                if is_raw_rollout_file(rollout) and rollout_matches_bounds(rollout)
             )
         try:
             flat_archived_dir = safe_directory_path(pathlib.PurePosixPath("archived_sessions"))
             rollout_paths.extend(
                 rollout
                 for rollout in sorted_rollout_paths(flat_archived_dir)
-                if is_raw_rollout_file(rollout) and flat_archived_rollout_matches_date(rollout, date_text)
+                if is_raw_rollout_file(rollout)
+                and flat_archived_rollout_matches_date(rollout, date_text)
+                and rollout_matches_bounds(rollout)
             )
         except FileNotFoundError:
             pass
         except OSError:
             session_directory_unreadable()
+        rollout_paths.extend(
+            rollout
+            for rollout in sorted_rollout_paths(root)
+            if is_raw_rollout_file(rollout)
+            and flat_archived_rollout_matches_date(rollout, date_text)
+            and rollout_matches_bounds(rollout)
+        )
         seen_rollout_paths = set()
         for rollout in rollout_paths:
             rel = pathlib.PurePosixPath(rollout.relative_to(root).as_posix())
@@ -1058,6 +1281,7 @@ def fetch_rollout():
     if not (
         ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
         or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
+        or ROOT_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
     ):
         print(json.dumps({{"ok": False, "error": "invalid rollout path"}}, separators=(",", ":"), sort_keys=True))
         print(FETCH_ROLLOUT_END)
@@ -1122,6 +1346,9 @@ def _scan_session_meta_records(
     dates: list[dt.date],
     limit: int,
     host: str,
+    rollout_start: dt.datetime | None = None,
+    rollout_end: dt.datetime | None = None,
+    rollout_filename_mode: str = "all",
 ) -> SessionMetaScan:
     try:
         resolved_root = _resolve_safe_codex_root(codex_root)
@@ -1153,18 +1380,43 @@ def _scan_session_meta_records(
                 rollout_path
                 for rollout_path in sorted_rollout_paths(date_dir)
                 if _is_raw_rollout_file(rollout_path)
+                and _rollout_matches_bounds(
+                    rollout_path,
+                    rollout_start,
+                    rollout_end,
+                    filename_mode=rollout_filename_mode,
+                )
             )
         try:
             flat_archived_dir = _safe_directory_path(resolved_root, pathlib.PurePosixPath("archived_sessions"))
             rollout_paths.extend(
                 rollout_path
                 for rollout_path in sorted_rollout_paths(flat_archived_dir)
-                if _is_raw_rollout_file(rollout_path) and _flat_archived_rollout_matches_date(rollout_path, date_value)
+                if _is_raw_rollout_file(rollout_path)
+                and _flat_archived_rollout_matches_date(rollout_path, date_value)
+                and _rollout_matches_bounds(
+                    rollout_path,
+                    rollout_start,
+                    rollout_end,
+                    filename_mode=rollout_filename_mode,
+                )
             )
         except FileNotFoundError:
             pass
         except OSError as exc:
             raise SessionMetaRolloutError("session directory unreadable") from exc
+        rollout_paths.extend(
+            rollout_path
+            for rollout_path in sorted_rollout_paths(resolved_root)
+            if _is_raw_rollout_file(rollout_path)
+            and _flat_archived_rollout_matches_date(rollout_path, date_value)
+            and _rollout_matches_bounds(
+                rollout_path,
+                rollout_start,
+                rollout_end,
+                filename_mode=rollout_filename_mode,
+            )
+        )
         seen_rollout_paths: set[str] = set()
         for rollout_path in rollout_paths:
             rollout_relative_path = pathlib.PurePosixPath(
@@ -1222,12 +1474,18 @@ def _iter_session_meta_records(
     dates: list[dt.date],
     limit: int,
     host: str,
+    rollout_start: dt.datetime | None = None,
+    rollout_end: dt.datetime | None = None,
+    rollout_filename_mode: str = "all",
 ) -> list[dict[str, str]]:
     return _scan_session_meta_records(
         codex_root=codex_root,
         dates=dates,
         limit=limit,
         host=host,
+        rollout_start=rollout_start,
+        rollout_end=rollout_end,
+        rollout_filename_mode=rollout_filename_mode,
     ).rows
 
 
@@ -1434,10 +1692,164 @@ def _session_meta_error_from_item(item: dict[str, Any]) -> SessionMetaRolloutErr
 def _session_meta_limit_error(host: str, limit: int) -> int:
     print(f"host={host}", file=sys.stderr)
     print(
-        f"error=session-meta result exceeded --limit={limit}; narrow the date/host scope or raise --limit up to {MAX_SESSION_META_LIMIT}",
+        f"error=session-meta result exceeded --limit={limit}; narrow the date/host scope, use --auto-split, or raise --limit up to {MAX_SESSION_META_LIMIT}",
         file=sys.stderr,
     )
     return 1
+
+
+def _scan_host_session_meta(
+    alias: str,
+    *,
+    dates: list[dt.date],
+    limit: int,
+    rollout_start: dt.datetime | None,
+    rollout_end: dt.datetime | None,
+    rollout_filename_mode: str = "all",
+) -> SessionMetaScan:
+    if HOSTS[alias]["kind"] == "local":
+        return _scan_session_meta_records(
+            codex_root=_local_codex_root(),
+            dates=dates,
+            limit=limit,
+            host=alias,
+            rollout_start=rollout_start,
+            rollout_end=rollout_end,
+            rollout_filename_mode=rollout_filename_mode,
+        )
+
+    payload: dict[str, object] = {
+        "mode": "session-meta",
+        "dates": [date_value.strftime(DATE_FORMAT) for date_value in dates],
+        "limit": limit,
+        "codex_root": HOSTS[alias]["codex_root"],
+        "session_meta_scan_bytes": MAX_SESSION_META_SCAN_BYTES,
+    }
+    if rollout_start is not None:
+        payload["rollout_start"] = _iso_utc(rollout_start)
+    if rollout_end is not None:
+        payload["rollout_end"] = _iso_utc(rollout_end)
+    if rollout_filename_mode != "all":
+        payload["rollout_filename_mode"] = rollout_filename_mode
+    result = _run_remote_python(alias, payload)
+    if result.returncode != 0:
+        raise RuntimeError("remote session-meta failed")
+    rows: list[dict[str, str]] = []
+    truncated = False
+    payload_lines = _extract_framed_lines(
+        result.stdout,
+        begin_marker=REMOTE_SESSION_META_BEGIN,
+        end_marker=REMOTE_SESSION_META_END,
+        host=alias,
+        command="session-meta",
+    )
+    for line in payload_lines:
+        if not line.strip():
+            continue
+        item = _json_line_to_dict(line, host=alias)
+        if _is_session_meta_truncation_item(item):
+            truncated = True
+            continue
+        session_meta_error = _session_meta_error_from_item(item)
+        if session_meta_error is not None:
+            raise session_meta_error
+        rows.append(_session_meta_row_from_item(item, host=alias))
+    return SessionMetaScan(rows=rows, truncated=truncated)
+
+
+def _session_meta_split_windows(
+    windows: list[tuple[dt.date, dt.datetime, dt.datetime]],
+    step: dt.timedelta,
+) -> list[tuple[dt.date, dt.datetime, dt.datetime]]:
+    split: list[tuple[dt.date, dt.datetime, dt.datetime]] = []
+    for date_value, window_start, window_end in windows:
+        current = window_start
+        while current < window_end:
+            next_value = min(current + step, window_end)
+            split.append((date_value, current, next_value))
+            current = next_value
+    return split
+
+
+def _dedupe_session_meta_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    deduped: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in _sort_session_meta_rows(rows):
+        key = (row.get("host", ""), row.get("session_id", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
+def _auto_split_host_session_meta(
+    alias: str,
+    *,
+    dates: list[dt.date],
+    limit: int,
+) -> SessionMetaScan:
+    rows: list[dict[str, str]] = []
+    for date_value in reversed(dates):
+        unknown_scan = _scan_host_session_meta(
+            alias,
+            dates=[date_value],
+            limit=limit,
+            rollout_start=None,
+            rollout_end=None,
+            rollout_filename_mode="unknown",
+        )
+        rows.extend(unknown_scan.rows)
+        if unknown_scan.truncated:
+            return SessionMetaScan(rows=_dedupe_session_meta_rows(rows), truncated=True)
+
+    pending: list[tuple[dt.date, dt.datetime, dt.datetime]] = []
+    for date_value in reversed(dates):
+        day_start = dt.datetime.combine(date_value, dt.time.min, tzinfo=dt.timezone.utc)
+        pending.append((date_value, day_start, day_start + dt.timedelta(days=1)))
+
+    for step in (dt.timedelta(hours=1), dt.timedelta(minutes=15), dt.timedelta(minutes=1)):
+        next_pending: list[tuple[dt.date, dt.datetime, dt.datetime]] = []
+        for date_value, rollout_start, rollout_end in _session_meta_split_windows(pending, step):
+            scan = _scan_host_session_meta(
+                alias,
+                dates=[date_value],
+                limit=limit,
+                rollout_start=rollout_start,
+                rollout_end=rollout_end,
+                rollout_filename_mode="known",
+            )
+            if scan.truncated:
+                next_pending.append((date_value, rollout_start, rollout_end))
+                continue
+            rows.extend(scan.rows)
+        if not next_pending:
+            return SessionMetaScan(rows=_dedupe_session_meta_rows(rows), truncated=False)
+        pending = next_pending
+    return SessionMetaScan(rows=_dedupe_session_meta_rows(rows), truncated=True)
+
+
+def _scan_host_session_meta_with_auto_split(
+    alias: str,
+    *,
+    dates: list[dt.date],
+    limit: int,
+) -> SessionMetaScan:
+    rows: list[dict[str, str]] = []
+    truncated = False
+    for date_value in dates:
+        scan = _scan_host_session_meta(
+            alias,
+            dates=[date_value],
+            limit=limit,
+            rollout_start=None,
+            rollout_end=None,
+        )
+        if scan.truncated:
+            scan = _auto_split_host_session_meta(alias, dates=[date_value], limit=limit)
+        rows.extend(scan.rows)
+        truncated = truncated or scan.truncated
+    return SessionMetaScan(rows=_dedupe_session_meta_rows(rows), truncated=truncated)
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -1477,6 +1889,7 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
     try:
         hosts = _resolve_hosts(args.host)
         dates = _resolve_dates(args)
+        rollout_start, rollout_end = _resolve_rollout_bounds(args)
         if args.limit < 1 or args.limit > MAX_SESSION_META_LIMIT:
             raise ValueError(
                 f"--limit must stay between 1 and {MAX_SESSION_META_LIMIT}"
@@ -1485,85 +1898,34 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
         return _error(str(error))
 
     rows: list[dict[str, str]] = []
+    auto_split = bool(getattr(args, "auto_split", False))
     for alias in hosts:
-        if HOSTS[alias]["kind"] == "local":
-            try:
-                scan = _scan_session_meta_records(
-                    codex_root=_local_codex_root(),
+        try:
+            if auto_split:
+                scan = _scan_host_session_meta_with_auto_split(alias, dates=dates, limit=args.limit)
+            else:
+                scan = _scan_host_session_meta(
+                    alias,
                     dates=dates,
                     limit=args.limit,
-                    host=alias,
+                    rollout_start=rollout_start,
+                    rollout_end=rollout_end,
                 )
-            except SessionMetaRolloutError as error:
-                print(f"host={alias}", file=sys.stderr)
-                if error.rollout:
-                    print(f"rollout={error.rollout}", file=sys.stderr)
-                print(f"error={error.error}", file=sys.stderr)
-                return 1
-            except ValueError as error:
-                print(f"host={alias}", file=sys.stderr)
-                print(f"error={error}", file=sys.stderr)
-                return 1
-            if scan.truncated:
-                return _session_meta_limit_error(alias, args.limit)
-            host_rows = scan.rows
-        else:
-            payload = {
-                "mode": "session-meta",
-                "dates": [date_value.strftime(DATE_FORMAT) for date_value in dates],
-                "limit": args.limit,
-                "codex_root": HOSTS[alias]["codex_root"],
-                "session_meta_scan_bytes": MAX_SESSION_META_SCAN_BYTES,
-            }
-            try:
-                result = _run_remote_python(alias, payload)
-            except RuntimeError as error:
-                print(f"host={alias}", file=sys.stderr)
-                print(f"error={error}", file=sys.stderr)
-                return 1
-            if result.returncode != 0:
-                print(f"host={alias}", file=sys.stderr)
-                print("error=remote session-meta failed", file=sys.stderr)
-                return 1
-            host_rows = []
-            try:
-                payload_lines = _extract_framed_lines(
-                    result.stdout,
-                    begin_marker=REMOTE_SESSION_META_BEGIN,
-                    end_marker=REMOTE_SESSION_META_END,
-                    host=alias,
-                    command="session-meta",
-                )
-            except ValueError as error:
-                print(f"host={alias}", file=sys.stderr)
-                print(f"error={error}", file=sys.stderr)
-                return 1
-            for line in payload_lines:
-                if not line.strip():
-                    continue
-                try:
-                    item = _json_line_to_dict(line, host=alias)
-                except ValueError as error:
-                    print(f"host={alias}", file=sys.stderr)
-                    print(f"error={error}", file=sys.stderr)
-                    return 1
-                if _is_session_meta_truncation_item(item):
-                    return _session_meta_limit_error(alias, args.limit)
-                session_meta_error = _session_meta_error_from_item(item)
-                if session_meta_error is not None:
-                    print(f"host={alias}", file=sys.stderr)
-                    if session_meta_error.rollout:
-                        print(f"rollout={session_meta_error.rollout}", file=sys.stderr)
-                    print(f"error={session_meta_error.error}", file=sys.stderr)
-                    return 1
-                try:
-                    host_rows.append(_session_meta_row_from_item(item, host=alias))
-                except ValueError as error:
-                    print(f"host={alias}", file=sys.stderr)
-                    print(f"error={error}", file=sys.stderr)
-                    return 1
+        except SessionMetaRolloutError as error:
+            print(f"host={alias}", file=sys.stderr)
+            if error.rollout:
+                print(f"rollout={error.rollout}", file=sys.stderr)
+            print(f"error={error.error}", file=sys.stderr)
+            return 1
+        except (RuntimeError, ValueError) as error:
+            print(f"host={alias}", file=sys.stderr)
+            print(f"error={error}", file=sys.stderr)
+            return 1
+        if scan.truncated:
+            return _session_meta_limit_error(alias, args.limit)
+        host_rows = scan.rows
         rows.extend(host_rows)
-        if len(rows) > args.limit:
+        if not auto_split and len(rows) > args.limit:
             return _session_meta_limit_error("all", args.limit)
     rows = _sort_session_meta_rows(rows)
 
@@ -1818,11 +2180,33 @@ def _summarize_rollout_records(
     tail_records: int,
     max_text_chars: int,
 ) -> list[dict[str, Any]]:
+    records, _meta = _summarize_rollout_records_with_meta(
+        lines=lines,
+        keywords=keywords,
+        limit=limit,
+        tail_records=tail_records,
+        max_text_chars=max_text_chars,
+    )
+    return records
+
+
+def _summarize_rollout_records_with_meta(
+    *,
+    lines: Iterable[str],
+    keywords: list[str],
+    limit: int,
+    tail_records: int,
+    max_text_chars: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     search_keywords = [value.casefold() for value in keywords if value]
     matched: list[dict[str, Any]] = []
     matched_seen: set[tuple[str, int]] = set()
     signal_records: list[dict[str, Any]] = []
     signal_seen: set[tuple[str, int]] = set()
+    signal_record_limit_reached = False
+    matched_record_limit_reached = False
+    json_error_count = 0
+    summary_record_count = 0
     tail: collections.deque[dict[str, Any]] = collections.deque(maxlen=tail_records)
     session_meta_record: dict[str, Any] | None = None
     last_assistant_record: dict[str, Any] | None = None
@@ -1833,6 +2217,7 @@ def _summarize_rollout_records(
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
+            json_error_count += 1
             continue
         timestamp = str(obj.get("timestamp", ""))
         record: dict[str, Any] | None = None
@@ -1907,19 +2292,26 @@ def _summarize_rollout_records(
         if record is None:
             continue
 
+        summary_record_count += 1
         if _summary_record_has_signal(record):
             key = (str(record.get("kind", "")), int(record.get("line", 0)))
-            if key not in signal_seen and (limit <= 0 or len(signal_records) < limit):
-                signal_records.append(record)
-                signal_seen.add(key)
+            if key not in signal_seen:
+                if limit <= 0 or len(signal_records) < limit:
+                    signal_records.append(record)
+                    signal_seen.add(key)
+                else:
+                    signal_record_limit_reached = True
 
         if search_keywords:
             text_value = str(record.get("_match_text") or record.get("text", "")).casefold()
             if any(keyword in text_value for keyword in search_keywords):
                 key = (str(record.get("kind", "")), int(record.get("line", 0)))
-                if key not in matched_seen and (limit <= 0 or len(matched) < limit):
-                    matched.append(record)
-                    matched_seen.add(key)
+                if key not in matched_seen:
+                    if limit <= 0 or len(matched) < limit:
+                        matched.append(record)
+                        matched_seen.add(key)
+                    else:
+                        matched_record_limit_reached = True
 
         if tail_records > 0:
             tail.append(record)
@@ -1950,18 +2342,64 @@ def _summarize_rollout_records(
     append(last_assistant_record)
     if last_assistant_record is None:
         append(last_task_complete_record)
-    return result
+    keyword_filter_applied = bool(search_keywords)
+    emitted_summary_record_count = sum(1 for record in result if record.get("kind") != "session_meta")
+    return result, {
+        "keyword_filter_applied": keyword_filter_applied,
+        "json_error_count": json_error_count,
+        "matched_record_limit_reached": matched_record_limit_reached,
+        "record_limit_reached": signal_record_limit_reached or matched_record_limit_reached,
+        "signal_record_limit_reached": signal_record_limit_reached,
+        "summary_record_count": summary_record_count,
+        "summary_limit": limit,
+        "tail_record_limit_reached": not keyword_filter_applied
+        and summary_record_count > emitted_summary_record_count,
+        "tail_records": tail_records,
+    }
 
 
-def _rollout_summary_scan_meta(*, source_bytes: int, scan_bytes: int) -> dict[str, Any]:
+def _rollout_summary_scan_meta(
+    *,
+    source_bytes: int,
+    scan_bytes: int,
+    summary_limit: int,
+    record_limit_reached: bool = False,
+    signal_record_limit_reached: bool = False,
+    matched_record_limit_reached: bool = False,
+    tail_record_limit_reached: bool = False,
+    keyword_filter_applied: bool = False,
+    json_error_count: int = 0,
+    tail_records: int = 0,
+    summary_record_count: int = 0,
+) -> dict[str, Any]:
     scan_truncated = bool(scan_bytes and source_bytes > scan_bytes)
+    record_limit_reached = bool(record_limit_reached or signal_record_limit_reached or matched_record_limit_reached)
     return {
         "kind": "scan_meta",
+        "json_error_count": json_error_count,
+        "keyword_filter_applied": keyword_filter_applied,
         "line": 0,
+        "matched_record_limit_reached": matched_record_limit_reached,
+        "record_limit_reached": record_limit_reached,
         "scan_bytes": scan_bytes,
         "scan_truncated": scan_truncated,
+        "signal_record_limit_reached": signal_record_limit_reached,
         "source_bytes": source_bytes,
-        "text": f"scan_truncated={str(scan_truncated).lower()} scan_bytes={scan_bytes} source_bytes={source_bytes}",
+        "summary_record_count": summary_record_count,
+        "summary_limit": summary_limit,
+        "tail_record_limit_reached": tail_record_limit_reached,
+        "tail_records": tail_records,
+        "text": (
+            f"scan_truncated={str(scan_truncated).lower()} "
+            f"keyword_filter_applied={str(keyword_filter_applied).lower()} "
+            f"record_limit_reached={str(record_limit_reached).lower()} "
+            f"signal_record_limit_reached={str(signal_record_limit_reached).lower()} "
+            f"matched_record_limit_reached={str(matched_record_limit_reached).lower()} "
+            f"tail_record_limit_reached={str(tail_record_limit_reached).lower()} "
+            f"scan_bytes={scan_bytes} json_error_count={json_error_count} "
+            f"summary_limit={summary_limit} tail_records={tail_records} "
+            f"summary_record_count={summary_record_count} source_bytes={source_bytes}"
+        ),
         "timestamp": "",
     }
 
@@ -1988,12 +2426,13 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
     except ValueError as error:
         return _error(str(error))
 
+    rollout_ref = rollout_relative_path.as_posix()
     try:
         if HOSTS[alias]["kind"] == "local":
             codex_root = _local_codex_root()
             source_bytes = _safe_rollout_path(codex_root, rollout_relative_path).stat().st_size
             with _open_local_rollout_text(codex_root, rollout_relative_path) as handle:
-                records = _summarize_rollout_records(
+                records, summary_meta = _summarize_rollout_records_with_meta(
                     lines=_bounded_text_lines(handle, MAX_ROLLOUT_SUMMARY_SCAN_BYTES),
                     keywords=args.keyword,
                     limit=args.limit,
@@ -2005,12 +2444,22 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                 _rollout_summary_scan_meta(
                     source_bytes=source_bytes,
                     scan_bytes=MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
+                    summary_limit=args.limit,
+                    record_limit_reached=bool(summary_meta["record_limit_reached"]),
+                    signal_record_limit_reached=bool(summary_meta["signal_record_limit_reached"]),
+                    matched_record_limit_reached=bool(summary_meta["matched_record_limit_reached"]),
+                    tail_record_limit_reached=bool(summary_meta["tail_record_limit_reached"]),
+                    keyword_filter_applied=bool(summary_meta["keyword_filter_applied"]),
+                    json_error_count=int(summary_meta["json_error_count"]),
+                    tail_records=int(summary_meta["tail_records"]),
+                    summary_record_count=int(summary_meta["summary_record_count"]),
                 ),
             )
+            records = [dict(record, rollout=rollout_ref) for record in records]
         else:
             payload = {
                 "mode": "rollout-summary",
-                "rollout": rollout_relative_path.as_posix(),
+                "rollout": rollout_ref,
                 "codex_root": HOSTS[alias]["codex_root"],
                 "session_meta_scan_bytes": MAX_SESSION_META_SCAN_BYTES,
                 "summary_keywords": list(args.keyword),
@@ -2023,7 +2472,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                 result = _run_remote_python(alias, payload)
             except RuntimeError as error:
                 print(f"host={alias}", file=sys.stderr)
-                print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+                print(f"rollout={rollout_ref}", file=sys.stderr)
                 print(f"error={error}", file=sys.stderr)
                 return 1
             if result.returncode != 0:
@@ -2033,7 +2482,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                     or "remote rollout-summary failed"
                 )
                 print(f"host={alias}", file=sys.stderr)
-                print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+                print(f"rollout={rollout_ref}", file=sys.stderr)
                 print(f"error={message}", file=sys.stderr)
                 return 1
             try:
@@ -2046,34 +2495,35 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                 )
             except FileNotFoundError:
                 print(f"host={alias}", file=sys.stderr)
-                print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+                print(f"rollout={rollout_ref}", file=sys.stderr)
                 print("error=rollout not found", file=sys.stderr)
                 return 1
             except ValueError as error:
                 print(f"host={alias}", file=sys.stderr)
-                print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+                print(f"rollout={rollout_ref}", file=sys.stderr)
                 print(f"error={error}", file=sys.stderr)
                 return 1
     except FileNotFoundError:
         print(f"host={alias}", file=sys.stderr)
-        print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+        print(f"rollout={rollout_ref}", file=sys.stderr)
         print("error=rollout not found", file=sys.stderr)
         return 1
     except OSError:
         print(f"host={alias}", file=sys.stderr)
-        print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+        print(f"rollout={rollout_ref}", file=sys.stderr)
         print("error=rollout unreadable", file=sys.stderr)
         return 1
     except ValueError as error:
         print(f"host={alias}", file=sys.stderr)
-        print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+        print(f"rollout={rollout_ref}", file=sys.stderr)
         print(f"error={error}", file=sys.stderr)
         return 1
 
+    # Normalize the host and backing ref after both local and remote paths.
     for record in records:
         item = dict(record)
         item["host"] = alias
-        item["rollout"] = rollout_relative_path.as_posix()
+        item["rollout"] = rollout_ref
         print(json.dumps(item, separators=(",", ":"), sort_keys=True))
     return 0
 
@@ -2100,6 +2550,19 @@ def build_parser() -> argparse.ArgumentParser:
     session_meta.add_argument("--from", dest="from_date")
     session_meta.add_argument("--to", dest="to_date")
     session_meta.add_argument("--limit", type=int, default=200)
+    session_meta.add_argument(
+        "--rollout-start",
+        help="Inclusive UTC filename timestamp lower bound, e.g. 2026-05-21T10:00:00Z.",
+    )
+    session_meta.add_argument(
+        "--rollout-end",
+        help="Exclusive UTC filename timestamp upper bound, e.g. 2026-05-21T11:00:00Z.",
+    )
+    session_meta.add_argument(
+        "--auto-split",
+        action="store_true",
+        help="When a date overflows --limit, retry by hour, then 15-minute, then 1-minute rollout filename windows and merge rows.",
+    )
     session_meta.set_defaults(func=cmd_session_meta)
 
     fetch_rollout = subparsers.add_parser(
@@ -2110,7 +2573,7 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_rollout.add_argument(
         "--rollout",
         required=True,
-        help="Relative rollout path under the remote Codex root (sessions/... or archived_sessions/...).",
+        help="Relative rollout path under the remote Codex root (sessions/..., archived_sessions/..., or root rollout-*.jsonl).",
     )
     fetch_rollout.add_argument(
         "--output",
@@ -2127,7 +2590,7 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_summary.add_argument(
         "--rollout",
         required=True,
-        help="Relative rollout path under the remote Codex root (sessions/... or archived_sessions/...).",
+        help="Relative rollout path under the remote Codex root (sessions/..., archived_sessions/..., or root rollout-*.jsonl).",
     )
     rollout_summary.add_argument("--keyword", action="append", default=[])
     rollout_summary.add_argument("--limit", type=int, default=40)

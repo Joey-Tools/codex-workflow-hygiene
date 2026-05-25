@@ -47,6 +47,34 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
 
+def complete_rollout_summary_scan_meta(**overrides: object) -> dict:
+    row = {
+        "kind": "scan_meta",
+        "json_error_count": 0,
+        "keyword_filter_applied": False,
+        "line": 0,
+        "matched_record_limit_reached": False,
+        "record_limit_reached": False,
+        "scan_bytes": 2097152,
+        "scan_truncated": False,
+        "signal_record_limit_reached": False,
+        "source_bytes": 1200,
+        "summary_record_count": 1,
+        "summary_limit": 40,
+        "tail_record_limit_reached": False,
+        "tail_records": 8,
+        "timestamp": "",
+        "text": (
+            "scan_truncated=false keyword_filter_applied=false record_limit_reached=false "
+            "signal_record_limit_reached=false matched_record_limit_reached=false "
+            "tail_record_limit_reached=false scan_bytes=2097152 json_error_count=0 summary_limit=40 "
+            "tail_records=8 summary_record_count=1 source_bytes=1200"
+        ),
+    }
+    row.update(overrides)
+    return row
+
+
 def blocked_path_open(target: Path):
     real_open = Path.open
 
@@ -256,6 +284,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_filename_parsers_support_current_and_legacy_rollouts(self) -> None:
         current = Path("rollout-2026-05-07T13-24-44-019d-uuid.jsonl")
+        current_without_suffix = Path("rollout-2026-05-07T13-24-44.jsonl")
         legacy = Path("rollout-2025-05-26-legacy-uuid.jsonl")
 
         self.assertEqual(MODULE.session_id_from_path(current), MODULE.opaque_session_id("019d-uuid"))
@@ -264,6 +293,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotEqual(MODULE.session_id_from_path(current), "019d-uuid")
         self.assertNotEqual(MODULE.session_id_from_path(legacy), "legacy-uuid")
         self.assertEqual(MODULE.iso(MODULE.rollout_date_from_path(current)), "2026-05-07T13:24:44Z")
+        self.assertEqual(MODULE.iso(MODULE.rollout_date_from_path(current_without_suffix)), "2026-05-07T13:24:44Z")
         self.assertEqual(MODULE.iso(MODULE.rollout_date_from_path(legacy)), "2025-05-26T00:00:00Z")
 
     def test_prompt_category_does_not_treat_prompt_as_pr_review(self) -> None:
@@ -650,6 +680,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "archived_sessions/2026/05/01/rollout-2026-05-01T10-00-00-archived.jsonl",
         )
 
+    def test_remote_probe_supports_root_rollout_paths(self) -> None:
+        path = REMOTE_PROBE._resolve_rollout_relative_path("rollout-2026-05-01T10-00-00-root.jsonl")
+
+        self.assertEqual(path.as_posix(), "rollout-2026-05-01T10-00-00-root.jsonl")
+
+    def test_remote_probe_session_meta_includes_root_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_jsonl(
+                root / "rollout-2026-05-01T10-00-00-root.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "root-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+
+            rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["session_id"], "root-session")
+        self.assertEqual(rows[0]["rollout"], "rollout-2026-05-01T10-00-00-root.jsonl")
+
     def test_remote_probe_session_meta_includes_dated_archived_rollouts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -713,10 +773,156 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["session_id"], "flat-archived-session")
-            self.assertEqual(
-                rows[0]["rollout"],
-                "archived_sessions/rollout-2026-05-01T10-00-00-flat.jsonl",
+        self.assertEqual(
+            rows[0]["rollout"],
+            "archived_sessions/rollout-2026-05-01T10-00-00-flat.jsonl",
+        )
+
+    def test_remote_probe_session_meta_filters_by_rollout_filename_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            for hour in (10, 11):
+                rollout = root / "sessions" / "2026" / "05" / "01" / f"rollout-2026-05-01T{hour:02d}-00-00.jsonl"
+                write_jsonl(
+                    rollout,
+                    [
+                        {
+                            "type": "session_meta",
+                            "timestamp": f"2026-05-01T{hour:02d}:00:00Z",
+                            "payload": {"id": f"session-{hour}", "cwd": "/redacted/repo"},
+                        }
+                    ],
+                )
+
+            rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+                rollout_start=dt.datetime(2026, 5, 1, 11, 0, 0, tzinfo=dt.timezone.utc),
+                rollout_end=dt.datetime(2026, 5, 1, 12, 0, 0, tzinfo=dt.timezone.utc),
             )
+
+        self.assertEqual([row["session_id"] for row in rows], ["session-11"])
+
+    def test_remote_probe_session_meta_treats_date_only_rollout_name_as_day_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01-date-only.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T12:00:00Z",
+                        "payload": {"id": "session-date-only", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+
+            midday_rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+                rollout_start=dt.datetime(2026, 5, 1, 12, 0, 0, tzinfo=dt.timezone.utc),
+                rollout_end=dt.datetime(2026, 5, 1, 13, 0, 0, tzinfo=dt.timezone.utc),
+            )
+            next_day_rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+                rollout_start=dt.datetime(2026, 5, 2, 0, 0, 0, tzinfo=dt.timezone.utc),
+                rollout_end=dt.datetime(2026, 5, 2, 1, 0, 0, tzinfo=dt.timezone.utc),
+            )
+
+        self.assertEqual([row["session_id"] for row in midday_rows], ["session-date-only"])
+        self.assertEqual(next_day_rows, [])
+
+    def test_remote_probe_session_meta_classifies_date_only_rollout_name_as_unknown_for_split(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_jsonl(
+                root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01-date-only.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T12:00:00Z",
+                        "payload": {"id": "session-date-only", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            write_jsonl(
+                root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T12-00-00-known.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T12:00:00Z",
+                        "payload": {"id": "session-known", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+
+            unknown_rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+                rollout_filename_mode="unknown",
+            )
+            known_rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+                rollout_filename_mode="known",
+            )
+
+        self.assertEqual([row["session_id"] for row in unknown_rows], ["session-date-only"])
+        self.assertEqual([row["session_id"] for row in known_rows], ["session-known"])
+
+    def test_remote_probe_session_meta_treats_bad_filename_timestamp_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_jsonl(
+                root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "session-known", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            write_jsonl(
+                root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T99-00-00-bad.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T11:00:00Z",
+                        "payload": {"id": "session-bad-name", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+
+            unknown_rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+                rollout_filename_mode="unknown",
+            )
+            known_rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+                rollout_filename_mode="known",
+            )
+
+        self.assertEqual([row["session_id"] for row in unknown_rows], ["session-bad-name"])
+        self.assertEqual([row["session_id"] for row in known_rows], ["session-known"])
 
     def test_remote_probe_session_meta_ignores_rollout_summary_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -833,6 +1039,211 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("session-meta result exceeded --limit=2", stderr.getvalue())
         self.assertEqual(stdout.getvalue(), "")
+
+    def test_remote_probe_session_meta_auto_split_merges_over_limit_day(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            for hour in range(3):
+                rollout = root / "sessions" / "2026" / "05" / "01" / f"rollout-2026-05-01T{hour:02d}-00-00-{hour}.jsonl"
+                write_jsonl(
+                    rollout,
+                    [
+                        {
+                            "type": "session_meta",
+                            "timestamp": f"2026-05-01T{hour:02d}:00:00Z",
+                            "payload": {"id": f"session-{hour}", "cwd": "/redacted/repo"},
+                        }
+                    ],
+                )
+            write_jsonl(
+                root / "sessions" / "2026" / "05" / "01" / "rollout-undated.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T12:00:00Z",
+                        "payload": {"id": "session-undated", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                sys, "stderr", stderr
+            ), mock.patch.object(sys, "stdout", stdout):
+                result = REMOTE_PROBE.cmd_session_meta(
+                    types.SimpleNamespace(
+                        host=["local"],
+                        date=["2026/05/01"],
+                        from_date=None,
+                        to_date=None,
+                        limit=1,
+                        rollout_start=None,
+                        rollout_end=None,
+                        auto_split=True,
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        rows = stdout.getvalue().strip().splitlines()
+        self.assertEqual(rows[0], "host\tdate\tsession_id\tcwd\trollout")
+        self.assertEqual(
+            {row.split("\t")[2] for row in rows[1:]},
+            {"session-0", "session-1", "session-2", "session-undated"},
+        )
+
+    def test_remote_probe_session_meta_auto_split_scans_unknown_names_per_date(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            for day in (1, 2):
+                rollout = root / "sessions" / "2026" / "05" / f"{day:02d}" / f"rollout-undated-{day}.jsonl"
+                write_jsonl(
+                    rollout,
+                    [
+                        {
+                            "type": "session_meta",
+                            "timestamp": f"2026-05-{day:02d}T10:00:00Z",
+                            "payload": {"id": f"session-{day}", "cwd": "/redacted/repo"},
+                        }
+                    ],
+                )
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                sys, "stderr", stderr
+            ), mock.patch.object(sys, "stdout", stdout):
+                result = REMOTE_PROBE.cmd_session_meta(
+                    types.SimpleNamespace(
+                        host=["local"],
+                        date=["2026/05/01", "2026/05/02"],
+                        from_date=None,
+                        to_date=None,
+                        limit=1,
+                        rollout_start=None,
+                        rollout_end=None,
+                        auto_split=True,
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        rows = stdout.getvalue().strip().splitlines()
+        self.assertEqual(rows[0], "host\tdate\tsession_id\tcwd\trollout")
+        self.assertEqual({row.split("\t")[2] for row in rows[1:]}, {"session-1", "session-2"})
+
+    def test_remote_probe_session_meta_auto_split_only_splits_truncated_dates(self) -> None:
+        calls = []
+
+        def fake_scan_host_session_meta(
+            alias: str,
+            *,
+            dates: list[dt.date],
+            limit: int,
+            rollout_start: dt.datetime | None,
+            rollout_end: dt.datetime | None,
+            rollout_filename_mode: str = "all",
+        ) -> REMOTE_PROBE.SessionMetaScan:
+            date_value = dates[0]
+            calls.append((date_value, rollout_filename_mode, rollout_start, rollout_end))
+            if rollout_filename_mode == "all" and date_value == dt.date(2026, 5, 1):
+                return REMOTE_PROBE.SessionMetaScan(
+                    rows=[
+                        {
+                            "host": alias,
+                            "date": "2026/05/01",
+                            "session_id": "session-1",
+                            "cwd": "/redacted/repo",
+                            "rollout": "sessions/2026/05/01/rollout-2026-05-01T10-00-00-1.jsonl",
+                        }
+                    ],
+                    truncated=False,
+                )
+            if rollout_filename_mode == "all":
+                return REMOTE_PROBE.SessionMetaScan(rows=[], truncated=True)
+            if rollout_filename_mode == "unknown":
+                return REMOTE_PROBE.SessionMetaScan(rows=[], truncated=False)
+            return REMOTE_PROBE.SessionMetaScan(
+                rows=[
+                    {
+                        "host": alias,
+                        "date": "2026/05/02",
+                        "session_id": "session-2",
+                        "cwd": "/redacted/repo",
+                        "rollout": "sessions/2026/05/02/rollout-2026-05-02T00-00-00-2.jsonl",
+                    }
+                ],
+                truncated=False,
+            )
+
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+
+        with mock.patch.object(REMOTE_PROBE, "_scan_host_session_meta", side_effect=fake_scan_host_session_meta), mock.patch.object(
+            sys, "stderr", stderr
+        ), mock.patch.object(sys, "stdout", stdout):
+            result = REMOTE_PROBE.cmd_session_meta(
+                types.SimpleNamespace(
+                    host=["local"],
+                    date=["2026/05/01", "2026/05/02"],
+                    from_date=None,
+                    to_date=None,
+                    limit=1,
+                    rollout_start=None,
+                    rollout_end=None,
+                    auto_split=True,
+                )
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertTrue(any(call[0] == dt.date(2026, 5, 2) and call[1] == "known" for call in calls))
+        self.assertFalse(any(call[0] == dt.date(2026, 5, 1) and call[1] == "known" for call in calls))
+        self.assertEqual({row.split("\t")[2] for row in stdout.getvalue().strip().splitlines()[1:]}, {"session-1", "session-2"})
+
+    def test_remote_probe_session_meta_auto_split_keeps_latest_rollout_for_duplicate_session(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            for hour in (1, 2):
+                rollout = root / "sessions" / "2026" / "05" / "01" / f"rollout-2026-05-01T{hour:02d}-00-00-same.jsonl"
+                write_jsonl(
+                    rollout,
+                    [
+                        {
+                            "type": "session_meta",
+                            "timestamp": f"2026-05-01T{hour:02d}:00:00Z",
+                            "payload": {"id": "session-same", "cwd": "/redacted/repo"},
+                        }
+                    ],
+                )
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                sys, "stderr", stderr
+            ), mock.patch.object(sys, "stdout", stdout):
+                result = REMOTE_PROBE.cmd_session_meta(
+                    types.SimpleNamespace(
+                        host=["local"],
+                        date=["2026/05/01"],
+                        from_date=None,
+                        to_date=None,
+                        limit=1,
+                        rollout_start=None,
+                        rollout_end=None,
+                        auto_split=True,
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        rows = stdout.getvalue().strip().splitlines()
+        self.assertEqual(rows[0], "host\tdate\tsession_id\tcwd\trollout")
+        self.assertEqual(len(rows), 2)
+        fields = rows[1].split("\t")
+        self.assertEqual(fields[2], "session-same")
+        self.assertEqual(fields[4], "sessions/2026/05/01/rollout-2026-05-01T02-00-00-same.jsonl")
 
     def test_remote_probe_session_meta_rejects_remote_limit_marker(self) -> None:
         row = json.dumps(
@@ -959,6 +1370,37 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             self.assertIn("private-output-session", output.read_text(encoding="utf-8"))
+
+    def test_remote_probe_fetch_rollout_accepts_root_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "rollout-2026-05-01T10-00-00-root.jsonl"
+            write_jsonl(
+                root / rollout_ref,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "root-rollout-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            task_output_root = Path(raw) / "task-output"
+            output = task_output_root / "rollout.jsonl"
+
+            def fake_task_output_root(workspace_root: Path | None = None) -> Path:
+                return task_output_root.resolve()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                REMOTE_PROBE, "_task_output_root", fake_task_output_root
+            ):
+                result = REMOTE_PROBE.cmd_fetch_rollout(
+                    types.SimpleNamespace(host="local", rollout=rollout_ref, output="rollout.jsonl")
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertIn("root-rollout-session", output.read_text(encoding="utf-8"))
 
     def test_remote_probe_fetch_rollout_accepts_task_output_relative_path(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1189,6 +1631,331 @@ class SessionRetrospectiveTests(unittest.TestCase):
         ]
         self.assertEqual([row["kind"] for row in rows], ["user_message"])
         self.assertEqual(rows[0]["text"], "user message present")
+        self.assertEqual(rows[0]["rollout"], "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl")
+
+    def test_remote_probe_generated_rollout_summary_accepts_root_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "rollout-2026-05-01T10-00-00-root.jsonl"
+            write_jsonl(root / rollout_ref, [message("user", "Review the deployment.", "2026-05-01T10:00:00Z")])
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": rollout_ref,
+                    "summary_limit": 10,
+                    "summary_scan_bytes": 4096,
+                    "summary_tail_records": 0,
+                    "summary_max_text_chars": 80,
+                    "summary_keywords": [],
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if line.startswith("{") and json.loads(line).get("kind")
+        ]
+        self.assertTrue(rows)
+        self.assertTrue(all(row.get("rollout") == rollout_ref for row in rows))
+
+    def test_remote_probe_local_rollout_summary_emits_backing_rollout_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(root / rollout_ref, [message("user", "Review the deployment.", "2026-05-01T10:00:00Z")])
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                sys, "stdout", stdout
+            ):
+                result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=10,
+                        tail_records=0,
+                        max_text_chars=80,
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        rows = [json.loads(line) for line in stdout.getvalue().splitlines() if line.startswith("{")]
+        self.assertTrue(rows)
+        self.assertTrue(all(row.get("rollout") == rollout_ref for row in rows))
+
+    def test_remote_probe_root_rollout_summary_emits_backing_rollout_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "rollout-2026-05-01T10-00-00-root.jsonl"
+            write_jsonl(root / rollout_ref, [message("user", "Review the deployment.", "2026-05-01T10:00:00Z")])
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                sys, "stdout", stdout
+            ):
+                result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=10,
+                        tail_records=0,
+                        max_text_chars=80,
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        rows = [json.loads(line) for line in stdout.getvalue().splitlines() if line.startswith("{")]
+        self.assertTrue(rows)
+        self.assertTrue(all(row.get("rollout") == rollout_ref for row in rows))
+
+    def test_remote_probe_rollout_summary_reports_record_limit_metadata(self) -> None:
+        records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
+            lines=[
+                json.dumps(message("user", "You forgot verification.", "2026-05-01T10:00:00Z")),
+                json.dumps(message("user", "You missed tests.", "2026-05-01T10:01:00Z")),
+            ],
+            keywords=["you"],
+            limit=1,
+            tail_records=0,
+            max_text_chars=80,
+        )
+
+        self.assertGreaterEqual(len(records), 1)
+        self.assertTrue(meta["record_limit_reached"])
+        self.assertTrue(meta["signal_record_limit_reached"])
+        self.assertTrue(meta["matched_record_limit_reached"])
+        self.assertTrue(meta["keyword_filter_applied"])
+        self.assertFalse(meta["tail_record_limit_reached"])
+
+    def test_remote_probe_rollout_summary_reports_tail_limit_metadata(self) -> None:
+        records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
+            lines=[
+                json.dumps(message("assistant", "Ordinary update 1.", "2026-05-01T10:00:00Z")),
+                json.dumps(message("assistant", "Ordinary update 2.", "2026-05-01T10:01:00Z")),
+            ],
+            keywords=[],
+            limit=10,
+            tail_records=1,
+            max_text_chars=80,
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertFalse(meta["record_limit_reached"])
+        self.assertFalse(meta["keyword_filter_applied"])
+        self.assertTrue(meta["tail_record_limit_reached"])
+        self.assertEqual(meta["json_error_count"], 0)
+
+    def test_remote_probe_rollout_summary_tail_flag_ignores_signal_records_already_emitted(self) -> None:
+        records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
+            lines=[
+                json.dumps(message("user", f"You forgot verification {index}.", f"2026-05-01T10:0{index}:00Z"))
+                for index in range(9)
+            ],
+            keywords=[],
+            limit=40,
+            tail_records=8,
+            max_text_chars=80,
+        )
+
+        self.assertEqual(len(records), 9)
+        self.assertFalse(meta["record_limit_reached"])
+        self.assertFalse(meta["tail_record_limit_reached"])
+
+    def test_remote_probe_rollout_summary_reports_json_error_metadata(self) -> None:
+        records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
+            lines=[
+                json.dumps(message("user", "You forgot verification.", "2026-05-01T10:00:00Z")),
+                "{not json",
+                json.dumps(message("assistant", "Done.", "2026-05-01T10:01:00Z")),
+            ],
+            keywords=[],
+            limit=10,
+            tail_records=8,
+            max_text_chars=80,
+        )
+
+        self.assertGreaterEqual(len(records), 1)
+        self.assertEqual(meta["json_error_count"], 1)
+        self.assertFalse(meta["record_limit_reached"])
+
+    def test_remote_probe_cmd_rollout_summary_emits_record_limit_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You forgot verification.", "2026-05-01T10:00:00Z"),
+                    message("user", "You missed tests.", "2026-05-01T10:01:00Z"),
+                ],
+            )
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(sys, "stdout", stdout):
+                result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout="sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                        keyword=["you"],
+                        limit=1,
+                        tail_records=0,
+                        max_text_chars=80,
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        scan_meta = rows[0]
+        self.assertEqual(scan_meta["kind"], "scan_meta")
+        self.assertTrue(scan_meta["record_limit_reached"])
+        self.assertTrue(scan_meta["signal_record_limit_reached"])
+        self.assertTrue(scan_meta["matched_record_limit_reached"])
+        self.assertTrue(scan_meta["keyword_filter_applied"])
+        self.assertFalse(scan_meta["tail_record_limit_reached"])
+        self.assertEqual(scan_meta["summary_limit"], 1)
+        self.assertEqual(scan_meta["json_error_count"], 0)
+        self.assertTrue(all(row["rollout"] == "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl" for row in rows))
+
+    def test_remote_probe_generated_rollout_summary_emits_record_limit_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You forgot verification.", "2026-05-01T10:00:00Z"),
+                    message("user", "You missed tests.", "2026-05-01T10:01:00Z"),
+                ],
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                    "summary_limit": 1,
+                    "summary_scan_bytes": 4096,
+                    "summary_tail_records": 0,
+                    "summary_max_text_chars": 80,
+                    "summary_keywords": ["you"],
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scan_meta = next(
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if line.startswith("{") and json.loads(line).get("kind") == "scan_meta"
+        )
+        self.assertTrue(scan_meta["record_limit_reached"])
+        self.assertTrue(scan_meta["signal_record_limit_reached"])
+        self.assertTrue(scan_meta["matched_record_limit_reached"])
+        self.assertTrue(scan_meta["keyword_filter_applied"])
+        self.assertFalse(scan_meta["tail_record_limit_reached"])
+        self.assertEqual(scan_meta["summary_limit"], 1)
+        self.assertEqual(scan_meta["json_error_count"], 0)
+
+    def test_remote_probe_generated_rollout_summary_tail_flag_ignores_signal_records_already_emitted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", f"You forgot verification {index}.", f"2026-05-01T10:0{index}:00Z")
+                    for index in range(9)
+                ],
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                    "summary_limit": 40,
+                    "summary_scan_bytes": 4096,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 80,
+                    "summary_keywords": [],
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scan_meta = next(
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if line.startswith("{") and json.loads(line).get("kind") == "scan_meta"
+        )
+        self.assertFalse(scan_meta["record_limit_reached"])
+        self.assertFalse(scan_meta["tail_record_limit_reached"])
+        self.assertEqual(scan_meta["summary_record_count"], 9)
+
+    def test_remote_probe_generated_rollout_summary_reports_json_error_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "You forgot verification.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + "{not json"
+                + "\n",
+                encoding="utf-8",
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                    "summary_limit": 10,
+                    "summary_scan_bytes": 4096,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 80,
+                    "summary_keywords": [],
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scan_meta = next(
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if line.startswith("{") and json.loads(line).get("kind") == "scan_meta"
+        )
+        self.assertEqual(scan_meta["json_error_count"], 1)
 
     def test_remote_probe_rollout_summary_preserves_early_signal_outside_tail(self) -> None:
         lines = [json.dumps(message("user", "permission denied while fetching remote logs", "2026-05-01T10:00:00Z"))]
@@ -4148,6 +4915,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
 
+    def test_make_shards_skips_exact_timestamp_invalid_rollout_outside_subday_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-bad.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n", encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T11:00:00Z", "end": "2026-05-01T12:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = list((output / "shards.jsonl").read_text(encoding="utf-8").splitlines())
+
+        self.assertEqual(rows, [])
+
     def test_make_shards_skips_non_ready_manifest_sources(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "miku-bot-dev"
@@ -4943,6 +5733,879 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
+
+    def test_complete_rollout_summary_covers_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
+                    {"kind": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "text": "session_id=s1"},
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("user_correction", rows[0]["issue_flags"])
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_complete_rollout_summary_without_retained_flags_does_not_cover_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
+                    {"kind": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "text": "session_id=s1"},
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Ordinary assistant update without retained flags.",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_complete_summary_extracts_when_backing_ref_is_relevant_but_summary_path_is_late(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=rollout_ref, source_bytes=rollout.stat().st_size),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("user_correction", rows[0]["issue_flags"])
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_complete_summary_extracts_untimestamped_record_when_backing_ref_is_relevant_but_summary_path_is_late(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(untimestamped_message("user", "Fresh oversized task."))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=rollout_ref, source_bytes=rollout.stat().st_size),
+                    {
+                        "kind": "user_message",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], "2026-05-01T10:00:00Z")
+        self.assertIn("user_correction", rows[0]["issue_flags"])
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_late_summary_without_scan_meta_uses_record_backing_ref_for_relevance(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "user_message",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], "2026-05-01T10:00:00Z")
+        self.assertIn("user_correction", rows[0]["issue_flags"])
+
+    def test_complete_summary_extracts_when_late_path_backs_old_rollout_with_current_record(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Old oversized task.", "2026-01-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-late.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("user_correction", rows[0]["issue_flags"])
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_complete_rollout_summary_covers_flat_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "rollout-2026-05-01T10-00-00-flat.jsonl"
+            rollout = root / rollout_ref
+            rollout.write_text(
+                json.dumps(message("user", "Fresh flat oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "rollout-summary-flat.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_scan_meta_only_complete_summary_does_not_cover_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "payload": {"id": "s1"}})
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        summary_record_count=0,
+                    )
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_scan_meta_only_complete_summary_does_not_cover_old_oversized_rollout_with_current_record(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "payload": {"id": "s1"}})
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        summary_record_count=0,
+                    )
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_scan_meta_only_complete_summary_late_path_does_not_cover_without_records(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "payload": {"id": "s1"}})
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-late.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        summary_record_count=0,
+                    )
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_scan_meta_with_short_scan_bytes_does_not_cover_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        scan_bytes=1,
+                        scan_truncated=False,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_root_scan_meta_only_complete_summary_does_not_cover_without_records(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "payload": {"id": "s1"}})
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        summary_record_count=0,
+                    )
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_stale_rollout_summary_source_bytes_does_not_cover_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size - 1),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertIn("oversized_rollout_skipped", reasons)
+        self.assertIn("stale_rollout_summary", reasons)
+        self.assertEqual(rows, [])
+
+    def test_stale_rollout_summary_does_not_block_direct_raw_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-small.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Fresh direct task.", "2026-05-01T10:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-small.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size + 1,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Stale summary text",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+            discover_output = safe_output_dir(raw, "discover")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            MODULE.run_discover(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(discover_output), allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((discover_output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("Stale summary text", rows[0]["redacted_user_prompt_summary"])
+        self.assertNotIn("stale_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "ready")
+        self.assertNotIn("stale_rollout_summary", [gap["reason"] for gap in manifest["coverage_gaps"]])
+
+    def test_truncated_stale_summary_does_not_block_direct_raw_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-small.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Fresh direct task.", "2026-05-01T10:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-small.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size + 1,
+                        scan_truncated=True,
+                        record_limit_reached=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Stale summary text",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("Stale summary text", rows[0]["redacted_user_prompt_summary"])
+        self.assertNotIn("stale_rollout_summary", reasons)
+        self.assertNotIn("truncated_rollout_summary", reasons)
+
+    def test_stale_root_rollout_summary_uses_direct_raw_rollout_when_sessions_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            (root / "sessions").mkdir(parents=True, exist_ok=True)
+            rollout_ref = "rollout-2026-05-01T10-00-00-small.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Fresh root direct task.", "2026-05-01T10:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-small.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size + 1,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Stale root summary text",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            expected_source_hash = MODULE.file_source_hash(rollout)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source_hash"], expected_source_hash)
+        self.assertNotIn("Stale root summary text", rows[0]["redacted_user_prompt_summary"])
+        self.assertNotIn("stale_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_truncated_stale_rollout_summary_does_not_extract_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        source_bytes=rollout.stat().st_size - 1,
+                        scan_truncated=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertIn("oversized_rollout_skipped", reasons)
+        self.assertIn("stale_rollout_summary", reasons)
+        self.assertIn("truncated_rollout_summary", reasons)
+        self.assertEqual(rows, [])
+
+    def test_json_error_rollout_summary_does_not_cover_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + "{not json"
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(json_error_count=1),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_record_limited_rollout_summary_does_not_cover_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        matched_record_limit_reached=True,
+                        record_limit_reached=True,
+                        summary_limit=1,
+                        text=(
+                            "scan_truncated=false keyword_filter_applied=false record_limit_reached=true "
+                            "signal_record_limit_reached=false matched_record_limit_reached=true "
+                            "tail_record_limit_reached=false scan_bytes=2097152 summary_limit=1 "
+                            "tail_records=8 summary_record_count=1 source_bytes=1200"
+                        ),
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertIn("oversized_rollout_skipped", reasons)
+        self.assertIn("truncated_rollout_summary", reasons)
+
+    def test_truncated_rollout_summary_does_not_cover_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "scan_meta",
+                        "timestamp": "",
+                        "text": "scan_truncated=true scan_bytes=1000 source_bytes=3000",
+                        "scan_truncated": True,
+                    },
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertIn("oversized_rollout_skipped", reasons)
+        self.assertIn("truncated_rollout_summary", reasons)
 
     def test_old_oversized_rollout_with_uncertain_middle_timestamp_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -7503,7 +9166,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1500, allow_partial_hosts=True),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -8233,6 +9896,56 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
 
+    def test_default_remote_mixed_stale_summary_does_not_cover_valid_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            oversized_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-oversized.jsonl"
+            stale_covered_ref = "sessions/2026/05/01/rollout-2026-05-01T11-00-00-covered.jsonl"
+            oversized = remote / oversized_ref
+            oversized.parent.mkdir(parents=True, exist_ok=True)
+            oversized.write_text(
+                json.dumps(message("user", "Oversized remote task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 5000),
+                encoding="utf-8",
+            )
+            stale_covered = remote / stale_covered_ref
+            write_jsonl(stale_covered, [message("user", "Covered remote task.", "2026-05-01T11:00:00Z")])
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=oversized_ref, source_bytes=oversized.stat().st_size),
+                    complete_rollout_summary_scan_meta(rollout=stale_covered_ref, source_bytes=1),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": oversized_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T11:01:00Z",
+                        "rollout": stale_covered_ref,
+                        "text": "You missed verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=4000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertIn("oversized_rollout_skipped", reasons)
+        self.assertNotIn("remote_source_not_materialized", reasons)
+
     def test_default_remote_summary_backing_ignores_out_of_window_rollout_refs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
@@ -8270,6 +9983,362 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_complete_summary_covers_unknown_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-remote.jsonl"
+            rollout = remote / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Old oversized task.", "2026-01-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertNotIn("remote_source_not_materialized", reasons)
+        self.assertNotIn("oversized_rollout_skipped", reasons)
+
+    def test_default_remote_complete_summary_with_rollout_scan_meta_covers_old_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-remote.jsonl"
+            rollout = remote / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Old oversized task.", "2026-01-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                    ),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertNotIn("remote_source_not_materialized", reasons)
+        self.assertNotIn("oversized_rollout_skipped", reasons)
+
+    def test_default_remote_complete_summary_requires_scan_meta_for_each_backing_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout_a_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-a.jsonl"
+            rollout_b_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-b.jsonl"
+            rollout_payload = (
+                json.dumps(message("user", "Old oversized task.", "2026-01-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000)
+            )
+            for rollout_ref in (rollout_a_ref, rollout_b_ref):
+                rollout = remote / rollout_ref
+                rollout.parent.mkdir(parents=True, exist_ok=True)
+                rollout.write_text(rollout_payload, encoding="utf-8")
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_a_ref,
+                        source_bytes=(remote / rollout_a_ref).stat().st_size,
+                    ),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_b_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_complete_summary_requires_rollout_backing_ref_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            non_rollout_ref = "notes/rollout-2026-05-01T10-00-00-note.jsonl"
+            non_rollout = remote / non_rollout_ref
+            non_rollout.parent.mkdir(parents=True, exist_ok=True)
+            non_rollout.write_text("not a rollout\n", encoding="utf-8")
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=non_rollout_ref, source_bytes=non_rollout.stat().st_size),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": non_rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_complete_summary_requires_materialized_backing_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-remote.jsonl"
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=3000),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_complete_summary_covers_materialized_root_backing_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            (remote / "sessions").mkdir(parents=True)
+            rollout_ref = "rollout-2026-05-01T10-00-00-root.jsonl"
+            rollout = remote / rollout_ref
+            rollout.write_text(
+                json.dumps(message("user", "Root materialized remote task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=rollout_ref, source_bytes=rollout.stat().st_size),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "ready")
+
+    def test_default_remote_late_summary_uses_backing_rollout_date_for_untimestamped_record(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-remote.jsonl"
+            rollout = remote / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(untimestamped_message("user", "Remote oversized task."))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = remote / "sessions" / "2026" / "06" / "01" / "rollout-summary-late.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=rollout_ref, source_bytes=rollout.stat().st_size),
+                    {
+                        "kind": "user_message",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], "2026-05-01T10:00:00Z")
+        self.assertIn("user_correction", rows[0]["issue_flags"])
+        self.assertNotIn("remote_source_not_materialized", reasons)
+        self.assertNotIn("oversized_rollout_skipped", reasons)
+
+    def test_complete_summary_rejects_nested_backing_rollout_when_source_scans_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "copied/rollout-2026-05-01T10-00-00-nested.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Nested oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "rollout-summary-nested.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=rollout_ref, source_bytes=rollout.stat().st_size),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_scan_meta_backing_ref_uses_exact_filename_timestamp_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-old.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Old task.", "2026-05-01T10:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        summary_record_count=0,
+                    )
+                ],
+            )
+
+            self.assertFalse(
+                MODULE.rollout_ref_in_window(
+                    rollout_ref,
+                    MODULE.parse_time("2026-05-01T11:00:00Z"),
+                    MODULE.parse_time("2026-05-01T12:00:00Z"),
+                )
+            )
+            self.assertFalse(
+                MODULE.summary_file_has_relevant_backing_ref(
+                    summary,
+                    MODULE.parse_time("2026-05-01T11:00:00Z"),
+                    MODULE.parse_time("2026-05-01T12:00:00Z"),
+                    max_scan_bytes=1000,
+                )
+            )
+            refs = MODULE.complete_summary_backing_rollout_refs(
+                [summary],
+                MODULE.parse_time("2026-05-01T11:00:00Z"),
+                MODULE.parse_time("2026-05-01T12:00:00Z"),
+                source_root=root,
+                max_scan_bytes=1000,
+            )
+
+        self.assertEqual(refs, set())
 
     def test_default_remote_old_rollout_does_not_cover_current_summary_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -8570,6 +10639,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
+
+    def test_exact_timestamp_invalid_rollout_before_subday_start_does_not_report_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-bad.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n", encoding="utf-8")
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T11:00:00Z"),
+                end=MODULE.parse_time("2026-05-01T12:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("invalid_jsonl", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_old_invalid_rollout_with_active_mtime_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -9702,6 +11791,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertIn("oversized_summary_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
 
+    def test_future_oversized_rollout_summary_with_current_record_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-late.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text(
+                json.dumps({"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"})
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("oversized_summary_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_truncated_rollout_summary_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "remote"
@@ -9952,6 +12064,40 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             output = safe_output_dir(raw)
 
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1500"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "oversized")
+        self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_marks_future_oversized_summary_with_current_record(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-late.jsonl"
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text(
+                json.dumps({"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"})
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
             MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
             rows = [
                 json.loads(line)
@@ -9962,6 +12108,859 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "oversized")
         self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_uses_complete_summary_instead_of_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
+                    {"kind": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "text": "session_id=s1"},
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "ready")
+
+    def test_make_shards_keeps_oversized_rollout_when_complete_summary_has_no_retained_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
+                    {"kind": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "text": "session_id=s1"},
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Ordinary assistant update without retained flags.",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("kind", rows[0])
+        self.assertEqual(rows[0]["status"], "oversized")
+
+    def test_make_shards_complete_summary_covers_only_refs_with_retained_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_a_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-a.jsonl"
+            rollout_b_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-b.jsonl"
+            for rollout_ref in (rollout_a_ref, rollout_b_ref):
+                rollout = root / rollout_ref
+                rollout.parent.mkdir(parents=True, exist_ok=True)
+                rollout.write_text(
+                    json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                    + "\n"
+                    + ("x" * 5000),
+                    encoding="utf-8",
+                )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_a_ref,
+                        source_bytes=(root / rollout_a_ref).stat().st_size,
+                    ),
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_b_ref,
+                        source_bytes=(root / rollout_b_ref).stat().st_size,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_a_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:02:00Z",
+                        "rollout": rollout_b_ref,
+                        "text": "Ordinary assistant update without retained flags.",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "3000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        summary_rows = [row for row in rows if row.get("kind") == "summary"]
+        oversized_rows = [row for row in rows if row.get("status") == "oversized"]
+        self.assertEqual(len(summary_rows), 1)
+        self.assertEqual(summary_rows[0]["status"], "ready")
+        self.assertEqual(len(oversized_rows), 1)
+
+    def test_make_shards_stale_rollout_summary_keeps_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size - 1),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        rollout_rows = [
+            row
+            for row in rows
+            if row.get("status") == "oversized" and "rollout exceeds" in str(row.get("coverage_gap", ""))
+        ]
+        summary_rows = [row for row in rows if row.get("kind") == "summary"]
+        self.assertEqual(len(rollout_rows), 1)
+        self.assertIn("coverage_gap", rollout_rows[0])
+        self.assertEqual(len(summary_rows), 1)
+        self.assertEqual(summary_rows[0]["status"], "partial")
+        self.assertIn("source_bytes", summary_rows[0]["coverage_gap"])
+
+    def test_make_shards_skips_stale_summary_when_raw_rollout_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-small.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Fresh direct task.", "2026-05-01T10:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-small.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size + 1,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Stale summary text",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "ready")
+        self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(rollout))
+
+    def test_make_shards_skips_truncated_stale_summary_when_raw_rollout_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-small.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Fresh direct task.", "2026-05-01T10:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-small.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size + 1,
+                        scan_truncated=True,
+                        record_limit_reached=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Stale summary text",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "ready")
+        self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(rollout))
+
+    def test_make_shards_skips_stale_root_summary_when_raw_rollout_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            (root / "sessions").mkdir(parents=True, exist_ok=True)
+            rollout_ref = "rollout-2026-05-01T10-00-00-small.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Fresh root direct task.", "2026-05-01T10:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-small.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size + 1,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Stale summary text",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "ready")
+        self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(rollout))
+
+    def test_make_shards_remote_complete_summary_covers_unknown_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-remote.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Old oversized task.", "2026-01-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "ready")
+
+    def test_make_shards_remote_late_summary_uses_backing_rollout_date_for_untimestamped_record(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-remote.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(untimestamped_message("user", "Remote oversized task."))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-late.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=rollout_ref, source_bytes=rollout.stat().st_size),
+                    {
+                        "kind": "user_message",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "ready")
+
+    def test_make_shards_mixed_stale_summary_does_not_cover_valid_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            oversized_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-oversized.jsonl"
+            stale_covered_ref = "sessions/2026/05/01/rollout-2026-05-01T11-00-00-covered.jsonl"
+            oversized = root / oversized_ref
+            oversized.parent.mkdir(parents=True, exist_ok=True)
+            oversized.write_text(
+                json.dumps(message("user", "Oversized remote task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 5000),
+                encoding="utf-8",
+            )
+            stale_covered = root / stale_covered_ref
+            write_jsonl(stale_covered, [message("user", "Covered remote task.", "2026-05-01T11:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=oversized_ref, source_bytes=oversized.stat().st_size),
+                    complete_rollout_summary_scan_meta(rollout=stale_covered_ref, source_bytes=1),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": oversized_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T11:01:00Z",
+                        "rollout": stale_covered_ref,
+                        "text": "You missed verification for /customer/repo",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "4000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertTrue(
+            any(
+                row.get("status") == "oversized"
+                and "rollout exceeds" in str(row.get("coverage_gap", ""))
+                for row in rows
+            )
+        )
+        self.assertFalse(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in rows))
+
+    def test_make_shards_remote_complete_summary_with_rollout_scan_meta_covers_old_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-remote.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Old oversized task.", "2026-01-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                    ),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "ready")
+
+    def test_make_shards_late_complete_summary_with_current_record_covers_old_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-remote.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Old oversized task.", "2026-01-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-late.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                    ),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "ready")
+
+    def test_make_shards_scan_meta_only_late_summary_does_not_cover_without_records(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-remote.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "payload": {"id": "s1"}})
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-late.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        summary_record_count=0,
+                    )
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "oversized")
+        self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_marks_summary_with_short_scan_bytes_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-remote.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        scan_bytes=rollout.stat().st_size - 1,
+                    ),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 2)
+        summary_rows = [row for row in rows if row.get("kind") == "summary"]
+        oversized_rows = [row for row in rows if row.get("status") == "oversized"]
+        self.assertEqual(len(summary_rows), 1)
+        self.assertEqual(summary_rows[0]["status"], "partial")
+        self.assertEqual(
+            summary_rows[0]["coverage_gap"],
+            "summary scan incomplete; regenerate complete bounded evidence before extractor handoff",
+        )
+        self.assertEqual(len(oversized_rows), 1)
+
+    def test_make_shards_complete_summary_requires_scan_meta_for_each_backing_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_a_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-a.jsonl"
+            rollout_b_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-b.jsonl"
+            rollout_payload = (
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000)
+            )
+            for rollout_ref in (rollout_a_ref, rollout_b_ref):
+                rollout = root / rollout_ref
+                rollout.parent.mkdir(parents=True, exist_ok=True)
+                rollout.write_text(rollout_payload, encoding="utf-8")
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_a_ref,
+                        source_bytes=(root / rollout_a_ref).stat().st_size,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_b_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        summary_rows = [row for row in rows if row.get("kind") == "summary"]
+        oversized_rows = [row for row in rows if row.get("status") == "oversized"]
+        self.assertEqual(len(summary_rows), 1)
+        self.assertEqual(summary_rows[0]["status"], "partial")
+        self.assertIn("source_bytes", summary_rows[0]["coverage_gap"])
+        self.assertGreaterEqual(len(oversized_rows), 1)
+
+    def test_make_shards_remote_complete_summary_requires_materialized_backing_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-remote.jsonl"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=3000),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "remote_source_not_materialized")
+
+    def test_make_shards_remote_complete_summary_rejects_invalid_backing_ref_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            non_rollout_ref = "notes/rollout-2026-05-01T10-00-00-note.jsonl"
+            non_rollout = root / non_rollout_ref
+            non_rollout.parent.mkdir(parents=True, exist_ok=True)
+            non_rollout.write_text("not a rollout\n", encoding="utf-8")
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=non_rollout_ref, source_bytes=non_rollout.stat().st_size),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": non_rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "remote_source_not_materialized")
 
     def test_make_shards_skips_future_truncated_rollout_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -10173,6 +13172,164 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn(REMOTE_PROBE.SESSION_META_LIMIT_TRUNCATED_REASON, result.stdout)
         self.assertIn('"kind":"truncation"', result.stdout)
+
+    def test_remote_probe_generated_session_meta_filters_rollout_window_before_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            for hour in (10, 11):
+                rollout = root / "sessions" / "2026" / "05" / "01" / f"rollout-2026-05-01T{hour:02d}-00-00.jsonl"
+                write_jsonl(
+                    rollout,
+                    [
+                        {
+                            "type": "session_meta",
+                            "timestamp": f"2026-05-01T{hour:02d}:00:00Z",
+                            "payload": {"id": f"session-{hour}", "cwd": "/redacted/repo"},
+                        }
+                    ],
+                )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "session-meta",
+                    "codex_root": str(root),
+                    "dates": ["2026/05/01"],
+                    "limit": 1,
+                    "session_meta_scan_bytes": 1024,
+                    "rollout_start": "2026-05-01T11:00:00Z",
+                    "rollout_end": "2026-05-01T12:00:00Z",
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"session_id":"session-11"', result.stdout)
+        self.assertNotIn("session-10", result.stdout)
+        self.assertNotIn(REMOTE_PROBE.SESSION_META_LIMIT_TRUNCATED_REASON, result.stdout)
+
+    def test_remote_probe_generated_session_meta_includes_root_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_jsonl(
+                root / "rollout-2026-05-01T10-00-00-root.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "root-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "session-meta",
+                    "codex_root": str(root),
+                    "dates": ["2026/05/01"],
+                    "limit": 10,
+                    "session_meta_scan_bytes": 1024,
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"session_id":"root-session"', result.stdout)
+        self.assertIn('"rollout":"rollout-2026-05-01T10-00-00-root.jsonl"', result.stdout)
+
+    def test_remote_probe_generated_session_meta_filters_rollout_filename_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_jsonl(
+                root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "session-known", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            write_jsonl(
+                root / "sessions" / "2026" / "05" / "01" / "rollout-undated.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T11:00:00Z",
+                        "payload": {"id": "session-unknown", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            write_jsonl(
+                root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01-date-only.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T12:30:00Z",
+                        "payload": {"id": "session-date-only", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            write_jsonl(
+                root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T99-00-00-bad.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T12:00:00Z",
+                        "payload": {"id": "session-bad-name", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            base_payload = {
+                "mode": "session-meta",
+                "codex_root": str(root),
+                "dates": ["2026/05/01"],
+                "limit": 10,
+                "session_meta_scan_bytes": 1024,
+            }
+            unknown_script = REMOTE_PROBE._remote_python_script(
+                {**base_payload, "rollout_filename_mode": "unknown"}
+            )
+            known_script = REMOTE_PROBE._remote_python_script(
+                {**base_payload, "rollout_filename_mode": "known"}
+            )
+
+            unknown_result = subprocess.run(
+                [sys.executable, "-"],
+                input=unknown_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            known_result = subprocess.run(
+                [sys.executable, "-"],
+                input=known_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(unknown_result.returncode, 0, unknown_result.stderr)
+        self.assertIn("session-unknown", unknown_result.stdout)
+        self.assertIn("session-date-only", unknown_result.stdout)
+        self.assertIn("session-bad-name", unknown_result.stdout)
+        self.assertNotIn("session-known", unknown_result.stdout)
+        self.assertEqual(known_result.returncode, 0, known_result.stderr)
+        self.assertIn("session-known", known_result.stdout)
+        self.assertNotIn("session-unknown", known_result.stdout)
+        self.assertNotIn("session-date-only", known_result.stdout)
+        self.assertNotIn("session-bad-name", known_result.stdout)
 
     def test_remote_probe_generated_session_meta_marks_unreadable_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
