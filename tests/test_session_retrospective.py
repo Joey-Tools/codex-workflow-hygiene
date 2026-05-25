@@ -685,6 +685,31 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(path.as_posix(), "rollout-2026-05-01T10-00-00-root.jsonl")
 
+    def test_remote_probe_session_meta_includes_root_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_jsonl(
+                root / "rollout-2026-05-01T10-00-00-root.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "root-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+
+            rows = REMOTE_PROBE._iter_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["session_id"], "root-session")
+        self.assertEqual(rows[0]["rollout"], "rollout-2026-05-01T10-00-00-root.jsonl")
+
     def test_remote_probe_session_meta_includes_dated_archived_rollouts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -4886,6 +4911,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = list((output / "shards.jsonl").read_text(encoding="utf-8").splitlines())
+
+        self.assertEqual(rows, [])
+
+    def test_make_shards_skips_exact_timestamp_invalid_rollout_outside_subday_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-bad.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n", encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T11:00:00Z", "end": "2026-05-01T12:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
             rows = list((output / "shards.jsonl").read_text(encoding="utf-8").splitlines())
 
         self.assertEqual(rows, [])
@@ -10592,6 +10640,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
 
+    def test_exact_timestamp_invalid_rollout_before_subday_start_does_not_report_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-bad.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n", encoding="utf-8")
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T11:00:00Z"),
+                end=MODULE.parse_time("2026-05-01T12:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("invalid_jsonl", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_old_invalid_rollout_with_active_mtime_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             home = Path(raw) / "home"
@@ -13144,6 +13212,41 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn('"session_id":"session-11"', result.stdout)
         self.assertNotIn("session-10", result.stdout)
         self.assertNotIn(REMOTE_PROBE.SESSION_META_LIMIT_TRUNCATED_REASON, result.stdout)
+
+    def test_remote_probe_generated_session_meta_includes_root_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_jsonl(
+                root / "rollout-2026-05-01T10-00-00-root.jsonl",
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "root-session", "cwd": "/redacted/repo"},
+                    }
+                ],
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "session-meta",
+                    "codex_root": str(root),
+                    "dates": ["2026/05/01"],
+                    "limit": 10,
+                    "session_meta_scan_bytes": 1024,
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"session_id":"root-session"', result.stdout)
+        self.assertIn('"rollout":"rollout-2026-05-01T10-00-00-root.jsonl"', result.stdout)
 
     def test_remote_probe_generated_session_meta_filters_rollout_filename_mode(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

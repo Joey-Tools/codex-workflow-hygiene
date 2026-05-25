@@ -1223,6 +1223,13 @@ def iter_session_meta():
             pass
         except OSError:
             session_directory_unreadable()
+        rollout_paths.extend(
+            rollout
+            for rollout in sorted_rollout_paths(root)
+            if is_raw_rollout_file(rollout)
+            and flat_archived_rollout_matches_date(rollout, date_text)
+            and rollout_matches_bounds(rollout)
+        )
         seen_rollout_paths = set()
         for rollout in rollout_paths:
             rel = pathlib.PurePosixPath(rollout.relative_to(root).as_posix())
@@ -1398,6 +1405,18 @@ def _scan_session_meta_records(
             pass
         except OSError as exc:
             raise SessionMetaRolloutError("session directory unreadable") from exc
+        rollout_paths.extend(
+            rollout_path
+            for rollout_path in sorted_rollout_paths(resolved_root)
+            if _is_raw_rollout_file(rollout_path)
+            and _flat_archived_rollout_matches_date(rollout_path, date_value)
+            and _rollout_matches_bounds(
+                rollout_path,
+                rollout_start,
+                rollout_end,
+                filename_mode=rollout_filename_mode,
+            )
+        )
         seen_rollout_paths: set[str] = set()
         for rollout_path in rollout_paths:
             rollout_relative_path = pathlib.PurePosixPath(

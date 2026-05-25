@@ -1077,7 +1077,23 @@ def rollout_has_record_in_window(
 
 
 def rollout_filename_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
-    rollout_date = rollout_window_date(path)
+    match = re.search(
+        r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)",
+        path.name,
+    )
+    if match:
+        if match.group(2):
+            rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+            if rollout_time is None:
+                return True
+            if start and rollout_time < start:
+                return False
+            if end and rollout_time >= end:
+                return False
+            return True
+        rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
+    else:
+        rollout_date = dated_path_from_parts(path)
     if rollout_date is None:
         return True
     rollout_end = rollout_date + dt.timedelta(days=1)
