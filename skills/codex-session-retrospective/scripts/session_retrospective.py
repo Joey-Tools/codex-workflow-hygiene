@@ -1353,6 +1353,97 @@ def summary_record_in_window(
     return True
 
 
+def rollout_ref_in_window(ref: str, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    if start is None and end is None:
+        return True
+    ref_path = Path(ref)
+    rollout_date = rollout_date_from_path(ref_path) or dated_path_from_parts(ref_path)
+    if rollout_date is None:
+        return False
+    rollout_end = rollout_date + dt.timedelta(days=1)
+    if start and rollout_end <= start:
+        return False
+    if end and rollout_date >= end:
+        return False
+    return True
+
+
+def summary_file_has_relevant_scan_meta_backing_ref(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(max_scan_bytes + 1)
+    except OSError:
+        return False
+    if len(data) > max_scan_bytes:
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(record, dict) or str(record.get("kind") or "summary") != "scan_meta":
+            continue
+        rollout_ref = record.get("rollout")
+        if not isinstance(rollout_ref, str):
+            continue
+        safe_ref = safe_rollout_backing_ref(rollout_ref)
+        if safe_ref is not None and rollout_ref_in_window(safe_ref, start, end):
+            return True
+    return False
+
+
+def summary_file_relevant_or_backing_ref_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    return summary_file_relevant_with_scan_cap(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    ) or summary_file_has_relevant_scan_meta_backing_ref(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    )
+
+
+def summary_file_maybe_relevant_or_backing_ref_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    return summary_file_maybe_relevant_with_scan_cap(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    ) or summary_file_has_relevant_scan_meta_backing_ref(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    )
+
+
 def summary_backing_rollout_refs(
     path: Path,
     start: dt.datetime | None,
@@ -1388,14 +1479,14 @@ def summary_backing_rollout_refs(
         if kind == "session_meta":
             continue
         if kind == "scan_meta":
-            if not summary_record_in_window(record, path, start, end):
-                continue
             rollout_ref = record.get("rollout")
             if not isinstance(rollout_ref, str):
                 continue
             safe_ref = safe_rollout_backing_ref(rollout_ref)
             if safe_ref is None:
                 unbacked_record_seen = True
+                continue
+            if not summary_record_in_window(record, path, start, end) and not rollout_ref_in_window(safe_ref, start, end):
                 continue
             relevant_record_seen = True
             refs.add(safe_ref)
@@ -1433,7 +1524,7 @@ def complete_summary_backing_rollout_refs(
             continue
         if size > max_scan_bytes:
             continue
-        if not summary_file_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_scan_bytes):
+        if not summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_scan_bytes):
             continue
         if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
             continue
@@ -1479,7 +1570,7 @@ def summary_file_has_stale_backing_source(
         return False
     if size > max_scan_bytes:
         return False
-    if not summary_file_relevant_with_scan_cap(path, start, end, max_scan_bytes=max_scan_bytes):
+    if not summary_file_relevant_or_backing_ref_relevant(path, start, end, max_scan_bytes=max_scan_bytes):
         return False
     source_bytes = summary_file_declared_source_bytes(path)
     if source_bytes is None:
@@ -3684,7 +3775,7 @@ def remote_summary_only_gaps(
         if rollout_ref is not None:
             covered_rollout_refs.add(rollout_ref)
     for summary in summaries:
-        if not summary_file_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_scan_bytes):
+        if not summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_scan_bytes):
             continue
         backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
             summary,
@@ -3931,7 +4022,7 @@ def run_scan(
             if (
                 summary_file_has_truncated_scan(summary)
                 or summary_file_has_record_limit_gap(summary)
-            ) and summary_file_maybe_relevant_with_scan_cap(
+            ) and summary_file_maybe_relevant_or_backing_ref_relevant(
                 summary,
                 gap_start,
                 end,
@@ -3948,7 +4039,7 @@ def run_scan(
                 if (
                     summary_file_maybe_relevant_with_scan_cap(summary, gap_start, end, max_scan_bytes=max_raw_bytes)
                     if jsonl_error.unreadable
-                    else summary_file_relevant(summary, gap_start, end)
+                    else summary_file_relevant_or_backing_ref_relevant(summary, gap_start, end, max_scan_bytes=max_raw_bytes)
                 ):
                     coverage_gaps.append(
                         {
@@ -4245,7 +4336,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             return
         jsonl_error = first_jsonl_error(summary)
         if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(summary):
-            if not summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_raw_bytes):
+            if not summary_file_maybe_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes):
                 return
             row["status"] = "partial"
             row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
@@ -4255,7 +4346,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             if not (
                 summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_raw_bytes)
                 if jsonl_error.unreadable
-                else summary_file_relevant(summary, start, end)
+                else summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes)
             ):
                 return
             row["status"] = "invalid"
@@ -4273,7 +4364,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             row["coverage_gap"] = "summary source_bytes does not match current backing rollout; regenerate bounded rollout-summary before extractor handoff"
             rows.append(row)
             return
-        if not summary_file_relevant(summary, start, end):
+        if not summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes):
             return
         row["status"] = "ready"
         rows.append(row)

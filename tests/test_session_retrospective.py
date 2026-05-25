@@ -986,6 +986,49 @@ class SessionRetrospectiveTests(unittest.TestCase):
             {"session-0", "session-1", "session-2", "session-undated"},
         )
 
+    def test_remote_probe_session_meta_auto_split_keeps_latest_rollout_for_duplicate_session(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            for hour in (1, 2):
+                rollout = root / "sessions" / "2026" / "05" / "01" / f"rollout-2026-05-01T{hour:02d}-00-00-same.jsonl"
+                write_jsonl(
+                    rollout,
+                    [
+                        {
+                            "type": "session_meta",
+                            "timestamp": f"2026-05-01T{hour:02d}:00:00Z",
+                            "payload": {"id": "session-same", "cwd": "/redacted/repo"},
+                        }
+                    ],
+                )
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                sys, "stderr", stderr
+            ), mock.patch.object(sys, "stdout", stdout):
+                result = REMOTE_PROBE.cmd_session_meta(
+                    types.SimpleNamespace(
+                        host=["local"],
+                        date=["2026/05/01"],
+                        from_date=None,
+                        to_date=None,
+                        limit=1,
+                        rollout_start=None,
+                        rollout_end=None,
+                        auto_split=True,
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        rows = stdout.getvalue().strip().splitlines()
+        self.assertEqual(rows[0], "host\tdate\tsession_id\tcwd\trollout")
+        self.assertEqual(len(rows), 2)
+        fields = rows[1].split("\t")
+        self.assertEqual(fields[2], "session-same")
+        self.assertEqual(fields[4], "sessions/2026/05/01/rollout-2026-05-01T02-00-00-same.jsonl")
+
     def test_remote_probe_session_meta_rejects_remote_limit_marker(self) -> None:
         row = json.dumps(
             {"date": "2026/05/01", "session_id": "session-1", "cwd": "/redacted/repo", "rollout": "sessions/2026/05/01/rollout-1.jsonl"}
@@ -5373,6 +5416,47 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 encoding="utf-8",
             )
             summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        summary_record_count=0,
+                    )
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_root_scan_meta_only_complete_summary_uses_backing_rollout_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "payload": {"id": "s1"}})
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "rollout-summary-large.jsonl"
             write_jsonl(
                 summary,
                 [

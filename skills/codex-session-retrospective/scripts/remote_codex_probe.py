@@ -1726,7 +1726,7 @@ def _session_meta_split_windows(
 def _dedupe_session_meta_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     deduped: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for row in rows:
+    for row in _sort_session_meta_rows(rows):
         key = (row.get("host", ""), row.get("session_id", ""))
         if key in seen:
             continue
