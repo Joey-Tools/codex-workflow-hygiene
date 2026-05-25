@@ -152,6 +152,12 @@ PATH_LIKE_TEXT_PATTERN = re.compile(
     re.I,
 )
 RAW_ROLLOUT_FILENAME_TEXT_PATTERN = re.compile(r"\brollout-\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2})?-[A-Za-z0-9_.-]+\.jsonl\b")
+ACTIVE_ROLLOUT_RELATIVE_RE = re.compile(
+    r"^sessions/\d{4}/\d{2}/\d{2}/rollout-(?!summary)[^/]+\.jsonl$"
+)
+ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile(
+    r"^archived_sessions/(?:\d{4}/\d{2}/\d{2}/)?rollout-(?!summary)[^/]+\.jsonl$"
+)
 RAW_SESSION_ID_TEXT_PATTERN = re.compile(r"\bsession_id[\"']?\s*(?:=|:)\s*[\"']?(?!session_ref_v1:)[A-Za-z0-9][A-Za-z0-9_.:-]*")
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
@@ -689,7 +695,10 @@ def session_id_from_path(path: Path) -> str:
 
 
 def rollout_date_from_path(path: Path) -> dt.datetime | None:
-    match = re.search(r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?-", path.name)
+    match = re.search(
+        r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)",
+        path.name,
+    )
     if not match:
         return None
     if match.group(2):
@@ -1313,6 +1322,15 @@ def safe_relative_summary_ref(value: str) -> str | None:
     return candidate.as_posix()
 
 
+def safe_rollout_backing_ref(value: str) -> str | None:
+    ref = safe_relative_summary_ref(value)
+    if ref is None:
+        return None
+    if ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(ref) or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(ref):
+        return ref
+    return None
+
+
 def summary_record_in_window(
     record: dict[str, Any],
     path: Path,
@@ -1369,7 +1387,7 @@ def summary_backing_rollout_refs(
         if not isinstance(rollout_ref, str):
             unbacked_record_seen = True
             continue
-        safe_ref = safe_relative_summary_ref(rollout_ref)
+        safe_ref = safe_rollout_backing_ref(rollout_ref)
         if safe_ref is None:
             unbacked_record_seen = True
             continue
@@ -1377,6 +1395,38 @@ def summary_backing_rollout_refs(
     if not complete:
         return refs, False, True, True
     return refs, True, relevant_record_seen, unbacked_record_seen
+
+
+def complete_summary_backing_rollout_refs(
+    summaries: list[Path],
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> set[str]:
+    refs: set[str] = set()
+    for summary in summaries:
+        try:
+            size = summary.stat().st_size
+        except OSError:
+            continue
+        if size > max_scan_bytes:
+            continue
+        if not summary_file_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_scan_bytes):
+            continue
+        if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
+            continue
+        if not summary_file_has_complete_backing_scan_meta(summary):
+            continue
+        backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+            summary,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+        )
+        if complete and relevant_record_seen and not unbacked_record_seen:
+            refs.update(backing_refs)
+    return refs
 
 
 def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
@@ -1436,6 +1486,53 @@ def summary_file_has_truncated_scan(path: Path) -> bool:
     except (OSError, ValueError):
         return False
     return False
+
+
+def summary_file_has_record_limit_gap(path: Path) -> bool:
+    limit_fields = (
+        "keyword_filter_applied",
+        "record_limit_reached",
+        "signal_record_limit_reached",
+        "matched_record_limit_reached",
+        "tail_record_limit_reached",
+    )
+    try:
+        for _line_no, record in iter_jsonl(path):
+            if str(record.get("kind") or "") != "scan_meta":
+                continue
+            text = str(record.get("text") or "")
+            for field in limit_fields:
+                if record.get(field) is True or f"{field}=true" in text:
+                    return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def summary_file_has_complete_backing_scan_meta(path: Path) -> bool:
+    limit_fields = (
+        "keyword_filter_applied",
+        "record_limit_reached",
+        "signal_record_limit_reached",
+        "matched_record_limit_reached",
+        "tail_record_limit_reached",
+    )
+    saw_scan_meta = False
+    try:
+        for _line_no, record in iter_jsonl(path):
+            if str(record.get("kind") or "") != "scan_meta":
+                continue
+            saw_scan_meta = True
+            if record.get("scan_truncated") is not False:
+                return False
+            summary_limit = record.get("summary_limit")
+            if type(summary_limit) is not int or summary_limit < 0:
+                return False
+            if any(record.get(field) is not False for field in limit_fields):
+                return False
+    except (OSError, ValueError):
+        return False
+    return saw_scan_meta
 
 
 def summary_session_id(record: dict[str, Any]) -> str | None:
@@ -3427,11 +3524,19 @@ def remote_summary_only_gaps(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    complete_summary_refs: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return []
-    covered_rollout_refs: set[str] = set()
-    has_covered_rollout = False
+    if complete_summary_refs is None:
+        complete_summary_refs = complete_summary_backing_rollout_refs(
+            summaries,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+        )
+    covered_rollout_refs: set[str] = set(complete_summary_refs)
+    has_covered_rollout = bool(complete_summary_refs)
     for rollout in rollouts:
         if not rollout_has_materialized_window_coverage(
             rollout,
@@ -3582,6 +3687,12 @@ def run_scan(
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
+        summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
+            summaries,
+            gap_start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+        )
         source_materialization_gaps = materialization_gaps_for_source(source)
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
@@ -3590,6 +3701,7 @@ def run_scan(
             gap_start,
             end,
             max_scan_bytes=max_raw_bytes,
+            complete_summary_refs=summary_backed_rollout_refs,
         )
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
@@ -3654,6 +3766,9 @@ def run_scan(
             relevance = oversized_rollout_relevance(rollout, gap_start, end)
             if relevance == "irrelevant":
                 continue
+            rollout_ref = source_relative_path_ref(rollout, source.root)
+            if rollout_ref is not None and rollout_ref in summary_backed_rollout_refs:
+                continue
             append_oversized_rollout_gap(rollout, size)
             continue
         for summary in summaries:
@@ -3663,7 +3778,10 @@ def run_scan(
                     append_oversized_summary_gap(summary, size)
                 continue
             jsonl_error = first_jsonl_error(summary)
-            if summary_file_has_truncated_scan(summary) and summary_file_maybe_relevant_with_scan_cap(
+            if (
+                summary_file_has_truncated_scan(summary)
+                or summary_file_has_record_limit_gap(summary)
+            ) and summary_file_maybe_relevant_with_scan_cap(
                 summary,
                 gap_start,
                 end,
@@ -3786,6 +3904,12 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         source_materialization_gaps = materialization_gaps_for_source(source)
+        summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
+            summaries,
+            start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+        )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
             rollouts,
@@ -3793,6 +3917,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             start,
             end,
             max_scan_bytes=max_raw_bytes,
+            complete_summary_refs=summary_backed_rollout_refs,
         )
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
@@ -3950,11 +4075,11 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             rows.append(row)
             return
         jsonl_error = first_jsonl_error(summary)
-        if summary_file_has_truncated_scan(summary):
+        if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(summary):
             if not summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_raw_bytes):
                 return
             row["status"] = "partial"
-            row["coverage_gap"] = "summary scan truncated; regenerate complete bounded evidence before extractor handoff"
+            row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
             rows.append(row)
             return
         if jsonl_error is not None:
@@ -4002,6 +4127,12 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
+        summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
+            summaries,
+            start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+        )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
             rollouts,
@@ -4009,6 +4140,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             start,
             end,
             max_scan_bytes=max_raw_bytes,
+            complete_summary_refs=summary_backed_rollout_refs,
         )
         if source_summary_only_gaps:
             append_source_gap_shards(source_summary_only_gaps, root)
@@ -4045,6 +4177,9 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 continue
             relevance = oversized_rollout_relevance(rollout, start, end)
             if relevance == "irrelevant":
+                continue
+            rollout_ref = source_relative_path_ref(rollout, root)
+            if rollout_ref is not None and rollout_ref in summary_backed_rollout_refs:
                 continue
             if relevance == "unknown":
                 row["status"] = "oversized"
