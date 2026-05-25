@@ -1384,7 +1384,21 @@ def summary_backing_rollout_refs(
             return refs, False, True, True
         if not isinstance(record, dict):
             return refs, False, True, True
-        if str(record.get("kind") or "summary") in {"session_meta", "scan_meta"}:
+        kind = str(record.get("kind") or "summary")
+        if kind == "session_meta":
+            continue
+        if kind == "scan_meta":
+            if not summary_record_in_window(record, path, start, end):
+                continue
+            rollout_ref = record.get("rollout")
+            if not isinstance(rollout_ref, str):
+                continue
+            safe_ref = safe_rollout_backing_ref(rollout_ref)
+            if safe_ref is None:
+                unbacked_record_seen = True
+                continue
+            relevant_record_seen = True
+            refs.add(safe_ref)
             continue
         if not summary_record_in_window(record, path, start, end):
             continue
@@ -3649,8 +3663,12 @@ def remote_summary_only_gaps(
             source_root=source.root,
             max_scan_bytes=max_scan_bytes,
         )
-    covered_rollout_refs: set[str] = set()
-    has_covered_rollout = False
+    covered_rollout_refs: set[str] = {
+        ref
+        for ref in complete_summary_refs
+        if safe_source_file(source.root / ref, source.root)
+    }
+    has_covered_rollout = bool(covered_rollout_refs)
     for rollout in rollouts:
         rollout_ref = source_relative_path_ref(rollout, source.root)
         summary_backed_materialized = rollout_ref is not None and rollout_ref in complete_summary_refs

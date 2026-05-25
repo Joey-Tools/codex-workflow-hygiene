@@ -5359,6 +5359,47 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
 
+    def test_scan_meta_only_complete_summary_covers_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "payload": {"id": "s1"}})
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        summary_record_count=0,
+                    )
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_stale_rollout_summary_source_bytes_does_not_cover_oversized_rollout_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -9015,6 +9056,46 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_complete_summary_covers_materialized_root_backing_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            (remote / "sessions").mkdir(parents=True)
+            rollout_ref = "rollout-2026-05-01T10-00-00-root.jsonl"
+            rollout = remote / rollout_ref
+            rollout.write_text(
+                json.dumps(message("user", "Root materialized remote task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=rollout_ref, source_bytes=rollout.stat().st_size),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "ready")
 
     def test_default_remote_old_rollout_does_not_cover_current_summary_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
