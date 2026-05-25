@@ -5529,6 +5529,57 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("stale_rollout_summary", reasons)
         self.assertEqual(rows, [])
 
+    def test_stale_rollout_summary_does_not_block_direct_raw_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-small.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Fresh direct task.", "2026-05-01T10:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-small.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size + 1,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Stale summary text",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+            discover_output = safe_output_dir(raw, "discover")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            MODULE.run_discover(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(discover_output), allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((discover_output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("Stale summary text", rows[0]["redacted_user_prompt_summary"])
+        self.assertNotIn("stale_rollout_summary", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "ready")
+        self.assertNotIn("stale_rollout_summary", [gap["reason"] for gap in manifest["coverage_gaps"]])
+
     def test_truncated_stale_rollout_summary_does_not_extract_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -10975,6 +11026,50 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(summary_rows), 1)
         self.assertEqual(summary_rows[0]["status"], "partial")
         self.assertIn("source_bytes", summary_rows[0]["coverage_gap"])
+
+    def test_make_shards_skips_stale_summary_when_raw_rollout_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-small.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Fresh direct task.", "2026-05-01T10:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-small.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size + 1,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Stale summary text",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "ready")
+        self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(rollout))
 
     def test_make_shards_remote_complete_summary_covers_unknown_oversized_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -1556,6 +1556,32 @@ def backing_ref_matches_current_rollout(source_root: Path, ref: str, source_byte
         return False
 
 
+def backing_ref_has_direct_materialized_window_coverage(
+    source_root: Path,
+    ref: str,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+    allow_mtime_fallback: bool = False,
+) -> bool:
+    rollout = source_root / ref
+    if not safe_source_file(rollout, source_root):
+        return False
+    try:
+        if rollout.stat().st_size > max_scan_bytes:
+            return False
+    except OSError:
+        return False
+    return rollout_has_materialized_window_coverage(
+        rollout,
+        start,
+        end,
+        max_raw_bytes=max_scan_bytes,
+        allow_mtime_fallback=allow_mtime_fallback,
+    )
+
+
 def summary_file_has_stale_backing_source(
     path: Path,
     source_root: Path,
@@ -1589,6 +1615,44 @@ def summary_file_has_stale_backing_source(
     )
 
 
+def summary_file_stale_backing_requires_gap(
+    path: Path,
+    source_root: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+    allow_mtime_fallback: bool = False,
+) -> bool:
+    source_bytes = summary_file_declared_source_bytes(path)
+    if source_bytes is None:
+        return False
+    backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    )
+    if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
+        return False
+    stale_refs = [
+        ref
+        for ref in backing_refs
+        if not backing_ref_matches_current_rollout(source_root, ref, source_bytes)
+    ]
+    return any(
+        not backing_ref_has_direct_materialized_window_coverage(
+            source_root,
+            ref,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+        )
+        for ref in stale_refs
+    )
+
+
 def stale_backing_summary_paths(
     summaries: list[Path],
     source_root: Path,
@@ -1606,6 +1670,29 @@ def stale_backing_summary_paths(
             start,
             end,
             max_scan_bytes=max_scan_bytes,
+        )
+    }
+
+
+def stale_backing_summary_gap_paths(
+    summaries: set[Path],
+    source_root: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+    allow_mtime_fallback: bool = False,
+) -> set[Path]:
+    return {
+        summary
+        for summary in summaries
+        if summary_file_stale_backing_requires_gap(
+            summary,
+            source_root,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
         )
     }
 
@@ -3911,6 +3998,7 @@ def run_scan(
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
+        allow_mtime_fallback = source_allows_mtime_fallback(source)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
             gap_start,
@@ -3924,6 +4012,14 @@ def run_scan(
             gap_start,
             end,
             max_scan_bytes=max_raw_bytes,
+        )
+        stale_summary_gap_paths = stale_backing_summary_gap_paths(
+            stale_summary_paths,
+            source.root,
+            gap_start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
         )
         source_materialization_gaps = materialization_gaps_for_source(source)
         source_summary_only_gaps = remote_summary_only_gaps(
@@ -3943,10 +4039,9 @@ def run_scan(
                 "path_ref": path_ref(summary),
                 "reason": "stale_rollout_summary",
             }
-            for summary in stale_summary_paths
+            for summary in stale_summary_gap_paths
         ]
         coverage_gaps.extend(stale_summary_gaps)
-        allow_mtime_fallback = source_allows_mtime_fallback(source)
         blocking_gaps = source_materialization_gaps + source_summary_only_gaps + stale_summary_gaps
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
@@ -4146,6 +4241,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
+        allow_mtime_fallback = source_allows_mtime_fallback(source)
         source_materialization_gaps = materialization_gaps_for_source(source)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
@@ -4160,6 +4256,14 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             start,
             end,
             max_scan_bytes=max_raw_bytes,
+        )
+        stale_summary_gap_paths = stale_backing_summary_gap_paths(
+            stale_summary_paths,
+            source.root,
+            start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
         )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
@@ -4178,7 +4282,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                 "path_ref": path_ref(summary),
                 "reason": "stale_rollout_summary",
             }
-            for summary in stale_summary_paths
+            for summary in stale_summary_gap_paths
         ]
         coverage_gaps.extend(stale_summary_gaps)
         blocking_gaps = source_materialization_gaps + source_summary_only_gaps + stale_summary_gaps
@@ -4360,9 +4464,17 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             end,
             max_scan_bytes=max_raw_bytes,
         ):
-            row["status"] = "partial"
-            row["coverage_gap"] = "summary source_bytes does not match current backing rollout; regenerate bounded rollout-summary before extractor handoff"
-            rows.append(row)
+            if summary_file_stale_backing_requires_gap(
+                summary,
+                root,
+                start,
+                end,
+                max_scan_bytes=max_raw_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+            ):
+                row["status"] = "partial"
+                row["coverage_gap"] = "summary source_bytes does not match current backing rollout; regenerate bounded rollout-summary before extractor handoff"
+                rows.append(row)
             return
         if not summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes):
             return
