@@ -89,6 +89,38 @@ PY
 
 Do not use `jq` or Python to print every record timestamp, key list, or tool call from a large rollout just to orient yourself. Once the counts identify the relevant shape, add an explicit selector and row cap before printing snippets.
 
+For JSONL schema checks, inspect one record or aggregate unique keys once. Do not run `jq -R 'fromjson | keys' file.jsonl`, because it prints the same key list for every line and can produce massive output on retained artifacts such as `turn_flags.jsonl`.
+
+```bash
+python3 - "$JSONL_PATH" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+path = Path(sys.argv[1])
+line_count = 0
+keys = set()
+first = None
+
+with path.open(encoding='utf-8', errors='replace') as handle:
+    for line in handle:
+        line_count += 1
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if first is None:
+            first = row
+        keys.update(row.keys())
+
+print(json.dumps({
+    'path': str(path),
+    'line_count': line_count,
+    'first_record_keys': sorted(first.keys()) if isinstance(first, dict) else [],
+    'unique_keys': sorted(keys),
+}, ensure_ascii=False, sort_keys=True))
+PY
+```
+
 Show user and assistant messages for one rollout, while skipping the wrapper noise that otherwise makes every session look like it mentioned every listed skill:
 
 ```bash

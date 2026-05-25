@@ -16,6 +16,14 @@ class SkillStructureTests(unittest.TestCase):
             self.assertIn("\nname:", frontmatter, path)
             self.assertIn("\ndescription:", frontmatter, path)
 
+    def test_session_mining_avoids_per_record_jsonl_key_dumps(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        self.assertIn("do not run a per-line key dump", skill)
+        self.assertIn("jq -R 'fromjson | keys'", skill)
+        self.assertIn("aggregate unique keys once", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
