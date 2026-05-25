@@ -3765,6 +3765,872 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["window"]["start"], "2026-01-01T00:00:00Z")
         self.assertEqual(trend["window"]["end"], "2026-04-01T00:00:00Z")
 
+    def test_baseline_dry_run_writes_scan_shards_and_report_only(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-dry.jsonl"
+            write_jsonl(rollout, [message("user", "Dry-run task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw, "baseline-dry-run")
+
+            MODULE.main(
+                [
+                    "baseline-dry-run",
+                    "--window-days",
+                    "90",
+                    "--from",
+                    "2026-05-01T00:00:00Z",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--output",
+                    str(output),
+                ]
+            )
+            report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
+            scan_exists = (output / "scan" / "trend_report.json").is_file()
+            shards_exist = (output / "shards" / "shards.jsonl").is_file()
+
+        self.assertTrue(scan_exists)
+        self.assertTrue(shards_exist)
+        self.assertEqual(report["kind"], "baseline_dry_run")
+        self.assertFalse(report["retained_export_created"])
+        self.assertFalse(report["history_commit_created"])
+        self.assertFalse(report["state_advanced"])
+
+    def test_baseline_dry_run_stores_absolute_source_roots_for_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            workspace = Path(raw) / "workspace"
+            workspace.mkdir()
+            root = workspace / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-relative.jsonl"
+            write_jsonl(rollout, [message("user", "Relative dry-run task.", "2026-05-01T10:00:00Z")])
+            dry_run = workspace / ".codex-local" / "session-retrospective" / "baseline-dry-run"
+            repair = workspace / ".codex-local" / "session-retrospective" / "coverage-repair"
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(workspace)
+                MODULE.main(
+                    [
+                        "baseline-dry-run",
+                        "--window-days",
+                        "90",
+                        "--from",
+                        "2026-05-01T00:00:00Z",
+                        "--end",
+                        "2026-05-02T00:00:00Z",
+                        "--source",
+                        "local=.codex",
+                        "--allow-partial-hosts",
+                        "--output",
+                        ".codex-local/session-retrospective/baseline-dry-run",
+                    ]
+                )
+                elsewhere = Path(raw) / "elsewhere"
+                elsewhere.mkdir()
+                os.chdir(elsewhere)
+                MODULE.main(
+                    [
+                        "repair-coverage",
+                        "--run-dir",
+                        str(dry_run),
+                        "--output",
+                        str(repair),
+                        "--skip-remote-materialization",
+                        "--allow-partial-hosts",
+                    ]
+                )
+            finally:
+                os.chdir(previous_cwd)
+            manifest = json.loads((dry_run / "scan" / "shard_manifest.json").read_text(encoding="utf-8"))
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(Path(manifest["sources"][0]["root"]).is_absolute())
+        self.assertEqual(Path(manifest["sources"][0]["root"]).resolve(), root.resolve())
+        self.assertEqual(trend["turn_count"], 1)
+
+    def test_baseline_dry_run_stores_absolute_default_roots_for_skip_remote_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            workspace = Path(raw) / "workspace"
+            home = Path(raw) / "home"
+            workspace.mkdir()
+            root = home / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-default.jsonl"
+            write_jsonl(rollout, [message("user", "Default dry-run task.", "2026-05-01T10:00:00Z")])
+            dry_run = workspace / ".codex-local" / "session-retrospective" / "baseline-dry-run"
+            repair = workspace / ".codex-local" / "session-retrospective" / "coverage-repair"
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(workspace)
+                with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                    MODULE.main(
+                        [
+                            "baseline-dry-run",
+                            "--window-days",
+                            "90",
+                            "--from",
+                            "2026-05-01T00:00:00Z",
+                            "--end",
+                            "2026-05-02T00:00:00Z",
+                            "--output",
+                            ".codex-local/session-retrospective/baseline-dry-run",
+                        ]
+                    )
+                    MODULE.main(
+                        [
+                            "repair-coverage",
+                            "--run-dir",
+                            str(dry_run),
+                            "--output",
+                            str(repair),
+                            "--skip-remote-materialization",
+                        ]
+                    )
+            finally:
+                os.chdir(previous_cwd)
+            manifest = json.loads((dry_run / "scan" / "shard_manifest.json").read_text(encoding="utf-8"))
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(all(Path(source["root"]).is_absolute() for source in manifest["sources"]))
+        self.assertEqual(trend["turn_count"], 1)
+
+    def test_repair_coverage_reruns_with_larger_raw_limit_for_local_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [message("user", f"Oversized local task {index}.", "2026-05-01T10:00:00Z") for index in range(40)],
+            )
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            repair = safe_output_dir(raw, "coverage-repair")
+
+            MODULE.main(
+                [
+                    "baseline-dry-run",
+                    "--window-days",
+                    "90",
+                    "--from",
+                    "2026-05-01T00:00:00Z",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "200",
+                    "--output",
+                    str(dry_run),
+                ]
+            )
+            before = json.loads((dry_run / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+
+            MODULE.main(
+                [
+                    "repair-coverage",
+                    "--run-dir",
+                    str(dry_run),
+                    "--output",
+                    str(repair),
+                    "--skip-remote-materialization",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "20000",
+                ]
+            )
+            after = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in before["coverage_gaps"]])
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in after["coverage_gaps"]])
+        self.assertEqual(report["kind"], "coverage_repair")
+        self.assertFalse(report["retained_export_created"])
+        self.assertFalse(report["state_advanced"])
+
+    def test_repair_coverage_default_output_does_not_nest_under_direct_scan_run_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-direct-scan.jsonl"
+            write_jsonl(rollout, [message("user", "Direct scan repair task.", "2026-05-01T10:00:00Z")])
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+
+            MODULE.main(
+                [
+                    "baseline-dry-run",
+                    "--window-days",
+                    "90",
+                    "--from",
+                    "2026-05-01T00:00:00Z",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--output",
+                    str(dry_run),
+                ]
+            )
+            MODULE.main(
+                [
+                    "repair-coverage",
+                    "--run-dir",
+                    str(dry_run / "scan"),
+                    "--skip-remote-materialization",
+                    "--allow-partial-hosts",
+                ]
+            )
+            MODULE.main(["validate-output", "--run-dir", str(dry_run / "scan")])
+            sibling_report_exists = (dry_run / "coverage-repair" / "repair_report.json").is_file()
+            nested_output_exists = (dry_run / "scan" / "coverage-repair").exists()
+
+        self.assertTrue(sibling_report_exists)
+        self.assertFalse(nested_output_exists)
+
+    def test_repair_coverage_materializes_remote_with_auto_split_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root": str(Path(raw) / "stale-miku"),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 0,
+                        "summary_count": 0,
+                        "status": "stale",
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "reason": "remote_source_not_materialized",
+                    }
+                ],
+                "redaction_policy_version": 1,
+                "retention_safe": False,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            fake_probe_home = Path(raw) / "home"
+            fake_probe_home.mkdir()
+            fake_probe = fake_probe_home / "fake_remote_probe.py"
+            fake_probe.write_text(
+                "\n".join(
+                    [
+                        "import json, pathlib, sys",
+                        "args = sys.argv[1:]",
+                        "cmd = args[0]",
+                        "def arg(name):",
+                        "    return args[args.index(name) + 1]",
+                        "if cmd == 'preflight':",
+                        "    print('host\\thostname\\tuser\\thome\\tcodex\\trg\\tpython3')",
+                        "    print(arg('--host') + '\\tfake\\thoteng\\t/home/hoteng\\tpresent\\tpresent\\tpresent')",
+                        "elif cmd == 'session-meta':",
+                        "    host = arg('--host')",
+                        "    print('host\\tdate\\tsession_id\\tcwd\\trollout')",
+                        "    print(host + '\\t2026/05/01\\ts1\\t/work\\tsessions/2026/05/01/rollout-2026-05-01T10-00-00-remote.jsonl')",
+                        "elif cmd == 'fetch-rollout':",
+                        "    output = pathlib.Path(arg('--output'))",
+                        "    output.parent.mkdir(parents=True, exist_ok=True)",
+                        "    row = {'type': 'event_msg', 'timestamp': '2026-05-01T10:00:00Z', 'payload': {'type': 'user_message', 'message': 'Remote repaired task.'}}",
+                        "    output.write_text(json.dumps(row) + '\\n', encoding='utf-8')",
+                        "    print('ok=true')",
+                        "else:",
+                        "    raise SystemExit(2)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            repair = safe_output_dir(raw, "coverage-repair")
+
+            with mock.patch.dict(os.environ, {"HOME": str(fake_probe_home)}):
+                MODULE.main(
+                    [
+                        "repair-coverage",
+                        "--run-dir",
+                        str(dry_run),
+                        "--output",
+                        str(repair),
+                        "--allow-partial-hosts",
+                        "--remote-probe",
+                        "~/fake_remote_probe.py",
+                    ]
+                )
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["hosts"]["miku-bot-dev"], 1)
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(report["repair"]["materialized_hosts"][0]["rollout_count"], 1)
+
+    def test_repair_coverage_does_not_rematerialize_ready_remote_without_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            remote = Path(raw) / "ready-miku"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-ready.jsonl"
+            write_jsonl(rollout, [message("user", "Ready remote task.", "2026-05-01T10:00:00Z")])
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root": str(remote),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 1,
+                        "summary_count": 0,
+                        "status": "ready",
+                    }
+                ],
+                "coverage_gaps": [],
+                "redaction_policy_version": 1,
+                "retention_safe": True,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe.write_text("raise SystemExit('remote probe should not run')\n", encoding="utf-8")
+            repair = safe_output_dir(raw, "coverage-repair")
+
+            MODULE.main(
+                [
+                    "repair-coverage",
+                    "--run-dir",
+                    str(dry_run),
+                    "--output",
+                    str(repair),
+                    "--allow-partial-hosts",
+                    "--remote-probe",
+                    str(fake_probe),
+                ]
+            )
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["hosts"]["miku-bot-dev"], 1)
+        self.assertEqual(report["repair"]["materialized_hosts"], [])
+
+    def test_repair_coverage_rejects_malformed_session_meta_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root": str(Path(raw) / "stale-miku"),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 0,
+                        "summary_count": 0,
+                        "status": "stale",
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "reason": "remote_source_not_materialized",
+                    }
+                ],
+                "redaction_policy_version": 1,
+                "retention_safe": False,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe.write_text(
+                "\n".join(
+                    [
+                        "import sys",
+                        "args = sys.argv[1:]",
+                        "cmd = args[0]",
+                        "def arg(name):",
+                        "    return args[args.index(name) + 1]",
+                        "if cmd == 'preflight':",
+                        "    print('host\\thostname\\tuser\\thome\\tcodex\\trg\\tpython3')",
+                        "    print(arg('--host') + '\\tfake\\thoteng\\t/home/hoteng\\tpresent\\tpresent\\tpresent')",
+                        "elif cmd == 'session-meta':",
+                        "    print('host\\tdate\\tsession_id\\tcwd')",
+                        "    print(arg('--host') + '\\t2026/05/01\\ts1\\t/work')",
+                        "else:",
+                        "    raise SystemExit(2)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            repair = safe_output_dir(raw, "coverage-repair")
+
+            MODULE.main(
+                [
+                    "repair-coverage",
+                    "--run-dir",
+                    str(dry_run),
+                    "--output",
+                    str(repair),
+                    "--allow-partial-hosts",
+                    "--remote-probe",
+                    str(fake_probe),
+                ]
+            )
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        host_report = report["repair"]["materialized_hosts"][0]
+        self.assertEqual(host_report["status"], "remote_source_not_materialized")
+        self.assertIn("missing required columns: rollout", host_report["errors"][0]["error"])
+
+    def test_repair_coverage_rejects_malformed_session_meta_rows(self) -> None:
+        with self.assertRaisesRegex(ValueError, "row 2 has 4 columns; expected 5"):
+            MODULE.parse_session_meta_rows("host\tdate\tsession_id\tcwd\trollout\nmiku-bot-dev\t2026/05/01\ts1\t/work\n")
+
+        with self.assertRaisesRegex(ValueError, "empty required fields: rollout"):
+            MODULE.parse_session_meta_rows("host\tdate\tsession_id\tcwd\trollout\nmiku-bot-dev\t2026/05/01\ts1\t/work\t\n")
+
+    def test_repair_coverage_preserves_missing_codex_preflight_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root": str(Path(raw) / "stale-miku"),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 0,
+                        "summary_count": 0,
+                        "status": "stale",
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "reason": "remote_source_not_materialized",
+                    }
+                ],
+                "redaction_policy_version": 1,
+                "retention_safe": False,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe.write_text(
+                "\n".join(
+                    [
+                        "import sys",
+                        "args = sys.argv[1:]",
+                        "cmd = args[0]",
+                        "def arg(name):",
+                        "    return args[args.index(name) + 1]",
+                        "if cmd == 'preflight':",
+                        "    print('host\\thostname\\tuser\\thome\\tcodex\\trg\\tpython3')",
+                        "    print(arg('--host') + '\\tfake\\thoteng\\t/home/hoteng\\tmissing\\tpresent\\tpresent')",
+                        "elif cmd == 'session-meta':",
+                        "    raise SystemExit('session-meta should not run when codex is missing')",
+                        "else:",
+                        "    raise SystemExit(2)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            repair = safe_output_dir(raw, "coverage-repair")
+
+            MODULE.main(
+                [
+                    "repair-coverage",
+                    "--run-dir",
+                    str(dry_run),
+                    "--output",
+                    str(repair),
+                    "--allow-partial-hosts",
+                    "--remote-probe",
+                    str(fake_probe),
+                ]
+            )
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+            metadata = json.loads(
+                (repair / "remote-sources" / "miku-bot-dev" / MODULE.REMOTE_SOURCE_METADATA_FILE).read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertIn("missing_codex", [gap["reason"] for gap in trend["coverage_gaps"]])
+        host_report = report["repair"]["materialized_hosts"][0]
+        self.assertEqual(host_report["status"], "missing_codex")
+        self.assertEqual(host_report["errors"][0]["error"], "codex=missing")
+        self.assertEqual(metadata["status"], "missing_codex")
+
+    def test_repair_coverage_keeps_remote_gap_when_rollout_materialization_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root": str(Path(raw) / "stale-miku"),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 0,
+                        "summary_count": 0,
+                        "status": "stale",
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "reason": "remote_source_not_materialized",
+                    }
+                ],
+                "redaction_policy_version": 1,
+                "retention_safe": False,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe.write_text(
+                "\n".join(
+                    [
+                        "import sys",
+                        "args = sys.argv[1:]",
+                        "cmd = args[0]",
+                        "def arg(name):",
+                        "    return args[args.index(name) + 1]",
+                        "if cmd == 'preflight':",
+                        "    print('host\\thostname\\tuser\\thome\\tcodex\\trg\\tpython3')",
+                        "    print(arg('--host') + '\\tfake\\thoteng\\t/home/hoteng\\tpresent\\tpresent\\tpresent')",
+                        "elif cmd == 'session-meta':",
+                        "    host = arg('--host')",
+                        "    print('host\\tdate\\tsession_id\\tcwd\\trollout')",
+                        "    print(host + '\\t2026/05/01\\ts1\\t/work\\tsessions/2026/05/01/rollout-2026-05-01T10-00-00-missing.jsonl')",
+                        "elif cmd in {'fetch-rollout', 'rollout-summary'}:",
+                        "    print('error=blocked', file=sys.stderr)",
+                        "    raise SystemExit(1)",
+                        "else:",
+                        "    raise SystemExit(2)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            repair = safe_output_dir(raw, "coverage-repair")
+
+            MODULE.main(
+                [
+                    "repair-coverage",
+                    "--run-dir",
+                    str(dry_run),
+                    "--output",
+                    str(repair),
+                    "--allow-partial-hosts",
+                    "--remote-probe",
+                    str(fake_probe),
+                ]
+            )
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        host_report = report["repair"]["materialized_hosts"][0]
+        self.assertEqual(host_report["status"], "remote_source_not_materialized")
+        self.assertEqual(host_report["failed_rollout_count"], 1)
+
+    def test_repair_coverage_keeps_remote_gap_when_only_summary_fallback_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root": str(Path(raw) / "stale-miku"),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 0,
+                        "summary_count": 0,
+                        "status": "stale",
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "reason": "remote_source_not_materialized",
+                    }
+                ],
+                "redaction_policy_version": 1,
+                "retention_safe": False,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe.write_text(
+                "\n".join(
+                    [
+                        "import json, sys",
+                        "args = sys.argv[1:]",
+                        "cmd = args[0]",
+                        "def arg(name):",
+                        "    return args[args.index(name) + 1]",
+                        "if cmd == 'preflight':",
+                        "    print('host\\thostname\\tuser\\thome\\tcodex\\trg\\tpython3')",
+                        "    print(arg('--host') + '\\tfake\\thoteng\\t/home/hoteng\\tpresent\\tpresent\\tpresent')",
+                        "elif cmd == 'session-meta':",
+                        "    host = arg('--host')",
+                        "    print('host\\tdate\\tsession_id\\tcwd\\trollout')",
+                        "    print(host + '\\t2026/05/01\\ts1\\t/work\\tsessions/2026/05/01/rollout-2026-05-01T10-00-00-summary-only.jsonl')",
+                        "elif cmd == 'fetch-rollout':",
+                        "    print('error=blocked', file=sys.stderr)",
+                        "    raise SystemExit(1)",
+                        "elif cmd == 'rollout-summary':",
+                        "    rollout = arg('--rollout')",
+                        "    print(json.dumps({'kind': 'scan_meta', 'timestamp': '', 'rollout': rollout, 'scan_bytes': 1000, 'scan_truncated': False, 'json_error_count': 0, 'keyword_filter_applied': False, 'record_limit_reached': False, 'signal_record_limit_reached': False, 'matched_record_limit_reached': False, 'tail_record_limit_reached': False, 'summary_limit': 200, 'source_bytes': 1000}))",
+                        "    print(json.dumps({'kind': 'user_message', 'timestamp': '2026-05-01T10:00:00Z', 'rollout': rollout, 'text': 'permission denied while reading remote rollout'}))",
+                        "else:",
+                        "    raise SystemExit(2)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            repair = safe_output_dir(raw, "coverage-repair")
+
+            MODULE.main(
+                [
+                    "repair-coverage",
+                    "--run-dir",
+                    str(dry_run),
+                    "--output",
+                    str(repair),
+                    "--allow-partial-hosts",
+                    "--remote-probe",
+                    str(fake_probe),
+                ]
+            )
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+            metadata = json.loads(
+                (
+                    repair
+                    / "remote-sources"
+                    / "miku-bot-dev"
+                    / MODULE.REMOTE_SOURCE_METADATA_FILE
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(trend["turn_count"], 1)
+        host_report = report["repair"]["materialized_hosts"][0]
+        self.assertEqual(host_report["status"], "ready")
+        self.assertEqual(host_report["summary_count"], 1)
+        self.assertEqual(host_report["failed_rollout_count"], 0)
+        self.assertEqual(metadata["status"], "ready")
+
+    def test_repair_coverage_rejects_relative_manifest_source_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "local",
+                        "root": ".codex",
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 1,
+                        "summary_count": 0,
+                        "status": "ready",
+                    }
+                ],
+                "coverage_gaps": [],
+                "redaction_policy_version": 1,
+                "retention_safe": False,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            repair = safe_output_dir(raw, "coverage-repair")
+
+            with self.assertRaisesRegex(SystemExit, "absolute source roots"):
+                MODULE.main(
+                    [
+                        "repair-coverage",
+                        "--run-dir",
+                        str(dry_run),
+                        "--output",
+                        str(repair),
+                        "--skip-remote-materialization",
+                        "--allow-partial-hosts",
+                    ]
+                )
+
+    def test_repair_coverage_rejects_symlinked_remote_sources_output(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root": str(Path(raw) / "stale-miku"),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 0,
+                        "summary_count": 0,
+                        "status": "stale",
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "reason": "remote_source_not_materialized",
+                    }
+                ],
+                "redaction_policy_version": 1,
+                "retention_safe": False,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe.write_text("raise SystemExit(2)\n", encoding="utf-8")
+            repair = safe_output_dir(raw, "coverage-repair")
+            repair.mkdir(parents=True)
+            outside = Path(raw) / "outside"
+            outside.mkdir()
+            (repair / "remote-sources").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(SystemExit, "materialized remote metadata must not use symlink"):
+                MODULE.main(
+                    [
+                        "repair-coverage",
+                        "--run-dir",
+                        str(dry_run),
+                        "--output",
+                        str(repair),
+                        "--allow-partial-hosts",
+                        "--remote-probe",
+                        str(fake_probe),
+                    ]
+                )
+
+    def test_repair_coverage_rejects_non_empty_remote_materialization_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root": str(Path(raw) / "stale-miku"),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 0,
+                        "summary_count": 0,
+                        "status": "stale",
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "reason": "remote_source_not_materialized",
+                    }
+                ],
+                "redaction_policy_version": 1,
+                "retention_safe": False,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe.write_text("raise SystemExit(2)\n", encoding="utf-8")
+            repair = safe_output_dir(raw, "coverage-repair")
+            stale = repair / "remote-sources" / "miku-bot-dev" / "sessions" / "2026" / "05" / "01"
+            write_jsonl(
+                stale / "rollout-2026-05-01T10-00-00-stale.jsonl",
+                [message("user", "Stale remote task.", "2026-05-01T10:00:00Z")],
+            )
+
+            with self.assertRaisesRegex(SystemExit, "remote materialization root must be empty"):
+                MODULE.main(
+                    [
+                        "repair-coverage",
+                        "--run-dir",
+                        str(dry_run),
+                        "--output",
+                        str(repair),
+                        "--allow-partial-hosts",
+                        "--remote-probe",
+                        str(fake_probe),
+                    ]
+                )
+
     def test_baseline_from_first_includes_rollout_summary_dates(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

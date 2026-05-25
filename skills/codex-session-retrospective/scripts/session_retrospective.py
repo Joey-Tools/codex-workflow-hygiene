@@ -168,6 +168,8 @@ RETAINED_MODEL_IDS = frozenset(("gpt-5.5", "gpt-5.4", "gpt-5.3-codex"))
 RETAINED_MODEL_ERAS = frozenset((*RETAINED_MODEL_IDS, "other-model", "pre-gpt-5.3-codex", "unknown"))
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
+SESSION_META_TSV_FIELDS = ("host", "date", "session_id", "cwd", "rollout")
+PREFLIGHT_TSV_FIELDS = ("host", "codex")
 HISTORY_FORBIDDEN_FILENAMES = frozenset((*TRANSIENT_OUTPUT_FILES, *LOCAL_EVIDENCE_FILES, REMOTE_SOURCE_METADATA_FILE))
 HISTORY_FORBIDDEN_COMPONENTS = frozenset((".codex", ".codex-local", ".codex-tmp", "raw", "scratch", "transient"))
 HISTORY_FORBIDDEN_NAME_STEMS = frozenset(
@@ -1976,6 +1978,32 @@ def stale_backing_summary_gap_paths(
     }
 
 
+def remote_summary_fallback_is_extractable(
+    source: Source,
+    summary: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    if source.host not in DEFAULT_REMOTE_HOSTS:
+        return False
+    backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+        summary,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+        source_root=source.root,
+    )
+    if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
+        return False
+    for ref in backing_refs:
+        backing_path = source.root / ref
+        if backing_path.exists() or backing_path.is_symlink():
+            return False
+    return True
+
+
 def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
     if start is None and end is None:
         return True
@@ -3249,6 +3277,49 @@ def parse_sources(values: list[str] | None, *, require_default_hosts: bool = Tru
             if host not in present:
                 sources.append(Source(host, DEFAULT_REMOTE_SOURCE_ROOT / host, "remote_source_not_materialized"))
     return sources
+
+
+def absolute_source_arg_values(values: list[str] | None) -> list[str] | None:
+    if values is None:
+        return None
+    normalized: list[str] = []
+    for value in values:
+        if "=" not in value:
+            raise SystemExit(f"--source must be HOST=PATH, got {value!r}")
+        host, raw_path = value.split("=", 1)
+        if not raw_path.strip():
+            raise SystemExit("--source PATH must be non-empty")
+        root = Path(raw_path).expanduser()
+        if not root.is_absolute():
+            root = (Path.cwd() / root).absolute()
+        normalized.append(f"{host}={root}")
+    return normalized
+
+
+def absolute_default_source_path(host: str) -> Path:
+    if host == "local":
+        return Path("~/.codex").expanduser()
+    return (Path.cwd() / DEFAULT_REMOTE_SOURCE_ROOT / host).absolute()
+
+
+def baseline_dry_run_source_arg_values(values: list[str] | None, *, require_default_hosts: bool) -> list[str]:
+    normalized = absolute_source_arg_values(values) or []
+    present: set[str] = set()
+    for value in normalized:
+        host, _raw_path = value.split("=", 1)
+        present.add(retained_source_host(host))
+    if not normalized:
+        normalized.append(f"local={absolute_default_source_path('local')}")
+        present.add("local")
+    if require_default_hosts:
+        if "local" not in present:
+            normalized.insert(0, f"local={absolute_default_source_path('local')}")
+            present.add("local")
+        for host in DEFAULT_REMOTE_HOSTS:
+            if host not in present:
+                normalized.append(f"{host}={absolute_default_source_path(host)}")
+                present.add(host)
+    return normalized
 
 
 def load_state(path: Path | None) -> dict[str, Any]:
@@ -4534,7 +4605,13 @@ def run_scan(
                         }
                     )
                 continue
-            if summary in stale_summary_paths:
+            if summary in stale_summary_paths and not remote_summary_fallback_is_extractable(
+                source,
+                summary,
+                gap_start,
+                end,
+                max_scan_bytes=max_raw_bytes,
+            ):
                 continue
             if not summary_file_relevant_or_backing_ref_relevant(
                 summary,
@@ -4769,6 +4846,14 @@ def bounded_baseline_end(start: dt.datetime, window_days: int, now: dt.datetime)
 
 
 def cmd_baseline(args: argparse.Namespace) -> int:
+    window_days, start, now = baseline_window(args)
+    mode = f"baseline-{window_days}d"
+    end = bounded_baseline_end(start, window_days, now)
+    validate_window_bounds(start, end, "baseline")
+    return run_scan(args, mode=mode, start=start, end=end)
+
+
+def baseline_window(args: argparse.Namespace) -> tuple[int, dt.datetime, dt.datetime]:
     window_days = require_positive_window(args.window_days, "--window-days")
     if window_days > MAX_BASELINE_WINDOW_DAYS:
         raise SystemExit(f"--window-days must stay at or below {MAX_BASELINE_WINDOW_DAYS}")
@@ -4780,10 +4865,590 @@ def cmd_baseline(args: argparse.Namespace) -> int:
         start = parse_time(args.from_value)
         if start is None:
             raise SystemExit(f"invalid --from timestamp: {args.from_value}")
-    mode = f"baseline-{window_days}d"
+    return window_days, start, now
+
+
+def gap_counts(gaps: Iterable[dict[str, Any]]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for gap in gaps:
+        reason = str(gap.get("reason") or "unknown")
+        counts[reason] += 1
+    return dict(sorted(counts.items()))
+
+
+def source_status_counts(sources: Iterable[dict[str, Any]]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for source in sources:
+        status = str(source.get("status") or "unknown")
+        counts[status] += 1
+    return dict(sorted(counts.items()))
+
+
+def read_json_file(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path}: JSON root must be an object")
+    return data
+
+
+def count_jsonl_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for _line_no, _record in iter_jsonl_strict(path))
+
+
+def dry_run_report(
+    *,
+    kind: str,
+    root: Path,
+    scan_dir: Path,
+    shards_dir: Path,
+    trend: dict[str, Any],
+    manifest: dict[str, Any],
+    repair_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    coverage_gaps = list(manifest.get("coverage_gaps") or [])
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": kind,
+        "root": root.as_posix(),
+        "scan_dir": scan_dir.as_posix(),
+        "shards_dir": shards_dir.as_posix(),
+        "window": manifest.get("window") or trend.get("window") or {},
+        "turn_count": trend.get("turn_count", 0),
+        "episode_count": trend.get("episode_count", 0),
+        "coverage_gap_counts": gap_counts(coverage_gaps),
+        "source_status_counts": source_status_counts(manifest.get("sources") or []),
+        "shard_count": count_jsonl_rows(shards_dir / "shards.jsonl"),
+        "retained_export_created": False,
+        "history_commit_created": False,
+        "state_advanced": False,
+    }
+    if repair_report is not None:
+        report["repair"] = repair_report
+    return report
+
+
+def run_make_shards_for_scan(scan_dir: Path, shards_dir: Path, *, max_raw_bytes: int) -> None:
+    cmd_make_shards(
+        argparse.Namespace(
+            manifest=str(scan_dir / "shard_manifest.json"),
+            output=str(shards_dir),
+            max_raw_bytes=max_raw_bytes,
+            include_raw_paths=False,
+        )
+    )
+
+
+def cmd_baseline_dry_run(args: argparse.Namespace) -> int:
+    window_days, start, now = baseline_window(args)
     end = bounded_baseline_end(start, window_days, now)
-    validate_window_bounds(start, end, "baseline")
-    return run_scan(args, mode=mode, start=start, end=end)
+    validate_window_bounds(start, end, "baseline dry-run")
+    max_raw_bytes = require_positive_window(args.max_raw_bytes, "--max-raw-bytes")
+    root = ensure_safe_output_dir(Path(args.output)).absolute()
+    scan_dir = root / "scan"
+    shards_dir = root / "shards"
+    source_values = baseline_dry_run_source_arg_values(
+        args.source,
+        require_default_hosts=not args.allow_partial_hosts,
+    )
+    scan_args = argparse.Namespace(
+        source=source_values,
+        state=None,
+        output=str(scan_dir),
+        max_raw_bytes=max_raw_bytes,
+        allow_partial_hosts=args.allow_partial_hosts,
+    )
+    mode = f"baseline-{window_days}d"
+    run_scan(scan_args, mode=mode, start=start, end=end)
+    trend, _retained_manifest = validate_output_run(scan_dir)
+    run_make_shards_for_scan(scan_dir, shards_dir, max_raw_bytes=max_raw_bytes)
+    manifest = read_json_file(scan_dir / "shard_manifest.json")
+    write_json(
+        root / "dry_run_report.json",
+        dry_run_report(
+            kind="baseline_dry_run",
+            root=root,
+            scan_dir=scan_dir,
+            shards_dir=shards_dir,
+            trend=trend,
+            manifest=manifest,
+        ),
+    )
+    print(root)
+    return 0
+
+
+def scan_dir_from_run_dir(run_dir: Path) -> Path:
+    if (run_dir / "scan" / "shard_manifest.json").is_file():
+        return run_dir / "scan"
+    if (run_dir / "shard_manifest.json").is_file():
+        return run_dir
+    raise SystemExit("--run-dir must be a baseline-dry-run directory or a scan output directory")
+
+
+def manifest_window_bounds(manifest: dict[str, Any]) -> tuple[dt.datetime, dt.datetime]:
+    window = manifest.get("window")
+    if not isinstance(window, dict):
+        raise SystemExit("scan manifest must include a window object")
+    return require_manifest_window_bounds(window, "scan manifest window")
+
+
+def date_chunks_for_window(start: dt.datetime, end: dt.datetime, *, max_days: int = 31) -> list[tuple[dt.date, dt.date]]:
+    if end <= start:
+        raise SystemExit("repair window start must be before end")
+    first = start.astimezone(dt.timezone.utc).date()
+    last = (end.astimezone(dt.timezone.utc) - dt.timedelta(microseconds=1)).date()
+    chunks: list[tuple[dt.date, dt.date]] = []
+    current = first
+    while current <= last:
+        chunk_end = min(last, current + dt.timedelta(days=max_days - 1))
+        chunks.append((current, chunk_end))
+        current = chunk_end + dt.timedelta(days=1)
+    return chunks
+
+
+def date_arg(value: dt.date) -> str:
+    return value.strftime("%Y/%m/%d")
+
+
+def command_failure(result: subprocess.CompletedProcess[str]) -> str:
+    message = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+    return compact(message, 400)
+
+
+def run_remote_probe(remote_probe: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(remote_probe), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
+def parse_session_meta_rows(text: str) -> list[dict[str, str]]:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(f"session-meta TSV output is missing required columns: {', '.join(SESSION_META_TSV_FIELDS)}")
+    header = lines[0].split("\t")
+    duplicate_fields = sorted(field for field, count in Counter(header).items() if count > 1)
+    if duplicate_fields:
+        raise ValueError(f"session-meta TSV output has duplicate columns: {', '.join(duplicate_fields)}")
+    missing_fields = [field for field in SESSION_META_TSV_FIELDS if field not in header]
+    if missing_fields:
+        raise ValueError(f"session-meta TSV output is missing required columns: {', '.join(missing_fields)}")
+    rows: list[dict[str, str]] = []
+    for line_no, line in enumerate(lines[1:], start=2):
+        values = line.split("\t")
+        if len(values) != len(header):
+            raise ValueError(
+                f"session-meta TSV row {line_no} has {len(values)} columns; expected {len(header)}"
+            )
+        row = {key: values[index] for index, key in enumerate(header)}
+        empty_fields = [field for field in ("host", "date", "session_id", "rollout") if not row[field]]
+        if empty_fields:
+            raise ValueError(
+                f"session-meta TSV row {line_no} has empty required fields: {', '.join(empty_fields)}"
+            )
+        rows.append(row)
+    return rows
+
+
+def parse_preflight_rows(text: str) -> list[dict[str, str]]:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(f"preflight TSV output is missing required columns: {', '.join(PREFLIGHT_TSV_FIELDS)}")
+    header = lines[0].split("\t")
+    duplicate_fields = sorted(field for field, count in Counter(header).items() if count > 1)
+    if duplicate_fields:
+        raise ValueError(f"preflight TSV output has duplicate columns: {', '.join(duplicate_fields)}")
+    missing_fields = [field for field in PREFLIGHT_TSV_FIELDS if field not in header]
+    if missing_fields:
+        raise ValueError(f"preflight TSV output is missing required columns: {', '.join(missing_fields)}")
+    rows: list[dict[str, str]] = []
+    for line_no, line in enumerate(lines[1:], start=2):
+        values = line.split("\t")
+        if len(values) != len(header):
+            raise ValueError(f"preflight TSV row {line_no} has {len(values)} columns; expected {len(header)}")
+        row = {key: values[index] for index, key in enumerate(header)}
+        empty_fields = [field for field in PREFLIGHT_TSV_FIELDS if not row[field]]
+        if empty_fields:
+            raise ValueError(f"preflight TSV row {line_no} has empty required fields: {', '.join(empty_fields)}")
+        rows.append(row)
+    return rows
+
+
+def preflight_row_for_host(rows: list[dict[str, str]], host: str) -> dict[str, str]:
+    for row in rows:
+        if row.get("host") == host:
+            return row
+    raise ValueError(f"preflight TSV output is missing row for host: {host}")
+
+
+def safe_materialized_target(root: Path, ref: str) -> Path:
+    safe_ref = safe_rollout_backing_ref(ref)
+    if safe_ref is None:
+        raise SystemExit(f"remote session-meta returned unsafe rollout ref: {ref}")
+    target = root / safe_ref
+    resolved_root = root.resolve(strict=False)
+    resolved_target = target.resolve(strict=False)
+    try:
+        resolved_target.relative_to(resolved_root)
+    except ValueError as exc:
+        raise SystemExit(f"remote session-meta rollout ref escapes materialized root: {ref}") from exc
+    reject_symlink_ancestors(target, label="materialized remote rollout")
+    return target
+
+
+def safe_write_bytes(path: Path, data: bytes) -> None:
+    reject_symlink_ancestors(path, label="materialized remote artifact")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and (path.is_symlink() or not path.is_file()):
+        raise SystemExit(f"refusing to overwrite unexpected materialized artifact: {path}")
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except Exception:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def write_materialized_remote_metadata(root: Path, metadata: dict[str, Any]) -> None:
+    safe_write_bytes(root / REMOTE_SOURCE_METADATA_FILE, json_bytes(metadata))
+
+
+def summary_path_for_rollout(root: Path, rollout_ref: str) -> Path:
+    safe_ref = safe_rollout_backing_ref(rollout_ref)
+    if safe_ref is None:
+        raise SystemExit(f"unsafe rollout ref: {rollout_ref}")
+    rollout_path = Path(safe_ref)
+    digest = hashlib.sha256(safe_ref.encode("utf-8")).hexdigest()[:12]
+    name = f"rollout-summary-{rollout_path.stem}-{digest}.jsonl"
+    return root / Path(*rollout_path.parts[:-1]) / name
+
+
+def materialize_remote_host(
+    *,
+    host: str,
+    root: Path,
+    start: dt.datetime,
+    end: dt.datetime,
+    remote_probe: Path,
+    session_meta_limit: int,
+) -> dict[str, Any]:
+    reject_symlink_ancestors(root / REMOTE_SOURCE_METADATA_FILE, label="materialized remote metadata")
+    if root.exists():
+        if not root.is_dir():
+            raise SystemExit(f"remote materialization root must be a directory: {root}")
+        if any(root.iterdir()):
+            raise SystemExit(f"remote materialization root must be empty before repair: {root}")
+    report: dict[str, Any] = {
+        "host": host,
+        "root": root.as_posix(),
+        "status": "ready",
+        "rollout_count": 0,
+        "summary_count": 0,
+        "failed_rollout_count": 0,
+        "errors": [],
+    }
+    preflight = run_remote_probe(remote_probe, ["preflight", "--host", host])
+    if preflight.returncode != 0:
+        report["status"] = "host_unreachable"
+        report["errors"].append({"command": "preflight", "error": command_failure(preflight)})
+        write_materialized_remote_metadata(
+            root,
+            {
+                "host": host,
+                "status": "host_unreachable",
+                "reason": "host_unreachable",
+                "window_start": iso(start),
+                "window_end": iso(end),
+                "materialized_at": iso(utc_now()),
+            },
+        )
+        return report
+    try:
+        preflight_row = preflight_row_for_host(parse_preflight_rows(preflight.stdout), host)
+    except ValueError as error:
+        report["status"] = "remote_source_not_materialized"
+        report["errors"].append({"command": "preflight", "error": str(error)})
+        write_materialized_remote_metadata(
+            root,
+            {
+                "host": host,
+                "status": "remote_source_not_materialized",
+                "reason": "remote_source_not_materialized",
+                "window_start": iso(start),
+                "window_end": iso(end),
+                "materialized_at": iso(utc_now()),
+            },
+        )
+        return report
+    if preflight_row["codex"] != "present":
+        report["status"] = "missing_codex"
+        report["errors"].append({"command": "preflight", "error": f"codex={preflight_row['codex']}"})
+        write_materialized_remote_metadata(
+            root,
+            {
+                "host": host,
+                "status": "missing_codex",
+                "reason": "missing_codex",
+                "window_start": iso(start),
+                "window_end": iso(end),
+                "materialized_at": iso(utc_now()),
+            },
+        )
+        return report
+
+    rows: list[dict[str, str]] = []
+    for chunk_start, chunk_end in date_chunks_for_window(start, end):
+        session_meta = run_remote_probe(
+            remote_probe,
+            [
+                "session-meta",
+                "--host",
+                host,
+                "--from",
+                date_arg(chunk_start),
+                "--to",
+                date_arg(chunk_end),
+                "--limit",
+                str(session_meta_limit),
+                "--auto-split",
+            ],
+        )
+        if session_meta.returncode != 0:
+            report["status"] = "remote_source_not_materialized"
+            report["errors"].append(
+                {
+                    "command": "session-meta",
+                    "from": date_arg(chunk_start),
+                    "to": date_arg(chunk_end),
+                    "error": command_failure(session_meta),
+                }
+            )
+            write_materialized_remote_metadata(
+                root,
+                {
+                    "host": host,
+                    "status": "remote_source_not_materialized",
+                    "reason": "remote_source_not_materialized",
+                    "window_start": iso(start),
+                    "window_end": iso(end),
+                    "materialized_at": iso(utc_now()),
+                },
+            )
+            return report
+        try:
+            rows.extend(parse_session_meta_rows(session_meta.stdout))
+        except ValueError as error:
+            report["status"] = "remote_source_not_materialized"
+            report["errors"].append(
+                {
+                    "command": "session-meta",
+                    "from": date_arg(chunk_start),
+                    "to": date_arg(chunk_end),
+                    "error": str(error),
+                }
+            )
+            write_materialized_remote_metadata(
+                root,
+                {
+                    "host": host,
+                    "status": "remote_source_not_materialized",
+                    "reason": "remote_source_not_materialized",
+                    "window_start": iso(start),
+                    "window_end": iso(end),
+                    "materialized_at": iso(utc_now()),
+                },
+            )
+            return report
+
+    rollout_refs = sorted(
+        {
+            str(row.get("rollout") or "")
+            for row in rows
+            if str(row.get("host") or host) == host and str(row.get("rollout") or "")
+        }
+    )
+    with tempfile.TemporaryDirectory(prefix="codex-session-retrospective-fetch-", dir="/tmp") as temp_dir:
+        temp_root = Path(temp_dir)
+        for rollout_ref in rollout_refs:
+            target = safe_materialized_target(root, rollout_ref)
+            temp_output = temp_root / hashlib.sha256(rollout_ref.encode("utf-8")).hexdigest()
+            fetch = run_remote_probe(
+                remote_probe,
+                ["fetch-rollout", "--host", host, "--rollout", rollout_ref, "--output", str(temp_output)],
+            )
+            if fetch.returncode == 0:
+                safe_write_bytes(target, temp_output.read_bytes())
+                report["rollout_count"] += 1
+                continue
+            summary = run_remote_probe(
+                remote_probe,
+                ["rollout-summary", "--host", host, "--rollout", rollout_ref, "--limit", "200", "--tail-records", "50"],
+            )
+            if summary.returncode == 0:
+                safe_write_bytes(summary_path_for_rollout(root, rollout_ref), summary.stdout.encode("utf-8"))
+                report["summary_count"] += 1
+                report["errors"].append(
+                    {
+                        "command": "fetch-rollout",
+                        "rollout": path_ref(target),
+                        "error": command_failure(fetch),
+                        "repair": "wrote bounded rollout-summary; raw backing rollout is absent, so scan keeps a coverage gap while extracting bounded signal",
+                    }
+                )
+                continue
+            report["errors"].append(
+                {
+                    "command": "fetch-rollout",
+                    "rollout": path_ref(target),
+                    "error": command_failure(fetch),
+                }
+            )
+            report["errors"].append(
+                {
+                    "command": "rollout-summary",
+                    "rollout": path_ref(target),
+                    "error": command_failure(summary),
+                }
+            )
+            report["failed_rollout_count"] += 1
+
+    if report["status"] == "ready" and report["failed_rollout_count"]:
+        report["status"] = "remote_source_not_materialized"
+    metadata: dict[str, Any] = {
+        "host": host,
+        "status": report["status"],
+        "window_start": iso(start),
+        "window_end": iso(end),
+        "materialized_at": iso(utc_now()),
+    }
+    if report["status"] != "ready":
+        metadata["reason"] = report["status"]
+    write_materialized_remote_metadata(
+        root,
+        metadata,
+    )
+    return report
+
+
+def source_args_from_manifest(
+    manifest: dict[str, Any],
+    *,
+    remote_roots: dict[str, Path],
+) -> list[str]:
+    values: list[str] = []
+    for source in manifest.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        host = str(source.get("host") or "")
+        root = remote_roots.get(host)
+        if root is None:
+            raw_root = source.get("root")
+            if not isinstance(raw_root, str) or not raw_root:
+                raise SystemExit("repair-coverage requires a transient shard_manifest.json with raw source roots")
+            root = Path(raw_root).expanduser()
+            if not root.is_absolute():
+                raise SystemExit(
+                    "repair-coverage requires absolute source roots in shard_manifest.json; rerun baseline-dry-run with the updated helper"
+                )
+        values.append(f"{host}={root}")
+    if not values:
+        raise SystemExit("repair-coverage requires at least one source in the scan manifest")
+    return values
+
+
+def cmd_repair_coverage(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir)
+    scan_dir = scan_dir_from_run_dir(run_dir)
+    manifest = read_json_file(scan_dir / "shard_manifest.json")
+    start, end = manifest_window_bounds(manifest)
+    max_raw_bytes = require_positive_window(args.max_raw_bytes, "--max-raw-bytes")
+    session_meta_limit = require_positive_window(args.remote_session_meta_limit, "--remote-session-meta-limit")
+    root = (
+        ensure_safe_output_dir(Path(args.output)).absolute()
+        if args.output
+        else ensure_safe_output_dir(scan_dir.parent / "coverage-repair").absolute()
+    )
+    remote_probe = Path(args.remote_probe).expanduser() if args.remote_probe else Path(__file__).with_name("remote_codex_probe.py")
+    if not remote_probe.is_file():
+        raise SystemExit(f"remote probe helper not found: {remote_probe}")
+
+    remote_roots: dict[str, Path] = {}
+    materialized_hosts: list[dict[str, Any]] = []
+    if not args.skip_remote_materialization:
+        gap_hosts = {
+            str(gap.get("host") or "")
+            for gap in manifest.get("coverage_gaps") or []
+            if isinstance(gap, dict) and str(gap.get("reason") or "") in ALLOWED_REMOTE_GAP_REASONS
+        }
+        for host in DEFAULT_REMOTE_HOSTS:
+            if host not in gap_hosts:
+                continue
+            remote_root = root / "remote-sources" / host
+            remote_roots[host] = remote_root
+            materialized_hosts.append(
+                materialize_remote_host(
+                    host=host,
+                    root=remote_root,
+                    start=start,
+                    end=end,
+                    remote_probe=remote_probe,
+                    session_meta_limit=session_meta_limit,
+                )
+            )
+
+    repaired_scan_dir = root / "scan"
+    repaired_shards_dir = root / "shards"
+    source_args = source_args_from_manifest(manifest, remote_roots=remote_roots)
+    mode = str(manifest.get("mode") or (manifest.get("window") or {}).get("mode") or "baseline-repair")
+    run_scan(
+        argparse.Namespace(
+            source=source_args,
+            state=None,
+            output=str(repaired_scan_dir),
+            max_raw_bytes=max_raw_bytes,
+            allow_partial_hosts=args.allow_partial_hosts,
+        ),
+        mode=mode,
+        start=start,
+        end=end,
+    )
+    trend, _retained_manifest = validate_output_run(repaired_scan_dir)
+    run_make_shards_for_scan(repaired_scan_dir, repaired_shards_dir, max_raw_bytes=max_raw_bytes)
+    repaired_manifest = read_json_file(repaired_scan_dir / "shard_manifest.json")
+    repair_summary = {
+        "input_scan_dir": scan_dir.as_posix(),
+        "before_coverage_gap_counts": gap_counts(manifest.get("coverage_gaps") or []),
+        "after_coverage_gap_counts": gap_counts(repaired_manifest.get("coverage_gaps") or []),
+        "max_raw_bytes": max_raw_bytes,
+        "materialized_hosts": materialized_hosts,
+    }
+    write_json(
+        root / "repair_report.json",
+        dry_run_report(
+            kind="coverage_repair",
+            root=root,
+            scan_dir=repaired_scan_dir,
+            shards_dir=repaired_shards_dir,
+            trend=trend,
+            manifest=repaired_manifest,
+            repair_report=repair_summary,
+        ),
+    )
+    print(root)
+    return 0
 
 
 def parse_manifest_window_time(window: dict[str, Any], key: str) -> dt.datetime | None:
@@ -5325,6 +5990,48 @@ def build_parser() -> argparse.ArgumentParser:
     baseline.add_argument("--from", dest="from_value", default="first")
     baseline.add_argument("--end", help="Fixed upper bound timestamp for the baseline window.")
     baseline.set_defaults(func=cmd_baseline)
+
+    baseline_dry_run = subparsers.add_parser(
+        "baseline-dry-run",
+        help="Run a baseline scan, validation, and shard dry run without retained export, commit, or state advancement.",
+    )
+    add_common_scan_args(baseline_dry_run)
+    baseline_dry_run.add_argument("--window-days", type=int, default=90)
+    baseline_dry_run.add_argument("--from", dest="from_value", default="first")
+    baseline_dry_run.add_argument("--end", help="Fixed upper bound timestamp for the baseline window.")
+    baseline_dry_run.set_defaults(func=cmd_baseline_dry_run)
+
+    repair_coverage = subparsers.add_parser(
+        "repair-coverage",
+        help="Repair dry-run coverage by rematerializing default remotes and rerunning the scan; no retained export, commit, or state advancement.",
+    )
+    repair_coverage.add_argument("--run-dir", required=True, help="baseline-dry-run root or scan output directory.")
+    repair_coverage.add_argument(
+        "--output",
+        help="Output directory under .codex-local/session-retrospective. Defaults to the scan output directory's sibling coverage-repair.",
+    )
+    repair_coverage.add_argument(
+        "--max-raw-bytes",
+        type=int,
+        default=16 * 1024 * 1024,
+        help="Raw rollout size limit for the repaired scan.",
+    )
+    repair_coverage.add_argument(
+        "--remote-probe",
+        help="Path to remote_codex_probe.py. Defaults to the bundled helper beside this script.",
+    )
+    repair_coverage.add_argument("--remote-session-meta-limit", type=int, default=500)
+    repair_coverage.add_argument(
+        "--skip-remote-materialization",
+        action="store_true",
+        help="Only rerun the scan, useful for local oversized coverage repair.",
+    )
+    repair_coverage.add_argument(
+        "--allow-partial-hosts",
+        action="store_true",
+        help="Allow intentionally narrowed repair scans. Partial scans cannot advance shared state.",
+    )
+    repair_coverage.set_defaults(func=cmd_repair_coverage)
 
     shards = subparsers.add_parser("make-shards")
     shards.add_argument("--manifest", required=True)
