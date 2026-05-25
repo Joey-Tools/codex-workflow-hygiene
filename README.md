@@ -1,6 +1,7 @@
 # Codex Workflow Hygiene
 
-Public skills for skill authoring, session mining, and Codex rules hygiene.
+Public skills for skill authoring, session mining, Codex rules hygiene, and
+redacted session retrospective artifact generation.
 
 ## Test
 
