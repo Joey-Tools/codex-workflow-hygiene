@@ -1580,8 +1580,8 @@ def complete_scan_meta_backing_source_bytes_by_ref(
             if safe_ref is None:
                 return None
             has_rollout_ref = True
-            if not rollout_ref_in_window(safe_ref, start, end):
-                continue
+            # The selected backing refs already apply the summary/window filter.
+            # Keep proof collection complete so old rollout filenames can back current summary records.
             previous = source_bytes_by_ref.get(safe_ref)
             if previous is not None and previous != source_bytes:
                 return None
@@ -4279,6 +4279,8 @@ def run_scan(
                 if summary_file_maybe_relevant_with_scan_cap(summary, gap_start, end, max_scan_bytes=max_raw_bytes):
                     append_oversized_summary_gap(summary, size)
                 continue
+            if summary in stale_summary_paths and summary not in stale_summary_gap_paths:
+                continue
             jsonl_error = first_jsonl_error(summary)
             if (
                 summary_file_has_truncated_scan(summary)
@@ -4604,25 +4606,6 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             row["coverage_gap"] = "summary exceeds max raw shard bytes; regenerate bounded rollout-summary before extractor handoff"
             rows.append(row)
             return
-        jsonl_error = first_jsonl_error(summary)
-        if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(summary):
-            if not summary_file_maybe_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes):
-                return
-            row["status"] = "partial"
-            row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
-            rows.append(row)
-            return
-        if jsonl_error is not None:
-            if not (
-                summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_raw_bytes)
-                if jsonl_error.unreadable
-                else summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes)
-            ):
-                return
-            row["status"] = "invalid"
-            row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
-            rows.append(row)
-            return
         if summary_file_has_stale_backing_source(
             summary,
             root,
@@ -4641,6 +4624,25 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 row["status"] = "partial"
                 row["coverage_gap"] = "summary source_bytes does not match current backing rollout; regenerate bounded rollout-summary before extractor handoff"
                 rows.append(row)
+            return
+        jsonl_error = first_jsonl_error(summary)
+        if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(summary):
+            if not summary_file_maybe_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes):
+                return
+            row["status"] = "partial"
+            row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
+            rows.append(row)
+            return
+        if jsonl_error is not None:
+            if not (
+                summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=max_raw_bytes)
+                if jsonl_error.unreadable
+                else summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes)
+            ):
+                return
+            row["status"] = "invalid"
+            row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
+            rows.append(row)
             return
         if not summary_file_relevant_or_backing_ref_relevant(summary, start, end, max_scan_bytes=max_raw_bytes):
             return

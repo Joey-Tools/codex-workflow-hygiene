@@ -5690,6 +5690,51 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(manifest["sources"][0]["status"], "ready")
         self.assertNotIn("stale_rollout_summary", [gap["reason"] for gap in manifest["coverage_gaps"]])
 
+    def test_truncated_stale_summary_does_not_block_direct_raw_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-small.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Fresh direct task.", "2026-05-01T10:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-small.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size + 1,
+                        scan_truncated=True,
+                        record_limit_reached=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Stale summary text",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("Stale summary text", rows[0]["redacted_user_prompt_summary"])
+        self.assertNotIn("stale_rollout_summary", reasons)
+        self.assertNotIn("truncated_rollout_summary", reasons)
+
     def test_stale_root_rollout_summary_uses_direct_raw_rollout_when_sessions_exists(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -9287,6 +9332,49 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("remote_source_not_materialized", reasons)
         self.assertNotIn("oversized_rollout_skipped", reasons)
 
+    def test_default_remote_complete_summary_with_rollout_scan_meta_covers_old_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-remote.jsonl"
+            rollout = remote / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Old oversized task.", "2026-01-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                    ),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertNotIn("remote_source_not_materialized", reasons)
+        self.assertNotIn("oversized_rollout_skipped", reasons)
+
     def test_default_remote_complete_summary_requires_scan_meta_for_each_backing_ref(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
@@ -11334,6 +11422,52 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "ready")
         self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(rollout))
 
+    def test_make_shards_skips_truncated_stale_summary_when_raw_rollout_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-small.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Fresh direct task.", "2026-05-01T10:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-small.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size + 1,
+                        scan_truncated=True,
+                        record_limit_reached=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Stale summary text",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "ready")
+        self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(rollout))
+
     def test_make_shards_skips_stale_root_summary_when_raw_rollout_ready(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -11397,6 +11531,57 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 summary,
                 [
                     complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "permission denied before raw materialization",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "ready")
+
+    def test_make_shards_remote_complete_summary_with_rollout_scan_meta_covers_old_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            rollout_ref = "sessions/2026/01/01/rollout-2026-01-01T10-00-00-remote.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Old oversized task.", "2026-01-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                    ),
                     {
                         "kind": "summary",
                         "timestamp": "2026-05-01T10:01:00Z",
