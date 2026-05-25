@@ -1663,6 +1663,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertTrue(meta["tail_record_limit_reached"])
         self.assertEqual(meta["json_error_count"], 0)
 
+    def test_remote_probe_rollout_summary_tail_flag_ignores_signal_records_already_emitted(self) -> None:
+        records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
+            lines=[
+                json.dumps(message("user", f"You forgot verification {index}.", f"2026-05-01T10:0{index}:00Z"))
+                for index in range(9)
+            ],
+            keywords=[],
+            limit=40,
+            tail_records=8,
+            max_text_chars=80,
+        )
+
+        self.assertEqual(len(records), 9)
+        self.assertFalse(meta["record_limit_reached"])
+        self.assertFalse(meta["tail_record_limit_reached"])
+
     def test_remote_probe_rollout_summary_reports_json_error_metadata(self) -> None:
         records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
             lines=[
@@ -1763,6 +1779,48 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(scan_meta["tail_record_limit_reached"])
         self.assertEqual(scan_meta["summary_limit"], 1)
         self.assertEqual(scan_meta["json_error_count"], 0)
+
+    def test_remote_probe_generated_rollout_summary_tail_flag_ignores_signal_records_already_emitted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", f"You forgot verification {index}.", f"2026-05-01T10:0{index}:00Z")
+                    for index in range(9)
+                ],
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                    "summary_limit": 40,
+                    "summary_scan_bytes": 4096,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 80,
+                    "summary_keywords": [],
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scan_meta = next(
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if line.startswith("{") and json.loads(line).get("kind") == "scan_meta"
+        )
+        self.assertFalse(scan_meta["record_limit_reached"])
+        self.assertFalse(scan_meta["tail_record_limit_reached"])
+        self.assertEqual(scan_meta["summary_record_count"], 9)
 
     def test_remote_probe_generated_rollout_summary_reports_json_error_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

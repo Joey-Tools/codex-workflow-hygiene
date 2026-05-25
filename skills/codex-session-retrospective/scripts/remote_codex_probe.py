@@ -1088,10 +1088,28 @@ def summarize_rollout():
     print(json.dumps({{"ok": True}}, separators=(",", ":"), sort_keys=True))
     keyword_filter_applied = bool(keywords)
     record_limit_reached = bool(signal_record_limit_reached or matched_record_limit_reached)
+    planned_emitted = set()
+
+    def mark_planned(record):
+        if not record:
+            return
+        planned_emitted.add((str(record.get("kind", "")), int(record.get("line", 0))))
+
+    mark_planned(session_meta_record)
+    for record in signal_records:
+        mark_planned(record)
+    for record in matched:
+        mark_planned(record)
+    if not keywords:
+        for record in tail:
+            mark_planned(record)
+    mark_planned(last_user_record)
+    mark_planned(last_assistant_record)
+    if last_assistant_record is None:
+        mark_planned(last_task_complete_record)
+    emitted_summary_record_count = sum(1 for kind, _line in planned_emitted if kind != "session_meta")
     tail_record_limit_reached = bool(
-        not keyword_filter_applied
-        and SUMMARY_TAIL_RECORDS >= 0
-        and summary_record_count > SUMMARY_TAIL_RECORDS
+        not keyword_filter_applied and summary_record_count > emitted_summary_record_count
     )
     print(json.dumps(
         {{
@@ -2282,6 +2300,7 @@ def _summarize_rollout_records_with_meta(
     if last_assistant_record is None:
         append(last_task_complete_record)
     keyword_filter_applied = bool(search_keywords)
+    emitted_summary_record_count = sum(1 for record in result if record.get("kind") != "session_meta")
     return result, {
         "keyword_filter_applied": keyword_filter_applied,
         "json_error_count": json_error_count,
@@ -2290,9 +2309,8 @@ def _summarize_rollout_records_with_meta(
         "signal_record_limit_reached": signal_record_limit_reached,
         "summary_record_count": summary_record_count,
         "summary_limit": limit,
-        "tail_record_limit_reached": (
-            not keyword_filter_applied and tail_records >= 0 and summary_record_count > tail_records
-        ),
+        "tail_record_limit_reached": not keyword_filter_applied
+        and summary_record_count > emitted_summary_record_count,
         "tail_records": tail_records,
     }
 
