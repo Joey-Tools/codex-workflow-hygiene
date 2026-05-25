@@ -168,6 +168,7 @@ RETAINED_MODEL_IDS = frozenset(("gpt-5.5", "gpt-5.4", "gpt-5.3-codex"))
 RETAINED_MODEL_ERAS = frozenset((*RETAINED_MODEL_IDS, "other-model", "pre-gpt-5.3-codex", "unknown"))
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
+SESSION_META_TSV_FIELDS = ("host", "date", "session_id", "cwd", "rollout")
 HISTORY_FORBIDDEN_FILENAMES = frozenset((*TRANSIENT_OUTPUT_FILES, *LOCAL_EVIDENCE_FILES, REMOTE_SOURCE_METADATA_FILE))
 HISTORY_FORBIDDEN_COMPONENTS = frozenset((".codex", ".codex-local", ".codex-tmp", "raw", "scratch", "transient"))
 HISTORY_FORBIDDEN_NAME_STEMS = frozenset(
@@ -5025,19 +5026,17 @@ def run_remote_probe(remote_probe: Path, args: list[str]) -> subprocess.Complete
     )
 
 
-def parse_tsv_rows(text: str, *, required_fields: Iterable[str] = ()) -> list[dict[str, str]]:
+def parse_session_meta_rows(text: str) -> list[dict[str, str]]:
     lines = [line for line in text.splitlines() if line.strip()]
     if not lines:
-        if required_fields:
-            raise ValueError(f"TSV output is missing required columns: {', '.join(required_fields)}")
-        return []
+        raise ValueError(f"session-meta TSV output is missing required columns: {', '.join(SESSION_META_TSV_FIELDS)}")
     header = lines[0].split("\t")
     duplicate_fields = sorted(field for field, count in Counter(header).items() if count > 1)
     if duplicate_fields:
-        raise ValueError(f"TSV output has duplicate columns: {', '.join(duplicate_fields)}")
-    missing_fields = [field for field in required_fields if field not in header]
+        raise ValueError(f"session-meta TSV output has duplicate columns: {', '.join(duplicate_fields)}")
+    missing_fields = [field for field in SESSION_META_TSV_FIELDS if field not in header]
     if missing_fields:
-        raise ValueError(f"TSV output is missing required columns: {', '.join(missing_fields)}")
+        raise ValueError(f"session-meta TSV output is missing required columns: {', '.join(missing_fields)}")
     rows: list[dict[str, str]] = []
     for line in lines[1:]:
         values = line.split("\t")
@@ -5177,12 +5176,7 @@ def materialize_remote_host(
             )
             return report
         try:
-            rows.extend(
-                parse_tsv_rows(
-                    session_meta.stdout,
-                    required_fields=("host", "date", "session_id", "cwd", "rollout"),
-                )
-            )
+            rows.extend(parse_session_meta_rows(session_meta.stdout))
         except ValueError as error:
             report["status"] = "remote_source_not_materialized"
             report["errors"].append(
