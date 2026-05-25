@@ -5291,7 +5291,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(
                 summary,
                 [
-                    complete_rollout_summary_scan_meta(),
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
                     {"kind": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "text": "session_id=s1"},
                     {
                         "kind": "user_message",
@@ -5336,7 +5336,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(
                 summary,
                 [
-                    complete_rollout_summary_scan_meta(),
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
                     {
                         "kind": "user_message",
                         "timestamp": "2026-05-01T10:01:00Z",
@@ -5356,6 +5356,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_stale_rollout_summary_source_bytes_does_not_cover_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size - 1),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_json_error_rollout_summary_does_not_cover_oversized_rollout_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -8838,7 +8876,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(
                 summary,
                 [
-                    complete_rollout_summary_scan_meta(source_bytes=3000),
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
                     {
                         "kind": "summary",
                         "timestamp": "2026-05-01T10:01:00Z",
@@ -10598,7 +10636,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(
                 summary,
                 [
-                    complete_rollout_summary_scan_meta(),
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
                     {"kind": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "text": "session_id=s1"},
                     {
                         "kind": "user_message",
@@ -10630,6 +10668,57 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "ready")
 
+    def test_make_shards_stale_rollout_summary_keeps_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size - 1),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        rollout_rows = [
+            row
+            for row in rows
+            if row.get("status") == "oversized" and "rollout exceeds" in str(row.get("coverage_gap", ""))
+        ]
+        self.assertEqual(len(rollout_rows), 1)
+        self.assertIn("coverage_gap", rollout_rows[0])
+
     def test_make_shards_remote_complete_summary_covers_unknown_oversized_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "miku-bot-dev"
@@ -10647,7 +10736,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(
                 summary,
                 [
-                    complete_rollout_summary_scan_meta(source_bytes=3000),
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
                     {
                         "kind": "summary",
                         "timestamp": "2026-05-01T10:01:00Z",

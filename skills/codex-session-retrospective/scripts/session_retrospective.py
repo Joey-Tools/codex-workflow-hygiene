@@ -1407,6 +1407,7 @@ def complete_summary_backing_rollout_refs(
     start: dt.datetime | None,
     end: dt.datetime | None,
     *,
+    source_root: Path,
     max_scan_bytes: int,
 ) -> set[str]:
     refs: set[str] = set()
@@ -1421,7 +1422,8 @@ def complete_summary_backing_rollout_refs(
             continue
         if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
             continue
-        if not summary_file_has_complete_backing_scan_meta(summary):
+        source_bytes = summary_file_complete_backing_source_bytes(summary)
+        if source_bytes is None:
             continue
         backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
             summary,
@@ -1430,8 +1432,22 @@ def complete_summary_backing_rollout_refs(
             max_scan_bytes=max_scan_bytes,
         )
         if complete and relevant_record_seen and not unbacked_record_seen:
-            refs.update(backing_refs)
+            refs.update(
+                ref
+                for ref in backing_refs
+                if backing_ref_matches_current_rollout(source_root, ref, source_bytes)
+            )
     return refs
+
+
+def backing_ref_matches_current_rollout(source_root: Path, ref: str, source_bytes: int) -> bool:
+    rollout = source_root / ref
+    if not safe_source_file(rollout, source_root):
+        return False
+    try:
+        return rollout.stat().st_size == source_bytes
+    except OSError:
+        return False
 
 
 def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
@@ -1521,6 +1537,10 @@ def summary_file_has_record_limit_gap(path: Path) -> bool:
 
 
 def summary_file_has_complete_backing_scan_meta(path: Path) -> bool:
+    return summary_file_complete_backing_source_bytes(path) is not None
+
+
+def summary_file_complete_backing_source_bytes(path: Path) -> int | None:
     limit_fields = (
         "keyword_filter_applied",
         "record_limit_reached",
@@ -1529,24 +1549,31 @@ def summary_file_has_complete_backing_scan_meta(path: Path) -> bool:
         "tail_record_limit_reached",
     )
     saw_scan_meta = False
+    source_bytes_seen: set[int] = set()
     try:
         for _line_no, record in iter_jsonl(path):
             if str(record.get("kind") or "") != "scan_meta":
                 continue
             saw_scan_meta = True
             if record.get("scan_truncated") is not False:
-                return False
+                return None
             summary_limit = record.get("summary_limit")
             if type(summary_limit) is not int or summary_limit < 0:
-                return False
+                return None
             json_error_count = record.get("json_error_count")
             if type(json_error_count) is not int or json_error_count != 0:
-                return False
+                return None
             if any(record.get(field) is not False for field in limit_fields):
-                return False
+                return None
+            source_bytes = record.get("source_bytes")
+            if type(source_bytes) is not int or source_bytes < 0:
+                return None
+            source_bytes_seen.add(source_bytes)
     except (OSError, ValueError):
-        return False
-    return saw_scan_meta
+        return None
+    if not saw_scan_meta or len(source_bytes_seen) != 1:
+        return None
+    return next(iter(source_bytes_seen))
 
 
 def summary_session_id(record: dict[str, Any]) -> str | None:
@@ -3547,6 +3574,7 @@ def remote_summary_only_gaps(
             summaries,
             start,
             end,
+            source_root=source.root,
             max_scan_bytes=max_scan_bytes,
         )
     covered_rollout_refs: set[str] = set(complete_summary_refs)
@@ -3705,6 +3733,7 @@ def run_scan(
             summaries,
             gap_start,
             end,
+            source_root=source.root,
             max_scan_bytes=max_raw_bytes,
         )
         source_materialization_gaps = materialization_gaps_for_source(source)
@@ -3922,6 +3951,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             summaries,
             start,
             end,
+            source_root=source.root,
             max_scan_bytes=max_raw_bytes,
         )
         source_summary_only_gaps = remote_summary_only_gaps(
@@ -4145,6 +4175,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             summaries,
             start,
             end,
+            source_root=root,
             max_scan_bytes=max_raw_bytes,
         )
         source_summary_only_gaps = remote_summary_only_gaps(
