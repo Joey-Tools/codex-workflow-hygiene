@@ -1508,6 +1508,104 @@ def summary_backing_rollout_refs(
     return refs, True, relevant_record_seen, unbacked_record_seen
 
 
+@dataclasses.dataclass(frozen=True)
+class CompleteScanMetaProof:
+    source_bytes_by_ref: dict[str, int]
+    has_rollout_ref: bool
+
+
+def complete_scan_meta_record_source_bytes(record: dict[str, Any]) -> int | None:
+    limit_fields = (
+        "keyword_filter_applied",
+        "record_limit_reached",
+        "signal_record_limit_reached",
+        "matched_record_limit_reached",
+        "tail_record_limit_reached",
+    )
+    if record.get("scan_truncated") is not False:
+        return None
+    summary_limit = record.get("summary_limit")
+    if type(summary_limit) is not int or summary_limit < 0:
+        return None
+    json_error_count = record.get("json_error_count")
+    if type(json_error_count) is not int or json_error_count != 0:
+        return None
+    if any(record.get(field) is not False for field in limit_fields):
+        return None
+    source_bytes = record.get("source_bytes")
+    if type(source_bytes) is not int or source_bytes < 0:
+        return None
+    return source_bytes
+
+
+def complete_scan_meta_backing_source_bytes_by_ref(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> CompleteScanMetaProof | None:
+    saw_scan_meta = False
+    has_rollout_ref = False
+    source_bytes_by_ref: dict[str, int] = {}
+    try:
+        for _line_no, record in iter_jsonl(path):
+            if str(record.get("kind") or "") != "scan_meta":
+                continue
+            saw_scan_meta = True
+            source_bytes = complete_scan_meta_record_source_bytes(record)
+            if source_bytes is None:
+                return None
+            rollout_ref = record.get("rollout")
+            if rollout_ref is None:
+                continue
+            if not isinstance(rollout_ref, str):
+                return None
+            safe_ref = safe_rollout_backing_ref(rollout_ref)
+            if safe_ref is None:
+                return None
+            has_rollout_ref = True
+            if not summary_record_in_window(record, path, start, end) and not rollout_ref_in_window(safe_ref, start, end):
+                continue
+            previous = source_bytes_by_ref.get(safe_ref)
+            if previous is not None and previous != source_bytes:
+                return None
+            source_bytes_by_ref[safe_ref] = source_bytes
+    except (OSError, ValueError):
+        return None
+    if not saw_scan_meta:
+        return None
+    return CompleteScanMetaProof(source_bytes_by_ref=source_bytes_by_ref, has_rollout_ref=has_rollout_ref)
+
+
+def complete_summary_backing_source_bytes_by_ref(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> dict[str, int] | None:
+    backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    )
+    if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
+        return None
+    proof = complete_scan_meta_backing_source_bytes_by_ref(path, start, end)
+    if proof is None:
+        return None
+    if proof.source_bytes_by_ref:
+        if not backing_refs.issubset(proof.source_bytes_by_ref):
+            return None
+        return {ref: proof.source_bytes_by_ref[ref] for ref in backing_refs}
+    if proof.has_rollout_ref:
+        return None
+    legacy_source_bytes = summary_file_complete_backing_source_bytes(path)
+    if legacy_source_bytes is None or len(backing_refs) != 1:
+        return None
+    return {next(iter(backing_refs)): legacy_source_bytes}
+
+
 def complete_summary_backing_rollout_refs(
     summaries: list[Path],
     start: dt.datetime | None,
@@ -1528,21 +1626,19 @@ def complete_summary_backing_rollout_refs(
             continue
         if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
             continue
-        source_bytes = summary_file_complete_backing_source_bytes(summary)
-        if source_bytes is None:
-            continue
-        backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+        source_bytes_by_ref = complete_summary_backing_source_bytes_by_ref(
             summary,
             start,
             end,
             max_scan_bytes=max_scan_bytes,
         )
-        if complete and relevant_record_seen and not unbacked_record_seen:
-            refs.update(
-                ref
-                for ref in backing_refs
-                if backing_ref_matches_current_rollout(source_root, ref, source_bytes)
-            )
+        if source_bytes_by_ref is None:
+            continue
+        refs.update(
+            ref
+            for ref, source_bytes in source_bytes_by_ref.items()
+            if backing_ref_matches_current_rollout(source_root, ref, source_bytes)
+        )
     return refs
 
 
@@ -1598,9 +1694,6 @@ def summary_file_has_stale_backing_source(
         return False
     if not summary_file_relevant_or_backing_ref_relevant(path, start, end, max_scan_bytes=max_scan_bytes):
         return False
-    source_bytes = summary_file_declared_source_bytes(path)
-    if source_bytes is None:
-        return False
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
         path,
         start,
@@ -1609,9 +1702,25 @@ def summary_file_has_stale_backing_source(
     )
     if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
         return False
+    source_bytes_by_ref = complete_summary_backing_source_bytes_by_ref(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    )
+    if source_bytes_by_ref is None:
+        if complete_scan_meta_backing_source_bytes_by_ref(path, start, end) is not None:
+            return True
+        source_bytes = summary_file_declared_source_bytes(path)
+        if source_bytes is None:
+            return False
+        return any(
+            not backing_ref_matches_current_rollout(source_root, ref, source_bytes)
+            for ref in backing_refs
+        )
     return any(
         not backing_ref_matches_current_rollout(source_root, ref, source_bytes)
-        for ref in backing_refs
+        for ref, source_bytes in source_bytes_by_ref.items()
     )
 
 
@@ -1624,9 +1733,6 @@ def summary_file_stale_backing_requires_gap(
     max_scan_bytes: int,
     allow_mtime_fallback: bool = False,
 ) -> bool:
-    source_bytes = summary_file_declared_source_bytes(path)
-    if source_bytes is None:
-        return False
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
         path,
         start,
@@ -1635,11 +1741,30 @@ def summary_file_stale_backing_requires_gap(
     )
     if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
         return False
-    stale_refs = [
-        ref
-        for ref in backing_refs
-        if not backing_ref_matches_current_rollout(source_root, ref, source_bytes)
-    ]
+    source_bytes_by_ref = complete_summary_backing_source_bytes_by_ref(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    )
+    if source_bytes_by_ref is None:
+        if complete_scan_meta_backing_source_bytes_by_ref(path, start, end) is None:
+            source_bytes = summary_file_declared_source_bytes(path)
+            if source_bytes is None:
+                return False
+            stale_refs = {
+                ref
+                for ref in backing_refs
+                if not backing_ref_matches_current_rollout(source_root, ref, source_bytes)
+            }
+        else:
+            stale_refs = set(backing_refs)
+    else:
+        stale_refs = {
+            ref
+            for ref, source_bytes in source_bytes_by_ref.items()
+            if not backing_ref_matches_current_rollout(source_root, ref, source_bytes)
+        }
     return any(
         not backing_ref_has_direct_materialized_window_coverage(
             source_root,
