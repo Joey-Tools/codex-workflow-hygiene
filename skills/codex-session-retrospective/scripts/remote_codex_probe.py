@@ -2500,6 +2500,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
         print(f"error={error}", file=sys.stderr)
         return 1
 
+    # Normalize the host and backing ref after both local and remote paths.
     for record in records:
         item = dict(record)
         item["host"] = alias

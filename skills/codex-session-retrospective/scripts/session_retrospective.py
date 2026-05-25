@@ -1376,18 +1376,26 @@ def rollout_ref_in_window(ref: str, start: dt.datetime | None, end: dt.datetime 
         r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)",
         ref_path.name,
     )
-    if match and match.group(2):
-        rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
-        if rollout_time is None:
+    if match:
+        if match.group(2):
+            rollout_start = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+            if rollout_start is None:
+                return False
+            if start and rollout_start < start:
+                return False
+            if end and rollout_start >= end:
+                return False
+            return True
+        rollout_start = parse_time(f"{match.group(1)}T00:00:00Z")
+        if rollout_start is None:
             return False
-        if start and rollout_time < start:
+        rollout_end = rollout_start + dt.timedelta(days=1)
+        if start and rollout_end <= start:
             return False
-        if end and rollout_time >= end:
+        if end and rollout_start >= end:
             return False
         return True
-    # Exact timestamped filenames are handled above; this fallback is only for
-    # date-only rollout refs and dated directory paths.
-    rollout_date = rollout_date_from_path(ref_path) or dated_path_from_parts(ref_path)
+    rollout_date = dated_path_from_parts(ref_path)
     if rollout_date is None:
         return False
     rollout_end = rollout_date + dt.timedelta(days=1)
@@ -1398,7 +1406,7 @@ def rollout_ref_in_window(ref: str, start: dt.datetime | None, end: dt.datetime 
     return True
 
 
-def summary_file_has_relevant_scan_meta_backing_ref(
+def summary_file_has_relevant_backing_ref(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
@@ -1427,13 +1435,20 @@ def summary_file_has_relevant_scan_meta_backing_ref(
             record = json.loads(line)
         except json.JSONDecodeError:
             return False
-        if not isinstance(record, dict) or str(record.get("kind") or "summary") != "scan_meta":
+        if not isinstance(record, dict):
+            continue
+        kind = str(record.get("kind") or "summary")
+        if kind == "session_meta":
             continue
         rollout_ref = record.get("rollout")
         if not isinstance(rollout_ref, str):
             continue
         safe_ref = safe_rollout_backing_ref(rollout_ref)
         if safe_ref is None:
+            continue
+        if kind != "scan_meta":
+            if summary_record_in_window(record, path, start, end):
+                return True
             continue
         if rollout_ref_in_window(safe_ref, start, end) or (
             source_root is not None
@@ -1464,7 +1479,7 @@ def summary_file_relevant_or_backing_ref_relevant(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
-    ) or summary_file_has_relevant_scan_meta_backing_ref(
+    ) or summary_file_has_relevant_backing_ref(
         path,
         start,
         end,
@@ -1488,7 +1503,7 @@ def summary_file_maybe_relevant_or_backing_ref_relevant(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
-    ) or summary_file_has_relevant_scan_meta_backing_ref(
+    ) or summary_file_has_relevant_backing_ref(
         path,
         start,
         end,
@@ -1687,7 +1702,8 @@ def complete_summary_backing_rollout_refs(
             max_scan_bytes=max_scan_bytes,
         ):
             continue
-        if not summary_file_has_extractable_record_in_window(summary, start, end):
+        extractable_refs = summary_extractable_backing_refs_in_window(summary, start, end)
+        if not extractable_refs:
             continue
         source_bytes_by_ref = complete_summary_backing_source_bytes_by_ref(
             summary,
@@ -1701,6 +1717,7 @@ def complete_summary_backing_rollout_refs(
         refs.update(
             ref
             for ref, source_bytes in source_bytes_by_ref.items()
+            if ref in extractable_refs
             if backing_ref_matches_current_rollout(source_root, ref, source_bytes)
         )
     return refs
@@ -2062,6 +2079,32 @@ def summary_file_has_extractable_record_in_window(
     except (OSError, ValueError):
         return False
     return False
+
+
+def summary_extractable_backing_refs_in_window(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> set[str]:
+    refs: set[str] = set()
+    try:
+        for _line_no, record in iter_jsonl(path):
+            kind = str(record.get("kind") or "summary")
+            if kind in {"session_meta", "scan_meta"}:
+                continue
+            if not summary_record_in_window(record, path, start, end):
+                continue
+            if not summary_record_has_retained_flags(record):
+                continue
+            rollout_ref = record.get("rollout")
+            if not isinstance(rollout_ref, str):
+                continue
+            safe_ref = safe_rollout_backing_ref(rollout_ref)
+            if safe_ref is not None:
+                refs.add(safe_ref)
+    except (OSError, ValueError):
+        return set()
+    return refs
 
 
 def summary_record_has_retained_flags(record: dict[str, Any]) -> bool:
