@@ -1385,6 +1385,8 @@ def rollout_ref_in_window(ref: str, start: dt.datetime | None, end: dt.datetime 
         if end and rollout_time >= end:
             return False
         return True
+    # Exact timestamped filenames are handled above; this fallback is only for
+    # date-only rollout refs and dated directory paths.
     rollout_date = rollout_date_from_path(ref_path) or dated_path_from_parts(ref_path)
     if rollout_date is None:
         return False
@@ -4127,15 +4129,16 @@ def remote_summary_only_gaps(
             source_root=source.root,
             max_scan_bytes=max_scan_bytes,
         )
-    covered_rollout_refs: set[str] = {
+    candidate_rollout_refs = {
         ref
-        for ref in complete_summary_refs
-        if rollout_ref_is_direct_candidate(source.root, ref) and safe_source_file(source.root / ref, source.root)
+        for rollout in rollouts
+        if (ref := source_relative_path_ref(rollout, source.root)) is not None
     }
+    covered_rollout_refs = complete_summary_refs & candidate_rollout_refs
     has_covered_rollout = bool(covered_rollout_refs)
     for rollout in rollouts:
         rollout_ref = source_relative_path_ref(rollout, source.root)
-        summary_backed_materialized = rollout_ref is not None and rollout_ref in complete_summary_refs
+        summary_backed_materialized = rollout_ref is not None and rollout_ref in covered_rollout_refs
         if not summary_backed_materialized and not rollout_has_materialized_window_coverage(
             rollout,
             start,

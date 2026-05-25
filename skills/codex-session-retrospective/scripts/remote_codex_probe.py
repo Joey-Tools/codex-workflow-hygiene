@@ -2383,6 +2383,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
     except ValueError as error:
         return _error(str(error))
 
+    rollout_ref = rollout_relative_path.as_posix()
     try:
         if HOSTS[alias]["kind"] == "local":
             codex_root = _local_codex_root()
@@ -2411,10 +2412,11 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                     summary_record_count=int(summary_meta["summary_record_count"]),
                 ),
             )
+            records = [dict(record, rollout=rollout_ref) for record in records]
         else:
             payload = {
                 "mode": "rollout-summary",
-                "rollout": rollout_relative_path.as_posix(),
+                "rollout": rollout_ref,
                 "codex_root": HOSTS[alias]["codex_root"],
                 "session_meta_scan_bytes": MAX_SESSION_META_SCAN_BYTES,
                 "summary_keywords": list(args.keyword),
@@ -2427,7 +2429,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                 result = _run_remote_python(alias, payload)
             except RuntimeError as error:
                 print(f"host={alias}", file=sys.stderr)
-                print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+                print(f"rollout={rollout_ref}", file=sys.stderr)
                 print(f"error={error}", file=sys.stderr)
                 return 1
             if result.returncode != 0:
@@ -2437,7 +2439,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                     or "remote rollout-summary failed"
                 )
                 print(f"host={alias}", file=sys.stderr)
-                print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+                print(f"rollout={rollout_ref}", file=sys.stderr)
                 print(f"error={message}", file=sys.stderr)
                 return 1
             try:
@@ -2450,34 +2452,34 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                 )
             except FileNotFoundError:
                 print(f"host={alias}", file=sys.stderr)
-                print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+                print(f"rollout={rollout_ref}", file=sys.stderr)
                 print("error=rollout not found", file=sys.stderr)
                 return 1
             except ValueError as error:
                 print(f"host={alias}", file=sys.stderr)
-                print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+                print(f"rollout={rollout_ref}", file=sys.stderr)
                 print(f"error={error}", file=sys.stderr)
                 return 1
     except FileNotFoundError:
         print(f"host={alias}", file=sys.stderr)
-        print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+        print(f"rollout={rollout_ref}", file=sys.stderr)
         print("error=rollout not found", file=sys.stderr)
         return 1
     except OSError:
         print(f"host={alias}", file=sys.stderr)
-        print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+        print(f"rollout={rollout_ref}", file=sys.stderr)
         print("error=rollout unreadable", file=sys.stderr)
         return 1
     except ValueError as error:
         print(f"host={alias}", file=sys.stderr)
-        print(f"rollout={rollout_relative_path.as_posix()}", file=sys.stderr)
+        print(f"rollout={rollout_ref}", file=sys.stderr)
         print(f"error={error}", file=sys.stderr)
         return 1
 
     for record in records:
         item = dict(record)
         item["host"] = alias
-        item["rollout"] = rollout_relative_path.as_posix()
+        item["rollout"] = rollout_ref
         print(json.dumps(item, separators=(",", ":"), sort_keys=True))
     return 0
 
