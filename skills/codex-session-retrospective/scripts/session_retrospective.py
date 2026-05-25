@@ -5025,11 +5025,19 @@ def run_remote_probe(remote_probe: Path, args: list[str]) -> subprocess.Complete
     )
 
 
-def parse_tsv_rows(text: str) -> list[dict[str, str]]:
+def parse_tsv_rows(text: str, *, required_fields: Iterable[str] = ()) -> list[dict[str, str]]:
     lines = [line for line in text.splitlines() if line.strip()]
     if not lines:
+        if required_fields:
+            raise ValueError(f"TSV output is missing required columns: {', '.join(required_fields)}")
         return []
     header = lines[0].split("\t")
+    duplicate_fields = sorted(field for field, count in Counter(header).items() if count > 1)
+    if duplicate_fields:
+        raise ValueError(f"TSV output has duplicate columns: {', '.join(duplicate_fields)}")
+    missing_fields = [field for field in required_fields if field not in header]
+    if missing_fields:
+        raise ValueError(f"TSV output is missing required columns: {', '.join(missing_fields)}")
     rows: list[dict[str, str]] = []
     for line in lines[1:]:
         values = line.split("\t")
@@ -5168,7 +5176,35 @@ def materialize_remote_host(
                 },
             )
             return report
-        rows.extend(parse_tsv_rows(session_meta.stdout))
+        try:
+            rows.extend(
+                parse_tsv_rows(
+                    session_meta.stdout,
+                    required_fields=("host", "date", "session_id", "cwd", "rollout"),
+                )
+            )
+        except ValueError as error:
+            report["status"] = "remote_source_not_materialized"
+            report["errors"].append(
+                {
+                    "command": "session-meta",
+                    "from": date_arg(chunk_start),
+                    "to": date_arg(chunk_end),
+                    "error": str(error),
+                }
+            )
+            write_materialized_remote_metadata(
+                root,
+                {
+                    "host": host,
+                    "status": "remote_source_not_materialized",
+                    "reason": "remote_source_not_materialized",
+                    "window_start": iso(start),
+                    "window_end": iso(end),
+                    "materialized_at": iso(utc_now()),
+                },
+            )
+            return report
 
     rollout_refs = sorted(
         {
@@ -5278,21 +5314,20 @@ def cmd_repair_coverage(args: argparse.Namespace) -> int:
         if args.output
         else ensure_safe_output_dir(scan_dir.parent / "coverage-repair").absolute()
     )
-    remote_probe = Path(args.remote_probe) if args.remote_probe else Path(__file__).with_name("remote_codex_probe.py")
+    remote_probe = Path(args.remote_probe).expanduser() if args.remote_probe else Path(__file__).with_name("remote_codex_probe.py")
     if not remote_probe.is_file():
         raise SystemExit(f"remote probe helper not found: {remote_probe}")
 
     remote_roots: dict[str, Path] = {}
     materialized_hosts: list[dict[str, Any]] = []
     if not args.skip_remote_materialization:
-        manifest_hosts = {str(source.get("host") or "") for source in manifest.get("sources") or [] if isinstance(source, dict)}
         gap_hosts = {
             str(gap.get("host") or "")
             for gap in manifest.get("coverage_gaps") or []
             if isinstance(gap, dict) and str(gap.get("reason") or "") in ALLOWED_REMOTE_GAP_REASONS
         }
         for host in DEFAULT_REMOTE_HOSTS:
-            if host not in manifest_hosts and host not in gap_hosts:
+            if host not in gap_hosts:
                 continue
             remote_root = root / "remote-sources" / host
             remote_roots[host] = remote_root
@@ -5904,7 +5939,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repair dry-run coverage by rematerializing default remotes and rerunning the scan; no retained export, commit, or state advancement.",
     )
     repair_coverage.add_argument("--run-dir", required=True, help="baseline-dry-run root or scan output directory.")
-    repair_coverage.add_argument("--output", help="Output directory under .codex-local/session-retrospective. Defaults to RUN_DIR/coverage-repair.")
+    repair_coverage.add_argument(
+        "--output",
+        help="Output directory under .codex-local/session-retrospective. Defaults to the scan output directory's sibling coverage-repair.",
+    )
     repair_coverage.add_argument(
         "--max-raw-bytes",
         type=int,

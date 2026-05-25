@@ -4021,7 +4021,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "retention_safe": False,
             }
             (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe_home = Path(raw) / "home"
+            fake_probe_home.mkdir()
+            fake_probe = fake_probe_home / "fake_remote_probe.py"
             fake_probe.write_text(
                 "\n".join(
                     [
@@ -4052,6 +4054,62 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             repair = safe_output_dir(raw, "coverage-repair")
 
+            with mock.patch.dict(os.environ, {"HOME": str(fake_probe_home)}):
+                MODULE.main(
+                    [
+                        "repair-coverage",
+                        "--run-dir",
+                        str(dry_run),
+                        "--output",
+                        str(repair),
+                        "--allow-partial-hosts",
+                        "--remote-probe",
+                        "~/fake_remote_probe.py",
+                    ]
+                )
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(trend["hosts"]["miku-bot-dev"], 1)
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(report["repair"]["materialized_hosts"][0]["rollout_count"], 1)
+
+    def test_repair_coverage_does_not_rematerialize_ready_remote_without_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            remote = Path(raw) / "ready-miku"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout = remote / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-ready.jsonl"
+            write_jsonl(rollout, [message("user", "Ready remote task.", "2026-05-01T10:00:00Z")])
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root": str(remote),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 1,
+                        "summary_count": 0,
+                        "status": "ready",
+                    }
+                ],
+                "coverage_gaps": [],
+                "redaction_policy_version": 1,
+                "retention_safe": True,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe.write_text("raise SystemExit('remote probe should not run')\n", encoding="utf-8")
+            repair = safe_output_dir(raw, "coverage-repair")
+
             MODULE.main(
                 [
                     "repair-coverage",
@@ -4068,8 +4126,85 @@ class SessionRetrospectiveTests(unittest.TestCase):
             report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
 
         self.assertEqual(trend["hosts"]["miku-bot-dev"], 1)
-        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
-        self.assertEqual(report["repair"]["materialized_hosts"][0]["rollout_count"], 1)
+        self.assertEqual(report["repair"]["materialized_hosts"], [])
+
+    def test_repair_coverage_rejects_malformed_session_meta_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root": str(Path(raw) / "stale-miku"),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 0,
+                        "summary_count": 0,
+                        "status": "stale",
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "reason": "remote_source_not_materialized",
+                    }
+                ],
+                "redaction_policy_version": 1,
+                "retention_safe": False,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe.write_text(
+                "\n".join(
+                    [
+                        "import sys",
+                        "args = sys.argv[1:]",
+                        "cmd = args[0]",
+                        "def arg(name):",
+                        "    return args[args.index(name) + 1]",
+                        "if cmd == 'preflight':",
+                        "    print('host\\thostname\\tuser\\thome\\tcodex\\trg\\tpython3')",
+                        "    print(arg('--host') + '\\tfake\\thoteng\\t/home/hoteng\\tpresent\\tpresent\\tpresent')",
+                        "elif cmd == 'session-meta':",
+                        "    print('host\\tdate\\tsession_id\\tcwd')",
+                        "    print(arg('--host') + '\\t2026/05/01\\ts1\\t/work')",
+                        "else:",
+                        "    raise SystemExit(2)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            repair = safe_output_dir(raw, "coverage-repair")
+
+            MODULE.main(
+                [
+                    "repair-coverage",
+                    "--run-dir",
+                    str(dry_run),
+                    "--output",
+                    str(repair),
+                    "--allow-partial-hosts",
+                    "--remote-probe",
+                    str(fake_probe),
+                ]
+            )
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        host_report = report["repair"]["materialized_hosts"][0]
+        self.assertEqual(host_report["status"], "remote_source_not_materialized")
+        self.assertIn("missing required columns: rollout", host_report["errors"][0]["error"])
 
     def test_repair_coverage_keeps_remote_gap_when_rollout_materialization_fails(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
