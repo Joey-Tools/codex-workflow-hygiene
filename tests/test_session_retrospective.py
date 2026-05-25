@@ -4213,6 +4213,89 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "empty required fields: rollout"):
             MODULE.parse_session_meta_rows("host\tdate\tsession_id\tcwd\trollout\nmiku-bot-dev\t2026/05/01\ts1\t/work\t\n")
 
+    def test_repair_coverage_preserves_missing_codex_preflight_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dry_run = safe_output_dir(raw, "baseline-dry-run")
+            scan = dry_run / "scan"
+            scan.mkdir(parents=True)
+            manifest = {
+                "schema_version": 1,
+                "mode": "baseline-90d",
+                "window": {
+                    "mode": "baseline-90d",
+                    "start": "2026-05-01T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root": str(Path(raw) / "stale-miku"),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 0,
+                        "summary_count": 0,
+                        "status": "stale",
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "miku-bot-dev",
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "reason": "remote_source_not_materialized",
+                    }
+                ],
+                "redaction_policy_version": 1,
+                "retention_safe": False,
+            }
+            (scan / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe.write_text(
+                "\n".join(
+                    [
+                        "import sys",
+                        "args = sys.argv[1:]",
+                        "cmd = args[0]",
+                        "def arg(name):",
+                        "    return args[args.index(name) + 1]",
+                        "if cmd == 'preflight':",
+                        "    print('host\\thostname\\tuser\\thome\\tcodex\\trg\\tpython3')",
+                        "    print(arg('--host') + '\\tfake\\thoteng\\t/home/hoteng\\tmissing\\tpresent\\tpresent')",
+                        "elif cmd == 'session-meta':",
+                        "    raise SystemExit('session-meta should not run when codex is missing')",
+                        "else:",
+                        "    raise SystemExit(2)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            repair = safe_output_dir(raw, "coverage-repair")
+
+            MODULE.main(
+                [
+                    "repair-coverage",
+                    "--run-dir",
+                    str(dry_run),
+                    "--output",
+                    str(repair),
+                    "--allow-partial-hosts",
+                    "--remote-probe",
+                    str(fake_probe),
+                ]
+            )
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+            metadata = json.loads(
+                (repair / "remote-sources" / "miku-bot-dev" / MODULE.REMOTE_SOURCE_METADATA_FILE).read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertIn("missing_codex", [gap["reason"] for gap in trend["coverage_gaps"]])
+        host_report = report["repair"]["materialized_hosts"][0]
+        self.assertEqual(host_report["status"], "missing_codex")
+        self.assertEqual(host_report["errors"][0]["error"], "codex=missing")
+        self.assertEqual(metadata["status"], "missing_codex")
+
     def test_repair_coverage_keeps_remote_gap_when_rollout_materialization_fails(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             dry_run = safe_output_dir(raw, "baseline-dry-run")

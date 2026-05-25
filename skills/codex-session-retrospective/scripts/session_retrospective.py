@@ -169,6 +169,7 @@ RETAINED_MODEL_ERAS = frozenset((*RETAINED_MODEL_IDS, "other-model", "pre-gpt-5.
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
 SESSION_META_TSV_FIELDS = ("host", "date", "session_id", "cwd", "rollout")
+PREFLIGHT_TSV_FIELDS = ("host", "codex")
 HISTORY_FORBIDDEN_FILENAMES = frozenset((*TRANSIENT_OUTPUT_FILES, *LOCAL_EVIDENCE_FILES, REMOTE_SOURCE_METADATA_FILE))
 HISTORY_FORBIDDEN_COMPONENTS = frozenset((".codex", ".codex-local", ".codex-tmp", "raw", "scratch", "transient"))
 HISTORY_FORBIDDEN_NAME_STEMS = frozenset(
@@ -5054,6 +5055,37 @@ def parse_session_meta_rows(text: str) -> list[dict[str, str]]:
     return rows
 
 
+def parse_preflight_rows(text: str) -> list[dict[str, str]]:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(f"preflight TSV output is missing required columns: {', '.join(PREFLIGHT_TSV_FIELDS)}")
+    header = lines[0].split("\t")
+    duplicate_fields = sorted(field for field, count in Counter(header).items() if count > 1)
+    if duplicate_fields:
+        raise ValueError(f"preflight TSV output has duplicate columns: {', '.join(duplicate_fields)}")
+    missing_fields = [field for field in PREFLIGHT_TSV_FIELDS if field not in header]
+    if missing_fields:
+        raise ValueError(f"preflight TSV output is missing required columns: {', '.join(missing_fields)}")
+    rows: list[dict[str, str]] = []
+    for line_no, line in enumerate(lines[1:], start=2):
+        values = line.split("\t")
+        if len(values) != len(header):
+            raise ValueError(f"preflight TSV row {line_no} has {len(values)} columns; expected {len(header)}")
+        row = {key: values[index] for index, key in enumerate(header)}
+        empty_fields = [field for field in PREFLIGHT_TSV_FIELDS if not row[field]]
+        if empty_fields:
+            raise ValueError(f"preflight TSV row {line_no} has empty required fields: {', '.join(empty_fields)}")
+        rows.append(row)
+    return rows
+
+
+def preflight_row_for_host(rows: list[dict[str, str]], host: str) -> dict[str, str]:
+    for row in rows:
+        if row.get("host") == host:
+            return row
+    raise ValueError(f"preflight TSV output is missing row for host: {host}")
+
+
 def safe_materialized_target(root: Path, ref: str) -> Path:
     safe_ref = safe_rollout_backing_ref(ref)
     if safe_ref is None:
@@ -5138,6 +5170,38 @@ def materialize_remote_host(
                 "host": host,
                 "status": "host_unreachable",
                 "reason": "host_unreachable",
+                "window_start": iso(start),
+                "window_end": iso(end),
+                "materialized_at": iso(utc_now()),
+            },
+        )
+        return report
+    try:
+        preflight_row = preflight_row_for_host(parse_preflight_rows(preflight.stdout), host)
+    except ValueError as error:
+        report["status"] = "remote_source_not_materialized"
+        report["errors"].append({"command": "preflight", "error": str(error)})
+        write_materialized_remote_metadata(
+            root,
+            {
+                "host": host,
+                "status": "remote_source_not_materialized",
+                "reason": "remote_source_not_materialized",
+                "window_start": iso(start),
+                "window_end": iso(end),
+                "materialized_at": iso(utc_now()),
+            },
+        )
+        return report
+    if preflight_row["codex"] != "present":
+        report["status"] = "missing_codex"
+        report["errors"].append({"command": "preflight", "error": f"codex={preflight_row['codex']}"})
+        write_materialized_remote_metadata(
+            root,
+            {
+                "host": host,
+                "status": "missing_codex",
+                "reason": "missing_codex",
                 "window_start": iso(start),
                 "window_end": iso(end),
                 "materialized_at": iso(utc_now()),
