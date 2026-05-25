@@ -8972,7 +8972,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.run_scan(
-                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=1500, allow_partial_hosts=True),
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
@@ -9701,6 +9701,56 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_mixed_stale_summary_does_not_cover_valid_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            oversized_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-oversized.jsonl"
+            stale_covered_ref = "sessions/2026/05/01/rollout-2026-05-01T11-00-00-covered.jsonl"
+            oversized = remote / oversized_ref
+            oversized.parent.mkdir(parents=True, exist_ok=True)
+            oversized.write_text(
+                json.dumps(message("user", "Oversized remote task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 5000),
+                encoding="utf-8",
+            )
+            stale_covered = remote / stale_covered_ref
+            write_jsonl(stale_covered, [message("user", "Covered remote task.", "2026-05-01T11:00:00Z")])
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=oversized_ref, source_bytes=oversized.stat().st_size),
+                    complete_rollout_summary_scan_meta(rollout=stale_covered_ref, source_bytes=1),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": oversized_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T11:01:00Z",
+                        "rollout": stale_covered_ref,
+                        "text": "You missed verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=None, max_raw_bytes=4000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertIn("oversized_rollout_skipped", reasons)
+        self.assertNotIn("remote_source_not_materialized", reasons)
 
     def test_default_remote_summary_backing_ignores_out_of_window_rollout_refs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -11785,7 +11835,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             output = safe_output_dir(raw)
 
-            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1500"])
             rows = [
                 json.loads(line)
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
@@ -12162,6 +12212,69 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "ready")
+
+    def test_make_shards_mixed_stale_summary_does_not_cover_valid_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(root, "miku-bot-dev")
+            oversized_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-oversized.jsonl"
+            stale_covered_ref = "sessions/2026/05/01/rollout-2026-05-01T11-00-00-covered.jsonl"
+            oversized = root / oversized_ref
+            oversized.parent.mkdir(parents=True, exist_ok=True)
+            oversized.write_text(
+                json.dumps(message("user", "Oversized remote task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 5000),
+                encoding="utf-8",
+            )
+            stale_covered = root / stale_covered_ref
+            write_jsonl(stale_covered, [message("user", "Covered remote task.", "2026-05-01T11:00:00Z")])
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(rollout=oversized_ref, source_bytes=oversized.stat().st_size),
+                    complete_rollout_summary_scan_meta(rollout=stale_covered_ref, source_bytes=1),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": oversized_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T11:01:00Z",
+                        "rollout": stale_covered_ref,
+                        "text": "You missed verification for /customer/repo",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "4000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertTrue(
+            any(
+                row.get("status") == "oversized"
+                and "rollout exceeds" in str(row.get("coverage_gap", ""))
+                for row in rows
+            )
+        )
+        self.assertFalse(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in rows))
 
     def test_make_shards_remote_complete_summary_with_rollout_scan_meta_covers_old_oversized_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

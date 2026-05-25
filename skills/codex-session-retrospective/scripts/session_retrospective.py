@@ -1677,6 +1677,14 @@ def complete_summary_backing_rollout_refs(
             continue
         if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
             continue
+        if summary_file_has_stale_backing_source(
+            summary,
+            source_root,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+        ):
+            continue
         source_bytes_by_ref = complete_summary_backing_source_bytes_by_ref(
             summary,
             start,
