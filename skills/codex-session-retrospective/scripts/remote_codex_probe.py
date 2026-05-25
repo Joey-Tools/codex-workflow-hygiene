@@ -38,6 +38,7 @@ ACTIVE_ROLLOUT_RELATIVE_RE = re.compile(
 ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile(
     r"^archived_sessions/(?:\d{4}/\d{2}/\d{2}/)?rollout-(?!summary)[^/]+\.jsonl$"
 )
+ROOT_ROLLOUT_RELATIVE_RE = re.compile(r"^rollout-(?!summary)[^/]+\.jsonl$")
 ROLLOUT_FILENAME_TIME_RE = re.compile(
     r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)"
 )
@@ -228,13 +229,13 @@ def _iso_utc(value: dt.datetime) -> str:
     return value.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _rollout_filename_timestamp(path: pathlib.Path) -> dt.datetime | None:
+def _rollout_filename_window(path: pathlib.Path) -> tuple[dt.datetime, dt.datetime, bool] | None:
     match = ROLLOUT_FILENAME_TIME_RE.search(path.name)
     if not match:
         return None
     try:
         if match.group(2):
-            return dt.datetime(
+            timestamp = dt.datetime(
                 int(match.group(1)[0:4]),
                 int(match.group(1)[5:7]),
                 int(match.group(1)[8:10]),
@@ -243,12 +244,14 @@ def _rollout_filename_timestamp(path: pathlib.Path) -> dt.datetime | None:
                 int(match.group(4)),
                 tzinfo=dt.timezone.utc,
             )
-        return dt.datetime(
+            return timestamp, timestamp + dt.timedelta(seconds=1), True
+        day_start = dt.datetime(
             int(match.group(1)[0:4]),
             int(match.group(1)[5:7]),
             int(match.group(1)[8:10]),
             tzinfo=dt.timezone.utc,
         )
+        return day_start, day_start + dt.timedelta(days=1), False
     except ValueError:
         return None
 
@@ -260,18 +263,19 @@ def _rollout_matches_bounds(
     *,
     filename_mode: str = "all",
 ) -> bool:
-    timestamp = _rollout_filename_timestamp(path)
+    window = _rollout_filename_window(path)
     if filename_mode == "unknown":
-        return timestamp is None
-    if filename_mode == "known" and timestamp is None:
+        return window is None or not window[2]
+    if filename_mode == "known" and (window is None or not window[2]):
         return False
     if rollout_start is None and rollout_end is None:
         return True
-    if timestamp is None:
+    if window is None:
         return False
-    if rollout_start and timestamp < rollout_start:
+    window_start, window_end, _has_exact_time = window
+    if rollout_start and window_end <= rollout_start:
         return False
-    if rollout_end and timestamp >= rollout_end:
+    if rollout_end and window_start >= rollout_end:
         return False
     return True
 
@@ -361,9 +365,10 @@ def _resolve_rollout_relative_path(value: str) -> pathlib.PurePosixPath:
     if not (
         ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
         or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
+        or ROOT_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
     ):
         raise ValueError(
-            "rollout path must match sessions/YYYY/MM/DD/rollout-*.jsonl or archived_sessions/rollout-*.jsonl"
+            "rollout path must match sessions/YYYY/MM/DD/rollout-*.jsonl, archived_sessions/rollout-*.jsonl, or rollout-*.jsonl"
         )
     return candidate
 
@@ -628,6 +633,7 @@ ROLLOUT_END = CONFIG.get("rollout_end")
 ROLLOUT_FILENAME_MODE = str(CONFIG.get("rollout_filename_mode", "all"))
 ACTIVE_ROLLOUT_RELATIVE_RE = re.compile({ACTIVE_ROLLOUT_RELATIVE_RE.pattern!r})
 ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile({ARCHIVED_ROLLOUT_RELATIVE_RE.pattern!r})
+ROOT_ROLLOUT_RELATIVE_RE = re.compile({ROOT_ROLLOUT_RELATIVE_RE.pattern!r})
 ROLLOUT_FILENAME_TIME_RE = re.compile({ROLLOUT_FILENAME_TIME_RE.pattern!r})
 PRIVATE_IPV4_SIGNAL_RE = re.compile({PRIVATE_IPV4_SIGNAL_RE.pattern!r})
 PRIVATE_IPV6_SIGNAL_RE = re.compile({PRIVATE_IPV6_SIGNAL_RE.pattern!r}, re.I)
@@ -713,13 +719,13 @@ ROLLOUT_START_TIME = parse_config_time(ROLLOUT_START)
 ROLLOUT_END_TIME = parse_config_time(ROLLOUT_END)
 
 
-def rollout_filename_timestamp(path):
+def rollout_filename_window(path):
     match = ROLLOUT_FILENAME_TIME_RE.search(path.name)
     if not match:
         return None
     try:
         if match.group(2):
-            return datetime.datetime(
+            timestamp = datetime.datetime(
                 int(match.group(1)[0:4]),
                 int(match.group(1)[5:7]),
                 int(match.group(1)[8:10]),
@@ -728,29 +734,32 @@ def rollout_filename_timestamp(path):
                 int(match.group(4)),
                 tzinfo=datetime.timezone.utc,
             )
-        return datetime.datetime(
+            return timestamp, timestamp + datetime.timedelta(seconds=1), True
+        day_start = datetime.datetime(
             int(match.group(1)[0:4]),
             int(match.group(1)[5:7]),
             int(match.group(1)[8:10]),
             tzinfo=datetime.timezone.utc,
         )
+        return day_start, day_start + datetime.timedelta(days=1), False
     except ValueError:
         return None
 
 
 def rollout_matches_bounds(path):
-    timestamp = rollout_filename_timestamp(path)
+    window = rollout_filename_window(path)
     if ROLLOUT_FILENAME_MODE == "unknown":
-        return timestamp is None
-    if ROLLOUT_FILENAME_MODE == "known" and timestamp is None:
+        return window is None or not window[2]
+    if ROLLOUT_FILENAME_MODE == "known" and (window is None or not window[2]):
         return False
     if ROLLOUT_START_TIME is None and ROLLOUT_END_TIME is None:
         return True
-    if timestamp is None:
+    if window is None:
         return False
-    if ROLLOUT_START_TIME is not None and timestamp < ROLLOUT_START_TIME:
+    window_start, window_end, _has_exact_time = window
+    if ROLLOUT_START_TIME is not None and window_end <= ROLLOUT_START_TIME:
         return False
-    if ROLLOUT_END_TIME is not None and timestamp >= ROLLOUT_END_TIME:
+    if ROLLOUT_END_TIME is not None and window_start >= ROLLOUT_END_TIME:
         return False
     return True
 
@@ -961,6 +970,7 @@ def summarize_rollout():
     if not (
         ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
         or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
+        or ROOT_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
     ):
         print(json.dumps({{"ok": False, "error": "invalid rollout path"}}, separators=(",", ":"), sort_keys=True))
         print(ROLLOUT_SUMMARY_END)
@@ -1246,6 +1256,7 @@ def fetch_rollout():
     if not (
         ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
         or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
+        or ROOT_ROLLOUT_RELATIVE_RE.fullmatch(normalized)
     ):
         print(json.dumps({{"ok": False, "error": "invalid rollout path"}}, separators=(",", ":"), sort_keys=True))
         print(FETCH_ROLLOUT_END)
@@ -2498,7 +2509,7 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_rollout.add_argument(
         "--rollout",
         required=True,
-        help="Relative rollout path under the remote Codex root (sessions/... or archived_sessions/...).",
+        help="Relative rollout path under the remote Codex root (sessions/..., archived_sessions/..., or root rollout-*.jsonl).",
     )
     fetch_rollout.add_argument(
         "--output",
@@ -2515,7 +2526,7 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_summary.add_argument(
         "--rollout",
         required=True,
-        help="Relative rollout path under the remote Codex root (sessions/... or archived_sessions/...).",
+        help="Relative rollout path under the remote Codex root (sessions/..., archived_sessions/..., or root rollout-*.jsonl).",
     )
     rollout_summary.add_argument("--keyword", action="append", default=[])
     rollout_summary.add_argument("--limit", type=int, default=40)

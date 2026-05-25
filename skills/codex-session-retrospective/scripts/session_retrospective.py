@@ -1343,8 +1343,11 @@ def safe_rollout_backing_ref(value: str) -> str | None:
     ref = safe_relative_summary_ref(value)
     if ref is None:
         return None
-    name = Path(ref).name
-    if name.startswith("rollout-") and not name.startswith("rollout-summary") and name.endswith(".jsonl"):
+    if (
+        ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(ref)
+        or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(ref)
+        or ROOT_ROLLOUT_RELATIVE_RE.fullmatch(ref)
+    ):
         return ref
     return None
 
@@ -1535,20 +1538,6 @@ def summary_backing_rollout_refs(
             safe_ref = safe_rollout_backing_ref(rollout_ref)
             if safe_ref is None:
                 unbacked_record_seen = True
-                continue
-            if not rollout_ref_in_window(safe_ref, start, end) and not (
-                source_root is not None
-                and backing_ref_has_materialized_window_coverage(
-                    source_root,
-                    safe_ref,
-                    start,
-                    end,
-                    max_scan_bytes=max_scan_bytes,
-                )
-            ):
-                continue
-            relevant_record_seen = True
-            refs.add(safe_ref)
             continue
         if not summary_record_in_window(record, path, start, end):
             continue
@@ -1725,6 +1714,8 @@ def backing_ref_has_materialized_window_coverage(
     allow_mtime_fallback: bool = False,
 ) -> bool:
     rollout = source_root / ref
+    if not rollout_ref_is_direct_candidate(source_root, ref):
+        return False
     if not safe_source_file(rollout, source_root):
         return False
     return rollout_has_materialized_window_coverage(
@@ -2030,9 +2021,30 @@ def summary_file_has_record_limit_gap(path: Path) -> bool:
             match = re.search(r"\bjson_error_count=(\d+)\b", text)
             if match and int(match.group(1)) > 0:
                 return True
+            source_bytes = record.get("source_bytes")
+            scan_bytes = record.get("scan_bytes")
+            if type(source_bytes) is int and type(scan_bytes) is int and scan_bytes < source_bytes:
+                return True
             for field in limit_fields:
                 if record.get(field) is True or f"{field}=true" in text:
                     return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def summary_file_has_extractable_record_in_window(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> bool:
+    try:
+        for _line_no, record in iter_jsonl(path):
+            kind = str(record.get("kind") or "summary")
+            if kind in {"session_meta", "scan_meta"}:
+                continue
+            if summary_record_in_window(record, path, start, end):
+                return True
     except (OSError, ValueError):
         return False
     return False
@@ -4099,7 +4111,7 @@ def remote_summary_only_gaps(
     covered_rollout_refs: set[str] = {
         ref
         for ref in complete_summary_refs
-        if safe_source_file(source.root / ref, source.root)
+        if rollout_ref_is_direct_candidate(source.root, ref) and safe_source_file(source.root / ref, source.root)
     }
     has_covered_rollout = bool(covered_rollout_refs)
     for rollout in rollouts:
@@ -4793,6 +4805,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             source_root=root,
             allow_mtime_fallback=allow_mtime_fallback,
         ):
+            return
+        if not summary_file_has_extractable_record_in_window(summary, start, end):
             return
         row["status"] = "ready"
         rows.append(row)
