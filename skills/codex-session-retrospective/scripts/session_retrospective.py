@@ -5038,9 +5038,18 @@ def parse_session_meta_rows(text: str) -> list[dict[str, str]]:
     if missing_fields:
         raise ValueError(f"session-meta TSV output is missing required columns: {', '.join(missing_fields)}")
     rows: list[dict[str, str]] = []
-    for line in lines[1:]:
+    for line_no, line in enumerate(lines[1:], start=2):
         values = line.split("\t")
-        row = {key: values[index] if index < len(values) else "" for index, key in enumerate(header)}
+        if len(values) != len(header):
+            raise ValueError(
+                f"session-meta TSV row {line_no} has {len(values)} columns; expected {len(header)}"
+            )
+        row = {key: values[index] for index, key in enumerate(header)}
+        empty_fields = [field for field in ("host", "date", "session_id", "rollout") if not row[field]]
+        if empty_fields:
+            raise ValueError(
+                f"session-meta TSV row {line_no} has empty required fields: {', '.join(empty_fields)}"
+            )
         rows.append(row)
     return rows
 

@@ -4206,6 +4206,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(host_report["status"], "remote_source_not_materialized")
         self.assertIn("missing required columns: rollout", host_report["errors"][0]["error"])
 
+    def test_repair_coverage_rejects_malformed_session_meta_rows(self) -> None:
+        with self.assertRaisesRegex(ValueError, "row 2 has 4 columns; expected 5"):
+            MODULE.parse_session_meta_rows("host\tdate\tsession_id\tcwd\trollout\nmiku-bot-dev\t2026/05/01\ts1\t/work\n")
+
+        with self.assertRaisesRegex(ValueError, "empty required fields: rollout"):
+            MODULE.parse_session_meta_rows("host\tdate\tsession_id\tcwd\trollout\nmiku-bot-dev\t2026/05/01\ts1\t/work\t\n")
+
     def test_repair_coverage_keeps_remote_gap_when_rollout_materialization_fails(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             dry_run = safe_output_dir(raw, "baseline-dry-run")
