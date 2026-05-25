@@ -1108,6 +1108,75 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0], "host\tdate\tsession_id\tcwd\trollout")
         self.assertEqual({row.split("\t")[2] for row in rows[1:]}, {"session-1", "session-2"})
 
+    def test_remote_probe_session_meta_auto_split_only_splits_truncated_dates(self) -> None:
+        calls = []
+
+        def fake_scan_host_session_meta(
+            alias: str,
+            *,
+            dates: list[dt.date],
+            limit: int,
+            rollout_start: dt.datetime | None,
+            rollout_end: dt.datetime | None,
+            rollout_filename_mode: str = "all",
+        ) -> REMOTE_PROBE.SessionMetaScan:
+            date_value = dates[0]
+            calls.append((date_value, rollout_filename_mode, rollout_start, rollout_end))
+            if rollout_filename_mode == "all" and date_value == dt.date(2026, 5, 1):
+                return REMOTE_PROBE.SessionMetaScan(
+                    rows=[
+                        {
+                            "host": alias,
+                            "date": "2026/05/01",
+                            "session_id": "session-1",
+                            "cwd": "/redacted/repo",
+                            "rollout": "sessions/2026/05/01/rollout-2026-05-01T10-00-00-1.jsonl",
+                        }
+                    ],
+                    truncated=False,
+                )
+            if rollout_filename_mode == "all":
+                return REMOTE_PROBE.SessionMetaScan(rows=[], truncated=True)
+            if rollout_filename_mode == "unknown":
+                return REMOTE_PROBE.SessionMetaScan(rows=[], truncated=False)
+            return REMOTE_PROBE.SessionMetaScan(
+                rows=[
+                    {
+                        "host": alias,
+                        "date": "2026/05/02",
+                        "session_id": "session-2",
+                        "cwd": "/redacted/repo",
+                        "rollout": "sessions/2026/05/02/rollout-2026-05-02T00-00-00-2.jsonl",
+                    }
+                ],
+                truncated=False,
+            )
+
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+
+        with mock.patch.object(REMOTE_PROBE, "_scan_host_session_meta", side_effect=fake_scan_host_session_meta), mock.patch.object(
+            sys, "stderr", stderr
+        ), mock.patch.object(sys, "stdout", stdout):
+            result = REMOTE_PROBE.cmd_session_meta(
+                types.SimpleNamespace(
+                    host=["local"],
+                    date=["2026/05/01", "2026/05/02"],
+                    from_date=None,
+                    to_date=None,
+                    limit=1,
+                    rollout_start=None,
+                    rollout_end=None,
+                    auto_split=True,
+                )
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertTrue(any(call[0] == dt.date(2026, 5, 2) and call[1] == "known" for call in calls))
+        self.assertFalse(any(call[0] == dt.date(2026, 5, 1) and call[1] == "known" for call in calls))
+        self.assertEqual({row.split("\t")[2] for row in stdout.getvalue().strip().splitlines()[1:]}, {"session-1", "session-2"})
+
     def test_remote_probe_session_meta_auto_split_keeps_latest_rollout_for_duplicate_session(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -5662,6 +5731,50 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("user_correction", rows[0]["issue_flags"])
         self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_complete_rollout_summary_without_retained_flags_does_not_cover_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
+                    {"kind": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "text": "session_id=s1"},
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Ordinary assistant update without retained flags.",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rows, [])
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_complete_summary_extracts_when_backing_ref_is_relevant_but_summary_path_is_late(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -11927,6 +12040,54 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "ready")
+
+    def test_make_shards_keeps_oversized_rollout_when_complete_summary_has_no_retained_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(source_bytes=rollout.stat().st_size),
+                    {"kind": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "text": "session_id=s1"},
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Ordinary assistant update without retained flags.",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("kind", rows[0])
+        self.assertEqual(rows[0]["status"], "oversized")
 
     def test_make_shards_stale_rollout_summary_keeps_oversized_rollout_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

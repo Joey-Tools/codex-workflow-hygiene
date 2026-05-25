@@ -1687,6 +1687,8 @@ def complete_summary_backing_rollout_refs(
             max_scan_bytes=max_scan_bytes,
         ):
             continue
+        if not summary_file_has_extractable_record_in_window(summary, start, end):
+            continue
         source_bytes_by_ref = complete_summary_backing_source_bytes_by_ref(
             summary,
             start,
@@ -2053,11 +2055,25 @@ def summary_file_has_extractable_record_in_window(
             kind = str(record.get("kind") or "summary")
             if kind in {"session_meta", "scan_meta"}:
                 continue
-            if summary_record_in_window(record, path, start, end):
+            if not summary_record_in_window(record, path, start, end):
+                continue
+            if summary_record_has_retained_flags(record):
                 return True
     except (OSError, ValueError):
         return False
     return False
+
+
+def summary_record_has_retained_flags(record: dict[str, Any]) -> bool:
+    text = str(record.get("text") or "")
+    kind = str(record.get("kind") or "summary")
+    flag_text = text
+    if kind == "user_message":
+        flag_text = meaningful_prompt_text(text)
+        if not flag_text or not meaningful_user_text(text):
+            return False
+    _redacted_text, changed = redact(flag_text)
+    return bool(flags_for_text(flag_text, redacted_changed=changed))
 
 
 def summary_file_has_complete_backing_scan_meta(path: Path) -> bool:

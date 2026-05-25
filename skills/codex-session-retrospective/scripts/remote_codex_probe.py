@@ -1810,6 +1810,29 @@ def _auto_split_host_session_meta(
     return SessionMetaScan(rows=_dedupe_session_meta_rows(rows), truncated=True)
 
 
+def _scan_host_session_meta_with_auto_split(
+    alias: str,
+    *,
+    dates: list[dt.date],
+    limit: int,
+) -> SessionMetaScan:
+    rows: list[dict[str, str]] = []
+    truncated = False
+    for date_value in dates:
+        scan = _scan_host_session_meta(
+            alias,
+            dates=[date_value],
+            limit=limit,
+            rollout_start=None,
+            rollout_end=None,
+        )
+        if scan.truncated:
+            scan = _auto_split_host_session_meta(alias, dates=[date_value], limit=limit)
+        rows.extend(scan.rows)
+        truncated = truncated or scan.truncated
+    return SessionMetaScan(rows=_dedupe_session_meta_rows(rows), truncated=truncated)
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     try:
         hosts = _resolve_hosts(args.host)
@@ -1859,15 +1882,16 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
     auto_split = bool(getattr(args, "auto_split", False))
     for alias in hosts:
         try:
-            scan = _scan_host_session_meta(
-                alias,
-                dates=dates,
-                limit=args.limit,
-                rollout_start=rollout_start,
-                rollout_end=rollout_end,
-            )
-            if scan.truncated and auto_split:
-                scan = _auto_split_host_session_meta(alias, dates=dates, limit=args.limit)
+            if auto_split:
+                scan = _scan_host_session_meta_with_auto_split(alias, dates=dates, limit=args.limit)
+            else:
+                scan = _scan_host_session_meta(
+                    alias,
+                    dates=dates,
+                    limit=args.limit,
+                    rollout_start=rollout_start,
+                    rollout_end=rollout_end,
+                )
         except SessionMetaRolloutError as error:
             print(f"host={alias}", file=sys.stderr)
             if error.rollout:
