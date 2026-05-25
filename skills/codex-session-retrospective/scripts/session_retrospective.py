@@ -1976,6 +1976,32 @@ def stale_backing_summary_gap_paths(
     }
 
 
+def remote_summary_fallback_is_extractable(
+    source: Source,
+    summary: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    if source.host not in DEFAULT_REMOTE_HOSTS:
+        return False
+    backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+        summary,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+        source_root=source.root,
+    )
+    if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
+        return False
+    for ref in backing_refs:
+        backing_path = source.root / ref
+        if backing_path.exists() or backing_path.is_symlink():
+            return False
+    return True
+
+
 def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
     if start is None and end is None:
         return True
@@ -4577,7 +4603,13 @@ def run_scan(
                         }
                     )
                 continue
-            if summary in stale_summary_paths:
+            if summary in stale_summary_paths and not remote_summary_fallback_is_extractable(
+                source,
+                summary,
+                gap_start,
+                end,
+                max_scan_bytes=max_raw_bytes,
+            ):
                 continue
             if not summary_file_relevant_or_backing_ref_relevant(
                 summary,
@@ -5165,13 +5197,12 @@ def materialize_remote_host(
             if summary.returncode == 0:
                 safe_write_bytes(summary_path_for_rollout(root, rollout_ref), summary.stdout.encode("utf-8"))
                 report["summary_count"] += 1
-                report["failed_rollout_count"] += 1
                 report["errors"].append(
                     {
                         "command": "fetch-rollout",
                         "rollout": path_ref(target),
                         "error": command_failure(fetch),
-                        "repair": "wrote bounded rollout-summary; raw backing rollout is still absent, so host remains not fully materialized",
+                        "repair": "wrote bounded rollout-summary; raw backing rollout is absent, so scan keeps a coverage gap while extracting bounded signal",
                     }
                 )
                 continue

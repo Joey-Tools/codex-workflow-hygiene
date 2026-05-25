@@ -4207,8 +4207,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         "    print('error=blocked', file=sys.stderr)",
                         "    raise SystemExit(1)",
                         "elif cmd == 'rollout-summary':",
-                        "    print(json.dumps({'kind': 'scan_meta', 'timestamp': '', 'scan_truncated': False, 'json_error_count': 0, 'keyword_filter_applied': False, 'record_limit_reached': False, 'signal_record_limit_reached': False, 'matched_record_limit_reached': False, 'tail_record_limit_reached': False, 'summary_limit': 200, 'source_bytes': 1000}))",
-                        "    print(json.dumps({'kind': 'user_message', 'timestamp': '2026-05-01T10:00:00Z', 'text': 'Summary-only fallback.'}))",
+                        "    rollout = arg('--rollout')",
+                        "    print(json.dumps({'kind': 'scan_meta', 'timestamp': '', 'rollout': rollout, 'scan_bytes': 1000, 'scan_truncated': False, 'json_error_count': 0, 'keyword_filter_applied': False, 'record_limit_reached': False, 'signal_record_limit_reached': False, 'matched_record_limit_reached': False, 'tail_record_limit_reached': False, 'summary_limit': 200, 'source_bytes': 1000}))",
+                        "    print(json.dumps({'kind': 'user_message', 'timestamp': '2026-05-01T10:00:00Z', 'rollout': rollout, 'text': 'permission denied while reading remote rollout'}))",
                         "else:",
                         "    raise SystemExit(2)",
                     ]
@@ -4242,11 +4243,12 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
 
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(trend["turn_count"], 1)
         host_report = report["repair"]["materialized_hosts"][0]
-        self.assertEqual(host_report["status"], "remote_source_not_materialized")
+        self.assertEqual(host_report["status"], "ready")
         self.assertEqual(host_report["summary_count"], 1)
-        self.assertEqual(host_report["failed_rollout_count"], 1)
-        self.assertEqual(metadata["status"], "remote_source_not_materialized")
+        self.assertEqual(host_report["failed_rollout_count"], 0)
+        self.assertEqual(metadata["status"], "ready")
 
     def test_repair_coverage_rejects_relative_manifest_source_root(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
