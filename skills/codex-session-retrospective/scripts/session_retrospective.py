@@ -1310,7 +1310,15 @@ def summary_file_relevant_with_scan_cap(
         except OSError:
             return False
     if summary_date and end and summary_date >= end:
-        return False
+        try:
+            if path.stat().st_size > max_scan_bytes:
+                return False
+        except OSError:
+            return False
+        try:
+            return raw_timestamp_in_window(path, start, end, max_scan_bytes=max_scan_bytes)
+        except OSError:
+            return False
     return True
 
 
@@ -1467,6 +1475,7 @@ def summary_backing_rollout_refs(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    source_root: Path | None = None,
 ) -> tuple[set[str], bool, bool, bool]:
     refs: set[str] = set()
     try:
@@ -1503,7 +1512,16 @@ def summary_backing_rollout_refs(
             if safe_ref is None:
                 unbacked_record_seen = True
                 continue
-            if not rollout_ref_in_window(safe_ref, start, end):
+            if not rollout_ref_in_window(safe_ref, start, end) and not (
+                source_root is not None
+                and backing_ref_has_materialized_window_coverage(
+                    source_root,
+                    safe_ref,
+                    start,
+                    end,
+                    max_scan_bytes=max_scan_bytes,
+                )
+            ):
                 continue
             relevant_record_seen = True
             refs.add(safe_ref)
@@ -1552,6 +1570,9 @@ def complete_scan_meta_record_source_bytes(record: dict[str, Any]) -> int | None
     source_bytes = record.get("source_bytes")
     if type(source_bytes) is not int or source_bytes < 0:
         return None
+    scan_bytes = record.get("scan_bytes")
+    if type(scan_bytes) is not int or scan_bytes < source_bytes:
+        return None
     return source_bytes
 
 
@@ -1599,12 +1620,14 @@ def complete_summary_backing_source_bytes_by_ref(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    source_root: Path | None = None,
 ) -> dict[str, int] | None:
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
         path,
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     )
     if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
         return None
@@ -1648,6 +1671,7 @@ def complete_summary_backing_rollout_refs(
             start,
             end,
             max_scan_bytes=max_scan_bytes,
+            source_root=source_root,
         )
         if source_bytes_by_ref is None:
             continue
@@ -1667,6 +1691,27 @@ def backing_ref_matches_current_rollout(source_root: Path, ref: str, source_byte
         return rollout.stat().st_size == source_bytes
     except OSError:
         return False
+
+
+def backing_ref_has_materialized_window_coverage(
+    source_root: Path,
+    ref: str,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+    allow_mtime_fallback: bool = False,
+) -> bool:
+    rollout = source_root / ref
+    if not safe_source_file(rollout, source_root):
+        return False
+    return rollout_has_materialized_window_coverage(
+        rollout,
+        start,
+        end,
+        max_raw_bytes=max_scan_bytes,
+        allow_mtime_fallback=allow_mtime_fallback,
+    )
 
 
 def backing_ref_has_direct_materialized_window_coverage(
@@ -1740,6 +1785,7 @@ def summary_file_has_stale_backing_source(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     )
     if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
         return False
@@ -1748,6 +1794,7 @@ def summary_file_has_stale_backing_source(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     )
     if source_bytes_by_ref is None:
         if complete_scan_meta_backing_source_bytes_by_ref(path, start, end) is not None:
@@ -1779,6 +1826,7 @@ def summary_file_stale_backing_requires_gap(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     )
     if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
         return False
@@ -1787,6 +1835,7 @@ def summary_file_stale_backing_requires_gap(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     )
     if source_bytes_by_ref is None:
         if complete_scan_meta_backing_source_bytes_by_ref(path, start, end) is None:
@@ -4035,6 +4084,7 @@ def remote_summary_only_gaps(
             start,
             end,
             max_scan_bytes=max_scan_bytes,
+            source_root=source.root,
         )
         if not relevant_record_seen:
             continue
