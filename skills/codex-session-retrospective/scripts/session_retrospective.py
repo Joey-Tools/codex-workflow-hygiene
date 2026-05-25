@@ -158,6 +158,7 @@ ACTIVE_ROLLOUT_RELATIVE_RE = re.compile(
 ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile(
     r"^archived_sessions/(?:\d{4}/\d{2}/\d{2}/)?rollout-(?!summary)[^/]+\.jsonl$"
 )
+ROOT_ROLLOUT_RELATIVE_RE = re.compile(r"^rollout-(?!summary)[^/]+\.jsonl$")
 RAW_SESSION_ID_TEXT_PATTERN = re.compile(r"\bsession_id[\"']?\s*(?:=|:)\s*[\"']?(?!session_ref_v1:)[A-Za-z0-9][A-Za-z0-9_.:-]*")
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
@@ -1326,7 +1327,11 @@ def safe_rollout_backing_ref(value: str) -> str | None:
     ref = safe_relative_summary_ref(value)
     if ref is None:
         return None
-    if ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(ref) or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(ref):
+    if (
+        ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(ref)
+        or ARCHIVED_ROLLOUT_RELATIVE_RE.fullmatch(ref)
+        or ROOT_ROLLOUT_RELATIVE_RE.fullmatch(ref)
+    ):
         return ref
     return None
 
@@ -1501,6 +1506,12 @@ def summary_file_has_record_limit_gap(path: Path) -> bool:
             if str(record.get("kind") or "") != "scan_meta":
                 continue
             text = str(record.get("text") or "")
+            json_error_count = record.get("json_error_count")
+            if isinstance(json_error_count, int) and json_error_count > 0:
+                return True
+            match = re.search(r"\bjson_error_count=(\d+)\b", text)
+            if match and int(match.group(1)) > 0:
+                return True
             for field in limit_fields:
                 if record.get(field) is True or f"{field}=true" in text:
                     return True
@@ -1527,6 +1538,9 @@ def summary_file_has_complete_backing_scan_meta(path: Path) -> bool:
                 return False
             summary_limit = record.get("summary_limit")
             if type(summary_limit) is not int or summary_limit < 0:
+                return False
+            json_error_count = record.get("json_error_count")
+            if type(json_error_count) is not int or json_error_count != 0:
                 return False
             if any(record.get(field) is not False for field in limit_fields):
                 return False

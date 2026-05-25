@@ -50,6 +50,7 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 def complete_rollout_summary_scan_meta(**overrides: object) -> dict:
     row = {
         "kind": "scan_meta",
+        "json_error_count": 0,
         "keyword_filter_applied": False,
         "line": 0,
         "matched_record_limit_reached": False,
@@ -66,7 +67,7 @@ def complete_rollout_summary_scan_meta(**overrides: object) -> dict:
         "text": (
             "scan_truncated=false keyword_filter_applied=false record_limit_reached=false "
             "signal_record_limit_reached=false matched_record_limit_reached=false "
-            "tail_record_limit_reached=false scan_bytes=2097152 summary_limit=40 "
+            "tail_record_limit_reached=false scan_bytes=2097152 json_error_count=0 summary_limit=40 "
             "tail_records=8 summary_record_count=1 source_bytes=1200"
         ),
     }
@@ -1376,6 +1377,24 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(meta["record_limit_reached"])
         self.assertFalse(meta["keyword_filter_applied"])
         self.assertTrue(meta["tail_record_limit_reached"])
+        self.assertEqual(meta["json_error_count"], 0)
+
+    def test_remote_probe_rollout_summary_reports_json_error_metadata(self) -> None:
+        records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
+            lines=[
+                json.dumps(message("user", "You forgot verification.", "2026-05-01T10:00:00Z")),
+                "{not json",
+                json.dumps(message("assistant", "Done.", "2026-05-01T10:01:00Z")),
+            ],
+            keywords=[],
+            limit=10,
+            tail_records=8,
+            max_text_chars=80,
+        )
+
+        self.assertGreaterEqual(len(records), 1)
+        self.assertEqual(meta["json_error_count"], 1)
+        self.assertFalse(meta["record_limit_reached"])
 
     def test_remote_probe_cmd_rollout_summary_emits_record_limit_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1412,6 +1431,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertTrue(scan_meta["keyword_filter_applied"])
         self.assertFalse(scan_meta["tail_record_limit_reached"])
         self.assertEqual(scan_meta["summary_limit"], 1)
+        self.assertEqual(scan_meta["json_error_count"], 0)
 
     def test_remote_probe_generated_rollout_summary_emits_record_limit_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1457,6 +1477,48 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertTrue(scan_meta["keyword_filter_applied"])
         self.assertFalse(scan_meta["tail_record_limit_reached"])
         self.assertEqual(scan_meta["summary_limit"], 1)
+        self.assertEqual(scan_meta["json_error_count"], 0)
+
+    def test_remote_probe_generated_rollout_summary_reports_json_error_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "You forgot verification.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + "{not json"
+                + "\n",
+                encoding="utf-8",
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                    "summary_limit": 10,
+                    "summary_scan_bytes": 4096,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 80,
+                    "summary_keywords": [],
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scan_meta = next(
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if line.startswith("{") and json.loads(line).get("kind") == "scan_meta"
+        )
+        self.assertEqual(scan_meta["json_error_count"], 1)
 
     def test_remote_probe_rollout_summary_preserves_early_signal_outside_tail(self) -> None:
         lines = [json.dumps(message("user", "permission denied while fetching remote logs", "2026-05-01T10:00:00Z"))]
@@ -5257,6 +5319,83 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("user_correction", rows[0]["issue_flags"])
         self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_complete_rollout_summary_covers_flat_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "rollout-2026-05-01T10-00-00-flat.jsonl"
+            rollout = root / rollout_ref
+            rollout.write_text(
+                json.dumps(message("user", "Fresh flat oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "rollout-summary-flat.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_json_error_rollout_summary_does_not_cover_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Fresh oversized task.", "2026-05-01T10:00:00Z"))
+                + "\n"
+                + "{not json"
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(json_error_count=1),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_record_limited_rollout_summary_does_not_cover_oversized_rollout_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

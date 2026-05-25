@@ -983,6 +983,7 @@ def summarize_rollout():
     signal_seen = set()
     signal_record_limit_reached = False
     matched_record_limit_reached = False
+    json_error_count = 0
     summary_record_count = 0
     tail = collections.deque(maxlen=SUMMARY_TAIL_RECORDS)
     session_meta_record = None
@@ -1002,6 +1003,7 @@ def summarize_rollout():
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
+                json_error_count += 1
                 continue
             timestamp = str(obj.get("timestamp", ""))
             record = None
@@ -1085,6 +1087,7 @@ def summarize_rollout():
         {{
             "keyword_filter_applied": keyword_filter_applied,
             "kind": "scan_meta",
+            "json_error_count": json_error_count,
             "line": 0,
             "matched_record_limit_reached": matched_record_limit_reached,
             "record_limit_reached": record_limit_reached,
@@ -1103,6 +1106,7 @@ def summarize_rollout():
                 + " matched_record_limit_reached=" + str(matched_record_limit_reached).lower()
                 + " tail_record_limit_reached=" + str(tail_record_limit_reached).lower()
                 + " scan_bytes=" + str(SUMMARY_SCAN_BYTES)
+                + " json_error_count=" + str(json_error_count)
                 + " summary_limit=" + str(SUMMARY_LIMIT)
                 + " tail_records=" + str(SUMMARY_TAIL_RECORDS)
                 + " summary_record_count=" + str(summary_record_count)
@@ -2125,6 +2129,7 @@ def _summarize_rollout_records_with_meta(
     signal_seen: set[tuple[str, int]] = set()
     signal_record_limit_reached = False
     matched_record_limit_reached = False
+    json_error_count = 0
     summary_record_count = 0
     tail: collections.deque[dict[str, Any]] = collections.deque(maxlen=tail_records)
     session_meta_record: dict[str, Any] | None = None
@@ -2136,6 +2141,7 @@ def _summarize_rollout_records_with_meta(
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
+            json_error_count += 1
             continue
         timestamp = str(obj.get("timestamp", ""))
         record: dict[str, Any] | None = None
@@ -2263,6 +2269,7 @@ def _summarize_rollout_records_with_meta(
     keyword_filter_applied = bool(search_keywords)
     return result, {
         "keyword_filter_applied": keyword_filter_applied,
+        "json_error_count": json_error_count,
         "matched_record_limit_reached": matched_record_limit_reached,
         "record_limit_reached": signal_record_limit_reached or matched_record_limit_reached,
         "signal_record_limit_reached": signal_record_limit_reached,
@@ -2285,6 +2292,7 @@ def _rollout_summary_scan_meta(
     matched_record_limit_reached: bool = False,
     tail_record_limit_reached: bool = False,
     keyword_filter_applied: bool = False,
+    json_error_count: int = 0,
     tail_records: int = 0,
     summary_record_count: int = 0,
 ) -> dict[str, Any]:
@@ -2292,6 +2300,7 @@ def _rollout_summary_scan_meta(
     record_limit_reached = bool(record_limit_reached or signal_record_limit_reached or matched_record_limit_reached)
     return {
         "kind": "scan_meta",
+        "json_error_count": json_error_count,
         "keyword_filter_applied": keyword_filter_applied,
         "line": 0,
         "matched_record_limit_reached": matched_record_limit_reached,
@@ -2311,7 +2320,8 @@ def _rollout_summary_scan_meta(
             f"signal_record_limit_reached={str(signal_record_limit_reached).lower()} "
             f"matched_record_limit_reached={str(matched_record_limit_reached).lower()} "
             f"tail_record_limit_reached={str(tail_record_limit_reached).lower()} "
-            f"scan_bytes={scan_bytes} summary_limit={summary_limit} tail_records={tail_records} "
+            f"scan_bytes={scan_bytes} json_error_count={json_error_count} "
+            f"summary_limit={summary_limit} tail_records={tail_records} "
             f"summary_record_count={summary_record_count} source_bytes={source_bytes}"
         ),
         "timestamp": "",
@@ -2363,6 +2373,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                     matched_record_limit_reached=bool(summary_meta["matched_record_limit_reached"]),
                     tail_record_limit_reached=bool(summary_meta["tail_record_limit_reached"]),
                     keyword_filter_applied=bool(summary_meta["keyword_filter_applied"]),
+                    json_error_count=int(summary_meta["json_error_count"]),
                     tail_records=int(summary_meta["tail_records"]),
                     summary_record_count=int(summary_meta["summary_record_count"]),
                 ),
