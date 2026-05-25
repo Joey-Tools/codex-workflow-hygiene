@@ -2117,8 +2117,19 @@ def summary_session_id(record: dict[str, Any]) -> str | None:
     return None
 
 
+def summary_backing_rollout_date(record: dict[str, Any]) -> dt.datetime | None:
+    rollout_ref = record.get("rollout")
+    if not isinstance(rollout_ref, str):
+        return None
+    safe_ref = safe_rollout_backing_ref(rollout_ref)
+    if safe_ref is None:
+        return None
+    ref_path = Path(safe_ref)
+    return rollout_date_from_path(ref_path) or dated_path_from_parts(ref_path)
+
+
 def summary_timestamp_with_fallback(record: dict[str, Any], path: Path) -> dt.datetime | None:
-    return parse_time(str(record.get("timestamp") or "")) or summary_date_from_path(path)
+    return parse_time(str(record.get("timestamp") or "")) or summary_backing_rollout_date(record) or summary_date_from_path(path)
 
 
 def infer_model_era(model: str | None, timestamp: str | None) -> str:
