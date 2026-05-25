@@ -299,6 +299,7 @@ RETAINED_COVERAGE_GAP_REASONS = frozenset(
         "source_root_missing",
         "source_root_symlink",
         "stale_host",
+        "stale_rollout_summary",
         "truncated_rollout_summary",
         "unreachable",
         "unsafe_source_artifact",
@@ -1448,6 +1449,66 @@ def backing_ref_matches_current_rollout(source_root: Path, ref: str, source_byte
         return rollout.stat().st_size == source_bytes
     except OSError:
         return False
+
+
+def summary_file_has_stale_backing_source(
+    path: Path,
+    source_root: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size > max_scan_bytes:
+        return False
+    if not summary_file_relevant_with_scan_cap(path, start, end, max_scan_bytes=max_scan_bytes):
+        return False
+    if (
+        summary_file_has_truncated_scan(path)
+        or summary_file_has_record_limit_gap(path)
+        or first_jsonl_error(path) is not None
+    ):
+        return False
+    source_bytes = summary_file_complete_backing_source_bytes(path)
+    if source_bytes is None:
+        return False
+    backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    )
+    if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
+        return False
+    return any(
+        not backing_ref_matches_current_rollout(source_root, ref, source_bytes)
+        for ref in backing_refs
+    )
+
+
+def stale_backing_summary_paths(
+    summaries: list[Path],
+    source_root: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> set[Path]:
+    return {
+        summary
+        for summary in summaries
+        if summary_file_has_stale_backing_source(
+            summary,
+            source_root,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+        )
+    }
 
 
 def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
@@ -3736,6 +3797,13 @@ def run_scan(
             source_root=source.root,
             max_scan_bytes=max_raw_bytes,
         )
+        stale_summary_paths = stale_backing_summary_paths(
+            summaries,
+            source.root,
+            gap_start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+        )
         source_materialization_gaps = materialization_gaps_for_source(source)
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
@@ -3748,8 +3816,17 @@ def run_scan(
         )
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
+        stale_summary_gaps = [
+            {
+                "host": source.host,
+                "path_ref": path_ref(summary),
+                "reason": "stale_rollout_summary",
+            }
+            for summary in stale_summary_paths
+        ]
+        coverage_gaps.extend(stale_summary_gaps)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
-        blocking_gaps = source_materialization_gaps + source_summary_only_gaps
+        blocking_gaps = source_materialization_gaps + source_summary_only_gaps + stale_summary_gaps
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
         manifest_sources.append(
@@ -3850,6 +3927,8 @@ def run_scan(
                             "reason": "invalid_jsonl",
                         }
                     )
+                continue
+            if summary in stale_summary_paths:
                 continue
             if not summary_file_relevant(summary, start, end):
                 continue
@@ -3954,6 +4033,13 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             source_root=source.root,
             max_scan_bytes=max_raw_bytes,
         )
+        stale_summary_paths = stale_backing_summary_paths(
+            summaries,
+            source.root,
+            start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+        )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
             rollouts,
@@ -3965,7 +4051,16 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         )
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
-        blocking_gaps = source_materialization_gaps + source_summary_only_gaps
+        stale_summary_gaps = [
+            {
+                "host": source.host,
+                "path_ref": path_ref(summary),
+                "reason": "stale_rollout_summary",
+            }
+            for summary in stale_summary_paths
+        ]
+        coverage_gaps.extend(stale_summary_gaps)
+        blocking_gaps = source_materialization_gaps + source_summary_only_gaps + stale_summary_gaps
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
         manifest_sources.append(
@@ -4135,6 +4230,17 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 return
             row["status"] = "invalid"
             row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
+            rows.append(row)
+            return
+        if summary_file_has_stale_backing_source(
+            summary,
+            root,
+            start,
+            end,
+            max_scan_bytes=max_raw_bytes,
+        ):
+            row["status"] = "partial"
+            row["coverage_gap"] = "summary source_bytes does not match current backing rollout; regenerate bounded rollout-summary before extractor handoff"
             rows.append(row)
             return
         if not summary_file_relevant(summary, start, end):

@@ -5392,8 +5392,15 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
 
-        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertIn("oversized_rollout_skipped", reasons)
+        self.assertIn("stale_rollout_summary", reasons)
+        self.assertEqual(rows, [])
 
     def test_json_error_rollout_summary_does_not_cover_oversized_rollout_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -10716,8 +10723,12 @@ class SessionRetrospectiveTests(unittest.TestCase):
             for row in rows
             if row.get("status") == "oversized" and "rollout exceeds" in str(row.get("coverage_gap", ""))
         ]
+        summary_rows = [row for row in rows if row.get("kind") == "summary"]
         self.assertEqual(len(rollout_rows), 1)
         self.assertIn("coverage_gap", rollout_rows[0])
+        self.assertEqual(len(summary_rows), 1)
+        self.assertEqual(summary_rows[0]["status"], "partial")
+        self.assertIn("source_bytes", summary_rows[0]["coverage_gap"])
 
     def test_make_shards_remote_complete_summary_covers_unknown_oversized_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
