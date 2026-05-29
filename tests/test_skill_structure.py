@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import unittest
 
 
@@ -63,42 +61,13 @@ class SkillStructureTests(unittest.TestCase):
         code = workflow[start : workflow.index("\nPY\n```", start)]
 
         needle = "needle-structured-probe"
-        rows = [
-            {"session_id": "history-session", "thread_name": f"history {needle}", "ts": "2026-05-29T00:00:00Z"},
-            {
-                "type": "session_meta",
-                "timestamp": "2026-05-29T00:00:01Z",
-                "payload": {"id": f"session-{needle}", "cwd": f"/tmp/{needle}", "model": "gpt-5.5"},
-            },
-            {
-                "type": "turn_context",
-                "timestamp": "2026-05-29T00:00:02Z",
-                "payload": {"sandbox_policy": f"read-only {needle}", "approval_policy": "never"},
-            },
-            {
-                "type": "event_msg",
-                "timestamp": "2026-05-29T00:00:03Z",
-                "payload": {
-                    "type": "user_message",
-                    "message": {"role": "user", "content": [{"type": "input_text", "text": f"structured {needle}"}]},
-                },
-            },
-            {
-                "type": "response_item",
-                "timestamp": "2026-05-29T00:00:04Z",
-                "payload": {"type": "function_call_output", "output": f"tool result {needle}"},
-            },
-        ]
-
-        with tempfile.TemporaryDirectory() as raw:
-            jsonl = Path(raw) / "rollout.jsonl"
-            jsonl.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
-            result = subprocess.run(
-                [sys.executable, "-c", code, str(jsonl), needle],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+        jsonl = root / "tests/fixtures/codex_session_mining_exact_probe.jsonl"
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(jsonl), needle],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
         output = result.stdout
         for kind in ("history", "session_meta", "turn_context", "user_message", "function_call_output"):
