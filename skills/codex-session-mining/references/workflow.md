@@ -121,15 +121,37 @@ def hit_window(text, needle):
     suffix = '...' if end < len(text) else ''
     return prefix + text[start:end] + suffix
 
-def add_history_fields(obj, parts):
-    for key in ('text', 'message', 'thread_name', 'session_id', 'title'):
+def add_top_level_fields(obj, parts):
+    for key in (
+        'id',
+        'session_id',
+        'thread_name',
+        'updated_at',
+        'ts',
+        'timestamp',
+        'cwd',
+        'model',
+        'current_date',
+        'timezone',
+        'approval_policy',
+        'sandbox_policy',
+        'permission_profile',
+        'originator',
+        'cli_version',
+        'source',
+        'thread_source',
+        'model_provider',
+        'text',
+        'message',
+        'title',
+    ):
         collect_text(obj.get(key) or '', parts)
 
 for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
     obj = json.loads(line)
     payload = obj.get('payload') or {}
     item_type = payload.get('type')
-    record_kind = item_type or 'history'
+    record_kind = item_type or obj.get('type') or 'history'
     text_parts = []
     if item_type == 'message':
         collect_text(payload.get('content') or [], text_parts)
@@ -141,7 +163,7 @@ for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1)
     elif item_type == 'user_message':
         collect_text(payload.get('message') or payload.get('text') or payload.get('content') or '', text_parts)
     elif not item_type:
-        add_history_fields(obj, text_parts)
+        add_top_level_fields(obj, text_parts)
     else:
         continue
     text = ' '.join(' '.join(text_parts).split())
