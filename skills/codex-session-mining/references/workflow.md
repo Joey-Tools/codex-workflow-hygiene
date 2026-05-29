@@ -465,6 +465,8 @@ for path in paths:
     for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
         obj = json.loads(line)
         payload = obj.get('payload') or {}
+        if obj.get('type') == 'function_call_output' or payload.get('type') == 'function_call_output':
+            continue
         parts = []
         add_record_fields(obj, payload, parts)
         text = ' '.join(' '.join(parts).split())

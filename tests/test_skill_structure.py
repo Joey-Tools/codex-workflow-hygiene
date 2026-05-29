@@ -151,6 +151,26 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("sample 20", lines[-1])
         self.assertNotIn("sample 21", result.stdout)
 
+    def test_session_mining_bounded_rollout_probe_skips_tool_output(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        code = extract_python_block_after(workflow, "Search a bounded rollout set without dumping full JSONL records:")
+        jsonl = root / "tests/fixtures/codex_session_mining_tool_output_then_thread_start.jsonl"
+        env = dict(os.environ, CODEX_ROLLOUT_SAMPLE=str(jsonl))
+
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            check=True,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+
+        self.assertEqual(1, len(result.stdout.splitlines()))
+        self.assertIn(":event_msg:thread/start:", result.stdout)
+        self.assertIn("real event", result.stdout)
+        self.assertNotIn("tool output", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
