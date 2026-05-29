@@ -36,6 +36,12 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("function_call_output", workflow)
         self.assertIn("def hit_window", workflow)
         self.assertIn("hit_window(text, needle)", workflow)
+        self.assertIn("def add_history_fields", workflow)
+        self.assertIn("thread_name", workflow)
+        self.assertIn("session_id", workflow)
+        self.assertIn("elif item_type == 'user_message'", workflow)
+        self.assertIn("payload.get('message')", workflow)
+        self.assertIn("record_kind = item_type or 'history'", workflow)
         self.assertNotIn("text = json.dumps(payload", workflow)
         self.assertNotIn("snippet = ' '.join(text.split())[:", workflow)
 

@@ -121,12 +121,15 @@ def hit_window(text, needle):
     suffix = '...' if end < len(text) else ''
     return prefix + text[start:end] + suffix
 
+def add_history_fields(obj, parts):
+    for key in ('text', 'message', 'thread_name', 'session_id', 'title'):
+        collect_text(obj.get(key) or '', parts)
+
 for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
     obj = json.loads(line)
     payload = obj.get('payload') or {}
     item_type = payload.get('type')
-    if item_type not in ('message', 'function_call', 'function_call_output'):
-        continue
+    record_kind = item_type or 'history'
     text_parts = []
     if item_type == 'message':
         collect_text(payload.get('content') or [], text_parts)
@@ -135,10 +138,16 @@ for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1)
         text_parts.append(str(payload.get('arguments') or ''))
     elif item_type == 'function_call_output':
         collect_text(payload.get('output') or payload.get('content') or payload.get('result') or '', text_parts)
+    elif item_type == 'user_message':
+        collect_text(payload.get('message') or payload.get('text') or payload.get('content') or '', text_parts)
+    elif not item_type:
+        add_history_fields(obj, text_parts)
+    else:
+        continue
     text = ' '.join(' '.join(text_parts).split())
     if needle not in text:
         continue
-    print(f'{path}:{line_no}:{obj.get("timestamp")}:{item_type}:{hit_window(text, needle)}')
+    print(f'{path}:{line_no}:{obj.get("timestamp") or obj.get("ts")}:{record_kind}:{hit_window(text, needle)}')
     printed += 1
     if printed >= 20:
         break
