@@ -375,6 +375,7 @@ import os
 sample = os.environ.get('CODEX_ROLLOUT_SAMPLE')
 paths = [Path(sample).expanduser()] if sample else sorted(Path('~/.codex/sessions/2026/03/12').expanduser().glob('rollout-*.jsonl'))
 needle = 'thread/start'
+printed = 0
 
 def collect_text(value, parts):
     if isinstance(value, str):
@@ -459,6 +460,9 @@ for path in paths:
             continue
         snippet = hit_window(text, needle)
         print(f'{path}:{line_no}:{obj.get("timestamp")}:{obj.get("type")}:{payload.get("type")}:{snippet}')
+        printed += 1
+        if printed >= 20:
+            raise SystemExit
 PY
 ```
 
