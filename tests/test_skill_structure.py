@@ -85,6 +85,14 @@ class SkillStructureTests(unittest.TestCase):
             self.assertIn(f":{kind}:", output)
         self.assertIn("top-level output", output)
 
+        metadata_result = subprocess.run(
+            [sys.executable, "-c", code, str(jsonl), "approval_policy"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn(":turn_context:", metadata_result.stdout)
+
     def test_session_mining_failure_probe_handles_event_message_fields(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
@@ -102,6 +110,8 @@ class SkillStructureTests(unittest.TestCase):
 
         self.assertIn(":event_msg:task_complete:", result.stdout)
         self.assertIn("permission denied", result.stdout)
+        self.assertIn(":turn_context:None:", result.stdout)
+        self.assertIn("approval_policy", result.stdout)
 
     def test_session_mining_bounded_rollout_probe_handles_structured_user_messages(self) -> None:
         root = Path(__file__).resolve().parents[1]

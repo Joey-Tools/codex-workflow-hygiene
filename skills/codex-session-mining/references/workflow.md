@@ -151,7 +151,11 @@ def add_top_level_fields(obj, parts):
         'last_agent_message',
         'title',
     ):
-        collect_text(obj.get(key) or '', parts)
+        value = obj.get(key)
+        if value is None or value == '' or value == [] or value == {}:
+            continue
+        parts.append(key)
+        collect_text(value, parts)
 
 for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
     obj = json.loads(line)
@@ -325,7 +329,11 @@ def add_selected_fields(obj, parts):
         'last_agent_message',
         'title',
     ):
-        collect_text(obj.get(key) or '', parts)
+        value = obj.get(key)
+        if value is None or value == '' or value == [] or value == {}:
+            continue
+        parts.append(key)
+        collect_text(value, parts)
 
 def add_record_fields(obj, payload, parts):
     item_type = payload.get('type')
@@ -427,7 +435,11 @@ def add_selected_fields(obj, parts):
         'last_agent_message',
         'title',
     ):
-        collect_text(obj.get(key) or '', parts)
+        value = obj.get(key)
+        if value is None or value == '' or value == [] or value == {}:
+            continue
+        parts.append(key)
+        collect_text(value, parts)
 
 def add_record_fields(obj, payload, parts):
     item_type = payload.get('type')
