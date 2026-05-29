@@ -101,24 +101,44 @@ path = Path(sys.argv[1]).expanduser()
 needle = sys.argv[2]
 printed = 0
 
+def collect_text(value, parts):
+    if isinstance(value, str):
+        parts.append(value)
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                collect_text(item.get('text') or item.get('content') or '', parts)
+            else:
+                collect_text(item, parts)
+
+def hit_window(text, needle):
+    idx = text.find(needle)
+    if idx < 0:
+        return ''
+    start = max(0, idx - 180)
+    end = min(len(text), idx + len(needle) + 220)
+    prefix = '...' if start else ''
+    suffix = '...' if end < len(text) else ''
+    return prefix + text[start:end] + suffix
+
 for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
     obj = json.loads(line)
     payload = obj.get('payload') or {}
     item_type = payload.get('type')
-    if item_type not in ('message', 'function_call'):
+    if item_type not in ('message', 'function_call', 'function_call_output'):
         continue
     text_parts = []
     if item_type == 'message':
-        for part in payload.get('content') or []:
-            if isinstance(part, dict) and part.get('type') in ('input_text', 'output_text'):
-                text_parts.append(str(part.get('text') or ''))
+        collect_text(payload.get('content') or [], text_parts)
     elif item_type == 'function_call':
         text_parts.append(str(payload.get('name') or ''))
         text_parts.append(str(payload.get('arguments') or ''))
+    elif item_type == 'function_call_output':
+        collect_text(payload.get('output') or payload.get('content') or payload.get('result') or '', text_parts)
     text = ' '.join(' '.join(text_parts).split())
     if needle not in text:
         continue
-    print(f'{path}:{line_no}:{obj.get("timestamp")}:{item_type}:{text[:400]}')
+    print(f'{path}:{line_no}:{obj.get("timestamp")}:{item_type}:{hit_window(text, needle)}')
     printed += 1
     if printed >= 20:
         break

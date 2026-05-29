@@ -33,6 +33,9 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("filter by record type and field first", skill)
         self.assertIn("Do not use `jq 'select(tostring | contains", workflow)
         self.assertIn("filter on record shape and specific fields", workflow)
+        self.assertIn("function_call_output", workflow)
+        self.assertIn("def hit_window", workflow)
+        self.assertIn("hit_window(text, needle)", workflow)
 
 
 if __name__ == "__main__":
