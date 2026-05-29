@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 import sys
 import unittest
+
+
+def extract_python_block_after(workflow: str, heading: str, marker: str = "```bash\npython3 - <<'PY'\n") -> str:
+    section_start = workflow.index(heading)
+    code_start = workflow.index(marker, section_start) + len(marker)
+    return workflow[code_start : workflow.index("\nPY\n```", code_start)]
 
 
 class SkillStructureTests(unittest.TestCase):
@@ -44,11 +51,15 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("current_date", workflow)
         self.assertIn("sandbox_policy", workflow)
         self.assertIn("model_provider", workflow)
+        self.assertIn("'output'", workflow)
+        self.assertIn("'arguments'", workflow)
         self.assertIn("add_top_level_fields(payload, text_parts)", workflow)
         self.assertIn("elif isinstance(value, dict)", workflow)
         self.assertIn("for item in value.values()", workflow)
         self.assertIn("elif item_type == 'user_message'", workflow)
+        self.assertIn("elif item_type == 'task_complete'", workflow)
         self.assertIn("payload.get('message')", workflow)
+        self.assertIn("last_agent_message", workflow)
         self.assertIn("record_kind = item_type or obj.get('type') or 'history'", workflow)
         self.assertNotIn("text = json.dumps(payload", workflow)
         self.assertNotIn("snippet = ' '.join(text.split())[:", workflow)
@@ -70,8 +81,45 @@ class SkillStructureTests(unittest.TestCase):
         )
 
         output = result.stdout
-        for kind in ("history", "session_meta", "turn_context", "user_message", "function_call_output"):
+        for kind in ("history", "session_meta", "turn_context", "user_message", "function_call_output", "task_complete", "thread/start"):
             self.assertIn(f":{kind}:", output)
+        self.assertIn("top-level output", output)
+
+    def test_session_mining_failure_probe_handles_event_message_fields(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        code = extract_python_block_after(workflow, "Focus on tool failures or approval friction:")
+        jsonl = root / "tests/fixtures/codex_session_mining_exact_probe.jsonl"
+        env = dict(os.environ, CODEX_ROLLOUT_SAMPLE=str(jsonl))
+
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            check=True,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+
+        self.assertIn(":event_msg:task_complete:", result.stdout)
+        self.assertIn("permission denied", result.stdout)
+
+    def test_session_mining_bounded_rollout_probe_handles_structured_user_messages(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        code = extract_python_block_after(workflow, "Search a bounded rollout set without dumping full JSONL records:")
+        jsonl = root / "tests/fixtures/codex_session_mining_exact_probe.jsonl"
+        env = dict(os.environ, CODEX_ROLLOUT_SAMPLE=str(jsonl))
+
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            check=True,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+
+        self.assertIn(":event_msg:user_message:", result.stdout)
+        self.assertIn("thread/start", result.stdout)
 
 
 if __name__ == "__main__":
