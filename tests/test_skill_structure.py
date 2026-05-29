@@ -36,6 +36,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("function_call_output", workflow)
         self.assertIn("def hit_window", workflow)
         self.assertIn("hit_window(text, needle)", workflow)
+        self.assertNotIn("text = json.dumps(payload", workflow)
+        self.assertNotIn("snippet = ' '.join(text.split())[:", workflow)
 
 
 if __name__ == "__main__":

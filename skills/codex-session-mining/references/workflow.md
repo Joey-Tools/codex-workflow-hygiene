@@ -234,13 +234,33 @@ path = Path('~/.codex/sessions/2026/03/12/rollout-2026-03-12T13-19-05-019ce233-6
 needle = re.compile(r'auth|approval|permission|denied|Could not open file|failed|blocked', re.I)
 printed = 0
 
+def collect_text(value, parts):
+    if isinstance(value, str):
+        parts.append(value)
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                collect_text(item.get('text') or item.get('content') or '', parts)
+            else:
+                collect_text(item, parts)
+
+def hit_window(text, match):
+    start = max(0, match.start() - 180)
+    end = min(len(text), match.end() + 220)
+    prefix = '...' if start else ''
+    suffix = '...' if end < len(text) else ''
+    return prefix + text[start:end] + suffix
+
 for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
-    if not needle.search(line):
-        continue
     obj = json.loads(line)
     payload = obj.get('payload') or {}
-    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    snippet = ' '.join(text.split())[:400]
+    parts = [str(payload.get('type') or ''), str(payload.get('name') or '')]
+    collect_text(payload.get('arguments') or payload.get('output') or payload.get('content') or payload.get('result') or '', parts)
+    text = ' '.join(' '.join(parts).split())
+    match = needle.search(text)
+    if not match:
+        continue
+    snippet = hit_window(text, match)
     print(f'{path}:{line_no}:{obj.get("timestamp")}:{obj.get("type")}:{payload.get("type")}:{snippet}')
     printed += 1
     if printed >= 20:
@@ -258,14 +278,36 @@ import json
 paths = sorted(Path('~/.codex/sessions/2026/03/12').expanduser().glob('rollout-*.jsonl'))
 needle = 'thread/start'
 
+def collect_text(value, parts):
+    if isinstance(value, str):
+        parts.append(value)
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                collect_text(item.get('text') or item.get('content') or '', parts)
+            else:
+                collect_text(item, parts)
+
+def hit_window(text, needle):
+    idx = text.find(needle)
+    if idx < 0:
+        return ''
+    start = max(0, idx - 160)
+    end = min(len(text), idx + len(needle) + 200)
+    prefix = '...' if start else ''
+    suffix = '...' if end < len(text) else ''
+    return prefix + text[start:end] + suffix
+
 for path in paths:
     for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
         obj = json.loads(line)
         payload = obj.get('payload') or {}
-        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        parts = [str(payload.get('type') or ''), str(payload.get('name') or '')]
+        collect_text(payload.get('arguments') or payload.get('output') or payload.get('content') or payload.get('result') or '', parts)
+        text = ' '.join(' '.join(parts).split())
         if needle not in text:
             continue
-        snippet = ' '.join(text.split())[:300]
+        snippet = hit_window(text, needle)
         print(f'{path}:{line_no}:{obj.get("timestamp")}:{obj.get("type")}:{payload.get("type")}:{snippet}')
 PY
 ```
