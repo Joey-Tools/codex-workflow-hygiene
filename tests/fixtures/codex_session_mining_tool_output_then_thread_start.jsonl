@@ -1,0 +1,21 @@
+{"type":"response_item","timestamp":"2026-05-29T00:00:01Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 01"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:02Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 02"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:03Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 03"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:04Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 04"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:05Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 05"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:06Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 06"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:07Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 07"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:08Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 08"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:09Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 09"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:10Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 10"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:11Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 11"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:12Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 12"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:13Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 13"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:14Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 14"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:15Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 15"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:16Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 16"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:17Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 17"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:18Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 18"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:19Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 19"}}
+{"type":"response_item","timestamp":"2026-05-29T00:00:20Z","payload":{"type":"function_call_output","output":"tool output thread/start sample 20"}}
+{"type":"event_msg","timestamp":"2026-05-29T00:00:21Z","payload":{"type":"thread/start","message":"real event thread/start sample"}}

@@ -89,6 +89,106 @@ PY
 
 Do not use `jq` or Python to print every record timestamp, key list, or tool call from a large rollout just to orient yourself. Once the counts identify the relevant shape, add an explicit selector and row cap before printing snippets.
 
+Do not use `jq 'select(tostring | contains("needle"))'` as a shortcut on rollout or history records. It stringifies the whole record, so a keyword inside retained `function_call_output` can match and print a huge nested payload even when the final projection slices text. Instead, filter on record shape and specific fields before producing an explicitly capped snippet:
+
+```bash
+python3 - "$ROLLOUT" "$NEEDLE" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+path = Path(sys.argv[1]).expanduser()
+needle = sys.argv[2]
+printed = 0
+
+def collect_text(value, parts):
+    if isinstance(value, str):
+        parts.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            collect_text(item, parts)
+    elif isinstance(value, list):
+        for item in value:
+            collect_text(item, parts)
+
+def hit_window(text, needle):
+    idx = text.find(needle)
+    if idx < 0:
+        return ''
+    start = max(0, idx - 180)
+    end = min(len(text), idx + len(needle) + 220)
+    prefix = '...' if start else ''
+    suffix = '...' if end < len(text) else ''
+    return prefix + text[start:end] + suffix
+
+def add_top_level_fields(obj, parts):
+    for key in (
+        'id',
+        'session_id',
+        'thread_name',
+        'updated_at',
+        'ts',
+        'timestamp',
+        'cwd',
+        'model',
+        'current_date',
+        'timezone',
+        'approval_policy',
+        'sandbox_policy',
+        'permission_profile',
+        'originator',
+        'cli_version',
+        'source',
+        'thread_source',
+        'model_provider',
+        'name',
+        'arguments',
+        'output',
+        'content',
+        'result',
+        'text',
+        'message',
+        'last_agent_message',
+        'title',
+    ):
+        value = obj.get(key)
+        if value is None or value == '' or value == [] or value == {}:
+            continue
+        parts.append(key)
+        collect_text(value, parts)
+
+for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
+    obj = json.loads(line)
+    payload = obj.get('payload') or {}
+    item_type = payload.get('type')
+    record_kind = item_type or obj.get('type') or 'history'
+    text_parts = [str(item_type or '')]
+    if item_type == 'message':
+        collect_text(payload.get('content') or [], text_parts)
+    elif item_type == 'function_call':
+        text_parts.append(str(payload.get('name') or ''))
+        text_parts.append(str(payload.get('arguments') or ''))
+    elif item_type == 'function_call_output':
+        collect_text(payload.get('output') or payload.get('content') or payload.get('result') or '', text_parts)
+    elif item_type == 'user_message':
+        collect_text(payload.get('message') or payload.get('text') or payload.get('content') or '', text_parts)
+    elif item_type == 'task_complete':
+        collect_text(payload.get('last_agent_message') or payload.get('message') or payload.get('text') or '', text_parts)
+    elif not item_type:
+        add_top_level_fields(obj, text_parts)
+        add_top_level_fields(payload, text_parts)
+    else:
+        add_top_level_fields(payload, text_parts)
+    text = ' '.join(' '.join(text_parts).split())
+    if needle not in text:
+        continue
+    print(f'{path}:{line_no}:{obj.get("timestamp") or obj.get("ts")}:{record_kind}:{hit_window(text, needle)}')
+    printed += 1
+    if printed >= 20:
+        break
+PY
+```
+
 For JSONL schema checks, inspect one record or aggregate unique keys once. Do not run `jq -R 'fromjson | keys' file.jsonl`, because it prints the same key list for every line and can produce massive output on retained artifacts such as `turn_flags.jsonl`.
 
 ```bash
@@ -172,19 +272,99 @@ Focus on tool failures or approval friction:
 python3 - <<'PY'
 from pathlib import Path
 import json
+import os
 import re
 
-path = Path('~/.codex/sessions/2026/03/12/rollout-2026-03-12T13-19-05-019ce233-677c-7e73-a77d-a3b7eecab61e.jsonl').expanduser()
+path = Path(os.environ.get(
+    'CODEX_ROLLOUT_SAMPLE',
+    '~/.codex/sessions/2026/03/12/rollout-2026-03-12T13-19-05-019ce233-677c-7e73-a77d-a3b7eecab61e.jsonl',
+)).expanduser()
 needle = re.compile(r'auth|approval|permission|denied|Could not open file|failed|blocked', re.I)
 printed = 0
 
+def collect_text(value, parts):
+    if isinstance(value, str):
+        parts.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            collect_text(item, parts)
+    elif isinstance(value, list):
+        for item in value:
+            collect_text(item, parts)
+
+def hit_window(text, match):
+    start = max(0, match.start() - 180)
+    end = min(len(text), match.end() + 220)
+    prefix = '...' if start else ''
+    suffix = '...' if end < len(text) else ''
+    return prefix + text[start:end] + suffix
+
+def add_selected_fields(obj, parts):
+    for key in (
+        'id',
+        'session_id',
+        'thread_name',
+        'updated_at',
+        'ts',
+        'timestamp',
+        'cwd',
+        'model',
+        'current_date',
+        'timezone',
+        'approval_policy',
+        'sandbox_policy',
+        'permission_profile',
+        'originator',
+        'cli_version',
+        'source',
+        'thread_source',
+        'model_provider',
+        'name',
+        'arguments',
+        'output',
+        'content',
+        'result',
+        'text',
+        'message',
+        'last_agent_message',
+        'title',
+    ):
+        value = obj.get(key)
+        if value is None or value == '' or value == [] or value == {}:
+            continue
+        parts.append(key)
+        collect_text(value, parts)
+
+def add_record_fields(obj, payload, parts):
+    item_type = payload.get('type')
+    parts.append(str(item_type or ''))
+    if item_type == 'message':
+        collect_text(payload.get('content') or [], parts)
+    elif item_type == 'function_call':
+        collect_text(payload.get('name') or '', parts)
+        collect_text(payload.get('arguments') or '', parts)
+    elif item_type == 'function_call_output':
+        collect_text(payload.get('output') or payload.get('content') or payload.get('result') or '', parts)
+    elif item_type == 'user_message':
+        collect_text(payload.get('message') or payload.get('text') or payload.get('content') or '', parts)
+    elif item_type == 'task_complete':
+        collect_text(payload.get('last_agent_message') or payload.get('message') or payload.get('text') or '', parts)
+    elif not item_type:
+        add_selected_fields(obj, parts)
+        add_selected_fields(payload, parts)
+    else:
+        add_selected_fields(payload, parts)
+
 for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
-    if not needle.search(line):
-        continue
     obj = json.loads(line)
     payload = obj.get('payload') or {}
-    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    snippet = ' '.join(text.split())[:400]
+    parts = []
+    add_record_fields(obj, payload, parts)
+    text = ' '.join(' '.join(parts).split())
+    match = needle.search(text)
+    if not match:
+        continue
+    snippet = hit_window(text, match)
     print(f'{path}:{line_no}:{obj.get("timestamp")}:{obj.get("type")}:{payload.get("type")}:{snippet}')
     printed += 1
     if printed >= 20:
@@ -198,19 +378,105 @@ Search a bounded rollout set without dumping full JSONL records:
 python3 - <<'PY'
 from pathlib import Path
 import json
+import os
 
-paths = sorted(Path('~/.codex/sessions/2026/03/12').expanduser().glob('rollout-*.jsonl'))
+sample = os.environ.get('CODEX_ROLLOUT_SAMPLE')
+paths = [Path(sample).expanduser()] if sample else sorted(Path('~/.codex/sessions/2026/03/12').expanduser().glob('rollout-*.jsonl'))
 needle = 'thread/start'
+printed = 0
+
+def collect_text(value, parts):
+    if isinstance(value, str):
+        parts.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            collect_text(item, parts)
+    elif isinstance(value, list):
+        for item in value:
+            collect_text(item, parts)
+
+def hit_window(text, needle):
+    idx = text.find(needle)
+    if idx < 0:
+        return ''
+    start = max(0, idx - 160)
+    end = min(len(text), idx + len(needle) + 200)
+    prefix = '...' if start else ''
+    suffix = '...' if end < len(text) else ''
+    return prefix + text[start:end] + suffix
+
+def add_selected_fields(obj, parts):
+    for key in (
+        'id',
+        'session_id',
+        'thread_name',
+        'updated_at',
+        'ts',
+        'timestamp',
+        'cwd',
+        'model',
+        'current_date',
+        'timezone',
+        'approval_policy',
+        'sandbox_policy',
+        'permission_profile',
+        'originator',
+        'cli_version',
+        'source',
+        'thread_source',
+        'model_provider',
+        'name',
+        'arguments',
+        'output',
+        'content',
+        'result',
+        'text',
+        'message',
+        'last_agent_message',
+        'title',
+    ):
+        value = obj.get(key)
+        if value is None or value == '' or value == [] or value == {}:
+            continue
+        parts.append(key)
+        collect_text(value, parts)
+
+def add_record_fields(obj, payload, parts):
+    item_type = payload.get('type')
+    parts.append(str(item_type or ''))
+    if item_type == 'message':
+        collect_text(payload.get('content') or [], parts)
+    elif item_type == 'function_call':
+        collect_text(payload.get('name') or '', parts)
+        collect_text(payload.get('arguments') or '', parts)
+    elif item_type == 'function_call_output':
+        collect_text(payload.get('output') or payload.get('content') or payload.get('result') or '', parts)
+    elif item_type == 'user_message':
+        collect_text(payload.get('message') or payload.get('text') or payload.get('content') or '', parts)
+    elif item_type == 'task_complete':
+        collect_text(payload.get('last_agent_message') or payload.get('message') or payload.get('text') or '', parts)
+    elif not item_type:
+        add_selected_fields(obj, parts)
+        add_selected_fields(payload, parts)
+    else:
+        add_selected_fields(payload, parts)
 
 for path in paths:
     for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
         obj = json.loads(line)
         payload = obj.get('payload') or {}
-        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if obj.get('type') == 'function_call_output' or payload.get('type') == 'function_call_output':
+            continue
+        parts = []
+        add_record_fields(obj, payload, parts)
+        text = ' '.join(' '.join(parts).split())
         if needle not in text:
             continue
-        snippet = ' '.join(text.split())[:300]
+        snippet = hit_window(text, needle)
         print(f'{path}:{line_no}:{obj.get("timestamp")}:{obj.get("type")}:{payload.get("type")}:{snippet}')
+        printed += 1
+        if printed >= 20:
+            raise SystemExit
 PY
 ```
 
