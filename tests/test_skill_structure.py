@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 
@@ -42,11 +46,63 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("current_date", workflow)
         self.assertIn("sandbox_policy", workflow)
         self.assertIn("model_provider", workflow)
+        self.assertIn("add_top_level_fields(payload, text_parts)", workflow)
+        self.assertIn("elif isinstance(value, dict)", workflow)
+        self.assertIn("for item in value.values()", workflow)
         self.assertIn("elif item_type == 'user_message'", workflow)
         self.assertIn("payload.get('message')", workflow)
         self.assertIn("record_kind = item_type or obj.get('type') or 'history'", workflow)
         self.assertNotIn("text = json.dumps(payload", workflow)
         self.assertNotIn("snippet = ' '.join(text.split())[:", workflow)
+
+    def test_session_mining_exact_probe_handles_real_record_shapes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
+        start = workflow.index(marker) + len(marker)
+        code = workflow[start : workflow.index("\nPY\n```", start)]
+
+        needle = "needle-structured-probe"
+        rows = [
+            {"session_id": "history-session", "thread_name": f"history {needle}", "ts": "2026-05-29T00:00:00Z"},
+            {
+                "type": "session_meta",
+                "timestamp": "2026-05-29T00:00:01Z",
+                "payload": {"id": f"session-{needle}", "cwd": f"/tmp/{needle}", "model": "gpt-5.5"},
+            },
+            {
+                "type": "turn_context",
+                "timestamp": "2026-05-29T00:00:02Z",
+                "payload": {"sandbox_policy": f"read-only {needle}", "approval_policy": "never"},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-05-29T00:00:03Z",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": [{"type": "input_text", "text": f"structured {needle}"}]},
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-29T00:00:04Z",
+                "payload": {"type": "function_call_output", "output": f"tool result {needle}"},
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as raw:
+            jsonl = Path(raw) / "rollout.jsonl"
+            jsonl.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(jsonl), needle],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        output = result.stdout
+        for kind in ("history", "session_meta", "turn_context", "user_message", "function_call_output"):
+            self.assertIn(f":{kind}:", output)
 
 
 if __name__ == "__main__":

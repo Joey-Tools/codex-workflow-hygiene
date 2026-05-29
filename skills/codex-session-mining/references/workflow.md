@@ -104,12 +104,12 @@ printed = 0
 def collect_text(value, parts):
     if isinstance(value, str):
         parts.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            collect_text(item, parts)
     elif isinstance(value, list):
         for item in value:
-            if isinstance(item, dict):
-                collect_text(item.get('text') or item.get('content') or '', parts)
-            else:
-                collect_text(item, parts)
+            collect_text(item, parts)
 
 def hit_window(text, needle):
     idx = text.find(needle)
@@ -164,6 +164,7 @@ for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1)
         collect_text(payload.get('message') or payload.get('text') or payload.get('content') or '', text_parts)
     elif not item_type:
         add_top_level_fields(obj, text_parts)
+        add_top_level_fields(payload, text_parts)
     else:
         continue
     text = ' '.join(' '.join(text_parts).split())
@@ -268,12 +269,12 @@ printed = 0
 def collect_text(value, parts):
     if isinstance(value, str):
         parts.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            collect_text(item, parts)
     elif isinstance(value, list):
         for item in value:
-            if isinstance(item, dict):
-                collect_text(item.get('text') or item.get('content') or '', parts)
-            else:
-                collect_text(item, parts)
+            collect_text(item, parts)
 
 def hit_window(text, match):
     start = max(0, match.start() - 180)
@@ -312,12 +313,12 @@ needle = 'thread/start'
 def collect_text(value, parts):
     if isinstance(value, str):
         parts.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            collect_text(item, parts)
     elif isinstance(value, list):
         for item in value:
-            if isinstance(item, dict):
-                collect_text(item.get('text') or item.get('content') or '', parts)
-            else:
-                collect_text(item, parts)
+            collect_text(item, parts)
 
 def hit_window(text, needle):
     idx = text.find(needle)
