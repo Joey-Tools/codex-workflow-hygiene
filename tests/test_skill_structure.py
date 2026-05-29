@@ -24,6 +24,16 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("jq -R 'fromjson | keys'", skill)
         self.assertIn("aggregate unique keys once", workflow)
 
+    def test_session_mining_avoids_whole_record_tostring_searches(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        self.assertIn("select(tostring | contains", skill)
+        self.assertIn("function_call_output", skill)
+        self.assertIn("filter by record type and field first", skill)
+        self.assertIn("Do not use `jq 'select(tostring | contains", workflow)
+        self.assertIn("filter on record shape and specific fields", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

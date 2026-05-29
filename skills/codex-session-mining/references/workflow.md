@@ -89,6 +89,42 @@ PY
 
 Do not use `jq` or Python to print every record timestamp, key list, or tool call from a large rollout just to orient yourself. Once the counts identify the relevant shape, add an explicit selector and row cap before printing snippets.
 
+Do not use `jq 'select(tostring | contains("needle"))'` as a shortcut on rollout or history records. It stringifies the whole record, so a keyword inside retained `function_call_output` can match and print a huge nested payload even when the final projection slices text. Instead, filter on record shape and specific fields before producing an explicitly capped snippet:
+
+```bash
+python3 - "$ROLLOUT" "$NEEDLE" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+path = Path(sys.argv[1]).expanduser()
+needle = sys.argv[2]
+printed = 0
+
+for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
+    obj = json.loads(line)
+    payload = obj.get('payload') or {}
+    item_type = payload.get('type')
+    if item_type not in ('message', 'function_call'):
+        continue
+    text_parts = []
+    if item_type == 'message':
+        for part in payload.get('content') or []:
+            if isinstance(part, dict) and part.get('type') in ('input_text', 'output_text'):
+                text_parts.append(str(part.get('text') or ''))
+    elif item_type == 'function_call':
+        text_parts.append(str(payload.get('name') or ''))
+        text_parts.append(str(payload.get('arguments') or ''))
+    text = ' '.join(' '.join(text_parts).split())
+    if needle not in text:
+        continue
+    print(f'{path}:{line_no}:{obj.get("timestamp")}:{item_type}:{text[:400]}')
+    printed += 1
+    if printed >= 20:
+        break
+PY
+```
+
 For JSONL schema checks, inspect one record or aggregate unique keys once. Do not run `jq -R 'fromjson | keys' file.jsonl`, because it prints the same key list for every line and can produce massive output on retained artifacts such as `turn_flags.jsonl`.
 
 ```bash
