@@ -31,6 +31,37 @@ find ~/.codex/sessions -type f -name "rollout-*${SESSION_ID}*.jsonl"
 
 Do not append `~/.codex/sessions` to a raw `rg`. A raw rollout match prints the whole JSONL record, and a nested `function_call_output` match can expand into hundreds of thousands of tokens before the useful path is visible.
 
+Recent prior turn or "read your rollout":
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import json
+
+per_source_limit = 12
+for path in (Path('~/.codex/history.jsonl'), Path('~/.codex/session_index.jsonl')):
+    path = path.expanduser()
+    if not path.exists():
+        continue
+    rows = []
+    with path.open(encoding='utf-8', errors='replace') as handle:
+        for line_no, line in enumerate(handle, 1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rows.append((row.get('ts') or row.get('updated_at') or '', line_no, row))
+    for _, line_no, row in sorted(rows, reverse=True)[:per_source_limit]:
+        selected = {key: row.get(key) for key in ('session_id', 'id', 'ts', 'updated_at', 'cwd')}
+        text = ' '.join(str(row.get('text') or row.get('thread_name') or '').split())[:240]
+        if text:
+            selected['text'] = text
+        print(f'{path}:{line_no}:{json.dumps(selected, ensure_ascii=False, sort_keys=True)}')
+PY
+```
+
+Do not run keyword `rg -n ... ~/.codex` or `rg -n ... "$CODEX_HOME"` to recover a recent command, password hint, or rollout memory. The whole tree includes retained transcript output plus installed skills, overlays, caches, and package payloads; a single match can print irrelevant or enormous records. Use the recent index rows above, a known session ID, or a bounded date directory to select rollout files first.
+
 Bounded date range:
 
 ```bash
