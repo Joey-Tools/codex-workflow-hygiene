@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import sys
 import unittest
+
+
+def json_dumps(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 def extract_python_block_after(workflow: str, heading: str, marker: str = "```bash\npython3 - <<'PY'\n") -> str:
@@ -74,6 +80,46 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn('Recent prior turn or "read your rollout":', workflow)
         self.assertIn("Do not run keyword `rg -n ... ~/.codex`", workflow)
         self.assertIn("installed skills, overlays, caches, and package payloads", workflow)
+
+    def test_session_mining_recent_turn_recipe_reads_both_indexes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        code = extract_python_block_after(workflow, 'Recent prior turn or "read your rollout":')
+
+        with tempfile.TemporaryDirectory() as home:
+            codex_home = Path(home) / ".codex"
+            codex_home.mkdir()
+            history_rows = [
+                {"session_id": f"history-{index}", "ts": f"2026-06-04T00:{index:02d}:00Z", "text": f"history row {index}"}
+                for index in range(20)
+            ]
+            (codex_home / "history.jsonl").write_text(
+                "\n".join(json_dumps(row) for row in history_rows) + "\n",
+                encoding="utf-8",
+            )
+            (codex_home / "session_index.jsonl").write_text(
+                json_dumps({
+                    "session_id": "index-session",
+                    "updated_at": "2026-06-03T00:00:00Z",
+                    "cwd": "/tmp/index-repo",
+                    "thread_name": "session index row",
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                check=True,
+                capture_output=True,
+                env=dict(os.environ, HOME=home),
+                text=True,
+            )
+
+        lines = result.stdout.splitlines()
+        self.assertEqual(13, len(lines))
+        self.assertIn("history-19", result.stdout)
+        self.assertIn("index-session", result.stdout)
+        self.assertIn("session_index.jsonl", result.stdout)
 
     def test_session_mining_exact_probe_handles_real_record_shapes(self) -> None:
         root = Path(__file__).resolve().parents[1]

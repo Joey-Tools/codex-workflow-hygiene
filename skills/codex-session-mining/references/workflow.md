@@ -38,8 +38,7 @@ python3 - <<'PY'
 from pathlib import Path
 import json
 
-limit = 12
-printed = 0
+per_source_limit = 12
 for path in (Path('~/.codex/history.jsonl'), Path('~/.codex/session_index.jsonl')):
     path = path.expanduser()
     if not path.exists():
@@ -52,15 +51,12 @@ for path in (Path('~/.codex/history.jsonl'), Path('~/.codex/session_index.jsonl'
             except json.JSONDecodeError:
                 continue
             rows.append((row.get('ts') or row.get('updated_at') or '', line_no, row))
-    for _, line_no, row in sorted(rows, reverse=True)[:limit]:
+    for _, line_no, row in sorted(rows, reverse=True)[:per_source_limit]:
         selected = {key: row.get(key) for key in ('session_id', 'id', 'ts', 'updated_at', 'cwd')}
         text = ' '.join(str(row.get('text') or row.get('thread_name') or '').split())[:240]
         if text:
             selected['text'] = text
         print(f'{path}:{line_no}:{json.dumps(selected, ensure_ascii=False, sort_keys=True)}')
-        printed += 1
-        if printed >= limit:
-            raise SystemExit
 PY
 ```
 
