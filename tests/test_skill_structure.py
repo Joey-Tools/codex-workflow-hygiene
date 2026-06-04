@@ -64,6 +64,17 @@ class SkillStructureTests(unittest.TestCase):
         self.assertNotIn("text = json.dumps(payload", workflow)
         self.assertNotIn("snippet = ' '.join(text.split())[:", workflow)
 
+    def test_session_mining_avoids_whole_codex_home_searches(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        self.assertIn("read your rollout", skill)
+        self.assertIn("Do not start with keyword `rg -n` over all of `$CODEX_HOME` / `~/.codex`", skill)
+        self.assertIn("Do not point raw `rg -n` at the whole `$CODEX_HOME` / `~/.codex` tree", skill)
+        self.assertIn('Recent prior turn or "read your rollout":', workflow)
+        self.assertIn("Do not run keyword `rg -n ... ~/.codex`", workflow)
+        self.assertIn("installed skills, overlays, caches, and package payloads", workflow)
+
     def test_session_mining_exact_probe_handles_real_record_shapes(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
