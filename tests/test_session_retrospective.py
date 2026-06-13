@@ -4398,7 +4398,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             markdown = (output / "dry_run_report.md").read_text(encoding="utf-8")
 
         expected_root = output.absolute().as_posix()
-        self.assertEqual(MODULE.shlex.split(report["next_command"]), ["weekly-repair", "--run-dir", expected_root])
+        self.assertEqual(
+            MODULE.shlex.split(report["next_command"]),
+            ["weekly-repair", "--run-dir", expected_root, "--allow-partial-hosts"],
+        )
         self.assertIn(report["next_command"], markdown)
 
     def test_weekly_dry_run_repair_ignores_partial_host_scope_only_gap(self) -> None:
@@ -4428,6 +4431,35 @@ class SessionRetrospectiveTests(unittest.TestCase):
             repair_exists = (output / "weekly-coverage-repair").exists()
 
         self.assertEqual(report["coverage_gap_counts"], {"partial_host_scope": 1})
+        self.assertNotIn("next_command", report)
+        self.assertFalse(repair_exists)
+
+    def test_weekly_dry_run_repair_ignores_local_missing_source_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            missing_root = Path(raw) / ".codex"
+            output = safe_output_dir(raw, "weekly-dry-run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={missing_root}",
+                    "--allow-partial-hosts",
+                    "--repair",
+                    "--repair-skip-remote-materialization",
+                    "--output",
+                    str(output),
+                ]
+            )
+            report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
+            repair_exists = (output / "weekly-coverage-repair").exists()
+
+        self.assertEqual(report["coverage_gap_counts"], {"source_root_missing": 1, "partial_host_scope": 1})
+        self.assertEqual(report["repairable_coverage_gap_counts"], {})
         self.assertNotIn("next_command", report)
         self.assertFalse(repair_exists)
 

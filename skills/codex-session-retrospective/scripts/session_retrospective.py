@@ -323,7 +323,8 @@ ALLOWED_REMOTE_GAP_REASONS = {
     "stale_host",
     "unreachable",
 }
-REPAIRABLE_COVERAGE_GAP_REASONS = frozenset(ALLOWED_REMOTE_GAP_REASONS | {"oversized_rollout_skipped", "oversized_summary_skipped"})
+OVERSIZED_REPAIRABLE_GAP_REASONS = frozenset({"oversized_rollout_skipped", "oversized_summary_skipped"})
+REPAIRABLE_COVERAGE_GAP_REASONS = frozenset(ALLOWED_REMOTE_GAP_REASONS | OVERSIZED_REPAIRABLE_GAP_REASONS)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5998,6 +5999,7 @@ def dry_run_report(
     repair_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     coverage_gaps = list(manifest.get("coverage_gaps") or [])
+    repairable_gaps = repairable_coverage_gaps(coverage_gaps)
     report: dict[str, Any] = {
         "schema_version": 1,
         "kind": kind,
@@ -6008,6 +6010,7 @@ def dry_run_report(
         "turn_count": trend.get("turn_count", 0),
         "episode_count": trend.get("episode_count", 0),
         "coverage_gap_counts": gap_counts(coverage_gaps),
+        "repairable_coverage_gap_counts": gap_counts(repairable_gaps),
         "source_status_counts": source_status_counts(manifest.get("sources") or []),
         "shard_count": count_jsonl_rows(shards_dir / "shards.jsonl"),
         "retained_export_created": False,
@@ -6033,6 +6036,9 @@ def dry_run_report_markdown(report: dict[str, Any]) -> str:
     start = str(window.get("start") or "unknown")
     end = str(window.get("end") or "unknown")
     coverage_gap_counts = report.get("coverage_gap_counts") if isinstance(report.get("coverage_gap_counts"), dict) else {}
+    repairable_coverage_gap_counts = (
+        report.get("repairable_coverage_gap_counts") if isinstance(report.get("repairable_coverage_gap_counts"), dict) else {}
+    )
     source_status_counts = report.get("source_status_counts") if isinstance(report.get("source_status_counts"), dict) else {}
     retained = "yes" if report.get("retained_export_created") else "no"
     history = "yes" if report.get("history_commit_created") else "no"
@@ -6049,6 +6055,7 @@ def dry_run_report_markdown(report: dict[str, Any]) -> str:
         f"- Episodes: `{report.get('episode_count', 0)}`",
         f"- Shard count: `{report.get('shard_count', 0)}`",
         f"- Coverage gaps: {count_lines_for_report(coverage_gap_counts)}",
+        f"- Repairable coverage gaps: {count_lines_for_report(repairable_coverage_gap_counts)}",
         f"- Source status: {count_lines_for_report(source_status_counts)}",
         f"- Retained export created: {retained}",
         f"- History commit created: {history}",
@@ -6084,11 +6091,16 @@ def write_dry_run_report_pair(root: Path, name: str, report: dict[str, Any]) -> 
 
 
 def is_repairable_coverage_gap(gap: Any) -> bool:
-    return isinstance(gap, dict) and str(gap.get("reason") or "") in REPAIRABLE_COVERAGE_GAP_REASONS
+    if not isinstance(gap, dict):
+        return False
+    reason = str(gap.get("reason") or "")
+    if reason in OVERSIZED_REPAIRABLE_GAP_REASONS:
+        return True
+    return reason in ALLOWED_REMOTE_GAP_REASONS and str(gap.get("host") or "") in DEFAULT_REMOTE_HOSTS
 
 
-def has_repairable_coverage_gaps(gaps: Any) -> bool:
-    return any(is_repairable_coverage_gap(gap) for gap in gaps or [])
+def repairable_coverage_gaps(gaps: Any) -> list[dict[str, Any]]:
+    return [gap for gap in gaps or [] if is_repairable_coverage_gap(gap)]
 
 
 def has_repairable_gap_counts(counts: Any) -> bool:
@@ -6137,8 +6149,11 @@ def run_dry_run(
     run_make_shards_for_scan(scan_dir, shards_dir, max_raw_bytes=max_raw_bytes)
     manifest = read_json_file(scan_dir / "shard_manifest.json")
     next_command = None
-    if has_repairable_coverage_gaps(manifest.get("coverage_gaps")):
-        next_command = shlex.join([next_command_name, "--run-dir", root.as_posix()])
+    if repairable_coverage_gaps(manifest.get("coverage_gaps")):
+        next_command_argv = [next_command_name, "--run-dir", root.as_posix()]
+        if args.allow_partial_hosts:
+            next_command_argv.append("--allow-partial-hosts")
+        next_command = shlex.join(next_command_argv)
     report = dry_run_report(
         kind=kind,
         root=root,
@@ -6182,7 +6197,7 @@ def cmd_weekly_dry_run(args: argparse.Namespace) -> int:
         end=end,
         next_command_name="weekly-repair",
     )
-    if args.repair and has_repairable_gap_counts(report.get("coverage_gap_counts")):
+    if args.repair and has_repairable_gap_counts(report.get("repairable_coverage_gap_counts")):
         repair_output = Path(args.repair_output).expanduser() if args.repair_output else root / "weekly-coverage-repair"
         run_coverage_repair(
             argparse.Namespace(
