@@ -4398,9 +4398,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             markdown = (output / "dry_run_report.md").read_text(encoding="utf-8")
 
         expected_root = output.absolute().as_posix()
+        expected_script = Path(MODULE.__file__).resolve().as_posix()
         self.assertEqual(
             MODULE.shlex.split(report["next_command"]),
-            ["weekly-repair", "--run-dir", expected_root, "--allow-partial-hosts"],
+            ["python3", expected_script, "weekly-repair", "--run-dir", expected_root, "--allow-partial-hosts"],
         )
         self.assertIn(report["next_command"], markdown)
 

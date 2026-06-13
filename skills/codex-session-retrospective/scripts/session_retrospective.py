@@ -6150,7 +6150,13 @@ def run_dry_run(
     manifest = read_json_file(scan_dir / "shard_manifest.json")
     next_command = None
     if repairable_coverage_gaps(manifest.get("coverage_gaps")):
-        next_command_argv = [next_command_name, "--run-dir", root.as_posix()]
+        next_command_argv = [
+            "python3",
+            Path(__file__).resolve().as_posix(),
+            next_command_name,
+            "--run-dir",
+            root.as_posix(),
+        ]
         if args.allow_partial_hosts:
             next_command_argv.append("--allow-partial-hosts")
         next_command = shlex.join(next_command_argv)
@@ -7306,7 +7312,7 @@ def build_parser() -> argparse.ArgumentParser:
     weekly_dry_run.add_argument(
         "--repair",
         action="store_true",
-        help="If coverage gaps are found, also run weekly-repair as a transient follow-up.",
+        help="If repairable coverage gaps are found, also run weekly-repair as a transient follow-up.",
     )
     weekly_dry_run.add_argument("--repair-output", help="Output directory for the optional --repair follow-up.")
     weekly_dry_run.add_argument(
