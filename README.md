@@ -18,3 +18,8 @@ python3 skills/codex-session-retrospective/scripts/session_retrospective.py repa
 
 These commands only write transient `.codex-local/session-retrospective/**` artifacts.
 They do not export retained history, commit, or advance scan state.
+
+## Session Retrospective Roadmap
+
+Follow-up retrospective automation improvements are tracked in
+[`docs/session-retrospective-improvement-todo.md`](docs/session-retrospective-improvement-todo.md).

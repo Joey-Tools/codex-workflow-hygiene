@@ -127,10 +127,13 @@ SESSION_REF_PREFIX = "session_ref_v1"
 EPISODE_REF_PREFIX = "episode_ref_v1"
 TURN_REF_PREFIX = "turn_ref_v1"
 SOURCE_HASH_PREFIX = "source_hash_v1"
+FLAT_ARCHIVED_UNDATED_ALIAS_PREFIX = "flat_archived_undated_v1"
 OPAQUE_ID_PATTERN = re.compile(r"^(?:session_ref_v1|episode_ref_v1|turn_ref_v1):[0-9a-f]{20}$")
 SOURCE_HASH_PATTERN = re.compile(r"^source_hash_v1:[0-9a-f]{20}$")
 COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 BARE_64_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
+SOURCE_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+SUMMARY_HASH_VERIFY_MAX_BYTES = 2 * 1024 * 1024
 PRIVATE_IPV4_PATTERN = re.compile(
     r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|127(?:\.\d{1,3}){3}|169\.254(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})(?![\d.])"
 )
@@ -258,6 +261,7 @@ TURN_FLAG_FIELDS = {
     "issue_flags",
     "prompt_improvement",
 }
+LEGACY_TURN_FLAG_REQUIRED_FIELDS = TURN_FLAG_FIELDS - {"source_hash"}
 TREND_FIELDS = {
     "schema_version",
     "window",
@@ -949,7 +953,7 @@ def source_rollout_search_roots(source: Source) -> list[Path]:
     return search_roots
 
 
-def source_rollout_candidates(source: Source) -> list[Path]:
+def source_rollout_candidate_paths(source: Source) -> set[Path]:
     search_roots = source_rollout_search_roots(source)
     candidates = {
         path
@@ -963,7 +967,79 @@ def source_rollout_candidates(source: Source) -> list[Path]:
             for path in source.root.glob("rollout-*.jsonl")
             if not path.name.startswith("rollout-summary")
         )
-    return sorted(candidates)
+    return candidates
+
+
+def rollout_paths_have_same_bounded_source(path: Path, other: Path, root: Path) -> bool:
+    if not safe_source_file(path, root) or not safe_source_file(other, root):
+        return False
+    try:
+        path_size = path.stat().st_size
+        other_size = other.stat().st_size
+    except OSError:
+        return False
+    if path_size != other_size or path_size > SUMMARY_HASH_VERIFY_MAX_BYTES:
+        return False
+    try:
+        return file_sha256(path) == file_sha256(other)
+    except OSError:
+        return False
+
+
+def source_rollout_candidates(source: Source) -> list[Path]:
+    selected: list[Path] = []
+    key_owner: dict[str, Path] = {}
+    flat_archived_alias_owner: dict[str, list[Path]] = {}
+    for path in sorted(
+        source_rollout_candidate_paths(source),
+        key=lambda candidate: rollout_candidate_preference(source, candidate),
+    ):
+        keys = source_rollout_candidate_keys_for_path(source, path)
+        ref = source_relative_path_ref(path, source.root)
+        primary_key = rollout_duplicate_key_for_ref(ref) if ref is not None else path.as_posix()
+        if primary_key in key_owner:
+            continue
+        conflicting_paths = {
+            key_owner[key]
+            for key in keys
+            if key in key_owner
+        }
+        if any(
+            rollout_paths_have_same_bounded_source(path, owner, source.root)
+            for owner in conflicting_paths
+        ):
+            continue
+        ref_parts = Path(ref).parts if ref is not None else ()
+        is_session_rollout = bool(ref_parts and ref_parts[0] == "sessions")
+        flat_archived_alias = flat_undated_archive_alias_for_ref(ref) if ref is not None else None
+        if (
+            flat_archived_alias is not None
+            and not is_session_rollout
+            and flat_archived_alias in flat_archived_alias_owner
+            and any(
+                rollout_paths_have_same_bounded_source(path, owner, source.root)
+                for owner in flat_archived_alias_owner[flat_archived_alias]
+            )
+        ):
+            continue
+        selected.append(path)
+        for key in keys:
+            key_owner.setdefault(key, path)
+        if flat_archived_alias is not None:
+            flat_archived_alias_owner.setdefault(flat_archived_alias, []).append(path)
+    return sorted(selected)
+
+
+def rollout_candidate_preference(source: Source, path: Path) -> tuple[int, str]:
+    ref = source_relative_path_ref(path, source.root)
+    parts = Path(ref).parts if ref is not None else ()
+    if parts and parts[0] == "sessions":
+        tier = 0
+    elif parts and parts[0] == "archived_sessions":
+        tier = 2
+    else:
+        tier = 1
+    return (tier, path.as_posix())
 
 
 def source_rollouts(source: Source) -> list[Path]:
@@ -971,7 +1047,7 @@ def source_rollouts(source: Source) -> list[Path]:
 
 
 def unsafe_source_rollouts(source: Source) -> list[Path]:
-    return sorted(path for path in source_rollout_candidates(source) if not safe_source_file(path, source.root))
+    return sorted(path for path in source_rollout_candidate_paths(source) if not safe_source_file(path, source.root))
 
 
 def source_summary_files(source: Source) -> list[Path]:
@@ -1157,7 +1233,15 @@ def rollout_has_materialized_window_coverage(
     except OSError:
         return False
     if max_raw_bytes is not None and size > max_raw_bytes:
-        return oversized_rollout_relevance(path, start, end) == "relevant"
+        return (
+            oversized_rollout_relevance(
+                path,
+                start,
+                end,
+                allow_mtime_fallback=allow_mtime_fallback,
+            )
+            == "relevant"
+        )
     if rollout_date and start and rollout_date < start:
         if allow_mtime_fallback and rollout_mtime_active(path, start, end):
             return True
@@ -1251,7 +1335,13 @@ def earliest_timestamp_in_file(path: Path, *, max_scan_bytes: int) -> dt.datetim
         return None
 
 
-def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> str:
+def oversized_rollout_relevance(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    allow_mtime_fallback: bool = False,
+) -> str:
     if start is None and end is None:
         return "relevant"
     rollout_date = rollout_window_date(path)
@@ -1268,6 +1358,8 @@ def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.d
             return "relevant"
         if not complete:
             return "unknown"
+        if not allow_mtime_fallback:
+            return "irrelevant"
         try:
             mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
         except OSError:
@@ -1278,8 +1370,22 @@ def oversized_rollout_relevance(path: Path, start: dt.datetime | None, end: dt.d
     return "relevant"
 
 
-def oversized_rollout_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
-    return oversized_rollout_relevance(path, start, end) == "relevant"
+def oversized_rollout_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    allow_mtime_fallback: bool = False,
+) -> bool:
+    return (
+        oversized_rollout_relevance(
+            path,
+            start,
+            end,
+            allow_mtime_fallback=allow_mtime_fallback,
+        )
+        == "relevant"
+    )
 
 
 def raw_timestamp_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None, *, max_scan_bytes: int | None = None) -> bool:
@@ -1345,6 +1451,261 @@ def source_relative_path_ref(path: Path, root: Path) -> str | None:
         return path.relative_to(root).as_posix()
     except ValueError:
         return None
+
+
+def rollout_ref_is_archived(ref: str) -> bool:
+    parts = Path(ref).parts
+    return bool(parts and parts[0] == "archived_sessions")
+
+
+def rollout_path_is_archived(path: Path, root: Path) -> bool:
+    ref = source_relative_path_ref(path, root)
+    return ref is not None and rollout_ref_is_archived(ref)
+
+
+def rollout_duplicate_key_for_ref(ref: str) -> str:
+    path = Path(ref)
+    parts = path.parts
+    if not parts:
+        return ref
+    if parts[0] == "sessions" and len(parts) > 1:
+        return Path(*parts[1:]).as_posix()
+    if parts[0] == "archived_sessions" and len(parts) > 1:
+        remainder = parts[1:]
+        if len(remainder) == 1:
+            rollout_date = rollout_date_from_path(Path(remainder[0]))
+            if rollout_date is None:
+                return path.as_posix()
+            return f"{rollout_date:%Y/%m/%d}/{remainder[0]}"
+        return Path(*remainder).as_posix()
+    if len(parts) == 1:
+        rollout_date = rollout_date_from_path(path)
+        if rollout_date is not None:
+            return f"{rollout_date:%Y/%m/%d}/{parts[0]}"
+    return path.as_posix()
+
+
+def rollout_duplicate_keys_for_ref(ref: str) -> set[str]:
+    keys = {rollout_duplicate_key_for_ref(ref)}
+    parts = Path(ref).parts
+    if parts:
+        name = parts[-1]
+        if (
+            name.startswith("rollout-")
+            and name.endswith(".jsonl")
+            and rollout_date_from_path(Path(name)) is None
+            and (len(parts) == 1 or parts[0] == "archived_sessions")
+        ):
+            keys.add(name)
+    return keys
+
+
+def summary_backed_rollout_key_for_ref(ref: str) -> str:
+    return rollout_duplicate_key_for_ref(ref)
+
+
+def rollout_ref_has_duplicate_key(ref: str, keys: set[str]) -> bool:
+    return bool(rollout_duplicate_keys_for_ref(ref) & keys)
+
+
+def flat_archived_undated_alias_key(name: str) -> str:
+    return f"{FLAT_ARCHIVED_UNDATED_ALIAS_PREFIX}:{name}"
+
+
+def flat_undated_archive_alias_for_ref(ref: str) -> str | None:
+    parts = Path(ref).parts
+    if not parts:
+        return None
+    name = parts[-1]
+    if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+        return None
+    if rollout_date_from_path(Path(name)) is not None:
+        return None
+    if len(parts) == 1 or parts[0] == "sessions" or (len(parts) == 2 and parts[0] == "archived_sessions"):
+        return flat_archived_undated_alias_key(name)
+    return None
+
+
+def rollout_match_keys_for_ref(ref: str) -> set[str]:
+    keys = set(rollout_duplicate_keys_for_ref(ref))
+    if alias := flat_undated_archive_alias_for_ref(ref):
+        keys.add(alias)
+    return keys
+
+
+def selected_rollout_identity_for_ref(
+    ref: str,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None,
+) -> tuple[str | None, RolloutSourceIdentity | None]:
+    if not selected_source_identity_by_key:
+        return None, None
+    for duplicate_key in sorted(rollout_match_keys_for_ref(ref)):
+        selected_identity = selected_source_identity_by_key.get(duplicate_key)
+        if selected_identity is not None:
+            return duplicate_key, selected_identity
+    return None, None
+
+
+def rollout_ref_has_archived_duplicate_key(ref: str, archived_duplicate_keys: set[str]) -> bool:
+    return bool(rollout_match_keys_for_ref(ref) & archived_duplicate_keys)
+
+
+def rollout_duplicate_key_for_path(source: Source, path: Path) -> str:
+    ref = source_relative_path_ref(path, source.root)
+    if ref is None:
+        return path.as_posix()
+    return rollout_duplicate_key_for_ref(ref)
+
+
+def rollout_duplicate_keys_for_path(source: Source, path: Path) -> set[str]:
+    ref = source_relative_path_ref(path, source.root)
+    if ref is None:
+        return {path.as_posix()}
+    return rollout_duplicate_keys_for_ref(ref)
+
+
+def source_rollout_candidate_keys_for_path(source: Source, path: Path) -> set[str]:
+    ref = source_relative_path_ref(path, source.root)
+    if ref is None:
+        return {path.as_posix()}
+    return rollout_match_keys_for_ref(ref)
+
+
+def archived_rollout_duplicate_keys(root: Path) -> set[str]:
+    archived = root / "archived_sessions"
+    if not os.path.lexists(archived):
+        return set()
+    if archived.is_symlink() or not archived.is_dir():
+        return set()
+    try:
+        archived.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError):
+        return set()
+    try:
+        keys: set[str] = set()
+        for path in archived.rglob("rollout-*.jsonl"):
+            if path.name.startswith("rollout-summary"):
+                continue
+            ref = path.relative_to(root).as_posix()
+            keys.update(rollout_duplicate_keys_for_ref(ref))
+            parts = Path(ref).parts
+            if (
+                len(parts) == 2
+                and parts[0] == "archived_sessions"
+                and rollout_date_from_path(Path(parts[1])) is None
+            ):
+                keys.add(flat_archived_undated_alias_key(parts[1]))
+        return keys
+    except (OSError, ValueError):
+        return set()
+
+
+def rollout_path_has_archived_duplicate(
+    source: Source,
+    path: Path,
+    archived_duplicate_keys: set[str] | None = None,
+) -> bool:
+    if rollout_path_is_archived(path, source.root):
+        return False
+    if archived_duplicate_keys is None:
+        archived_duplicate_keys = archived_rollout_duplicate_keys(source.root)
+    ref = source_relative_path_ref(path, source.root)
+    if ref is None:
+        return path.as_posix() in archived_duplicate_keys
+    return rollout_ref_has_archived_duplicate_key(ref, archived_duplicate_keys)
+
+
+def rollout_path_allows_mtime_fallback(
+    source: Source,
+    path: Path,
+    archived_duplicate_keys: set[str] | None = None,
+) -> bool:
+    return (
+        source_allows_mtime_fallback(source)
+        and not rollout_path_is_archived(path, source.root)
+        and not rollout_path_has_archived_duplicate(source, path, archived_duplicate_keys)
+    )
+
+
+def rollout_ref_allows_mtime_fallback(
+    ref: str,
+    *,
+    allow_mtime_fallback: bool,
+    source_root: Path | None = None,
+    archived_duplicate_keys: set[str] | None = None,
+) -> bool:
+    if not allow_mtime_fallback or rollout_ref_is_archived(ref):
+        return False
+    if source_root is not None:
+        if archived_duplicate_keys is None:
+            archived_duplicate_keys = archived_rollout_duplicate_keys(source_root)
+        if rollout_ref_has_archived_duplicate_key(ref, archived_duplicate_keys):
+            return False
+    return True
+
+
+def backing_ref_matches_current_or_selected_rollout(
+    source_root: Path,
+    ref: str,
+    source_identity: RolloutSourceIdentity,
+    *,
+    max_hash_bytes: int | None = None,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+) -> bool:
+    selected_duplicate_key, selected_identity = selected_rollout_identity_for_ref(
+        ref,
+        selected_source_identity_by_key,
+    )
+    if selected_identity is None:
+        return backing_ref_matches_current_rollout_identity(
+            source_root,
+            ref,
+            source_identity,
+            max_hash_bytes=max_hash_bytes,
+        )
+    if selected_identity.ref == ref:
+        return backing_ref_matches_current_rollout_identity(
+            source_root,
+            ref,
+            source_identity,
+            max_hash_bytes=max_hash_bytes,
+        )
+    if source_identity.source_sha256 is None:
+        current_identity = rollout_source_identity_with_sha256(
+            source_root,
+            dataclasses.replace(source_identity, ref=ref),
+            max_hash_bytes=max_hash_bytes,
+        )
+        selected_identity = rollout_source_identity_with_sha256(
+            source_root,
+            selected_identity,
+            max_hash_bytes=max_hash_bytes,
+        )
+        if selected_duplicate_key is not None and selected_source_identity_by_key is not None:
+            selected_source_identity_by_key[selected_duplicate_key] = selected_identity
+        return (
+            current_identity.source_sha256 is not None
+            and selected_identity.source_sha256 is not None
+            and current_identity.source_sha256 == selected_identity.source_sha256
+        )
+    if selected_identity.source_bytes != source_identity.source_bytes:
+        return False
+    if selected_identity.source_sha256 is None:
+        selected_identity = rollout_source_identity_with_sha256(
+            source_root,
+            selected_identity,
+            max_hash_bytes=max_hash_bytes,
+        )
+        if selected_duplicate_key is not None:
+            selected_source_identity_by_key[selected_duplicate_key] = selected_identity
+    return (
+        selected_identity.source_sha256 is not None
+        and selected_identity.source_sha256 == source_identity.source_sha256
+    )
+
+
+def summary_hash_verify_max_bytes(max_scan_bytes: int) -> int:
+    return max(max_scan_bytes, SUMMARY_HASH_VERIFY_MAX_BYTES)
 
 
 def safe_relative_summary_ref(value: str) -> str | None:
@@ -1424,6 +1785,13 @@ def rollout_ref_in_window(ref: str, start: dt.datetime | None, end: dt.datetime 
     return True
 
 
+def rollout_ref_has_window_hint(ref: str) -> bool:
+    ref_path = Path(ref)
+    if rollout_date_from_path(ref_path) is not None:
+        return True
+    return dated_path_from_parts(ref_path) is not None
+
+
 def summary_file_has_relevant_backing_ref(
     path: Path,
     start: dt.datetime | None,
@@ -1432,6 +1800,7 @@ def summary_file_has_relevant_backing_ref(
     max_scan_bytes: int,
     source_root: Path | None = None,
     allow_mtime_fallback: bool = False,
+    archived_duplicate_keys: set[str] | None = None,
 ) -> bool:
     try:
         with path.open("rb") as handle:
@@ -1477,6 +1846,7 @@ def summary_file_has_relevant_backing_ref(
                 end,
                 max_scan_bytes=max_scan_bytes,
                 allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
             )
         ):
             return True
@@ -1491,6 +1861,7 @@ def summary_file_relevant_or_backing_ref_relevant(
     max_scan_bytes: int,
     source_root: Path | None = None,
     allow_mtime_fallback: bool = False,
+    archived_duplicate_keys: set[str] | None = None,
 ) -> bool:
     return summary_file_relevant_with_scan_cap(
         path,
@@ -1504,6 +1875,7 @@ def summary_file_relevant_or_backing_ref_relevant(
         max_scan_bytes=max_scan_bytes,
         source_root=source_root,
         allow_mtime_fallback=allow_mtime_fallback,
+        archived_duplicate_keys=archived_duplicate_keys,
     )
 
 
@@ -1515,6 +1887,7 @@ def summary_file_maybe_relevant_or_backing_ref_relevant(
     max_scan_bytes: int,
     source_root: Path | None = None,
     allow_mtime_fallback: bool = False,
+    archived_duplicate_keys: set[str] | None = None,
 ) -> bool:
     return summary_file_maybe_relevant_with_scan_cap(
         path,
@@ -1528,6 +1901,7 @@ def summary_file_maybe_relevant_or_backing_ref_relevant(
         max_scan_bytes=max_scan_bytes,
         source_root=source_root,
         allow_mtime_fallback=allow_mtime_fallback,
+        archived_duplicate_keys=archived_duplicate_keys,
     )
 
 
@@ -1591,10 +1965,116 @@ def summary_backing_rollout_refs(
     return refs, True, relevant_record_seen, unbacked_record_seen
 
 
+def summary_scan_meta_backing_rollout_refs(path: Path, *, max_scan_bytes: int) -> tuple[set[str], bool]:
+    refs: set[str] = set()
+    invalid_ref_seen = False
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(max_scan_bytes + 1)
+    except OSError:
+        invalid_ref_seen = True
+        return refs, invalid_ref_seen
+    if len(data) > max_scan_bytes:
+        return refs, invalid_ref_seen
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        invalid_ref_seen = True
+        return refs, invalid_ref_seen
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            invalid_ref_seen = True
+            continue
+        if not isinstance(record, dict):
+            invalid_ref_seen = True
+            continue
+        if str(record.get("kind") or "") != "scan_meta":
+            continue
+        rollout_ref = record.get("rollout")
+        if rollout_ref is None:
+            continue
+        if not isinstance(rollout_ref, str):
+            invalid_ref_seen = True
+            continue
+        safe_ref = safe_rollout_backing_ref(rollout_ref)
+        if safe_ref is None:
+            invalid_ref_seen = True
+            continue
+        refs.add(safe_ref)
+    return refs, invalid_ref_seen
+
+
+def summary_file_has_session_meta_in_window(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(max_scan_bytes + 1)
+    except OSError:
+        return False
+    if len(data) > max_scan_bytes:
+        data = data[:max_scan_bytes].rsplit(b"\n", 1)[0]
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("kind") or "") != "session_meta":
+            continue
+        if summary_record_in_window(record, path, start, end):
+            return True
+    return False
+
+
+def oversized_summary_starts_with_scan_meta(path: Path, *, max_scan_bytes: int) -> bool:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(max_scan_bytes)
+    except OSError:
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(record, dict) and str(record.get("kind") or "") == "scan_meta"
+    return False
+
+
 @dataclasses.dataclass(frozen=True)
 class CompleteScanMetaProof:
     source_bytes_by_ref: dict[str, int]
+    source_sha256_by_ref: dict[str, str]
     has_rollout_ref: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class RolloutSourceIdentity:
+    source_bytes: int
+    source_sha256: str | None = None
+    ref: str | None = None
 
 
 def complete_scan_meta_record_source_bytes(record: dict[str, Any]) -> int | None:
@@ -1624,6 +2104,29 @@ def complete_scan_meta_record_source_bytes(record: dict[str, Any]) -> int | None
     return source_bytes
 
 
+def complete_scan_meta_record_source_sha256(record: dict[str, Any]) -> str | None:
+    value = record.get("source_sha256")
+    if value is None:
+        return None
+    if isinstance(value, str) and SOURCE_SHA256_PATTERN.fullmatch(value):
+        return value
+    return ""
+
+
+def summary_file_has_malformed_scan_meta_source_sha256(path: Path) -> bool:
+    try:
+        for _line_no, record in iter_jsonl(path):
+            if str(record.get("kind") or "") != "scan_meta":
+                continue
+            if record.get("source_sha256") is None:
+                continue
+            if complete_scan_meta_record_source_sha256(record) == "":
+                return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
 def complete_scan_meta_backing_source_bytes_by_ref(
     path: Path,
     start: dt.datetime | None,
@@ -1632,6 +2135,7 @@ def complete_scan_meta_backing_source_bytes_by_ref(
     saw_scan_meta = False
     has_rollout_ref = False
     source_bytes_by_ref: dict[str, int] = {}
+    source_sha256_by_ref: dict[str, str] = {}
     try:
         for _line_no, record in iter_jsonl(path):
             if str(record.get("kind") or "") != "scan_meta":
@@ -1639,6 +2143,9 @@ def complete_scan_meta_backing_source_bytes_by_ref(
             saw_scan_meta = True
             source_bytes = complete_scan_meta_record_source_bytes(record)
             if source_bytes is None:
+                return None
+            source_sha256 = complete_scan_meta_record_source_sha256(record)
+            if source_sha256 == "":
                 return None
             rollout_ref = record.get("rollout")
             if rollout_ref is None:
@@ -1655,21 +2162,30 @@ def complete_scan_meta_backing_source_bytes_by_ref(
             if previous is not None and previous != source_bytes:
                 return None
             source_bytes_by_ref[safe_ref] = source_bytes
+            if source_sha256 is not None:
+                previous_sha256 = source_sha256_by_ref.get(safe_ref)
+                if previous_sha256 is not None and previous_sha256 != source_sha256:
+                    return None
+                source_sha256_by_ref[safe_ref] = source_sha256
     except (OSError, ValueError):
         return None
     if not saw_scan_meta:
         return None
-    return CompleteScanMetaProof(source_bytes_by_ref=source_bytes_by_ref, has_rollout_ref=has_rollout_ref)
+    return CompleteScanMetaProof(
+        source_bytes_by_ref=source_bytes_by_ref,
+        source_sha256_by_ref=source_sha256_by_ref,
+        has_rollout_ref=has_rollout_ref,
+    )
 
 
-def complete_summary_backing_source_bytes_by_ref(
+def complete_summary_backing_source_identity_by_ref(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
     source_root: Path | None = None,
-) -> dict[str, int] | None:
+) -> dict[str, RolloutSourceIdentity] | None:
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
         path,
         start,
@@ -1685,13 +2201,39 @@ def complete_summary_backing_source_bytes_by_ref(
     if proof.source_bytes_by_ref:
         if not backing_refs.issubset(proof.source_bytes_by_ref):
             return None
-        return {ref: proof.source_bytes_by_ref[ref] for ref in backing_refs}
+        return {
+            ref: RolloutSourceIdentity(
+                source_bytes=proof.source_bytes_by_ref[ref],
+                source_sha256=proof.source_sha256_by_ref.get(ref),
+            )
+            for ref in backing_refs
+        }
     if proof.has_rollout_ref:
         return None
     legacy_source_bytes = summary_file_complete_backing_source_bytes(path)
     if legacy_source_bytes is None or len(backing_refs) != 1:
         return None
-    return {next(iter(backing_refs)): legacy_source_bytes}
+    return {next(iter(backing_refs)): RolloutSourceIdentity(source_bytes=legacy_source_bytes)}
+
+
+def complete_summary_backing_source_bytes_by_ref(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+    source_root: Path | None = None,
+) -> dict[str, int] | None:
+    identities = complete_summary_backing_source_identity_by_ref(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
+    )
+    if identities is None:
+        return None
+    return {ref: identity.source_bytes for ref, identity in identities.items()}
 
 
 def complete_summary_backing_rollout_refs(
@@ -1723,21 +2265,228 @@ def complete_summary_backing_rollout_refs(
         extractable_refs = summary_extractable_backing_refs_in_window(summary, start, end)
         if not extractable_refs:
             continue
-        source_bytes_by_ref = complete_summary_backing_source_bytes_by_ref(
+        source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
             summary,
             start,
             end,
             max_scan_bytes=max_scan_bytes,
             source_root=source_root,
         )
-        if source_bytes_by_ref is None:
+        if source_identity_by_ref is None:
             continue
         refs.update(
             ref
-            for ref, source_bytes in source_bytes_by_ref.items()
+            for ref, source_identity in source_identity_by_ref.items()
             if ref in extractable_refs
-            if backing_ref_matches_current_rollout(source_root, ref, source_bytes)
+            if backing_ref_matches_current_rollout_identity(
+                source_root,
+                ref,
+                source_identity,
+                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+            )
         )
+    return refs
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("source path is not a regular file")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return digest.hexdigest()
+
+
+def rollout_source_identity_with_sha256(
+    source_root: Path,
+    identity: RolloutSourceIdentity,
+    *,
+    max_hash_bytes: int | None = None,
+) -> RolloutSourceIdentity:
+    if identity.source_sha256 is not None or identity.ref is None:
+        return identity
+    effective_max_hash_bytes = summary_hash_verify_max_bytes(max_hash_bytes) if max_hash_bytes is not None else None
+    if effective_max_hash_bytes is not None and identity.source_bytes > effective_max_hash_bytes:
+        return identity
+    rollout = source_root / identity.ref
+    if not safe_source_file(rollout, source_root):
+        return identity
+    try:
+        return dataclasses.replace(identity, source_sha256=file_sha256(rollout))
+    except OSError:
+        return identity
+
+
+def rollout_source_identity_by_duplicate_key(rollouts: list[Path], source_root: Path) -> dict[str, RolloutSourceIdentity]:
+    result: dict[str, RolloutSourceIdentity] = {}
+    ambiguous_match_keys: set[str] = set()
+
+    def set_unambiguous_identity(match_key: str, identity: RolloutSourceIdentity) -> None:
+        if match_key in ambiguous_match_keys:
+            return
+        existing_identity = result.get(match_key)
+        if existing_identity is None or existing_identity.ref == identity.ref:
+            result[match_key] = identity
+            return
+        result.pop(match_key, None)
+        ambiguous_match_keys.add(match_key)
+
+    for rollout in rollouts:
+        ref = source_relative_path_ref(rollout, source_root)
+        if ref is None:
+            continue
+        try:
+            source_bytes = rollout.stat().st_size
+        except OSError:
+            continue
+        identity = RolloutSourceIdentity(
+            source_bytes=source_bytes,
+            ref=ref,
+        )
+        for duplicate_key in rollout_duplicate_keys_for_ref(ref):
+            set_unambiguous_identity(duplicate_key, identity)
+        alias_key = flat_undated_archive_alias_for_ref(ref)
+        if alias_key is None:
+            continue
+        set_unambiguous_identity(alias_key, identity)
+    return result
+
+
+def rollout_source_bytes_by_duplicate_key(rollouts: list[Path], source_root: Path) -> dict[str, int]:
+    return {
+        duplicate_key: identity.source_bytes
+        for duplicate_key, identity in rollout_source_identity_by_duplicate_key(rollouts, source_root).items()
+    }
+
+
+def complete_summary_backing_rollout_keys(
+    summaries: list[Path],
+    rollouts: list[Path],
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path,
+    max_scan_bytes: int,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+    archived_duplicate_keys: set[str] | None = None,
+) -> set[str]:
+    if selected_source_identity_by_key is None:
+        selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source_root)
+    keys: set[str] = set()
+    for summary in summaries:
+        try:
+            size = summary.stat().st_size
+        except OSError:
+            continue
+        if size > max_scan_bytes:
+            continue
+        if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
+            continue
+        if summary_file_has_stale_backing_source(
+            summary,
+            source_root,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
+        ):
+            continue
+        extractable_refs = summary_extractable_backing_refs_in_window(summary, start, end)
+        if not extractable_refs:
+            continue
+        source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
+            summary,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+            source_root=source_root,
+        )
+        if source_identity_by_ref is None:
+            continue
+        for ref, source_identity in source_identity_by_ref.items():
+            if ref not in extractable_refs:
+                continue
+            if backing_ref_matches_current_or_selected_rollout(
+                source_root,
+                ref,
+                source_identity,
+                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                selected_source_identity_by_key=selected_source_identity_by_key,
+            ):
+                _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
+                selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
+                keys.add(summary_backed_rollout_key_for_ref(selected_ref))
+    return keys
+
+
+def complete_summary_backing_rollout_keys_for_refs(
+    summary: Path,
+    backing_refs: set[str],
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path,
+    max_scan_bytes: int,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+) -> set[str]:
+    keys: set[str] = set()
+    complete_refs = complete_summary_backing_rollout_refs_for_refs(
+        summary,
+        backing_refs,
+        start,
+        end,
+        source_root=source_root,
+        max_scan_bytes=max_scan_bytes,
+        selected_source_identity_by_key=selected_source_identity_by_key,
+    )
+    for ref in complete_refs:
+        _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
+        selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
+        keys.add(summary_backed_rollout_key_for_ref(selected_ref))
+    return keys
+
+
+def complete_summary_backing_rollout_refs_for_refs(
+    summary: Path,
+    backing_refs: set[str],
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path,
+    max_scan_bytes: int,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+) -> set[str]:
+    source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
+        summary,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
+    )
+    if source_identity_by_ref is None:
+        return set()
+    refs: set[str] = set()
+    for ref in backing_refs:
+        source_identity = source_identity_by_ref.get(ref)
+        if source_identity is None:
+            continue
+        if backing_ref_matches_current_or_selected_rollout(
+            source_root,
+            ref,
+            source_identity,
+            max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+            selected_source_identity_by_key=selected_source_identity_by_key,
+        ):
+            refs.add(ref)
     return refs
 
 
@@ -1751,6 +2500,29 @@ def backing_ref_matches_current_rollout(source_root: Path, ref: str, source_byte
         return False
 
 
+def backing_ref_matches_current_rollout_identity(
+    source_root: Path,
+    ref: str,
+    source_identity: RolloutSourceIdentity,
+    *,
+    max_hash_bytes: int | None = None,
+) -> bool:
+    rollout = source_root / ref
+    if not safe_source_file(rollout, source_root):
+        return False
+    try:
+        if rollout.stat().st_size != source_identity.source_bytes:
+            return False
+        if source_identity.source_sha256 is None:
+            return True
+        effective_max_hash_bytes = summary_hash_verify_max_bytes(max_hash_bytes) if max_hash_bytes is not None else None
+        if effective_max_hash_bytes is not None and source_identity.source_bytes > effective_max_hash_bytes:
+            return False
+        return file_sha256(rollout) == source_identity.source_sha256
+    except OSError:
+        return False
+
+
 def backing_ref_has_materialized_window_coverage(
     source_root: Path,
     ref: str,
@@ -1759,6 +2531,7 @@ def backing_ref_has_materialized_window_coverage(
     *,
     max_scan_bytes: int,
     allow_mtime_fallback: bool = False,
+    archived_duplicate_keys: set[str] | None = None,
 ) -> bool:
     rollout = source_root / ref
     if not rollout_ref_is_direct_candidate(source_root, ref):
@@ -1770,7 +2543,12 @@ def backing_ref_has_materialized_window_coverage(
         start,
         end,
         max_raw_bytes=max_scan_bytes,
-        allow_mtime_fallback=allow_mtime_fallback,
+        allow_mtime_fallback=rollout_ref_allows_mtime_fallback(
+            ref,
+            allow_mtime_fallback=allow_mtime_fallback,
+            source_root=source_root,
+            archived_duplicate_keys=archived_duplicate_keys,
+        ),
     )
 
 
@@ -1782,6 +2560,7 @@ def backing_ref_has_direct_materialized_window_coverage(
     *,
     max_scan_bytes: int,
     allow_mtime_fallback: bool = False,
+    archived_duplicate_keys: set[str] | None = None,
 ) -> bool:
     rollout = source_root / ref
     if not rollout_ref_is_direct_candidate(source_root, ref):
@@ -1798,7 +2577,12 @@ def backing_ref_has_direct_materialized_window_coverage(
         start,
         end,
         max_raw_bytes=max_scan_bytes,
-        allow_mtime_fallback=allow_mtime_fallback,
+        allow_mtime_fallback=rollout_ref_allows_mtime_fallback(
+            ref,
+            allow_mtime_fallback=allow_mtime_fallback,
+            source_root=source_root,
+            archived_duplicate_keys=archived_duplicate_keys,
+        ),
     )
 
 
@@ -1824,6 +2608,41 @@ def rollout_ref_is_direct_candidate(source_root: Path, ref: str) -> bool:
     return False
 
 
+def backing_ref_or_selected_has_direct_materialized_window_coverage(
+    source_root: Path,
+    ref: str,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+    allow_mtime_fallback: bool = False,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+    archived_duplicate_keys: set[str] | None = None,
+) -> bool:
+    if backing_ref_has_direct_materialized_window_coverage(
+        source_root,
+        ref,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+        allow_mtime_fallback=allow_mtime_fallback,
+        archived_duplicate_keys=archived_duplicate_keys,
+    ):
+        return True
+    _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
+    if selected_identity is None or selected_identity.ref is None or selected_identity.ref == ref:
+        return False
+    return backing_ref_has_direct_materialized_window_coverage(
+        source_root,
+        selected_identity.ref,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+        allow_mtime_fallback=allow_mtime_fallback,
+        archived_duplicate_keys=archived_duplicate_keys,
+    )
+
+
 def summary_file_has_stale_backing_source(
     path: Path,
     source_root: Path,
@@ -1831,6 +2650,8 @@ def summary_file_has_stale_backing_source(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+    archived_duplicate_keys: set[str] | None = None,
 ) -> bool:
     try:
         size = path.stat().st_size
@@ -1844,6 +2665,7 @@ def summary_file_has_stale_backing_source(
         end,
         max_scan_bytes=max_scan_bytes,
         source_root=source_root,
+        archived_duplicate_keys=archived_duplicate_keys,
     ):
         return False
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
@@ -1855,26 +2677,41 @@ def summary_file_has_stale_backing_source(
     )
     if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
         return False
-    source_bytes_by_ref = complete_summary_backing_source_bytes_by_ref(
+    source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
         path,
         start,
         end,
         max_scan_bytes=max_scan_bytes,
         source_root=source_root,
     )
-    if source_bytes_by_ref is None:
-        if complete_scan_meta_backing_source_bytes_by_ref(path, start, end) is not None:
+    if source_identity_by_ref is None:
+        proof = complete_scan_meta_backing_source_bytes_by_ref(path, start, end)
+        if proof is not None:
+            return True
+        if summary_file_has_malformed_scan_meta_source_sha256(path):
             return True
         source_bytes = summary_file_declared_source_bytes(path)
         if source_bytes is None:
             return False
         return any(
-            not backing_ref_matches_current_rollout(source_root, ref, source_bytes)
+            not backing_ref_matches_current_or_selected_rollout(
+                source_root,
+                ref,
+                RolloutSourceIdentity(source_bytes=source_bytes),
+                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                selected_source_identity_by_key=selected_source_identity_by_key,
+            )
             for ref in backing_refs
         )
     return any(
-        not backing_ref_matches_current_rollout(source_root, ref, source_bytes)
-        for ref, source_bytes in source_bytes_by_ref.items()
+        not backing_ref_matches_current_or_selected_rollout(
+            source_root,
+            ref,
+            source_identity,
+            max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+            selected_source_identity_by_key=selected_source_identity_by_key,
+        )
+        for ref, source_identity in source_identity_by_ref.items()
     )
 
 
@@ -1886,6 +2723,8 @@ def summary_file_stale_backing_requires_gap(
     *,
     max_scan_bytes: int,
     allow_mtime_fallback: bool = False,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+    archived_duplicate_keys: set[str] | None = None,
 ) -> bool:
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
         path,
@@ -1896,39 +2735,56 @@ def summary_file_stale_backing_requires_gap(
     )
     if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
         return False
-    source_bytes_by_ref = complete_summary_backing_source_bytes_by_ref(
+    source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
         path,
         start,
         end,
         max_scan_bytes=max_scan_bytes,
         source_root=source_root,
     )
-    if source_bytes_by_ref is None:
-        if complete_scan_meta_backing_source_bytes_by_ref(path, start, end) is None:
+    if source_identity_by_ref is None:
+        if summary_file_has_malformed_scan_meta_source_sha256(path):
+            return True
+        proof = complete_scan_meta_backing_source_bytes_by_ref(path, start, end)
+        if proof is None:
             source_bytes = summary_file_declared_source_bytes(path)
             if source_bytes is None:
                 return False
             stale_refs = {
                 ref
                 for ref in backing_refs
-                if not backing_ref_matches_current_rollout(source_root, ref, source_bytes)
+                if not backing_ref_matches_current_or_selected_rollout(
+                    source_root,
+                    ref,
+                    RolloutSourceIdentity(source_bytes=source_bytes),
+                    max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                    selected_source_identity_by_key=selected_source_identity_by_key,
+                )
             }
         else:
             stale_refs = set(backing_refs)
     else:
         stale_refs = {
             ref
-            for ref, source_bytes in source_bytes_by_ref.items()
-            if not backing_ref_matches_current_rollout(source_root, ref, source_bytes)
+            for ref, source_identity in source_identity_by_ref.items()
+            if not backing_ref_matches_current_or_selected_rollout(
+                source_root,
+                ref,
+                source_identity,
+                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                selected_source_identity_by_key=selected_source_identity_by_key,
+            )
         }
     return any(
-        not backing_ref_has_direct_materialized_window_coverage(
+        not backing_ref_or_selected_has_direct_materialized_window_coverage(
             source_root,
             ref,
             start,
             end,
             max_scan_bytes=max_scan_bytes,
             allow_mtime_fallback=allow_mtime_fallback,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         for ref in stale_refs
     )
@@ -1941,6 +2797,8 @@ def stale_backing_summary_paths(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+    archived_duplicate_keys: set[str] | None = None,
 ) -> set[Path]:
     return {
         summary
@@ -1951,6 +2809,8 @@ def stale_backing_summary_paths(
             start,
             end,
             max_scan_bytes=max_scan_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
     }
 
@@ -1963,6 +2823,8 @@ def stale_backing_summary_gap_paths(
     *,
     max_scan_bytes: int,
     allow_mtime_fallback: bool = False,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+    archived_duplicate_keys: set[str] | None = None,
 ) -> set[Path]:
     return {
         summary
@@ -1974,6 +2836,8 @@ def stale_backing_summary_gap_paths(
             end,
             max_scan_bytes=max_scan_bytes,
             allow_mtime_fallback=allow_mtime_fallback,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
     }
 
@@ -2588,6 +3452,8 @@ def extract_summary_file(
         text = str(record.get("text") or "")
         kind = str(record.get("kind") or "summary")
         retained_kind = retained_summary_kind(kind)
+        if kind == "scan_meta":
+            continue
         if kind == "session_meta" and text:
             record_session_id = summary_session_id(record)
             if record_session_id:
@@ -3025,7 +3891,7 @@ def validate_episode_row(row: dict[str, Any], *, label: str) -> None:
     require_optional_string(row["work_report_hint"], label=f"{label}.work_report_hint")
 
 
-def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
+def validate_turn_flag_row(row: dict[str, Any], *, label: str, require_source_hash: bool = True) -> None:
     require_opaque_digest_string(row["turn_id"], label=f"{label}.turn_id", prefix=TURN_REF_PREFIX)
     require_opaque_digest_string(row["episode_id"], label=f"{label}.episode_id", prefix=EPISODE_REF_PREFIX)
     require_retained_host_string(row["host"], label=f"{label}.host")
@@ -3033,9 +3899,14 @@ def validate_turn_flag_row(row: dict[str, Any], *, label: str) -> None:
     require_string(row["source_path"], label=f"{label}.source_path")
     if not PATH_REF_PATTERN.fullmatch(row["source_path"]):
         raise SystemExit(f"{label}.source_path: retained refs must use opaque {PATH_REF_PREFIX} values")
-    source_hash = require_string(row["source_hash"], label=f"{label}.source_hash")
-    if not SOURCE_HASH_PATTERN.fullmatch(source_hash):
-        raise SystemExit(f"{label}.source_hash: expected opaque keyed source hash")
+    if "source_hash" not in row:
+        if require_source_hash:
+            raise SystemExit(f"{label}.source_hash: missing required key")
+    else:
+        source_hash = row["source_hash"]
+        source_hash = require_string(source_hash, label=f"{label}.source_hash")
+        if not SOURCE_HASH_PATTERN.fullmatch(source_hash):
+            raise SystemExit(f"{label}.source_hash: expected opaque keyed source hash")
     require_timestamp_or_none(row["timestamp"], label=f"{label}.timestamp")
     require_path_ref_or_none(row["cwd"], label=f"{label}.cwd")
     model = require_retained_model_id_or_none(row["model"], label=f"{label}.model")
@@ -3054,6 +3925,7 @@ def sanitize_retained_jsonl(
     path: Path,
     *,
     allowed: set[str],
+    required: set[str] | None = None,
     strict: bool,
     validator: Any | None = None,
 ) -> list[dict[str, Any]]:
@@ -3062,9 +3934,10 @@ def sanitize_retained_jsonl(
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     sanitized_rows: list[dict[str, Any]] = []
+    required_fields = allowed if required is None else required
     for line_no, obj in rows:
         label = f"{path}:{line_no}"
-        sanitized = sanitize_mapping(obj, allowed=allowed, required=allowed, label=label, strict=strict)
+        sanitized = sanitize_mapping(obj, allowed=allowed, required=required_fields, label=label, strict=strict)
         if validator is not None:
             validator(sanitized, label=label)
         sanitized_rows.append(sanitized)
@@ -3076,6 +3949,7 @@ def sanitize_retained_jsonl_bytes(
     *,
     label: str,
     allowed: set[str],
+    required: set[str] | None = None,
     strict: bool,
     validator: Any | None = None,
 ) -> list[dict[str, Any]]:
@@ -3084,9 +3958,10 @@ def sanitize_retained_jsonl_bytes(
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     sanitized_rows: list[dict[str, Any]] = []
+    required_fields = allowed if required is None else required
     for line_no, obj in rows:
         row_label = f"{label}:{line_no}"
-        sanitized = sanitize_mapping(obj, allowed=allowed, required=allowed, label=row_label, strict=strict)
+        sanitized = sanitize_mapping(obj, allowed=allowed, required=required_fields, label=row_label, strict=strict)
         if validator is not None:
             validator(sanitized, label=row_label)
         sanitized_rows.append(sanitized)
@@ -3564,6 +4439,8 @@ def validate_retained_export_consistency(
 
 def retained_export_records_from_files(
     retained_files: dict[str, bytes],
+    *,
+    allow_missing_source_hash: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     episodes = sanitize_retained_jsonl_bytes(
         retained_files["episodes.jsonl"],
@@ -3576,8 +4453,13 @@ def retained_export_records_from_files(
         retained_files["turn_flags.jsonl"],
         label="turn_flags.jsonl",
         allowed=TURN_FLAG_FIELDS,
+        required=LEGACY_TURN_FLAG_REQUIRED_FIELDS if allow_missing_source_hash else TURN_FLAG_FIELDS,
         strict=True,
-        validator=validate_turn_flag_row,
+        validator=lambda row, *, label: validate_turn_flag_row(
+            row,
+            label=label,
+            require_source_hash=not allow_missing_source_hash,
+        ),
     )
     trend = sanitize_trend_report(history_json(retained_files["trend_report.json"], "trend_report.json"), label="trend_report.json", strict=True)
     manifest = sanitize_retained_manifest_obj(
@@ -3588,8 +4470,16 @@ def retained_export_records_from_files(
     return episodes, turn_flags, trend, manifest
 
 
-def validate_retained_export_parent(retained_files: dict[str, bytes], parent: str | None = None) -> str:
-    episodes, turn_flags, trend, manifest = retained_export_records_from_files(retained_files)
+def validate_retained_export_parent(
+    retained_files: dict[str, bytes],
+    parent: str | None = None,
+    *,
+    allow_missing_source_hash: bool = False,
+) -> str:
+    episodes, turn_flags, trend, manifest = retained_export_records_from_files(
+        retained_files,
+        allow_missing_source_hash=allow_missing_source_hash,
+    )
     validate_retained_export_consistency(episodes, turn_flags, trend, label="retained export")
     expected_parent = retained_export_parent_for_records(trend, manifest)
     if parent is not None and parent != expected_parent:
@@ -3922,7 +4812,7 @@ def validate_history_tree_ref(repo: Path, history_ref: str) -> None:
         for file_path in paths.values():
             require_regular_history_blob(entries, file_path)
         retained_files = {name: history_blob(repo, history_ref, paths[name]) for name in RETAINED_OUTPUT_FILES}
-        validate_retained_export_parent(retained_files)
+        validate_retained_export_parent(retained_files, allow_missing_source_hash=True)
     for file_path in files:
         require_regular_history_blob(entries, file_path)
         if forbidden_history_artifact(file_path):
@@ -3938,12 +4828,18 @@ def validate_history_tree_ref(repo: Path, history_ref: str) -> None:
                 validator=validate_episode_row,
             )
         elif kind == "turn_flags":
+            legacy_turn_flags = history_legacy_data_artifact(file_path) is not None
             sanitize_retained_jsonl_bytes(
                 data,
                 label=file_path,
                 allowed=TURN_FLAG_FIELDS,
+                required=LEGACY_TURN_FLAG_REQUIRED_FIELDS if legacy_turn_flags else TURN_FLAG_FIELDS,
                 strict=True,
-                validator=validate_turn_flag_row,
+                validator=lambda row, *, label: validate_turn_flag_row(
+                    row,
+                    label=label,
+                    require_source_hash=not legacy_turn_flags,
+                ),
             )
         elif kind == "trend":
             sanitize_trend_report(history_json(data, file_path), label=file_path, strict=True)
@@ -4264,9 +5160,16 @@ def remote_summary_only_gaps(
     *,
     max_scan_bytes: int,
     complete_summary_refs: set[str] | None = None,
+    complete_summary_keys: set[str] | None = None,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+    archived_duplicate_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     if source.host not in DEFAULT_REMOTE_HOSTS:
         return []
+    if selected_source_identity_by_key is None:
+        selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source.root)
+    if archived_duplicate_keys is None:
+        archived_duplicate_keys = archived_rollout_duplicate_keys(source.root)
     if complete_summary_refs is None:
         complete_summary_refs = complete_summary_backing_rollout_refs(
             summaries,
@@ -4275,16 +5178,35 @@ def remote_summary_only_gaps(
             source_root=source.root,
             max_scan_bytes=max_scan_bytes,
         )
+    if complete_summary_keys is None:
+        complete_summary_keys = complete_summary_backing_rollout_keys(
+            summaries,
+            rollouts,
+            start,
+            end,
+            source_root=source.root,
+            max_scan_bytes=max_scan_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
+        )
     candidate_rollout_refs = {
         ref
         for rollout in rollouts
         if (ref := source_relative_path_ref(rollout, source.root)) is not None
     }
+    candidate_rollout_keys: set[str] = set()
+    for ref in candidate_rollout_refs:
+        candidate_rollout_keys.update(rollout_duplicate_keys_for_ref(ref))
     covered_rollout_refs = complete_summary_refs & candidate_rollout_refs
-    has_covered_rollout = bool(covered_rollout_refs)
+    covered_rollout_keys = complete_summary_keys & candidate_rollout_keys
+    has_covered_rollout = bool(covered_rollout_refs or covered_rollout_keys)
     for rollout in rollouts:
         rollout_ref = source_relative_path_ref(rollout, source.root)
-        summary_backed_materialized = rollout_ref is not None and rollout_ref in covered_rollout_refs
+        rollout_keys = rollout_duplicate_keys_for_ref(rollout_ref) if rollout_ref is not None else set()
+        summary_backed_materialized = (
+            rollout_ref is not None
+            and (rollout_ref in covered_rollout_refs or bool(rollout_keys & covered_rollout_keys))
+        )
         if not summary_backed_materialized and not rollout_has_materialized_window_coverage(
             rollout,
             start,
@@ -4296,6 +5218,7 @@ def remote_summary_only_gaps(
         has_covered_rollout = True
         if rollout_ref is not None:
             covered_rollout_refs.add(rollout_ref)
+            covered_rollout_keys.update(rollout_duplicate_keys_for_ref(rollout_ref))
     for summary in summaries:
         if not summary_file_relevant_or_backing_ref_relevant(
             summary,
@@ -4304,8 +5227,15 @@ def remote_summary_only_gaps(
             max_scan_bytes=max_scan_bytes,
             source_root=source.root,
             allow_mtime_fallback=source_allows_mtime_fallback(source),
+            archived_duplicate_keys=archived_duplicate_keys,
         ):
             continue
+        try:
+            summary_size = summary.stat().st_size
+            if summary_size > max_scan_bytes:
+                return [remote_metadata_gap(source, "remote_source_not_materialized")]
+        except OSError:
+            return [remote_metadata_gap(source, "remote_source_not_materialized")]
         backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
             summary,
             start,
@@ -4314,16 +5244,125 @@ def remote_summary_only_gaps(
             source_root=source.root,
         )
         if not relevant_record_seen:
+            scan_meta_refs, invalid_scan_meta_ref_seen = summary_scan_meta_backing_rollout_refs(
+                summary,
+                max_scan_bytes=max_scan_bytes,
+            )
+            if invalid_scan_meta_ref_seen:
+                return [remote_metadata_gap(source, "remote_source_not_materialized")]
+            scan_meta_context_relevant = summary_file_has_session_meta_in_window(
+                summary,
+                start,
+                end,
+                max_scan_bytes=max_scan_bytes,
+            )
+            for ref in scan_meta_refs:
+                if rollout_ref_has_window_hint(ref) and not rollout_ref_in_window(ref, start, end):
+                    continue
+                _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
+                selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
+                if (
+                    selected_ref != ref
+                    and rollout_ref_has_window_hint(selected_ref)
+                    and not rollout_ref_in_window(selected_ref, start, end)
+                ):
+                    continue
+                ref_key = summary_backed_rollout_key_for_ref(selected_ref)
+                ref_has_direct_coverage = backing_ref_has_materialized_window_coverage(
+                    source.root,
+                    selected_ref,
+                    start,
+                    end,
+                    max_scan_bytes=max_scan_bytes,
+                    allow_mtime_fallback=source_allows_mtime_fallback(source),
+                    archived_duplicate_keys=archived_duplicate_keys,
+                )
+                if (
+                    not scan_meta_context_relevant
+                    and not rollout_ref_in_window(ref, start, end)
+                    and not ref_has_direct_coverage
+                ):
+                    continue
+                if ref in covered_rollout_refs or ref_key in covered_rollout_keys:
+                    continue
+                if not ref_has_direct_coverage:
+                    return [remote_metadata_gap(source, "remote_source_not_materialized")]
             continue
         if unbacked_record_seen:
             return [remote_metadata_gap(source, "remote_source_not_materialized")]
         if backing_refs:
-            if not complete or not backing_refs.issubset(covered_rollout_refs):
+            if not summary_backing_refs_are_materialized_or_proven(
+                source,
+                summary,
+                start,
+                end,
+                max_scan_bytes=max_scan_bytes,
+                allow_mtime_fallback=source_allows_mtime_fallback(source),
+                selected_source_identity_by_key=selected_source_identity_by_key,
+                archived_duplicate_keys=archived_duplicate_keys,
+            ):
                 return [remote_metadata_gap(source, "remote_source_not_materialized")]
             continue
         if not complete or not has_covered_rollout:
             return [remote_metadata_gap(source, "remote_source_not_materialized")]
     return []
+
+
+def summary_backing_refs_are_materialized_or_proven(
+    source: Source,
+    summary: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int,
+    allow_mtime_fallback: bool = False,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+    archived_duplicate_keys: set[str] | None = None,
+) -> bool:
+    backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+        summary,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+        source_root=source.root,
+    )
+    if not relevant_record_seen:
+        return True
+    if not complete or unbacked_record_seen:
+        return False
+    if not backing_refs:
+        return True
+    if archived_duplicate_keys is None:
+        archived_duplicate_keys = archived_rollout_duplicate_keys(source.root)
+    summary_complete_refs = complete_summary_backing_rollout_refs_for_refs(
+        summary,
+        backing_refs,
+        start,
+        end,
+        source_root=source.root,
+        max_scan_bytes=max_scan_bytes,
+        selected_source_identity_by_key=selected_source_identity_by_key,
+    )
+    for ref in backing_refs:
+        _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
+        if selected_identity is not None and selected_identity.ref != ref:
+            if ref in summary_complete_refs:
+                continue
+            return False
+        if backing_ref_has_materialized_window_coverage(
+            source.root,
+            ref,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+        ):
+            continue
+        if ref in summary_complete_refs:
+            continue
+        return False
+    return True
 
 
 def source_manifest_status(
@@ -4442,6 +5481,8 @@ def run_scan(
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
+        archived_duplicate_keys = archived_rollout_duplicate_keys(source.root)
+        selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source.root)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
             gap_start,
@@ -4449,12 +5490,24 @@ def run_scan(
             source_root=source.root,
             max_scan_bytes=max_raw_bytes,
         )
+        summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
+            summaries,
+            rollouts,
+            gap_start,
+            end,
+            source_root=source.root,
+            max_scan_bytes=max_raw_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
+        )
         stale_summary_paths = stale_backing_summary_paths(
             summaries,
             source.root,
             gap_start,
             end,
             max_scan_bytes=max_raw_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         stale_summary_gap_paths = stale_backing_summary_gap_paths(
             stale_summary_paths,
@@ -4463,6 +5516,8 @@ def run_scan(
             end,
             max_scan_bytes=max_raw_bytes,
             allow_mtime_fallback=allow_mtime_fallback,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         source_materialization_gaps = materialization_gaps_for_source(source)
         source_summary_only_gaps = remote_summary_only_gaps(
@@ -4473,6 +5528,9 @@ def run_scan(
             end,
             max_scan_bytes=max_raw_bytes,
             complete_summary_refs=summary_backed_rollout_refs,
+            complete_summary_keys=summary_backed_rollout_keys,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
@@ -4501,12 +5559,13 @@ def run_scan(
         if source_materialization_gaps:
             continue
         for rollout in rollouts:
+            rollout_mtime_fallback = rollout_path_allows_mtime_fallback(source, rollout, archived_duplicate_keys)
             if not rollout_candidate_relevant(
                 rollout,
                 start,
                 end,
                 max_raw_bytes=max_raw_bytes,
-                allow_mtime_fallback=allow_mtime_fallback,
+                allow_mtime_fallback=rollout_mtime_fallback,
             ):
                 continue
             size = rollout.stat().st_size
@@ -4514,7 +5573,7 @@ def run_scan(
                 jsonl_error = first_jsonl_error(rollout)
                 if jsonl_error is not None:
                     relevant_invalid_rollout = rollout_filename_in_window(rollout, gap_start, end) or (
-                        allow_mtime_fallback and rollout_mtime_active(rollout, gap_start, end)
+                        rollout_mtime_fallback and rollout_mtime_active(rollout, gap_start, end)
                     )
                     if not jsonl_error.unreadable:
                         relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
@@ -4529,7 +5588,7 @@ def run_scan(
                             }
                         )
                     continue
-                if not rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=allow_mtime_fallback):
+                if not rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=rollout_mtime_fallback):
                     continue
                 all_turns.extend(
                     extract_rollout(
@@ -4538,15 +5597,20 @@ def run_scan(
                         start,
                         end,
                         emit_start=emit_start,
-                        allow_mtime_fallback=allow_mtime_fallback,
+                        allow_mtime_fallback=rollout_mtime_fallback,
                     )
                 )
                 continue
-            relevance = oversized_rollout_relevance(rollout, gap_start, end)
+            relevance = oversized_rollout_relevance(
+                rollout,
+                gap_start,
+                end,
+                allow_mtime_fallback=rollout_mtime_fallback,
+            )
             if relevance == "irrelevant":
                 continue
             rollout_ref = source_relative_path_ref(rollout, source.root)
-            if rollout_ref is not None and rollout_ref in summary_backed_rollout_refs:
+            if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
                 continue
             append_oversized_rollout_gap(rollout, size)
             continue
@@ -4560,6 +5624,7 @@ def run_scan(
                     max_scan_bytes=max_raw_bytes,
                     source_root=source.root,
                     allow_mtime_fallback=allow_mtime_fallback,
+                    archived_duplicate_keys=archived_duplicate_keys,
                 ):
                     append_oversized_summary_gap(summary, size)
                 continue
@@ -4576,6 +5641,7 @@ def run_scan(
                 max_scan_bytes=max_raw_bytes,
                 source_root=source.root,
                 allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
             ):
                 coverage_gaps.append(
                     {
@@ -4595,6 +5661,7 @@ def run_scan(
                         max_scan_bytes=max_raw_bytes,
                         source_root=source.root,
                         allow_mtime_fallback=allow_mtime_fallback,
+                        archived_duplicate_keys=archived_duplicate_keys,
                     )
                 ):
                     coverage_gaps.append(
@@ -4620,6 +5687,7 @@ def run_scan(
                 max_scan_bytes=max_raw_bytes,
                 source_root=source.root,
                 allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
             ):
                 continue
             all_turns.extend(extract_summary_file(source, summary, start, end, emit_start=emit_start))
@@ -4716,6 +5784,8 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
+        archived_duplicate_keys = archived_rollout_duplicate_keys(source.root)
+        selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source.root)
         source_materialization_gaps = materialization_gaps_for_source(source)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
@@ -4724,12 +5794,24 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             source_root=source.root,
             max_scan_bytes=max_raw_bytes,
         )
+        summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
+            summaries,
+            rollouts,
+            start,
+            end,
+            source_root=source.root,
+            max_scan_bytes=max_raw_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
+        )
         stale_summary_paths = stale_backing_summary_paths(
             summaries,
             source.root,
             start,
             end,
             max_scan_bytes=max_raw_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         stale_summary_gap_paths = stale_backing_summary_gap_paths(
             stale_summary_paths,
@@ -4738,6 +5820,8 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             end,
             max_scan_bytes=max_raw_bytes,
             allow_mtime_fallback=allow_mtime_fallback,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
@@ -4747,6 +5831,9 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             end,
             max_scan_bytes=max_raw_bytes,
             complete_summary_refs=summary_backed_rollout_refs,
+            complete_summary_keys=summary_backed_rollout_keys,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
@@ -5211,20 +6298,25 @@ def materialize_remote_host(
 
     rows: list[dict[str, str]] = []
     for chunk_start, chunk_end in date_chunks_for_window(start, end):
+        session_meta_args = [
+            "session-meta",
+            "--host",
+            host,
+            "--from",
+            date_arg(chunk_start),
+            "--to",
+            date_arg(chunk_end),
+            "--limit",
+            str(session_meta_limit),
+            "--auto-split",
+            "--rollout-start",
+            iso(start),
+            "--rollout-end",
+            iso(end),
+        ]
         session_meta = run_remote_probe(
             remote_probe,
-            [
-                "session-meta",
-                "--host",
-                host,
-                "--from",
-                date_arg(chunk_start),
-                "--to",
-                date_arg(chunk_end),
-                "--limit",
-                str(session_meta_limit),
-                "--auto-split",
-            ],
+            session_meta_args,
         )
         if session_meta.returncode != 0:
             report["status"] = "remote_source_not_materialized"
@@ -5501,6 +6593,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 max_scan_bytes=max_raw_bytes,
                 source_root=root,
                 allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
             ):
                 return
             row["status"] = "oversized"
@@ -5513,6 +6606,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             start,
             end,
             max_scan_bytes=max_raw_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         ):
             if summary_file_stale_backing_requires_gap(
                 summary,
@@ -5521,6 +6616,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 end,
                 max_scan_bytes=max_raw_bytes,
                 allow_mtime_fallback=allow_mtime_fallback,
+                selected_source_identity_by_key=selected_source_identity_by_key,
+                archived_duplicate_keys=archived_duplicate_keys,
             ):
                 row["status"] = "partial"
                 row["coverage_gap"] = "summary source_bytes does not match current backing rollout; regenerate bounded rollout-summary before extractor handoff"
@@ -5535,6 +6632,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 max_scan_bytes=max_raw_bytes,
                 source_root=root,
                 allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
             ):
                 return
             row["status"] = "partial"
@@ -5552,6 +6650,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     max_scan_bytes=max_raw_bytes,
                     source_root=root,
                     allow_mtime_fallback=allow_mtime_fallback,
+                    archived_duplicate_keys=archived_duplicate_keys,
                 )
             ):
                 return
@@ -5566,6 +6665,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             max_scan_bytes=max_raw_bytes,
             source_root=root,
             allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
         ):
             return
         if not summary_file_has_extractable_record_in_window(summary, start, end):
@@ -5602,12 +6702,24 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
+        archived_duplicate_keys = archived_rollout_duplicate_keys(root)
+        selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, root)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
             start,
             end,
             source_root=root,
             max_scan_bytes=max_raw_bytes,
+        )
+        summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
+            summaries,
+            rollouts,
+            start,
+            end,
+            source_root=root,
+            max_scan_bytes=max_raw_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
@@ -5617,17 +6729,21 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             end,
             max_scan_bytes=max_raw_bytes,
             complete_summary_refs=summary_backed_rollout_refs,
+            complete_summary_keys=summary_backed_rollout_keys,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         if source_summary_only_gaps:
             append_source_gap_shards(source_summary_only_gaps, root)
             continue
         for rollout in rollouts:
+            rollout_mtime_fallback = rollout_path_allows_mtime_fallback(source, rollout, archived_duplicate_keys)
             if not rollout_candidate_relevant(
                 rollout,
                 start,
                 end,
                 max_raw_bytes=max_raw_bytes,
-                allow_mtime_fallback=allow_mtime_fallback,
+                allow_mtime_fallback=rollout_mtime_fallback,
             ):
                 continue
             size = rollout.stat().st_size
@@ -5636,7 +6752,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 jsonl_error = first_jsonl_error(rollout)
                 if jsonl_error is not None:
                     relevant_invalid_rollout = rollout_filename_in_window(rollout, start, end) or (
-                        allow_mtime_fallback and rollout_mtime_active(rollout, start, end)
+                        rollout_mtime_fallback and rollout_mtime_active(rollout, start, end)
                     )
                     if not jsonl_error.unreadable:
                         relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
@@ -5647,15 +6763,20 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                         row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"
                         rows.append(row)
                     continue
-                if rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=allow_mtime_fallback):
+                if rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=rollout_mtime_fallback):
                     row["status"] = "ready"
                     rows.append(row)
                 continue
-            relevance = oversized_rollout_relevance(rollout, start, end)
+            relevance = oversized_rollout_relevance(
+                rollout,
+                start,
+                end,
+                allow_mtime_fallback=rollout_mtime_fallback,
+            )
             if relevance == "irrelevant":
                 continue
             rollout_ref = source_relative_path_ref(rollout, root)
-            if rollout_ref is not None and rollout_ref in summary_backed_rollout_refs:
+            if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
                 continue
             if relevance == "unknown":
                 row["status"] = "oversized"
@@ -5663,6 +6784,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 rows.append(row)
                 continue
             if size > max_raw_bytes:
+                if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
+                    continue
                 row["status"] = "oversized"
                 row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"
                 rows.append(row)
