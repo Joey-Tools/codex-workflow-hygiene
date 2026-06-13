@@ -8,6 +8,7 @@ import binascii
 import collections
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
@@ -29,6 +30,7 @@ MAX_ROLLOUT_SUMMARY_SCAN_BYTES = 2 * 1024 * 1024
 MAX_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 MAX_ROLLOUT_SUMMARY_TEXT_CHARS = 1200
 MAX_SESSION_META_SCAN_BYTES = 256 * 1024
+SESSION_META_FLAT_UNDATED_ALIAS_PREFIX = "flat_archived_undated_v1"
 REMOTE_PREFLIGHT_TIMEOUT_SECONDS = 15
 REMOTE_COMMAND_TIMEOUT_SECONDS = 60
 TASK_OUTPUT_RELATIVE_DIR = pathlib.Path(".codex-tmp/remote-host-context")
@@ -220,8 +222,6 @@ def _resolve_rollout_bounds(args: argparse.Namespace) -> tuple[dt.datetime | Non
     rollout_end = _parse_rollout_bound(getattr(args, "rollout_end", None), "--rollout-end")
     if rollout_start and rollout_end and rollout_end <= rollout_start:
         raise ValueError("--rollout-end must be after --rollout-start")
-    if getattr(args, "auto_split", False) and (rollout_start or rollout_end):
-        raise ValueError("--auto-split cannot be combined with --rollout-start/--rollout-end")
     return rollout_start, rollout_end
 
 
@@ -451,6 +451,23 @@ def _open_local_rollout_text(
             os.close(fd)
 
 
+def _file_sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("rollout path is not a regular file")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    finally:
+        if fd != -1:
+            os.close(fd)
+    return digest.hexdigest()
+
+
 def _read_local_rollout_bytes(
     codex_root: pathlib.Path,
     rollout_relative_path: pathlib.PurePosixPath,
@@ -515,15 +532,242 @@ def _flat_archived_rollout_matches_date(
     return rollout_path.name.startswith(f"rollout-{date_value.strftime('%Y-%m-%d')}")
 
 
+def _flat_archived_rollout_matches_date_or_unknown(
+    rollout_path: pathlib.Path, date_value: dt.date
+) -> bool:
+    return _flat_archived_rollout_matches_date(
+        rollout_path,
+        date_value,
+    ) or _session_meta_rollout_filename_date(rollout_path.name) is None
+
+
+def _flat_archived_rollout_matches_bounds_or_unknown(
+    rollout_path: pathlib.Path,
+    rollout_start: dt.datetime | None,
+    rollout_end: dt.datetime | None,
+    *,
+    filename_mode: str,
+) -> bool:
+    if _session_meta_rollout_filename_date(rollout_path.name) is None:
+        return filename_mode != "known"
+    return _rollout_matches_bounds(
+        rollout_path,
+        rollout_start,
+        rollout_end,
+        filename_mode=filename_mode,
+    )
+
+
 def _is_raw_rollout_file(path: pathlib.Path) -> bool:
     return path.name.startswith("rollout-") and not path.name.startswith("rollout-summary")
 
 
+def _session_meta_rollout_filename_date(name: str) -> dt.date | None:
+    window = _rollout_filename_window(pathlib.PurePosixPath(name))
+    if window is None:
+        return None
+    return window[0].date()
+
+
 def _session_meta_rollout_dedupe_key(relative_path: pathlib.PurePosixPath) -> str:
     parts = relative_path.parts
-    if len(parts) >= 2 and parts[0] == "archived_sessions":
-        return f"archived_sessions/{relative_path.name}"
+    if not parts:
+        return relative_path.as_posix()
+    if parts[0] == "sessions" and len(parts) > 1:
+        return pathlib.PurePosixPath(*parts[1:]).as_posix()
+    if parts[0] == "archived_sessions" and len(parts) > 1:
+        remainder = parts[1:]
+        if len(remainder) == 1:
+            rollout_date = _session_meta_rollout_filename_date(remainder[0])
+            if rollout_date is None:
+                return relative_path.as_posix()
+            return f"{rollout_date:%Y/%m/%d}/{remainder[0]}"
+        return pathlib.PurePosixPath(*remainder).as_posix()
+    if len(parts) == 1:
+        rollout_date = _session_meta_rollout_filename_date(parts[0])
+        if rollout_date is not None:
+            return f"{rollout_date:%Y/%m/%d}/{parts[0]}"
     return relative_path.as_posix()
+
+
+def _session_meta_flat_undated_alias(relative_path: pathlib.PurePosixPath) -> str | None:
+    parts = relative_path.parts
+    if not parts:
+        return None
+    name = parts[-1]
+    if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+        return None
+    if _session_meta_rollout_filename_date(name) is not None:
+        return None
+    if len(parts) == 1 or parts[0] == "sessions" or (len(parts) == 2 and parts[0] == "archived_sessions"):
+        return f"{SESSION_META_FLAT_UNDATED_ALIAS_PREFIX}:{name}"
+    return None
+
+
+def _session_meta_is_flat_archived_undated(relative_path: pathlib.PurePosixPath) -> bool:
+    return relative_path.parts[:1] == ("archived_sessions",) and _session_meta_flat_undated_alias(relative_path) is not None
+
+
+def _rollout_paths_have_same_bounded_source(path: pathlib.Path, other: pathlib.Path) -> bool:
+    try:
+        path_size = path.stat().st_size
+        other_size = other.stat().st_size
+    except OSError:
+        return False
+    if path_size != other_size or path_size > MAX_SESSION_META_SCAN_BYTES:
+        return False
+    try:
+        return _file_sha256(path) == _file_sha256(other)
+    except OSError:
+        return False
+
+
+def _session_meta_record_timestamp(row: dict[str, Any]) -> dt.datetime | None:
+    timestamp = row.get("timestamp")
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return None
+    try:
+        return _parse_rollout_bound(timestamp, "session_meta.timestamp")
+    except ValueError:
+        return None
+
+
+def _session_meta_record_matches_window(
+    row: dict[str, Any],
+    date_value: dt.date,
+    rollout_start: dt.datetime | None,
+    rollout_end: dt.datetime | None,
+) -> bool:
+    timestamp = _session_meta_record_timestamp(row)
+    if timestamp is None:
+        return False
+    if timestamp.date() != date_value:
+        return False
+    if rollout_start is not None and timestamp < rollout_start:
+        return False
+    if rollout_end is not None and timestamp >= rollout_end:
+        return False
+    return True
+
+
+def _session_meta_date_overlaps_window(
+    date_value: dt.date,
+    rollout_start: dt.datetime | None,
+    rollout_end: dt.datetime | None,
+) -> bool:
+    day_start = dt.datetime.combine(date_value, dt.time.min, tzinfo=dt.timezone.utc)
+    day_end = day_start + dt.timedelta(days=1)
+    if rollout_start is not None and day_end <= rollout_start:
+        return False
+    if rollout_end is not None and day_start >= rollout_end:
+        return False
+    return True
+
+
+def _session_meta_from_rollout(
+    resolved_root: pathlib.Path,
+    rollout_relative_path: pathlib.PurePosixPath,
+    *,
+    date_value: dt.date | None = None,
+    require_record_date_match: bool = False,
+    rollout_start: dt.datetime | None = None,
+    rollout_end: dt.datetime | None = None,
+) -> tuple[dt.date | None, str, str, dt.datetime | None] | None:
+    try:
+        handle = _open_local_rollout_text(resolved_root, rollout_relative_path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SessionMetaRolloutError(
+            "rollout unreadable",
+            rollout=rollout_relative_path.as_posix(),
+        ) from exc
+    with handle:
+        for line in _bounded_text_lines(handle, MAX_SESSION_META_SCAN_BYTES):
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") != "session_meta":
+                continue
+            timestamp = _session_meta_record_timestamp(obj)
+            if require_record_date_match:
+                if date_value is None or not _session_meta_record_matches_window(
+                    obj,
+                    date_value,
+                    rollout_start,
+                    rollout_end,
+                ):
+                    continue
+            elif timestamp is None:
+                if date_value is None or not _session_meta_date_overlaps_window(
+                    date_value,
+                    rollout_start,
+                    rollout_end,
+                ):
+                    continue
+            else:
+                if rollout_start is not None and timestamp < rollout_start:
+                    continue
+                if rollout_end is not None and timestamp >= rollout_end:
+                    continue
+            payload = obj.get("payload", {})
+            session_id = str(payload.get("id", ""))
+            if not session_id:
+                return None
+            cwd = str(payload.get("cwd", ""))
+            return (timestamp.date() if timestamp is not None else date_value), session_id, cwd, timestamp
+    return None
+
+
+def _session_meta_rollout_preference(relative_path: pathlib.PurePosixPath) -> tuple[int, str]:
+    parts = relative_path.parts
+    if parts and parts[0] == "sessions":
+        tier = 0
+    elif parts and parts[0] == "archived_sessions":
+        tier = 2
+    else:
+        tier = 1
+    return (tier, relative_path.as_posix())
+
+
+def _session_meta_rollout_sort_key(
+    relative_path: pathlib.PurePosixPath,
+    cached_timestamp: dt.datetime | None = None,
+) -> tuple[dt.datetime, str]:
+    window = _rollout_filename_window(relative_path)
+    timestamp = cached_timestamp or (window[0] if window is not None else dt.datetime.min.replace(tzinfo=dt.timezone.utc))
+    return (timestamp, relative_path.as_posix())
+
+
+def _filter_session_meta_flat_archived_rollouts(
+    selected_rollout_paths: dict[str, pathlib.Path],
+    resolved_root: pathlib.Path,
+) -> dict[str, pathlib.Path]:
+    filtered: dict[str, pathlib.Path] = {}
+    alias_owner: dict[str, list[pathlib.Path]] = {}
+    for rollout_relative_key, rollout_path in sorted(
+        selected_rollout_paths.items(),
+        key=lambda item: _session_meta_rollout_preference(
+            pathlib.PurePosixPath(item[1].relative_to(resolved_root).as_posix())
+        ),
+    ):
+        rollout_relative_path = pathlib.PurePosixPath(rollout_path.relative_to(resolved_root).as_posix())
+        alias = _session_meta_flat_undated_alias(rollout_relative_path)
+        if alias is not None:
+            is_session_rollout = rollout_relative_path.parts[:1] == ("sessions",)
+            if (
+                not is_session_rollout
+                and alias in alias_owner
+                and any(
+                    _rollout_paths_have_same_bounded_source(rollout_path, owner)
+                    for owner in alias_owner[alias]
+                )
+            ):
+                continue
+            alias_owner.setdefault(alias, []).append(rollout_path)
+        filtered[rollout_relative_key] = rollout_path
+    return filtered
 
 
 def _parse_kv_lines(text: str) -> dict[str, str]:
@@ -609,6 +853,7 @@ def _remote_python_script(payload: dict[str, object]) -> str:
 import base64
 import collections
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -647,6 +892,7 @@ SUMMARY_SIGNAL_MARKERS = {SUMMARY_SIGNAL_MARKERS!r}
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
 SESSION_META_END = {REMOTE_SESSION_META_END!r}
 SESSION_META_LIMIT_TRUNCATED_REASON = {SESSION_META_LIMIT_TRUNCATED_REASON!r}
+SESSION_META_FLAT_UNDATED_ALIAS_PREFIX = {SESSION_META_FLAT_UNDATED_ALIAS_PREFIX!r}
 FETCH_ROLLOUT_BEGIN = {REMOTE_FETCH_ROLLOUT_BEGIN!r}
 FETCH_ROLLOUT_END = {REMOTE_FETCH_ROLLOUT_END!r}
 ROLLOUT_SUMMARY_BEGIN = {REMOTE_ROLLOUT_SUMMARY_BEGIN!r}
@@ -778,6 +1024,23 @@ def open_rollout_text(target):
             os.close(fd)
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("rollout path is not a regular file")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    finally:
+        if fd != -1:
+            os.close(fd)
+    return digest.hexdigest()
+
+
 def read_rollout_bytes(target, max_bytes):
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(str(target), flags)
@@ -800,15 +1063,200 @@ def flat_archived_rollout_matches_date(rollout, date_text):
     return rollout.name.startswith("rollout-" + date_text.replace("/", "-"))
 
 
+def flat_archived_rollout_matches_date_or_unknown(rollout, date_text):
+    return flat_archived_rollout_matches_date(rollout, date_text) or session_meta_rollout_filename_date(rollout.name) is None
+
+
+def flat_archived_rollout_matches_bounds_or_unknown(rollout):
+    if session_meta_rollout_filename_date(rollout.name) is None:
+        return ROLLOUT_FILENAME_MODE != "known"
+    return rollout_matches_bounds(rollout)
+
+
 def is_raw_rollout_file(path):
     return path.name.startswith("rollout-") and not path.name.startswith("rollout-summary")
 
 
+def session_meta_rollout_filename_date(name):
+    window = rollout_filename_window(pathlib.PurePosixPath(name))
+    if window is None:
+        return None
+    return window[0].date()
+
+
 def session_meta_rollout_dedupe_key(rel):
     parts = rel.parts
-    if len(parts) >= 2 and parts[0] == "archived_sessions":
-        return "archived_sessions/" + rel.name
+    if not parts:
+        return rel.as_posix()
+    if parts[0] == "sessions" and len(parts) > 1:
+        return pathlib.PurePosixPath(*parts[1:]).as_posix()
+    if parts[0] == "archived_sessions" and len(parts) > 1:
+        remainder = parts[1:]
+        if len(remainder) == 1:
+            rollout_date = session_meta_rollout_filename_date(remainder[0])
+            if rollout_date is None:
+                return rel.as_posix()
+            return rollout_date.strftime("%Y/%m/%d") + "/" + remainder[0]
+        return pathlib.PurePosixPath(*remainder).as_posix()
+    if len(parts) == 1:
+        rollout_date = session_meta_rollout_filename_date(parts[0])
+        if rollout_date is not None:
+            return rollout_date.strftime("%Y/%m/%d") + "/" + parts[0]
     return rel.as_posix()
+
+
+def session_meta_flat_undated_alias(rel):
+    parts = rel.parts
+    if not parts:
+        return None
+    name = parts[-1]
+    if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+        return None
+    if session_meta_rollout_filename_date(name) is not None:
+        return None
+    if len(parts) == 1 or parts[0] == "sessions" or (len(parts) == 2 and parts[0] == "archived_sessions"):
+        return SESSION_META_FLAT_UNDATED_ALIAS_PREFIX + ":" + name
+    return None
+
+
+def session_meta_is_flat_archived_undated(rel):
+    return rel.parts[:1] == ("archived_sessions",) and session_meta_flat_undated_alias(rel) is not None
+
+
+def rollout_paths_have_same_bounded_source(path, other):
+    try:
+        path_size = path.stat().st_size
+        other_size = other.stat().st_size
+    except OSError:
+        return False
+    if path_size != other_size or path_size > SESSION_META_SCAN_BYTES:
+        return False
+    try:
+        return file_sha256(path) == file_sha256(other)
+    except OSError:
+        return False
+
+
+def session_meta_record_timestamp(row):
+    timestamp = row.get("timestamp")
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return None
+    try:
+        return parse_config_time(timestamp)
+    except Exception:
+        return None
+
+
+def session_meta_record_matches_window(row, date_text):
+    timestamp = session_meta_record_timestamp(row)
+    if timestamp is None:
+        return False
+    if timestamp.date() != datetime.datetime.strptime(date_text, "%Y/%m/%d").date():
+        return False
+    if ROLLOUT_START_TIME is not None and timestamp < ROLLOUT_START_TIME:
+        return False
+    if ROLLOUT_END_TIME is not None and timestamp >= ROLLOUT_END_TIME:
+        return False
+    return True
+
+
+def session_meta_date_overlaps_window(date_text):
+    try:
+        date_value = datetime.datetime.strptime(date_text, "%Y/%m/%d").date()
+    except ValueError:
+        return False
+    day_start = datetime.datetime.combine(date_value, datetime.time.min, tzinfo=datetime.timezone.utc)
+    day_end = day_start + datetime.timedelta(days=1)
+    if ROLLOUT_START_TIME is not None and day_end <= ROLLOUT_START_TIME:
+        return False
+    if ROLLOUT_END_TIME is not None and day_start >= ROLLOUT_END_TIME:
+        return False
+    return True
+
+
+def session_meta_from_rollout(rel, date_text=None, require_record_date_match=False):
+    try:
+        target = safe_rollout_path(rel)
+    except FileNotFoundError:
+        return None
+    try:
+        handle = open_rollout_text(target)
+    except OSError:
+        print(json.dumps({{"kind": "error", "error": "rollout unreadable", "rollout": rel.as_posix()}}, separators=(",", ":"), sort_keys=True))
+        print(SESSION_META_END)
+        raise SystemExit(0)
+    with handle:
+        for line in bounded_text_lines(handle, SESSION_META_SCAN_BYTES):
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") != "session_meta":
+                continue
+            timestamp = session_meta_record_timestamp(obj)
+            if require_record_date_match:
+                if date_text is None or not session_meta_record_matches_window(obj, date_text):
+                    continue
+            elif timestamp is None:
+                if date_text is None or not session_meta_date_overlaps_window(date_text):
+                    continue
+            else:
+                if ROLLOUT_START_TIME is not None and timestamp < ROLLOUT_START_TIME:
+                    continue
+                if ROLLOUT_END_TIME is not None and timestamp >= ROLLOUT_END_TIME:
+                    continue
+            payload = obj.get("payload", {{}})
+            session_id = str(payload.get("id", ""))
+            if not session_id:
+                return None
+            cwd = str(payload.get("cwd", ""))
+            if timestamp is None:
+                meta_date = date_text
+            else:
+                meta_date = timestamp.strftime("%Y/%m/%d")
+            return meta_date, session_id, cwd, timestamp
+    return None
+
+
+def session_meta_rollout_preference(rel):
+    parts = rel.parts
+    if parts and parts[0] == "sessions":
+        tier = 0
+    elif parts and parts[0] == "archived_sessions":
+        tier = 2
+    else:
+        tier = 1
+    return (tier, rel.as_posix())
+
+
+def session_meta_rollout_sort_key(rel, cached_timestamp=None):
+    window = rollout_filename_window(rel)
+    timestamp = cached_timestamp or (window[0] if window is not None else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc))
+    return (timestamp, rel.as_posix())
+
+
+def filter_session_meta_flat_archived_rollouts(selected_rollout_paths, root):
+    filtered = {{}}
+    alias_owner = {{}}
+    for rel_key, rollout in sorted(
+        selected_rollout_paths.items(),
+        key=lambda item: session_meta_rollout_preference(
+            pathlib.PurePosixPath(item[1].relative_to(root).as_posix())
+        ),
+    ):
+        rel = pathlib.PurePosixPath(rollout.relative_to(root).as_posix())
+        alias = session_meta_flat_undated_alias(rel)
+        if alias is not None:
+            is_session_rollout = rel.parts[:1] == ("sessions",)
+            if (
+                not is_session_rollout
+                and alias in alias_owner
+                and any(rollout_paths_have_same_bounded_source(rollout, owner) for owner in alias_owner[alias])
+            ):
+                continue
+            alias_owner.setdefault(alias, []).append(rollout)
+        filtered[rel_key] = rollout
+    return filtered
 
 
 def normalize_text(text, max_chars):
@@ -1003,6 +1451,9 @@ def summarize_rollout():
 
     try:
         target_size = target.stat().st_size
+        target_sha256 = None
+        if not SUMMARY_SCAN_BYTES or target_size <= SUMMARY_SCAN_BYTES:
+            target_sha256 = file_sha256(target)
         handle = open_rollout_text(target)
     except OSError:
         print(json.dumps({{"ok": False, "error": "rollout unreadable"}}, separators=(",", ":"), sort_keys=True))
@@ -1111,40 +1562,39 @@ def summarize_rollout():
     tail_record_limit_reached = bool(
         not keyword_filter_applied and summary_record_count > emitted_summary_record_count
     )
-    print(json.dumps(
-        {{
-            "keyword_filter_applied": keyword_filter_applied,
-            "kind": "scan_meta",
-            "json_error_count": json_error_count,
-            "line": 0,
-            "matched_record_limit_reached": matched_record_limit_reached,
-            "record_limit_reached": record_limit_reached,
-            "rollout": normalized,
-            "scan_bytes": SUMMARY_SCAN_BYTES,
-            "scan_truncated": bool(SUMMARY_SCAN_BYTES and target_size > SUMMARY_SCAN_BYTES),
-            "signal_record_limit_reached": signal_record_limit_reached,
-            "source_bytes": target_size,
-            "summary_limit": SUMMARY_LIMIT,
-            "summary_record_count": summary_record_count,
-            "tail_record_limit_reached": tail_record_limit_reached,
-            "tail_records": SUMMARY_TAIL_RECORDS,
-            "text": "scan_truncated=" + str(bool(SUMMARY_SCAN_BYTES and target_size > SUMMARY_SCAN_BYTES)).lower()
-                + " keyword_filter_applied=" + str(keyword_filter_applied).lower()
-                + " record_limit_reached=" + str(record_limit_reached).lower()
-                + " signal_record_limit_reached=" + str(signal_record_limit_reached).lower()
-                + " matched_record_limit_reached=" + str(matched_record_limit_reached).lower()
-                + " tail_record_limit_reached=" + str(tail_record_limit_reached).lower()
-                + " scan_bytes=" + str(SUMMARY_SCAN_BYTES)
-                + " json_error_count=" + str(json_error_count)
-                + " summary_limit=" + str(SUMMARY_LIMIT)
-                + " tail_records=" + str(SUMMARY_TAIL_RECORDS)
-                + " summary_record_count=" + str(summary_record_count)
-                + " source_bytes=" + str(target_size),
-            "timestamp": "",
-        }},
-        separators=(",", ":"),
-        sort_keys=True,
-    ))
+    scan_meta = {{
+        "keyword_filter_applied": keyword_filter_applied,
+        "kind": "scan_meta",
+        "json_error_count": json_error_count,
+        "line": 0,
+        "matched_record_limit_reached": matched_record_limit_reached,
+        "record_limit_reached": record_limit_reached,
+        "rollout": normalized,
+        "scan_bytes": SUMMARY_SCAN_BYTES,
+        "scan_truncated": bool(SUMMARY_SCAN_BYTES and target_size > SUMMARY_SCAN_BYTES),
+        "signal_record_limit_reached": signal_record_limit_reached,
+        "source_bytes": target_size,
+        "summary_limit": SUMMARY_LIMIT,
+        "summary_record_count": summary_record_count,
+        "tail_record_limit_reached": tail_record_limit_reached,
+        "tail_records": SUMMARY_TAIL_RECORDS,
+        "text": "scan_truncated=" + str(bool(SUMMARY_SCAN_BYTES and target_size > SUMMARY_SCAN_BYTES)).lower()
+            + " keyword_filter_applied=" + str(keyword_filter_applied).lower()
+            + " record_limit_reached=" + str(record_limit_reached).lower()
+            + " signal_record_limit_reached=" + str(signal_record_limit_reached).lower()
+            + " matched_record_limit_reached=" + str(matched_record_limit_reached).lower()
+            + " tail_record_limit_reached=" + str(tail_record_limit_reached).lower()
+            + " scan_bytes=" + str(SUMMARY_SCAN_BYTES)
+            + " json_error_count=" + str(json_error_count)
+            + " summary_limit=" + str(SUMMARY_LIMIT)
+            + " tail_records=" + str(SUMMARY_TAIL_RECORDS)
+            + " summary_record_count=" + str(summary_record_count)
+            + " source_bytes=" + str(target_size),
+        "timestamp": "",
+    }}
+    if target_sha256 is not None:
+        scan_meta["source_sha256"] = target_sha256
+    print(json.dumps(scan_meta, separators=(",", ":"), sort_keys=True))
     emitted = set()
 
     def emit(record):
@@ -1196,6 +1646,27 @@ def iter_session_meta():
 
     count = 0
     seen_session_ids = set()
+    flat_archived_unknown_by_date = {{}}
+    if ROLLOUT_FILENAME_MODE != "known":
+        try:
+            flat_archived_dir = safe_directory_path(pathlib.PurePosixPath("archived_sessions"))
+            date_set = set(DATE_STRINGS)
+            for rollout in sorted_rollout_paths(flat_archived_dir):
+                if not is_raw_rollout_file(rollout):
+                    continue
+                if session_meta_rollout_filename_date(rollout.name) is not None:
+                    continue
+                rel = pathlib.PurePosixPath(rollout.relative_to(root).as_posix())
+                meta = session_meta_from_rollout(rel)
+                if meta is None:
+                    continue
+                meta_date, session_id, cwd, timestamp = meta
+                if meta_date in date_set:
+                    flat_archived_unknown_by_date.setdefault(meta_date, {{}})[rollout] = (session_id, cwd, timestamp)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            session_directory_unreadable()
     for date_text in reversed(DATE_STRINGS):
         rollout_paths = []
         for rel_dir in (pathlib.PurePosixPath("sessions") / date_text, pathlib.PurePosixPath("archived_sessions") / date_text):
@@ -1217,12 +1688,13 @@ def iter_session_meta():
                 for rollout in sorted_rollout_paths(flat_archived_dir)
                 if is_raw_rollout_file(rollout)
                 and flat_archived_rollout_matches_date(rollout, date_text)
-                and rollout_matches_bounds(rollout)
+                and flat_archived_rollout_matches_bounds_or_unknown(rollout)
             )
         except FileNotFoundError:
             pass
         except OSError:
             session_directory_unreadable()
+        rollout_paths.extend(flat_archived_unknown_by_date.get(date_text, {{}}))
         rollout_paths.extend(
             rollout
             for rollout in sorted_rollout_paths(root)
@@ -1230,37 +1702,42 @@ def iter_session_meta():
             and flat_archived_rollout_matches_date(rollout, date_text)
             and rollout_matches_bounds(rollout)
         )
-        seen_rollout_paths = set()
+        selected_rollout_paths = {{}}
         for rollout in rollout_paths:
             rel = pathlib.PurePosixPath(rollout.relative_to(root).as_posix())
             rel_key = session_meta_rollout_dedupe_key(rel)
-            if rel_key in seen_rollout_paths:
+            selected_rollout = selected_rollout_paths.get(rel_key)
+            if selected_rollout is None:
+                selected_rollout_paths[rel_key] = rollout
                 continue
-            seen_rollout_paths.add(rel_key)
-            session_id = ""
-            cwd = ""
-            try:
-                target = safe_rollout_path(rel)
-            except FileNotFoundError:
-                continue
-            try:
-                handle = open_rollout_text(target)
-            except OSError:
-                print(json.dumps({{"kind": "error", "error": "rollout unreadable", "rollout": rel.as_posix()}}, separators=(",", ":"), sort_keys=True))
-                print(SESSION_META_END)
-                return
-            with handle:
-                for line in bounded_text_lines(handle, SESSION_META_SCAN_BYTES):
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if obj.get("type") != "session_meta":
-                        continue
-                    payload = obj.get("payload", {{}})
-                    session_id = str(payload.get("id", ""))
-                    cwd = str(payload.get("cwd", ""))
-                    break
+            selected_rel = pathlib.PurePosixPath(selected_rollout.relative_to(root).as_posix())
+            if session_meta_rollout_preference(rel) < session_meta_rollout_preference(selected_rel):
+                selected_rollout_paths[rel_key] = rollout
+        selected_rollout_paths = filter_session_meta_flat_archived_rollouts(selected_rollout_paths, root)
+        cached_rollout_meta = flat_archived_unknown_by_date.get(date_text, {{}})
+        selected_rollouts = sorted(
+            selected_rollout_paths.values(),
+            key=lambda rollout: session_meta_rollout_sort_key(
+                pathlib.PurePosixPath(rollout.relative_to(root).as_posix()),
+                cached_rollout_meta.get(rollout, ("", "", None))[2],
+            ),
+            reverse=True,
+        )
+        for rollout in selected_rollouts:
+            rel = pathlib.PurePosixPath(rollout.relative_to(root).as_posix())
+            require_record_date_match = session_meta_is_flat_archived_undated(rel)
+            cached_meta = cached_rollout_meta.get(rollout)
+            if cached_meta is not None:
+                session_id, cwd, _timestamp = cached_meta
+            else:
+                meta = session_meta_from_rollout(
+                    rel,
+                    date_text,
+                    require_record_date_match=require_record_date_match,
+                )
+                if meta is None:
+                    continue
+                _meta_date, session_id, cwd, _timestamp = meta
             if session_id:
                 if session_id in seen_session_ids:
                     continue
@@ -1363,6 +1840,35 @@ def _scan_session_meta_records(
         except OSError as exc:
             raise SessionMetaRolloutError("session directory unreadable") from exc
 
+    flat_archived_unknown_by_date: dict[dt.date, dict[pathlib.Path, tuple[str, str, dt.datetime | None]]] = {}
+    if rollout_filename_mode != "known":
+        try:
+            flat_archived_dir = _safe_directory_path(resolved_root, pathlib.PurePosixPath("archived_sessions"))
+            date_set = set(dates)
+            for rollout_path in sorted_rollout_paths(flat_archived_dir):
+                if not _is_raw_rollout_file(rollout_path):
+                    continue
+                if _session_meta_rollout_filename_date(rollout_path.name) is not None:
+                    continue
+                rollout_relative_path = pathlib.PurePosixPath(
+                    rollout_path.relative_to(resolved_root).as_posix()
+                )
+                meta = _session_meta_from_rollout(
+                    resolved_root,
+                    rollout_relative_path,
+                    rollout_start=rollout_start,
+                    rollout_end=rollout_end,
+                )
+                if meta is None:
+                    continue
+                meta_date, session_id, cwd, timestamp = meta
+                if meta_date in date_set:
+                    flat_archived_unknown_by_date.setdefault(meta_date, {})[rollout_path] = (session_id, cwd, timestamp)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise SessionMetaRolloutError("session directory unreadable") from exc
+
     for date_value in reversed(dates):
         date_text = date_value.strftime(DATE_FORMAT)
         rollout_paths: list[pathlib.Path] = []
@@ -1394,7 +1900,7 @@ def _scan_session_meta_records(
                 for rollout_path in sorted_rollout_paths(flat_archived_dir)
                 if _is_raw_rollout_file(rollout_path)
                 and _flat_archived_rollout_matches_date(rollout_path, date_value)
-                and _rollout_matches_bounds(
+                and _flat_archived_rollout_matches_bounds_or_unknown(
                     rollout_path,
                     rollout_start,
                     rollout_end,
@@ -1405,6 +1911,7 @@ def _scan_session_meta_records(
             pass
         except OSError as exc:
             raise SessionMetaRolloutError("session directory unreadable") from exc
+        rollout_paths.extend(flat_archived_unknown_by_date.get(date_value, {}))
         rollout_paths.extend(
             rollout_path
             for rollout_path in sorted_rollout_paths(resolved_root)
@@ -1417,38 +1924,51 @@ def _scan_session_meta_records(
                 filename_mode=rollout_filename_mode,
             )
         )
-        seen_rollout_paths: set[str] = set()
+        selected_rollout_paths: dict[str, pathlib.Path] = {}
         for rollout_path in rollout_paths:
             rollout_relative_path = pathlib.PurePosixPath(
                 rollout_path.relative_to(resolved_root).as_posix()
             )
             rollout_relative_key = _session_meta_rollout_dedupe_key(rollout_relative_path)
-            if rollout_relative_key in seen_rollout_paths:
+            selected_rollout_path = selected_rollout_paths.get(rollout_relative_key)
+            if selected_rollout_path is None:
+                selected_rollout_paths[rollout_relative_key] = rollout_path
                 continue
-            seen_rollout_paths.add(rollout_relative_key)
-            session_id = ""
-            cwd = ""
-            try:
-                handle = _open_local_rollout_text(resolved_root, rollout_relative_path)
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                raise SessionMetaRolloutError(
-                    "rollout unreadable",
-                    rollout=rollout_relative_path.as_posix(),
-                ) from exc
-            with handle:
-                for line in _bounded_text_lines(handle, MAX_SESSION_META_SCAN_BYTES):
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if obj.get("type") != "session_meta":
-                        continue
-                    payload = obj.get("payload", {})
-                    session_id = str(payload.get("id", ""))
-                    cwd = str(payload.get("cwd", ""))
-                    break
+            selected_relative_path = pathlib.PurePosixPath(
+                selected_rollout_path.relative_to(resolved_root).as_posix()
+            )
+            if _session_meta_rollout_preference(rollout_relative_path) < _session_meta_rollout_preference(selected_relative_path):
+                selected_rollout_paths[rollout_relative_key] = rollout_path
+        selected_rollout_paths = _filter_session_meta_flat_archived_rollouts(selected_rollout_paths, resolved_root)
+        cached_rollout_meta = flat_archived_unknown_by_date.get(date_value, {})
+        selected_rollout_values = sorted(
+            selected_rollout_paths.values(),
+            key=lambda candidate: _session_meta_rollout_sort_key(
+                pathlib.PurePosixPath(candidate.relative_to(resolved_root).as_posix()),
+                cached_rollout_meta.get(candidate, ("", "", None))[2],
+            ),
+            reverse=True,
+        )
+        for rollout_path in selected_rollout_values:
+            rollout_relative_path = pathlib.PurePosixPath(
+                rollout_path.relative_to(resolved_root).as_posix()
+            )
+            require_record_date_match = _session_meta_is_flat_archived_undated(rollout_relative_path)
+            cached_meta = cached_rollout_meta.get(rollout_path)
+            if cached_meta is not None:
+                session_id, cwd, _timestamp = cached_meta
+            else:
+                meta = _session_meta_from_rollout(
+                    resolved_root,
+                    rollout_relative_path,
+                    date_value=date_value,
+                    require_record_date_match=require_record_date_match,
+                    rollout_start=rollout_start,
+                    rollout_end=rollout_end,
+                )
+                if meta is None:
+                    continue
+                _meta_date, session_id, cwd, _timestamp = meta
             if not session_id:
                 continue
             if session_id in seen_session_ids:
@@ -1788,6 +2308,8 @@ def _auto_split_host_session_meta(
     *,
     dates: list[dt.date],
     limit: int,
+    rollout_start: dt.datetime | None = None,
+    rollout_end: dt.datetime | None = None,
 ) -> SessionMetaScan:
     rows: list[dict[str, str]] = []
     for date_value in reversed(dates):
@@ -1795,8 +2317,8 @@ def _auto_split_host_session_meta(
             alias,
             dates=[date_value],
             limit=limit,
-            rollout_start=None,
-            rollout_end=None,
+            rollout_start=rollout_start,
+            rollout_end=rollout_end,
             rollout_filename_mode="unknown",
         )
         rows.extend(unknown_scan.rows)
@@ -1806,7 +2328,12 @@ def _auto_split_host_session_meta(
     pending: list[tuple[dt.date, dt.datetime, dt.datetime]] = []
     for date_value in reversed(dates):
         day_start = dt.datetime.combine(date_value, dt.time.min, tzinfo=dt.timezone.utc)
-        pending.append((date_value, day_start, day_start + dt.timedelta(days=1)))
+        day_end = day_start + dt.timedelta(days=1)
+        window_start = max(day_start, rollout_start) if rollout_start is not None else day_start
+        window_end = min(day_end, rollout_end) if rollout_end is not None else day_end
+        if window_end <= window_start:
+            continue
+        pending.append((date_value, window_start, window_end))
 
     for step in (dt.timedelta(hours=1), dt.timedelta(minutes=15), dt.timedelta(minutes=1)):
         next_pending: list[tuple[dt.date, dt.datetime, dt.datetime]] = []
@@ -1834,6 +2361,8 @@ def _scan_host_session_meta_with_auto_split(
     *,
     dates: list[dt.date],
     limit: int,
+    rollout_start: dt.datetime | None = None,
+    rollout_end: dt.datetime | None = None,
 ) -> SessionMetaScan:
     rows: list[dict[str, str]] = []
     truncated = False
@@ -1842,11 +2371,17 @@ def _scan_host_session_meta_with_auto_split(
             alias,
             dates=[date_value],
             limit=limit,
-            rollout_start=None,
-            rollout_end=None,
+            rollout_start=rollout_start,
+            rollout_end=rollout_end,
         )
         if scan.truncated:
-            scan = _auto_split_host_session_meta(alias, dates=[date_value], limit=limit)
+            scan = _auto_split_host_session_meta(
+                alias,
+                dates=[date_value],
+                limit=limit,
+                rollout_start=rollout_start,
+                rollout_end=rollout_end,
+            )
         rows.extend(scan.rows)
         truncated = truncated or scan.truncated
     return SessionMetaScan(rows=_dedupe_session_meta_rows(rows), truncated=truncated)
@@ -1902,7 +2437,13 @@ def cmd_session_meta(args: argparse.Namespace) -> int:
     for alias in hosts:
         try:
             if auto_split:
-                scan = _scan_host_session_meta_with_auto_split(alias, dates=dates, limit=args.limit)
+                scan = _scan_host_session_meta_with_auto_split(
+                    alias,
+                    dates=dates,
+                    limit=args.limit,
+                    rollout_start=rollout_start,
+                    rollout_end=rollout_end,
+                )
             else:
                 scan = _scan_host_session_meta(
                     alias,
@@ -2361,6 +2902,7 @@ def _summarize_rollout_records_with_meta(
 def _rollout_summary_scan_meta(
     *,
     source_bytes: int,
+    source_sha256: str | None = None,
     scan_bytes: int,
     summary_limit: int,
     record_limit_reached: bool = False,
@@ -2374,7 +2916,7 @@ def _rollout_summary_scan_meta(
 ) -> dict[str, Any]:
     scan_truncated = bool(scan_bytes and source_bytes > scan_bytes)
     record_limit_reached = bool(record_limit_reached or signal_record_limit_reached or matched_record_limit_reached)
-    return {
+    row = {
         "kind": "scan_meta",
         "json_error_count": json_error_count,
         "keyword_filter_applied": keyword_filter_applied,
@@ -2402,6 +2944,9 @@ def _rollout_summary_scan_meta(
         ),
         "timestamp": "",
     }
+    if source_sha256 is not None:
+        row["source_sha256"] = source_sha256
+    return row
 
 
 def cmd_rollout_summary(args: argparse.Namespace) -> int:
@@ -2430,7 +2975,11 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
     try:
         if HOSTS[alias]["kind"] == "local":
             codex_root = _local_codex_root()
-            source_bytes = _safe_rollout_path(codex_root, rollout_relative_path).stat().st_size
+            rollout_path = _safe_rollout_path(codex_root, rollout_relative_path)
+            source_bytes = rollout_path.stat().st_size
+            source_sha256 = None
+            if not MAX_ROLLOUT_SUMMARY_SCAN_BYTES or source_bytes <= MAX_ROLLOUT_SUMMARY_SCAN_BYTES:
+                source_sha256 = _file_sha256(rollout_path)
             with _open_local_rollout_text(codex_root, rollout_relative_path) as handle:
                 records, summary_meta = _summarize_rollout_records_with_meta(
                     lines=_bounded_text_lines(handle, MAX_ROLLOUT_SUMMARY_SCAN_BYTES),
@@ -2443,6 +2992,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                 0,
                 _rollout_summary_scan_meta(
                     source_bytes=source_bytes,
+                    source_sha256=source_sha256,
                     scan_bytes=MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
                     summary_limit=args.limit,
                     record_limit_reached=bool(summary_meta["record_limit_reached"]),
