@@ -4368,6 +4368,69 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("weekly_dry_run", markdown)
         self.assertIn("Retained export created: no", markdown)
 
+    def test_weekly_dry_run_quotes_next_command_run_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-weekly-large.jsonl"
+            write_jsonl(
+                rollout,
+                [message("user", f"Weekly oversized task {index}.", "2026-05-01T10:00:00Z") for index in range(40)],
+            )
+            output = safe_output_dir(raw, "weekly dry;run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "200",
+                    "--output",
+                    str(output),
+                ]
+            )
+            report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
+            markdown = (output / "dry_run_report.md").read_text(encoding="utf-8")
+
+        expected_root = output.absolute().as_posix()
+        self.assertEqual(MODULE.shlex.split(report["next_command"]), ["weekly-repair", "--run-dir", expected_root])
+        self.assertIn(report["next_command"], markdown)
+
+    def test_weekly_dry_run_repair_ignores_partial_host_scope_only_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-weekly.jsonl"
+            write_jsonl(rollout, [message("user", "Weekly partial-scope task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw, "weekly-dry-run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--repair",
+                    "--repair-skip-remote-materialization",
+                    "--output",
+                    str(output),
+                ]
+            )
+            report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
+            repair_exists = (output / "weekly-coverage-repair").exists()
+
+        self.assertEqual(report["coverage_gap_counts"], {"partial_host_scope": 1})
+        self.assertNotIn("next_command", report)
+        self.assertFalse(repair_exists)
+
     def test_weekly_repair_uses_weekly_default_output_and_report_kind(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

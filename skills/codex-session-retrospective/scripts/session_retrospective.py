@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import stat
 import subprocess
 import sys
@@ -322,6 +323,7 @@ ALLOWED_REMOTE_GAP_REASONS = {
     "stale_host",
     "unreachable",
 }
+REPAIRABLE_COVERAGE_GAP_REASONS = frozenset(ALLOWED_REMOTE_GAP_REASONS | {"oversized_rollout_skipped", "oversized_summary_skipped"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -6081,6 +6083,20 @@ def write_dry_run_report_pair(root: Path, name: str, report: dict[str, Any]) -> 
     write_bytes_atomic(root / f"{name}.md", dry_run_report_markdown(report).encode("utf-8"))
 
 
+def is_repairable_coverage_gap(gap: Any) -> bool:
+    return isinstance(gap, dict) and str(gap.get("reason") or "") in REPAIRABLE_COVERAGE_GAP_REASONS
+
+
+def has_repairable_coverage_gaps(gaps: Any) -> bool:
+    return any(is_repairable_coverage_gap(gap) for gap in gaps or [])
+
+
+def has_repairable_gap_counts(counts: Any) -> bool:
+    if not isinstance(counts, dict):
+        return False
+    return any(str(reason) in REPAIRABLE_COVERAGE_GAP_REASONS and bool(count) for reason, count in counts.items())
+
+
 def run_make_shards_for_scan(scan_dir: Path, shards_dir: Path, *, max_raw_bytes: int) -> None:
     cmd_make_shards(
         argparse.Namespace(
@@ -6121,8 +6137,8 @@ def run_dry_run(
     run_make_shards_for_scan(scan_dir, shards_dir, max_raw_bytes=max_raw_bytes)
     manifest = read_json_file(scan_dir / "shard_manifest.json")
     next_command = None
-    if manifest.get("coverage_gaps"):
-        next_command = f"{next_command_name} --run-dir {root}"
+    if has_repairable_coverage_gaps(manifest.get("coverage_gaps")):
+        next_command = shlex.join([next_command_name, "--run-dir", root.as_posix()])
     report = dry_run_report(
         kind=kind,
         root=root,
@@ -6166,7 +6182,7 @@ def cmd_weekly_dry_run(args: argparse.Namespace) -> int:
         end=end,
         next_command_name="weekly-repair",
     )
-    if args.repair and report.get("coverage_gap_counts"):
+    if args.repair and has_repairable_gap_counts(report.get("coverage_gap_counts")):
         repair_output = Path(args.repair_output).expanduser() if args.repair_output else root / "weekly-coverage-repair"
         run_coverage_repair(
             argparse.Namespace(
