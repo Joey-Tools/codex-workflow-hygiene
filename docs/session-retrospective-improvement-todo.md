@@ -11,13 +11,14 @@ review gates, and merge before starting the next item.
    - Prevent archive or unarchive file mtimes from defining session time.
    - Deduplicate active and archived copies of the same rollout, preferring the
      active copy.
-   - Status: in progress.
+   - Status: completed in PR #11.
 
 2. Weekly dry-run and repair commands
    - Add first-class `weekly-dry-run` and `weekly-repair` commands instead of
      using `baseline-dry-run --window-days 7`.
    - Support a combined transient `--repair` path when appropriate.
    - Emit a compact human-readable report next to JSON reports.
+   - Status: completed.
 
 3. Local oversized rollout summaries
    - Generate bounded local rollout summaries for relevant oversized local
