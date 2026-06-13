@@ -4334,6 +4334,222 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(report["history_commit_created"])
         self.assertFalse(report["state_advanced"])
 
+    def test_weekly_dry_run_writes_scan_shards_json_and_markdown_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-weekly.jsonl"
+            write_jsonl(rollout, [message("user", "Weekly dry-run task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw, "weekly-dry-run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--output",
+                    str(output),
+                ]
+            )
+            report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
+            markdown = (output / "dry_run_report.md").read_text(encoding="utf-8")
+            trend = json.loads((output / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            shards_exist = (output / "shards" / "shards.jsonl").is_file()
+
+        self.assertEqual(report["kind"], "weekly_dry_run")
+        self.assertEqual(report["window"]["mode"], "weekly")
+        self.assertEqual(report["window"]["start"], "2026-04-25T00:00:00Z")
+        self.assertEqual(trend["turn_count"], 1)
+        self.assertTrue(shards_exist)
+        self.assertIn("weekly_dry_run", markdown)
+        self.assertIn("Retained export created: no", markdown)
+
+    def test_weekly_dry_run_quotes_next_command_run_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-weekly-large.jsonl"
+            write_jsonl(
+                rollout,
+                [message("user", f"Weekly oversized task {index}.", "2026-05-01T10:00:00Z") for index in range(40)],
+            )
+            output = safe_output_dir(raw, "weekly dry;run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "200",
+                    "--output",
+                    str(output),
+                ]
+            )
+            report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
+            markdown = (output / "dry_run_report.md").read_text(encoding="utf-8")
+
+        expected_root = output.absolute().as_posix()
+        expected_script = Path(MODULE.__file__).resolve().as_posix()
+        self.assertEqual(
+            MODULE.shlex.split(report["next_command"]),
+            ["python3", expected_script, "weekly-repair", "--run-dir", expected_root, "--allow-partial-hosts"],
+        )
+        self.assertIn(report["next_command"], markdown)
+
+    def test_weekly_dry_run_repair_ignores_partial_host_scope_only_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-weekly.jsonl"
+            write_jsonl(rollout, [message("user", "Weekly partial-scope task.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw, "weekly-dry-run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--repair",
+                    "--repair-skip-remote-materialization",
+                    "--output",
+                    str(output),
+                ]
+            )
+            report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
+            repair_exists = (output / "weekly-coverage-repair").exists()
+
+        self.assertEqual(report["coverage_gap_counts"], {"partial_host_scope": 1})
+        self.assertNotIn("next_command", report)
+        self.assertFalse(repair_exists)
+
+    def test_weekly_dry_run_repair_ignores_local_missing_source_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            missing_root = Path(raw) / ".codex"
+            output = safe_output_dir(raw, "weekly-dry-run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={missing_root}",
+                    "--allow-partial-hosts",
+                    "--repair",
+                    "--repair-skip-remote-materialization",
+                    "--output",
+                    str(output),
+                ]
+            )
+            report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
+            repair_exists = (output / "weekly-coverage-repair").exists()
+
+        self.assertEqual(report["coverage_gap_counts"], {"source_root_missing": 1, "partial_host_scope": 1})
+        self.assertEqual(report["repairable_coverage_gap_counts"], {})
+        self.assertNotIn("next_command", report)
+        self.assertFalse(repair_exists)
+
+    def test_weekly_repair_uses_weekly_default_output_and_report_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-weekly-large.jsonl"
+            write_jsonl(
+                rollout,
+                [message("user", f"Weekly oversized task {index}.", "2026-05-01T10:00:00Z") for index in range(40)],
+            )
+            dry_run = safe_output_dir(raw, "weekly-dry-run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "200",
+                    "--output",
+                    str(dry_run),
+                ]
+            )
+            MODULE.main(
+                [
+                    "weekly-repair",
+                    "--run-dir",
+                    str(dry_run / "scan"),
+                    "--skip-remote-materialization",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "20000",
+                ]
+            )
+            repair = dry_run / "weekly-coverage-repair"
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+            markdown = (repair / "repair_report.md").read_text(encoding="utf-8")
+            repaired_scan_exists = (repair / "scan" / "trend_report.json").is_file()
+
+        self.assertEqual(report["kind"], "weekly_repair")
+        self.assertTrue(repaired_scan_exists)
+        self.assertIn("Before gaps:", markdown)
+        self.assertIn("After gaps:", markdown)
+
+    def test_weekly_dry_run_repair_runs_transient_follow_up_when_gaps_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-combined.jsonl"
+            write_jsonl(
+                rollout,
+                [message("user", f"Combined repair task {index}.", "2026-05-01T10:00:00Z") for index in range(40)],
+            )
+            output = safe_output_dir(raw, "weekly-dry-run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "200",
+                    "--repair",
+                    "--repair-skip-remote-materialization",
+                    "--repair-max-raw-bytes",
+                    "20000",
+                    "--output",
+                    str(output),
+                ]
+            )
+            repair = output / "weekly-coverage-repair"
+            dry_report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
+            repair_report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+            repaired_shards_exist = (repair / "shards" / "shards.jsonl").is_file()
+
+        self.assertEqual(dry_report["kind"], "weekly_dry_run")
+        self.assertEqual(repair_report["kind"], "weekly_repair")
+        self.assertTrue(repaired_shards_exist)
+
     def test_baseline_dry_run_stores_absolute_source_roots_for_repair(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             workspace = Path(raw) / "workspace"

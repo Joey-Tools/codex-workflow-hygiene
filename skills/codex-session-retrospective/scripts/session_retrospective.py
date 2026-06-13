@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import stat
 import subprocess
 import sys
@@ -322,6 +323,8 @@ ALLOWED_REMOTE_GAP_REASONS = {
     "stale_host",
     "unreachable",
 }
+OVERSIZED_REPAIRABLE_GAP_REASONS = frozenset({"oversized_rollout_skipped", "oversized_summary_skipped"})
+REPAIRABLE_COVERAGE_GAP_REASONS = frozenset(ALLOWED_REMOTE_GAP_REASONS | OVERSIZED_REPAIRABLE_GAP_REASONS)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5992,9 +5995,11 @@ def dry_run_report(
     shards_dir: Path,
     trend: dict[str, Any],
     manifest: dict[str, Any],
+    next_command: str | None = None,
     repair_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     coverage_gaps = list(manifest.get("coverage_gaps") or [])
+    repairable_gaps = repairable_coverage_gaps(coverage_gaps)
     report: dict[str, Any] = {
         "schema_version": 1,
         "kind": kind,
@@ -6005,15 +6010,103 @@ def dry_run_report(
         "turn_count": trend.get("turn_count", 0),
         "episode_count": trend.get("episode_count", 0),
         "coverage_gap_counts": gap_counts(coverage_gaps),
+        "repairable_coverage_gap_counts": gap_counts(repairable_gaps),
         "source_status_counts": source_status_counts(manifest.get("sources") or []),
         "shard_count": count_jsonl_rows(shards_dir / "shards.jsonl"),
         "retained_export_created": False,
         "history_commit_created": False,
         "state_advanced": False,
     }
+    if next_command is not None:
+        report["next_command"] = next_command
     if repair_report is not None:
         report["repair"] = repair_report
     return report
+
+
+def count_lines_for_report(counts: dict[str, int]) -> str:
+    if not counts:
+        return "none"
+    return ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+
+
+def dry_run_report_markdown(report: dict[str, Any]) -> str:
+    window = report.get("window") if isinstance(report.get("window"), dict) else {}
+    mode = str(window.get("mode") or "unknown")
+    start = str(window.get("start") or "unknown")
+    end = str(window.get("end") or "unknown")
+    coverage_gap_counts = report.get("coverage_gap_counts") if isinstance(report.get("coverage_gap_counts"), dict) else {}
+    repairable_coverage_gap_counts = (
+        report.get("repairable_coverage_gap_counts") if isinstance(report.get("repairable_coverage_gap_counts"), dict) else {}
+    )
+    source_status_counts = report.get("source_status_counts") if isinstance(report.get("source_status_counts"), dict) else {}
+    retained = "yes" if report.get("retained_export_created") else "no"
+    history = "yes" if report.get("history_commit_created") else "no"
+    state = "yes" if report.get("state_advanced") else "no"
+    lines = [
+        "# Session Retrospective Dry Run",
+        "",
+        f"- Kind: `{report.get('kind', 'unknown')}`",
+        f"- Window: `{mode}` `{start}` to `{end}`",
+        f"- Output: `{report.get('root', '')}`",
+        f"- Scan: `{report.get('scan_dir', '')}`",
+        f"- Shards: `{report.get('shards_dir', '')}`",
+        f"- Turns: `{report.get('turn_count', 0)}`",
+        f"- Episodes: `{report.get('episode_count', 0)}`",
+        f"- Shard count: `{report.get('shard_count', 0)}`",
+        f"- Coverage gaps: {count_lines_for_report(coverage_gap_counts)}",
+        f"- Repairable coverage gaps: {count_lines_for_report(repairable_coverage_gap_counts)}",
+        f"- Source status: {count_lines_for_report(source_status_counts)}",
+        f"- Retained export created: {retained}",
+        f"- History commit created: {history}",
+        f"- State advanced: {state}",
+    ]
+    next_command = report.get("next_command")
+    if isinstance(next_command, str) and next_command:
+        lines.append(f"- Next command: `{next_command}`")
+    repair = report.get("repair")
+    if isinstance(repair, dict):
+        before = repair.get("before_coverage_gap_counts") if isinstance(repair.get("before_coverage_gap_counts"), dict) else {}
+        after = repair.get("after_coverage_gap_counts") if isinstance(repair.get("after_coverage_gap_counts"), dict) else {}
+        lines.extend(
+            [
+                "",
+                "## Repair",
+                "",
+                f"- Input scan: `{repair.get('input_scan_dir', '')}`",
+                f"- Before gaps: {count_lines_for_report(before)}",
+                f"- After gaps: {count_lines_for_report(after)}",
+                f"- Max raw bytes: `{repair.get('max_raw_bytes', 0)}`",
+            ]
+        )
+        materialized_hosts = repair.get("materialized_hosts")
+        if isinstance(materialized_hosts, list):
+            lines.append(f"- Materialized hosts: `{len(materialized_hosts)}`")
+    return "\n".join(lines) + "\n"
+
+
+def write_dry_run_report_pair(root: Path, name: str, report: dict[str, Any]) -> None:
+    write_json(root / f"{name}.json", report)
+    write_bytes_atomic(root / f"{name}.md", dry_run_report_markdown(report).encode("utf-8"))
+
+
+def is_repairable_coverage_gap(gap: Any) -> bool:
+    if not isinstance(gap, dict):
+        return False
+    reason = str(gap.get("reason") or "")
+    if reason in OVERSIZED_REPAIRABLE_GAP_REASONS:
+        return True
+    return reason in ALLOWED_REMOTE_GAP_REASONS and str(gap.get("host") or "") in DEFAULT_REMOTE_HOSTS
+
+
+def repairable_coverage_gaps(gaps: Any) -> list[dict[str, Any]]:
+    return [gap for gap in gaps or [] if is_repairable_coverage_gap(gap)]
+
+
+def has_repairable_gap_counts(counts: Any) -> bool:
+    if not isinstance(counts, dict):
+        return False
+    return any(str(reason) in REPAIRABLE_COVERAGE_GAP_REASONS and bool(count) for reason, count in counts.items())
 
 
 def run_make_shards_for_scan(scan_dir: Path, shards_dir: Path, *, max_raw_bytes: int) -> None:
@@ -6027,10 +6120,15 @@ def run_make_shards_for_scan(scan_dir: Path, shards_dir: Path, *, max_raw_bytes:
     )
 
 
-def cmd_baseline_dry_run(args: argparse.Namespace) -> int:
-    window_days, start, now = baseline_window(args)
-    end = bounded_baseline_end(start, window_days, now)
-    validate_window_bounds(start, end, "baseline dry-run")
+def run_dry_run(
+    args: argparse.Namespace,
+    *,
+    kind: str,
+    mode: str,
+    start: dt.datetime,
+    end: dt.datetime,
+    next_command_name: str,
+) -> tuple[Path, dict[str, Any]]:
     max_raw_bytes = require_positive_window(args.max_raw_bytes, "--max-raw-bytes")
     root = ensure_safe_output_dir(Path(args.output)).absolute()
     scan_dir = root / "scan"
@@ -6046,22 +6144,80 @@ def cmd_baseline_dry_run(args: argparse.Namespace) -> int:
         max_raw_bytes=max_raw_bytes,
         allow_partial_hosts=args.allow_partial_hosts,
     )
-    mode = f"baseline-{window_days}d"
     run_scan(scan_args, mode=mode, start=start, end=end)
     trend, _retained_manifest = validate_output_run(scan_dir)
     run_make_shards_for_scan(scan_dir, shards_dir, max_raw_bytes=max_raw_bytes)
     manifest = read_json_file(scan_dir / "shard_manifest.json")
-    write_json(
-        root / "dry_run_report.json",
-        dry_run_report(
-            kind="baseline_dry_run",
-            root=root,
-            scan_dir=scan_dir,
-            shards_dir=shards_dir,
-            trend=trend,
-            manifest=manifest,
-        ),
+    next_command = None
+    if repairable_coverage_gaps(manifest.get("coverage_gaps")):
+        next_command_argv = [
+            "python3",
+            Path(__file__).resolve().as_posix(),
+            next_command_name,
+            "--run-dir",
+            root.as_posix(),
+        ]
+        if args.allow_partial_hosts:
+            next_command_argv.append("--allow-partial-hosts")
+        next_command = shlex.join(next_command_argv)
+    report = dry_run_report(
+        kind=kind,
+        root=root,
+        scan_dir=scan_dir,
+        shards_dir=shards_dir,
+        trend=trend,
+        manifest=manifest,
+        next_command=next_command,
     )
+    write_dry_run_report_pair(root, "dry_run_report", report)
+    return root, report
+
+
+def cmd_baseline_dry_run(args: argparse.Namespace) -> int:
+    window_days, start, now = baseline_window(args)
+    end = bounded_baseline_end(start, window_days, now)
+    validate_window_bounds(start, end, "baseline dry-run")
+    mode = f"baseline-{window_days}d"
+    root, _report = run_dry_run(
+        args,
+        kind="baseline_dry_run",
+        mode=mode,
+        start=start,
+        end=end,
+        next_command_name="repair-coverage",
+    )
+    print(root)
+    return 0
+
+
+def cmd_weekly_dry_run(args: argparse.Namespace) -> int:
+    days = require_positive_window(args.days, "--days")
+    end = scan_end(args)
+    start = end - dt.timedelta(days=days)
+    validate_window_bounds(start, end, "weekly dry-run")
+    root, report = run_dry_run(
+        args,
+        kind="weekly_dry_run",
+        mode="weekly",
+        start=start,
+        end=end,
+        next_command_name="weekly-repair",
+    )
+    if args.repair and has_repairable_gap_counts(report.get("repairable_coverage_gap_counts")):
+        repair_output = Path(args.repair_output).expanduser() if args.repair_output else root / "weekly-coverage-repair"
+        run_coverage_repair(
+            argparse.Namespace(
+                run_dir=str(root),
+                output=str(repair_output),
+                max_raw_bytes=args.repair_max_raw_bytes,
+                remote_probe=args.repair_remote_probe,
+                remote_session_meta_limit=args.repair_remote_session_meta_limit,
+                skip_remote_materialization=args.repair_skip_remote_materialization,
+                allow_partial_hosts=args.allow_partial_hosts,
+            ),
+            default_output_name="weekly-coverage-repair",
+            report_kind="weekly_repair",
+        )
     print(root)
     return 0
 
@@ -6461,7 +6617,12 @@ def source_args_from_manifest(
     return values
 
 
-def cmd_repair_coverage(args: argparse.Namespace) -> int:
+def run_coverage_repair(
+    args: argparse.Namespace,
+    *,
+    default_output_name: str,
+    report_kind: str,
+) -> Path:
     run_dir = Path(args.run_dir)
     scan_dir = scan_dir_from_run_dir(run_dir)
     manifest = read_json_file(scan_dir / "shard_manifest.json")
@@ -6471,7 +6632,7 @@ def cmd_repair_coverage(args: argparse.Namespace) -> int:
     root = (
         ensure_safe_output_dir(Path(args.output)).absolute()
         if args.output
-        else ensure_safe_output_dir(scan_dir.parent / "coverage-repair").absolute()
+        else ensure_safe_output_dir(scan_dir.parent / default_output_name).absolute()
     )
     remote_probe = Path(args.remote_probe).expanduser() if args.remote_probe else Path(__file__).with_name("remote_codex_probe.py")
     if not remote_probe.is_file():
@@ -6527,17 +6688,34 @@ def cmd_repair_coverage(args: argparse.Namespace) -> int:
         "max_raw_bytes": max_raw_bytes,
         "materialized_hosts": materialized_hosts,
     }
-    write_json(
-        root / "repair_report.json",
-        dry_run_report(
-            kind="coverage_repair",
-            root=root,
-            scan_dir=repaired_scan_dir,
-            shards_dir=repaired_shards_dir,
-            trend=trend,
-            manifest=repaired_manifest,
-            repair_report=repair_summary,
-        ),
+    report = dry_run_report(
+        kind=report_kind,
+        root=root,
+        scan_dir=repaired_scan_dir,
+        shards_dir=repaired_shards_dir,
+        trend=trend,
+        manifest=repaired_manifest,
+        repair_report=repair_summary,
+    )
+    write_dry_run_report_pair(root, "repair_report", report)
+    return root
+
+
+def cmd_repair_coverage(args: argparse.Namespace) -> int:
+    root = run_coverage_repair(
+        args,
+        default_output_name="coverage-repair",
+        report_kind="coverage_repair",
+    )
+    print(root)
+    return 0
+
+
+def cmd_weekly_repair(args: argparse.Namespace) -> int:
+    root = run_coverage_repair(
+        args,
+        default_output_name="weekly-coverage-repair",
+        report_kind="weekly_repair",
     )
     print(root)
     return 0
@@ -7124,6 +7302,37 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_dry_run.add_argument("--end", help="Fixed upper bound timestamp for the baseline window.")
     baseline_dry_run.set_defaults(func=cmd_baseline_dry_run)
 
+    weekly_dry_run = subparsers.add_parser(
+        "weekly-dry-run",
+        help="Run a weekly scan, validation, and shard dry run without retained export, commit, or state advancement.",
+    )
+    add_common_scan_args(weekly_dry_run)
+    weekly_dry_run.add_argument("--days", type=int, default=7)
+    weekly_dry_run.add_argument("--end", help="Fixed exclusive window end timestamp.")
+    weekly_dry_run.add_argument(
+        "--repair",
+        action="store_true",
+        help="If repairable coverage gaps are found, also run weekly-repair as a transient follow-up.",
+    )
+    weekly_dry_run.add_argument("--repair-output", help="Output directory for the optional --repair follow-up.")
+    weekly_dry_run.add_argument(
+        "--repair-max-raw-bytes",
+        type=int,
+        default=16 * 1024 * 1024,
+        help="Raw rollout size limit for the optional --repair follow-up.",
+    )
+    weekly_dry_run.add_argument(
+        "--repair-remote-probe",
+        help="Path to remote_codex_probe.py for the optional --repair follow-up.",
+    )
+    weekly_dry_run.add_argument("--repair-remote-session-meta-limit", type=int, default=500)
+    weekly_dry_run.add_argument(
+        "--repair-skip-remote-materialization",
+        action="store_true",
+        help="Only rerun the optional --repair scan, useful for local oversized coverage repair.",
+    )
+    weekly_dry_run.set_defaults(func=cmd_weekly_dry_run)
+
     repair_coverage = subparsers.add_parser(
         "repair-coverage",
         help="Repair dry-run coverage by rematerializing default remotes and rerunning the scan; no retained export, commit, or state advancement.",
@@ -7155,6 +7364,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow intentionally narrowed repair scans. Partial scans cannot advance shared state.",
     )
     repair_coverage.set_defaults(func=cmd_repair_coverage)
+
+    weekly_repair = subparsers.add_parser(
+        "weekly-repair",
+        help="Repair weekly dry-run coverage; no retained export, commit, or state advancement.",
+    )
+    weekly_repair.add_argument("--run-dir", required=True, help="weekly-dry-run root or scan output directory.")
+    weekly_repair.add_argument(
+        "--output",
+        help="Output directory under .codex-local/session-retrospective. Defaults to the scan output directory's sibling weekly-coverage-repair.",
+    )
+    weekly_repair.add_argument(
+        "--max-raw-bytes",
+        type=int,
+        default=16 * 1024 * 1024,
+        help="Raw rollout size limit for the repaired scan.",
+    )
+    weekly_repair.add_argument(
+        "--remote-probe",
+        help="Path to remote_codex_probe.py. Defaults to the bundled helper beside this script.",
+    )
+    weekly_repair.add_argument("--remote-session-meta-limit", type=int, default=500)
+    weekly_repair.add_argument(
+        "--skip-remote-materialization",
+        action="store_true",
+        help="Only rerun the scan, useful for local oversized coverage repair.",
+    )
+    weekly_repair.add_argument(
+        "--allow-partial-hosts",
+        action="store_true",
+        help="Allow intentionally narrowed repair scans. Partial scans cannot advance shared state.",
+    )
+    weekly_repair.set_defaults(func=cmd_weekly_repair)
 
     shards = subparsers.add_parser("make-shards")
     shards.add_argument("--manifest", required=True)
