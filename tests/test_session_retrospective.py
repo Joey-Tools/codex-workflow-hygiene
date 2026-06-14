@@ -7902,7 +7902,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(relevance, "unknown")
         self.assertEqual(scan.call_args.kwargs["max_scan_bytes"], MODULE.ROLLOUT_TIMESTAMP_SCAN_BYTES)
 
-    def test_old_oversized_rollout_with_large_in_window_record_blocks_state(self) -> None:
+    def test_old_oversized_rollout_with_large_in_window_record_generates_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
@@ -7932,7 +7932,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertFalse(state.exists())
-        self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_scan_generates_local_summary_for_oversized_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -8017,6 +8017,97 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("generated_summary_root", manifest["sources"][0])
         self.assertEqual(retained_manifest["sources"][0]["host"], "custom_source")
         self.assertNotIn("generated_summary_root", retained_manifest["sources"][0])
+
+    def test_generated_local_summary_rejects_symlink_output_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw)
+            generated_base = MODULE.generated_summary_base_for_output(output)
+            generated_root = MODULE.generated_summary_root_for_source(generated_base, MODULE.Source("local", root))
+            outside = Path(raw) / "outside"
+            outside.mkdir()
+            generated_root.mkdir(parents=True)
+            (generated_root / "sessions").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(SystemExit, "generated summary output path must not use symlink ancestors"):
+                MODULE.run_scan(
+                    types.SimpleNamespace(
+                        source=[f"local={root}"],
+                        output=str(output),
+                        state=None,
+                        max_raw_bytes=3000,
+                        allow_partial_hosts=True,
+                    ),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+
+            self.assertFalse(any(outside.rglob("rollout-summary*.jsonl")))
+
+    def test_generated_local_summary_without_retained_flags_covers_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please build the weekly helper for the report.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=3000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            shard_output = safe_output_dir(raw, "no-flags-shards")
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(output / "shard_manifest.json"),
+                    "--output",
+                    str(shard_output),
+                    "--max-raw-bytes",
+                    "3000",
+                ]
+            )
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertEqual(rows, [])
+        self.assertEqual(manifest["sources"][0]["summary_count"], 1)
+        self.assertNotIn("oversized_rollout_skipped", reasons)
+        self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
 
     def test_truncated_generated_local_summary_preserves_coverage_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -141,6 +141,7 @@ LOCAL_ROLLOUT_SUMMARY_LIMIT = 200
 LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS = 1200
 LOCAL_GENERATED_SUMMARY_DIR_SUFFIX = "generated-rollout-summaries"
+LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF = "local_generated_rollout_summary_v1"
 PRIVATE_IPV4_PATTERN = re.compile(
     r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|127(?:\.\d{1,3}){3}|169\.254(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})(?![\d.])"
 )
@@ -1123,23 +1124,22 @@ def local_rollout_summary_jsonl_bytes(source: Source, rollout: Path, rollout_ref
     finally:
         if fd >= 0:
             os.close(fd)
-    records.insert(
-        0,
-        remote_probe._rollout_summary_scan_meta(
-            source_bytes=source_bytes,
-            source_sha256=source_sha256,
-            scan_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
-            summary_limit=LOCAL_ROLLOUT_SUMMARY_LIMIT,
-            record_limit_reached=bool(summary_meta["record_limit_reached"]),
-            signal_record_limit_reached=bool(summary_meta["signal_record_limit_reached"]),
-            matched_record_limit_reached=bool(summary_meta["matched_record_limit_reached"]),
-            tail_record_limit_reached=bool(summary_meta["tail_record_limit_reached"]),
-            keyword_filter_applied=bool(summary_meta["keyword_filter_applied"]),
-            json_error_count=int(summary_meta["json_error_count"]),
-            tail_records=int(summary_meta["tail_records"]),
-            summary_record_count=int(summary_meta["summary_record_count"]),
-        ),
+    scan_meta = remote_probe._rollout_summary_scan_meta(
+        source_bytes=source_bytes,
+        source_sha256=source_sha256,
+        scan_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
+        summary_limit=LOCAL_ROLLOUT_SUMMARY_LIMIT,
+        record_limit_reached=bool(summary_meta["record_limit_reached"]),
+        signal_record_limit_reached=bool(summary_meta["signal_record_limit_reached"]),
+        matched_record_limit_reached=bool(summary_meta["matched_record_limit_reached"]),
+        tail_record_limit_reached=bool(summary_meta["tail_record_limit_reached"]),
+        keyword_filter_applied=bool(summary_meta["keyword_filter_applied"]),
+        json_error_count=int(summary_meta["json_error_count"]),
+        tail_records=int(summary_meta["tail_records"]),
+        summary_record_count=int(summary_meta["summary_record_count"]),
     )
+    scan_meta["coverage_proof"] = LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF
+    records.insert(0, scan_meta)
     summary_records = [dict(record, host=source.host, rollout=safe_ref) for record in records]
     return jsonl_bytes(summary_records)
 
@@ -1149,6 +1149,7 @@ def write_generated_local_rollout_summary(source: Source, rollout: Path, generat
     if rollout_ref is None or safe_rollout_backing_ref(rollout_ref) is None:
         return None
     target = summary_path_for_rollout(generated_root, rollout_ref)
+    reject_symlink_ancestors(target.parent, label="generated summary output path")
     write_bytes_atomic(target, local_rollout_summary_jsonl_bytes(source, rollout, rollout_ref))
     return target
 
@@ -2162,6 +2163,36 @@ def summary_scan_meta_backing_rollout_refs(path: Path, *, max_scan_bytes: int) -
     return refs, invalid_ref_seen
 
 
+def summary_has_generated_local_coverage_proof(path: Path, *, max_scan_bytes: int) -> bool:
+    proof_seen = False
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(max_scan_bytes + 1)
+    except OSError:
+        return False
+    if len(data) > max_scan_bytes:
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(record, dict) or str(record.get("kind") or "") != "scan_meta":
+            continue
+        if record.get("rollout") is None:
+            continue
+        if record.get("coverage_proof") != LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF:
+            return False
+        proof_seen = True
+    return proof_seen
+
+
 def summary_file_has_session_meta_in_window(
     path: Path,
     start: dt.datetime | None,
@@ -2417,28 +2448,88 @@ def complete_summary_backing_rollout_refs(
         ):
             continue
         extractable_refs = summary_extractable_backing_refs_in_window(summary, start, end)
-        if not extractable_refs:
-            continue
-        source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
-            summary,
-            start,
-            end,
-            max_scan_bytes=max_scan_bytes,
-            source_root=source_root,
-        )
-        if source_identity_by_ref is None:
-            continue
+        if extractable_refs:
+            source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
+                summary,
+                start,
+                end,
+                max_scan_bytes=max_scan_bytes,
+                source_root=source_root,
+            )
+            if source_identity_by_ref is not None:
+                refs.update(
+                    ref
+                    for ref, source_identity in source_identity_by_ref.items()
+                    if ref in extractable_refs
+                    if backing_ref_matches_current_rollout_identity(
+                        source_root,
+                        ref,
+                        source_identity,
+                        max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                    )
+                )
         refs.update(
-            ref
-            for ref, source_identity in source_identity_by_ref.items()
-            if ref in extractable_refs
-            if backing_ref_matches_current_rollout_identity(
-                source_root,
-                ref,
-                source_identity,
-                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+            complete_scan_meta_backing_rollout_refs(
+                summary,
+                start,
+                end,
+                source_root=source_root,
+                max_scan_bytes=max_scan_bytes,
             )
         )
+    return refs
+
+
+def complete_scan_meta_backing_rollout_refs(
+    summary: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path,
+    max_scan_bytes: int,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+    archived_duplicate_keys: set[str] | None = None,
+) -> set[str]:
+    if not summary_has_generated_local_coverage_proof(summary, max_scan_bytes=max_scan_bytes):
+        return set()
+    scan_meta_refs, invalid_ref_seen = summary_scan_meta_backing_rollout_refs(
+        summary,
+        max_scan_bytes=max_scan_bytes,
+    )
+    if invalid_ref_seen or not scan_meta_refs:
+        return set()
+    proof = complete_scan_meta_backing_source_bytes_by_ref(summary, start, end)
+    if proof is None or not proof.source_bytes_by_ref:
+        return set()
+    refs: set[str] = set()
+    for ref in scan_meta_refs:
+        source_bytes = proof.source_bytes_by_ref.get(ref)
+        if source_bytes is None:
+            continue
+        source_identity = RolloutSourceIdentity(
+            source_bytes=source_bytes,
+            source_sha256=proof.source_sha256_by_ref.get(ref),
+        )
+        if not (
+            rollout_ref_in_window(ref, start, end)
+            or backing_ref_has_materialized_window_coverage(
+                source_root,
+                ref,
+                start,
+                end,
+                max_scan_bytes=max_scan_bytes,
+                archived_duplicate_keys=archived_duplicate_keys,
+            )
+        ):
+            continue
+        if backing_ref_matches_current_or_selected_rollout(
+            source_root,
+            ref,
+            source_identity,
+            max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+            selected_source_identity_by_key=selected_source_identity_by_key,
+        ):
+            refs.add(ref)
     return refs
 
 
@@ -2555,30 +2646,41 @@ def complete_summary_backing_rollout_keys(
         ):
             continue
         extractable_refs = summary_extractable_backing_refs_in_window(summary, start, end)
-        if not extractable_refs:
-            continue
-        source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
+        if extractable_refs:
+            source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
+                summary,
+                start,
+                end,
+                max_scan_bytes=max_scan_bytes,
+                source_root=source_root,
+            )
+            if source_identity_by_ref is not None:
+                for ref, source_identity in source_identity_by_ref.items():
+                    if ref not in extractable_refs:
+                        continue
+                    if not backing_ref_matches_current_or_selected_rollout(
+                        source_root,
+                        ref,
+                        source_identity,
+                        max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                        selected_source_identity_by_key=selected_source_identity_by_key,
+                    ):
+                        continue
+                    _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
+                    selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
+                    keys.add(summary_backed_rollout_key_for_ref(selected_ref))
+        for ref in complete_scan_meta_backing_rollout_refs(
             summary,
             start,
             end,
-            max_scan_bytes=max_scan_bytes,
             source_root=source_root,
-        )
-        if source_identity_by_ref is None:
-            continue
-        for ref, source_identity in source_identity_by_ref.items():
-            if ref not in extractable_refs:
-                continue
-            if backing_ref_matches_current_or_selected_rollout(
-                source_root,
-                ref,
-                source_identity,
-                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
-                selected_source_identity_by_key=selected_source_identity_by_key,
-            ):
-                _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
-                selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
-                keys.add(summary_backed_rollout_key_for_ref(selected_ref))
+            max_scan_bytes=max_scan_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
+        ):
+            _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
+            selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
+            keys.add(summary_backed_rollout_key_for_ref(selected_ref))
     return keys
 
 
