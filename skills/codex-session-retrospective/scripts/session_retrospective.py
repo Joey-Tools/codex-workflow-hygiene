@@ -4422,6 +4422,7 @@ def extract_summary_file(
             proof_value=LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF,
             max_source_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
             remote_identity=False,
+            allow_tail_record_limit=True,
         )
     if not generated_identity_candidates and has_remote_generated_source_identity:
         set_generated_identity_candidates(

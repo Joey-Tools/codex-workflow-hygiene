@@ -9595,6 +9595,59 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(first_rows[0]["source_hash"], expected_source_hash)
         self.assertEqual(first_rows[0]["source_hash"], second_rows[0]["source_hash"])
 
+    def test_tail_limited_generated_local_summary_uses_backing_rollout_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            rollout_ref = MODULE.source_relative_path_ref(rollout, root)
+            self.assertIsNotNone(rollout_ref)
+            source_bytes = rollout.stat().st_size
+            output = safe_output_dir(raw)
+            generated_root = MODULE.generated_summary_root_for_source(
+                MODULE.generated_summary_base_for_output(output),
+                MODULE.Source("local", root),
+            )
+            summary = generated_root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        coverage_proof=MODULE.LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF,
+                        rollout=rollout_ref,
+                        scan_bytes=source_bytes,
+                        source_bytes=source_bytes,
+                        source_sha256=MODULE.file_sha256(rollout),
+                        tail_record_limit_reached=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "line": 1,
+                        "rollout": rollout_ref,
+                        "text": "You missed verification for /customer/repo.",
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_summary_file(MODULE.Source("local", root), summary, None, None)
+            expected_source_path = MODULE.path_ref(rollout)
+            expected_source_hash = MODULE.file_source_hash(rollout)
+            expected_session_id = MODULE.session_id_from_path(rollout)
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].session_id, expected_session_id)
+        self.assertEqual(turns[0].source_path, expected_source_path)
+        self.assertEqual(turns[0].source_hash, expected_source_hash)
+        self.assertIn("user_correction", turns[0].issue_flags)
+
     def test_generated_local_summary_extract_skips_when_backing_exceeds_scan_cap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
