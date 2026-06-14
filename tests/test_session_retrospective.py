@@ -7331,6 +7331,65 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "remote_source_not_materialized")
 
+    def test_scan_remote_source_identity_summary_uses_remote_scan_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-missing.jsonl"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-generated.jsonl"
+            write_remote_metadata(
+                root,
+                "miku-bot-dev",
+                remote_generated_summaries=[summary.relative_to(root).as_posix()],
+            )
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=24000000,
+                        scan_bytes=24000000,
+                        source_sha256="a" * 64,
+                        source_identity_proof=MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+                        tail_record_limit_reached=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo " + ("x" * 300),
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"miku-bot-dev={root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=200,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            summary_size = summary.stat().st_size
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertGreater(summary_size, 200)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["host"], "miku-bot-dev")
+        self.assertIn("user_correction", rows[0]["issue_flags"])
+        self.assertIn("remote_source_not_materialized", reasons)
+        self.assertIn("truncated_rollout_summary", reasons)
+        self.assertNotIn("oversized_summary_skipped", reasons)
+
     def test_make_shards_remote_generated_summary_missing_manifest_entry_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "miku-bot-dev"

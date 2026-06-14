@@ -2570,7 +2570,7 @@ def summary_metadata_scan_max_bytes_for_generated_remote(
     max_scan_bytes: int,
     remote_generated_summary_paths: set[Path] | None,
 ) -> int:
-    if summary_allows_generated_remote_coverage(
+    if summary_allows_generated_remote_source_identity(
         path,
         remote_generated_summary_paths,
         max_scan_bytes=max_scan_bytes,
