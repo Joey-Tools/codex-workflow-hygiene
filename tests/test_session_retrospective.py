@@ -5185,7 +5185,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
         expected_script = Path(MODULE.__file__).resolve().as_posix()
         self.assertEqual(
             MODULE.shlex.split(report["next_command"]),
-            ["python3", expected_script, "weekly-repair", "--run-dir", repair.absolute().as_posix(), "--allow-partial-hosts"],
+            [
+                "python3",
+                expected_script,
+                "weekly-repair",
+                "--run-dir",
+                repair.absolute().as_posix(),
+                "--max-raw-bytes",
+                "200",
+                "--allow-partial-hosts",
+            ],
         )
         self.assertEqual(report["report_summary"]["next_command"], report["next_command"])
         self.assertIn("oversized_summary_skipped", report["repairable_coverage_gap_counts"])

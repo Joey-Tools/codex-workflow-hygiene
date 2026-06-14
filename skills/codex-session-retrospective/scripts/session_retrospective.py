@@ -8433,6 +8433,8 @@ def run_coverage_repair(
             command_name,
             "--run-dir",
             root.as_posix(),
+            "--max-raw-bytes",
+            str(max_raw_bytes),
         ]
         if args.allow_partial_hosts:
             next_command_argv.append("--allow-partial-hosts")
