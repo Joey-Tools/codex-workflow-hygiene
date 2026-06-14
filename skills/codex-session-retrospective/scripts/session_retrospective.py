@@ -7389,6 +7389,7 @@ def dry_run_report_summary(
     source_coverage: dict[str, Any],
     shard_count: int,
     next_command: str | None,
+    next_command_note: str | None,
     repair_report: dict[str, Any] | None,
 ) -> dict[str, Any]:
     source_status_counts = (
@@ -7415,6 +7416,8 @@ def dry_run_report_summary(
             source_status_counts,
         ),
     }
+    if next_command_note is not None:
+        summary["next_command_note"] = next_command_note
     if repair_report is not None:
         before = (
             repair_report.get("before_coverage_gap_counts")
@@ -7444,6 +7447,7 @@ def dry_run_report(
     trend: dict[str, Any],
     manifest: dict[str, Any],
     next_command: str | None = None,
+    next_command_note: str | None = None,
     repair_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     coverage_gaps = list(manifest.get("coverage_gaps") or [])
@@ -7480,11 +7484,14 @@ def dry_run_report(
             source_coverage=source_coverage,
             shard_count=shard_count,
             next_command=next_command,
+            next_command_note=next_command_note,
             repair_report=repair_report,
         ),
     }
     if next_command is not None:
         report["next_command"] = next_command
+    if next_command_note is not None:
+        report["next_command_note"] = next_command_note
     if repair_report is not None:
         report["repair"] = repair_report
     return report
@@ -7556,6 +7563,13 @@ def dry_run_report_markdown(report: dict[str, Any]) -> str:
     summary_coverage = summary.get("source_coverage") if isinstance(summary.get("source_coverage"), dict) else {}
     summary_repair = summary.get("repair") if isinstance(summary.get("repair"), dict) else None
     next_command = report.get("next_command")
+    next_command_note = report.get("next_command_note")
+    if isinstance(next_command, str) and next_command:
+        next_command_line = f"- Next command: `{next_command}`"
+    elif isinstance(next_command_note, str) and next_command_note:
+        next_command_line = f"- Next command: none ({next_command_note})"
+    else:
+        next_command_line = "- Next command: none"
     lines = [
         "# Session Retrospective Dry Run",
         "",
@@ -7569,7 +7583,7 @@ def dry_run_report_markdown(report: dict[str, Any]) -> str:
         f"- Top blockers: {markdown_list_value(summary.get('top_blockers'))}",
         f"- Transient disk usage: `{format_bytes_for_report(summary.get('transient_disk_usage_bytes', 0))}`",
         f"- Confidence: `{summary.get('confidence', 'unknown')}`",
-        f"- Next command: `{next_command}`" if isinstance(next_command, str) and next_command else "- Next command: none",
+        next_command_line,
     ]
     if summary_repair is not None:
         before_total = report_int(summary_repair.get("before_gap_total"))
@@ -7614,6 +7628,8 @@ def dry_run_report_markdown(report: dict[str, Any]) -> str:
     )
     if isinstance(next_command, str) and next_command:
         lines.append(f"- Next command: `{next_command}`")
+    elif isinstance(next_command_note, str) and next_command_note:
+        lines.append(f"- Next command note: {next_command_note}")
     repair = report.get("repair")
     if isinstance(repair, dict):
         before = repair.get("before_coverage_gap_counts") if isinstance(repair.get("before_coverage_gap_counts"), dict) else {}
@@ -7651,6 +7667,18 @@ def is_repairable_coverage_gap(gap: Any) -> bool:
 
 def repairable_coverage_gaps(gaps: Any) -> list[dict[str, Any]]:
     return [gap for gap in gaps or [] if is_repairable_coverage_gap(gap)]
+
+
+def oversized_repairable_coverage_gaps(gaps: Iterable[Any]) -> list[dict[str, Any]]:
+    return [
+        gap
+        for gap in gaps
+        if isinstance(gap, dict) and str(gap.get("reason") or "") in OVERSIZED_REPAIRABLE_GAP_REASONS
+    ]
+
+
+def oversized_repair_next_command_note(*, max_raw_bytes: int) -> str:
+    return f"remaining oversized gaps require a higher --max-raw-bytes than {max_raw_bytes}"
 
 
 def repair_materialization_gap_hosts(gaps: Iterable[Any]) -> set[str]:
@@ -8425,7 +8453,11 @@ def run_coverage_repair(
         "materialized_hosts": materialized_hosts,
     }
     next_command = None
-    if repairable_coverage_gaps(repaired_manifest.get("coverage_gaps")):
+    next_command_note = None
+    remaining_repairable_gaps = repairable_coverage_gaps(repaired_manifest.get("coverage_gaps"))
+    if oversized_repairable_coverage_gaps(remaining_repairable_gaps):
+        next_command_note = oversized_repair_next_command_note(max_raw_bytes=max_raw_bytes)
+    elif remaining_repairable_gaps:
         command_name = "weekly-repair" if report_kind == "weekly_repair" else "repair-coverage"
         next_command_argv = [
             "python3",
@@ -8447,6 +8479,7 @@ def run_coverage_repair(
         trend=trend,
         manifest=repaired_manifest,
         next_command=next_command,
+        next_command_note=next_command_note,
         repair_report=repair_summary,
     )
     write_dry_run_report_pair(root, "repair_report", report)
