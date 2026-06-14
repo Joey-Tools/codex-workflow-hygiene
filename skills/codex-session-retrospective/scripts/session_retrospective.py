@@ -3910,7 +3910,6 @@ def extract_summary_file(
     emit_start: dt.datetime | None = None,
 ) -> list[TurnSummary]:
     turns: list[TurnSummary] = []
-    source_hash = file_source_hash(path)
     session_id = opaque_session_id(path.as_posix())
     records = list(iter_jsonl(path))
     identity_path = path
@@ -3932,6 +3931,7 @@ def extract_summary_file(
                 session_id = session_id_from_path(rollout_path)
                 break
     identity_path_ref = path_ref(identity_path) or ""
+    source_hash = file_source_hash(identity_path)
     for _line_no, record in records:
         if str(record.get("kind") or "summary") != "session_meta":
             continue

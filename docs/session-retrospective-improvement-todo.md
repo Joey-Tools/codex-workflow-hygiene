@@ -62,6 +62,9 @@ review gates, and merge before starting the next item.
      summaries from the backing rollout ref, not the transient generated-summary
      artifact path, so repeated runs into different output directories produce
      stable retained identities.
+   - Keep generated local summary retained `source_hash` aligned with the same
+     backing rollout used for retained `source_path`, not the transient summary
+     artifact.
    - Status: implemented in the local oversized rollout summaries PR; review
      and merge pending.
 

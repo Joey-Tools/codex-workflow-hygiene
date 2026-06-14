@@ -8070,6 +8070,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (second_output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             expected_source_path = MODULE.path_ref(rollout)
+            expected_source_hash = MODULE.file_source_hash(rollout)
             expected_session_id = MODULE.session_id_from_path(rollout)
 
         self.assertEqual(len(first_rows), 1)
@@ -8079,6 +8080,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(first_rows[0]["session_id"], expected_session_id)
         self.assertEqual(first_rows[0]["source_path"], expected_source_path)
         self.assertEqual(second_rows[0]["source_path"], expected_source_path)
+        self.assertEqual(first_rows[0]["source_hash"], expected_source_hash)
         self.assertEqual(first_rows[0]["source_hash"], second_rows[0]["source_hash"])
 
     def test_scan_generates_summary_for_custom_local_source_oversized_rollout(self) -> None:
