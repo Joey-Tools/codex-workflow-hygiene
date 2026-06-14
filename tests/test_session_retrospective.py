@@ -5135,7 +5135,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("Before gaps:", markdown)
         self.assertIn("After gaps:", markdown)
 
-    def test_weekly_repair_reports_follow_up_command_when_repairable_gaps_remain(self) -> None:
+    def test_weekly_repair_omits_follow_up_command_when_oversized_gaps_remain(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01T10-00-00-weekly-large.jsonl"
@@ -5182,6 +5182,49 @@ class SessionRetrospectiveTests(unittest.TestCase):
             report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
             markdown = (repair / "repair_report.md").read_text(encoding="utf-8")
 
+        self.assertNotIn("next_command", report)
+        self.assertIsNone(report["report_summary"]["next_command"])
+        self.assertIn("oversized_summary_skipped", report["repairable_coverage_gap_counts"])
+        self.assertIn("remaining oversized gaps require a higher --max-raw-bytes than 200", report["next_command_note"])
+        self.assertEqual(report["report_summary"]["next_command_note"], report["next_command_note"])
+        self.assertIn("Next command: none (remaining oversized gaps require a higher --max-raw-bytes than 200)", markdown)
+
+    def test_weekly_repair_reports_follow_up_command_when_remote_gaps_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote_root = Path(raw) / "missing-miku"
+            dry_run = safe_output_dir(raw, "weekly-dry-run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"miku-bot-dev={remote_root}",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "200",
+                    "--output",
+                    str(dry_run),
+                ]
+            )
+            MODULE.main(
+                [
+                    "weekly-repair",
+                    "--run-dir",
+                    str(dry_run / "scan"),
+                    "--skip-remote-materialization",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "200",
+                ]
+            )
+            repair = dry_run / "weekly-coverage-repair"
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+            markdown = (repair / "repair_report.md").read_text(encoding="utf-8")
+
         expected_script = Path(MODULE.__file__).resolve().as_posix()
         self.assertEqual(
             MODULE.shlex.split(report["next_command"]),
@@ -5196,8 +5239,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "--allow-partial-hosts",
             ],
         )
+        self.assertNotIn("next_command_note", report)
         self.assertEqual(report["report_summary"]["next_command"], report["next_command"])
-        self.assertIn("oversized_summary_skipped", report["repairable_coverage_gap_counts"])
+        self.assertEqual(report["repairable_coverage_gap_counts"], {"source_root_missing": 1})
         self.assertIn(report["next_command"], markdown)
 
     def test_weekly_dry_run_repair_runs_transient_follow_up_when_gaps_exist(self) -> None:

@@ -145,7 +145,11 @@ review gates, and merge before starting the next item.
      gaps remain.
    - Preserve the current repair `--max-raw-bytes` in generated repair follow-up
      commands, so repeated repairs do not fall back to the parser default.
-   - Status: completed in PR #20 with follow-up fixes in PR #21 and PR #22.
+   - Do not emit an automatic repair follow-up command when the repaired scan
+     still has oversized coverage gaps at the same raw-byte cap; instead report
+     that a higher `--max-raw-bytes` is required.
+   - Status: completed in PR #20 with follow-up fixes in PR #21, PR #22, and
+     the oversized follow-up guard PR.
 
 7. Safety and privacy flag calibration
    - Reduce false positives from ordinary paths, approval text, and host labels.
