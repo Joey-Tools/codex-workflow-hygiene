@@ -2062,22 +2062,21 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(meta["record_limit_reached"])
         self.assertFalse(meta["tail_record_limit_reached"])
 
-    def test_remote_probe_rollout_summary_caps_signal_text_before_regex(self) -> None:
-        captured: list[str] = []
+    def test_remote_probe_rollout_summary_chunks_signal_text_before_regex(self) -> None:
+        captured_lengths: list[int] = []
+        real_search = REMOTE_PROBE.re.search
 
-        def fake_signal_text(kind: str, text: str) -> str:
-            captured.append(text)
-            if "You missed" in text:
-                return "you missed"
-            return f"{kind.replace('_', ' ')} present"
+        def fake_search(pattern: str, text: str, flags: int = 0):
+            captured_lengths.append(len(text))
+            return real_search(pattern, text, flags)
 
-        with mock.patch.object(REMOTE_PROBE, "_summary_signal_text", side_effect=fake_signal_text):
+        with mock.patch.object(REMOTE_PROBE.re, "search", side_effect=fake_search):
             records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
                 lines=[
                     json.dumps(
                         message(
                             "user",
-                            ("x" * 5000) + " You missed verification at the tail.",
+                            ("x" * 9000) + " You missed verification in the middle." + ("y" * 9000),
                             "2026-05-01T10:00:00Z",
                         )
                     )
@@ -2089,9 +2088,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
 
         self.assertEqual(meta["json_error_count"], 0)
-        self.assertTrue(captured)
-        self.assertTrue(all(len(text) <= 513 for text in captured))
-        self.assertTrue(any("You missed verification at the tail." in text for text in captured))
+        self.assertTrue(captured_lengths)
+        self.assertTrue(all(length <= REMOTE_PROBE.SUMMARY_SIGNAL_CHUNK_CHARS for length in captured_lengths))
         self.assertTrue(any(record.get("text") == "you missed" for record in records))
 
     def test_remote_probe_rollout_summary_reports_json_error_metadata(self) -> None:
@@ -8167,6 +8165,69 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(manifest["sources"][0]["summary_count"], 1)
         self.assertNotIn("oversized_rollout_skipped", reasons)
+        self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
+
+    def test_generated_local_summary_uses_active_mtime_for_untimestamped_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = home / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    untimestamped_message("user", "Fix the failed deployment."),
+                    untimestamped_message("assistant", "x" * 5000),
+                ],
+            )
+            active_mtime = MODULE.parse_time("2026-05-01T12:00:00Z").timestamp()
+            os.utime(rollout, (active_mtime, active_mtime))
+            output = safe_output_dir(raw)
+
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.run_scan(
+                    types.SimpleNamespace(
+                        source=[f"local={root}"],
+                        output=str(output),
+                        state=None,
+                        max_raw_bytes=3000,
+                        allow_partial_hosts=True,
+                    ),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            shard_output = safe_output_dir(raw, "active-mtime-summary-shards")
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.main(
+                    [
+                        "make-shards",
+                        "--manifest",
+                        str(output / "shard_manifest.json"),
+                        "--output",
+                        str(shard_output),
+                        "--max-raw-bytes",
+                        "3000",
+                    ]
+                )
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], "2026-05-01T12:00:00Z")
+        self.assertIn("failed_command", rows[0]["issue_flags"])
+        self.assertEqual(manifest["sources"][0]["summary_count"], 1)
+        self.assertNotIn("oversized_rollout_skipped", reasons)
+        self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
         self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
 
     def test_oversized_generated_local_summary_still_covers_rollout_gap(self) -> None:
@@ -15665,6 +15726,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIsNotNone(record)
         assert record is not None
         self.assertEqual(record["_match_text"], prompt)
+
+    def test_remote_probe_detects_signal_in_middle_of_long_text_before_truncating(self) -> None:
+        text = ("a" * 9000) + " you missed verification " + ("b" * 9000)
+
+        record = REMOTE_PROBE._build_summary_record(
+            kind="assistant_message",
+            text=text,
+            line_no=1,
+            timestamp="2026-05-22T10:01:00Z",
+            max_text_chars=120,
+            session_id="s1",
+        )
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["text"], "you missed")
 
     def test_remote_probe_ignores_automation_prompt_before_signaling(self) -> None:
         records = REMOTE_PROBE._summarize_rollout_records(

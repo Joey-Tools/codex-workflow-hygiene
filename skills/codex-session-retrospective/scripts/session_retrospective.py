@@ -1154,7 +1154,13 @@ def generated_summary_files_from_manifest(root: Path | None, raw_paths: Any) -> 
     return sorted(summaries)
 
 
-def local_rollout_summary_jsonl_bytes(source: Source, rollout: Path, rollout_ref: str) -> bytes:
+def local_rollout_summary_jsonl_bytes(
+    source: Source,
+    rollout: Path,
+    rollout_ref: str,
+    *,
+    mtime_fallback_timestamp: str | None = None,
+) -> bytes:
     safe_ref = safe_rollout_backing_ref(rollout_ref)
     if safe_ref is None:
         raise ValueError(f"unsafe rollout ref: {rollout_ref}")
@@ -1202,17 +1208,35 @@ def local_rollout_summary_jsonl_bytes(source: Source, rollout: Path, rollout_ref
     )
     scan_meta["coverage_proof"] = LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF
     records.insert(0, scan_meta)
+    if mtime_fallback_timestamp:
+        for record in records:
+            if str(record.get("kind") or "") not in {"scan_meta", "session_meta"} and not record.get("timestamp"):
+                record["timestamp"] = mtime_fallback_timestamp
     summary_records = [dict(record, host=source.host, rollout=safe_ref) for record in records]
     return jsonl_bytes(summary_records)
 
 
-def write_generated_local_rollout_summary(source: Source, rollout: Path, generated_root: Path) -> Path | None:
+def write_generated_local_rollout_summary(
+    source: Source,
+    rollout: Path,
+    generated_root: Path,
+    *,
+    mtime_fallback_timestamp: str | None = None,
+) -> Path | None:
     rollout_ref = source_relative_path_ref(rollout, source.root)
     if rollout_ref is None or safe_rollout_backing_ref(rollout_ref) is None:
         return None
     target = summary_path_for_rollout(generated_root, rollout_ref)
     reject_symlink_ancestors(target.parent, label="generated summary output path")
-    write_bytes_atomic(target, local_rollout_summary_jsonl_bytes(source, rollout, rollout_ref))
+    write_bytes_atomic(
+        target,
+        local_rollout_summary_jsonl_bytes(
+            source,
+            rollout,
+            rollout_ref,
+            mtime_fallback_timestamp=mtime_fallback_timestamp,
+        ),
+    )
     return target
 
 
@@ -1262,8 +1286,14 @@ def generate_local_rollout_summaries_for_source(
             or rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys)
         ):
             continue
+        active_mtime = rollout_active_mtime(rollout, gap_start, end) if rollout_mtime_fallback else None
         try:
-            summary = write_generated_local_rollout_summary(source, rollout, generated_root)
+            summary = write_generated_local_rollout_summary(
+                source,
+                rollout,
+                generated_root,
+                mtime_fallback_timestamp=iso(active_mtime) if active_mtime is not None else None,
+            )
         except (OSError, ValueError):
             continue
         if summary is not None:
@@ -2502,6 +2532,8 @@ def complete_summary_backing_rollout_refs(
     *,
     source_root: Path,
     max_scan_bytes: int,
+    allow_mtime_fallback: bool = False,
+    archived_duplicate_keys: set[str] | None = None,
 ) -> set[str]:
     refs: set[str] = set()
     for summary in summaries:
@@ -2546,6 +2578,8 @@ def complete_summary_backing_rollout_refs(
                 end,
                 source_root=source_root,
                 max_scan_bytes=max_scan_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
             )
         )
     return refs
@@ -2558,6 +2592,7 @@ def complete_scan_meta_backing_rollout_refs(
     *,
     source_root: Path,
     max_scan_bytes: int,
+    allow_mtime_fallback: bool = False,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
 ) -> set[str]:
@@ -2600,6 +2635,7 @@ def complete_scan_meta_backing_rollout_refs(
                 start,
                 end,
                 max_scan_bytes=max_scan_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
                 archived_duplicate_keys=archived_duplicate_keys,
             )
             or summary_context_relevant
@@ -5519,6 +5555,7 @@ def remote_summary_only_gaps(
             end,
             source_root=source.root,
             max_scan_bytes=max_scan_bytes,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
     if complete_summary_keys is None:
         complete_summary_keys = complete_summary_backing_rollout_keys(
@@ -5856,6 +5893,8 @@ def run_scan(
             end,
             source_root=source.root,
             max_scan_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
             summaries,
@@ -6187,6 +6226,8 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             end,
             source_root=source.root,
             max_scan_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
             summaries,
@@ -7289,6 +7330,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             end,
             source_root=root,
             max_scan_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
         summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
             summaries,

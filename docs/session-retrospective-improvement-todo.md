@@ -36,8 +36,14 @@ review gates, and merge before starting the next item.
      summaries, so compact extraction and map-reduce planning stay consistent.
    - Ensure repeated runs with the same output path do not let stale generated
      summaries from older runs feed `make-shards`.
-   - Bound generated-summary signal regex input for very large single-record
-     payloads while preserving head/tail signal detection.
+   - Bound generated-summary signal regex input with fixed-size chunk scanning
+     for very large single-record payloads while preserving full-text signal
+     detection, so middle-record signals cannot be silently hidden by coverage
+     proof.
+   - Preserve canonical local active-mtime fallback for generated summaries:
+     complete coverage proof must receive the same mtime policy as raw rollout
+     scanning, and generated records without timestamps should carry the active
+     mtime fallback timestamp.
    - Status: implemented in the local oversized rollout summaries PR; review
      and merge pending.
 
