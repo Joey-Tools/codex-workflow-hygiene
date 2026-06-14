@@ -8413,6 +8413,71 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertTrue(any(row.get("status") == "oversized" for row in shard_rows))
         self.assertFalse(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
 
+    def test_tail_limited_generated_local_summary_hash_detects_same_size_rollout_change(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            rows = [
+                message("user", "You missed verification for this generated summary.", "2026-05-01T10:00:00Z"),
+            ]
+            rows.extend(
+                message(
+                    "assistant",
+                    f"ordinary assistant output {index} " + ("x" * 200),
+                    f"2026-05-01T10:{(index + 1) // 60:02d}:{(index + 1) % 60:02d}Z",
+                )
+                for index in range(60)
+            )
+            write_jsonl(rollout, rows)
+            output = safe_output_dir(raw)
+            MODULE.run_discover(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    max_raw_bytes=3000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            generated_root = Path(manifest["sources"][0]["generated_summary_root"])
+            generated_summary = next(generated_root.rglob("rollout-summary*.jsonl"))
+            scan_meta = json.loads(generated_summary.read_text(encoding="utf-8").splitlines()[0])
+            replacement = MODULE.jsonl_bytes(
+                [
+                    message("user", "Different same-size prompt for tail-limited stale detection.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "y" * 1000, "2026-05-01T10:00:01Z"),
+                ]
+            )
+            original_size = rollout.stat().st_size
+            self.assertLess(len(replacement), original_size)
+            rollout.write_bytes(replacement[:-1] + (b" " * (original_size - len(replacement))) + b"\n")
+            self.assertEqual(rollout.stat().st_size, original_size)
+            shard_output = safe_output_dir(raw, "tail-limited-stale-hash-shards")
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(output / "shard_manifest.json"),
+                    "--output",
+                    str(shard_output),
+                    "--max-raw-bytes",
+                    "3000",
+                ]
+            )
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertTrue(scan_meta["tail_record_limit_reached"])
+        self.assertRegex(scan_meta.get("source_sha256", ""), r"^[0-9a-f]{64}$")
+        self.assertTrue(any(row.get("status") == "oversized" for row in shard_rows))
+        self.assertFalse(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
+
     def test_generated_local_summary_preserves_under_asking_and_over_exploration_flags(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

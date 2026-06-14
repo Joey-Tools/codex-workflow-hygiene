@@ -2503,6 +2503,7 @@ def complete_summary_backing_source_identity_by_ref(
     *,
     max_scan_bytes: int,
     source_root: Path | None = None,
+    allow_tail_record_limit: bool = False,
 ) -> dict[str, RolloutSourceIdentity] | None:
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
         path,
@@ -2513,7 +2514,12 @@ def complete_summary_backing_source_identity_by_ref(
     )
     if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
         return None
-    proof = complete_scan_meta_backing_source_bytes_by_ref(path, start, end)
+    proof = complete_scan_meta_backing_source_bytes_by_ref(
+        path,
+        start,
+        end,
+        allow_tail_record_limit=allow_tail_record_limit,
+    )
     if proof is None:
         return None
     if proof.source_bytes_by_ref:
@@ -2541,6 +2547,7 @@ def complete_summary_backing_source_bytes_by_ref(
     *,
     max_scan_bytes: int,
     source_root: Path | None = None,
+    allow_tail_record_limit: bool = False,
 ) -> dict[str, int] | None:
     identities = complete_summary_backing_source_identity_by_ref(
         path,
@@ -2548,6 +2555,7 @@ def complete_summary_backing_source_bytes_by_ref(
         end,
         max_scan_bytes=max_scan_bytes,
         source_root=source_root,
+        allow_tail_record_limit=allow_tail_record_limit,
     )
     if identities is None:
         return None
@@ -2567,6 +2575,11 @@ def complete_summary_backing_rollout_refs(
 ) -> set[str]:
     refs: set[str] = set()
     for summary in summaries:
+        allow_generated_local_coverage = summary_allows_generated_local_coverage(
+            summary,
+            generated_summary_paths,
+            max_scan_bytes=max_scan_bytes,
+        )
         if not summary_metadata_size_within_scan_cap(summary, max_scan_bytes):
             continue
         if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
@@ -2577,6 +2590,7 @@ def complete_summary_backing_rollout_refs(
             start,
             end,
             max_scan_bytes=max_scan_bytes,
+            allow_tail_record_limit=allow_generated_local_coverage,
         ):
             continue
         hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(summary, max_scan_bytes)
@@ -2588,6 +2602,7 @@ def complete_summary_backing_rollout_refs(
                 end,
                 max_scan_bytes=max_scan_bytes,
                 source_root=source_root,
+                allow_tail_record_limit=allow_generated_local_coverage,
             )
             if source_identity_by_ref is not None:
                 refs.update(
@@ -2610,11 +2625,7 @@ def complete_summary_backing_rollout_refs(
                 max_scan_bytes=max_scan_bytes,
                 allow_mtime_fallback=allow_mtime_fallback,
                 archived_duplicate_keys=archived_duplicate_keys,
-                allow_generated_local_coverage=summary_allows_generated_local_coverage(
-                    summary,
-                    generated_summary_paths,
-                    max_scan_bytes=max_scan_bytes,
-                ),
+                allow_generated_local_coverage=allow_generated_local_coverage,
             )
         )
     return refs
@@ -2788,6 +2799,11 @@ def complete_summary_backing_rollout_keys(
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source_root)
     keys: set[str] = set()
     for summary in summaries:
+        allow_generated_local_coverage = summary_allows_generated_local_coverage(
+            summary,
+            generated_summary_paths,
+            max_scan_bytes=max_scan_bytes,
+        )
         if not summary_metadata_size_within_scan_cap(summary, max_scan_bytes):
             continue
         if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
@@ -2800,6 +2816,7 @@ def complete_summary_backing_rollout_keys(
             max_scan_bytes=max_scan_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            allow_tail_record_limit=allow_generated_local_coverage,
         ):
             continue
         hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(summary, max_scan_bytes)
@@ -2811,6 +2828,7 @@ def complete_summary_backing_rollout_keys(
                 end,
                 max_scan_bytes=max_scan_bytes,
                 source_root=source_root,
+                allow_tail_record_limit=allow_generated_local_coverage,
             )
             if source_identity_by_ref is not None:
                 for ref, source_identity in source_identity_by_ref.items():
@@ -2835,11 +2853,7 @@ def complete_summary_backing_rollout_keys(
             max_scan_bytes=max_scan_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
-            allow_generated_local_coverage=summary_allows_generated_local_coverage(
-                summary,
-                generated_summary_paths,
-                max_scan_bytes=max_scan_bytes,
-            ),
+            allow_generated_local_coverage=allow_generated_local_coverage,
         ):
             _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
             selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
@@ -3071,6 +3085,7 @@ def summary_file_has_stale_backing_source(
     max_scan_bytes: int,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
+    allow_tail_record_limit: bool = False,
 ) -> bool:
     try:
         size = path.stat().st_size
@@ -3102,9 +3117,15 @@ def summary_file_has_stale_backing_source(
         end,
         max_scan_bytes=max_scan_bytes,
         source_root=source_root,
+        allow_tail_record_limit=allow_tail_record_limit,
     )
     if source_identity_by_ref is None:
-        proof = complete_scan_meta_backing_source_bytes_by_ref(path, start, end)
+        proof = complete_scan_meta_backing_source_bytes_by_ref(
+            path,
+            start,
+            end,
+            allow_tail_record_limit=allow_tail_record_limit,
+        )
         if proof is not None:
             return True
         if summary_file_has_malformed_scan_meta_source_sha256(path):
@@ -3146,6 +3167,7 @@ def summary_file_stale_backing_requires_gap(
     allow_mtime_fallback: bool = False,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
+    allow_tail_record_limit: bool = False,
 ) -> bool:
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
         path,
@@ -3166,7 +3188,12 @@ def summary_file_stale_backing_requires_gap(
     if source_identity_by_ref is None:
         if summary_file_has_malformed_scan_meta_source_sha256(path):
             return True
-        proof = complete_scan_meta_backing_source_bytes_by_ref(path, start, end)
+        proof = complete_scan_meta_backing_source_bytes_by_ref(
+            path,
+            start,
+            end,
+            allow_tail_record_limit=allow_tail_record_limit,
+        )
         if proof is None:
             source_bytes = summary_file_declared_source_bytes(path)
             if source_bytes is None:
@@ -3221,6 +3248,7 @@ def stale_backing_summary_paths(
     max_scan_bytes: int,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
+    generated_summary_paths: set[Path] | None = None,
 ) -> set[Path]:
     return {
         summary
@@ -3233,6 +3261,11 @@ def stale_backing_summary_paths(
             max_scan_bytes=max_scan_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            allow_tail_record_limit=summary_allows_generated_local_coverage(
+                summary,
+                generated_summary_paths,
+                max_scan_bytes=max_scan_bytes,
+            ),
         )
     }
 
@@ -3247,6 +3280,7 @@ def stale_backing_summary_gap_paths(
     allow_mtime_fallback: bool = False,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
+    generated_summary_paths: set[Path] | None = None,
 ) -> set[Path]:
     return {
         summary
@@ -3260,6 +3294,11 @@ def stale_backing_summary_gap_paths(
             allow_mtime_fallback=allow_mtime_fallback,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            allow_tail_record_limit=summary_allows_generated_local_coverage(
+                summary,
+                generated_summary_paths,
+                max_scan_bytes=max_scan_bytes,
+            ),
         )
     }
 
@@ -5967,6 +6006,7 @@ def run_scan(
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         stale_summary_gap_paths = stale_backing_summary_gap_paths(
             stale_summary_paths,
@@ -5977,6 +6017,7 @@ def run_scan(
             allow_mtime_fallback=allow_mtime_fallback,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         source_materialization_gaps = materialization_gaps_for_source(source)
         source_summary_only_gaps = remote_summary_only_gaps(
@@ -6310,6 +6351,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         stale_summary_gap_paths = stale_backing_summary_gap_paths(
             stale_summary_paths,
@@ -6320,6 +6362,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             allow_mtime_fallback=allow_mtime_fallback,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
@@ -7283,6 +7326,11 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            allow_tail_record_limit=summary_allows_generated_local_coverage(
+                summary,
+                generated_summary_paths,
+                max_scan_bytes=max_raw_bytes,
+            ),
         ):
             if summary_file_stale_backing_requires_gap(
                 summary,
@@ -7293,6 +7341,11 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 allow_mtime_fallback=allow_mtime_fallback,
                 selected_source_identity_by_key=selected_source_identity_by_key,
                 archived_duplicate_keys=archived_duplicate_keys,
+                allow_tail_record_limit=summary_allows_generated_local_coverage(
+                    summary,
+                    generated_summary_paths,
+                    max_scan_bytes=max_raw_bytes,
+                ),
             ):
                 row["status"] = "partial"
                 row["coverage_gap"] = "summary source_bytes does not match current backing rollout; regenerate bounded rollout-summary before extractor handoff"

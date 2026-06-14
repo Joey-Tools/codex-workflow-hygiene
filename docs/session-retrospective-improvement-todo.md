@@ -36,6 +36,9 @@ review gates, and merge before starting the next item.
      summaries, so compact extraction and map-reduce planning stay consistent.
    - Ensure repeated runs with the same output path do not let stale generated
      summaries from older runs feed `make-shards`.
+   - Ensure stale checks for manifest-listed generated summaries keep using
+     `source_sha256` even when `tail_record_limit_reached=true`, so a same-size
+     backing rollout content change cannot be treated as ready coverage.
    - Bound generated-summary signal regex input with fixed-size chunk scanning
      for very large single-record payloads while preserving full-text signal
      detection, so middle-record signals cannot be silently hidden by coverage
