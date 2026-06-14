@@ -4371,10 +4371,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_weekly_dry_run_quotes_next_command_run_dir(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
-            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-weekly-large.jsonl"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01T10-00-00-weekly-large.jsonl"
             write_jsonl(
-                rollout,
-                [message("user", f"Weekly oversized task {index}.", "2026-05-01T10:00:00Z") for index in range(40)],
+                summary,
+                [
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "text": "permission denied " + ("x" * 1000),
+                    }
+                ],
             )
             output = safe_output_dir(raw, "weekly dry;run")
 
@@ -4467,10 +4473,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_weekly_repair_uses_weekly_default_output_and_report_kind(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
-            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-weekly-large.jsonl"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01T10-00-00-weekly-large.jsonl"
             write_jsonl(
-                rollout,
-                [message("user", f"Weekly oversized task {index}.", "2026-05-01T10:00:00Z") for index in range(40)],
+                summary,
+                [
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "text": "permission denied " + ("x" * 1000),
+                    }
+                ],
             )
             dry_run = safe_output_dir(raw, "weekly-dry-run")
 
@@ -4514,10 +4526,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_weekly_dry_run_repair_runs_transient_follow_up_when_gaps_exist(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
-            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-combined.jsonl"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01T10-00-00-combined.jsonl"
             write_jsonl(
-                rollout,
-                [message("user", f"Combined repair task {index}.", "2026-05-01T10:00:00Z") for index in range(40)],
+                summary,
+                [
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "text": "permission denied " + ("x" * 1000),
+                    }
+                ],
             )
             output = safe_output_dir(raw, "weekly-dry-run")
 
@@ -4646,13 +4664,19 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertTrue(all(Path(source["root"]).is_absolute() for source in manifest["sources"]))
         self.assertEqual(trend["turn_count"], 1)
 
-    def test_repair_coverage_reruns_with_larger_raw_limit_for_local_oversized_rollout(self) -> None:
+    def test_repair_coverage_reruns_with_larger_raw_limit_for_local_oversized_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
-            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01T10-00-00-large.jsonl"
             write_jsonl(
-                rollout,
-                [message("user", f"Oversized local task {index}.", "2026-05-01T10:00:00Z") for index in range(40)],
+                summary,
+                [
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "text": "permission denied " + ("x" * 1000),
+                    }
+                ],
             )
             dry_run = safe_output_dir(raw, "baseline-dry-run")
             repair = safe_output_dir(raw, "coverage-repair")
@@ -4693,8 +4717,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             after = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
             report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
 
-        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in before["coverage_gaps"]])
-        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in after["coverage_gaps"]])
+        self.assertIn("oversized_summary_skipped", [gap["reason"] for gap in before["coverage_gaps"]])
+        self.assertNotIn("oversized_summary_skipped", [gap["reason"] for gap in after["coverage_gaps"]])
         self.assertEqual(report["kind"], "coverage_repair")
         self.assertFalse(report["retained_export_created"])
         self.assertFalse(report["state_advanced"])
@@ -7989,7 +8013,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             write_jsonl(
                 rollout,
                 [
-                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("user", "Please build the weekly helper for the report.", "2026-05-01T10:00:00Z"),
                     message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
                 ],
             )
@@ -8109,6 +8133,67 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("oversized_rollout_skipped", reasons)
         self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
 
+    def test_oversized_generated_local_summary_still_covers_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=1000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            generated_root = Path(manifest["sources"][0]["generated_summary_root"])
+            generated_summary = next(generated_root.rglob("rollout-summary*.jsonl"))
+            generated_summary_size = generated_summary.stat().st_size
+            shard_output = safe_output_dir(raw, "oversized-generated-shards")
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(output / "shard_manifest.json"),
+                    "--output",
+                    str(shard_output),
+                    "--max-raw-bytes",
+                    "1000",
+                ]
+            )
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("user_correction", rows[0]["issue_flags"])
+        self.assertGreater(generated_summary_size, 1000)
+        self.assertNotIn("oversized_rollout_skipped", reasons)
+        self.assertNotIn("oversized_summary_skipped", reasons)
+        self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
+        self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
+
     def test_output_safe_root_keeps_generated_summaries_inside_safe_root(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -8137,6 +8222,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
             generated_root = Path(manifest["sources"][0]["generated_summary_root"])
+            MODULE.main(["validate-output", "--run-dir", str(output)])
 
         self.assertEqual(generated_root.relative_to(output).parts[0], MODULE.LOCAL_GENERATED_SUMMARY_DIR_SUFFIX)
 

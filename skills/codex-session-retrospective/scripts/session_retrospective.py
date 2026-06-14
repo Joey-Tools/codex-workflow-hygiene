@@ -137,6 +137,7 @@ BARE_64_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F]
 SOURCE_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SUMMARY_HASH_VERIFY_MAX_BYTES = 2 * 1024 * 1024
 LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES = 16 * 1024 * 1024
+LOCAL_GENERATED_SUMMARY_SCAN_BYTES = 2 * 1024 * 1024
 LOCAL_ROLLOUT_SUMMARY_LIMIT = 200
 LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS = 1200
@@ -1096,6 +1097,19 @@ def generated_summary_artifact_path(path: Path) -> bool:
     return any(part == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX or part.endswith(f"-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}") for part in path.parts)
 
 
+def summary_metadata_scan_max_bytes(path: Path, max_scan_bytes: int) -> int:
+    if generated_summary_artifact_path(path):
+        return max(max_scan_bytes, LOCAL_GENERATED_SUMMARY_SCAN_BYTES)
+    return max_scan_bytes
+
+
+def summary_metadata_size_within_scan_cap(path: Path, max_scan_bytes: int) -> bool:
+    try:
+        return path.stat().st_size <= summary_metadata_scan_max_bytes(path, max_scan_bytes)
+    except OSError:
+        return False
+
+
 def generated_summary_root_for_source(base: Path, source: Source) -> Path:
     safe_host = re.sub(r"[^A-Za-z0-9_.-]+", "_", source.host).strip("._-") or "source"
     digest = hashlib.sha256(f"{source.host}\0{source.root.as_posix()}".encode("utf-8")).hexdigest()[:12]
@@ -1578,6 +1592,7 @@ def summary_file_relevant_with_scan_cap(
     *,
     max_scan_bytes: int,
 ) -> bool:
+    metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     if start is None and end is None:
         return True
     summary_date = summary_date_from_path(path)
@@ -1587,7 +1602,7 @@ def summary_file_relevant_with_scan_cap(
                 path,
                 start,
                 end,
-                max_scan_bytes=max_scan_bytes,
+                max_scan_bytes=metadata_scan_bytes,
             )
         except OSError:
             return False
@@ -1596,22 +1611,22 @@ def summary_file_relevant_with_scan_cap(
         if summary_date + dt.timedelta(days=1) > start:
             return True
         try:
-            if path.stat().st_size > max_scan_bytes:
+            if path.stat().st_size > metadata_scan_bytes:
                 return False
         except OSError:
             return False
         try:
-            return raw_timestamp_in_window(path, start, end, max_scan_bytes=max_scan_bytes)
+            return raw_timestamp_in_window(path, start, end, max_scan_bytes=metadata_scan_bytes)
         except OSError:
             return False
     if summary_date and end and summary_date >= end:
         try:
-            if path.stat().st_size > max_scan_bytes:
+            if path.stat().st_size > metadata_scan_bytes:
                 return False
         except OSError:
             return False
         try:
-            return raw_timestamp_in_window(path, start, end, max_scan_bytes=max_scan_bytes)
+            return raw_timestamp_in_window(path, start, end, max_scan_bytes=metadata_scan_bytes)
         except OSError:
             return False
     return True
@@ -1881,7 +1896,7 @@ def summary_hash_verify_max_bytes(max_scan_bytes: int) -> int:
 
 def summary_identity_hash_verify_max_bytes(summary: Path, max_scan_bytes: int) -> int:
     base = summary_hash_verify_max_bytes(max_scan_bytes)
-    if summary_has_generated_local_coverage_proof(summary, max_scan_bytes=max_scan_bytes):
+    if generated_summary_artifact_path(summary):
         return max(base, LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES)
     return base
 
@@ -2092,14 +2107,15 @@ def summary_backing_rollout_refs(
     source_root: Path | None = None,
 ) -> tuple[set[str], bool, bool, bool]:
     refs: set[str] = set()
+    metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     try:
         with path.open("rb") as handle:
-            data = handle.read(max_scan_bytes + 1)
+            data = handle.read(metadata_scan_bytes + 1)
     except OSError:
         return refs, False, True, True
-    complete = len(data) <= max_scan_bytes
+    complete = len(data) <= metadata_scan_bytes
     if not complete:
-        data = data[:max_scan_bytes].rsplit(b"\n", 1)[0]
+        data = data[:metadata_scan_bytes].rsplit(b"\n", 1)[0]
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -2146,13 +2162,14 @@ def summary_backing_rollout_refs(
 def summary_scan_meta_backing_rollout_refs(path: Path, *, max_scan_bytes: int) -> tuple[set[str], bool]:
     refs: set[str] = set()
     invalid_ref_seen = False
+    metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     try:
         with path.open("rb") as handle:
-            data = handle.read(max_scan_bytes + 1)
+            data = handle.read(metadata_scan_bytes + 1)
     except OSError:
         invalid_ref_seen = True
         return refs, invalid_ref_seen
-    if len(data) > max_scan_bytes:
+    if len(data) > metadata_scan_bytes:
         return refs, invalid_ref_seen
     try:
         text = data.decode("utf-8")
@@ -2188,12 +2205,13 @@ def summary_scan_meta_backing_rollout_refs(path: Path, *, max_scan_bytes: int) -
 
 def summary_has_generated_local_coverage_proof(path: Path, *, max_scan_bytes: int) -> bool:
     proof_seen = False
+    metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     try:
         with path.open("rb") as handle:
-            data = handle.read(max_scan_bytes + 1)
+            data = handle.read(metadata_scan_bytes + 1)
     except OSError:
         return False
-    if len(data) > max_scan_bytes:
+    if len(data) > metadata_scan_bytes:
         return False
     try:
         text = data.decode("utf-8")
@@ -2223,13 +2241,14 @@ def summary_file_has_session_meta_in_window(
     *,
     max_scan_bytes: int,
 ) -> bool:
+    metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     try:
         with path.open("rb") as handle:
-            data = handle.read(max_scan_bytes + 1)
+            data = handle.read(metadata_scan_bytes + 1)
     except OSError:
         return False
-    if len(data) > max_scan_bytes:
-        data = data[:max_scan_bytes].rsplit(b"\n", 1)[0]
+    if len(data) > metadata_scan_bytes:
+        data = data[:metadata_scan_bytes].rsplit(b"\n", 1)[0]
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -2454,11 +2473,7 @@ def complete_summary_backing_rollout_refs(
 ) -> set[str]:
     refs: set[str] = set()
     for summary in summaries:
-        try:
-            size = summary.stat().st_size
-        except OSError:
-            continue
-        if size > max_scan_bytes:
+        if not summary_metadata_size_within_scan_cap(summary, max_scan_bytes):
             continue
         if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
             continue
@@ -2651,11 +2666,7 @@ def complete_summary_backing_rollout_keys(
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source_root)
     keys: set[str] = set()
     for summary in summaries:
-        try:
-            size = summary.stat().st_size
-        except OSError:
-            continue
-        if size > max_scan_bytes:
+        if not summary_metadata_size_within_scan_cap(summary, max_scan_bytes):
             continue
         if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
             continue
@@ -2938,7 +2949,7 @@ def summary_file_has_stale_backing_source(
         size = path.stat().st_size
     except OSError:
         return False
-    if size > max_scan_bytes:
+    if size > summary_metadata_scan_max_bytes(path, max_scan_bytes):
         return False
     if not summary_file_relevant_or_backing_ref_relevant(
         path,
@@ -3195,12 +3206,13 @@ def summary_file_maybe_relevant_with_scan_cap(
     if summary_date is None:
         return summary_file_relevant_with_scan_cap(path, start, end, max_scan_bytes=max_scan_bytes)
     if summary_date and end and summary_date >= end:
+        metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
         try:
             found, complete = oversized_rollout_has_timestamp_in_window(
                 path,
                 start,
                 end,
-                max_scan_bytes=max_scan_bytes,
+                max_scan_bytes=metadata_scan_bytes,
             )
         except OSError:
             return False
@@ -5928,7 +5940,7 @@ def run_scan(
             continue
         for summary in summaries:
             size = summary.stat().st_size
-            if size > max_raw_bytes:
+            if size > summary_metadata_scan_max_bytes(summary, max_raw_bytes):
                 if summary_file_maybe_relevant_or_backing_ref_relevant(
                     summary,
                     gap_start,
@@ -7098,7 +7110,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
 
     def append_summary_shard(summary: Path) -> None:
         row = shard_row(summary, bytes=summary.stat().st_size, kind="summary")
-        if row["bytes"] > max_raw_bytes:
+        if row["bytes"] > summary_metadata_scan_max_bytes(summary, max_raw_bytes):
             if not summary_file_maybe_relevant_or_backing_ref_relevant(
                 summary,
                 start,
@@ -7329,6 +7341,10 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     required_files = ("turn_summaries.jsonl", *RETAINED_OUTPUT_FILES)
     allowed = set(TRANSIENT_OUTPUT_FILES) | set(RETAINED_OUTPUT_FILES) | {"state.json"}
     for path in run_dir.iterdir():
+        if path.name == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX:
+            if path.is_symlink() or not path.is_dir():
+                raise SystemExit(f"unexpected output file: {path}")
+            continue
         if path.name not in allowed or path.is_symlink() or not path.is_file():
             raise SystemExit(f"unexpected output file: {path}")
     for name in required_files:
