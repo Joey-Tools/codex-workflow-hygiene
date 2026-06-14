@@ -2296,6 +2296,23 @@ def summary_has_generated_local_coverage_proof(path: Path, *, max_scan_bytes: in
     return proof_seen
 
 
+def generated_summary_path_set(paths: Iterable[Path]) -> set[Path]:
+    return {path.resolve(strict=False) for path in paths}
+
+
+def summary_allows_generated_local_coverage(
+    path: Path,
+    generated_summary_paths: set[Path] | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    if not generated_summary_paths:
+        return False
+    if path.resolve(strict=False) not in generated_summary_paths:
+        return False
+    return summary_has_generated_local_coverage_proof(path, max_scan_bytes=max_scan_bytes)
+
+
 def summary_file_has_session_meta_in_window(
     path: Path,
     start: dt.datetime | None,
@@ -2366,7 +2383,11 @@ class RolloutSourceIdentity:
     ref: str | None = None
 
 
-def complete_scan_meta_record_source_bytes(record: dict[str, Any]) -> int | None:
+def complete_scan_meta_record_source_bytes(
+    record: dict[str, Any],
+    *,
+    allow_tail_record_limit: bool = False,
+) -> int | None:
     limit_fields = (
         "keyword_filter_applied",
         "record_limit_reached",
@@ -2382,8 +2403,11 @@ def complete_scan_meta_record_source_bytes(record: dict[str, Any]) -> int | None
     json_error_count = record.get("json_error_count")
     if type(json_error_count) is not int or json_error_count != 0:
         return None
-    if any(record.get(field) is not False for field in limit_fields):
-        return None
+    for field in limit_fields:
+        if field == "tail_record_limit_reached" and allow_tail_record_limit:
+            continue
+        if record.get(field) is not False:
+            return None
     source_bytes = record.get("source_bytes")
     if type(source_bytes) is not int or source_bytes < 0:
         return None
@@ -2420,6 +2444,8 @@ def complete_scan_meta_backing_source_bytes_by_ref(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
+    *,
+    allow_tail_record_limit: bool = False,
 ) -> CompleteScanMetaProof | None:
     saw_scan_meta = False
     has_rollout_ref = False
@@ -2430,7 +2456,10 @@ def complete_scan_meta_backing_source_bytes_by_ref(
             if str(record.get("kind") or "") != "scan_meta":
                 continue
             saw_scan_meta = True
-            source_bytes = complete_scan_meta_record_source_bytes(record)
+            source_bytes = complete_scan_meta_record_source_bytes(
+                record,
+                allow_tail_record_limit=allow_tail_record_limit,
+            )
             if source_bytes is None:
                 return None
             source_sha256 = complete_scan_meta_record_source_sha256(record)
@@ -2534,6 +2563,7 @@ def complete_summary_backing_rollout_refs(
     max_scan_bytes: int,
     allow_mtime_fallback: bool = False,
     archived_duplicate_keys: set[str] | None = None,
+    generated_summary_paths: set[Path] | None = None,
 ) -> set[str]:
     refs: set[str] = set()
     for summary in summaries:
@@ -2580,6 +2610,11 @@ def complete_summary_backing_rollout_refs(
                 max_scan_bytes=max_scan_bytes,
                 allow_mtime_fallback=allow_mtime_fallback,
                 archived_duplicate_keys=archived_duplicate_keys,
+                allow_generated_local_coverage=summary_allows_generated_local_coverage(
+                    summary,
+                    generated_summary_paths,
+                    max_scan_bytes=max_scan_bytes,
+                ),
             )
         )
     return refs
@@ -2595,8 +2630,9 @@ def complete_scan_meta_backing_rollout_refs(
     allow_mtime_fallback: bool = False,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
+    allow_generated_local_coverage: bool = False,
 ) -> set[str]:
-    if not summary_has_generated_local_coverage_proof(summary, max_scan_bytes=max_scan_bytes):
+    if not allow_generated_local_coverage:
         return set()
     scan_meta_refs, invalid_ref_seen = summary_scan_meta_backing_rollout_refs(
         summary,
@@ -2604,7 +2640,12 @@ def complete_scan_meta_backing_rollout_refs(
     )
     if invalid_ref_seen or not scan_meta_refs:
         return set()
-    proof = complete_scan_meta_backing_source_bytes_by_ref(summary, start, end)
+    proof = complete_scan_meta_backing_source_bytes_by_ref(
+        summary,
+        start,
+        end,
+        allow_tail_record_limit=True,
+    )
     if proof is None or not proof.source_bytes_by_ref:
         return set()
     summary_context_relevant = summary_file_relevant_with_scan_cap(
@@ -2741,6 +2782,7 @@ def complete_summary_backing_rollout_keys(
     max_scan_bytes: int,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
+    generated_summary_paths: set[Path] | None = None,
 ) -> set[str]:
     if selected_source_identity_by_key is None:
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source_root)
@@ -2793,6 +2835,11 @@ def complete_summary_backing_rollout_keys(
             max_scan_bytes=max_scan_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            allow_generated_local_coverage=summary_allows_generated_local_coverage(
+                summary,
+                generated_summary_paths,
+                max_scan_bytes=max_scan_bytes,
+            ),
         ):
             _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
             selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
@@ -3315,7 +3362,7 @@ def summary_file_has_truncated_scan(path: Path) -> bool:
     return False
 
 
-def summary_file_has_record_limit_gap(path: Path) -> bool:
+def summary_file_has_record_limit_gap(path: Path, *, allow_tail_record_limit: bool = False) -> bool:
     limit_fields = (
         "keyword_filter_applied",
         "record_limit_reached",
@@ -3339,7 +3386,10 @@ def summary_file_has_record_limit_gap(path: Path) -> bool:
             if type(source_bytes) is int and type(scan_bytes) is int and scan_bytes < source_bytes:
                 return True
             for field in limit_fields:
-                if record.get(field) is True or f"{field}=true" in text:
+                if field == "tail_record_limit_reached" and allow_tail_record_limit:
+                    continue
+                text_field_true = re.search(rf"(?<![A-Za-z0-9_]){re.escape(field)}=true(?![A-Za-z0-9_])", text)
+                if record.get(field) is True or text_field_true:
                     return True
     except (OSError, ValueError):
         return False
@@ -5887,6 +5937,7 @@ def run_scan(
         )
         if generated_summaries:
             summaries = sorted([*summaries, *generated_summaries])
+        generated_summary_paths = generated_summary_path_set(generated_summaries)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
             gap_start,
@@ -5895,6 +5946,7 @@ def run_scan(
             max_scan_bytes=max_raw_bytes,
             allow_mtime_fallback=allow_mtime_fallback,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
             summaries,
@@ -5905,6 +5957,7 @@ def run_scan(
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         stale_summary_paths = stale_backing_summary_paths(
             summaries,
@@ -6041,7 +6094,14 @@ def run_scan(
             jsonl_error = first_jsonl_error(summary)
             if (
                 summary_file_has_truncated_scan(summary)
-                or summary_file_has_record_limit_gap(summary)
+                or summary_file_has_record_limit_gap(
+                    summary,
+                    allow_tail_record_limit=summary_allows_generated_local_coverage(
+                        summary,
+                        generated_summary_paths,
+                        max_scan_bytes=max_raw_bytes,
+                    ),
+                )
             ) and summary_file_maybe_relevant_or_backing_ref_relevant(
                 summary,
                 gap_start,
@@ -6220,6 +6280,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         )
         if generated_summaries:
             summaries = sorted([*summaries, *generated_summaries])
+        generated_summary_paths = generated_summary_path_set(generated_summaries)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
             start,
@@ -6228,6 +6289,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             max_scan_bytes=max_raw_bytes,
             allow_mtime_fallback=allow_mtime_fallback,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
             summaries,
@@ -6238,6 +6300,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         stale_summary_paths = stale_backing_summary_paths(
             summaries,
@@ -7236,7 +7299,14 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 rows.append(row)
             return
         jsonl_error = first_jsonl_error(summary)
-        if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(summary):
+        if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(
+            summary,
+            allow_tail_record_limit=summary_allows_generated_local_coverage(
+                summary,
+                generated_summary_paths,
+                max_scan_bytes=max_raw_bytes,
+            ),
+        ):
             if not summary_file_maybe_relevant_or_backing_ref_relevant(
                 summary,
                 start,
@@ -7303,6 +7373,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             generated_summary_root,
             source_entry.get("generated_summaries"),
         )
+        generated_summary_paths = generated_summary_path_set(generated_summaries)
         source = Source(str(host), root)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not root.exists():
@@ -7332,6 +7403,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             max_scan_bytes=max_raw_bytes,
             allow_mtime_fallback=allow_mtime_fallback,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
             summaries,
@@ -7342,6 +7414,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,

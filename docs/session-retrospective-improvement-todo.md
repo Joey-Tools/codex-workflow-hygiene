@@ -44,6 +44,14 @@ review gates, and merge before starting the next item.
      complete coverage proof must receive the same mtime policy as raw rollout
      scanning, and generated records without timestamps should carry the active
      mtime fallback timestamp.
+   - Trust `local_generated_rollout_summary_v1` coverage proof only for the
+     exact generated summary files listed in the current transient manifest.
+     Source-tree `rollout-summary*.jsonl` files must not become trusted local
+     generated summaries merely by carrying the same JSON field.
+   - Allow `tail_record_limit_reached=true` only for manifest-listed local
+     generated summaries whose full scan completed and whose signal/match
+     limits did not fire; omitted benign tail records must not keep valid
+     oversized rollout coverage gaps open.
    - Status: implemented in the local oversized rollout summaries PR; review
      and merge pending.
 

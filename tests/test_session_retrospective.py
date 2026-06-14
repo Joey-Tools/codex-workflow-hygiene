@@ -8452,6 +8452,117 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertTrue(any({"under_asking", "over_exploration"}.issubset(set(row["issue_flags"])) for row in rows))
         self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
 
+    def test_generated_local_summary_tail_limit_still_covers_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            rows = [
+                message("user", "You missed verification for this generated summary.", "2026-05-01T10:00:00Z"),
+            ]
+            rows.extend(
+                message(
+                    "assistant",
+                    f"ordinary assistant output {index} " + ("x" * 200),
+                    f"2026-05-01T10:{(index + 1) // 60:02d}:{(index + 1) % 60:02d}Z",
+                )
+                for index in range(60)
+            )
+            write_jsonl(rollout, rows)
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=3000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            generated_root = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))["sources"][0][
+                "generated_summary_root"
+            ]
+            generated_summary = next(Path(generated_root).rglob("rollout-summary*.jsonl"))
+            scan_meta = json.loads(generated_summary.read_text(encoding="utf-8").splitlines()[0])
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(scan_meta["tail_record_limit_reached"])
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertNotIn("oversized_rollout_skipped", reasons)
+        self.assertNotIn("truncated_rollout_summary", reasons)
+
+    def test_source_summary_with_generated_coverage_proof_does_not_cover_oversized_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            rollout_ref = MODULE.source_relative_path_ref(rollout, root)
+            self.assertIsNotNone(rollout_ref)
+            fake_summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-fake.jsonl"
+            write_jsonl(
+                fake_summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        coverage_proof=MODULE.LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF,
+                        rollout=rollout_ref,
+                        scan_bytes=rollout.stat().st_size,
+                        source_bytes=rollout.stat().st_size,
+                    ),
+                ],
+            )
+            manifest_dir = safe_output_dir(raw, "fake-proof-manifest")
+            manifest_dir.mkdir(parents=True)
+            manifest_path = manifest_dir / "shard_manifest.json"
+            manifest = manifest_fixture(
+                sources=[
+                    {
+                        "host": "local",
+                        "root": root.as_posix(),
+                        "root_ref": "path_ref_v1:0123456789abcdef",
+                        "rollout_count": 1,
+                        "summary_count": 1,
+                        "status": "ready",
+                    }
+                ]
+            )
+            manifest.pop("retention_safe", None)
+            manifest.pop("retention_note", None)
+            manifest_path.write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            shard_output = safe_output_dir(raw, "fake-proof-shards")
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(manifest_path),
+                    "--output",
+                    str(shard_output),
+                    "--max-raw-bytes",
+                    "3000",
+                    "--include-raw-paths",
+                ]
+            )
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertTrue(any(row.get("path") == rollout.as_posix() and row.get("status") == "oversized" for row in shard_rows))
+        self.assertFalse(any(row.get("path") == fake_summary.as_posix() and row.get("status") == "ready" for row in shard_rows))
+
     def test_truncated_generated_local_summary_preserves_coverage_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
