@@ -6508,6 +6508,17 @@ def source_manifest_status(
     return "empty"
 
 
+def source_path_coverage_gap(source: Source, path: Path, reason: str, **extra: Any) -> dict[str, Any]:
+    gap = {
+        "host": source.host,
+        "root_ref": path_ref(source.root),
+        "path_ref": path_ref(path),
+        "reason": reason,
+    }
+    gap.update(extra)
+    return gap
+
+
 def earliest_rollout_sources(sources: list[Source]) -> list[Source]:
     eligible: list[Source] = []
     for source in sources:
@@ -6538,24 +6549,10 @@ def run_scan(
     generated_summary_base = generated_summary_base_for_output(output)
 
     def append_oversized_rollout_gap(path: Path, size: int) -> None:
-        coverage_gaps.append(
-            {
-                "host": source.host,
-                "path_ref": path_ref(path),
-                "bytes": size,
-                "reason": "oversized_rollout_skipped",
-            }
-        )
+        coverage_gaps.append(source_path_coverage_gap(source, path, "oversized_rollout_skipped", bytes=size))
 
     def append_oversized_summary_gap(path: Path, size: int) -> None:
-        coverage_gaps.append(
-            {
-                "host": source.host,
-                "path_ref": path_ref(path),
-                "bytes": size,
-                "reason": "oversized_summary_skipped",
-            }
-        )
+        coverage_gaps.append(source_path_coverage_gap(source, path, "oversized_summary_skipped", bytes=size))
 
     for source in sources:
         if not source.root.exists():
@@ -6714,11 +6711,7 @@ def run_scan(
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
         stale_summary_gaps = [
-            {
-                "host": source.host,
-                "path_ref": path_ref(summary),
-                "reason": "stale_rollout_summary",
-            }
+            source_path_coverage_gap(source, summary, "stale_rollout_summary")
             for summary in stale_summary_gap_paths
         ]
         coverage_gaps.extend(stale_summary_gaps)
@@ -6765,13 +6758,7 @@ def run_scan(
                             rollout, gap_start, end
                         )
                     if relevant_invalid_rollout:
-                        coverage_gaps.append(
-                            {
-                                "host": source.host,
-                                "path_ref": path_ref(rollout),
-                                "reason": "invalid_jsonl",
-                            }
-                        )
+                        coverage_gaps.append(source_path_coverage_gap(source, rollout, "invalid_jsonl"))
                     continue
                 if not rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=rollout_mtime_fallback):
                     continue
@@ -6846,11 +6833,7 @@ def run_scan(
                 archived_duplicate_keys=archived_duplicate_keys,
             ):
                 coverage_gaps.append(
-                    {
-                        "host": source.host,
-                        "path_ref": path_ref(summary),
-                        "reason": "truncated_rollout_summary",
-                    }
+                    source_path_coverage_gap(source, summary, "truncated_rollout_summary")
                 )
             if jsonl_error is not None:
                 if (
@@ -6866,13 +6849,7 @@ def run_scan(
                         archived_duplicate_keys=archived_duplicate_keys,
                     )
                 ):
-                    coverage_gaps.append(
-                        {
-                            "host": source.host,
-                            "path_ref": path_ref(summary),
-                            "reason": "invalid_jsonl",
-                        }
-                    )
+                    coverage_gaps.append(source_path_coverage_gap(source, summary, "invalid_jsonl"))
                 continue
             if summary in stale_summary_paths and not remote_summary_fallback_is_extractable(
                 source,
@@ -7097,11 +7074,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         coverage_gaps.extend(source_materialization_gaps)
         coverage_gaps.extend(source_summary_only_gaps)
         stale_summary_gaps = [
-            {
-                "host": source.host,
-                "path_ref": path_ref(summary),
-                "reason": "stale_rollout_summary",
-            }
+            source_path_coverage_gap(source, summary, "stale_rollout_summary")
             for summary in stale_summary_gap_paths
         ]
         coverage_gaps.extend(stale_summary_gaps)
@@ -7295,29 +7268,61 @@ def coverage_gap_hosts(gaps: Iterable[dict[str, Any]]) -> set[str]:
     return {str(gap.get("host") or "unknown") for gap in gaps if isinstance(gap, dict)}
 
 
+def source_coverage_gap_index(
+    gaps: Iterable[dict[str, Any]],
+) -> tuple[set[tuple[str, str]], set[str], set[str]]:
+    root_scoped: set[tuple[str, str]] = set()
+    host_scoped: set[str] = set()
+    path_scoped: set[str] = set()
+    for gap in gaps:
+        if not isinstance(gap, dict):
+            continue
+        host = str(gap.get("host") or "unknown")
+        root_ref = gap.get("root_ref")
+        path_ref = gap.get("path_ref")
+        if isinstance(root_ref, str) and root_ref:
+            root_scoped.add((host, root_ref))
+        elif isinstance(path_ref, str) and path_ref:
+            path_scoped.add(host)
+        else:
+            host_scoped.add(host)
+    return root_scoped, host_scoped, path_scoped
+
+
 def source_coverage_summary(sources: Iterable[dict[str, Any]], coverage_gaps: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    source_rows = list(sources)
     hosts: list[dict[str, Any]] = []
     status_counts: Counter[str] = Counter()
-    gap_hosts = coverage_gap_hosts(coverage_gaps)
+    gap_root_keys, host_scoped_gap_hosts, path_scoped_gap_hosts = source_coverage_gap_index(coverage_gaps)
     ready_sources = 0
     empty_sources = 0
     blocked_sources = 0
-    for source in sources:
+    for source in source_rows:
         host = str(source.get("host") or "unknown")
         status = str(source.get("status") or "unknown")
-        no_activity = status == "empty" and host in DEFAULT_REMOTE_HOSTS and host not in gap_hosts
+        root_ref = source.get("root_ref")
+        has_coverage_gap = (
+            (isinstance(root_ref, str) and (host, root_ref) in gap_root_keys)
+            or host in host_scoped_gap_hosts
+            or host in path_scoped_gap_hosts
+        )
+        no_activity = status == "empty" and host in DEFAULT_REMOTE_HOSTS and not has_coverage_gap
         status_counts[status] += 1
-        if status == "ready":
+        if status == "ready" and not has_coverage_gap:
             ready_sources += 1
+            coverage_class = "ready"
         elif no_activity:
             empty_sources += 1
+            coverage_class = "no_activity"
         else:
             blocked_sources += 1
+            coverage_class = "blocked"
         hosts.append(
             {
                 "host": host,
                 "status": status,
-                "coverage_class": "no_activity" if no_activity else ("ready" if status == "ready" else "blocked"),
+                "coverage_class": coverage_class,
+                "has_coverage_gap": has_coverage_gap,
                 "rollout_count": report_int(source.get("rollout_count")),
                 "summary_count": report_int(source.get("summary_count")),
             }
@@ -7516,9 +7521,10 @@ def source_coverage_line_for_report(source_coverage: Any) -> str:
         if not isinstance(host, dict):
             continue
         host_lines.append(
-            "{host}:{status}({rollouts} rollouts, {summaries} summaries)".format(
+            "{host}:{coverage_class}(status={status}, {rollouts} rollouts, {summaries} summaries)".format(
                 host=host.get("host", "unknown"),
                 status=host.get("status", "unknown"),
+                coverage_class=host.get("coverage_class") or host.get("status", "unknown"),
                 rollouts=report_int(host.get("rollout_count")),
                 summaries=report_int(host.get("summary_count")),
             )
@@ -8418,6 +8424,19 @@ def run_coverage_repair(
         "max_raw_bytes": max_raw_bytes,
         "materialized_hosts": materialized_hosts,
     }
+    next_command = None
+    if repairable_coverage_gaps(repaired_manifest.get("coverage_gaps")):
+        command_name = "weekly-repair" if report_kind == "weekly_repair" else "repair-coverage"
+        next_command_argv = [
+            "python3",
+            Path(__file__).resolve().as_posix(),
+            command_name,
+            "--run-dir",
+            root.as_posix(),
+        ]
+        if args.allow_partial_hosts:
+            next_command_argv.append("--allow-partial-hosts")
+        next_command = shlex.join(next_command_argv)
     report = dry_run_report(
         kind=report_kind,
         root=root,
@@ -8425,6 +8444,7 @@ def run_coverage_repair(
         shards_dir=repaired_shards_dir,
         trend=trend,
         manifest=repaired_manifest,
+        next_command=next_command,
         repair_report=repair_summary,
     )
     write_dry_run_report_pair(root, "repair_report", report)
