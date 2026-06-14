@@ -7646,6 +7646,85 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(turns[0].session_id, MODULE.opaque_session_id("first-session"))
         self.assertEqual(turns[1].session_id, MODULE.opaque_session_id("second-session"))
 
+    def test_extract_remote_generated_summary_accepts_mixed_source_identity_and_legacy_coverage_proofs(
+        self,
+    ) -> None:
+        first_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-first.jsonl"
+        second_ref = "sessions/2026/05/01/rollout-2026-05-01T11-00-00-second.jsonl"
+        rows = [
+            complete_rollout_summary_scan_meta(
+                rollout=first_ref,
+                source_bytes=24000000,
+                scan_bytes=24000000,
+                source_sha256="b" * 64,
+                source_identity_proof=MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+                tail_record_limit_reached=True,
+            ),
+            complete_rollout_summary_scan_meta(
+                rollout=second_ref,
+                source_bytes=25000000,
+                scan_bytes=25000000,
+                source_sha256="c" * 64,
+                coverage_proof=MODULE.REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
+                tail_record_limit_reached=True,
+            ),
+            {
+                "kind": "session_meta",
+                "rollout": first_ref,
+                "session_id": "first-session",
+                "text": "session_id=first-session",
+            },
+            {
+                "kind": "session_meta",
+                "rollout": second_ref,
+                "session_id": "second-session",
+                "text": "session_id=second-session",
+            },
+            {
+                "kind": "user_message",
+                "timestamp": "2026-05-01T10:01:00Z",
+                "rollout": first_ref,
+                "text": "You forgot verification for /customer/repo",
+            },
+            {
+                "kind": "user_message",
+                "timestamp": "2026-05-01T11:01:00Z",
+                "rollout": second_ref,
+                "text": "You forgot verification for /customer/repo",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-generated.jsonl"
+            write_jsonl(summary, rows)
+            remote_paths = MODULE.generated_summary_path_set([summary])
+
+            has_source_identity = MODULE.summary_has_generated_remote_source_identity_proof(
+                summary,
+                max_scan_bytes=1000,
+            )
+            has_complete_coverage = MODULE.summary_has_generated_remote_coverage_proof(
+                summary,
+                max_scan_bytes=1000,
+            )
+            turns = MODULE.extract_summary_file(
+                MODULE.Source("miku-bot-dev", root),
+                summary,
+                None,
+                None,
+                remote_generated_summary_paths=remote_paths,
+            )
+
+        self.assertTrue(has_source_identity)
+        self.assertFalse(has_complete_coverage)
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].source_path, MODULE.remote_backing_path_ref("miku-bot-dev", first_ref))
+        self.assertEqual(turns[0].source_hash, MODULE.content_sha256_source_hash("b" * 64))
+        self.assertEqual(turns[1].source_path, MODULE.remote_backing_path_ref("miku-bot-dev", second_ref))
+        self.assertEqual(turns[1].source_hash, MODULE.content_sha256_source_hash("c" * 64))
+        self.assertEqual(turns[0].session_id, MODULE.opaque_session_id("first-session"))
+        self.assertEqual(turns[1].session_id, MODULE.opaque_session_id("second-session"))
+
     def test_remote_materialization_cleanup_failure_marks_source_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "materialized"

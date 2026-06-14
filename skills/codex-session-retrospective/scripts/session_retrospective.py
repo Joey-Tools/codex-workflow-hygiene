@@ -4432,6 +4432,13 @@ def extract_summary_file(
             remote_identity=True,
             allow_tail_record_limit=True,
         )
+        set_generated_identity_candidates(
+            proof_field="coverage_proof",
+            proof_value=REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
+            max_source_bytes=None,
+            remote_identity=True,
+            allow_tail_record_limit=True,
+        )
     if not generated_identity_candidates and has_remote_generated_coverage:
         set_generated_identity_candidates(
             proof_field="coverage_proof",
