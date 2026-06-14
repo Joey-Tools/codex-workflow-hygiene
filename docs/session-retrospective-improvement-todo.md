@@ -72,14 +72,58 @@ review gates, and merge before starting the next item.
    - Resolve generated local summary backing identity and `source_hash` lazily
      only when emitting a retained turn, so no-flag summaries do not read
      backing rollout hashes.
-   - Status: implemented in the local oversized rollout summaries PR; review
-     and merge pending.
+   - Status: completed in PRs #13 through #16.
 
 4. Remote oversized rollout summary completeness
    - Improve `rollout-summary` output for remote oversized rollouts so complete
      bounded signal can be distinguished from incomplete coverage.
    - Support chunked or multi-part summary records if needed.
    - Keep retained outputs free of raw remote transcript text.
+   - Generate trusted remote summaries during coverage repair when raw fetch
+     fails or when the fetched rollout is still larger than the repaired scan
+     limit.
+   - Trust remote-generated summary-only coverage only when the current
+     materialization metadata and transient manifest list the exact summary
+     file and its `scan_meta` carries complete `remote_generated_rollout_summary_v1`
+     proof.
+   - Emit `remote_generated_rollout_summary_v1` proof only for complete scans
+     with a valid `source_sha256`; summaries with parse errors, truncation,
+     keyword filters, record limits, or tail limits must remain coverage gaps.
+   - Consumer-side proof validation must also reject missing or malformed
+     `source_sha256`; do not let invalid proof switch a remote summary into
+     generated-summary identity mode.
+   - When coverage repair can fetch a remote raw rollout but it still exceeds
+     the scan limit, keep only the bounded generated summary after complete
+     proof succeeds; otherwise the oversized raw copy would recreate the same
+     coverage gap on the repaired scan. If cleanup cannot remove that oversized
+     raw copy, keep the source non-ready instead of publishing ready metadata.
+   - Do not delete a fetched oversized raw rollout merely because
+     `rollout-summary` exited successfully. First revalidate the written summary
+     with the same `remote_generated_rollout_summary_v1` proof gate used by
+     consumers; if proof is missing, malformed, truncated, filtered,
+     tail-limited, parse-error-limited, or missing a valid `source_sha256`, keep
+     the raw copy so later scans can report or repair the backing rollout
+     directly.
+   - Likewise, when raw fetch fails and repair falls back to remote
+     `rollout-summary`, do not publish ready materialization metadata unless
+     the fallback summary passes the same complete proof gate. A successful
+     command without trusted proof is still a `remote_source_not_materialized`
+     coverage gap because no raw backing exists.
+   - Never hash a materialized remote backing rollout above the configured
+     hash cap while validating generated-summary identity; treat that backing
+     as untrusted unless bounded summary-only proof is sufficient.
+   - Do not let `source_bytes`-only summary identity suppress an oversized raw
+     rollout gap when the backing is above the configured hash verification
+     cap; without `source_sha256` or trusted generated proof, the later scan
+     must still report the oversized backing directly.
+   - Keep ordinary source-tree `rollout-summary*.jsonl` files conservative:
+     they must still have materialized backing rollouts or they remain coverage
+     gaps.
+   - Resolve retained `source_path`, `source_hash`, and session identity per
+     backing rollout record for trusted remote-generated summaries; mixed
+     summary files must not reuse the first `scan_meta` identity for every
+     retained turn.
+   - Status: implemented in the remote oversized rollout summary completeness PR.
 
 5. Parallel remote materialization
    - Add bounded concurrency for host-level and rollout-level materialization.
