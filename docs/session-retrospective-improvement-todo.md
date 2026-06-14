@@ -139,6 +139,7 @@ review gates, and merge before starting the next item.
      retained-readiness status, top blockers, next command, transient disk usage,
      and confidence.
    - Keep JSON reports as the machine-readable source of truth.
+   - Status: implemented in the report readability PR.
 
 7. Safety and privacy flag calibration
    - Reduce false positives from ordinary paths, approval text, and host labels.
