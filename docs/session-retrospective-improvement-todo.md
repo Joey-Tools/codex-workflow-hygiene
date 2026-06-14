@@ -123,13 +123,16 @@ review gates, and merge before starting the next item.
      backing rollout record for trusted remote-generated summaries; mixed
      summary files must not reuse the first `scan_meta` identity for every
      retained turn.
-   - Status: implemented in the remote oversized rollout summary completeness PR.
+   - Status: completed in PR #18.
 
 5. Parallel remote materialization
    - Add bounded concurrency for host-level and rollout-level materialization.
    - Preserve deterministic reports, stable error collection, and read-only
      remote behavior.
    - Keep a conservative default for SSH and IO pressure.
+   - Expose `--remote-host-jobs` and `--remote-rollout-jobs` on repair commands,
+     defaulting to `2` and capped at `8`; `1` preserves serial behavior.
+   - Status: implemented in the parallel remote materialization PR.
 
 6. Report readability
    - Add a compact report with window, host coverage, before/after gap counts,
