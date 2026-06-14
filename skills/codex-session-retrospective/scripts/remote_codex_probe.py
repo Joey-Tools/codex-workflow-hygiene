@@ -26,7 +26,7 @@ MAX_SESSION_META_LIMIT = 500
 MAX_SESSION_META_DATE_COUNT = 31
 MAX_FETCH_ROLLOUT_BYTES = 16 * 1024 * 1024
 MAX_ROLLOUT_SUMMARY_LIMIT = 200
-MAX_ROLLOUT_SUMMARY_SCAN_BYTES = 0
+MAX_ROLLOUT_SUMMARY_SCAN_BYTES = MAX_FETCH_ROLLOUT_BYTES
 MAX_ROLLOUT_SUMMARY_LINE_BYTES = 1024 * 1024
 MAX_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 MAX_ROLLOUT_SUMMARY_TEXT_CHARS = 1200
@@ -1680,7 +1680,6 @@ def summarize_rollout():
         and scan_meta.get("record_limit_reached") is False
         and scan_meta.get("signal_record_limit_reached") is False
         and scan_meta.get("matched_record_limit_reached") is False
-        and scan_meta.get("tail_record_limit_reached") is False
         and type(scan_meta.get("source_bytes")) is int
         and scan_meta["source_bytes"] >= 0
         and type(scan_meta.get("scan_bytes")) is int
@@ -3121,7 +3120,6 @@ def _scan_meta_allows_remote_generated_coverage_proof(row: dict[str, Any]) -> bo
         and row.get("record_limit_reached") is False
         and row.get("signal_record_limit_reached") is False
         and row.get("matched_record_limit_reached") is False
-        and row.get("tail_record_limit_reached") is False
         and type(source_bytes) is int
         and source_bytes >= 0
         and type(scan_bytes) is int

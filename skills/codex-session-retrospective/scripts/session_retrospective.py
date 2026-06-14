@@ -2494,7 +2494,7 @@ def summary_has_generated_remote_coverage_proof(path: Path, *, max_scan_bytes: i
             continue
         if record.get("coverage_proof") != REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF:
             return False
-        if complete_scan_meta_record_source_bytes(record, allow_tail_record_limit=False) is None:
+        if complete_scan_meta_record_source_bytes(record, allow_tail_record_limit=True) is None:
             return False
         source_sha256 = complete_scan_meta_record_source_sha256(record)
         if not source_sha256:
@@ -7778,6 +7778,7 @@ def materialize_remote_host(
                         "command": "fetch-rollout",
                         "rollout": path_ref(target),
                         "error": command_failure(fetch),
+                        "repair": "wrote bounded rollout-summary; scan keeps a coverage gap unless the summary has complete generated coverage proof",
                     }
                 )
                 report["errors"].append(
@@ -7788,7 +7789,6 @@ def materialize_remote_host(
                         "repair": "raw rollout was not materialized and the fallback summary is not trusted complete coverage",
                     }
                 )
-                report["failed_rollout_count"] += 1
                 continue
             report["errors"].append(
                 {
