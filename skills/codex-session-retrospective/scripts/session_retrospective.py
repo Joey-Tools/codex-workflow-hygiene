@@ -2420,6 +2420,27 @@ def summary_scan_meta_backing_rollout_refs(path: Path, *, max_scan_bytes: int) -
     return refs, invalid_ref_seen
 
 
+def summary_has_scannable_backing_ref(
+    path: Path,
+    *,
+    max_scan_bytes: int,
+    source_root: Path | None = None,
+) -> bool:
+    scan_meta_refs, invalid_ref_seen = summary_scan_meta_backing_rollout_refs(path, max_scan_bytes=max_scan_bytes)
+    if invalid_ref_seen:
+        return False
+    if scan_meta_refs:
+        return True
+    backing_refs, complete, _relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+        path,
+        None,
+        None,
+        max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
+    )
+    return complete and not unbacked_record_seen and bool(backing_refs)
+
+
 def summary_has_generated_local_coverage_proof(path: Path, *, max_scan_bytes: int) -> bool:
     proof_seen = False
     metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
@@ -4487,6 +4508,14 @@ def extract_summary_file(
                 else session_id_from_path(Path(safe_ref))
             )
         if candidate_source_hash is not None:
+            if not backing_ref_matches_current_or_trusted_summary(
+                source.root,
+                safe_ref,
+                source_identity,
+                max_hash_bytes=REMOTE_ROLLOUT_SUMMARY_SCAN_BYTES,
+                allow_summary_only_coverage=True,
+            ):
+                return None
             return candidate_path_ref, candidate_source_hash, retained_session_id
         rollout_path = source.root / safe_ref
         if not backing_ref_matches_current_rollout_identity(
@@ -7840,6 +7869,29 @@ def materialize_remote_host(
                 continue
             summary_target, summary_error = write_remote_summary(rollout_ref)
             if summary_target is not None:
+                summary_scan_bytes = max(max_raw_bytes, REMOTE_ROLLOUT_SUMMARY_SCAN_BYTES)
+                if not summary_has_scannable_backing_ref(
+                    summary_target,
+                    max_scan_bytes=summary_scan_bytes,
+                    source_root=root,
+                ):
+                    report["failed_rollout_count"] += 1
+                    report["errors"].append(
+                        {
+                            "command": "fetch-rollout",
+                            "rollout": path_ref(target),
+                            "error": command_failure(fetch),
+                        }
+                    )
+                    report["errors"].append(
+                        {
+                            "command": "rollout-summary",
+                            "rollout": path_ref(target),
+                            "error": "remote rollout-summary did not include a scannable backing rollout ref",
+                            "repair": "raw rollout was not materialized and the fallback summary cannot preserve a remote_source_not_materialized gap",
+                        }
+                    )
+                    continue
                 if summary_has_generated_remote_coverage_proof(summary_target, max_scan_bytes=max_raw_bytes):
                     report["errors"].append(
                         {
