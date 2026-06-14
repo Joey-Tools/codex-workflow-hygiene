@@ -82,7 +82,16 @@ AUTOMATION_PROMPT_MARKERS = (
     "When reconstructing the real user task from rollouts, ignore injected wrapper content",
     "Write task-local artifacts under .codex-local/session-retrospective/runs/",
 )
-SUMMARY_SIGNAL_MARKERS = ("error:", "approval", "could not run", "you missed", "assumed", "secret")
+SUMMARY_SIGNAL_MARKERS = (
+    "error:",
+    "approval",
+    "could not run",
+    "you missed",
+    "assumed",
+    "over exploration",
+    "under asking",
+    "secret",
+)
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
 SESSION_META_LIMIT_TRUNCATED_REASON = "session_meta_limit_truncated"
@@ -1324,6 +1333,10 @@ def summary_signal_text(kind, text):
         signals.append("you missed")
     if re.search(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", text, re.I):
         signals.append("assumed")
+    if re.search(r"(?:over[-_ ]?explor|over[-_ ]?investigat|over[-_ ]?search|explored too much|too much exploration|unrelated files|unrelated paths)", text, re.I):
+        signals.append("over exploration")
+    if re.search(r"(?:under[-_ ]?ask|did not ask|didn't ask|should have asked|without asking|missing clarification|needed clarification)", text, re.I):
+        signals.append("under asking")
     if PRIVATE_IPV4_SIGNAL_RE.search(text) or PRIVATE_IPV6_SIGNAL_RE.search(text) or INTERNAL_HOSTNAME_SIGNAL_RE.search(text):
         signals.append("secret")
     elif re.search(
@@ -2617,6 +2630,10 @@ def _summary_signal_text(kind: str, text: str) -> str:
         signals.append("you missed")
     if re.search(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", text, re.I):
         signals.append("assumed")
+    if re.search(r"(?:over[-_ ]?explor|over[-_ ]?investigat|over[-_ ]?search|explored too much|too much exploration|unrelated files|unrelated paths)", text, re.I):
+        signals.append("over exploration")
+    if re.search(r"(?:under[-_ ]?ask|did not ask|didn't ask|should have asked|without asking|missing clarification|needed clarification)", text, re.I):
+        signals.append("under asking")
     if PRIVATE_IPV4_SIGNAL_RE.search(text) or PRIVATE_IPV6_SIGNAL_RE.search(text) or INTERNAL_HOSTNAME_SIGNAL_RE.search(text):
         signals.append("secret")
     elif re.search(

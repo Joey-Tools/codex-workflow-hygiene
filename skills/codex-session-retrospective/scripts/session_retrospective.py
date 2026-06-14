@@ -1085,7 +1085,15 @@ def load_remote_probe_module() -> Any:
 
 
 def generated_summary_base_for_output(output: Path) -> Path:
-    return ensure_safe_output_dir(output.parent / f"{output.name}-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}")
+    expanded = output.expanduser()
+    parts = expanded.parts
+    if len(parts) >= len(SAFE_OUTPUT_PARTS) and parts[-len(SAFE_OUTPUT_PARTS) :] == SAFE_OUTPUT_PARTS:
+        return ensure_safe_output_dir(expanded / LOCAL_GENERATED_SUMMARY_DIR_SUFFIX)
+    return ensure_safe_output_dir(expanded.parent / f"{expanded.name}-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}")
+
+
+def generated_summary_artifact_path(path: Path) -> bool:
+    return any(part == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX or part.endswith(f"-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}") for part in path.parts)
 
 
 def generated_summary_root_for_source(base: Path, source: Source) -> Path:
@@ -1104,14 +1112,16 @@ def local_rollout_summary_jsonl_bytes(source: Source, rollout: Path, rollout_ref
     safe_ref = safe_rollout_backing_ref(rollout_ref)
     if safe_ref is None:
         raise ValueError(f"unsafe rollout ref: {rollout_ref}")
-    source_bytes = rollout.stat().st_size
-    source_sha256 = None
+    source_bytes = 0
+    source_sha256: str | None = None
     remote_probe = load_remote_probe_module()
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(rollout, flags)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        fd_stat = os.fstat(fd)
+        if not stat.S_ISREG(fd_stat.st_mode):
             raise OSError("source path is not a regular file")
+        source_bytes = fd_stat.st_size
         with os.fdopen(fd, "rb") as handle:
             fd = -1
             records, summary_meta = remote_probe._summarize_rollout_records_with_meta(
@@ -1121,6 +1131,12 @@ def local_rollout_summary_jsonl_bytes(source: Source, rollout: Path, rollout_ref
                 tail_records=LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS,
                 max_text_chars=LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS,
             )
+            if source_bytes <= LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES:
+                handle.seek(0)
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                source_sha256 = digest.hexdigest()
     finally:
         if fd >= 0:
             os.close(fd)
@@ -1212,7 +1228,7 @@ def generate_local_rollout_summaries_for_source(
 def source_summary_candidates(source: Source) -> list[Path]:
     if not source.root.exists() or source.root.is_symlink():
         return []
-    return sorted(source.root.rglob("rollout-summary*.jsonl"))
+    return sorted(path for path in source.root.rglob("rollout-summary*.jsonl") if not generated_summary_artifact_path(path))
 
 
 def unsafe_source_summaries(source: Source) -> list[Path]:
@@ -1863,6 +1879,13 @@ def summary_hash_verify_max_bytes(max_scan_bytes: int) -> int:
     return max(max_scan_bytes, SUMMARY_HASH_VERIFY_MAX_BYTES)
 
 
+def summary_identity_hash_verify_max_bytes(summary: Path, max_scan_bytes: int) -> int:
+    base = summary_hash_verify_max_bytes(max_scan_bytes)
+    if summary_has_generated_local_coverage_proof(summary, max_scan_bytes=max_scan_bytes):
+        return max(base, LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES)
+    return base
+
+
 def safe_relative_summary_ref(value: str) -> str | None:
     candidate = Path(value)
     if candidate.is_absolute():
@@ -2447,6 +2470,7 @@ def complete_summary_backing_rollout_refs(
             max_scan_bytes=max_scan_bytes,
         ):
             continue
+        hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(summary, max_scan_bytes)
         extractable_refs = summary_extractable_backing_refs_in_window(summary, start, end)
         if extractable_refs:
             source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
@@ -2465,7 +2489,7 @@ def complete_summary_backing_rollout_refs(
                         source_root,
                         ref,
                         source_identity,
-                        max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                        max_hash_bytes=hash_verify_max_bytes,
                     )
                 )
         refs.update(
@@ -2526,7 +2550,7 @@ def complete_scan_meta_backing_rollout_refs(
             source_root,
             ref,
             source_identity,
-            max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+            max_hash_bytes=summary_identity_hash_verify_max_bytes(summary, max_scan_bytes),
             selected_source_identity_by_key=selected_source_identity_by_key,
         ):
             refs.add(ref)
@@ -2645,6 +2669,7 @@ def complete_summary_backing_rollout_keys(
             archived_duplicate_keys=archived_duplicate_keys,
         ):
             continue
+        hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(summary, max_scan_bytes)
         extractable_refs = summary_extractable_backing_refs_in_window(summary, start, end)
         if extractable_refs:
             source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
@@ -2662,7 +2687,7 @@ def complete_summary_backing_rollout_keys(
                         source_root,
                         ref,
                         source_identity,
-                        max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                        max_hash_bytes=hash_verify_max_bytes,
                         selected_source_identity_by_key=selected_source_identity_by_key,
                     ):
                         continue
@@ -2739,7 +2764,7 @@ def complete_summary_backing_rollout_refs_for_refs(
             source_root,
             ref,
             source_identity,
-            max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+            max_hash_bytes=summary_identity_hash_verify_max_bytes(summary, max_scan_bytes),
             selected_source_identity_by_key=selected_source_identity_by_key,
         ):
             refs.add(ref)
@@ -2949,22 +2974,24 @@ def summary_file_has_stale_backing_source(
         source_bytes = summary_file_declared_source_bytes(path)
         if source_bytes is None:
             return False
+        hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(path, max_scan_bytes)
         return any(
             not backing_ref_matches_current_or_selected_rollout(
                 source_root,
                 ref,
                 RolloutSourceIdentity(source_bytes=source_bytes),
-                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                max_hash_bytes=hash_verify_max_bytes,
                 selected_source_identity_by_key=selected_source_identity_by_key,
             )
             for ref in backing_refs
         )
+    hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(path, max_scan_bytes)
     return any(
         not backing_ref_matches_current_or_selected_rollout(
             source_root,
             ref,
             source_identity,
-            max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+            max_hash_bytes=hash_verify_max_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
         )
         for ref, source_identity in source_identity_by_ref.items()
@@ -3013,13 +3040,14 @@ def summary_file_stale_backing_requires_gap(
                     source_root,
                     ref,
                     RolloutSourceIdentity(source_bytes=source_bytes),
-                    max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                    max_hash_bytes=summary_identity_hash_verify_max_bytes(path, max_scan_bytes),
                     selected_source_identity_by_key=selected_source_identity_by_key,
                 )
             }
         else:
             stale_refs = set(backing_refs)
     else:
+        hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(path, max_scan_bytes)
         stale_refs = {
             ref
             for ref, source_identity in source_identity_by_ref.items()
@@ -3027,7 +3055,7 @@ def summary_file_stale_backing_requires_gap(
                 source_root,
                 ref,
                 source_identity,
-                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                max_hash_bytes=hash_verify_max_bytes,
                 selected_source_identity_by_key=selected_source_identity_by_key,
             )
         }

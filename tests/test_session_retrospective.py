@@ -8109,6 +8109,165 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("oversized_rollout_skipped", reasons)
         self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
 
+    def test_output_safe_root_keeps_generated_summaries_inside_safe_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = Path(raw) / ".codex-local" / "session-retrospective"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=3000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            generated_root = Path(manifest["sources"][0]["generated_summary_root"])
+
+        self.assertEqual(generated_root.relative_to(output).parts[0], MODULE.LOCAL_GENERATED_SUMMARY_DIR_SUFFIX)
+
+    def test_source_summary_files_ignores_generated_summary_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_root = root / "source"
+            write_local_evidence(source_root)
+            rollout = source_root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = source_root / ".codex-local" / "session-retrospective" / "out"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"local={source_root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=3000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+
+        self.assertEqual(MODULE.source_summary_files(MODULE.Source("local", source_root)), [])
+
+    def test_generated_local_summary_hash_detects_same_size_rollout_change(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw)
+            MODULE.run_discover(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    max_raw_bytes=3000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            generated_root = Path(manifest["sources"][0]["generated_summary_root"])
+            generated_summary = next(generated_root.rglob("rollout-summary*.jsonl"))
+            scan_meta = json.loads(generated_summary.read_text(encoding="utf-8").splitlines()[0])
+            replacement = MODULE.jsonl_bytes(
+                [
+                    message("user", "Different same-size prompt for stale detection.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "y" * 1000, "2026-05-01T10:00:01Z"),
+                ]
+            )
+            original_size = rollout.stat().st_size
+            self.assertLess(len(replacement), original_size)
+            rollout.write_bytes(replacement[:-1] + (b" " * (original_size - len(replacement))) + b"\n")
+            self.assertEqual(rollout.stat().st_size, original_size)
+            shard_output = safe_output_dir(raw, "stale-hash-shards")
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(output / "shard_manifest.json"),
+                    "--output",
+                    str(shard_output),
+                    "--max-raw-bytes",
+                    "3000",
+                ]
+            )
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertRegex(scan_meta.get("source_sha256", ""), r"^[0-9a-f]{64}$")
+        self.assertTrue(any(row.get("status") == "oversized" for row in shard_rows))
+        self.assertFalse(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
+
+    def test_generated_local_summary_preserves_under_asking_and_over_exploration_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message(
+                        "user",
+                        "Codex should have asked before it over explored unrelated files.",
+                        "2026-05-01T10:00:00Z",
+                    ),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=3000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(any({"under_asking", "over_exploration"}.issubset(set(row["issue_flags"])) for row in rows))
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_truncated_generated_local_summary_preserves_coverage_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
