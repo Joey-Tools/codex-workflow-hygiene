@@ -8070,6 +8070,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (second_output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             expected_source_path = MODULE.path_ref(rollout)
+            expected_source_hash = MODULE.file_source_hash(rollout)
             expected_session_id = MODULE.session_id_from_path(rollout)
 
         self.assertEqual(len(first_rows), 1)
@@ -8079,7 +8080,113 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(first_rows[0]["session_id"], expected_session_id)
         self.assertEqual(first_rows[0]["source_path"], expected_source_path)
         self.assertEqual(second_rows[0]["source_path"], expected_source_path)
+        self.assertEqual(first_rows[0]["source_hash"], expected_source_hash)
         self.assertEqual(first_rows[0]["source_hash"], second_rows[0]["source_hash"])
+
+    def test_generated_local_summary_extract_keeps_summary_identity_when_backing_exceeds_scan_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            rollout_ref = MODULE.source_relative_path_ref(rollout, root)
+            self.assertIsNotNone(rollout_ref)
+            source_bytes = rollout.stat().st_size
+            output = safe_output_dir(raw)
+            generated_root = MODULE.generated_summary_root_for_source(
+                MODULE.generated_summary_base_for_output(output),
+                MODULE.Source("local", root),
+            )
+            summary = generated_root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        coverage_proof=MODULE.LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF,
+                        rollout=rollout_ref,
+                        scan_bytes=source_bytes,
+                        source_bytes=source_bytes,
+                        source_sha256=MODULE.file_sha256(rollout),
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "line": 1,
+                        "text": "You missed verification for /customer/repo.",
+                    },
+                ],
+            )
+
+            def fake_file_source_hash(candidate: Path) -> str:
+                self.assertEqual(candidate, summary)
+                return VALID_SOURCE_HASH
+
+            with (
+                mock.patch.object(MODULE, "LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES", 1000),
+                mock.patch.object(MODULE, "file_source_hash", side_effect=fake_file_source_hash),
+            ):
+                turns = MODULE.extract_summary_file(MODULE.Source("local", root), summary, None, None)
+
+            expected_source_path = MODULE.path_ref(summary)
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].source_path, expected_source_path)
+        self.assertEqual(turns[0].source_hash, VALID_SOURCE_HASH)
+
+    def test_generated_local_summary_extract_does_not_hash_backing_without_retained_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please build the weekly helper for the report.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            rollout_ref = MODULE.source_relative_path_ref(rollout, root)
+            self.assertIsNotNone(rollout_ref)
+            source_bytes = rollout.stat().st_size
+            source_sha256 = MODULE.file_sha256(rollout)
+            output = safe_output_dir(raw)
+            generated_root = MODULE.generated_summary_root_for_source(
+                MODULE.generated_summary_base_for_output(output),
+                MODULE.Source("local", root),
+            )
+            summary = generated_root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        coverage_proof=MODULE.LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF,
+                        rollout=rollout_ref,
+                        scan_bytes=source_bytes,
+                        source_bytes=source_bytes,
+                        source_sha256=source_sha256,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "line": 1,
+                        "text": "Please build the weekly helper for the report.",
+                    },
+                ],
+            )
+
+            with (
+                mock.patch.object(MODULE, "file_sha256", side_effect=AssertionError("backing sha should be lazy")),
+                mock.patch.object(MODULE, "file_source_hash", side_effect=AssertionError("source hash should be lazy")),
+            ):
+                turns = MODULE.extract_summary_file(MODULE.Source("local", root), summary, None, None)
+
+        self.assertEqual(turns, [])
 
     def test_scan_generates_summary_for_custom_local_source_oversized_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
