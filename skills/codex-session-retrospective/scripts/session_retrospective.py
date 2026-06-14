@@ -1093,6 +1093,10 @@ def generated_summary_base_for_output(output: Path) -> Path:
     return ensure_safe_output_dir(expanded.parent / f"{expanded.name}-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}")
 
 
+def transient_manifest_path_value(path: Path) -> str:
+    return path.expanduser().absolute().as_posix()
+
+
 def generated_summary_artifact_path(path: Path) -> bool:
     return any(part == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX or part.endswith(f"-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}") for part in path.parts)
 
@@ -3909,6 +3913,25 @@ def extract_summary_file(
     source_hash = file_source_hash(path)
     session_id = opaque_session_id(path.as_posix())
     records = list(iter_jsonl(path))
+    identity_path = path
+    if generated_summary_artifact_path(path):
+        for _line_no, record in records:
+            if str(record.get("kind") or "summary") != "scan_meta":
+                continue
+            if record.get("coverage_proof") != LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF:
+                continue
+            rollout_ref = record.get("rollout")
+            if not isinstance(rollout_ref, str):
+                continue
+            safe_ref = safe_rollout_backing_ref(rollout_ref)
+            if safe_ref is None:
+                continue
+            rollout_path = source.root / safe_ref
+            if safe_source_file(rollout_path, source.root):
+                identity_path = rollout_path
+                session_id = session_id_from_path(rollout_path)
+                break
+    identity_path_ref = path_ref(identity_path) or ""
     for _line_no, record in records:
         if str(record.get("kind") or "summary") != "session_meta":
             continue
@@ -3952,11 +3975,11 @@ def extract_summary_file(
         episode_id = opaque_episode_id("|".join([source.host, session_id, "rollout-summary", date_bucket, model_era, retained_kind]))
         turns.append(
             TurnSummary(
-                turn_id=opaque_turn_id(f"{source.host}|{path_ref(path)}|{line_no}|{timestamp}"),
+                turn_id=opaque_turn_id(f"{source.host}|{identity_path_ref}|{line_no}|{timestamp}"),
                 episode_id=episode_id,
                 host=source.host,
                 session_id=session_id,
-                source_path=path_ref(path) or "",
+                source_path=identity_path_ref,
                 source_hash=source_hash,
                 timestamp=timestamp_value,
                 cwd=None,
@@ -5911,7 +5934,7 @@ def run_scan(
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -5925,7 +5948,7 @@ def run_scan(
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -5944,7 +5967,7 @@ def run_scan(
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -6053,15 +6076,15 @@ def run_scan(
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
         manifest_source = {
             "host": source.host,
-            "root": source.root.as_posix(),
+            "root": transient_manifest_path_value(source.root),
             "root_ref": path_ref(source.root),
             "rollout_count": len(rollouts),
             "summary_count": len(summaries),
             "status": source_manifest_status(rollouts, summaries, blocking_gaps),
         }
         if generated_summaries:
-            manifest_source["generated_summary_root"] = source_generated_summary_root.as_posix()
-            manifest_source["generated_summaries"] = [summary.as_posix() for summary in generated_summaries]
+            manifest_source["generated_summary_root"] = transient_manifest_path_value(source_generated_summary_root)
+            manifest_source["generated_summaries"] = [transient_manifest_path_value(summary) for summary in generated_summaries]
         manifest_sources.append(manifest_source)
         if source_materialization_gaps:
             continue
@@ -6255,7 +6278,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -6269,7 +6292,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -6288,7 +6311,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -6397,15 +6420,15 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
         manifest_source = {
             "host": source.host,
-            "root": source.root.as_posix(),
+            "root": transient_manifest_path_value(source.root),
             "root_ref": path_ref(source.root),
             "rollout_count": len(rollouts),
             "summary_count": len(summaries),
             "status": source_manifest_status(rollouts, summaries, blocking_gaps),
         }
         if generated_summaries:
-            manifest_source["generated_summary_root"] = source_generated_summary_root.as_posix()
-            manifest_source["generated_summaries"] = [summary.as_posix() for summary in generated_summaries]
+            manifest_source["generated_summary_root"] = transient_manifest_path_value(source_generated_summary_root)
+            manifest_source["generated_summaries"] = [transient_manifest_path_value(summary) for summary in generated_summaries]
         manifest_sources.append(manifest_source)
     if getattr(args, "allow_partial_hosts", False):
         coverage_gaps.append({"host": "scope", "reason": "partial_host_scope"})

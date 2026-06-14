@@ -55,6 +55,13 @@ review gates, and merge before starting the next item.
      generated summaries whose full scan completed and whose signal/match
      limits did not fire; omitted benign tail records must not keep valid
      oversized rollout coverage gaps open.
+   - Store transient raw manifest paths as absolute paths so `discover` and
+     `make-shards` can run from different working directories without losing
+     generated-summary files.
+   - Key retained turn/session/source-path identity for generated local
+     summaries from the backing rollout ref, not the transient generated-summary
+     artifact path, so repeated runs into different output directories produce
+     stable retained identities.
    - Status: implemented in the local oversized rollout summaries PR; review
      and merge pending.
 

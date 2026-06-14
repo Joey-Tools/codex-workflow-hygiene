@@ -8028,14 +8028,58 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertNotIn("oversized_rollout_skipped", reasons)
             generated_root = Path(manifest["sources"][0]["generated_summary_root"])
             self.assertTrue(generated_root.is_dir())
+            self.assertTrue(generated_root.is_absolute())
             with self.assertRaises(ValueError):
                 generated_root.relative_to(output)
             self.assertEqual(len(manifest["sources"][0]["generated_summaries"]), 1)
+            self.assertTrue(Path(manifest["sources"][0]["root"]).is_absolute())
+            self.assertTrue(Path(manifest["sources"][0]["generated_summaries"][0]).is_absolute())
             self.assertEqual(manifest["sources"][0]["summary_count"], 1)
             self.assertNotIn("generated_summary_root", retained_manifest["sources"][0])
             self.assertNotIn("generated_summaries", retained_manifest["sources"][0])
             self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
             self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
+
+    def test_generated_local_summary_uses_backing_rollout_identity_across_output_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            first_output = safe_output_dir(raw, "identity-one")
+            second_output = safe_output_dir(raw, "identity-two")
+            for output in (first_output, second_output):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            first_rows = [
+                json.loads(line)
+                for line in (first_output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            second_rows = [
+                json.loads(line)
+                for line in (second_output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            expected_source_path = MODULE.path_ref(rollout)
+            expected_session_id = MODULE.session_id_from_path(rollout)
+
+        self.assertEqual(len(first_rows), 1)
+        self.assertEqual(len(second_rows), 1)
+        self.assertEqual(first_rows[0]["turn_id"], second_rows[0]["turn_id"])
+        self.assertEqual(first_rows[0]["session_id"], second_rows[0]["session_id"])
+        self.assertEqual(first_rows[0]["session_id"], expected_session_id)
+        self.assertEqual(first_rows[0]["source_path"], expected_source_path)
+        self.assertEqual(second_rows[0]["source_path"], expected_source_path)
+        self.assertEqual(first_rows[0]["source_hash"], second_rows[0]["source_hash"])
 
     def test_scan_generates_summary_for_custom_local_source_oversized_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -8771,6 +8815,71 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertIn("generated_summary_root", manifest["sources"][0])
         self.assertEqual(len(manifest["sources"][0]["generated_summaries"]), 1)
+        self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
+        self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
+
+    def test_discover_generated_local_summary_manifest_paths_work_from_different_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            workspace = Path(raw) / "workspace"
+            other_cwd = Path(raw) / "other-cwd"
+            workspace.mkdir()
+            other_cwd.mkdir()
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(workspace)
+                MODULE.main(
+                    [
+                        "discover",
+                        "--source",
+                        f"local={root}",
+                        "--allow-partial-hosts",
+                        "--mode",
+                        "weekly",
+                        "--start",
+                        "2026-05-01T00:00:00Z",
+                        "--end",
+                        "2026-05-02T00:00:00Z",
+                        "--output",
+                        ".codex-local/session-retrospective/discover",
+                        "--max-raw-bytes",
+                        "3000",
+                    ]
+                )
+                manifest_path = workspace / ".codex-local" / "session-retrospective" / "discover" / "shard_manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                os.chdir(other_cwd)
+                MODULE.main(
+                    [
+                        "make-shards",
+                        "--manifest",
+                        str(manifest_path),
+                        "--output",
+                        ".codex-local/session-retrospective/shards",
+                        "--max-raw-bytes",
+                        "3000",
+                    ]
+                )
+            finally:
+                os.chdir(old_cwd)
+            shard_output = other_cwd / ".codex-local" / "session-retrospective" / "shards"
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertTrue(Path(manifest["sources"][0]["root"]).is_absolute())
+        self.assertTrue(Path(manifest["sources"][0]["generated_summary_root"]).is_absolute())
+        self.assertTrue(Path(manifest["sources"][0]["generated_summaries"][0]).is_absolute())
         self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
         self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
 
