@@ -2525,6 +2525,8 @@ def complete_summary_backing_source_identity_by_ref(
     if proof.source_bytes_by_ref:
         if not backing_refs.issubset(proof.source_bytes_by_ref):
             return None
+        if allow_tail_record_limit and not backing_refs.issubset(proof.source_sha256_by_ref):
+            return None
         return {
             ref: RolloutSourceIdentity(
                 source_bytes=proof.source_bytes_by_ref[ref],
@@ -2675,9 +2677,12 @@ def complete_scan_meta_backing_rollout_refs(
         source_bytes = proof.source_bytes_by_ref.get(ref)
         if source_bytes is None:
             continue
+        source_sha256 = proof.source_sha256_by_ref.get(ref)
+        if source_sha256 is None:
+            continue
         source_identity = RolloutSourceIdentity(
             source_bytes=source_bytes,
-            source_sha256=proof.source_sha256_by_ref.get(ref),
+            source_sha256=source_sha256,
         )
         if not (
             rollout_ref_in_window(ref, start, end)
