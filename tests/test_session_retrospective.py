@@ -549,7 +549,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(scan_meta["json_error_count"], 1)
         self.assertNotIn("coverage_proof", scan_meta)
 
-    def test_remote_probe_rollout_summary_proves_coverage_with_tail_limited_output(self) -> None:
+    def test_remote_probe_rollout_summary_records_source_identity_with_tail_limited_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-tail.jsonl"
@@ -584,10 +584,56 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertTrue(scan_meta["tail_record_limit_reached"])
+        self.assertEqual(
+            scan_meta["source_identity_proof"],
+            MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+        )
+        self.assertNotIn("coverage_proof", scan_meta)
+        self.assertIn("source_sha256", scan_meta)
+
+    def test_remote_probe_rollout_summary_proves_coverage_when_output_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-complete.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(
+                rollout,
+                [
+                    message("assistant", "Ordinary update 1.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "Ordinary update 2.", "2026-05-01T10:01:00Z"),
+                ],
+            )
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                sys, "stdout", stdout
+            ):
+                result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=40,
+                        tail_records=2,
+                        max_text_chars=400,
+                    )
+                )
+            scan_meta = next(
+                json.loads(line)
+                for line in stdout.getvalue().splitlines()
+                if line.startswith("{") and json.loads(line).get("kind") == "scan_meta"
+            )
+
+        self.assertEqual(result, 0)
+        self.assertFalse(scan_meta["tail_record_limit_reached"])
+        self.assertEqual(
+            scan_meta["source_identity_proof"],
+            MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+        )
         self.assertEqual(scan_meta["coverage_proof"], MODULE.REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF)
         self.assertIn("source_sha256", scan_meta)
 
-    def test_remote_probe_embedded_rollout_summary_proves_coverage_with_tail_limited_output(self) -> None:
+    def test_remote_probe_embedded_rollout_summary_records_source_identity_with_tail_limited_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-tail.jsonl"
@@ -628,11 +674,20 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 encoding="utf-8",
             )
             summary_trusted = MODULE.summary_has_generated_remote_coverage_proof(summary, max_scan_bytes=1000)
+            summary_identity_trusted = MODULE.summary_has_generated_remote_source_identity_proof(
+                summary,
+                max_scan_bytes=1000,
+            )
 
         self.assertTrue(scan_meta["tail_record_limit_reached"])
-        self.assertEqual(scan_meta["coverage_proof"], MODULE.REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF)
+        self.assertEqual(
+            scan_meta["source_identity_proof"],
+            MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+        )
+        self.assertNotIn("coverage_proof", scan_meta)
         self.assertIn("source_sha256", scan_meta)
-        self.assertTrue(summary_trusted)
+        self.assertFalse(summary_trusted)
+        self.assertTrue(summary_identity_trusted)
 
     def test_remote_probe_rollout_summary_scan_cap_is_finite(self) -> None:
         self.assertGreater(REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_SCAN_BYTES, 0)
@@ -7196,7 +7251,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "remote_source_not_materialized")
 
-    def test_make_shards_remote_generated_summary_accepts_tail_limit_proof(self) -> None:
+    def test_make_shards_remote_generated_summary_keeps_gap_for_tail_limited_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "miku-bot-dev"
             rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-missing.jsonl"
@@ -7214,7 +7269,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         source_bytes=24000000,
                         scan_bytes=24000000,
                         source_sha256="a" * 64,
-                        coverage_proof=MODULE.REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
+                        source_identity_proof=MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
                         tail_record_limit_reached=True,
                     ),
                     {
@@ -7248,6 +7303,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 MODULE.generated_summary_path_set([summary]),
                 max_scan_bytes=1000,
             )
+            summary_identity_trusted = MODULE.summary_allows_generated_remote_source_identity(
+                summary,
+                MODULE.generated_summary_path_set([summary]),
+                max_scan_bytes=1000,
+            )
 
             MODULE.main(
                 [
@@ -7265,10 +7325,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertTrue(summary_trusted)
+        self.assertFalse(summary_trusted)
+        self.assertTrue(summary_identity_trusted)
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["status"], "ready")
-        self.assertNotIn("coverage_gap", rows[0])
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "remote_source_not_materialized")
 
     def test_make_shards_remote_generated_summary_missing_manifest_entry_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
