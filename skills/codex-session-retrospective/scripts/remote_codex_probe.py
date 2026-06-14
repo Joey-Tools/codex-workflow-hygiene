@@ -33,6 +33,48 @@ MAX_ROLLOUT_SUMMARY_TEXT_CHARS = 1200
 REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = "remote_generated_rollout_summary_v1"
 REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF = "remote_generated_rollout_source_identity_v1"
 SOURCE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+BARE_64_HEX_SIGNAL_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
+SAFE_CREDENTIAL_VALUE_PATTERN_TEXT = (
+    r"(?:bearer|basic|digest|negotiate|token|api[-_]?key|hmac|aws4-hmac-sha256|signature|oauth|mac|"
+    r"redacted(?:[_-][a-z0-9]+)*|masked(?:[_-][a-z0-9]+)*|missing|omitted|present|unknown|null|none|empty|"
+    r"in|not|required|denied|expired|invalid|unavailable|absent|needed|necessary|revoked|rotated|budget|count|limit)"
+)
+SAFE_CREDENTIAL_VALUE_BOUNDARY_PATTERN_TEXT = r"(?=$|[\s,;&#，。；)\]\}>\"']|\.(?:$|\s))"
+SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT = (
+    r"(?![\[<({]?" + SAFE_CREDENTIAL_VALUE_PATTERN_TEXT + SAFE_CREDENTIAL_VALUE_BOUNDARY_PATTERN_TEXT + r")"
+)
+COMPACT_TOKEN_KEY_PATTERN_TEXT = r"(?:access|api|auth|authorization|client|refresh|id|session|csrf|xsrf)Token"
+COMPACT_TOKEN_FIELD_PATTERN_TEXT = (
+    r"(?:(?<![\w-])|(?<=[._-]))['\"]?(?:[A-Za-z0-9]+[._-])*"
+    + COMPACT_TOKEN_KEY_PATTERN_TEXT
+    + r"['\"]?"
+)
+AUTH_SCHEME_NAME_PATTERN_TEXT = r"(?:Bearer|Basic|Digest|Negotiate|Token|Api[-_]?Key|HMAC|AWS4-HMAC-SHA256|Signature|OAuth|MAC)"
+AUTH_SCHEME_CREDENTIAL_PATTERN_TEXT = (
+    r"\b(?:Proxy-)?Authorization\s*[:=]\s*"
+    + AUTH_SCHEME_NAME_PATTERN_TEXT
+    + r"\s+"
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[^'\"\r\n;]+"
+)
+AUTHORIZATION_FIELD_SCHEME_CREDENTIAL_PATTERN_TEXT = (
+    r"(?:(?<![\w-])|(?<=[._-]))['\"]?(?:[A-Za-z0-9]+[._-])*authorization['\"]?\s*[:=]\s*['\"]?"
+    + AUTH_SCHEME_NAME_PATTERN_TEXT
+    + r"\s+"
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[^'\"\r\n,;]+"
+)
+CREDENTIAL_FIELD_KEY_PATTERN_TEXT = (
+    r"(?:(?<![\w-])|(?<=[._-]))['\"]?(?:[A-Za-z0-9]+[._-])*(?:authorization|aws[\s_-]?secret[\s_-]?access[\s_-]?key|secret[\s_-]?access[\s_-]?key|access[\s_-]?token|client[\s_-]?secret|api[\s_-]?key|private[\s_-]?key|secret(?:[\s_-]?key)?|password|passwd|pwd|credential|token)['\"]?"
+)
+CREDENTIAL_FIELD_AUTH_SCHEME_CREDENTIAL_PATTERN_TEXT = (
+    r"(?:" + CREDENTIAL_FIELD_KEY_PATTERN_TEXT + r"|" + COMPACT_TOKEN_FIELD_PATTERN_TEXT + r")"
+    r"\s*[:=]\s*['\"]?"
+    + AUTH_SCHEME_NAME_PATTERN_TEXT
+    + r"\s+"
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[^'\"\r\n,;]+"
+)
 MAX_SESSION_META_SCAN_BYTES = 256 * 1024
 SESSION_META_FLAT_UNDATED_ALIAS_PREFIX = "flat_archived_undated_v1"
 REMOTE_PREFLIGHT_TIMEOUT_SECONDS = 15
@@ -56,7 +98,125 @@ PRIVATE_IPV6_SIGNAL_RE = re.compile(
     re.I,
 )
 INTERNAL_HOSTNAME_SIGNAL_RE = re.compile(
-    r"\b(?:[A-Za-z0-9-]+\.)+(?:internal|corp|local|lan|example|invalid|test)\b",
+    r"\b(?:[A-Za-z0-9-]+\.)+(?:internal|corp|local|localhost|lan|example|invalid|test)(?=$|[:/?#\s,;)>\]\"']|\.(?:$|\s))",
+    re.I,
+)
+SECRET_TOKEN_SIGNAL_RE = re.compile(
+    r"(?:"
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|"
+    r"\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b|"
+    r"\bAKIA[0-9A-Z]{16}\b|"
+    + AUTH_SCHEME_CREDENTIAL_PATTERN_TEXT
+    + r"|"
+    r"\bBearer\s+"
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[A-Za-z0-9._~+/\-]+=*|"
+    + CREDENTIAL_FIELD_AUTH_SCHEME_CREDENTIAL_PATTERN_TEXT
+    + r"|"
+    + AUTHORIZATION_FIELD_SCHEME_CREDENTIAL_PATTERN_TEXT
+    + r"|"
+    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+    r")",
+    re.I,
+)
+COMPACT_TOKEN_ASSIGNMENT_SIGNAL_RE = re.compile(
+    r"(?:"
+    + COMPACT_TOKEN_FIELD_PATTERN_TEXT
+    + r"\s*[:=]\s*['\"]?"
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[^'\"\s,;]+|"
+    r"(?<![\w-])--" + COMPACT_TOKEN_KEY_PATTERN_TEXT
+    + r"\s+"
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[^'\"\s,;]+|"
+    r"\b" + COMPACT_TOKEN_KEY_PATTERN_TEXT
+    + r"\s*(?:\bis\b|\bwas\b|\bset\s+to\b)\s*['\"]?"
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[^'\"\s,;]{3,}|"
+    r"\b(?:https?|ssh|sftp|git\+ssh)://[^\s)>\]\"']*[?&#]"
+    + COMPACT_TOKEN_KEY_PATTERN_TEXT
+    + r"="
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[^&#\s)>\]\"']+"
+    r")",
+    re.I,
+)
+CREDENTIAL_ASSIGNMENT_SIGNAL_RE = re.compile(
+    r"(?:"
+    r"(?:(?<![\w-])|(?<=[._-]))['\"]?(?:[A-Za-z0-9]+[._-])*(?:authorization|aws[\s_-]?secret[\s_-]?access[\s_-]?key|secret[\s_-]?access[\s_-]?key|access[\s_-]?token|client[\s_-]?secret|api[\s_-]?key|private[\s_-]?key|secret(?:[\s_-]?key)?|password|passwd|pwd|credential|token)['\"]?\s*[:=]\s*['\"]?"
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[^'\"\s,;]+|"
+    r"(?<![\w-])--(?:authorization|aws[\s_-]?secret[\s_-]?access[\s_-]?key|secret[\s_-]?access[\s_-]?key|access[\s_-]?token|client[\s_-]?secret|api[\s_-]?key|private[\s_-]?key|secret(?:[\s_-]?key)?|password|passwd|pwd|credential|token)\s+"
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[^'\"\s,;]+|"
+    r"\b(?:aws[\s_-]?secret[\s_-]?access[\s_-]?key|secret[\s_-]?access[\s_-]?key|access[\s_-]?token|client[\s_-]?secret|api[\s_-]?key|private[\s_-]?key|secret(?:[\s_-]?key)?|password|passwd|pwd|credential|token)\s*(?:\bis\b|\bwas\b|\bset\s+to\b)\s*['\"]?"
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[^'\"\s,;]{3,}"
+    r")",
+    re.I,
+)
+CHINESE_CREDENTIAL_ASSIGNMENT_SIGNAL_RE = re.compile(
+    r"(?:密码|口令|凭据|凭证|密钥|令牌|授权)\s*(?:[:=：]|是|为|设置为)\s*['\"]?"
+    r"(?!(?:[\[<({]?(?:(?i:redacted(?:[_-][a-z0-9]+)*|masked(?:[_-][a-z0-9]+)*|missing|omitted|unknown|null|none|empty)|已脱敏|缺失|不存在|未知|为空|空|未设置|无|没有|必须|必需|需要|被拒绝|拒绝|过期|已过期|失效|已失效|不可用|无效|错误|失败|未授权)(?:[\]\)>}]|(?:的|了)?(?:[\s,;，。；]|$))))"
+    r"[^'\"\s,;，。；]+"
+)
+SENSITIVE_IDENTIFIER_SIGNAL_RE = re.compile(
+    r"\b(?:customer|client|account|tenant|org|organi[sz]ation)[_-]?(?:id|name)?\s*[:=]\s*['\"]?"
+    r"(?!(?:[\[<({]?(?:(?i:redacted(?:[_-][a-z0-9]+)*|masked(?:[_-][a-z0-9]+)*|missing|omitted|unknown|null|none|empty)|已脱敏|缺失|不存在|未知|为空|空|未设置|无|没有)(?:[\]\)>}]|(?:的|了)?(?:[\s,;，。；]|$))))"
+    r"[^'\"\s,;，。；]+",
+    re.I,
+)
+CHINESE_IDENTIFIER_SIGNAL_RE = re.compile(
+    r"(?:客户|客户端|租户|账户|账号|组织|机构)(?:ID|Id|id|编号|名称|名)?\s*[:=：]\s*['\"]?"
+    r"(?!(?:[\[<({]?(?:(?i:redacted(?:[_-][a-z0-9]+)*|masked(?:[_-][a-z0-9]+)*|missing|omitted|unknown|null|none|empty)|已脱敏|缺失|不存在|未知|为空|空|未设置|无|没有)(?:[\]\)>}]|(?:的|了)?(?:[\s,;，。；]|$))))"
+    r"[^'\"\s,;，。；]+"
+)
+URL_CREDENTIAL_SIGNAL_RE = re.compile(
+    r"\b(?:https?|ssh|sftp|git\+ssh)://(?:"
+    r"[^/\s:@]+:[^@\s/]+@[^\s)>\]\"']+|"
+    r"[^\s)>\]\"']*(?:[?&#](?:[A-Za-z0-9]+[_-])*(?:token|key|secret|credential|authorization|password|passwd)="
+    + SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT
+    + r"[^&#\s)>\]\"']+)"
+    r")",
+    re.I,
+)
+EMAIL_SIGNAL_RE = re.compile(
+    r"(?<![\w.+-])(?!(?:git|ssh)@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?::[^\s]|/[^\s]))[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+)
+PRIVATE_URL_SIGNAL_RE = re.compile(
+    rf"(?:"
+    rf"\b(?:https?://|ssh://|sftp://|git\+ssh://)(?:[^@\s/]+@)?(?:localhost|{PRIVATE_IPV4_SIGNAL_RE.pattern}|(?:[A-Za-z0-9-]+\.)+(?:internal|corp|local|localhost|lan|example|invalid|test))(?=$|[:/?#\s,;)>\]\"']|\.(?:$|\s))(?::\d+)?(?:[/?#][^\s)>\]\"']*)?|"
+    rf"\b(?:https?://|ssh://|sftp://|git\+ssh://)(?:[^@\s/]+@)?[A-Za-z][A-Za-z0-9-]*(?::\d+)?(?:[/?#][^\s)>\]\"']*|(?=$|[\s,;)>\]\"']|\.(?:$|\s)))|"
+    rf"\bgit@(?:localhost|{PRIVATE_IPV4_SIGNAL_RE.pattern}|(?:[A-Za-z0-9-]+\.)+(?:internal|corp|local|lan|example|invalid|test)):[^\s)>\]\"']+|"
+    rf"\bgit@[A-Za-z][A-Za-z0-9-]*:[^\s)>\]\"']+"
+    rf")",
+    re.I,
+)
+PRIVACY_RISK_SIGNAL_RE = re.compile(
+    r"(?:"
+    r"\b(?:customer|client|tenant|account|personal)\s+data\b|"
+    r"\b(?:pii|personally identifiable information)\b|"
+    r"\bprivacy\s+(?:risk|issue|concern|leak|exposure|breach)\b|"
+    r"\b(?:credential|secret|data|api[\s_-]?key|private[\s_-]?key|token|password|passwd|key)\s+(?:leaks?|leaked|expos(?:ure|ed|e|es)|breach(?:ed|es)?)\b|"
+    r"\b(?:leaks?|leaked|expos(?:ure|ed|e|es)|breach(?:ed|es)?)\s+(?:credential|secret|data|api[\s_-]?key|private[\s_-]?key|token|password|passwd|key)\b|"
+    r"客户数据|客户隐私|个人信息|隐私风险|隐私泄露|凭据泄露|凭证泄露|密钥泄露|敏感数据"
+    r")",
+    re.I,
+)
+DESTRUCTIVE_COMMAND_SIGNAL_RE = re.compile(
+    r"(?:\brm\s+(?=(?:[^\n\r]|\\\r?\n)*(?:-[A-Za-z]*r[A-Za-z]*\b|--recursive\b))(?=(?:[^\n\r]|\\\r?\n)*(?:-[A-Za-z]*f[A-Za-z]*\b|--force\b))(?:[^\n\r]|\\\r?\n)*|\bgit\s+reset\s+--hard\b|\breset\s+--hard\b|\bdrop\s+(?:database|table|schema)\b|\btruncate\s+table\b|\bdelete\s+from\s+[`\"\[]?[A-Za-z_][A-Za-z0-9_.$`\"\]]*(?=\s*(?:where\b|;|$)))",
+    re.I,
+)
+PRODUCTION_RISK_SIGNAL_RE = re.compile(
+    r"(?:"
+    r"\b(?:production|prod)\s+(?:database|db|system|server|host|cluster|environment|tenant|customer|(?:(?:api|private|secret|access|auth)\s+)?(?:credentials?|secrets?|tokens?|keys?|passwords?|passwds?|pwds?)|traffic|data)\b|"
+    r"\b(?:prod|production)[-_](?:db|database|server|host|cluster|environment|tenant|customer|data|traffic|credentials?|secrets?|tokens?|keys?|passwords?|passwds?|pwds?|(?:(?:api|private|secret|access|auth)[-_])(?:credentials?|secrets?|tokens?|keys?|passwords?|passwds?|pwds?))[-_]?[A-Za-z0-9.-]*\b|"
+    r"\b(?:deploy|write|delete|migrate|run|execute|operate)\b[\s\S]{0,80}\bproduction\b[\s\S]{0,40}\b(?:database|db|data|system|server|cluster|environment)\b|"
+    r"\b(?:deploy|deploying|deployed|migrate|migration|rollback|restart|apply|write|delete|execute|operate)\b[\s\S]{0,40}\b(?:to|in|on|against)?\s*(?:prod|production)\b|"
+    r"\brun\b[\s\S]{0,20}\b(?:migration|migrate|schema\s+change|destructive\s+command)\b[\s\S]{0,40}\b(?:in|on|against)?\s*(?:prod|production)\b|"
+    r"\b(?:prod|production)\s+(?:deploy(?:ment)?|migration|rollback|write|delete|operation|change)\b|"
+    r"(?:生产(?:数据库|系统|服务器|主机|集群|环境|租户|客户|凭据|凭证|密钥|令牌|密码|口令|流量|数据)|(?:部署|写入|删除|迁移|运行|执行|操作)[\s\S]{0,80}生产[\s\S]{0,40}(?:数据库|数据|系统|服务器|集群|环境)|破坏性(?:命令|操作|删除|重置|清空|销毁))"
+    r")",
     re.I,
 )
 WRAPPER_PREFIXES = (
@@ -896,9 +1056,32 @@ ACTIVE_ROLLOUT_RELATIVE_RE = re.compile({ACTIVE_ROLLOUT_RELATIVE_RE.pattern!r})
 ARCHIVED_ROLLOUT_RELATIVE_RE = re.compile({ARCHIVED_ROLLOUT_RELATIVE_RE.pattern!r})
 ROOT_ROLLOUT_RELATIVE_RE = re.compile({ROOT_ROLLOUT_RELATIVE_RE.pattern!r})
 ROLLOUT_FILENAME_TIME_RE = re.compile({ROLLOUT_FILENAME_TIME_RE.pattern!r})
+BARE_64_HEX_SIGNAL_RE = re.compile({BARE_64_HEX_SIGNAL_RE.pattern!r})
+SAFE_CREDENTIAL_VALUE_PATTERN_TEXT = {SAFE_CREDENTIAL_VALUE_PATTERN_TEXT!r}
+SAFE_CREDENTIAL_VALUE_BOUNDARY_PATTERN_TEXT = {SAFE_CREDENTIAL_VALUE_BOUNDARY_PATTERN_TEXT!r}
+SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT = {SAFE_CREDENTIAL_VALUE_LOOKAHEAD_PATTERN_TEXT!r}
+COMPACT_TOKEN_KEY_PATTERN_TEXT = {COMPACT_TOKEN_KEY_PATTERN_TEXT!r}
+COMPACT_TOKEN_FIELD_PATTERN_TEXT = {COMPACT_TOKEN_FIELD_PATTERN_TEXT!r}
+AUTH_SCHEME_NAME_PATTERN_TEXT = {AUTH_SCHEME_NAME_PATTERN_TEXT!r}
+AUTH_SCHEME_CREDENTIAL_PATTERN_TEXT = {AUTH_SCHEME_CREDENTIAL_PATTERN_TEXT!r}
+AUTHORIZATION_FIELD_SCHEME_CREDENTIAL_PATTERN_TEXT = {AUTHORIZATION_FIELD_SCHEME_CREDENTIAL_PATTERN_TEXT!r}
+CREDENTIAL_FIELD_KEY_PATTERN_TEXT = {CREDENTIAL_FIELD_KEY_PATTERN_TEXT!r}
+CREDENTIAL_FIELD_AUTH_SCHEME_CREDENTIAL_PATTERN_TEXT = {CREDENTIAL_FIELD_AUTH_SCHEME_CREDENTIAL_PATTERN_TEXT!r}
 PRIVATE_IPV4_SIGNAL_RE = re.compile({PRIVATE_IPV4_SIGNAL_RE.pattern!r})
 PRIVATE_IPV6_SIGNAL_RE = re.compile({PRIVATE_IPV6_SIGNAL_RE.pattern!r}, re.I)
 INTERNAL_HOSTNAME_SIGNAL_RE = re.compile({INTERNAL_HOSTNAME_SIGNAL_RE.pattern!r}, re.I)
+SECRET_TOKEN_SIGNAL_RE = re.compile({SECRET_TOKEN_SIGNAL_RE.pattern!r}, re.I)
+COMPACT_TOKEN_ASSIGNMENT_SIGNAL_RE = re.compile({COMPACT_TOKEN_ASSIGNMENT_SIGNAL_RE.pattern!r}, re.I)
+CREDENTIAL_ASSIGNMENT_SIGNAL_RE = re.compile({CREDENTIAL_ASSIGNMENT_SIGNAL_RE.pattern!r}, re.I)
+CHINESE_CREDENTIAL_ASSIGNMENT_SIGNAL_RE = re.compile({CHINESE_CREDENTIAL_ASSIGNMENT_SIGNAL_RE.pattern!r})
+SENSITIVE_IDENTIFIER_SIGNAL_RE = re.compile({SENSITIVE_IDENTIFIER_SIGNAL_RE.pattern!r}, re.I)
+CHINESE_IDENTIFIER_SIGNAL_RE = re.compile({CHINESE_IDENTIFIER_SIGNAL_RE.pattern!r})
+URL_CREDENTIAL_SIGNAL_RE = re.compile({URL_CREDENTIAL_SIGNAL_RE.pattern!r}, re.I)
+EMAIL_SIGNAL_RE = re.compile({EMAIL_SIGNAL_RE.pattern!r})
+PRIVATE_URL_SIGNAL_RE = re.compile({PRIVATE_URL_SIGNAL_RE.pattern!r}, re.I)
+PRIVACY_RISK_SIGNAL_RE = re.compile({PRIVACY_RISK_SIGNAL_RE.pattern!r}, re.I)
+DESTRUCTIVE_COMMAND_SIGNAL_RE = re.compile({DESTRUCTIVE_COMMAND_SIGNAL_RE.pattern!r}, re.I)
+PRODUCTION_RISK_SIGNAL_RE = re.compile({PRODUCTION_RISK_SIGNAL_RE.pattern!r}, re.I)
 WRAPPER_PREFIXES = {WRAPPER_PREFIXES!r}
 WRAPPER_END_MARKERS = {WRAPPER_END_MARKERS!r}
 AUTOMATION_PROMPT_PATTERN_TEXTS = {AUTOMATION_PROMPT_PATTERN_TEXTS!r}
@@ -1354,11 +1537,38 @@ def summary_pattern_search(pattern, text):
     return any(pattern.search(chunk) for chunk in summary_signal_chunks(text))
 
 
+def summary_has_sensitive_signal(text):
+    if (
+        summary_pattern_search(PRIVATE_IPV4_SIGNAL_RE, text)
+        or summary_pattern_search(PRIVATE_IPV6_SIGNAL_RE, text)
+        or summary_pattern_search(INTERNAL_HOSTNAME_SIGNAL_RE, text)
+    ):
+        return True
+    return any(
+        summary_pattern_search(pattern, text)
+        for pattern in (
+            SECRET_TOKEN_SIGNAL_RE,
+            COMPACT_TOKEN_ASSIGNMENT_SIGNAL_RE,
+            CREDENTIAL_ASSIGNMENT_SIGNAL_RE,
+            CHINESE_CREDENTIAL_ASSIGNMENT_SIGNAL_RE,
+            SENSITIVE_IDENTIFIER_SIGNAL_RE,
+            CHINESE_IDENTIFIER_SIGNAL_RE,
+            URL_CREDENTIAL_SIGNAL_RE,
+            EMAIL_SIGNAL_RE,
+            PRIVATE_URL_SIGNAL_RE,
+            PRIVACY_RISK_SIGNAL_RE,
+            DESTRUCTIVE_COMMAND_SIGNAL_RE,
+            PRODUCTION_RISK_SIGNAL_RE,
+            BARE_64_HEX_SIGNAL_RE,
+        )
+    )
+
+
 def summary_signal_text(kind, text):
     signals = []
     if summary_regex_search(r"(?:exit(?:ed)?(?: with)? code [1-9]\\d*|failed|traceback|error:|permission denied)", text):
         signals.append("error:")
-    if summary_regex_search(r"(?:approval|require_escalated|sandbox|\\bauth(?:entication|orization|[-_ ]?gated)?\\b|credential|permission denied|TCC)", text):
+    if summary_regex_search(r"(?:approval|require_escalated|sandbox|\\bauth(?:entication|orization|[-_ ]?gated)?\\b|(?<![\\w-])(?!(?:redacted|masked)(?:[_-][a-z0-9]+)*\\b)[\\w-]*credential|permission denied|TCC)", text):
         signals.append("approval")
     if summary_regex_search(r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)", text):
         signals.append("could not run")
@@ -1370,26 +1580,7 @@ def summary_signal_text(kind, text):
         signals.append("over exploration")
     if summary_regex_search(r"(?:under[-_ ]?ask|did not ask|didn't ask|should have asked|without asking|missing clarification|needed clarification)", text):
         signals.append("under asking")
-    if (
-        summary_pattern_search(PRIVATE_IPV4_SIGNAL_RE, text)
-        or summary_pattern_search(PRIVATE_IPV6_SIGNAL_RE, text)
-        or summary_pattern_search(INTERNAL_HOSTNAME_SIGNAL_RE, text)
-    ):
-        signals.append("secret")
-    elif summary_regex_search(
-        r"(?:\\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|privacy|pii)\\b|"
-        r"\\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{{16,}}|gh[pousr]_[A-Za-z0-9_]{{16,}}|github_pat_[A-Za-z0-9_]{{16,}})\\b|"
-        r"\\bAKIA[0-9A-Z]{{16}}\\b|\\bBearer\\s+[A-Za-z0-9._~+/\\-]+=*|"
-        r"\\b(?:authorization|password|passwd|pwd|credential|secret(?:[\\s_-]?key)?|token|api[\\s_-]?key|private[\\s_-]?key)\\s*[:=]\\s*['\\\"]?[^'\\\"\\s,;]+|"
-        r"\\beyJ[A-Za-z0-9_-]{{10,}}\\.[A-Za-z0-9_-]{{10,}}\\.[A-Za-z0-9_-]{{10,}}\\b|"
-        r"(?<![0-9a-fA-F])[0-9a-fA-F]{{64}}(?![0-9a-fA-F])|"
-        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{{2,}}|https?://[^\\s)>\\]\\\"']+|"
-        r"\\b(?:ssh://[^\\s)>\\]\\\"']+|git@[A-Za-z0-9_.-]+:[^\\s)>\\]\\\"']+)|"
-        r"(?<!\\w)(?:~|/(?:Users|home|root|private|tmp|var|etc|opt|Volumes|workspace|workspaces))/[^\\s,;:)>\\]\\\"']+|"
-        r"\\b(?:customer|client|account|tenant|org|repo|repository)[_-]?(?:id|name)?\\s*[:=]\\s*['\\\"]?[A-Za-z0-9_.-]+|"
-        r"客户|客户数据|凭据|凭证|密钥|生产|破坏性)",
-        text,
-    ):
+    if summary_has_sensitive_signal(text):
         signals.append("secret")
     return " ".join(signals) if signals else kind.replace("_", " ") + " present"
 
@@ -2726,11 +2917,38 @@ def _summary_pattern_search(pattern: re.Pattern[str], text: str) -> bool:
     return any(pattern.search(chunk) for chunk in _summary_signal_chunks(text))
 
 
+def _summary_has_sensitive_signal(text: str) -> bool:
+    if (
+        _summary_pattern_search(PRIVATE_IPV4_SIGNAL_RE, text)
+        or _summary_pattern_search(PRIVATE_IPV6_SIGNAL_RE, text)
+        or _summary_pattern_search(INTERNAL_HOSTNAME_SIGNAL_RE, text)
+    ):
+        return True
+    return any(
+        _summary_pattern_search(pattern, text)
+        for pattern in (
+            SECRET_TOKEN_SIGNAL_RE,
+            COMPACT_TOKEN_ASSIGNMENT_SIGNAL_RE,
+            CREDENTIAL_ASSIGNMENT_SIGNAL_RE,
+            CHINESE_CREDENTIAL_ASSIGNMENT_SIGNAL_RE,
+            SENSITIVE_IDENTIFIER_SIGNAL_RE,
+            CHINESE_IDENTIFIER_SIGNAL_RE,
+            URL_CREDENTIAL_SIGNAL_RE,
+            EMAIL_SIGNAL_RE,
+            PRIVATE_URL_SIGNAL_RE,
+            PRIVACY_RISK_SIGNAL_RE,
+            DESTRUCTIVE_COMMAND_SIGNAL_RE,
+            PRODUCTION_RISK_SIGNAL_RE,
+            BARE_64_HEX_SIGNAL_RE,
+        )
+    )
+
+
 def _summary_signal_text(kind: str, text: str) -> str:
     signals: list[str] = []
     if _summary_regex_search(r"(?:exit(?:ed)?(?: with)? code [1-9]\d*|failed|traceback|error:|permission denied)", text):
         signals.append("error:")
-    if _summary_regex_search(r"(?:approval|require_escalated|sandbox|\bauth(?:entication|orization|[-_ ]?gated)?\b|credential|permission denied|TCC)", text):
+    if _summary_regex_search(r"(?:approval|require_escalated|sandbox|\bauth(?:entication|orization|[-_ ]?gated)?\b|(?<![\w-])(?!(?:redacted|masked)(?:[_-][a-z0-9]+)*\b)[\w-]*credential|permission denied|TCC)", text):
         signals.append("approval")
     if _summary_regex_search(r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)", text):
         signals.append("could not run")
@@ -2742,26 +2960,7 @@ def _summary_signal_text(kind: str, text: str) -> str:
         signals.append("over exploration")
     if _summary_regex_search(r"(?:under[-_ ]?ask|did not ask|didn't ask|should have asked|without asking|missing clarification|needed clarification)", text):
         signals.append("under asking")
-    if (
-        _summary_pattern_search(PRIVATE_IPV4_SIGNAL_RE, text)
-        or _summary_pattern_search(PRIVATE_IPV6_SIGNAL_RE, text)
-        or _summary_pattern_search(INTERNAL_HOSTNAME_SIGNAL_RE, text)
-    ):
-        signals.append("secret")
-    elif _summary_regex_search(
-        r"(?:\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|privacy|pii)\b|"
-        r"\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b|"
-        r"\bAKIA[0-9A-Z]{16}\b|\bBearer\s+[A-Za-z0-9._~+/\-]+=*|"
-        r"\b(?:authorization|password|passwd|pwd|credential|secret(?:[\s_-]?key)?|token|api[\s_-]?key|private[\s_-]?key)\s*[:=]\s*['\"]?[^'\"\s,;]+|"
-        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b|"
-        r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])|"
-        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|https?://[^\s)>\]\"']+|"
-        r"\b(?:ssh://[^\s)>\]\"']+|git@[A-Za-z0-9_.-]+:[^\s)>\]\"']+)|"
-        r"(?<!\w)(?:~|/(?:Users|home|root|private|tmp|var|etc|opt|Volumes|workspace|workspaces))/[^\s,;:)>\]\"']+|"
-        r"\b(?:customer|client|account|tenant|org|repo|repository)[_-]?(?:id|name)?\s*[:=]\s*['\"]?[A-Za-z0-9_.-]+|"
-        r"客户|客户数据|凭据|凭证|密钥|生产|破坏性)",
-        text,
-    ):
+    if _summary_has_sensitive_signal(text):
         signals.append("secret")
     return " ".join(signals) if signals else f"{kind.replace('_', ' ')} present"
 

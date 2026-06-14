@@ -156,6 +156,20 @@ review gates, and merge before starting the next item.
    - Separate true secrets, credentials, customer data, private URLs, and
      destructive/production risk from normal engineering context.
    - Add tests around representative false-positive and true-positive examples.
+   - Keep every sensitive-signal addition paired with local redaction coverage;
+     retained prompt summaries must not keep the raw value after a safety flag.
+   - Keep local rollout extraction, remote helper extraction, and generated
+     remote probe scripts in parity for compact/camelCase credential keys.
+   - Cover object-style credentials, prefixed auth headers, multi-word auth
+     schemes, and concise production-operation phrases with paired tests.
+   - Treat safe credential status words as exact values only; do not let a
+     word-boundary match skip real values such as `required-secret-*`.
+   - For auth scheme values such as `Authorization: Token ...`, require paired
+     safety-signal and redaction tests that prove the full value is removed.
+   - For English and Chinese customer, tenant, account, and organization
+     identifiers, require both signal tests and retained-output redaction checks.
+   - Status: implemented by the safety/privacy calibration change; scope covers
+     local rollout flags and remote rollout-summary signal extraction.
 
 ## Retained Readiness Bar
 
