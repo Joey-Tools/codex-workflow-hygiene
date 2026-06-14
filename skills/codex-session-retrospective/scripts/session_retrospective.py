@@ -1165,7 +1165,7 @@ def generate_local_rollout_summaries_for_source(
     archived_duplicate_keys: set[str],
     summary_backed_rollout_keys: set[str],
 ) -> list[Path]:
-    if source.host != "local":
+    if source.host in DEFAULT_REMOTE_HOSTS:
         return []
     generated: list[Path] = []
     for rollout in rollouts:

@@ -7981,6 +7981,43 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
             self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
 
+    def test_scan_generates_summary_for_custom_local_source_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"customer-acme={root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=3000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            retained_manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertNotIn("oversized_rollout_skipped", reasons)
+        self.assertEqual(manifest["sources"][0]["host"], "custom_source")
+        self.assertIn("generated_summary_root", manifest["sources"][0])
+        self.assertEqual(retained_manifest["sources"][0]["host"], "custom_source")
+        self.assertNotIn("generated_summary_root", retained_manifest["sources"][0])
+
     def test_truncated_generated_local_summary_preserves_coverage_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
