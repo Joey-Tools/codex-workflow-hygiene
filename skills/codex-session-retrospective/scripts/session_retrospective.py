@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import dataclasses
 import datetime as dt
 import errno
@@ -146,6 +147,7 @@ LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF = "local_generated_rollout_summary_v1"
 REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = "remote_generated_rollout_summary_v1"
 REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF = "remote_generated_rollout_source_identity_v1"
 REMOTE_ROLLOUT_SUMMARY_SCAN_BYTES = 16 * 1024 * 1024
+MAX_REMOTE_MATERIALIZATION_JOBS = 8
 PRIVATE_IPV4_PATTERN = re.compile(
     r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|127(?:\.\d{1,3}){3}|169\.254(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})(?![\d.])"
 )
@@ -6086,6 +6088,13 @@ def require_positive_window(value: int, name: str) -> int:
     return value
 
 
+def require_remote_materialization_jobs(value: int, name: str) -> int:
+    jobs = require_positive_window(value, name)
+    if jobs > MAX_REMOTE_MATERIALIZATION_JOBS:
+        raise SystemExit(f"{name} must be <= {MAX_REMOTE_MATERIALIZATION_JOBS}")
+    return jobs
+
+
 def validate_window_bounds(start: dt.datetime | None, end: dt.datetime | None, label: str) -> None:
     if start is not None and end is not None and start >= end:
         raise SystemExit(f"{label} start must be before end")
@@ -7477,6 +7486,8 @@ def cmd_weekly_dry_run(args: argparse.Namespace) -> int:
                 max_raw_bytes=args.repair_max_raw_bytes,
                 remote_probe=args.repair_remote_probe,
                 remote_session_meta_limit=args.repair_remote_session_meta_limit,
+                remote_host_jobs=args.repair_remote_host_jobs,
+                remote_rollout_jobs=args.repair_remote_rollout_jobs,
                 skip_remote_materialization=args.repair_skip_remote_materialization,
                 allow_partial_hosts=args.allow_partial_hosts,
             ),
@@ -7644,6 +7655,16 @@ def summary_path_for_rollout(root: Path, rollout_ref: str) -> Path:
     return root / Path(*rollout_path.parts[:-1]) / name
 
 
+@dataclasses.dataclass
+class RemoteRolloutMaterialization:
+    rollout_ref: str
+    rollout_count: int = 0
+    summary_count: int = 0
+    failed_rollout_count: int = 0
+    errors: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    remote_generated_summaries: list[str] = dataclasses.field(default_factory=list)
+
+
 def materialize_remote_host(
     *,
     host: str,
@@ -7653,7 +7674,11 @@ def materialize_remote_host(
     remote_probe: Path,
     session_meta_limit: int,
     max_raw_bytes: int,
+    rollout_jobs: int = 1,
 ) -> dict[str, Any]:
+    rollout_jobs = require_remote_materialization_jobs(rollout_jobs, "--remote-rollout-jobs")
+    # Initialize the opaque ref key before worker threads can call path_ref().
+    path_ref_key()
     reject_symlink_ancestors(root / REMOTE_SOURCE_METADATA_FILE, label="materialized remote metadata")
     if root.exists():
         if not root.is_dir():
@@ -7798,22 +7823,20 @@ def materialize_remote_host(
     with tempfile.TemporaryDirectory(prefix="codex-session-retrospective-fetch-", dir="/tmp") as temp_dir:
         temp_root = Path(temp_dir)
 
-        def write_remote_summary(rollout_ref: str) -> tuple[Path | None, str | None]:
+        def write_remote_summary(rollout_ref: str) -> tuple[Path | None, str | None, str | None]:
             summary = run_remote_probe(
                 remote_probe,
                 ["rollout-summary", "--host", host, "--rollout", rollout_ref, "--limit", "200", "--tail-records", "50"],
             )
             if summary.returncode != 0:
-                return None, command_failure(summary)
+                return None, command_failure(summary), None
             summary_target = summary_path_for_rollout(root, rollout_ref)
             safe_write_bytes(summary_target, summary.stdout.encode("utf-8"))
             summary_ref = source_relative_path_ref(summary_target, root)
-            if summary_ref is not None:
-                report["remote_generated_summaries"].append(summary_ref)
-            report["summary_count"] += 1
-            return summary_target, None
+            return summary_target, None, summary_ref
 
-        for rollout_ref in rollout_refs:
+        def materialize_rollout(rollout_ref: str) -> RemoteRolloutMaterialization:
+            result = RemoteRolloutMaterialization(rollout_ref=rollout_ref)
             target = safe_materialized_target(root, rollout_ref)
             temp_output = temp_root / hashlib.sha256(rollout_ref.encode("utf-8")).hexdigest()
             fetch = run_remote_probe(
@@ -7823,8 +7846,11 @@ def materialize_remote_host(
             if fetch.returncode == 0:
                 safe_write_bytes(target, temp_output.read_bytes())
                 if target.stat().st_size > max_raw_bytes:
-                    summary_target, summary_error = write_remote_summary(rollout_ref)
+                    summary_target, summary_error, summary_ref = write_remote_summary(rollout_ref)
                     if summary_error is None:
+                        result.summary_count += 1
+                        if summary_ref is not None:
+                            result.remote_generated_summaries.append(summary_ref)
                         trusted_summary = (
                             summary_target is not None
                             and summary_has_generated_remote_coverage_proof(summary_target, max_scan_bytes=max_raw_bytes)
@@ -7833,10 +7859,9 @@ def materialize_remote_host(
                             try:
                                 target.unlink()
                             except OSError as error:
-                                report["status"] = "remote_source_not_materialized"
-                                report["failed_rollout_count"] += 1
-                                report["rollout_count"] += 1
-                                report["errors"].append(
+                                result.failed_rollout_count += 1
+                                result.rollout_count += 1
+                                result.errors.append(
                                     {
                                         "command": "cleanup-oversized-rollout",
                                         "rollout": path_ref(target),
@@ -7844,9 +7869,9 @@ def materialize_remote_host(
                                         "repair": "bounded rollout-summary was written, but the oversized raw rollout copy could not be removed",
                                     }
                                 )
-                            continue
-                        report["rollout_count"] += 1
-                        report["errors"].append(
+                            return result
+                        result.rollout_count += 1
+                        result.errors.append(
                             {
                                 "command": "rollout-summary",
                                 "rollout": path_ref(target),
@@ -7854,9 +7879,9 @@ def materialize_remote_host(
                                 "repair": "raw rollout was materialized and kept so a later scan can report or repair the oversized backing directly",
                             }
                         )
-                        continue
-                    report["rollout_count"] += 1
-                    report["errors"].append(
+                        return result
+                    result.rollout_count += 1
+                    result.errors.append(
                         {
                             "command": "rollout-summary",
                             "rollout": path_ref(target),
@@ -7864,26 +7889,29 @@ def materialize_remote_host(
                             "repair": "raw rollout was materialized but exceeds repaired scan limit; scan may keep an oversized gap",
                         }
                     )
-                    continue
-                report["rollout_count"] += 1
-                continue
-            summary_target, summary_error = write_remote_summary(rollout_ref)
+                    return result
+                result.rollout_count += 1
+                return result
+            summary_target, summary_error, summary_ref = write_remote_summary(rollout_ref)
             if summary_target is not None:
+                result.summary_count += 1
+                if summary_ref is not None:
+                    result.remote_generated_summaries.append(summary_ref)
                 summary_scan_bytes = max(max_raw_bytes, REMOTE_ROLLOUT_SUMMARY_SCAN_BYTES)
                 if not summary_has_scannable_backing_ref(
                     summary_target,
                     max_scan_bytes=summary_scan_bytes,
                     source_root=root,
                 ):
-                    report["failed_rollout_count"] += 1
-                    report["errors"].append(
+                    result.failed_rollout_count += 1
+                    result.errors.append(
                         {
                             "command": "fetch-rollout",
                             "rollout": path_ref(target),
                             "error": command_failure(fetch),
                         }
                     )
-                    report["errors"].append(
+                    result.errors.append(
                         {
                             "command": "rollout-summary",
                             "rollout": path_ref(target),
@@ -7891,9 +7919,9 @@ def materialize_remote_host(
                             "repair": "raw rollout was not materialized and the fallback summary cannot preserve a remote_source_not_materialized gap",
                         }
                     )
-                    continue
+                    return result
                 if summary_has_generated_remote_coverage_proof(summary_target, max_scan_bytes=max_raw_bytes):
-                    report["errors"].append(
+                    result.errors.append(
                         {
                             "command": "fetch-rollout",
                             "rollout": path_ref(target),
@@ -7901,8 +7929,8 @@ def materialize_remote_host(
                             "repair": "wrote bounded rollout-summary; complete scan_meta proof can repair coverage without retaining raw remote transcript text",
                         }
                     )
-                    continue
-                report["errors"].append(
+                    return result
+                result.errors.append(
                     {
                         "command": "fetch-rollout",
                         "rollout": path_ref(target),
@@ -7910,7 +7938,7 @@ def materialize_remote_host(
                         "repair": "wrote bounded rollout-summary; scan keeps a coverage gap unless the summary has complete generated coverage proof",
                     }
                 )
-                report["errors"].append(
+                result.errors.append(
                     {
                         "command": "rollout-summary",
                         "rollout": path_ref(target),
@@ -7918,22 +7946,37 @@ def materialize_remote_host(
                         "repair": "raw rollout was not materialized and the fallback summary is not trusted complete coverage",
                     }
                 )
-                continue
-            report["errors"].append(
+                return result
+            result.errors.append(
                 {
                     "command": "fetch-rollout",
                     "rollout": path_ref(target),
                     "error": command_failure(fetch),
                 }
             )
-            report["errors"].append(
+            result.errors.append(
                 {
                     "command": "rollout-summary",
                     "rollout": path_ref(target),
                     "error": summary_error or "remote rollout-summary failed",
                 }
             )
-            report["failed_rollout_count"] += 1
+            result.failed_rollout_count += 1
+            return result
+
+        if rollout_jobs == 1 or len(rollout_refs) <= 1:
+            rollout_results = [materialize_rollout(rollout_ref) for rollout_ref in rollout_refs]
+        else:
+            worker_count = min(rollout_jobs, len(rollout_refs))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                rollout_results = list(executor.map(materialize_rollout, rollout_refs))
+
+        for result in rollout_results:
+            report["rollout_count"] += result.rollout_count
+            report["summary_count"] += result.summary_count
+            report["failed_rollout_count"] += result.failed_rollout_count
+            report["errors"].extend(result.errors)
+            report["remote_generated_summaries"].extend(result.remote_generated_summaries)
 
     if report["status"] == "ready" and report["failed_rollout_count"]:
         report["status"] = "remote_source_not_materialized"
@@ -7981,6 +8024,53 @@ def source_args_from_manifest(
     return values
 
 
+def materialize_repair_hosts(
+    *,
+    gap_hosts: set[str],
+    root: Path,
+    start: dt.datetime,
+    end: dt.datetime,
+    remote_probe: Path,
+    session_meta_limit: int,
+    max_raw_bytes: int,
+    host_jobs: int,
+    rollout_jobs: int,
+) -> tuple[dict[str, Path], list[dict[str, Any]]]:
+    host_jobs = require_remote_materialization_jobs(host_jobs, "--remote-host-jobs")
+    rollout_jobs = require_remote_materialization_jobs(rollout_jobs, "--remote-rollout-jobs")
+    # Initialize the opaque ref key before worker threads can call path_ref().
+    path_ref_key()
+    remote_roots: dict[str, Path] = {}
+    host_specs: list[tuple[str, Path]] = []
+    for host in DEFAULT_REMOTE_HOSTS:
+        if host not in gap_hosts:
+            continue
+        remote_root = root / "remote-sources" / host
+        remote_roots[host] = remote_root
+        host_specs.append((host, remote_root))
+
+    def materialize_host(spec: tuple[str, Path]) -> dict[str, Any]:
+        host, remote_root = spec
+        return materialize_remote_host(
+            host=host,
+            root=remote_root,
+            start=start,
+            end=end,
+            remote_probe=remote_probe,
+            session_meta_limit=session_meta_limit,
+            max_raw_bytes=max_raw_bytes,
+            rollout_jobs=rollout_jobs,
+        )
+
+    if host_jobs == 1 or len(host_specs) <= 1:
+        materialized_hosts = [materialize_host(spec) for spec in host_specs]
+    else:
+        worker_count = min(host_jobs, len(host_specs))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            materialized_hosts = list(executor.map(materialize_host, host_specs))
+    return remote_roots, materialized_hosts
+
+
 def run_coverage_repair(
     args: argparse.Namespace,
     *,
@@ -7993,6 +8083,8 @@ def run_coverage_repair(
     start, end = manifest_window_bounds(manifest)
     max_raw_bytes = require_positive_window(args.max_raw_bytes, "--max-raw-bytes")
     session_meta_limit = require_positive_window(args.remote_session_meta_limit, "--remote-session-meta-limit")
+    remote_host_jobs = require_remote_materialization_jobs(args.remote_host_jobs, "--remote-host-jobs")
+    remote_rollout_jobs = require_remote_materialization_jobs(args.remote_rollout_jobs, "--remote-rollout-jobs")
     root = (
         ensure_safe_output_dir(Path(args.output)).absolute()
         if args.output
@@ -8006,22 +8098,17 @@ def run_coverage_repair(
     materialized_hosts: list[dict[str, Any]] = []
     if not args.skip_remote_materialization:
         gap_hosts = repair_materialization_gap_hosts(manifest.get("coverage_gaps") or [])
-        for host in DEFAULT_REMOTE_HOSTS:
-            if host not in gap_hosts:
-                continue
-            remote_root = root / "remote-sources" / host
-            remote_roots[host] = remote_root
-            materialized_hosts.append(
-                materialize_remote_host(
-                    host=host,
-                    root=remote_root,
-                    start=start,
-                    end=end,
-                    remote_probe=remote_probe,
-                    session_meta_limit=session_meta_limit,
-                    max_raw_bytes=max_raw_bytes,
-                )
-            )
+        remote_roots, materialized_hosts = materialize_repair_hosts(
+            gap_hosts=gap_hosts,
+            root=root,
+            start=start,
+            end=end,
+            remote_probe=remote_probe,
+            session_meta_limit=session_meta_limit,
+            max_raw_bytes=max_raw_bytes,
+            host_jobs=remote_host_jobs,
+            rollout_jobs=remote_rollout_jobs,
+        )
 
     repaired_scan_dir = root / "scan"
     repaired_shards_dir = root / "shards"
@@ -8770,6 +8857,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     weekly_dry_run.add_argument("--repair-remote-session-meta-limit", type=int, default=500)
     weekly_dry_run.add_argument(
+        "--repair-remote-host-jobs",
+        type=int,
+        default=2,
+        help=f"Maximum default remote hosts to materialize concurrently for optional --repair, capped at {MAX_REMOTE_MATERIALIZATION_JOBS}.",
+    )
+    weekly_dry_run.add_argument(
+        "--repair-remote-rollout-jobs",
+        type=int,
+        default=2,
+        help=f"Maximum rollouts to materialize concurrently per host for optional --repair, capped at {MAX_REMOTE_MATERIALIZATION_JOBS}.",
+    )
+    weekly_dry_run.add_argument(
         "--repair-skip-remote-materialization",
         action="store_true",
         help="Only rerun the optional --repair scan, useful for local oversized coverage repair.",
@@ -8796,6 +8895,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to remote_codex_probe.py. Defaults to the bundled helper beside this script.",
     )
     repair_coverage.add_argument("--remote-session-meta-limit", type=int, default=500)
+    repair_coverage.add_argument(
+        "--remote-host-jobs",
+        type=int,
+        default=2,
+        help=f"Maximum default remote hosts to materialize concurrently, capped at {MAX_REMOTE_MATERIALIZATION_JOBS}.",
+    )
+    repair_coverage.add_argument(
+        "--remote-rollout-jobs",
+        type=int,
+        default=2,
+        help=f"Maximum rollouts to materialize concurrently per host, capped at {MAX_REMOTE_MATERIALIZATION_JOBS}.",
+    )
     repair_coverage.add_argument(
         "--skip-remote-materialization",
         action="store_true",
@@ -8828,6 +8939,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to remote_codex_probe.py. Defaults to the bundled helper beside this script.",
     )
     weekly_repair.add_argument("--remote-session-meta-limit", type=int, default=500)
+    weekly_repair.add_argument(
+        "--remote-host-jobs",
+        type=int,
+        default=2,
+        help=f"Maximum default remote hosts to materialize concurrently, capped at {MAX_REMOTE_MATERIALIZATION_JOBS}.",
+    )
+    weekly_repair.add_argument(
+        "--remote-rollout-jobs",
+        type=int,
+        default=2,
+        help=f"Maximum rollouts to materialize concurrently per host, capped at {MAX_REMOTE_MATERIALIZATION_JOBS}.",
+    )
     weekly_repair.add_argument(
         "--skip-remote-materialization",
         action="store_true",

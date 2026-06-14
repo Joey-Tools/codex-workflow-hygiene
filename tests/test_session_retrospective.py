@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -5202,6 +5203,128 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["hosts"]["miku-bot-dev"], 1)
         self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
         self.assertEqual(report["repair"]["materialized_hosts"][0]["rollout_count"], 1)
+
+    def test_materialize_repair_hosts_runs_default_hosts_concurrently_in_stable_order(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "coverage-repair"
+            active = 0
+            started = 0
+            max_active = 0
+            condition = threading.Condition()
+
+            def fake_materialize_remote_host(**kwargs: object) -> dict[str, object]:
+                nonlocal active, started, max_active
+                with condition:
+                    active += 1
+                    started += 1
+                    max_active = max(max_active, active)
+                    condition.notify_all()
+                    if started < 2:
+                        condition.wait_for(lambda: started >= 2, timeout=2)
+                    active -= 1
+                return {
+                    "host": kwargs["host"],
+                    "root": os.fspath(kwargs["root"]),
+                    "status": "ready",
+                    "rollout_count": 0,
+                    "summary_count": 0,
+                    "failed_rollout_count": 0,
+                    "errors": [],
+                    "remote_generated_summaries": [],
+                }
+
+            with mock.patch.object(MODULE, "materialize_remote_host", side_effect=fake_materialize_remote_host):
+                remote_roots, reports = MODULE.materialize_repair_hosts(
+                    gap_hosts=set(MODULE.DEFAULT_REMOTE_HOSTS),
+                    root=root,
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    remote_probe=Path(raw) / "remote_probe.py",
+                    session_meta_limit=500,
+                    max_raw_bytes=1000,
+                    host_jobs=2,
+                    rollout_jobs=1,
+                )
+
+        self.assertEqual(max_active, 2)
+        self.assertEqual([report["host"] for report in reports], list(MODULE.DEFAULT_REMOTE_HOSTS))
+        self.assertEqual(list(remote_roots), list(MODULE.DEFAULT_REMOTE_HOSTS))
+
+    def test_materialize_remote_host_fetches_rollouts_concurrently_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "materialized"
+            rollout_refs = [
+                "sessions/2026/05/01/rollout-2026-05-01T10-00-00-left.jsonl",
+                "sessions/2026/05/01/rollout-2026-05-01T10-00-00-right.jsonl",
+            ]
+            active = 0
+            started = 0
+            max_active = 0
+            condition = threading.Condition()
+
+            def completed(args: list[str], stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess[str]:
+                return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+            def fake_run_remote_probe(remote_probe: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+                nonlocal active, started, max_active
+                cmd = args[0]
+                if cmd == "preflight":
+                    host = args[args.index("--host") + 1]
+                    return completed(
+                        args,
+                        "host\thostname\tuser\thome\tcodex\trg\tpython3\n"
+                        f"{host}\tfake\thoteng\t/home/hoteng\tpresent\tpresent\tpresent\n",
+                    )
+                if cmd == "session-meta":
+                    host = args[args.index("--host") + 1]
+                    rows = [
+                        "host\tdate\tsession_id\tcwd\trollout",
+                        *(f"{host}\t2026/05/01\ts{index}\t/work\t{ref}" for index, ref in enumerate(rollout_refs, 1)),
+                    ]
+                    return completed(args, "\n".join(rows) + "\n")
+                if cmd == "fetch-rollout":
+                    output = Path(args[args.index("--output") + 1])
+                    rollout = args[args.index("--rollout") + 1]
+                    with condition:
+                        active += 1
+                        started += 1
+                        max_active = max(max_active, active)
+                        condition.notify_all()
+                        if started < 2:
+                            condition.wait_for(lambda: started >= 2, timeout=2)
+                        active -= 1
+                    output.write_text(
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "timestamp": "2026-05-01T10:00:00Z",
+                                "payload": {"type": "user_message", "message": f"Remote task from {rollout}."},
+                            }
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    return completed(args, "ok=true\n")
+                return completed(args, stderr="unexpected command", returncode=2)
+
+            with mock.patch.object(MODULE, "run_remote_probe", side_effect=fake_run_remote_probe):
+                report = MODULE.materialize_remote_host(
+                    host="miku-bot-dev",
+                    root=root,
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    remote_probe=Path(raw) / "remote_probe.py",
+                    session_meta_limit=500,
+                    max_raw_bytes=1000,
+                    rollout_jobs=2,
+                )
+            materialized_files_exist = all((root / rollout_ref).is_file() for rollout_ref in rollout_refs)
+
+        self.assertEqual(max_active, 2)
+        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["rollout_count"], 2)
+        self.assertEqual(report["failed_rollout_count"], 0)
+        self.assertTrue(materialized_files_exist)
 
     def test_repair_coverage_uses_remote_generated_summary_when_fetch_is_too_large(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

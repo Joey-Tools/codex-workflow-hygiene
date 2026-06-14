@@ -25,6 +25,8 @@ python3 skills/codex-session-retrospective/scripts/session_retrospective.py week
 
 These commands only write transient `.codex-local/session-retrospective/**` artifacts.
 They do not export retained history, commit, or advance scan state.
+Remote repair materialization defaults to conservative bounded concurrency:
+`--remote-host-jobs 2 --remote-rollout-jobs 2`. Use `1` for serial behavior.
 
 ## Session Retrospective Roadmap
 
