@@ -3925,8 +3925,23 @@ def extract_summary_file(
             safe_ref = safe_rollout_backing_ref(rollout_ref)
             if safe_ref is None:
                 continue
+            source_bytes = complete_scan_meta_record_source_bytes(record, allow_tail_record_limit=True)
+            source_sha256 = complete_scan_meta_record_source_sha256(record)
+            if (
+                source_bytes is None
+                or source_sha256 is None
+                or source_sha256 == ""
+                or source_bytes > LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES
+            ):
+                continue
+            source_identity = RolloutSourceIdentity(source_bytes=source_bytes, source_sha256=source_sha256)
             rollout_path = source.root / safe_ref
-            if safe_source_file(rollout_path, source.root):
+            if backing_ref_matches_current_rollout_identity(
+                source.root,
+                safe_ref,
+                source_identity,
+                max_hash_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
+            ):
                 identity_path = rollout_path
                 session_id = session_id_from_path(rollout_path)
                 break
