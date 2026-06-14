@@ -132,14 +132,20 @@ review gates, and merge before starting the next item.
    - Keep a conservative default for SSH and IO pressure.
    - Expose `--remote-host-jobs` and `--remote-rollout-jobs` on repair commands,
      defaulting to `2` and capped at `8`; `1` preserves serial behavior.
-   - Status: implemented in the parallel remote materialization PR.
+   - Status: completed in PR #19.
 
 6. Report readability
    - Add a compact report with window, host coverage, before/after gap counts,
      retained-readiness status, top blockers, next command, transient disk usage,
      and confidence.
    - Keep JSON reports as the machine-readable source of truth.
-   - Status: implemented in the report readability PR.
+   - Ensure ready sources with coverage gaps are shown as blocked in the compact
+     host coverage summary.
+   - Ensure repair reports suggest another follow-up command when repairable
+     gaps remain.
+   - Preserve the current repair `--max-raw-bytes` in generated repair follow-up
+     commands, so repeated repairs do not fall back to the parser default.
+   - Status: completed in PR #20 with follow-up fixes in PR #21 and PR #22.
 
 7. Safety and privacy flag calibration
    - Reduce false positives from ordinary paths, approval text, and host labels.
