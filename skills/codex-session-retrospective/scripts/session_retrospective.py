@@ -1122,6 +1122,38 @@ def generated_summary_files(root: Path | None) -> list[Path]:
     return sorted(path for path in root.rglob("rollout-summary*.jsonl") if safe_source_file(path, root))
 
 
+def generated_summary_files_from_manifest(root: Path | None, raw_paths: Any) -> list[Path]:
+    if root is None:
+        return []
+    if raw_paths is None:
+        return []
+    if not isinstance(raw_paths, list):
+        raise SystemExit("make-shards requires generated_summaries to be a list")
+    if not root.exists() or root.is_symlink():
+        return []
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError:
+        return []
+    summaries: list[Path] = []
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str) or not raw_path:
+            raise SystemExit("make-shards requires generated_summaries entries to be paths")
+        path = Path(raw_path).expanduser()
+        if not generated_summary_artifact_path(path):
+            raise SystemExit("make-shards generated_summaries entries must be generated-summary artifacts")
+        try:
+            path.resolve(strict=True).relative_to(resolved_root)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise SystemExit("make-shards generated_summaries entries must stay under generated_summary_root") from exc
+        if path_has_disallowed_symlink_component(path.parent) or path.is_symlink() or not path.is_file():
+            raise SystemExit("make-shards generated_summaries entries must be regular files without symlink ancestors")
+        summaries.append(path)
+    return sorted(summaries)
+
+
 def local_rollout_summary_jsonl_bytes(source: Source, rollout: Path, rollout_ref: str) -> bytes:
     safe_ref = safe_rollout_backing_ref(rollout_ref)
     if safe_ref is None:
@@ -2540,6 +2572,17 @@ def complete_scan_meta_backing_rollout_refs(
     proof = complete_scan_meta_backing_source_bytes_by_ref(summary, start, end)
     if proof is None or not proof.source_bytes_by_ref:
         return set()
+    summary_context_relevant = summary_file_relevant_with_scan_cap(
+        summary,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    ) or summary_file_has_session_meta_in_window(
+        summary,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    )
     refs: set[str] = set()
     for ref in scan_meta_refs:
         source_bytes = proof.source_bytes_by_ref.get(ref)
@@ -2559,6 +2602,7 @@ def complete_scan_meta_backing_rollout_refs(
                 max_scan_bytes=max_scan_bytes,
                 archived_duplicate_keys=archived_duplicate_keys,
             )
+            or summary_context_relevant
         ):
             continue
         if backing_ref_matches_current_or_selected_rollout(
@@ -3919,7 +3963,7 @@ def retained_manifest_from_transient(manifest: dict[str, Any]) -> dict[str, Any]
     for source in manifest.get("sources", []):
         retained_source: dict[str, Any] = {}
         for key, value in source.items():
-            if key in {"generated_summary_root"}:
+            if key in {"generated_summary_root", "generated_summaries"}:
                 continue
             if key in {"root", "path"}:
                 ref_key, ref_value = redacted_path_entry(key, value)
@@ -5879,6 +5923,7 @@ def run_scan(
         }
         if generated_summaries:
             manifest_source["generated_summary_root"] = source_generated_summary_root.as_posix()
+            manifest_source["generated_summaries"] = [summary.as_posix() for summary in generated_summaries]
         manifest_sources.append(manifest_source)
         if source_materialization_gaps:
             continue
@@ -6208,6 +6253,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         }
         if generated_summaries:
             manifest_source["generated_summary_root"] = source_generated_summary_root.as_posix()
+            manifest_source["generated_summaries"] = [summary.as_posix() for summary in generated_summaries]
         manifest_sources.append(manifest_source)
     if getattr(args, "allow_partial_hosts", False):
         coverage_gaps.append({"host": "scope", "reason": "partial_host_scope"})
@@ -7212,6 +7258,10 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         raw_generated_summary_root = source_entry.get("generated_summary_root")
         if isinstance(raw_generated_summary_root, str) and raw_generated_summary_root:
             generated_summary_root = ensure_safe_output_dir(Path(raw_generated_summary_root).expanduser())
+        generated_summaries = generated_summary_files_from_manifest(
+            generated_summary_root,
+            source_entry.get("generated_summaries"),
+        )
         source = Source(str(host), root)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not root.exists():
@@ -7230,7 +7280,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             append_source_gap_shards(source_materialization_gaps, root)
             continue
         rollouts = source_rollouts(source)
-        summaries = sorted([*source_summary_files(source), *generated_summary_files(generated_summary_root)])
+        summaries = sorted([*source_summary_files(source), *generated_summaries])
         archived_duplicate_keys = archived_rollout_duplicate_keys(root)
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, root)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(

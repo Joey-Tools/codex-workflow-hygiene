@@ -1362,6 +1362,14 @@ def safe_summary_text(kind, text):
     return summary_signal_text(kind, str(text))
 
 
+def summary_signal_sample_text(text, max_text_chars):
+    value = str(text)
+    sample_chars = max(int(max_text_chars or 0), 256)
+    if len(value) <= sample_chars * 2:
+        return value
+    return value[:sample_chars] + "\\n" + value[-sample_chars:]
+
+
 def event_user_message_text(payload):
     message = payload.get("message")
     if isinstance(message, str):
@@ -1382,7 +1390,7 @@ def summary_record(kind, text, *, line_no, timestamp, session_id=""):
         signal_text = meaningful_user_message_text(text)
         if not signal_text:
             return None
-    value = normalize_text(safe_summary_text(kind, signal_text), SUMMARY_MAX_TEXT_CHARS)
+    value = normalize_text(safe_summary_text(kind, summary_signal_sample_text(signal_text, SUMMARY_MAX_TEXT_CHARS)), SUMMARY_MAX_TEXT_CHARS)
     if not value:
         return None
     record = {{"kind": kind, "line": line_no, "text": value, "timestamp": timestamp or ""}}
@@ -2659,6 +2667,14 @@ def _safe_summary_text(kind: str, text: str) -> str:
     return _summary_signal_text(kind, text)
 
 
+def _summary_signal_sample_text(text: str, max_text_chars: int) -> str:
+    value = str(text)
+    sample_chars = max(max_text_chars, 256)
+    if len(value) <= sample_chars * 2:
+        return value
+    return value[:sample_chars] + "\n" + value[-sample_chars:]
+
+
 def _summary_record_has_signal(record: dict[str, Any] | None) -> bool:
     if record is None or str(record.get("kind", "")) in {"session_meta", "scan_meta"}:
         return False
@@ -2694,7 +2710,10 @@ def _build_summary_record(
         signal_text = _meaningful_user_message_text(text)
         if not signal_text:
             return None
-    normalized = _normalize_summary_text(_safe_summary_text(kind, signal_text), max_text_chars=max_text_chars)
+    normalized = _normalize_summary_text(
+        _safe_summary_text(kind, _summary_signal_sample_text(signal_text, max_text_chars)),
+        max_text_chars=max_text_chars,
+    )
     if not normalized:
         return None
     record = {

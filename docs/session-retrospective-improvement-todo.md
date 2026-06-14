@@ -26,14 +26,18 @@ review gates, and merge before starting the next item.
    - Keep raw rollout files read-only and transient.
    - Preserve coverage gaps when summaries are partial, stale, or truncated.
    - Store generated summaries in ignored transient generated-summary
-     directories and expose their root only in the transient
-     `shard_manifest.json`; retained manifests must drop the raw
-     generated-summary path.
+     directories and expose their root plus exact per-run generated file list
+     only in the transient `shard_manifest.json`; retained manifests must drop
+     both raw generated-summary fields.
    - Use a separate bounded generated-summary cap so trusted local generated
      summaries can feed both compact scan extraction and shard planning even
      when they are larger than the raw rollout cap.
    - Ensure both `scan-*` and `discover -> make-shards` can use the generated
      summaries, so compact extraction and map-reduce planning stay consistent.
+   - Ensure repeated runs with the same output path do not let stale generated
+     summaries from older runs feed `make-shards`.
+   - Bound generated-summary signal regex input for very large single-record
+     payloads while preserving head/tail signal detection.
    - Status: implemented in the local oversized rollout summaries PR; review
      and merge pending.
 

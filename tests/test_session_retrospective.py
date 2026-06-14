@@ -2062,6 +2062,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(meta["record_limit_reached"])
         self.assertFalse(meta["tail_record_limit_reached"])
 
+    def test_remote_probe_rollout_summary_caps_signal_text_before_regex(self) -> None:
+        captured: list[str] = []
+
+        def fake_signal_text(kind: str, text: str) -> str:
+            captured.append(text)
+            if "You missed" in text:
+                return "you missed"
+            return f"{kind.replace('_', ' ')} present"
+
+        with mock.patch.object(REMOTE_PROBE, "_summary_signal_text", side_effect=fake_signal_text):
+            records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
+                lines=[
+                    json.dumps(
+                        message(
+                            "user",
+                            ("x" * 5000) + " You missed verification at the tail.",
+                            "2026-05-01T10:00:00Z",
+                        )
+                    )
+                ],
+                keywords=[],
+                limit=10,
+                tail_records=8,
+                max_text_chars=80,
+            )
+
+        self.assertEqual(meta["json_error_count"], 0)
+        self.assertTrue(captured)
+        self.assertTrue(all(len(text) <= 513 for text in captured))
+        self.assertTrue(any("You missed verification at the tail." in text for text in captured))
+        self.assertTrue(any(record.get("text") == "you missed" for record in records))
+
     def test_remote_probe_rollout_summary_reports_json_error_metadata(self) -> None:
         records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
             lines=[
@@ -8000,8 +8032,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertTrue(generated_root.is_dir())
             with self.assertRaises(ValueError):
                 generated_root.relative_to(output)
+            self.assertEqual(len(manifest["sources"][0]["generated_summaries"]), 1)
             self.assertEqual(manifest["sources"][0]["summary_count"], 1)
             self.assertNotIn("generated_summary_root", retained_manifest["sources"][0])
+            self.assertNotIn("generated_summaries", retained_manifest["sources"][0])
             self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
             self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
 
@@ -8039,8 +8073,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("oversized_rollout_skipped", reasons)
         self.assertEqual(manifest["sources"][0]["host"], "custom_source")
         self.assertIn("generated_summary_root", manifest["sources"][0])
+        self.assertEqual(len(manifest["sources"][0]["generated_summaries"]), 1)
         self.assertEqual(retained_manifest["sources"][0]["host"], "custom_source")
         self.assertNotIn("generated_summary_root", retained_manifest["sources"][0])
+        self.assertNotIn("generated_summaries", retained_manifest["sources"][0])
 
     def test_generated_local_summary_rejects_symlink_output_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -8222,6 +8258,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
             generated_root = Path(manifest["sources"][0]["generated_summary_root"])
+            self.assertEqual(len(manifest["sources"][0]["generated_summaries"]), 1)
             MODULE.main(["validate-output", "--run-dir", str(output)])
 
         self.assertEqual(generated_root.relative_to(output).parts[0], MODULE.LOCAL_GENERATED_SUMMARY_DIR_SUFFIX)
@@ -8427,7 +8464,140 @@ class SessionRetrospectiveTests(unittest.TestCase):
             ]
 
         self.assertIn("generated_summary_root", manifest["sources"][0])
+        self.assertEqual(len(manifest["sources"][0]["generated_summaries"]), 1)
         self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
+        self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
+
+    def test_make_shards_uses_only_current_manifest_generated_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            old_rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-old.jsonl"
+            write_jsonl(
+                old_rollout,
+                [
+                    message("user", "You missed old verification.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw)
+            MODULE.run_discover(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    max_raw_bytes=3000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            first_manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            old_generated_summary = Path(first_manifest["sources"][0]["generated_summaries"][0])
+            old_rollout.unlink()
+
+            new_rollout = root / "sessions" / "2026" / "05" / "02" / "rollout-2026-05-02T10-00-00-new.jsonl"
+            write_jsonl(
+                new_rollout,
+                [
+                    message("user", "You missed new verification.", "2026-05-02T10:00:00Z"),
+                    message("assistant", "y" * 5000, "2026-05-02T10:00:01Z"),
+                ],
+            )
+            MODULE.run_discover(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    max_raw_bytes=3000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-03T00:00:00Z"),
+            )
+            second_manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            current_generated_summaries = [Path(path) for path in second_manifest["sources"][0]["generated_summaries"]]
+            self.assertEqual(len(current_generated_summaries), 1)
+            self.assertNotIn(old_generated_summary, current_generated_summaries)
+            self.assertTrue(old_generated_summary.exists())
+            shard_output = safe_output_dir(raw, "current-generated-shards")
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(output / "shard_manifest.json"),
+                    "--output",
+                    str(shard_output),
+                    "--max-raw-bytes",
+                    "3000",
+                    "--include-raw-paths",
+                ]
+            )
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertFalse(any(row.get("path") == old_generated_summary.as_posix() for row in shard_rows))
+        self.assertTrue(
+            any(
+                row.get("path") == current_generated_summaries[0].as_posix()
+                and row.get("kind") == "summary"
+                and row.get("status") == "ready"
+                for row in shard_rows
+            )
+        )
+        self.assertFalse(any(row.get("status") == "partial" for row in shard_rows))
+
+    def test_generated_summary_context_covers_old_oversized_rollout_without_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "04" / "01" / "rollout-2026-04-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("assistant", "x" * 1000, "2026-04-01T10:00:00Z"),
+                    message("user", "Please build the weekly helper for the report.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "Done.", "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            with mock.patch.object(MODULE, "ROLLOUT_TIMESTAMP_SCAN_BYTES", 128):
+                MODULE.run_scan(
+                    types.SimpleNamespace(
+                        source=[f"local={root}"],
+                        output=str(output),
+                        state=None,
+                        max_raw_bytes=300,
+                        allow_partial_hosts=True,
+                    ),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            shard_output = safe_output_dir(raw, "old-context-shards")
+            with mock.patch.object(MODULE, "ROLLOUT_TIMESTAMP_SCAN_BYTES", 128):
+                MODULE.main(
+                    [
+                        "make-shards",
+                        "--manifest",
+                        str(output / "shard_manifest.json"),
+                        "--output",
+                        str(shard_output),
+                        "--max-raw-bytes",
+                        "300",
+                    ]
+                )
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertNotIn("oversized_rollout_skipped", reasons)
         self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
 
     def test_complete_rollout_summary_covers_oversized_rollout_gap(self) -> None:
