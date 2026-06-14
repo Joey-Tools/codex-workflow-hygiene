@@ -26,9 +26,12 @@ MAX_SESSION_META_LIMIT = 500
 MAX_SESSION_META_DATE_COUNT = 31
 MAX_FETCH_ROLLOUT_BYTES = 16 * 1024 * 1024
 MAX_ROLLOUT_SUMMARY_LIMIT = 200
-MAX_ROLLOUT_SUMMARY_SCAN_BYTES = 2 * 1024 * 1024
+MAX_ROLLOUT_SUMMARY_SCAN_BYTES = 0
+MAX_ROLLOUT_SUMMARY_LINE_BYTES = 1024 * 1024
 MAX_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 MAX_ROLLOUT_SUMMARY_TEXT_CHARS = 1200
+REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = "remote_generated_rollout_summary_v1"
+SOURCE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_SESSION_META_SCAN_BYTES = 256 * 1024
 SESSION_META_FLAT_UNDATED_ALIAS_PREFIX = "flat_archived_undated_v1"
 REMOTE_PREFLIGHT_TIMEOUT_SECONDS = 15
@@ -880,6 +883,7 @@ MAX_FETCH_ROLLOUT_BYTES = int(CONFIG.get("max_fetch_rollout_bytes", 0))
 SESSION_META_SCAN_BYTES = int(CONFIG.get("session_meta_scan_bytes", 0))
 SUMMARY_LIMIT = int(CONFIG.get("summary_limit", 0))
 SUMMARY_SCAN_BYTES = int(CONFIG.get("summary_scan_bytes", 0))
+SUMMARY_LINE_BYTES = int(CONFIG.get("summary_line_bytes", 0)) or {MAX_ROLLOUT_SUMMARY_LINE_BYTES}
 SUMMARY_TAIL_RECORDS = int(CONFIG.get("summary_tail_records", 0))
 SUMMARY_MAX_TEXT_CHARS = int(CONFIG.get("summary_max_text_chars", 0))
 SUMMARY_MAX_TEXT_CHARS_LIMIT = {MAX_ROLLOUT_SUMMARY_TEXT_CHARS}
@@ -902,6 +906,7 @@ AUTOMATION_PROMPT_MARKERS = {AUTOMATION_PROMPT_MARKERS!r}
 SUMMARY_SIGNAL_MARKERS = {SUMMARY_SIGNAL_MARKERS!r}
 SUMMARY_SIGNAL_CHUNK_CHARS = {SUMMARY_SIGNAL_CHUNK_CHARS}
 SUMMARY_SIGNAL_CHUNK_OVERLAP = {SUMMARY_SIGNAL_CHUNK_OVERLAP}
+REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = {REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF!r}
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
 SESSION_META_END = {REMOTE_SESSION_META_END!r}
 SESSION_META_LIMIT_TRUNCATED_REASON = {SESSION_META_LIMIT_TRUNCATED_REASON!r}
@@ -1432,21 +1437,51 @@ def summary_record_has_signal(record):
 
 def bounded_text_lines(handle, max_scan_bytes):
     scanned = 0
+    buffer = bytearray()
+    dropping_oversized_line = False
+    chunk_bytes = 64 * 1024
+
+    def line_ended(part):
+        return part.endswith(b"\\n") or part.endswith(b"\\r")
+
     while True:
         if max_scan_bytes and scanned >= max_scan_bytes:
+            if dropping_oversized_line:
+                yield "\\n"
+            elif buffer:
+                yield bytes(buffer).decode("utf-8", "replace")
             return
         remaining = max_scan_bytes - scanned if max_scan_bytes else 0
-        raw_line = handle.readline(remaining + 1 if remaining else -1)
-        if not raw_line:
+        read_size = min(chunk_bytes, remaining) if remaining else chunk_bytes
+        chunk = handle.read(read_size)
+        if not chunk:
+            if dropping_oversized_line:
+                yield "\\n"
+            elif buffer:
+                yield bytes(buffer).decode("utf-8", "replace")
             return
-        if isinstance(raw_line, str):
-            raw_bytes = raw_line.encode("utf-8", "surrogatepass")
+        if isinstance(chunk, str):
+            raw_bytes = chunk.encode("utf-8", "surrogatepass")
         else:
-            raw_bytes = bytes(raw_line)
-        if max_scan_bytes and len(raw_bytes) > remaining:
-            return
+            raw_bytes = bytes(chunk)
         scanned += len(raw_bytes)
-        yield raw_bytes.decode("utf-8", "replace")
+        for part in raw_bytes.splitlines(keepends=True):
+            if dropping_oversized_line:
+                if line_ended(part):
+                    yield "\\n"
+                    dropping_oversized_line = False
+                continue
+            if len(buffer) + len(part) > SUMMARY_LINE_BYTES:
+                buffer.clear()
+                dropping_oversized_line = True
+                if line_ended(part):
+                    yield "\\n"
+                    dropping_oversized_line = False
+                continue
+            buffer.extend(part)
+            if line_ended(part):
+                yield bytes(buffer).decode("utf-8", "replace")
+                buffer.clear()
 
 
 def summarize_rollout():
@@ -1493,16 +1528,15 @@ def summarize_rollout():
 
     try:
         target_size = target.stat().st_size
-        target_sha256 = None
-        if not SUMMARY_SCAN_BYTES or target_size <= SUMMARY_SCAN_BYTES:
-            target_sha256 = file_sha256(target)
+        effective_summary_scan_bytes = SUMMARY_SCAN_BYTES or target_size
+        target_sha256 = file_sha256(target) if target_size <= effective_summary_scan_bytes else None
         handle = open_rollout_text(target)
     except OSError:
         print(json.dumps({{"ok": False, "error": "rollout unreadable"}}, separators=(",", ":"), sort_keys=True))
         print(ROLLOUT_SUMMARY_END)
         return
     with handle:
-        for line_no, line in enumerate(bounded_text_lines(handle, SUMMARY_SCAN_BYTES), 1):
+        for line_no, line in enumerate(bounded_text_lines(handle, effective_summary_scan_bytes), 1):
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
@@ -1612,21 +1646,21 @@ def summarize_rollout():
         "matched_record_limit_reached": matched_record_limit_reached,
         "record_limit_reached": record_limit_reached,
         "rollout": normalized,
-        "scan_bytes": SUMMARY_SCAN_BYTES,
-        "scan_truncated": bool(SUMMARY_SCAN_BYTES and target_size > SUMMARY_SCAN_BYTES),
+        "scan_bytes": effective_summary_scan_bytes,
+        "scan_truncated": bool(effective_summary_scan_bytes and target_size > effective_summary_scan_bytes),
         "signal_record_limit_reached": signal_record_limit_reached,
         "source_bytes": target_size,
         "summary_limit": SUMMARY_LIMIT,
         "summary_record_count": summary_record_count,
         "tail_record_limit_reached": tail_record_limit_reached,
         "tail_records": SUMMARY_TAIL_RECORDS,
-        "text": "scan_truncated=" + str(bool(SUMMARY_SCAN_BYTES and target_size > SUMMARY_SCAN_BYTES)).lower()
+        "text": "scan_truncated=" + str(bool(effective_summary_scan_bytes and target_size > effective_summary_scan_bytes)).lower()
             + " keyword_filter_applied=" + str(keyword_filter_applied).lower()
             + " record_limit_reached=" + str(record_limit_reached).lower()
             + " signal_record_limit_reached=" + str(signal_record_limit_reached).lower()
             + " matched_record_limit_reached=" + str(matched_record_limit_reached).lower()
             + " tail_record_limit_reached=" + str(tail_record_limit_reached).lower()
-            + " scan_bytes=" + str(SUMMARY_SCAN_BYTES)
+            + " scan_bytes=" + str(effective_summary_scan_bytes)
             + " json_error_count=" + str(json_error_count)
             + " summary_limit=" + str(SUMMARY_LIMIT)
             + " tail_records=" + str(SUMMARY_TAIL_RECORDS)
@@ -1636,6 +1670,25 @@ def summarize_rollout():
     }}
     if target_sha256 is not None:
         scan_meta["source_sha256"] = target_sha256
+    if (
+        scan_meta.get("scan_truncated") is False
+        and type(scan_meta.get("summary_limit")) is int
+        and scan_meta["summary_limit"] >= 0
+        and type(scan_meta.get("json_error_count")) is int
+        and scan_meta["json_error_count"] == 0
+        and scan_meta.get("keyword_filter_applied") is False
+        and scan_meta.get("record_limit_reached") is False
+        and scan_meta.get("signal_record_limit_reached") is False
+        and scan_meta.get("matched_record_limit_reached") is False
+        and scan_meta.get("tail_record_limit_reached") is False
+        and type(scan_meta.get("source_bytes")) is int
+        and scan_meta["source_bytes"] >= 0
+        and type(scan_meta.get("scan_bytes")) is int
+        and scan_meta["scan_bytes"] >= scan_meta["source_bytes"]
+        and isinstance(scan_meta.get("source_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{{64}}", scan_meta["source_sha256"]) is not None
+    ):
+        scan_meta["coverage_proof"] = REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF
     print(json.dumps(scan_meta, separators=(",", ":"), sort_keys=True))
     emitted = set()
 
@@ -2770,21 +2823,51 @@ def _build_summary_record(
 
 def _bounded_text_lines(handle: Any, max_scan_bytes: int) -> Iterable[str]:
     scanned = 0
+    buffer = bytearray()
+    dropping_oversized_line = False
+    chunk_bytes = 64 * 1024
+
+    def line_ended(part: bytes) -> bool:
+        return part.endswith(b"\n") or part.endswith(b"\r")
+
     while True:
         if max_scan_bytes and scanned >= max_scan_bytes:
+            if dropping_oversized_line:
+                yield "\n"
+            elif buffer:
+                yield bytes(buffer).decode("utf-8", "replace")
             return
         remaining = max_scan_bytes - scanned if max_scan_bytes else 0
-        raw_line = handle.readline(remaining + 1 if remaining else -1)
-        if not raw_line:
+        read_size = min(chunk_bytes, remaining) if remaining else chunk_bytes
+        chunk = handle.read(read_size)
+        if not chunk:
+            if dropping_oversized_line:
+                yield "\n"
+            elif buffer:
+                yield bytes(buffer).decode("utf-8", "replace")
             return
-        if isinstance(raw_line, str):
-            raw_bytes = raw_line.encode("utf-8", "surrogatepass")
+        if isinstance(chunk, str):
+            raw_bytes = chunk.encode("utf-8", "surrogatepass")
         else:
-            raw_bytes = bytes(raw_line)
-        if max_scan_bytes and len(raw_bytes) > remaining:
-            return
+            raw_bytes = bytes(chunk)
         scanned += len(raw_bytes)
-        yield raw_bytes.decode("utf-8", "replace")
+        for part in raw_bytes.splitlines(keepends=True):
+            if dropping_oversized_line:
+                if line_ended(part):
+                    yield "\n"
+                    dropping_oversized_line = False
+                continue
+            if len(buffer) + len(part) > MAX_ROLLOUT_SUMMARY_LINE_BYTES:
+                buffer.clear()
+                dropping_oversized_line = True
+                if line_ended(part):
+                    yield "\n"
+                    dropping_oversized_line = False
+                continue
+            buffer.extend(part)
+            if line_ended(part):
+                yield bytes(buffer).decode("utf-8", "replace")
+                buffer.clear()
 
 
 def _summarize_rollout_records(
@@ -3023,6 +3106,31 @@ def _rollout_summary_scan_meta(
     return row
 
 
+def _scan_meta_allows_remote_generated_coverage_proof(row: dict[str, Any]) -> bool:
+    source_bytes = row.get("source_bytes")
+    scan_bytes = row.get("scan_bytes")
+    summary_limit = row.get("summary_limit")
+    source_sha256 = row.get("source_sha256")
+    return (
+        row.get("scan_truncated") is False
+        and type(summary_limit) is int
+        and summary_limit >= 0
+        and type(row.get("json_error_count")) is int
+        and row["json_error_count"] == 0
+        and row.get("keyword_filter_applied") is False
+        and row.get("record_limit_reached") is False
+        and row.get("signal_record_limit_reached") is False
+        and row.get("matched_record_limit_reached") is False
+        and row.get("tail_record_limit_reached") is False
+        and type(source_bytes) is int
+        and source_bytes >= 0
+        and type(scan_bytes) is int
+        and scan_bytes >= source_bytes
+        and isinstance(source_sha256, str)
+        and SOURCE_SHA256_RE.fullmatch(source_sha256) is not None
+    )
+
+
 def cmd_rollout_summary(args: argparse.Namespace) -> int:
     try:
         hosts = _resolve_hosts([args.host])
@@ -3051,12 +3159,11 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
             codex_root = _local_codex_root()
             rollout_path = _safe_rollout_path(codex_root, rollout_relative_path)
             source_bytes = rollout_path.stat().st_size
-            source_sha256 = None
-            if not MAX_ROLLOUT_SUMMARY_SCAN_BYTES or source_bytes <= MAX_ROLLOUT_SUMMARY_SCAN_BYTES:
-                source_sha256 = _file_sha256(rollout_path)
+            effective_summary_scan_bytes = MAX_ROLLOUT_SUMMARY_SCAN_BYTES or source_bytes
+            source_sha256 = _file_sha256(rollout_path) if source_bytes <= effective_summary_scan_bytes else None
             with _open_local_rollout_text(codex_root, rollout_relative_path) as handle:
                 records, summary_meta = _summarize_rollout_records_with_meta(
-                    lines=_bounded_text_lines(handle, MAX_ROLLOUT_SUMMARY_SCAN_BYTES),
+                    lines=_bounded_text_lines(handle, effective_summary_scan_bytes),
                     keywords=args.keyword,
                     limit=args.limit,
                     tail_records=args.tail_records,
@@ -3067,7 +3174,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                 _rollout_summary_scan_meta(
                     source_bytes=source_bytes,
                     source_sha256=source_sha256,
-                    scan_bytes=MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
+                    scan_bytes=effective_summary_scan_bytes,
                     summary_limit=args.limit,
                     record_limit_reached=bool(summary_meta["record_limit_reached"]),
                     signal_record_limit_reached=bool(summary_meta["signal_record_limit_reached"]),
@@ -3079,6 +3186,8 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                     summary_record_count=int(summary_meta["summary_record_count"]),
                 ),
             )
+            if _scan_meta_allows_remote_generated_coverage_proof(records[0]):
+                records[0]["coverage_proof"] = REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF
             records = [dict(record, rollout=rollout_ref) for record in records]
         else:
             payload = {
@@ -3088,6 +3197,7 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                 "session_meta_scan_bytes": MAX_SESSION_META_SCAN_BYTES,
                 "summary_keywords": list(args.keyword),
                 "summary_limit": args.limit,
+                "summary_line_bytes": MAX_ROLLOUT_SUMMARY_LINE_BYTES,
                 "summary_scan_bytes": MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
                 "summary_tail_records": args.tail_records,
                 "summary_max_text_chars": args.max_text_chars,
