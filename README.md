@@ -27,6 +27,10 @@ These commands only write transient `.codex-local/session-retrospective/**` arti
 They do not export retained history, commit, or advance scan state.
 Remote repair materialization defaults to conservative bounded concurrency:
 `--remote-host-jobs 2 --remote-rollout-jobs 2`. Use `1` for serial behavior.
+Read `dry_run_report.md` or `repair_report.md` first for the compact quick read:
+window, host coverage, retained-readiness, top blockers, next command, transient
+disk usage, and confidence. The adjacent JSON report remains the
+machine-readable source of truth.
 
 ## Session Retrospective Roadmap
 

@@ -7249,6 +7249,187 @@ def count_jsonl_rows(path: Path) -> int:
     return sum(1 for _line_no, _record in iter_jsonl_strict(path))
 
 
+def directory_size_bytes(root: Path) -> int:
+    total = 0
+    if not root.exists():
+        return total
+    for path in root.rglob("*"):
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            continue
+        if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+            try:
+                total += path.lstat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def report_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
+def total_report_count(counts: dict[str, int]) -> int:
+    return sum(report_int(value) for value in counts.values())
+
+
+def top_report_counts(counts: dict[str, int], *, limit: int = 5) -> list[str]:
+    ranked = sorted(
+        ((str(key), report_int(value)) for key, value in counts.items() if report_int(value) > 0),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return [f"{key}={value}" for key, value in ranked[:limit]]
+
+
+def coverage_gap_hosts(gaps: Iterable[dict[str, Any]]) -> set[str]:
+    return {str(gap.get("host") or "unknown") for gap in gaps if isinstance(gap, dict)}
+
+
+def source_coverage_summary(sources: Iterable[dict[str, Any]], coverage_gaps: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    hosts: list[dict[str, Any]] = []
+    status_counts: Counter[str] = Counter()
+    gap_hosts = coverage_gap_hosts(coverage_gaps)
+    ready_sources = 0
+    empty_sources = 0
+    blocked_sources = 0
+    for source in sources:
+        host = str(source.get("host") or "unknown")
+        status = str(source.get("status") or "unknown")
+        no_activity = status == "empty" and host in DEFAULT_REMOTE_HOSTS and host not in gap_hosts
+        status_counts[status] += 1
+        if status == "ready":
+            ready_sources += 1
+        elif no_activity:
+            empty_sources += 1
+        else:
+            blocked_sources += 1
+        hosts.append(
+            {
+                "host": host,
+                "status": status,
+                "coverage_class": "no_activity" if no_activity else ("ready" if status == "ready" else "blocked"),
+                "rollout_count": report_int(source.get("rollout_count")),
+                "summary_count": report_int(source.get("summary_count")),
+            }
+        )
+    return {
+        "total_sources": len(hosts),
+        "ready_sources": ready_sources,
+        "empty_sources": empty_sources,
+        "blocked_sources": blocked_sources,
+        "non_ready_sources": len(hosts) - ready_sources,
+        "status_counts": dict(sorted(status_counts.items())),
+        "hosts": sorted(hosts, key=lambda item: (str(item["host"]), str(item["status"]))),
+    }
+
+
+def retained_readiness_status(
+    coverage_gap_counts: dict[str, int],
+    repairable_coverage_gap_counts: dict[str, int],
+    source_status_counts: dict[str, int],
+) -> str:
+    if coverage_gap_counts:
+        if total_report_count(coverage_gap_counts) == total_report_count(repairable_coverage_gap_counts):
+            return "repairable_coverage_gaps"
+        return "blocked_by_coverage_gaps"
+    if any(source_status_counts.get(status, 0) for status in ("missing", "stale", "unknown")):
+        return "blocked_by_source_status"
+    return "ready_for_retained_export"
+
+
+def confidence_for_report(
+    coverage_gap_counts: dict[str, int],
+    repairable_coverage_gap_counts: dict[str, int],
+    source_status_counts: dict[str, int],
+) -> str:
+    if retained_readiness_status(coverage_gap_counts, repairable_coverage_gap_counts, source_status_counts) == (
+        "ready_for_retained_export"
+    ):
+        return "high"
+    non_repairable_count = total_report_count(coverage_gap_counts) - total_report_count(repairable_coverage_gap_counts)
+    if coverage_gap_counts and non_repairable_count <= 0:
+        return "medium"
+    return "low"
+
+
+def top_blockers_for_report(
+    coverage_gap_counts: dict[str, int],
+    source_status_counts: dict[str, int],
+) -> list[str]:
+    if coverage_gap_counts:
+        return top_report_counts(coverage_gap_counts)
+    non_ready_sources = {
+        status: count for status, count in source_status_counts.items() if status not in {"ready", "empty"} and count > 0
+    }
+    return top_report_counts(non_ready_sources)
+
+
+def dry_run_report_summary(
+    *,
+    kind: str,
+    root: Path,
+    window: dict[str, Any],
+    coverage_gap_counts: dict[str, int],
+    repairable_coverage_gap_counts: dict[str, int],
+    source_coverage: dict[str, Any],
+    shard_count: int,
+    next_command: str | None,
+    repair_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    source_status_counts = (
+        source_coverage.get("status_counts") if isinstance(source_coverage.get("status_counts"), dict) else {}
+    )
+    summary: dict[str, Any] = {
+        "kind": kind,
+        "window": window,
+        "source_coverage": source_coverage,
+        "retained_readiness": retained_readiness_status(
+            coverage_gap_counts,
+            repairable_coverage_gap_counts,
+            source_status_counts,
+        ),
+        "coverage_gap_counts": coverage_gap_counts,
+        "repairable_coverage_gap_counts": repairable_coverage_gap_counts,
+        "top_blockers": top_blockers_for_report(coverage_gap_counts, source_status_counts),
+        "next_command": next_command,
+        "shard_count": shard_count,
+        "transient_disk_usage_bytes": directory_size_bytes(root),
+        "confidence": confidence_for_report(
+            coverage_gap_counts,
+            repairable_coverage_gap_counts,
+            source_status_counts,
+        ),
+    }
+    if repair_report is not None:
+        before = (
+            repair_report.get("before_coverage_gap_counts")
+            if isinstance(repair_report.get("before_coverage_gap_counts"), dict)
+            else {}
+        )
+        after = (
+            repair_report.get("after_coverage_gap_counts")
+            if isinstance(repair_report.get("after_coverage_gap_counts"), dict)
+            else {}
+        )
+        summary["repair"] = {
+            "before_coverage_gap_counts": before,
+            "after_coverage_gap_counts": after,
+            "before_gap_total": total_report_count(before),
+            "after_gap_total": total_report_count(after),
+        }
+    return summary
+
+
 def dry_run_report(
     *,
     kind: str,
@@ -7262,22 +7443,40 @@ def dry_run_report(
 ) -> dict[str, Any]:
     coverage_gaps = list(manifest.get("coverage_gaps") or [])
     repairable_gaps = repairable_coverage_gaps(coverage_gaps)
+    coverage_gap_counts = gap_counts(coverage_gaps)
+    repairable_coverage_gap_counts = gap_counts(repairable_gaps)
+    source_coverage = source_coverage_summary(manifest.get("sources") or [], coverage_gaps)
+    source_status_count_values = source_status_counts(manifest.get("sources") or [])
+    shard_count = count_jsonl_rows(shards_dir / "shards.jsonl")
+    window = manifest.get("window") or trend.get("window") or {}
     report: dict[str, Any] = {
         "schema_version": 1,
         "kind": kind,
         "root": root.as_posix(),
         "scan_dir": scan_dir.as_posix(),
         "shards_dir": shards_dir.as_posix(),
-        "window": manifest.get("window") or trend.get("window") or {},
+        "window": window,
         "turn_count": trend.get("turn_count", 0),
         "episode_count": trend.get("episode_count", 0),
-        "coverage_gap_counts": gap_counts(coverage_gaps),
-        "repairable_coverage_gap_counts": gap_counts(repairable_gaps),
-        "source_status_counts": source_status_counts(manifest.get("sources") or []),
-        "shard_count": count_jsonl_rows(shards_dir / "shards.jsonl"),
+        "coverage_gap_counts": coverage_gap_counts,
+        "repairable_coverage_gap_counts": repairable_coverage_gap_counts,
+        "source_status_counts": source_status_count_values,
+        "source_coverage": source_coverage,
+        "shard_count": shard_count,
         "retained_export_created": False,
         "history_commit_created": False,
         "state_advanced": False,
+        "report_summary": dry_run_report_summary(
+            kind=kind,
+            root=root,
+            window=window,
+            coverage_gap_counts=coverage_gap_counts,
+            repairable_coverage_gap_counts=repairable_coverage_gap_counts,
+            source_coverage=source_coverage,
+            shard_count=shard_count,
+            next_command=next_command,
+            repair_report=repair_report,
+        ),
     }
     if next_command is not None:
         report["next_command"] = next_command
@@ -7290,6 +7489,48 @@ def count_lines_for_report(counts: dict[str, int]) -> str:
     if not counts:
         return "none"
     return ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+
+
+def format_bytes_for_report(byte_count: Any) -> str:
+    value = float(report_int(byte_count))
+    units = ["B", "KiB", "MiB", "GiB"]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{int(value)} B"
+
+
+def source_coverage_line_for_report(source_coverage: Any) -> str:
+    if not isinstance(source_coverage, dict):
+        return "unknown"
+    total = report_int(source_coverage.get("total_sources"))
+    ready = report_int(source_coverage.get("ready_sources"))
+    empty = report_int(source_coverage.get("empty_sources"))
+    blocked = report_int(source_coverage.get("blocked_sources"))
+    hosts = source_coverage.get("hosts") if isinstance(source_coverage.get("hosts"), list) else []
+    host_lines: list[str] = []
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        host_lines.append(
+            "{host}:{status}({rollouts} rollouts, {summaries} summaries)".format(
+                host=host.get("host", "unknown"),
+                status=host.get("status", "unknown"),
+                rollouts=report_int(host.get("rollout_count")),
+                summaries=report_int(host.get("summary_count")),
+            )
+        )
+    host_summary = "; ".join(host_lines) if host_lines else "no hosts"
+    return f"{ready}/{total} ready, {empty} no-activity, {blocked} blocked; {host_summary}"
+
+
+def markdown_list_value(values: Any) -> str:
+    if not isinstance(values, list) or not values:
+        return "none"
+    return ", ".join(str(value) for value in values)
 
 
 def dry_run_report_markdown(report: dict[str, Any]) -> str:
@@ -7305,9 +7546,50 @@ def dry_run_report_markdown(report: dict[str, Any]) -> str:
     retained = "yes" if report.get("retained_export_created") else "no"
     history = "yes" if report.get("history_commit_created") else "no"
     state = "yes" if report.get("state_advanced") else "no"
+    summary = report.get("report_summary") if isinstance(report.get("report_summary"), dict) else {}
+    summary_coverage = summary.get("source_coverage") if isinstance(summary.get("source_coverage"), dict) else {}
+    summary_repair = summary.get("repair") if isinstance(summary.get("repair"), dict) else None
+    next_command = report.get("next_command")
     lines = [
         "# Session Retrospective Dry Run",
         "",
+        "## Quick Read",
+        "",
+        f"- Window: `{mode}` `{start}` to `{end}`",
+        f"- Host coverage: {source_coverage_line_for_report(summary_coverage)}",
+        f"- Retained readiness: `{summary.get('retained_readiness', 'unknown')}`",
+        f"- Coverage gaps: {count_lines_for_report(coverage_gap_counts)}",
+        f"- Repairable coverage gaps: {count_lines_for_report(repairable_coverage_gap_counts)}",
+        f"- Top blockers: {markdown_list_value(summary.get('top_blockers'))}",
+        f"- Transient disk usage: `{format_bytes_for_report(summary.get('transient_disk_usage_bytes', 0))}`",
+        f"- Confidence: `{summary.get('confidence', 'unknown')}`",
+        f"- Next command: `{next_command}`" if isinstance(next_command, str) and next_command else "- Next command: none",
+    ]
+    if summary_repair is not None:
+        before_total = report_int(summary_repair.get("before_gap_total"))
+        after_total = report_int(summary_repair.get("after_gap_total"))
+        before_counts = (
+            summary_repair.get("before_coverage_gap_counts")
+            if isinstance(summary_repair.get("before_coverage_gap_counts"), dict)
+            else {}
+        )
+        after_counts = (
+            summary_repair.get("after_coverage_gap_counts")
+            if isinstance(summary_repair.get("after_coverage_gap_counts"), dict)
+            else {}
+        )
+        lines.extend(
+            [
+                f"- Repair gap change: `{before_total}` before to `{after_total}` after",
+                f"- Repair before gaps: {count_lines_for_report(before_counts)}",
+                f"- Repair after gaps: {count_lines_for_report(after_counts)}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Details",
+            "",
         f"- Kind: `{report.get('kind', 'unknown')}`",
         f"- Window: `{mode}` `{start}` to `{end}`",
         f"- Output: `{report.get('root', '')}`",
@@ -7322,8 +7604,8 @@ def dry_run_report_markdown(report: dict[str, Any]) -> str:
         f"- Retained export created: {retained}",
         f"- History commit created: {history}",
         f"- State advanced: {state}",
-    ]
-    next_command = report.get("next_command")
+        ]
+    )
     if isinstance(next_command, str) and next_command:
         lines.append(f"- Next command: `{next_command}`")
     repair = report.get("repair")
