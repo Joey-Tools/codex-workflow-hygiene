@@ -549,7 +549,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(scan_meta["json_error_count"], 1)
         self.assertNotIn("coverage_proof", scan_meta)
 
-    def test_remote_probe_rollout_summary_omits_proof_for_tail_limited_scan_meta(self) -> None:
+    def test_remote_probe_rollout_summary_records_source_identity_with_tail_limited_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-tail.jsonl"
@@ -584,9 +584,56 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertTrue(scan_meta["tail_record_limit_reached"])
+        self.assertEqual(
+            scan_meta["source_identity_proof"],
+            MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+        )
         self.assertNotIn("coverage_proof", scan_meta)
+        self.assertIn("source_sha256", scan_meta)
 
-    def test_remote_probe_embedded_rollout_summary_omits_proof_for_tail_limited_scan_meta(self) -> None:
+    def test_remote_probe_rollout_summary_proves_coverage_when_output_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-complete.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(
+                rollout,
+                [
+                    message("assistant", "Ordinary update 1.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "Ordinary update 2.", "2026-05-01T10:01:00Z"),
+                ],
+            )
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                sys, "stdout", stdout
+            ):
+                result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=40,
+                        tail_records=2,
+                        max_text_chars=400,
+                    )
+                )
+            scan_meta = next(
+                json.loads(line)
+                for line in stdout.getvalue().splitlines()
+                if line.startswith("{") and json.loads(line).get("kind") == "scan_meta"
+            )
+
+        self.assertEqual(result, 0)
+        self.assertFalse(scan_meta["tail_record_limit_reached"])
+        self.assertEqual(
+            scan_meta["source_identity_proof"],
+            MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+        )
+        self.assertEqual(scan_meta["coverage_proof"], MODULE.REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF)
+        self.assertIn("source_sha256", scan_meta)
+
+    def test_remote_probe_embedded_rollout_summary_records_source_identity_with_tail_limited_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-tail.jsonl"
@@ -621,9 +668,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in result.stdout.splitlines()
                 if line.startswith("{") and json.loads(line).get("kind") == "scan_meta"
             )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-tail.jsonl"
+            summary.write_text(
+                "\n".join(line for line in result.stdout.splitlines() if line.startswith("{")) + "\n",
+                encoding="utf-8",
+            )
+            summary_trusted = MODULE.summary_has_generated_remote_coverage_proof(summary, max_scan_bytes=1000)
+            summary_identity_trusted = MODULE.summary_has_generated_remote_source_identity_proof(
+                summary,
+                max_scan_bytes=1000,
+            )
 
         self.assertTrue(scan_meta["tail_record_limit_reached"])
+        self.assertEqual(
+            scan_meta["source_identity_proof"],
+            MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+        )
         self.assertNotIn("coverage_proof", scan_meta)
+        self.assertIn("source_sha256", scan_meta)
+        self.assertFalse(summary_trusted)
+        self.assertTrue(summary_identity_trusted)
+
+    def test_remote_probe_rollout_summary_scan_cap_is_finite(self) -> None:
+        self.assertGreater(REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_SCAN_BYTES, 0)
+        self.assertLessEqual(
+            REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
+            REMOTE_PROBE.MAX_FETCH_ROLLOUT_BYTES,
+        )
 
     def test_remote_probe_rollout_summary_rejects_unbounded_text_limit(self) -> None:
         result = REMOTE_PROBE.cmd_rollout_summary(
@@ -2135,7 +2206,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         rows = [json.loads(line) for line in stdout.getvalue().splitlines() if line.startswith("{")]
         scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
         self.assertFalse(scan_meta["scan_truncated"])
-        self.assertEqual(scan_meta["scan_bytes"], scan_meta["source_bytes"])
+        self.assertGreaterEqual(scan_meta["scan_bytes"], scan_meta["source_bytes"])
         self.assertEqual(scan_meta["source_sha256"], expected_sha256)
         self.assertTrue(any(row.get("text") == "you missed" for row in rows))
 
@@ -2169,7 +2240,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         rows = [json.loads(line) for line in stdout.getvalue().splitlines() if line.startswith("{")]
         scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
         self.assertFalse(scan_meta["scan_truncated"])
-        self.assertEqual(scan_meta["scan_bytes"], scan_meta["source_bytes"])
+        self.assertGreaterEqual(scan_meta["scan_bytes"], scan_meta["source_bytes"])
         self.assertEqual(scan_meta["json_error_count"], 0)
         self.assertTrue(any(row.get("text") == "you missed" for row in rows))
 
@@ -5986,13 +6057,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
 
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
-        self.assertEqual(trend["turn_count"], 0)
+        self.assertEqual(trend["turn_count"], 1)
         host_report = report["repair"]["materialized_hosts"][0]
-        self.assertEqual(host_report["status"], "remote_source_not_materialized")
+        self.assertEqual(host_report["status"], "ready")
         self.assertEqual(host_report["summary_count"], 1)
-        self.assertEqual(host_report["failed_rollout_count"], 1)
-        self.assertEqual(metadata["status"], "remote_source_not_materialized")
-        self.assertEqual(metadata["reason"], "remote_source_not_materialized")
+        self.assertEqual(host_report["failed_rollout_count"], 0)
+        self.assertEqual(metadata["status"], "ready")
+        self.assertIn("remote_generated_summaries", metadata)
 
     def test_repair_coverage_rejects_relative_manifest_source_root(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -7180,7 +7251,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "remote_source_not_materialized")
 
-    def test_make_shards_remote_generated_summary_rejects_tail_limit_proof(self) -> None:
+    def test_make_shards_remote_generated_summary_keeps_gap_for_tail_limited_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "miku-bot-dev"
             rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-missing.jsonl"
@@ -7198,7 +7269,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         source_bytes=24000000,
                         scan_bytes=24000000,
                         source_sha256="a" * 64,
-                        coverage_proof=MODULE.REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
+                        source_identity_proof=MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
                         tail_record_limit_reached=True,
                     ),
                     {
@@ -7232,6 +7303,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 MODULE.generated_summary_path_set([summary]),
                 max_scan_bytes=1000,
             )
+            summary_identity_trusted = MODULE.summary_allows_generated_remote_source_identity(
+                summary,
+                MODULE.generated_summary_path_set([summary]),
+                max_scan_bytes=1000,
+            )
 
             MODULE.main(
                 [
@@ -7250,9 +7326,69 @@ class SessionRetrospectiveTests(unittest.TestCase):
             ]
 
         self.assertFalse(summary_trusted)
+        self.assertTrue(summary_identity_trusted)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "remote_source_not_materialized")
+
+    def test_scan_remote_source_identity_summary_uses_remote_scan_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-missing.jsonl"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-generated.jsonl"
+            write_remote_metadata(
+                root,
+                "miku-bot-dev",
+                remote_generated_summaries=[summary.relative_to(root).as_posix()],
+            )
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=24000000,
+                        scan_bytes=24000000,
+                        source_sha256="a" * 64,
+                        source_identity_proof=MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+                        tail_record_limit_reached=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You forgot verification for /customer/repo " + ("x" * 300),
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"miku-bot-dev={root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=200,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            summary_size = summary.stat().st_size
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertGreater(summary_size, 200)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["host"], "miku-bot-dev")
+        self.assertIn("user_correction", rows[0]["issue_flags"])
+        self.assertIn("remote_source_not_materialized", reasons)
+        self.assertIn("truncated_rollout_summary", reasons)
+        self.assertNotIn("oversized_summary_skipped", reasons)
 
     def test_make_shards_remote_generated_summary_missing_manifest_entry_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -7510,6 +7646,122 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(turns[0].session_id, MODULE.opaque_session_id("first-session"))
         self.assertEqual(turns[1].session_id, MODULE.opaque_session_id("second-session"))
 
+    def test_extract_remote_generated_summary_accepts_mixed_source_identity_and_legacy_coverage_proofs(
+        self,
+    ) -> None:
+        first_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-first.jsonl"
+        second_ref = "sessions/2026/05/01/rollout-2026-05-01T11-00-00-second.jsonl"
+        rows = [
+            complete_rollout_summary_scan_meta(
+                rollout=first_ref,
+                source_bytes=24000000,
+                scan_bytes=24000000,
+                source_sha256="b" * 64,
+                source_identity_proof=MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+                tail_record_limit_reached=True,
+            ),
+            complete_rollout_summary_scan_meta(
+                rollout=second_ref,
+                source_bytes=25000000,
+                scan_bytes=25000000,
+                source_sha256="c" * 64,
+                coverage_proof=MODULE.REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
+                tail_record_limit_reached=True,
+            ),
+            {
+                "kind": "session_meta",
+                "rollout": first_ref,
+                "session_id": "first-session",
+                "text": "session_id=first-session",
+            },
+            {
+                "kind": "session_meta",
+                "rollout": second_ref,
+                "session_id": "second-session",
+                "text": "session_id=second-session",
+            },
+            {
+                "kind": "user_message",
+                "timestamp": "2026-05-01T10:01:00Z",
+                "rollout": first_ref,
+                "text": "You forgot verification for /customer/repo",
+            },
+            {
+                "kind": "user_message",
+                "timestamp": "2026-05-01T11:01:00Z",
+                "rollout": second_ref,
+                "text": "You forgot verification for /customer/repo",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-generated.jsonl"
+            write_jsonl(summary, rows)
+            remote_paths = MODULE.generated_summary_path_set([summary])
+
+            has_source_identity = MODULE.summary_has_generated_remote_source_identity_proof(
+                summary,
+                max_scan_bytes=1000,
+            )
+            has_complete_coverage = MODULE.summary_has_generated_remote_coverage_proof(
+                summary,
+                max_scan_bytes=1000,
+            )
+            turns = MODULE.extract_summary_file(
+                MODULE.Source("miku-bot-dev", root),
+                summary,
+                None,
+                None,
+                remote_generated_summary_paths=remote_paths,
+            )
+
+        self.assertTrue(has_source_identity)
+        self.assertFalse(has_complete_coverage)
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].source_path, MODULE.remote_backing_path_ref("miku-bot-dev", first_ref))
+        self.assertEqual(turns[0].source_hash, MODULE.content_sha256_source_hash("b" * 64))
+        self.assertEqual(turns[1].source_path, MODULE.remote_backing_path_ref("miku-bot-dev", second_ref))
+        self.assertEqual(turns[1].source_hash, MODULE.content_sha256_source_hash("c" * 64))
+        self.assertEqual(turns[0].session_id, MODULE.opaque_session_id("first-session"))
+        self.assertEqual(turns[1].session_id, MODULE.opaque_session_id("second-session"))
+
+    def test_extract_remote_source_identity_summary_skips_mismatched_materialized_rollout(self) -> None:
+        rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-first.jsonl"
+        expected_bytes = b"old"
+        rows = [
+            complete_rollout_summary_scan_meta(
+                rollout=rollout_ref,
+                source_bytes=len(expected_bytes),
+                scan_bytes=len(expected_bytes),
+                source_sha256=hashlib.sha256(expected_bytes).hexdigest(),
+                source_identity_proof=MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+                tail_record_limit_reached=True,
+            ),
+            {
+                "kind": "user_message",
+                "timestamp": "2026-05-01T10:01:00Z",
+                "rollout": rollout_ref,
+                "text": "You forgot verification for /customer/repo",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "miku-bot-dev"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_bytes(b"new")
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-generated.jsonl"
+            write_jsonl(summary, rows)
+
+            turns = MODULE.extract_summary_file(
+                MODULE.Source("miku-bot-dev", root),
+                summary,
+                None,
+                None,
+                remote_generated_summary_paths=MODULE.generated_summary_path_set([summary]),
+            )
+
+        self.assertEqual(turns, [])
+
     def test_remote_materialization_cleanup_failure_marks_source_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "materialized"
@@ -7718,7 +7970,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in scan_trend["coverage_gaps"]])
         self.assertTrue(any(error["command"] == "rollout-summary" for error in report["errors"]))
 
-    def test_remote_materialization_rejects_untrusted_summary_when_fetch_fails(self) -> None:
+    def test_remote_materialization_keeps_untrusted_summary_when_fetch_fails(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "materialized"
             rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-huge.jsonl"
@@ -7793,16 +8045,95 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 generated_summary,
                 max_scan_bytes=MODULE.REMOTE_ROLLOUT_SUMMARY_SCAN_BYTES,
             )
+            scan_output = safe_output_dir(raw, "scan-after-fallback-summary")
+            state = safe_output_dir(raw, "state.json")
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"miku-bot-dev={root}"],
+                    output=str(scan_output),
+                    state=str(state),
+                    max_raw_bytes=MODULE.REMOTE_ROLLOUT_SUMMARY_SCAN_BYTES,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            scan_rows = [
+                json.loads(line)
+                for line in (scan_output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            scan_trend = json.loads((scan_output / "trend_report.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(report["status"], "remote_source_not_materialized")
+        self.assertEqual(report["status"], "ready")
         self.assertEqual(report["rollout_count"], 0)
-        self.assertEqual(report["failed_rollout_count"], 1)
+        self.assertEqual(report["failed_rollout_count"], 0)
         self.assertFalse(materialized_rollout_exists)
         self.assertTrue(generated_summary_exists)
         self.assertFalse(generated_summary_trusted)
+        self.assertEqual(metadata["status"], "ready")
+        self.assertIn("remote_generated_summaries", metadata)
+        self.assertEqual(len(scan_rows), 1)
+        self.assertEqual(scan_rows[0]["host"], "miku-bot-dev")
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in scan_trend["coverage_gaps"]])
+        self.assertFalse(state.exists())
+        self.assertTrue(any(error["command"] == "rollout-summary" for error in report["errors"]))
+
+    def test_remote_materialization_marks_unscannable_summary_failed_when_fetch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "materialized"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-huge.jsonl"
+            fake_probe = Path(raw) / "fake_remote_probe.py"
+            fake_probe.write_text(
+                "\n".join(
+                    [
+                        "import sys",
+                        "args = sys.argv[1:]",
+                        "cmd = args[0]",
+                        f"rollout = {rollout_ref!r}",
+                        "def arg(name):",
+                        "    return args[args.index(name) + 1]",
+                        "if cmd == 'preflight':",
+                        "    print('host\\thostname\\tuser\\thome\\tcodex\\trg\\tpython3')",
+                        "    print(arg('--host') + '\\tfake\\thoteng\\t/home/hoteng\\tpresent\\tpresent\\tpresent')",
+                        "elif cmd == 'session-meta':",
+                        "    host = arg('--host')",
+                        "    print('host\\tdate\\tsession_id\\tcwd\\trollout')",
+                        "    print(host + '\\t2026/05/01\\ts1\\t/work\\t' + rollout)",
+                        "elif cmd == 'fetch-rollout':",
+                        "    print('rollout too large', file=sys.stderr)",
+                        "    raise SystemExit(1)",
+                        "elif cmd == 'rollout-summary':",
+                        "    pass",
+                        "else:",
+                        "    raise SystemExit(2)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = MODULE.materialize_remote_host(
+                host="miku-bot-dev",
+                root=root,
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                remote_probe=fake_probe,
+                session_meta_limit=500,
+                max_raw_bytes=MODULE.REMOTE_ROLLOUT_SUMMARY_SCAN_BYTES,
+            )
+            metadata = json.loads((root / MODULE.REMOTE_SOURCE_METADATA_FILE).read_text(encoding="utf-8"))
+
+        self.assertEqual(report["status"], "remote_source_not_materialized")
+        self.assertEqual(report["failed_rollout_count"], 1)
         self.assertEqual(metadata["status"], "remote_source_not_materialized")
         self.assertEqual(metadata["reason"], "remote_source_not_materialized")
-        self.assertTrue(any(error["command"] == "rollout-summary" for error in report["errors"]))
+        self.assertTrue(
+            any(
+                error["command"] == "rollout-summary"
+                and "scannable backing rollout ref" in error["error"]
+                for error in report["errors"]
+            )
+        )
 
     def test_make_shards_marks_old_undated_oversized_summary_conservative(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -9494,6 +9825,59 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(second_rows[0]["source_path"], expected_source_path)
         self.assertEqual(first_rows[0]["source_hash"], expected_source_hash)
         self.assertEqual(first_rows[0]["source_hash"], second_rows[0]["source_hash"])
+
+    def test_tail_limited_generated_local_summary_uses_backing_rollout_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            rollout_ref = MODULE.source_relative_path_ref(rollout, root)
+            self.assertIsNotNone(rollout_ref)
+            source_bytes = rollout.stat().st_size
+            output = safe_output_dir(raw)
+            generated_root = MODULE.generated_summary_root_for_source(
+                MODULE.generated_summary_base_for_output(output),
+                MODULE.Source("local", root),
+            )
+            summary = generated_root / "sessions" / "2026" / "05" / "01" / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        coverage_proof=MODULE.LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF,
+                        rollout=rollout_ref,
+                        scan_bytes=source_bytes,
+                        source_bytes=source_bytes,
+                        source_sha256=MODULE.file_sha256(rollout),
+                        tail_record_limit_reached=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "line": 1,
+                        "rollout": rollout_ref,
+                        "text": "You missed verification for /customer/repo.",
+                    },
+                ],
+            )
+
+            turns = MODULE.extract_summary_file(MODULE.Source("local", root), summary, None, None)
+            expected_source_path = MODULE.path_ref(rollout)
+            expected_source_hash = MODULE.file_source_hash(rollout)
+            expected_session_id = MODULE.session_id_from_path(rollout)
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].session_id, expected_session_id)
+        self.assertEqual(turns[0].source_path, expected_source_path)
+        self.assertEqual(turns[0].source_hash, expected_source_hash)
+        self.assertIn("user_correction", turns[0].issue_flags)
 
     def test_generated_local_summary_extract_skips_when_backing_exceeds_scan_cap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

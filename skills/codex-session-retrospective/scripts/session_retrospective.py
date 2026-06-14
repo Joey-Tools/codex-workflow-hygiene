@@ -144,6 +144,7 @@ LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS = 1200
 LOCAL_GENERATED_SUMMARY_DIR_SUFFIX = "generated-rollout-summaries"
 LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF = "local_generated_rollout_summary_v1"
 REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = "remote_generated_rollout_summary_v1"
+REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF = "remote_generated_rollout_source_identity_v1"
 REMOTE_ROLLOUT_SUMMARY_SCAN_BYTES = 16 * 1024 * 1024
 PRIVATE_IPV4_PATTERN = re.compile(
     r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|127(?:\.\d{1,3}){3}|169\.254(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})(?![\d.])"
@@ -2419,6 +2420,27 @@ def summary_scan_meta_backing_rollout_refs(path: Path, *, max_scan_bytes: int) -
     return refs, invalid_ref_seen
 
 
+def summary_has_scannable_backing_ref(
+    path: Path,
+    *,
+    max_scan_bytes: int,
+    source_root: Path | None = None,
+) -> bool:
+    scan_meta_refs, invalid_ref_seen = summary_scan_meta_backing_rollout_refs(path, max_scan_bytes=max_scan_bytes)
+    if invalid_ref_seen:
+        return False
+    if scan_meta_refs:
+        return True
+    backing_refs, complete, _relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+        path,
+        None,
+        None,
+        max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
+    )
+    return complete and not unbacked_record_seen and bool(backing_refs)
+
+
 def summary_has_generated_local_coverage_proof(path: Path, *, max_scan_bytes: int) -> bool:
     proof_seen = False
     metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
@@ -2468,6 +2490,37 @@ def summary_allows_generated_local_coverage(
 
 
 def summary_has_generated_remote_coverage_proof(path: Path, *, max_scan_bytes: int) -> bool:
+    return summary_has_generated_remote_scan_meta_proof(
+        path,
+        max_scan_bytes=max_scan_bytes,
+        proof_field="coverage_proof",
+        proof_value=REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
+        allow_tail_record_limit=False,
+    )
+
+
+def summary_has_generated_remote_source_identity_proof(path: Path, *, max_scan_bytes: int) -> bool:
+    return summary_has_generated_remote_scan_meta_proof(
+        path,
+        max_scan_bytes=max_scan_bytes,
+        proof_field="source_identity_proof",
+        proof_value=REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+        allow_tail_record_limit=True,
+        fallback_proof_field="coverage_proof",
+        fallback_proof_value=REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
+    )
+
+
+def summary_has_generated_remote_scan_meta_proof(
+    path: Path,
+    *,
+    max_scan_bytes: int,
+    proof_field: str,
+    proof_value: str,
+    allow_tail_record_limit: bool,
+    fallback_proof_field: str | None = None,
+    fallback_proof_value: str | None = None,
+) -> bool:
     metadata_scan_bytes = max(max_scan_bytes, REMOTE_ROLLOUT_SUMMARY_SCAN_BYTES)
     try:
         with path.open("rb") as handle:
@@ -2492,9 +2545,13 @@ def summary_has_generated_remote_coverage_proof(path: Path, *, max_scan_bytes: i
             continue
         if record.get("rollout") is None:
             continue
-        if record.get("coverage_proof") != REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF:
+        if record.get(proof_field) != proof_value and (
+            fallback_proof_field is None
+            or fallback_proof_value is None
+            or record.get(fallback_proof_field) != fallback_proof_value
+        ):
             return False
-        if complete_scan_meta_record_source_bytes(record, allow_tail_record_limit=False) is None:
+        if complete_scan_meta_record_source_bytes(record, allow_tail_record_limit=allow_tail_record_limit) is None:
             return False
         source_sha256 = complete_scan_meta_record_source_sha256(record)
         if not source_sha256:
@@ -2516,12 +2573,25 @@ def summary_allows_generated_remote_coverage(
     return summary_has_generated_remote_coverage_proof(path, max_scan_bytes=max_scan_bytes)
 
 
+def summary_allows_generated_remote_source_identity(
+    path: Path,
+    remote_generated_summary_paths: set[Path] | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    if not remote_generated_summary_paths:
+        return False
+    if path.resolve(strict=False) not in remote_generated_summary_paths:
+        return False
+    return summary_has_generated_remote_source_identity_proof(path, max_scan_bytes=max_scan_bytes)
+
+
 def summary_metadata_scan_max_bytes_for_generated_remote(
     path: Path,
     max_scan_bytes: int,
     remote_generated_summary_paths: set[Path] | None,
 ) -> int:
-    if summary_allows_generated_remote_coverage(
+    if summary_allows_generated_remote_source_identity(
         path,
         remote_generated_summary_paths,
         max_scan_bytes=max_scan_bytes,
@@ -4299,12 +4369,17 @@ def extract_summary_file(
     source_hash: str | None = None
     identity_resolved = False
     is_local_generated_summary = generated_summary_artifact_path(path)
-    is_remote_generated_summary = summary_allows_generated_remote_coverage(
+    has_remote_generated_coverage = summary_allows_generated_remote_coverage(
         path,
         remote_generated_summary_paths,
         max_scan_bytes=0,
     )
-    is_generated_summary = is_local_generated_summary or is_remote_generated_summary
+    has_remote_generated_source_identity = summary_allows_generated_remote_source_identity(
+        path,
+        remote_generated_summary_paths,
+        max_scan_bytes=0,
+    )
+    is_generated_summary = is_local_generated_summary or has_remote_generated_source_identity
     generated_identity_candidates: dict[str, tuple[RolloutSourceIdentity, str, str | None]] = {}
     generated_identity_conflicts: set[str] = set()
     generated_source_hash_by_ref: dict[str, str] = {}
@@ -4313,14 +4388,16 @@ def extract_summary_file(
 
     def set_generated_identity_candidates(
         *,
-        coverage_proof: str,
+        proof_field: str,
+        proof_value: str,
         max_source_bytes: int | None,
         remote_identity: bool,
+        allow_tail_record_limit: bool = False,
     ) -> None:
         for _line_no, record in records:
             if str(record.get("kind") or "summary") != "scan_meta":
                 continue
-            if record.get("coverage_proof") != coverage_proof:
+            if record.get(proof_field) != proof_value:
                 continue
             rollout_ref = record.get("rollout")
             if not isinstance(rollout_ref, str):
@@ -4328,7 +4405,10 @@ def extract_summary_file(
             safe_ref = safe_rollout_backing_ref(rollout_ref)
             if safe_ref is None:
                 continue
-            source_bytes = complete_scan_meta_record_source_bytes(record, allow_tail_record_limit=True)
+            source_bytes = complete_scan_meta_record_source_bytes(
+                record,
+                allow_tail_record_limit=allow_tail_record_limit,
+            )
             source_sha256 = complete_scan_meta_record_source_sha256(record)
             if (
                 source_bytes is None
@@ -4359,13 +4439,31 @@ def extract_summary_file(
 
     if is_local_generated_summary:
         set_generated_identity_candidates(
-            coverage_proof=LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF,
+            proof_field="coverage_proof",
+            proof_value=LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF,
             max_source_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
             remote_identity=False,
+            allow_tail_record_limit=True,
         )
-    if not generated_identity_candidates and is_remote_generated_summary:
+    if not generated_identity_candidates and has_remote_generated_source_identity:
         set_generated_identity_candidates(
-            coverage_proof=REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
+            proof_field="source_identity_proof",
+            proof_value=REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+            max_source_bytes=None,
+            remote_identity=True,
+            allow_tail_record_limit=True,
+        )
+        set_generated_identity_candidates(
+            proof_field="coverage_proof",
+            proof_value=REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
+            max_source_bytes=None,
+            remote_identity=True,
+            allow_tail_record_limit=True,
+        )
+    if not generated_identity_candidates and has_remote_generated_coverage:
+        set_generated_identity_candidates(
+            proof_field="coverage_proof",
+            proof_value=REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
             max_source_bytes=None,
             remote_identity=True,
         )
@@ -4410,6 +4508,14 @@ def extract_summary_file(
                 else session_id_from_path(Path(safe_ref))
             )
         if candidate_source_hash is not None:
+            if not backing_ref_matches_current_or_trusted_summary(
+                source.root,
+                safe_ref,
+                source_identity,
+                max_hash_bytes=REMOTE_ROLLOUT_SUMMARY_SCAN_BYTES,
+                allow_summary_only_coverage=True,
+            ):
+                return None
             return candidate_path_ref, candidate_source_hash, retained_session_id
         rollout_path = source.root / safe_ref
         if not backing_ref_matches_current_rollout_identity(
@@ -7763,6 +7869,29 @@ def materialize_remote_host(
                 continue
             summary_target, summary_error = write_remote_summary(rollout_ref)
             if summary_target is not None:
+                summary_scan_bytes = max(max_raw_bytes, REMOTE_ROLLOUT_SUMMARY_SCAN_BYTES)
+                if not summary_has_scannable_backing_ref(
+                    summary_target,
+                    max_scan_bytes=summary_scan_bytes,
+                    source_root=root,
+                ):
+                    report["failed_rollout_count"] += 1
+                    report["errors"].append(
+                        {
+                            "command": "fetch-rollout",
+                            "rollout": path_ref(target),
+                            "error": command_failure(fetch),
+                        }
+                    )
+                    report["errors"].append(
+                        {
+                            "command": "rollout-summary",
+                            "rollout": path_ref(target),
+                            "error": "remote rollout-summary did not include a scannable backing rollout ref",
+                            "repair": "raw rollout was not materialized and the fallback summary cannot preserve a remote_source_not_materialized gap",
+                        }
+                    )
+                    continue
                 if summary_has_generated_remote_coverage_proof(summary_target, max_scan_bytes=max_raw_bytes):
                     report["errors"].append(
                         {
@@ -7778,6 +7907,7 @@ def materialize_remote_host(
                         "command": "fetch-rollout",
                         "rollout": path_ref(target),
                         "error": command_failure(fetch),
+                        "repair": "wrote bounded rollout-summary; scan keeps a coverage gap unless the summary has complete generated coverage proof",
                     }
                 )
                 report["errors"].append(
@@ -7788,7 +7918,6 @@ def materialize_remote_host(
                         "repair": "raw rollout was not materialized and the fallback summary is not trusted complete coverage",
                     }
                 )
-                report["failed_rollout_count"] += 1
                 continue
             report["errors"].append(
                 {

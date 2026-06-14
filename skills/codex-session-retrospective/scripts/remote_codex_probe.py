@@ -26,11 +26,12 @@ MAX_SESSION_META_LIMIT = 500
 MAX_SESSION_META_DATE_COUNT = 31
 MAX_FETCH_ROLLOUT_BYTES = 16 * 1024 * 1024
 MAX_ROLLOUT_SUMMARY_LIMIT = 200
-MAX_ROLLOUT_SUMMARY_SCAN_BYTES = 0
+MAX_ROLLOUT_SUMMARY_SCAN_BYTES = MAX_FETCH_ROLLOUT_BYTES
 MAX_ROLLOUT_SUMMARY_LINE_BYTES = 1024 * 1024
 MAX_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 MAX_ROLLOUT_SUMMARY_TEXT_CHARS = 1200
 REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = "remote_generated_rollout_summary_v1"
+REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF = "remote_generated_rollout_source_identity_v1"
 SOURCE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_SESSION_META_SCAN_BYTES = 256 * 1024
 SESSION_META_FLAT_UNDATED_ALIAS_PREFIX = "flat_archived_undated_v1"
@@ -907,6 +908,7 @@ SUMMARY_SIGNAL_MARKERS = {SUMMARY_SIGNAL_MARKERS!r}
 SUMMARY_SIGNAL_CHUNK_CHARS = {SUMMARY_SIGNAL_CHUNK_CHARS}
 SUMMARY_SIGNAL_CHUNK_OVERLAP = {SUMMARY_SIGNAL_CHUNK_OVERLAP}
 REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = {REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF!r}
+REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF = {REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF!r}
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
 SESSION_META_END = {REMOTE_SESSION_META_END!r}
 SESSION_META_LIMIT_TRUNCATED_REASON = {SESSION_META_LIMIT_TRUNCATED_REASON!r}
@@ -1670,7 +1672,7 @@ def summarize_rollout():
     }}
     if target_sha256 is not None:
         scan_meta["source_sha256"] = target_sha256
-    if (
+    source_identity_proven = (
         scan_meta.get("scan_truncated") is False
         and type(scan_meta.get("summary_limit")) is int
         and scan_meta["summary_limit"] >= 0
@@ -1680,14 +1682,16 @@ def summarize_rollout():
         and scan_meta.get("record_limit_reached") is False
         and scan_meta.get("signal_record_limit_reached") is False
         and scan_meta.get("matched_record_limit_reached") is False
-        and scan_meta.get("tail_record_limit_reached") is False
         and type(scan_meta.get("source_bytes")) is int
         and scan_meta["source_bytes"] >= 0
         and type(scan_meta.get("scan_bytes")) is int
         and scan_meta["scan_bytes"] >= scan_meta["source_bytes"]
         and isinstance(scan_meta.get("source_sha256"), str)
         and re.fullmatch(r"[0-9a-f]{{64}}", scan_meta["source_sha256"]) is not None
-    ):
+    )
+    if source_identity_proven:
+        scan_meta["source_identity_proof"] = REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF
+    if source_identity_proven and scan_meta.get("tail_record_limit_reached") is False:
         scan_meta["coverage_proof"] = REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF
     print(json.dumps(scan_meta, separators=(",", ":"), sort_keys=True))
     emitted = set()
@@ -3106,7 +3110,7 @@ def _rollout_summary_scan_meta(
     return row
 
 
-def _scan_meta_allows_remote_generated_coverage_proof(row: dict[str, Any]) -> bool:
+def _scan_meta_allows_remote_generated_source_identity_proof(row: dict[str, Any]) -> bool:
     source_bytes = row.get("source_bytes")
     scan_bytes = row.get("scan_bytes")
     summary_limit = row.get("summary_limit")
@@ -3121,13 +3125,19 @@ def _scan_meta_allows_remote_generated_coverage_proof(row: dict[str, Any]) -> bo
         and row.get("record_limit_reached") is False
         and row.get("signal_record_limit_reached") is False
         and row.get("matched_record_limit_reached") is False
-        and row.get("tail_record_limit_reached") is False
         and type(source_bytes) is int
         and source_bytes >= 0
         and type(scan_bytes) is int
         and scan_bytes >= source_bytes
         and isinstance(source_sha256, str)
         and SOURCE_SHA256_RE.fullmatch(source_sha256) is not None
+    )
+
+
+def _scan_meta_allows_remote_generated_coverage_proof(row: dict[str, Any]) -> bool:
+    return (
+        _scan_meta_allows_remote_generated_source_identity_proof(row)
+        and row.get("tail_record_limit_reached") is False
     )
 
 
@@ -3186,6 +3196,8 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                     summary_record_count=int(summary_meta["summary_record_count"]),
                 ),
             )
+            if _scan_meta_allows_remote_generated_source_identity_proof(records[0]):
+                records[0]["source_identity_proof"] = REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF
             if _scan_meta_allows_remote_generated_coverage_proof(records[0]):
                 records[0]["coverage_proof"] = REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF
             records = [dict(record, rollout=rollout_ref) for record in records]
