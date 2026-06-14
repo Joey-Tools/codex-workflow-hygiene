@@ -7934,6 +7934,129 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
 
+    def test_scan_generates_local_summary_for_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            retained_manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+            shard_output = safe_output_dir(raw, "shards")
+            MODULE.main(["make-shards", "--manifest", str(output / "shard_manifest.json"), "--output", str(shard_output), "--max-raw-bytes", "3000"])
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+            reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+            self.assertEqual(len(rows), 1)
+            self.assertIn("user_correction", rows[0]["issue_flags"])
+            self.assertNotIn("oversized_rollout_skipped", reasons)
+            generated_root = Path(manifest["sources"][0]["generated_summary_root"])
+            self.assertTrue(generated_root.is_dir())
+            with self.assertRaises(ValueError):
+                generated_root.relative_to(output)
+            self.assertEqual(manifest["sources"][0]["summary_count"], 1)
+            self.assertNotIn("generated_summary_root", retained_manifest["sources"][0])
+            self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
+            self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
+
+    def test_truncated_generated_local_summary_preserves_coverage_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            with mock.patch.object(MODULE, "LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES", 800):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("user_correction", rows[0]["issue_flags"])
+        self.assertIn("oversized_rollout_skipped", reasons)
+        self.assertIn("truncated_rollout_summary", reasons)
+
+    def test_discover_generated_local_summary_feeds_make_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw, "discover")
+            MODULE.main(
+                [
+                    "discover",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--mode",
+                    "weekly",
+                    "--start",
+                    "2026-05-01T00:00:00Z",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--output",
+                    str(output),
+                    "--max-raw-bytes",
+                    "3000",
+                ]
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            shard_output = safe_output_dir(raw, "discover-shards")
+            MODULE.main(["make-shards", "--manifest", str(output / "shard_manifest.json"), "--output", str(shard_output), "--max-raw-bytes", "3000"])
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIn("generated_summary_root", manifest["sources"][0])
+        self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
+        self.assertFalse(any(row.get("status") == "oversized" for row in shard_rows))
+
     def test_complete_rollout_summary_covers_oversized_rollout_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

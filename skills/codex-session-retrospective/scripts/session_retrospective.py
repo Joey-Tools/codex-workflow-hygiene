@@ -7,6 +7,7 @@ import datetime as dt
 import errno
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import re
@@ -135,6 +136,11 @@ COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 BARE_64_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
 SOURCE_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SUMMARY_HASH_VERIFY_MAX_BYTES = 2 * 1024 * 1024
+LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES = 16 * 1024 * 1024
+LOCAL_ROLLOUT_SUMMARY_LIMIT = 200
+LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
+LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS = 1200
+LOCAL_GENERATED_SUMMARY_DIR_SUFFIX = "generated-rollout-summaries"
 PRIVATE_IPV4_PATTERN = re.compile(
     r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|127(?:\.\d{1,3}){3}|169\.254(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})(?![\d.])"
 )
@@ -166,6 +172,7 @@ ROOT_ROLLOUT_RELATIVE_RE = re.compile(r"^rollout-(?!summary)[^/]+\.jsonl$")
 RAW_SESSION_ID_TEXT_PATTERN = re.compile(r"\bsession_id[\"']?\s*(?:=|:)\s*[\"']?(?!session_ref_v1:)[A-Za-z0-9][A-Za-z0-9_.:-]*")
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
+REMOTE_PROBE_MODULE: Any | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 RETAINED_SUMMARY_KINDS = frozenset(("summary", "function_call_output", "user_message"))
 RETAINED_MODEL_IDS = frozenset(("gpt-5.5", "gpt-5.4", "gpt-5.3-codex"))
@@ -1055,6 +1062,150 @@ def unsafe_source_rollouts(source: Source) -> list[Path]:
 
 def source_summary_files(source: Source) -> list[Path]:
     return sorted(path for path in source_summary_candidates(source) if safe_source_file(path, source.root))
+
+
+def load_remote_probe_module() -> Any:
+    global REMOTE_PROBE_MODULE
+    if REMOTE_PROBE_MODULE is not None:
+        return REMOTE_PROBE_MODULE
+    existing = sys.modules.get("remote_codex_probe")
+    if existing is not None and hasattr(existing, "_summarize_rollout_records_with_meta"):
+        REMOTE_PROBE_MODULE = existing
+        return REMOTE_PROBE_MODULE
+    script = Path(__file__).with_name("remote_codex_probe.py")
+    spec = importlib.util.spec_from_file_location("_codex_session_retrospective_remote_codex_probe", script)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"remote probe helper not importable: {script}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    REMOTE_PROBE_MODULE = module
+    return REMOTE_PROBE_MODULE
+
+
+def generated_summary_base_for_output(output: Path) -> Path:
+    return ensure_safe_output_dir(output.parent / f"{output.name}-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}")
+
+
+def generated_summary_root_for_source(base: Path, source: Source) -> Path:
+    safe_host = re.sub(r"[^A-Za-z0-9_.-]+", "_", source.host).strip("._-") or "source"
+    digest = hashlib.sha256(f"{source.host}\0{source.root.as_posix()}".encode("utf-8")).hexdigest()[:12]
+    return base / safe_host[:80] / digest
+
+
+def generated_summary_files(root: Path | None) -> list[Path]:
+    if root is None or not root.exists() or root.is_symlink():
+        return []
+    return sorted(path for path in root.rglob("rollout-summary*.jsonl") if safe_source_file(path, root))
+
+
+def local_rollout_summary_jsonl_bytes(source: Source, rollout: Path, rollout_ref: str) -> bytes:
+    safe_ref = safe_rollout_backing_ref(rollout_ref)
+    if safe_ref is None:
+        raise ValueError(f"unsafe rollout ref: {rollout_ref}")
+    source_bytes = rollout.stat().st_size
+    source_sha256 = None
+    remote_probe = load_remote_probe_module()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(rollout, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("source path is not a regular file")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            records, summary_meta = remote_probe._summarize_rollout_records_with_meta(
+                lines=remote_probe._bounded_text_lines(handle, LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES),
+                keywords=[],
+                limit=LOCAL_ROLLOUT_SUMMARY_LIMIT,
+                tail_records=LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS,
+                max_text_chars=LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS,
+            )
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    records.insert(
+        0,
+        remote_probe._rollout_summary_scan_meta(
+            source_bytes=source_bytes,
+            source_sha256=source_sha256,
+            scan_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
+            summary_limit=LOCAL_ROLLOUT_SUMMARY_LIMIT,
+            record_limit_reached=bool(summary_meta["record_limit_reached"]),
+            signal_record_limit_reached=bool(summary_meta["signal_record_limit_reached"]),
+            matched_record_limit_reached=bool(summary_meta["matched_record_limit_reached"]),
+            tail_record_limit_reached=bool(summary_meta["tail_record_limit_reached"]),
+            keyword_filter_applied=bool(summary_meta["keyword_filter_applied"]),
+            json_error_count=int(summary_meta["json_error_count"]),
+            tail_records=int(summary_meta["tail_records"]),
+            summary_record_count=int(summary_meta["summary_record_count"]),
+        ),
+    )
+    summary_records = [dict(record, host=source.host, rollout=safe_ref) for record in records]
+    return jsonl_bytes(summary_records)
+
+
+def write_generated_local_rollout_summary(source: Source, rollout: Path, generated_root: Path) -> Path | None:
+    rollout_ref = source_relative_path_ref(rollout, source.root)
+    if rollout_ref is None or safe_rollout_backing_ref(rollout_ref) is None:
+        return None
+    target = summary_path_for_rollout(generated_root, rollout_ref)
+    write_bytes_atomic(target, local_rollout_summary_jsonl_bytes(source, rollout, rollout_ref))
+    return target
+
+
+def generate_local_rollout_summaries_for_source(
+    source: Source,
+    rollouts: list[Path],
+    *,
+    generated_root: Path,
+    gap_start: dt.datetime | None,
+    end: dt.datetime | None,
+    max_raw_bytes: int,
+    allow_mtime_fallback: bool,
+    archived_duplicate_keys: set[str],
+    summary_backed_rollout_keys: set[str],
+) -> list[Path]:
+    if source.host != "local":
+        return []
+    generated: list[Path] = []
+    for rollout in rollouts:
+        rollout_mtime_fallback = rollout_path_allows_mtime_fallback(source, rollout, archived_duplicate_keys)
+        if not rollout_candidate_relevant(
+            rollout,
+            gap_start,
+            end,
+            max_raw_bytes=max_raw_bytes,
+            allow_mtime_fallback=rollout_mtime_fallback,
+        ):
+            continue
+        try:
+            size = rollout.stat().st_size
+        except OSError:
+            continue
+        if size <= max_raw_bytes:
+            continue
+        relevance = oversized_rollout_relevance(
+            rollout,
+            gap_start,
+            end,
+            allow_mtime_fallback=rollout_mtime_fallback,
+        )
+        if relevance == "irrelevant":
+            continue
+        rollout_ref = source_relative_path_ref(rollout, source.root)
+        if (
+            rollout_ref is None
+            or safe_rollout_backing_ref(rollout_ref) is None
+            or rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys)
+        ):
+            continue
+        try:
+            summary = write_generated_local_rollout_summary(source, rollout, generated_root)
+        except (OSError, ValueError):
+            continue
+        if summary is not None:
+            generated.append(summary)
+    return sorted(generated)
 
 
 def source_summary_candidates(source: Source) -> list[Path]:
@@ -3626,6 +3777,8 @@ def retained_manifest_from_transient(manifest: dict[str, Any]) -> dict[str, Any]
     for source in manifest.get("sources", []):
         retained_source: dict[str, Any] = {}
         for key, value in source.items():
+            if key in {"generated_summary_root"}:
+                continue
             if key in {"root", "path"}:
                 ref_key, ref_value = redacted_path_entry(key, value)
                 retained_source.setdefault(ref_key, ref_value)
@@ -5407,6 +5560,7 @@ def run_scan(
     coverage_gaps: list[dict[str, Any]] = []
     max_raw_bytes = require_positive_window(getattr(args, "max_raw_bytes", 512_000), "--max-raw-bytes")
     allow_partial_hosts = getattr(args, "allow_partial_hosts", False)
+    generated_summary_base = generated_summary_base_for_output(output)
 
     def append_oversized_rollout_gap(path: Path, size: int) -> None:
         coverage_gaps.append(
@@ -5486,6 +5640,30 @@ def run_scan(
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         archived_duplicate_keys = archived_rollout_duplicate_keys(source.root)
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source.root)
+        existing_summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
+            summaries,
+            rollouts,
+            gap_start,
+            end,
+            source_root=source.root,
+            max_scan_bytes=max_raw_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
+        )
+        source_generated_summary_root = generated_summary_root_for_source(generated_summary_base, source)
+        generated_summaries = generate_local_rollout_summaries_for_source(
+            source,
+            rollouts,
+            generated_root=source_generated_summary_root,
+            gap_start=gap_start,
+            end=end,
+            max_raw_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+            summary_backed_rollout_keys=existing_summary_backed_rollout_keys,
+        )
+        if generated_summaries:
+            summaries = sorted([*summaries, *generated_summaries])
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
             gap_start,
@@ -5549,16 +5727,17 @@ def run_scan(
         blocking_gaps = source_materialization_gaps + source_summary_only_gaps + stale_summary_gaps
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
-        manifest_sources.append(
-            {
-                "host": source.host,
-                "root": source.root.as_posix(),
-                "root_ref": path_ref(source.root),
-                "rollout_count": len(rollouts),
-                "summary_count": len(summaries),
-                "status": source_manifest_status(rollouts, summaries, blocking_gaps),
-            }
-        )
+        manifest_source = {
+            "host": source.host,
+            "root": source.root.as_posix(),
+            "root_ref": path_ref(source.root),
+            "rollout_count": len(rollouts),
+            "summary_count": len(summaries),
+            "status": source_manifest_status(rollouts, summaries, blocking_gaps),
+        }
+        if generated_summaries:
+            manifest_source["generated_summary_root"] = source_generated_summary_root.as_posix()
+        manifest_sources.append(manifest_source)
         if source_materialization_gaps:
             continue
         for rollout in rollouts:
@@ -5731,6 +5910,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
     manifest_sources: list[dict[str, Any]] = []
     coverage_gaps: list[dict[str, Any]] = []
     allow_partial_hosts = getattr(args, "allow_partial_hosts", False)
+    generated_summary_base = generated_summary_base_for_output(output)
     for source in sources:
         if not source.root.exists():
             coverage_gaps.append(
@@ -5790,6 +5970,30 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         archived_duplicate_keys = archived_rollout_duplicate_keys(source.root)
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source.root)
         source_materialization_gaps = materialization_gaps_for_source(source)
+        existing_summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
+            summaries,
+            rollouts,
+            start,
+            end,
+            source_root=source.root,
+            max_scan_bytes=max_raw_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
+        )
+        source_generated_summary_root = generated_summary_root_for_source(generated_summary_base, source)
+        generated_summaries = generate_local_rollout_summaries_for_source(
+            source,
+            rollouts,
+            generated_root=source_generated_summary_root,
+            gap_start=start,
+            end=end,
+            max_raw_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+            summary_backed_rollout_keys=existing_summary_backed_rollout_keys,
+        )
+        if generated_summaries:
+            summaries = sorted([*summaries, *generated_summaries])
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
             start,
@@ -5852,16 +6056,17 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         blocking_gaps = source_materialization_gaps + source_summary_only_gaps + stale_summary_gaps
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
-        manifest_sources.append(
-            {
-                "host": source.host,
-                "root": source.root.as_posix(),
-                "root_ref": path_ref(source.root),
-                "rollout_count": len(rollouts),
-                "summary_count": len(summaries),
-                "status": source_manifest_status(rollouts, summaries, blocking_gaps),
-            }
-        )
+        manifest_source = {
+            "host": source.host,
+            "root": source.root.as_posix(),
+            "root_ref": path_ref(source.root),
+            "rollout_count": len(rollouts),
+            "summary_count": len(summaries),
+            "status": source_manifest_status(rollouts, summaries, blocking_gaps),
+        }
+        if generated_summaries:
+            manifest_source["generated_summary_root"] = source_generated_summary_root.as_posix()
+        manifest_sources.append(manifest_source)
     if getattr(args, "allow_partial_hosts", False):
         coverage_gaps.append({"host": "scope", "reason": "partial_host_scope"})
 
@@ -6851,16 +7056,20 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         row["status"] = "ready"
         rows.append(row)
 
-    for source in sources:
-        host = source.get("host")
-        if not source.get("root"):
+    for source_entry in sources:
+        host = source_entry.get("host")
+        if not source_entry.get("root"):
             raise SystemExit("make-shards requires transient manifest sources with raw root fields")
-        root = Path(source["root"]).expanduser()
-        status = source.get("status")
+        root = Path(source_entry["root"]).expanduser()
+        status = source_entry.get("status")
         if status is None:
             raise SystemExit("make-shards requires transient manifest sources with status=ready")
         if status != "ready":
             continue
+        generated_summary_root: Path | None = None
+        raw_generated_summary_root = source_entry.get("generated_summary_root")
+        if isinstance(raw_generated_summary_root, str) and raw_generated_summary_root:
+            generated_summary_root = ensure_safe_output_dir(Path(raw_generated_summary_root).expanduser())
         source = Source(str(host), root)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not root.exists():
@@ -6879,7 +7088,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             append_source_gap_shards(source_materialization_gaps, root)
             continue
         rollouts = source_rollouts(source)
-        summaries = source_summary_files(source)
+        summaries = sorted([*source_summary_files(source), *generated_summary_files(generated_summary_root)])
         archived_duplicate_keys = archived_rollout_duplicate_keys(root)
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, root)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(

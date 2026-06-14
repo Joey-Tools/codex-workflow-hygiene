@@ -25,6 +25,13 @@ review gates, and merge before starting the next item.
      rollouts instead of only emitting `oversized_rollout_skipped`.
    - Keep raw rollout files read-only and transient.
    - Preserve coverage gaps when summaries are partial, stale, or truncated.
+   - Store generated summaries outside the scan output directory and expose
+     their root only in the transient `shard_manifest.json`; retained manifests
+     must drop the raw generated-summary path.
+   - Ensure both `scan-*` and `discover -> make-shards` can use the generated
+     summaries, so compact extraction and map-reduce planning stay consistent.
+   - Status: implemented in the local oversized rollout summaries PR; review
+     and merge pending.
 
 4. Remote oversized rollout summary completeness
    - Improve `rollout-summary` output for remote oversized rollouts so complete
