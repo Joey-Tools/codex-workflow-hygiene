@@ -3916,8 +3916,9 @@ def extract_summary_file(
     identity_path_ref = path_ref(path) or ""
     source_hash: str | None = None
     identity_resolved = False
+    is_generated_summary = generated_summary_artifact_path(path)
     generated_identity_candidate: tuple[str, RolloutSourceIdentity] | None = None
-    if generated_summary_artifact_path(path):
+    if is_generated_summary:
         for _line_no, record in records:
             if str(record.get("kind") or "summary") != "scan_meta":
                 continue
@@ -3953,7 +3954,7 @@ def extract_summary_file(
             summary_meta_session_id = True
             break
 
-    def resolve_retained_identity() -> tuple[str, str]:
+    def resolve_retained_identity() -> tuple[str, str] | None:
         nonlocal identity_path, identity_path_ref, identity_resolved, session_id, source_hash
         if not identity_resolved:
             if generated_identity_candidate is not None:
@@ -3970,6 +3971,8 @@ def extract_summary_file(
                     if not summary_meta_session_id:
                         session_id = session_id_from_path(rollout_path)
             identity_resolved = True
+        if is_generated_summary and identity_path == path:
+            return None
         if source_hash is None:
             source_hash = file_source_hash(identity_path)
         return identity_path_ref, source_hash
@@ -4004,7 +4007,10 @@ def extract_summary_file(
         flags = flags_for_text(flag_text, redacted_changed=changed)
         if not flags:
             continue
-        retained_identity_path_ref, retained_source_hash = resolve_retained_identity()
+        retained_identity = resolve_retained_identity()
+        if retained_identity is None:
+            continue
+        retained_identity_path_ref, retained_source_hash = retained_identity
         timestamp_value = iso(parsed_timestamp)
         date_bucket = parsed_timestamp.date().isoformat()
         model_era = infer_model_era(None, timestamp_value)
