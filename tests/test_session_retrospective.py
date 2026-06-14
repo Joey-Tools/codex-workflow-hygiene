@@ -4803,6 +4803,180 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("Host coverage: 0/1 ready, 0 no-activity, 1 blocked", markdown)
         self.assertIn("Top blockers: no_rollout_or_summary_files=1", markdown)
 
+    def test_weekly_dry_run_quick_read_counts_ready_source_with_gap_as_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [{"host": "local", "status": "ready", "rollout_count": 1, "summary_count": 0}],
+                    "coverage_gaps": [
+                        {
+                            "host": "local",
+                            "path_ref": "path_ref_v1:aaaaaaaaaaaaaaaa",
+                            "reason": "oversized_rollout_skipped",
+                        }
+                    ],
+                },
+            )
+            markdown = MODULE.dry_run_report_markdown(report)
+
+        source_coverage = report["report_summary"]["source_coverage"]
+        self.assertEqual(report["report_summary"]["retained_readiness"], "repairable_coverage_gaps")
+        self.assertEqual(source_coverage["ready_sources"], 0)
+        self.assertEqual(source_coverage["blocked_sources"], 1)
+        self.assertTrue(source_coverage["hosts"][0]["has_coverage_gap"])
+        self.assertEqual(source_coverage["hosts"][0]["coverage_class"], "blocked")
+        self.assertIn("Host coverage: 0/1 ready, 0 no-activity, 1 blocked", markdown)
+        self.assertIn("local:blocked(status=ready", markdown)
+        self.assertIn("Top blockers: oversized_rollout_skipped=1", markdown)
+
+    def test_source_path_coverage_gap_includes_source_root_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "source"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00.jsonl"
+            gap = MODULE.source_path_coverage_gap(
+                MODULE.Source("custom_source", root),
+                rollout,
+                "invalid_jsonl",
+                bytes=123,
+            )
+
+        self.assertEqual(gap["host"], "custom_source")
+        self.assertEqual(gap["root_ref"], MODULE.path_ref(root))
+        self.assertEqual(gap["path_ref"], MODULE.path_ref(rollout))
+        self.assertEqual(gap["reason"], "invalid_jsonl")
+        self.assertEqual(gap["bytes"], 123)
+
+    def test_weekly_dry_run_quick_read_blocks_path_only_gaps_across_matching_host(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [
+                        {
+                            "host": "custom_source",
+                            "root_ref": "path_ref_v1:1111111111111111",
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "summary_count": 0,
+                        },
+                        {
+                            "host": "custom_source",
+                            "root_ref": "path_ref_v1:2222222222222222",
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "summary_count": 0,
+                        },
+                    ],
+                    "coverage_gaps": [
+                        {
+                            "host": "custom_source",
+                            "path_ref": "path_ref_v1:3333333333333333",
+                            "reason": "oversized_rollout_skipped",
+                        }
+                    ],
+                },
+            )
+            markdown = MODULE.dry_run_report_markdown(report)
+
+        source_coverage = report["report_summary"]["source_coverage"]
+        self.assertEqual(source_coverage["ready_sources"], 0)
+        self.assertEqual(source_coverage["blocked_sources"], 2)
+        self.assertTrue(source_coverage["hosts"][0]["has_coverage_gap"])
+        self.assertTrue(source_coverage["hosts"][1]["has_coverage_gap"])
+        self.assertEqual(source_coverage["hosts"][0]["coverage_class"], "blocked")
+        self.assertEqual(source_coverage["hosts"][1]["coverage_class"], "blocked")
+        self.assertIn("Host coverage: 0/2 ready, 0 no-activity, 2 blocked", markdown)
+        self.assertEqual(markdown.count("custom_source:blocked(status=ready"), 2)
+
+    def test_weekly_dry_run_quick_read_scopes_custom_source_gaps_by_root_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [
+                        {
+                            "host": "custom_source",
+                            "root_ref": "path_ref_v1:1111111111111111",
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "summary_count": 0,
+                        },
+                        {
+                            "host": "custom_source",
+                            "root_ref": "path_ref_v1:2222222222222222",
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "summary_count": 0,
+                        },
+                    ],
+                    "coverage_gaps": [
+                        {
+                            "host": "custom_source",
+                            "root_ref": "path_ref_v1:1111111111111111",
+                            "reason": "oversized_rollout_skipped",
+                        }
+                    ],
+                },
+            )
+            markdown = MODULE.dry_run_report_markdown(report)
+
+        source_coverage = report["report_summary"]["source_coverage"]
+        self.assertEqual(source_coverage["ready_sources"], 1)
+        self.assertEqual(source_coverage["blocked_sources"], 1)
+        self.assertTrue(source_coverage["hosts"][0]["has_coverage_gap"])
+        self.assertFalse(source_coverage["hosts"][1]["has_coverage_gap"])
+        self.assertEqual(source_coverage["hosts"][0]["coverage_class"], "blocked")
+        self.assertEqual(source_coverage["hosts"][1]["coverage_class"], "ready")
+        self.assertIn("Host coverage: 1/2 ready, 0 no-activity, 1 blocked", markdown)
+        self.assertIn("custom_source:blocked(status=ready", markdown)
+        self.assertIn("custom_source:ready(status=ready", markdown)
+
     def test_weekly_dry_run_quotes_next_command_run_dir(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -4960,6 +5134,62 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("Repair gap change: `2` before to `1` after", markdown)
         self.assertIn("Before gaps:", markdown)
         self.assertIn("After gaps:", markdown)
+
+    def test_weekly_repair_reports_follow_up_command_when_repairable_gaps_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01T10-00-00-weekly-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "text": "permission denied " + ("x" * 1000),
+                    }
+                ],
+            )
+            dry_run = safe_output_dir(raw, "weekly-dry-run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "200",
+                    "--output",
+                    str(dry_run),
+                ]
+            )
+            MODULE.main(
+                [
+                    "weekly-repair",
+                    "--run-dir",
+                    str(dry_run / "scan"),
+                    "--skip-remote-materialization",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "200",
+                ]
+            )
+            repair = dry_run / "weekly-coverage-repair"
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+            markdown = (repair / "repair_report.md").read_text(encoding="utf-8")
+
+        expected_script = Path(MODULE.__file__).resolve().as_posix()
+        self.assertEqual(
+            MODULE.shlex.split(report["next_command"]),
+            ["python3", expected_script, "weekly-repair", "--run-dir", repair.absolute().as_posix(), "--allow-partial-hosts"],
+        )
+        self.assertEqual(report["report_summary"]["next_command"], report["next_command"])
+        self.assertIn("oversized_summary_skipped", report["repairable_coverage_gap_counts"])
+        self.assertIn(report["next_command"], markdown)
 
     def test_weekly_dry_run_repair_runs_transient_follow_up_when_gaps_exist(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
