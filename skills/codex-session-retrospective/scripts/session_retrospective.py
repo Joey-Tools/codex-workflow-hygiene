@@ -7,6 +7,7 @@ import datetime as dt
 import errno
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import re
@@ -135,6 +136,13 @@ COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 BARE_64_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
 SOURCE_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SUMMARY_HASH_VERIFY_MAX_BYTES = 2 * 1024 * 1024
+LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES = 16 * 1024 * 1024
+LOCAL_GENERATED_SUMMARY_SCAN_BYTES = 2 * 1024 * 1024
+LOCAL_ROLLOUT_SUMMARY_LIMIT = 200
+LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
+LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS = 1200
+LOCAL_GENERATED_SUMMARY_DIR_SUFFIX = "generated-rollout-summaries"
+LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF = "local_generated_rollout_summary_v1"
 PRIVATE_IPV4_PATTERN = re.compile(
     r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|100\.(?:6[4-9]|[78]\d|9\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|127(?:\.\d{1,3}){3}|169\.254(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})(?![\d.])"
 )
@@ -166,6 +174,7 @@ ROOT_ROLLOUT_RELATIVE_RE = re.compile(r"^rollout-(?!summary)[^/]+\.jsonl$")
 RAW_SESSION_ID_TEXT_PATTERN = re.compile(r"\bsession_id[\"']?\s*(?:=|:)\s*[\"']?(?!session_ref_v1:)[A-Za-z0-9][A-Za-z0-9_.:-]*")
 OPAQUE_REF_KEY_FILE = Path(".codex-local/session-retrospective/opaque_ref_key")
 PATH_REF_KEY: bytes | None = None
+REMOTE_PROBE_MODULE: Any | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 RETAINED_SUMMARY_KINDS = frozenset(("summary", "function_call_output", "user_message"))
 RETAINED_MODEL_IDS = frozenset(("gpt-5.5", "gpt-5.4", "gpt-5.3-codex"))
@@ -1057,10 +1066,249 @@ def source_summary_files(source: Source) -> list[Path]:
     return sorted(path for path in source_summary_candidates(source) if safe_source_file(path, source.root))
 
 
+def load_remote_probe_module() -> Any:
+    global REMOTE_PROBE_MODULE
+    if REMOTE_PROBE_MODULE is not None:
+        return REMOTE_PROBE_MODULE
+    existing = sys.modules.get("remote_codex_probe")
+    if existing is not None and hasattr(existing, "_summarize_rollout_records_with_meta"):
+        REMOTE_PROBE_MODULE = existing
+        return REMOTE_PROBE_MODULE
+    script = Path(__file__).with_name("remote_codex_probe.py")
+    spec = importlib.util.spec_from_file_location("_codex_session_retrospective_remote_codex_probe", script)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"remote probe helper not importable: {script}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    REMOTE_PROBE_MODULE = module
+    return REMOTE_PROBE_MODULE
+
+
+def generated_summary_base_for_output(output: Path) -> Path:
+    expanded = output.expanduser()
+    parts = expanded.parts
+    if len(parts) >= len(SAFE_OUTPUT_PARTS) and parts[-len(SAFE_OUTPUT_PARTS) :] == SAFE_OUTPUT_PARTS:
+        return ensure_safe_output_dir(expanded / LOCAL_GENERATED_SUMMARY_DIR_SUFFIX)
+    return ensure_safe_output_dir(expanded.parent / f"{expanded.name}-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}")
+
+
+def transient_manifest_path_value(path: Path) -> str:
+    return path.expanduser().absolute().as_posix()
+
+
+def generated_summary_artifact_path(path: Path) -> bool:
+    return any(part == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX or part.endswith(f"-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}") for part in path.parts)
+
+
+def summary_metadata_scan_max_bytes(path: Path, max_scan_bytes: int) -> int:
+    if generated_summary_artifact_path(path):
+        return max(max_scan_bytes, LOCAL_GENERATED_SUMMARY_SCAN_BYTES)
+    return max_scan_bytes
+
+
+def summary_metadata_size_within_scan_cap(path: Path, max_scan_bytes: int) -> bool:
+    try:
+        return path.stat().st_size <= summary_metadata_scan_max_bytes(path, max_scan_bytes)
+    except OSError:
+        return False
+
+
+def generated_summary_root_for_source(base: Path, source: Source) -> Path:
+    safe_host = re.sub(r"[^A-Za-z0-9_.-]+", "_", source.host).strip("._-") or "source"
+    digest = hashlib.sha256(f"{source.host}\0{source.root.as_posix()}".encode("utf-8")).hexdigest()[:12]
+    return base / safe_host[:80] / digest
+
+
+def generated_summary_files(root: Path | None) -> list[Path]:
+    if root is None or not root.exists() or root.is_symlink():
+        return []
+    return sorted(path for path in root.rglob("rollout-summary*.jsonl") if safe_source_file(path, root))
+
+
+def generated_summary_files_from_manifest(root: Path | None, raw_paths: Any) -> list[Path]:
+    if root is None:
+        return []
+    if raw_paths is None:
+        return []
+    if not isinstance(raw_paths, list):
+        raise SystemExit("make-shards requires generated_summaries to be a list")
+    if not root.exists() or root.is_symlink():
+        return []
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError:
+        return []
+    summaries: list[Path] = []
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str) or not raw_path:
+            raise SystemExit("make-shards requires generated_summaries entries to be paths")
+        path = Path(raw_path).expanduser()
+        if not generated_summary_artifact_path(path):
+            raise SystemExit("make-shards generated_summaries entries must be generated-summary artifacts")
+        try:
+            path.resolve(strict=True).relative_to(resolved_root)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise SystemExit("make-shards generated_summaries entries must stay under generated_summary_root") from exc
+        if path_has_disallowed_symlink_component(path.parent) or path.is_symlink() or not path.is_file():
+            raise SystemExit("make-shards generated_summaries entries must be regular files without symlink ancestors")
+        summaries.append(path)
+    return sorted(summaries)
+
+
+def local_rollout_summary_jsonl_bytes(
+    source: Source,
+    rollout: Path,
+    rollout_ref: str,
+    *,
+    mtime_fallback_timestamp: str | None = None,
+) -> bytes:
+    safe_ref = safe_rollout_backing_ref(rollout_ref)
+    if safe_ref is None:
+        raise ValueError(f"unsafe rollout ref: {rollout_ref}")
+    source_bytes = 0
+    source_sha256: str | None = None
+    remote_probe = load_remote_probe_module()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(rollout, flags)
+    try:
+        fd_stat = os.fstat(fd)
+        if not stat.S_ISREG(fd_stat.st_mode):
+            raise OSError("source path is not a regular file")
+        source_bytes = fd_stat.st_size
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            records, summary_meta = remote_probe._summarize_rollout_records_with_meta(
+                lines=remote_probe._bounded_text_lines(handle, LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES),
+                keywords=[],
+                limit=LOCAL_ROLLOUT_SUMMARY_LIMIT,
+                tail_records=LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS,
+                max_text_chars=LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS,
+            )
+            if source_bytes <= LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES:
+                handle.seek(0)
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                source_sha256 = digest.hexdigest()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    scan_meta = remote_probe._rollout_summary_scan_meta(
+        source_bytes=source_bytes,
+        source_sha256=source_sha256,
+        scan_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
+        summary_limit=LOCAL_ROLLOUT_SUMMARY_LIMIT,
+        record_limit_reached=bool(summary_meta["record_limit_reached"]),
+        signal_record_limit_reached=bool(summary_meta["signal_record_limit_reached"]),
+        matched_record_limit_reached=bool(summary_meta["matched_record_limit_reached"]),
+        tail_record_limit_reached=bool(summary_meta["tail_record_limit_reached"]),
+        keyword_filter_applied=bool(summary_meta["keyword_filter_applied"]),
+        json_error_count=int(summary_meta["json_error_count"]),
+        tail_records=int(summary_meta["tail_records"]),
+        summary_record_count=int(summary_meta["summary_record_count"]),
+    )
+    scan_meta["coverage_proof"] = LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF
+    records.insert(0, scan_meta)
+    if mtime_fallback_timestamp:
+        for record in records:
+            if str(record.get("kind") or "") not in {"scan_meta", "session_meta"} and not record.get("timestamp"):
+                record["timestamp"] = mtime_fallback_timestamp
+    summary_records = [dict(record, host=source.host, rollout=safe_ref) for record in records]
+    return jsonl_bytes(summary_records)
+
+
+def write_generated_local_rollout_summary(
+    source: Source,
+    rollout: Path,
+    generated_root: Path,
+    *,
+    mtime_fallback_timestamp: str | None = None,
+) -> Path | None:
+    rollout_ref = source_relative_path_ref(rollout, source.root)
+    if rollout_ref is None or safe_rollout_backing_ref(rollout_ref) is None:
+        return None
+    target = summary_path_for_rollout(generated_root, rollout_ref)
+    reject_symlink_ancestors(target.parent, label="generated summary output path")
+    write_bytes_atomic(
+        target,
+        local_rollout_summary_jsonl_bytes(
+            source,
+            rollout,
+            rollout_ref,
+            mtime_fallback_timestamp=mtime_fallback_timestamp,
+        ),
+    )
+    return target
+
+
+def generate_local_rollout_summaries_for_source(
+    source: Source,
+    rollouts: list[Path],
+    *,
+    generated_root: Path,
+    gap_start: dt.datetime | None,
+    end: dt.datetime | None,
+    max_raw_bytes: int,
+    allow_mtime_fallback: bool,
+    archived_duplicate_keys: set[str],
+    summary_backed_rollout_keys: set[str],
+) -> list[Path]:
+    if source.host in DEFAULT_REMOTE_HOSTS:
+        return []
+    generated: list[Path] = []
+    for rollout in rollouts:
+        rollout_mtime_fallback = rollout_path_allows_mtime_fallback(source, rollout, archived_duplicate_keys)
+        if not rollout_candidate_relevant(
+            rollout,
+            gap_start,
+            end,
+            max_raw_bytes=max_raw_bytes,
+            allow_mtime_fallback=rollout_mtime_fallback,
+        ):
+            continue
+        try:
+            size = rollout.stat().st_size
+        except OSError:
+            continue
+        if size <= max_raw_bytes:
+            continue
+        relevance = oversized_rollout_relevance(
+            rollout,
+            gap_start,
+            end,
+            allow_mtime_fallback=rollout_mtime_fallback,
+        )
+        if relevance == "irrelevant":
+            continue
+        rollout_ref = source_relative_path_ref(rollout, source.root)
+        if (
+            rollout_ref is None
+            or safe_rollout_backing_ref(rollout_ref) is None
+            or rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys)
+        ):
+            continue
+        active_mtime = rollout_active_mtime(rollout, gap_start, end) if rollout_mtime_fallback else None
+        try:
+            summary = write_generated_local_rollout_summary(
+                source,
+                rollout,
+                generated_root,
+                mtime_fallback_timestamp=iso(active_mtime) if active_mtime is not None else None,
+            )
+        except (OSError, ValueError):
+            continue
+        if summary is not None:
+            generated.append(summary)
+    return sorted(generated)
+
+
 def source_summary_candidates(source: Source) -> list[Path]:
     if not source.root.exists() or source.root.is_symlink():
         return []
-    return sorted(source.root.rglob("rollout-summary*.jsonl"))
+    return sorted(path for path in source.root.rglob("rollout-summary*.jsonl") if not generated_summary_artifact_path(path))
 
 
 def unsafe_source_summaries(source: Source) -> list[Path]:
@@ -1410,6 +1658,7 @@ def summary_file_relevant_with_scan_cap(
     *,
     max_scan_bytes: int,
 ) -> bool:
+    metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     if start is None and end is None:
         return True
     summary_date = summary_date_from_path(path)
@@ -1419,7 +1668,7 @@ def summary_file_relevant_with_scan_cap(
                 path,
                 start,
                 end,
-                max_scan_bytes=max_scan_bytes,
+                max_scan_bytes=metadata_scan_bytes,
             )
         except OSError:
             return False
@@ -1428,22 +1677,22 @@ def summary_file_relevant_with_scan_cap(
         if summary_date + dt.timedelta(days=1) > start:
             return True
         try:
-            if path.stat().st_size > max_scan_bytes:
+            if path.stat().st_size > metadata_scan_bytes:
                 return False
         except OSError:
             return False
         try:
-            return raw_timestamp_in_window(path, start, end, max_scan_bytes=max_scan_bytes)
+            return raw_timestamp_in_window(path, start, end, max_scan_bytes=metadata_scan_bytes)
         except OSError:
             return False
     if summary_date and end and summary_date >= end:
         try:
-            if path.stat().st_size > max_scan_bytes:
+            if path.stat().st_size > metadata_scan_bytes:
                 return False
         except OSError:
             return False
         try:
-            return raw_timestamp_in_window(path, start, end, max_scan_bytes=max_scan_bytes)
+            return raw_timestamp_in_window(path, start, end, max_scan_bytes=metadata_scan_bytes)
         except OSError:
             return False
     return True
@@ -1711,6 +1960,13 @@ def summary_hash_verify_max_bytes(max_scan_bytes: int) -> int:
     return max(max_scan_bytes, SUMMARY_HASH_VERIFY_MAX_BYTES)
 
 
+def summary_identity_hash_verify_max_bytes(summary: Path, max_scan_bytes: int) -> int:
+    base = summary_hash_verify_max_bytes(max_scan_bytes)
+    if generated_summary_artifact_path(summary):
+        return max(base, LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES)
+    return base
+
+
 def safe_relative_summary_ref(value: str) -> str | None:
     candidate = Path(value)
     if candidate.is_absolute():
@@ -1917,14 +2173,15 @@ def summary_backing_rollout_refs(
     source_root: Path | None = None,
 ) -> tuple[set[str], bool, bool, bool]:
     refs: set[str] = set()
+    metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     try:
         with path.open("rb") as handle:
-            data = handle.read(max_scan_bytes + 1)
+            data = handle.read(metadata_scan_bytes + 1)
     except OSError:
         return refs, False, True, True
-    complete = len(data) <= max_scan_bytes
+    complete = len(data) <= metadata_scan_bytes
     if not complete:
-        data = data[:max_scan_bytes].rsplit(b"\n", 1)[0]
+        data = data[:metadata_scan_bytes].rsplit(b"\n", 1)[0]
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -1971,13 +2228,14 @@ def summary_backing_rollout_refs(
 def summary_scan_meta_backing_rollout_refs(path: Path, *, max_scan_bytes: int) -> tuple[set[str], bool]:
     refs: set[str] = set()
     invalid_ref_seen = False
+    metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     try:
         with path.open("rb") as handle:
-            data = handle.read(max_scan_bytes + 1)
+            data = handle.read(metadata_scan_bytes + 1)
     except OSError:
         invalid_ref_seen = True
         return refs, invalid_ref_seen
-    if len(data) > max_scan_bytes:
+    if len(data) > metadata_scan_bytes:
         return refs, invalid_ref_seen
     try:
         text = data.decode("utf-8")
@@ -2011,6 +2269,54 @@ def summary_scan_meta_backing_rollout_refs(path: Path, *, max_scan_bytes: int) -
     return refs, invalid_ref_seen
 
 
+def summary_has_generated_local_coverage_proof(path: Path, *, max_scan_bytes: int) -> bool:
+    proof_seen = False
+    metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(metadata_scan_bytes + 1)
+    except OSError:
+        return False
+    if len(data) > metadata_scan_bytes:
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(record, dict) or str(record.get("kind") or "") != "scan_meta":
+            continue
+        if record.get("rollout") is None:
+            continue
+        if record.get("coverage_proof") != LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF:
+            return False
+        proof_seen = True
+    return proof_seen
+
+
+def generated_summary_path_set(paths: Iterable[Path]) -> set[Path]:
+    return {path.resolve(strict=False) for path in paths}
+
+
+def summary_allows_generated_local_coverage(
+    path: Path,
+    generated_summary_paths: set[Path] | None,
+    *,
+    max_scan_bytes: int,
+) -> bool:
+    if not generated_summary_paths:
+        return False
+    if path.resolve(strict=False) not in generated_summary_paths:
+        return False
+    return summary_has_generated_local_coverage_proof(path, max_scan_bytes=max_scan_bytes)
+
+
 def summary_file_has_session_meta_in_window(
     path: Path,
     start: dt.datetime | None,
@@ -2018,13 +2324,14 @@ def summary_file_has_session_meta_in_window(
     *,
     max_scan_bytes: int,
 ) -> bool:
+    metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     try:
         with path.open("rb") as handle:
-            data = handle.read(max_scan_bytes + 1)
+            data = handle.read(metadata_scan_bytes + 1)
     except OSError:
         return False
-    if len(data) > max_scan_bytes:
-        data = data[:max_scan_bytes].rsplit(b"\n", 1)[0]
+    if len(data) > metadata_scan_bytes:
+        data = data[:metadata_scan_bytes].rsplit(b"\n", 1)[0]
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -2080,7 +2387,11 @@ class RolloutSourceIdentity:
     ref: str | None = None
 
 
-def complete_scan_meta_record_source_bytes(record: dict[str, Any]) -> int | None:
+def complete_scan_meta_record_source_bytes(
+    record: dict[str, Any],
+    *,
+    allow_tail_record_limit: bool = False,
+) -> int | None:
     limit_fields = (
         "keyword_filter_applied",
         "record_limit_reached",
@@ -2096,8 +2407,11 @@ def complete_scan_meta_record_source_bytes(record: dict[str, Any]) -> int | None
     json_error_count = record.get("json_error_count")
     if type(json_error_count) is not int or json_error_count != 0:
         return None
-    if any(record.get(field) is not False for field in limit_fields):
-        return None
+    for field in limit_fields:
+        if field == "tail_record_limit_reached" and allow_tail_record_limit:
+            continue
+        if record.get(field) is not False:
+            return None
     source_bytes = record.get("source_bytes")
     if type(source_bytes) is not int or source_bytes < 0:
         return None
@@ -2134,6 +2448,8 @@ def complete_scan_meta_backing_source_bytes_by_ref(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
+    *,
+    allow_tail_record_limit: bool = False,
 ) -> CompleteScanMetaProof | None:
     saw_scan_meta = False
     has_rollout_ref = False
@@ -2144,7 +2460,10 @@ def complete_scan_meta_backing_source_bytes_by_ref(
             if str(record.get("kind") or "") != "scan_meta":
                 continue
             saw_scan_meta = True
-            source_bytes = complete_scan_meta_record_source_bytes(record)
+            source_bytes = complete_scan_meta_record_source_bytes(
+                record,
+                allow_tail_record_limit=allow_tail_record_limit,
+            )
             if source_bytes is None:
                 return None
             source_sha256 = complete_scan_meta_record_source_sha256(record)
@@ -2188,6 +2507,7 @@ def complete_summary_backing_source_identity_by_ref(
     *,
     max_scan_bytes: int,
     source_root: Path | None = None,
+    allow_tail_record_limit: bool = False,
 ) -> dict[str, RolloutSourceIdentity] | None:
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
         path,
@@ -2198,11 +2518,18 @@ def complete_summary_backing_source_identity_by_ref(
     )
     if not complete or not relevant_record_seen or unbacked_record_seen or not backing_refs:
         return None
-    proof = complete_scan_meta_backing_source_bytes_by_ref(path, start, end)
+    proof = complete_scan_meta_backing_source_bytes_by_ref(
+        path,
+        start,
+        end,
+        allow_tail_record_limit=allow_tail_record_limit,
+    )
     if proof is None:
         return None
     if proof.source_bytes_by_ref:
         if not backing_refs.issubset(proof.source_bytes_by_ref):
+            return None
+        if allow_tail_record_limit and not backing_refs.issubset(proof.source_sha256_by_ref):
             return None
         return {
             ref: RolloutSourceIdentity(
@@ -2226,6 +2553,7 @@ def complete_summary_backing_source_bytes_by_ref(
     *,
     max_scan_bytes: int,
     source_root: Path | None = None,
+    allow_tail_record_limit: bool = False,
 ) -> dict[str, int] | None:
     identities = complete_summary_backing_source_identity_by_ref(
         path,
@@ -2233,6 +2561,7 @@ def complete_summary_backing_source_bytes_by_ref(
         end,
         max_scan_bytes=max_scan_bytes,
         source_root=source_root,
+        allow_tail_record_limit=allow_tail_record_limit,
     )
     if identities is None:
         return None
@@ -2246,14 +2575,18 @@ def complete_summary_backing_rollout_refs(
     *,
     source_root: Path,
     max_scan_bytes: int,
+    allow_mtime_fallback: bool = False,
+    archived_duplicate_keys: set[str] | None = None,
+    generated_summary_paths: set[Path] | None = None,
 ) -> set[str]:
     refs: set[str] = set()
     for summary in summaries:
-        try:
-            size = summary.stat().st_size
-        except OSError:
-            continue
-        if size > max_scan_bytes:
+        allow_generated_local_coverage = summary_allows_generated_local_coverage(
+            summary,
+            generated_summary_paths,
+            max_scan_bytes=max_scan_bytes,
+        )
+        if not summary_metadata_size_within_scan_cap(summary, max_scan_bytes):
             continue
         if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
             continue
@@ -2263,31 +2596,120 @@ def complete_summary_backing_rollout_refs(
             start,
             end,
             max_scan_bytes=max_scan_bytes,
+            allow_tail_record_limit=allow_generated_local_coverage,
         ):
             continue
+        hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(summary, max_scan_bytes)
         extractable_refs = summary_extractable_backing_refs_in_window(summary, start, end)
-        if not extractable_refs:
-            continue
-        source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
-            summary,
-            start,
-            end,
-            max_scan_bytes=max_scan_bytes,
-            source_root=source_root,
-        )
-        if source_identity_by_ref is None:
-            continue
+        if extractable_refs:
+            source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
+                summary,
+                start,
+                end,
+                max_scan_bytes=max_scan_bytes,
+                source_root=source_root,
+                allow_tail_record_limit=allow_generated_local_coverage,
+            )
+            if source_identity_by_ref is not None:
+                refs.update(
+                    ref
+                    for ref, source_identity in source_identity_by_ref.items()
+                    if ref in extractable_refs
+                    if backing_ref_matches_current_rollout_identity(
+                        source_root,
+                        ref,
+                        source_identity,
+                        max_hash_bytes=hash_verify_max_bytes,
+                    )
+                )
         refs.update(
-            ref
-            for ref, source_identity in source_identity_by_ref.items()
-            if ref in extractable_refs
-            if backing_ref_matches_current_rollout_identity(
-                source_root,
-                ref,
-                source_identity,
-                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+            complete_scan_meta_backing_rollout_refs(
+                summary,
+                start,
+                end,
+                source_root=source_root,
+                max_scan_bytes=max_scan_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
+                allow_generated_local_coverage=allow_generated_local_coverage,
             )
         )
+    return refs
+
+
+def complete_scan_meta_backing_rollout_refs(
+    summary: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path,
+    max_scan_bytes: int,
+    allow_mtime_fallback: bool = False,
+    selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
+    archived_duplicate_keys: set[str] | None = None,
+    allow_generated_local_coverage: bool = False,
+) -> set[str]:
+    if not allow_generated_local_coverage:
+        return set()
+    scan_meta_refs, invalid_ref_seen = summary_scan_meta_backing_rollout_refs(
+        summary,
+        max_scan_bytes=max_scan_bytes,
+    )
+    if invalid_ref_seen or not scan_meta_refs:
+        return set()
+    proof = complete_scan_meta_backing_source_bytes_by_ref(
+        summary,
+        start,
+        end,
+        allow_tail_record_limit=True,
+    )
+    if proof is None or not proof.source_bytes_by_ref:
+        return set()
+    summary_context_relevant = summary_file_relevant_with_scan_cap(
+        summary,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    ) or summary_file_has_session_meta_in_window(
+        summary,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    )
+    refs: set[str] = set()
+    for ref in scan_meta_refs:
+        source_bytes = proof.source_bytes_by_ref.get(ref)
+        if source_bytes is None:
+            continue
+        source_sha256 = proof.source_sha256_by_ref.get(ref)
+        if source_sha256 is None:
+            continue
+        source_identity = RolloutSourceIdentity(
+            source_bytes=source_bytes,
+            source_sha256=source_sha256,
+        )
+        if not (
+            rollout_ref_in_window(ref, start, end)
+            or backing_ref_has_materialized_window_coverage(
+                source_root,
+                ref,
+                start,
+                end,
+                max_scan_bytes=max_scan_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
+            )
+            or summary_context_relevant
+        ):
+            continue
+        if backing_ref_matches_current_or_selected_rollout(
+            source_root,
+            ref,
+            source_identity,
+            max_hash_bytes=summary_identity_hash_verify_max_bytes(summary, max_scan_bytes),
+            selected_source_identity_by_key=selected_source_identity_by_key,
+        ):
+            refs.add(ref)
     return refs
 
 
@@ -2380,16 +2802,18 @@ def complete_summary_backing_rollout_keys(
     max_scan_bytes: int,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
+    generated_summary_paths: set[Path] | None = None,
 ) -> set[str]:
     if selected_source_identity_by_key is None:
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source_root)
     keys: set[str] = set()
     for summary in summaries:
-        try:
-            size = summary.stat().st_size
-        except OSError:
-            continue
-        if size > max_scan_bytes:
+        allow_generated_local_coverage = summary_allows_generated_local_coverage(
+            summary,
+            generated_summary_paths,
+            max_scan_bytes=max_scan_bytes,
+        )
+        if not summary_metadata_size_within_scan_cap(summary, max_scan_bytes):
             continue
         if summary_file_has_truncated_scan(summary) or first_jsonl_error(summary) is not None:
             continue
@@ -2401,33 +2825,48 @@ def complete_summary_backing_rollout_keys(
             max_scan_bytes=max_scan_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            allow_tail_record_limit=allow_generated_local_coverage,
         ):
             continue
+        hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(summary, max_scan_bytes)
         extractable_refs = summary_extractable_backing_refs_in_window(summary, start, end)
-        if not extractable_refs:
-            continue
-        source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
+        if extractable_refs:
+            source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
+                summary,
+                start,
+                end,
+                max_scan_bytes=max_scan_bytes,
+                source_root=source_root,
+                allow_tail_record_limit=allow_generated_local_coverage,
+            )
+            if source_identity_by_ref is not None:
+                for ref, source_identity in source_identity_by_ref.items():
+                    if ref not in extractable_refs:
+                        continue
+                    if not backing_ref_matches_current_or_selected_rollout(
+                        source_root,
+                        ref,
+                        source_identity,
+                        max_hash_bytes=hash_verify_max_bytes,
+                        selected_source_identity_by_key=selected_source_identity_by_key,
+                    ):
+                        continue
+                    _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
+                    selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
+                    keys.add(summary_backed_rollout_key_for_ref(selected_ref))
+        for ref in complete_scan_meta_backing_rollout_refs(
             summary,
             start,
             end,
-            max_scan_bytes=max_scan_bytes,
             source_root=source_root,
-        )
-        if source_identity_by_ref is None:
-            continue
-        for ref, source_identity in source_identity_by_ref.items():
-            if ref not in extractable_refs:
-                continue
-            if backing_ref_matches_current_or_selected_rollout(
-                source_root,
-                ref,
-                source_identity,
-                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
-                selected_source_identity_by_key=selected_source_identity_by_key,
-            ):
-                _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
-                selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
-                keys.add(summary_backed_rollout_key_for_ref(selected_ref))
+            max_scan_bytes=max_scan_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
+            allow_generated_local_coverage=allow_generated_local_coverage,
+        ):
+            _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
+            selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
+            keys.add(summary_backed_rollout_key_for_ref(selected_ref))
     return keys
 
 
@@ -2486,7 +2925,7 @@ def complete_summary_backing_rollout_refs_for_refs(
             source_root,
             ref,
             source_identity,
-            max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+            max_hash_bytes=summary_identity_hash_verify_max_bytes(summary, max_scan_bytes),
             selected_source_identity_by_key=selected_source_identity_by_key,
         ):
             refs.add(ref)
@@ -2655,12 +3094,13 @@ def summary_file_has_stale_backing_source(
     max_scan_bytes: int,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
+    allow_tail_record_limit: bool = False,
 ) -> bool:
     try:
         size = path.stat().st_size
     except OSError:
         return False
-    if size > max_scan_bytes:
+    if size > summary_metadata_scan_max_bytes(path, max_scan_bytes):
         return False
     if not summary_file_relevant_or_backing_ref_relevant(
         path,
@@ -2686,9 +3126,15 @@ def summary_file_has_stale_backing_source(
         end,
         max_scan_bytes=max_scan_bytes,
         source_root=source_root,
+        allow_tail_record_limit=allow_tail_record_limit,
     )
     if source_identity_by_ref is None:
-        proof = complete_scan_meta_backing_source_bytes_by_ref(path, start, end)
+        proof = complete_scan_meta_backing_source_bytes_by_ref(
+            path,
+            start,
+            end,
+            allow_tail_record_limit=allow_tail_record_limit,
+        )
         if proof is not None:
             return True
         if summary_file_has_malformed_scan_meta_source_sha256(path):
@@ -2696,22 +3142,24 @@ def summary_file_has_stale_backing_source(
         source_bytes = summary_file_declared_source_bytes(path)
         if source_bytes is None:
             return False
+        hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(path, max_scan_bytes)
         return any(
             not backing_ref_matches_current_or_selected_rollout(
                 source_root,
                 ref,
                 RolloutSourceIdentity(source_bytes=source_bytes),
-                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                max_hash_bytes=hash_verify_max_bytes,
                 selected_source_identity_by_key=selected_source_identity_by_key,
             )
             for ref in backing_refs
         )
+    hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(path, max_scan_bytes)
     return any(
         not backing_ref_matches_current_or_selected_rollout(
             source_root,
             ref,
             source_identity,
-            max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+            max_hash_bytes=hash_verify_max_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
         )
         for ref, source_identity in source_identity_by_ref.items()
@@ -2728,6 +3176,7 @@ def summary_file_stale_backing_requires_gap(
     allow_mtime_fallback: bool = False,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
+    allow_tail_record_limit: bool = False,
 ) -> bool:
     backing_refs, complete, relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
         path,
@@ -2748,7 +3197,12 @@ def summary_file_stale_backing_requires_gap(
     if source_identity_by_ref is None:
         if summary_file_has_malformed_scan_meta_source_sha256(path):
             return True
-        proof = complete_scan_meta_backing_source_bytes_by_ref(path, start, end)
+        proof = complete_scan_meta_backing_source_bytes_by_ref(
+            path,
+            start,
+            end,
+            allow_tail_record_limit=allow_tail_record_limit,
+        )
         if proof is None:
             source_bytes = summary_file_declared_source_bytes(path)
             if source_bytes is None:
@@ -2760,13 +3214,14 @@ def summary_file_stale_backing_requires_gap(
                     source_root,
                     ref,
                     RolloutSourceIdentity(source_bytes=source_bytes),
-                    max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                    max_hash_bytes=summary_identity_hash_verify_max_bytes(path, max_scan_bytes),
                     selected_source_identity_by_key=selected_source_identity_by_key,
                 )
             }
         else:
             stale_refs = set(backing_refs)
     else:
+        hash_verify_max_bytes = summary_identity_hash_verify_max_bytes(path, max_scan_bytes)
         stale_refs = {
             ref
             for ref, source_identity in source_identity_by_ref.items()
@@ -2774,7 +3229,7 @@ def summary_file_stale_backing_requires_gap(
                 source_root,
                 ref,
                 source_identity,
-                max_hash_bytes=summary_hash_verify_max_bytes(max_scan_bytes),
+                max_hash_bytes=hash_verify_max_bytes,
                 selected_source_identity_by_key=selected_source_identity_by_key,
             )
         }
@@ -2802,6 +3257,7 @@ def stale_backing_summary_paths(
     max_scan_bytes: int,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
+    generated_summary_paths: set[Path] | None = None,
 ) -> set[Path]:
     return {
         summary
@@ -2814,6 +3270,11 @@ def stale_backing_summary_paths(
             max_scan_bytes=max_scan_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            allow_tail_record_limit=summary_allows_generated_local_coverage(
+                summary,
+                generated_summary_paths,
+                max_scan_bytes=max_scan_bytes,
+            ),
         )
     }
 
@@ -2828,6 +3289,7 @@ def stale_backing_summary_gap_paths(
     allow_mtime_fallback: bool = False,
     selected_source_identity_by_key: dict[str, RolloutSourceIdentity] | None = None,
     archived_duplicate_keys: set[str] | None = None,
+    generated_summary_paths: set[Path] | None = None,
 ) -> set[Path]:
     return {
         summary
@@ -2841,6 +3303,11 @@ def stale_backing_summary_gap_paths(
             allow_mtime_fallback=allow_mtime_fallback,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            allow_tail_record_limit=summary_allows_generated_local_coverage(
+                summary,
+                generated_summary_paths,
+                max_scan_bytes=max_scan_bytes,
+            ),
         )
     }
 
@@ -2914,12 +3381,13 @@ def summary_file_maybe_relevant_with_scan_cap(
     if summary_date is None:
         return summary_file_relevant_with_scan_cap(path, start, end, max_scan_bytes=max_scan_bytes)
     if summary_date and end and summary_date >= end:
+        metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
         try:
             found, complete = oversized_rollout_has_timestamp_in_window(
                 path,
                 start,
                 end,
-                max_scan_bytes=max_scan_bytes,
+                max_scan_bytes=metadata_scan_bytes,
             )
         except OSError:
             return False
@@ -2942,7 +3410,7 @@ def summary_file_has_truncated_scan(path: Path) -> bool:
     return False
 
 
-def summary_file_has_record_limit_gap(path: Path) -> bool:
+def summary_file_has_record_limit_gap(path: Path, *, allow_tail_record_limit: bool = False) -> bool:
     limit_fields = (
         "keyword_filter_applied",
         "record_limit_reached",
@@ -2966,7 +3434,10 @@ def summary_file_has_record_limit_gap(path: Path) -> bool:
             if type(source_bytes) is int and type(scan_bytes) is int and scan_bytes < source_bytes:
                 return True
             for field in limit_fields:
-                if record.get(field) is True or f"{field}=true" in text:
+                if field == "tail_record_limit_reached" and allow_tail_record_limit:
+                    continue
+                text_field_true = re.search(rf"(?<![A-Za-z0-9_]){re.escape(field)}=true(?![A-Za-z0-9_])", text)
+                if record.get(field) is True or text_field_true:
                     return True
     except (OSError, ValueError):
         return False
@@ -3442,6 +3913,25 @@ def extract_summary_file(
     source_hash = file_source_hash(path)
     session_id = opaque_session_id(path.as_posix())
     records = list(iter_jsonl(path))
+    identity_path = path
+    if generated_summary_artifact_path(path):
+        for _line_no, record in records:
+            if str(record.get("kind") or "summary") != "scan_meta":
+                continue
+            if record.get("coverage_proof") != LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF:
+                continue
+            rollout_ref = record.get("rollout")
+            if not isinstance(rollout_ref, str):
+                continue
+            safe_ref = safe_rollout_backing_ref(rollout_ref)
+            if safe_ref is None:
+                continue
+            rollout_path = source.root / safe_ref
+            if safe_source_file(rollout_path, source.root):
+                identity_path = rollout_path
+                session_id = session_id_from_path(rollout_path)
+                break
+    identity_path_ref = path_ref(identity_path) or ""
     for _line_no, record in records:
         if str(record.get("kind") or "summary") != "session_meta":
             continue
@@ -3485,11 +3975,11 @@ def extract_summary_file(
         episode_id = opaque_episode_id("|".join([source.host, session_id, "rollout-summary", date_bucket, model_era, retained_kind]))
         turns.append(
             TurnSummary(
-                turn_id=opaque_turn_id(f"{source.host}|{path_ref(path)}|{line_no}|{timestamp}"),
+                turn_id=opaque_turn_id(f"{source.host}|{identity_path_ref}|{line_no}|{timestamp}"),
                 episode_id=episode_id,
                 host=source.host,
                 session_id=session_id,
-                source_path=path_ref(path) or "",
+                source_path=identity_path_ref,
                 source_hash=source_hash,
                 timestamp=timestamp_value,
                 cwd=None,
@@ -3626,6 +4116,8 @@ def retained_manifest_from_transient(manifest: dict[str, Any]) -> dict[str, Any]
     for source in manifest.get("sources", []):
         retained_source: dict[str, Any] = {}
         for key, value in source.items():
+            if key in {"generated_summary_root", "generated_summaries"}:
+                continue
             if key in {"root", "path"}:
                 ref_key, ref_value = redacted_path_entry(key, value)
                 retained_source.setdefault(ref_key, ref_value)
@@ -5180,6 +5672,7 @@ def remote_summary_only_gaps(
             end,
             source_root=source.root,
             max_scan_bytes=max_scan_bytes,
+            archived_duplicate_keys=archived_duplicate_keys,
         )
     if complete_summary_keys is None:
         complete_summary_keys = complete_summary_backing_rollout_keys(
@@ -5407,6 +5900,7 @@ def run_scan(
     coverage_gaps: list[dict[str, Any]] = []
     max_raw_bytes = require_positive_window(getattr(args, "max_raw_bytes", 512_000), "--max-raw-bytes")
     allow_partial_hosts = getattr(args, "allow_partial_hosts", False)
+    generated_summary_base = generated_summary_base_for_output(output)
 
     def append_oversized_rollout_gap(path: Path, size: int) -> None:
         coverage_gaps.append(
@@ -5440,7 +5934,7 @@ def run_scan(
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -5454,7 +5948,7 @@ def run_scan(
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -5473,7 +5967,7 @@ def run_scan(
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -5486,12 +5980,40 @@ def run_scan(
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         archived_duplicate_keys = archived_rollout_duplicate_keys(source.root)
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source.root)
+        existing_summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
+            summaries,
+            rollouts,
+            gap_start,
+            end,
+            source_root=source.root,
+            max_scan_bytes=max_raw_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
+        )
+        source_generated_summary_root = generated_summary_root_for_source(generated_summary_base, source)
+        generated_summaries = generate_local_rollout_summaries_for_source(
+            source,
+            rollouts,
+            generated_root=source_generated_summary_root,
+            gap_start=gap_start,
+            end=end,
+            max_raw_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+            summary_backed_rollout_keys=existing_summary_backed_rollout_keys,
+        )
+        if generated_summaries:
+            summaries = sorted([*summaries, *generated_summaries])
+        generated_summary_paths = generated_summary_path_set(generated_summaries)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
             gap_start,
             end,
             source_root=source.root,
             max_scan_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
             summaries,
@@ -5502,6 +6024,7 @@ def run_scan(
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         stale_summary_paths = stale_backing_summary_paths(
             summaries,
@@ -5511,6 +6034,7 @@ def run_scan(
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         stale_summary_gap_paths = stale_backing_summary_gap_paths(
             stale_summary_paths,
@@ -5521,6 +6045,7 @@ def run_scan(
             allow_mtime_fallback=allow_mtime_fallback,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         source_materialization_gaps = materialization_gaps_for_source(source)
         source_summary_only_gaps = remote_summary_only_gaps(
@@ -5549,16 +6074,18 @@ def run_scan(
         blocking_gaps = source_materialization_gaps + source_summary_only_gaps + stale_summary_gaps
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
-        manifest_sources.append(
-            {
-                "host": source.host,
-                "root": source.root.as_posix(),
-                "root_ref": path_ref(source.root),
-                "rollout_count": len(rollouts),
-                "summary_count": len(summaries),
-                "status": source_manifest_status(rollouts, summaries, blocking_gaps),
-            }
-        )
+        manifest_source = {
+            "host": source.host,
+            "root": transient_manifest_path_value(source.root),
+            "root_ref": path_ref(source.root),
+            "rollout_count": len(rollouts),
+            "summary_count": len(summaries),
+            "status": source_manifest_status(rollouts, summaries, blocking_gaps),
+        }
+        if generated_summaries:
+            manifest_source["generated_summary_root"] = transient_manifest_path_value(source_generated_summary_root)
+            manifest_source["generated_summaries"] = [transient_manifest_path_value(summary) for summary in generated_summaries]
+        manifest_sources.append(manifest_source)
         if source_materialization_gaps:
             continue
         for rollout in rollouts:
@@ -5619,7 +6146,7 @@ def run_scan(
             continue
         for summary in summaries:
             size = summary.stat().st_size
-            if size > max_raw_bytes:
+            if size > summary_metadata_scan_max_bytes(summary, max_raw_bytes):
                 if summary_file_maybe_relevant_or_backing_ref_relevant(
                     summary,
                     gap_start,
@@ -5636,7 +6163,14 @@ def run_scan(
             jsonl_error = first_jsonl_error(summary)
             if (
                 summary_file_has_truncated_scan(summary)
-                or summary_file_has_record_limit_gap(summary)
+                or summary_file_has_record_limit_gap(
+                    summary,
+                    allow_tail_record_limit=summary_allows_generated_local_coverage(
+                        summary,
+                        generated_summary_paths,
+                        max_scan_bytes=max_raw_bytes,
+                    ),
+                )
             ) and summary_file_maybe_relevant_or_backing_ref_relevant(
                 summary,
                 gap_start,
@@ -5731,6 +6265,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
     manifest_sources: list[dict[str, Any]] = []
     coverage_gaps: list[dict[str, Any]] = []
     allow_partial_hosts = getattr(args, "allow_partial_hosts", False)
+    generated_summary_base = generated_summary_base_for_output(output)
     for source in sources:
         if not source.root.exists():
             coverage_gaps.append(
@@ -5743,7 +6278,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -5757,7 +6292,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -5776,7 +6311,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             manifest_sources.append(
                 {
                     "host": source.host,
-                    "root": source.root.as_posix(),
+                    "root": transient_manifest_path_value(source.root),
                     "root_ref": path_ref(source.root),
                     "rollout_count": 0,
                     "summary_count": 0,
@@ -5790,12 +6325,40 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         archived_duplicate_keys = archived_rollout_duplicate_keys(source.root)
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, source.root)
         source_materialization_gaps = materialization_gaps_for_source(source)
+        existing_summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
+            summaries,
+            rollouts,
+            start,
+            end,
+            source_root=source.root,
+            max_scan_bytes=max_raw_bytes,
+            selected_source_identity_by_key=selected_source_identity_by_key,
+            archived_duplicate_keys=archived_duplicate_keys,
+        )
+        source_generated_summary_root = generated_summary_root_for_source(generated_summary_base, source)
+        generated_summaries = generate_local_rollout_summaries_for_source(
+            source,
+            rollouts,
+            generated_root=source_generated_summary_root,
+            gap_start=start,
+            end=end,
+            max_raw_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+            summary_backed_rollout_keys=existing_summary_backed_rollout_keys,
+        )
+        if generated_summaries:
+            summaries = sorted([*summaries, *generated_summaries])
+        generated_summary_paths = generated_summary_path_set(generated_summaries)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
             start,
             end,
             source_root=source.root,
             max_scan_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
             summaries,
@@ -5806,6 +6369,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         stale_summary_paths = stale_backing_summary_paths(
             summaries,
@@ -5815,6 +6379,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         stale_summary_gap_paths = stale_backing_summary_gap_paths(
             stale_summary_paths,
@@ -5825,6 +6390,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             allow_mtime_fallback=allow_mtime_fallback,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
@@ -5852,16 +6418,18 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
         blocking_gaps = source_materialization_gaps + source_summary_only_gaps + stale_summary_gaps
         if not rollouts and not summaries and source.host not in DEFAULT_REMOTE_HOSTS:
             coverage_gaps.append({"host": source.host, "root_ref": path_ref(source.root), "reason": "no_rollout_or_summary_files"})
-        manifest_sources.append(
-            {
-                "host": source.host,
-                "root": source.root.as_posix(),
-                "root_ref": path_ref(source.root),
-                "rollout_count": len(rollouts),
-                "summary_count": len(summaries),
-                "status": source_manifest_status(rollouts, summaries, blocking_gaps),
-            }
-        )
+        manifest_source = {
+            "host": source.host,
+            "root": transient_manifest_path_value(source.root),
+            "root_ref": path_ref(source.root),
+            "rollout_count": len(rollouts),
+            "summary_count": len(summaries),
+            "status": source_manifest_status(rollouts, summaries, blocking_gaps),
+        }
+        if generated_summaries:
+            manifest_source["generated_summary_root"] = transient_manifest_path_value(source_generated_summary_root)
+            manifest_source["generated_summaries"] = [transient_manifest_path_value(summary) for summary in generated_summaries]
+        manifest_sources.append(manifest_source)
     if getattr(args, "allow_partial_hosts", False):
         coverage_gaps.append({"host": "scope", "reason": "partial_host_scope"})
 
@@ -6763,7 +7331,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
 
     def append_summary_shard(summary: Path) -> None:
         row = shard_row(summary, bytes=summary.stat().st_size, kind="summary")
-        if row["bytes"] > max_raw_bytes:
+        if row["bytes"] > summary_metadata_scan_max_bytes(summary, max_raw_bytes):
             if not summary_file_maybe_relevant_or_backing_ref_relevant(
                 summary,
                 start,
@@ -6786,6 +7354,11 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            allow_tail_record_limit=summary_allows_generated_local_coverage(
+                summary,
+                generated_summary_paths,
+                max_scan_bytes=max_raw_bytes,
+            ),
         ):
             if summary_file_stale_backing_requires_gap(
                 summary,
@@ -6796,13 +7369,25 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 allow_mtime_fallback=allow_mtime_fallback,
                 selected_source_identity_by_key=selected_source_identity_by_key,
                 archived_duplicate_keys=archived_duplicate_keys,
+                allow_tail_record_limit=summary_allows_generated_local_coverage(
+                    summary,
+                    generated_summary_paths,
+                    max_scan_bytes=max_raw_bytes,
+                ),
             ):
                 row["status"] = "partial"
                 row["coverage_gap"] = "summary source_bytes does not match current backing rollout; regenerate bounded rollout-summary before extractor handoff"
                 rows.append(row)
             return
         jsonl_error = first_jsonl_error(summary)
-        if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(summary):
+        if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(
+            summary,
+            allow_tail_record_limit=summary_allows_generated_local_coverage(
+                summary,
+                generated_summary_paths,
+                max_scan_bytes=max_raw_bytes,
+            ),
+        ):
             if not summary_file_maybe_relevant_or_backing_ref_relevant(
                 summary,
                 start,
@@ -6851,16 +7436,25 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         row["status"] = "ready"
         rows.append(row)
 
-    for source in sources:
-        host = source.get("host")
-        if not source.get("root"):
+    for source_entry in sources:
+        host = source_entry.get("host")
+        if not source_entry.get("root"):
             raise SystemExit("make-shards requires transient manifest sources with raw root fields")
-        root = Path(source["root"]).expanduser()
-        status = source.get("status")
+        root = Path(source_entry["root"]).expanduser()
+        status = source_entry.get("status")
         if status is None:
             raise SystemExit("make-shards requires transient manifest sources with status=ready")
         if status != "ready":
             continue
+        generated_summary_root: Path | None = None
+        raw_generated_summary_root = source_entry.get("generated_summary_root")
+        if isinstance(raw_generated_summary_root, str) and raw_generated_summary_root:
+            generated_summary_root = ensure_safe_output_dir(Path(raw_generated_summary_root).expanduser())
+        generated_summaries = generated_summary_files_from_manifest(
+            generated_summary_root,
+            source_entry.get("generated_summaries"),
+        )
+        generated_summary_paths = generated_summary_path_set(generated_summaries)
         source = Source(str(host), root)
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not root.exists():
@@ -6879,7 +7473,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             append_source_gap_shards(source_materialization_gaps, root)
             continue
         rollouts = source_rollouts(source)
-        summaries = source_summary_files(source)
+        summaries = sorted([*source_summary_files(source), *generated_summaries])
         archived_duplicate_keys = archived_rollout_duplicate_keys(root)
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, root)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
@@ -6888,6 +7482,9 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             end,
             source_root=root,
             max_scan_bytes=max_raw_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
             summaries,
@@ -6898,6 +7495,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             max_scan_bytes=max_raw_bytes,
             selected_source_identity_by_key=selected_source_identity_by_key,
             archived_duplicate_keys=archived_duplicate_keys,
+            generated_summary_paths=generated_summary_paths,
         )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
@@ -6990,6 +7588,10 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     required_files = ("turn_summaries.jsonl", *RETAINED_OUTPUT_FILES)
     allowed = set(TRANSIENT_OUTPUT_FILES) | set(RETAINED_OUTPUT_FILES) | {"state.json"}
     for path in run_dir.iterdir():
+        if path.name == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX:
+            if path.is_symlink() or not path.is_dir():
+                raise SystemExit(f"unexpected output file: {path}")
+            continue
         if path.name not in allowed or path.is_symlink() or not path.is_file():
             raise SystemExit(f"unexpected output file: {path}")
     for name in required_files:

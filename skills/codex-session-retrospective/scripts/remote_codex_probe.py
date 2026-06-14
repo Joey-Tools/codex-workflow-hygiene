@@ -82,7 +82,18 @@ AUTOMATION_PROMPT_MARKERS = (
     "When reconstructing the real user task from rollouts, ignore injected wrapper content",
     "Write task-local artifacts under .codex-local/session-retrospective/runs/",
 )
-SUMMARY_SIGNAL_MARKERS = ("error:", "approval", "could not run", "you missed", "assumed", "secret")
+SUMMARY_SIGNAL_MARKERS = (
+    "error:",
+    "approval",
+    "could not run",
+    "you missed",
+    "assumed",
+    "over exploration",
+    "under asking",
+    "secret",
+)
+SUMMARY_SIGNAL_CHUNK_CHARS = 8192
+SUMMARY_SIGNAL_CHUNK_OVERLAP = 256
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
 SESSION_META_LIMIT_TRUNCATED_REASON = "session_meta_limit_truncated"
@@ -889,6 +900,8 @@ AUTOMATION_PROMPT_PATTERN_TEXTS = {AUTOMATION_PROMPT_PATTERN_TEXTS!r}
 AUTOMATION_PROMPT_PATTERNS = tuple(re.compile(pattern, re.I) for pattern in AUTOMATION_PROMPT_PATTERN_TEXTS)
 AUTOMATION_PROMPT_MARKERS = {AUTOMATION_PROMPT_MARKERS!r}
 SUMMARY_SIGNAL_MARKERS = {SUMMARY_SIGNAL_MARKERS!r}
+SUMMARY_SIGNAL_CHUNK_CHARS = {SUMMARY_SIGNAL_CHUNK_CHARS}
+SUMMARY_SIGNAL_CHUNK_OVERLAP = {SUMMARY_SIGNAL_CHUNK_OVERLAP}
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
 SESSION_META_END = {REMOTE_SESSION_META_END!r}
 SESSION_META_LIMIT_TRUNCATED_REASON = {SESSION_META_LIMIT_TRUNCATED_REASON!r}
@@ -1312,21 +1325,51 @@ def meaningful_user_message_text(text):
     return stripped
 
 
+def summary_signal_chunks(text):
+    value = str(text)
+    if len(value) <= SUMMARY_SIGNAL_CHUNK_CHARS:
+        yield value
+        return
+    step = max(1, SUMMARY_SIGNAL_CHUNK_CHARS - SUMMARY_SIGNAL_CHUNK_OVERLAP)
+    offset = 0
+    while offset < len(value):
+        yield value[offset : offset + SUMMARY_SIGNAL_CHUNK_CHARS]
+        if offset + SUMMARY_SIGNAL_CHUNK_CHARS >= len(value):
+            break
+        offset += step
+
+
+def summary_regex_search(pattern, text, flags=re.I):
+    return any(re.search(pattern, chunk, flags) for chunk in summary_signal_chunks(text))
+
+
+def summary_pattern_search(pattern, text):
+    return any(pattern.search(chunk) for chunk in summary_signal_chunks(text))
+
+
 def summary_signal_text(kind, text):
     signals = []
-    if re.search(r"(?:exit(?:ed)?(?: with)? code [1-9]\\d*|failed|traceback|error:|permission denied)", text, re.I):
+    if summary_regex_search(r"(?:exit(?:ed)?(?: with)? code [1-9]\\d*|failed|traceback|error:|permission denied)", text):
         signals.append("error:")
-    if re.search(r"(?:approval|require_escalated|sandbox|\\bauth(?:entication|orization|[-_ ]?gated)?\\b|credential|permission denied|TCC)", text, re.I):
+    if summary_regex_search(r"(?:approval|require_escalated|sandbox|\\bauth(?:entication|orization|[-_ ]?gated)?\\b|credential|permission denied|TCC)", text):
         signals.append("approval")
-    if re.search(r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)", text, re.I):
+    if summary_regex_search(r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)", text):
         signals.append("could not run")
-    if re.search(r"(?:you missed|you forgot|wrong|incorrect|not what I asked|漏了|忘了|不对|错了)", text, re.I):
+    if summary_regex_search(r"(?:you missed|you forgot|wrong|incorrect|not what I asked|漏了|忘了|不对|错了)", text):
         signals.append("you missed")
-    if re.search(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", text, re.I):
+    if summary_regex_search(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", text):
         signals.append("assumed")
-    if PRIVATE_IPV4_SIGNAL_RE.search(text) or PRIVATE_IPV6_SIGNAL_RE.search(text) or INTERNAL_HOSTNAME_SIGNAL_RE.search(text):
+    if summary_regex_search(r"(?:over[-_ ]?explor|over[-_ ]?investigat|over[-_ ]?search|explored too much|too much exploration|unrelated files|unrelated paths)", text):
+        signals.append("over exploration")
+    if summary_regex_search(r"(?:under[-_ ]?ask|did not ask|didn't ask|should have asked|without asking|missing clarification|needed clarification)", text):
+        signals.append("under asking")
+    if (
+        summary_pattern_search(PRIVATE_IPV4_SIGNAL_RE, text)
+        or summary_pattern_search(PRIVATE_IPV6_SIGNAL_RE, text)
+        or summary_pattern_search(INTERNAL_HOSTNAME_SIGNAL_RE, text)
+    ):
         signals.append("secret")
-    elif re.search(
+    elif summary_regex_search(
         r"(?:\\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|privacy|pii)\\b|"
         r"\\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{{16,}}|gh[pousr]_[A-Za-z0-9_]{{16,}}|github_pat_[A-Za-z0-9_]{{16,}})\\b|"
         r"\\bAKIA[0-9A-Z]{{16}}\\b|\\bBearer\\s+[A-Za-z0-9._~+/\\-]+=*|"
@@ -1339,7 +1382,6 @@ def summary_signal_text(kind, text):
         r"\\b(?:customer|client|account|tenant|org|repo|repository)[_-]?(?:id|name)?\\s*[:=]\\s*['\\\"]?[A-Za-z0-9_.-]+|"
         r"客户|客户数据|凭据|凭证|密钥|生产|破坏性)",
         text,
-        re.I,
     ):
         signals.append("secret")
     return " ".join(signals) if signals else kind.replace("_", " ") + " present"
@@ -2605,21 +2647,51 @@ def _meaningful_user_message_text(text: str) -> str:
     return stripped
 
 
+def _summary_signal_chunks(text: str) -> Iterable[str]:
+    value = str(text)
+    if len(value) <= SUMMARY_SIGNAL_CHUNK_CHARS:
+        yield value
+        return
+    step = max(1, SUMMARY_SIGNAL_CHUNK_CHARS - SUMMARY_SIGNAL_CHUNK_OVERLAP)
+    offset = 0
+    while offset < len(value):
+        yield value[offset : offset + SUMMARY_SIGNAL_CHUNK_CHARS]
+        if offset + SUMMARY_SIGNAL_CHUNK_CHARS >= len(value):
+            break
+        offset += step
+
+
+def _summary_regex_search(pattern: str, text: str, flags: int = re.I) -> bool:
+    return any(re.search(pattern, chunk, flags) for chunk in _summary_signal_chunks(text))
+
+
+def _summary_pattern_search(pattern: re.Pattern[str], text: str) -> bool:
+    return any(pattern.search(chunk) for chunk in _summary_signal_chunks(text))
+
+
 def _summary_signal_text(kind: str, text: str) -> str:
     signals: list[str] = []
-    if re.search(r"(?:exit(?:ed)?(?: with)? code [1-9]\d*|failed|traceback|error:|permission denied)", text, re.I):
+    if _summary_regex_search(r"(?:exit(?:ed)?(?: with)? code [1-9]\d*|failed|traceback|error:|permission denied)", text):
         signals.append("error:")
-    if re.search(r"(?:approval|require_escalated|sandbox|\bauth(?:entication|orization|[-_ ]?gated)?\b|credential|permission denied|TCC)", text, re.I):
+    if _summary_regex_search(r"(?:approval|require_escalated|sandbox|\bauth(?:entication|orization|[-_ ]?gated)?\b|credential|permission denied|TCC)", text):
         signals.append("approval")
-    if re.search(r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)", text, re.I):
+    if _summary_regex_search(r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)", text):
         signals.append("could not run")
-    if re.search(r"(?:you missed|you forgot|wrong|incorrect|not what I asked|漏了|忘了|不对|错了)", text, re.I):
+    if _summary_regex_search(r"(?:you missed|you forgot|wrong|incorrect|not what I asked|漏了|忘了|不对|错了)", text):
         signals.append("you missed")
-    if re.search(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", text, re.I):
+    if _summary_regex_search(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", text):
         signals.append("assumed")
-    if PRIVATE_IPV4_SIGNAL_RE.search(text) or PRIVATE_IPV6_SIGNAL_RE.search(text) or INTERNAL_HOSTNAME_SIGNAL_RE.search(text):
+    if _summary_regex_search(r"(?:over[-_ ]?explor|over[-_ ]?investigat|over[-_ ]?search|explored too much|too much exploration|unrelated files|unrelated paths)", text):
+        signals.append("over exploration")
+    if _summary_regex_search(r"(?:under[-_ ]?ask|did not ask|didn't ask|should have asked|without asking|missing clarification|needed clarification)", text):
+        signals.append("under asking")
+    if (
+        _summary_pattern_search(PRIVATE_IPV4_SIGNAL_RE, text)
+        or _summary_pattern_search(PRIVATE_IPV6_SIGNAL_RE, text)
+        or _summary_pattern_search(INTERNAL_HOSTNAME_SIGNAL_RE, text)
+    ):
         signals.append("secret")
-    elif re.search(
+    elif _summary_regex_search(
         r"(?:\b(secret|token|credential|password|private key|production|destructive|rm -rf|reset --hard|customer data|privacy|pii)\b|"
         r"\b(?:(?:sk|rk)[-_](?:proj[-_])?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b|"
         r"\bAKIA[0-9A-Z]{16}\b|\bBearer\s+[A-Za-z0-9._~+/\-]+=*|"
@@ -2632,7 +2704,6 @@ def _summary_signal_text(kind: str, text: str) -> str:
         r"\b(?:customer|client|account|tenant|org|repo|repository)[_-]?(?:id|name)?\s*[:=]\s*['\"]?[A-Za-z0-9_.-]+|"
         r"客户|客户数据|凭据|凭证|密钥|生产|破坏性)",
         text,
-        re.I,
     ):
         signals.append("secret")
     return " ".join(signals) if signals else f"{kind.replace('_', ' ')} present"
@@ -2677,7 +2748,10 @@ def _build_summary_record(
         signal_text = _meaningful_user_message_text(text)
         if not signal_text:
             return None
-    normalized = _normalize_summary_text(_safe_summary_text(kind, signal_text), max_text_chars=max_text_chars)
+    normalized = _normalize_summary_text(
+        _safe_summary_text(kind, signal_text),
+        max_text_chars=max_text_chars,
+    )
     if not normalized:
         return None
     record = {
