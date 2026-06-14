@@ -65,9 +65,10 @@ review gates, and merge before starting the next item.
    - Keep generated local summary retained `source_hash` aligned with the same
      backing rollout used for retained `source_path`, not the transient summary
      artifact.
-   - Align generated local summary retained identity only when scan metadata
-     proves complete bounded backing coverage; incomplete or over-cap backing
-     rollouts must retain the summary artifact identity.
+  - Align generated local summary retained identity only when scan metadata
+    proves complete bounded backing coverage; incomplete or over-cap backing
+    rollouts must keep the coverage gap and must not emit retained turns with
+    transient generated-summary artifact identity.
    - Resolve generated local summary backing identity and `source_hash` lazily
      only when emitting a retained turn, so no-flag summaries do not read
      backing rollout hashes.

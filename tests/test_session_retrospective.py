@@ -8083,7 +8083,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(first_rows[0]["source_hash"], expected_source_hash)
         self.assertEqual(first_rows[0]["source_hash"], second_rows[0]["source_hash"])
 
-    def test_generated_local_summary_extract_keeps_summary_identity_when_backing_exceeds_scan_cap(self) -> None:
+    def test_generated_local_summary_extract_skips_when_backing_exceeds_scan_cap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
@@ -8123,21 +8123,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 ],
             )
 
-            def fake_file_source_hash(candidate: Path) -> str:
-                self.assertEqual(candidate, summary)
-                return VALID_SOURCE_HASH
-
             with (
                 mock.patch.object(MODULE, "LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES", 1000),
-                mock.patch.object(MODULE, "file_source_hash", side_effect=fake_file_source_hash),
+                mock.patch.object(MODULE, "file_source_hash", side_effect=AssertionError("transient summary should not be hashed")),
             ):
                 turns = MODULE.extract_summary_file(MODULE.Source("local", root), summary, None, None)
 
-            expected_source_path = MODULE.path_ref(summary)
-
-        self.assertEqual(len(turns), 1)
-        self.assertEqual(turns[0].source_path, expected_source_path)
-        self.assertEqual(turns[0].source_hash, VALID_SOURCE_HASH)
+        self.assertEqual(turns, [])
 
     def test_generated_local_summary_extract_does_not_hash_backing_without_retained_rows(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -8848,7 +8840,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertTrue(any(row.get("path") == rollout.as_posix() and row.get("status") == "oversized" for row in shard_rows))
         self.assertFalse(any(row.get("path") == fake_summary.as_posix() and row.get("status") == "ready" for row in shard_rows))
 
-    def test_truncated_generated_local_summary_preserves_coverage_gap(self) -> None:
+    def test_truncated_generated_local_summary_keeps_gap_without_retained_turn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
@@ -8876,8 +8868,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
-        self.assertEqual(len(rows), 1)
-        self.assertIn("user_correction", rows[0]["issue_flags"])
+        self.assertEqual(rows, [])
         self.assertIn("oversized_rollout_skipped", reasons)
         self.assertIn("truncated_rollout_summary", reasons)
 
