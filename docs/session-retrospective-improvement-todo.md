@@ -68,6 +68,9 @@ review gates, and merge before starting the next item.
    - Align generated local summary retained identity only when scan metadata
      proves complete bounded backing coverage; incomplete or over-cap backing
      rollouts must retain the summary artifact identity.
+   - Resolve generated local summary backing identity and `source_hash` lazily
+     only when emitting a retained turn, so no-flag summaries do not read
+     backing rollout hashes.
    - Status: implemented in the local oversized rollout summaries PR; review
      and merge pending.
 

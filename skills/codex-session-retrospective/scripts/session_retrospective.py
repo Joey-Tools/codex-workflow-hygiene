@@ -3913,6 +3913,10 @@ def extract_summary_file(
     session_id = opaque_session_id(path.as_posix())
     records = list(iter_jsonl(path))
     identity_path = path
+    identity_path_ref = path_ref(path) or ""
+    source_hash: str | None = None
+    identity_resolved = False
+    generated_identity_candidate: tuple[str, RolloutSourceIdentity] | None = None
     if generated_summary_artifact_path(path):
         for _line_no, record in records:
             if str(record.get("kind") or "summary") != "scan_meta":
@@ -3936,24 +3940,40 @@ def extract_summary_file(
                 continue
             source_identity = RolloutSourceIdentity(source_bytes=source_bytes, source_sha256=source_sha256)
             rollout_path = source.root / safe_ref
-            if backing_ref_matches_current_rollout_identity(
-                source.root,
-                safe_ref,
-                source_identity,
-                max_hash_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
-            ):
-                identity_path = rollout_path
-                session_id = session_id_from_path(rollout_path)
+            if safe_source_file(rollout_path, source.root):
+                generated_identity_candidate = (safe_ref, source_identity)
                 break
-    identity_path_ref = path_ref(identity_path) or ""
-    source_hash = file_source_hash(identity_path)
+    summary_meta_session_id = False
     for _line_no, record in records:
         if str(record.get("kind") or "summary") != "session_meta":
             continue
         record_session_id = summary_session_id(record)
         if record_session_id:
             session_id = opaque_session_id(record_session_id)
+            summary_meta_session_id = True
             break
+
+    def resolve_retained_identity() -> tuple[str, str]:
+        nonlocal identity_path, identity_path_ref, identity_resolved, session_id, source_hash
+        if not identity_resolved:
+            if generated_identity_candidate is not None:
+                safe_ref, source_identity = generated_identity_candidate
+                rollout_path = source.root / safe_ref
+                if backing_ref_matches_current_rollout_identity(
+                    source.root,
+                    safe_ref,
+                    source_identity,
+                    max_hash_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
+                ):
+                    identity_path = rollout_path
+                    identity_path_ref = path_ref(rollout_path) or ""
+                    if not summary_meta_session_id:
+                        session_id = session_id_from_path(rollout_path)
+            identity_resolved = True
+        if source_hash is None:
+            source_hash = file_source_hash(identity_path)
+        return identity_path_ref, source_hash
+
     for line_no, record in records:
         timestamp = str(record.get("timestamp") or "") or None
         parsed_timestamp = summary_timestamp_with_fallback(record, path)
@@ -3984,18 +4004,19 @@ def extract_summary_file(
         flags = flags_for_text(flag_text, redacted_changed=changed)
         if not flags:
             continue
+        retained_identity_path_ref, retained_source_hash = resolve_retained_identity()
         timestamp_value = iso(parsed_timestamp)
         date_bucket = parsed_timestamp.date().isoformat()
         model_era = infer_model_era(None, timestamp_value)
         episode_id = opaque_episode_id("|".join([source.host, session_id, "rollout-summary", date_bucket, model_era, retained_kind]))
         turns.append(
             TurnSummary(
-                turn_id=opaque_turn_id(f"{source.host}|{identity_path_ref}|{line_no}|{timestamp}"),
+                turn_id=opaque_turn_id(f"{source.host}|{retained_identity_path_ref}|{line_no}|{timestamp}"),
                 episode_id=episode_id,
                 host=source.host,
                 session_id=session_id,
-                source_path=identity_path_ref,
-                source_hash=source_hash,
+                source_path=retained_identity_path_ref,
+                source_hash=retained_source_hash,
                 timestamp=timestamp_value,
                 cwd=None,
                 model=None,
