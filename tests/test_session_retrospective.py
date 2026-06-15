@@ -2108,6 +2108,54 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["text"], "user message present")
         self.assertEqual(rows[0]["rollout"], "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl")
 
+    def test_remote_probe_generated_rollout_summary_detects_calibrated_sensitive_signals(self) -> None:
+        samples = [
+            "apiToken=abc123",
+            "clientToken=abc123",
+            "Deploy\nto production.",
+            "Run migration\nin production.",
+            "Run rm -r \\" "\n-f /tmp/session-retrospective-cache.",
+        ]
+        for index, sample in enumerate(samples):
+            with self.subTest(sample=sample):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw) / ".codex"
+                    rollout_ref = f"sessions/2026/05/01/rollout-2026-05-01T10-00-{index:02d}.jsonl"
+                    write_jsonl(root / rollout_ref, [message("user", sample, "2026-05-01T10:00:00Z")])
+                    script = REMOTE_PROBE._remote_python_script(
+                        {
+                            "mode": "rollout-summary",
+                            "codex_root": str(root),
+                            "rollout": rollout_ref,
+                            "summary_limit": 10,
+                            "summary_scan_bytes": 4096,
+                            "summary_tail_records": 0,
+                            "summary_max_text_chars": 120,
+                            "summary_keywords": [],
+                        }
+                    )
+
+                    result = subprocess.run(
+                        [sys.executable, "-"],
+                        input=script,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rows = [
+                    row
+                    for line in result.stdout.splitlines()
+                    if line.startswith("{")
+                    for row in [json.loads(line)]
+                    if row.get("kind") == "user_message"
+                ]
+                self.assertEqual(len(rows), 1)
+                self.assertIn("secret", rows[0]["text"])
+                self.assertNotIn("abc123", json.dumps(rows[0]))
+                self.assertNotIn("/tmp/session-retrospective-cache", json.dumps(rows[0]))
+
     def test_remote_probe_generated_rollout_summary_accepts_root_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -3159,6 +3207,332 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertIn("over_exploration", over_flags)
         self.assertIn("under_asking", under_flags)
+
+    def test_safety_privacy_flag_ignores_ordinary_engineering_context(self) -> None:
+        samples = [
+            "Please review the production checklist in docs/deploy.md.",
+            "Destructive test coverage is missing from the parser.",
+            "Delete from the list after sorting.",
+            "Privacy design review for ordinary settings UI.",
+            "Keep token budget under control for this retrospective.",
+            "The secret is missing from the test fixture.",
+            "authorization is required for this remote host.",
+            "authorization was denied by the API.",
+            "password is required by the integration test.",
+            "token was expired during auth preflight.",
+            "token=[REDACTED]",
+            "token=[REDACTED_SECRET]",
+            "authToken=[REDACTED]",
+            "refreshToken=<REDACTED_CREDENTIAL>",
+            "authToken=required",
+            "authToken=required.",
+            "token=missing.",
+            "refreshToken=missing",
+            "refreshToken=missing.",
+            '{"authToken": "[REDACTED]"}',
+            "X-AuthToken: [REDACTED]",
+            "api_key=<REDACTED_CREDENTIAL>",
+            "token=Bearer [REDACTED]",
+            "authToken=Basic [REDACTED]",
+            "run deploy --token [REDACTED]",
+            "run deploy --api-key <REDACTED_CREDENTIAL>",
+            "run deploy --authToken [REDACTED]",
+            "Keep --token budget under control.",
+            "password: <masked>",
+            "password: [MASKED_CREDENTIAL]",
+            "密码: [REDACTED]",
+            "密钥=<REDACTED_CREDENTIAL>",
+            "客户ID=[REDACTED]",
+            "客户ID=[已脱敏]",
+            "客户ID=已脱敏",
+            "Open https://example.com/oauth/callback?access_token=[REDACTED]",
+            "Open https://example.com/oauth/callback#access_token=<REDACTED_CREDENTIAL>",
+            "Open https://example.com/oauth/callback?authToken=[REDACTED]",
+            "Open https://example.com/oauth/callback?refreshToken=<REDACTED_CREDENTIAL>",
+            "授权是必须的。",
+            "令牌是过期的。",
+            "Fetch from ssh://git@github.com/Joey-Tools/codex-workflow-hygiene.git.",
+            "Fetch from sftp://github.com/Joey-Tools/codex-workflow-hygiene.git.",
+            "Use source host miku-bot-dev and hoteng-srv-01.",
+            "Fetch from git@github.com:Joey-Tools/codex-workflow-hygiene.git.",
+            "repo_id=codex-workflow-hygiene",
+            "repository_name=codex-workflow-hygiene",
+            "token_count=123",
+            "secret_status=missing",
+            "Open https://foo.locality.com/path",
+            "Open https://corp.example.com/path",
+            "Open https://docs.example.com/path",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                redacted, changed = MODULE.redact(sample)
+                self.assertNotIn("[REDACTED_IDENTIFIER]", redacted)
+                self.assertNotIn("safety_privacy_flag", MODULE.flags_for_text(sample, redacted_changed=changed))
+
+        for sample in ["authToken=required.", "token=missing.", "refreshToken=missing."]:
+            with self.subTest(safe_status_sample=sample):
+                _redacted, changed = MODULE.redact(sample)
+                self.assertFalse(changed)
+                self.assertEqual(MODULE.flags_for_text(sample, redacted_changed=changed), set())
+
+    def test_summary_safety_marker_preserves_generated_summary_flag(self) -> None:
+        for sample in ["secret", "approval secret", "error: approval secret"]:
+            with self.subTest(generated_summary_sample=sample):
+                _redacted, changed = MODULE.redact(sample)
+                self.assertNotIn("safety_privacy_flag", MODULE.flags_for_text(sample, redacted_changed=changed))
+                self.assertIn("safety_privacy_flag", MODULE.flags_for_summary_text(sample, redacted_changed=changed))
+
+        ordinary = "The secret is missing from the test fixture."
+        _redacted, changed = MODULE.redact(ordinary)
+        self.assertNotIn("safety_privacy_flag", MODULE.flags_for_text(ordinary, redacted_changed=changed))
+        self.assertNotIn("safety_privacy_flag", MODULE.flags_for_summary_text(ordinary, redacted_changed=changed))
+
+    def test_redacted_credential_placeholders_do_not_emit_issue_flags(self) -> None:
+        samples = [
+            "api_key=<REDACTED_CREDENTIAL>",
+            "api_key=<REDACTED-CREDENTIAL>",
+            "password: [MASKED_CREDENTIAL]",
+            "password: [MASKED-CREDENTIAL]",
+            "authToken=[REDACTED]",
+            "refreshToken=<REDACTED_CREDENTIAL>",
+            '{"authToken": "[REDACTED]"}',
+            "X-AuthToken: [REDACTED]",
+            "placeholder=[REDACTED_CREDENTIAL]",
+            "placeholder=<masked_credential>",
+            "placeholder=<masked-credential>",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                redacted, changed = MODULE.redact(sample)
+                self.assertFalse(changed)
+                self.assertEqual(MODULE.flags_for_text(sample, redacted_changed=changed), set())
+
+    def test_safety_privacy_flag_detects_specific_sensitive_risks(self) -> None:
+        samples = [
+            "Contact joey@example.com",
+            "Contact git@example.com",
+            "Contact ssh@example.com",
+            "Contact git@example.com: urgent",
+            "Open https://internal.example/ticket",
+            "Open http://jenkins:8080/job",
+            "Open http://api.localhost:3000/callback",
+            "Open HTTP://jenkins/job",
+            "Open HTTPS://user:pass@localhost/path",
+            "Open ssh://gitlab/repo",
+            "Open sftp://gitlab/repo",
+            "Open git+ssh://gitlab/repo",
+            "Open http://jenkins:8080",
+            "Open https://grafana",
+            "Open https://grafana.",
+            "Open ssh://gitlab",
+            "db01.internal:5432",
+            "svc.corp/path",
+            "customer_id=AcmeCorp",
+            "customer_id=北京公司",
+            "tenant_name=腾讯云",
+            "organization_id=OpenAI",
+            "organization_name=Research",
+            "organisation_id=LondonOrg",
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+            "Authorization: Basic dXNlcjpwYXNz",
+            "Authorization: Token abc123",
+            "Authorization: ApiKey abc123",
+            "Authorization: Api-Key abc123",
+            "Authorization: HMAC abc123",
+            "Authorization: AWS4-HMAC-SHA256 abc123",
+            "X-Authorization: Token abc123",
+            "Proxy-Authorization: ApiKey abc123",
+            '{"authorization": "Token abc123"}',
+            '{"authorization": "ApiKey abc123"}',
+            "Proxy-Authorization: Basic dXNlcjpwYXNz",
+            "Contact git@example.com: urgent",
+            "password=x",
+            "token=ab",
+            "api_key=xy",
+            "db.password=hunter2",
+            "settings.api_key=xy",
+            "env.token=abc",
+            "access_token=abc123",
+            "apiToken=abc123",
+            "authToken=abc123",
+            "authToken=required-secret-abc",
+            "authToken=missing:secret-abc",
+            "clientToken=abc123",
+            "refreshToken=abc123",
+            "refreshToken=missing-token-abc",
+            "token=Basic dXNlcjpwYXNz",
+            "authToken=Digest abcdef",
+            "token=Negotiate abcdef",
+            "authToken=Basic dXNlcjpwYXNz",
+            "authorization=Bearer abc123",
+            "idToken=abc123",
+            "sessionToken=abc123",
+            '{"authToken": "abc123"}',
+            '{"refreshToken": "abc123"}',
+            "X-AuthToken: abc123",
+            "client_secret=abc123",
+            "OPENAI_API_KEY=abc123",
+            "GITHUB_TOKEN=abc123",
+            "DATABASE_PASSWORD=hunter2",
+            "AWS_SECRET_ACCESS_KEY=abc123",
+            "secret_access_key=abc123",
+            "run deploy --token=abc123",
+            "run deploy --api-key=xy",
+            "run deploy --token abc123",
+            "run deploy --authToken abc123",
+            "run deploy --api-key xy",
+            "run deploy --password hunter2",
+            "X-Api-Key: xy",
+            '{"password": "hunter2"}',
+            '{"token": "abc"}',
+            '{"api_key": "xy"}',
+            "The password is hunter2.",
+            "The secret was abcdef.",
+            "The api key set to abcdef123.",
+            "密钥: ab",
+            "密钥: abc123",
+            "凭据=abc123",
+            "Open https://github.com/oauth/callback?access_token=abc123",
+            "Open https://github.com/oauth/callback?apiToken=abc123",
+            "Open https://github.com/oauth/callback?authToken=abc123",
+            "Open https://github.com/oauth/callback?clientToken=abc123",
+            "Open https://github.com/oauth/callback?refreshToken=abc123",
+            "Open https://github.com/oauth/callback?idToken=abc123",
+            "Open https://github.com/oauth/callback?sessionToken=abc123",
+            "Open https://example.com/oauth/callback?client_secret=abc123",
+            "Open https://example.com/oauth/callback?refresh_token=abc123",
+            "Open https://example.com/oauth/callback?id_token=abc123",
+            "Open https://example.com/oauth/callback?auth_token=abc123",
+            "Open https://example.com/oauth/callback#access_token=abc123",
+            "Open https://user:pa$$@github.com/org/repo",
+            "Open ssh://user:pass@github.com/org/repo",
+            "Open sftp://user:pass@host/path",
+            "API key leak in logs.",
+            "The private key leaked.",
+            "Leaked password in logs.",
+            "Exposed token in CI.",
+            "Breached credential in output.",
+            "Use sk-proj-abcdefghijklmnop123456",
+            "Please check customer data and PII privacy risk.",
+            "Run rm -rf /tmp/session-retrospective-cache.",
+            "Run rm -fr /tmp/session-retrospective-cache.",
+            "Run rm --force -r /tmp/session-retrospective-cache.",
+            "Run rm -r \\" "\n-f /tmp/session-retrospective-cache.",
+            "Recover from git reset --hard origin/master.",
+            "delete from users where id=1",
+            "Run against production database prod-db-01.",
+            "Deploy to production.",
+            "Deploy\nto production.",
+            "Run migration in production.",
+            "Run migration\nin production.",
+            "Rollback production service.",
+            "Rotate production API key.",
+            "Check production auth token.",
+            "Check production password.",
+            "Run against production-db-01.",
+            "Rotate production_api_key.",
+            "Check production-password.",
+            "Rotate prod_password.",
+            "Rotate prod-password.",
+            "customer_id=北京公司",
+            "tenant_name=腾讯云",
+            "客户ID=AcmeCorp",
+            "租户ID=tenant123",
+            "客户名称=北京公司",
+            "租户名称：腾讯云",
+            "组织名=研发一部",
+            "请在生产数据库上运行迁移。",
+            "请轮换生产密码。",
+            "请执行破坏性删除。",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                redacted, changed = MODULE.redact(sample)
+                self.assertIn("safety_privacy_flag", MODULE.flags_for_text(sample, redacted_changed=changed))
+
+        for sample, secret in [
+            ('{"password": "hunter2"}', "hunter2"),
+            ('{"token": "abc"}', "abc"),
+            ('{"api_key": "xy"}', "xy"),
+            ("db.password=hunter2", "hunter2"),
+            ("settings.api_key=xy", "xy"),
+            ("env.token=abc", "abc"),
+            ("access_token=abc123", "abc123"),
+            ("apiToken=abc123", "abc123"),
+            ("authToken=abc123", "abc123"),
+            ("authToken=required-secret-abc", "required-secret-abc"),
+            ("authToken=missing:secret-abc", "missing:secret-abc"),
+            ("clientToken=abc123", "abc123"),
+            ("refreshToken=abc123", "abc123"),
+            ("refreshToken=missing-token-abc", "missing-token-abc"),
+            ("token=Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("authToken=Digest abcdef", "abcdef"),
+            ("token=Negotiate abcdef", "abcdef"),
+            ("authToken=Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("authorization=Bearer abc123", "abc123"),
+            ("idToken=abc123", "abc123"),
+            ("sessionToken=abc123", "abc123"),
+            ('{"authToken": "abc123"}', "abc123"),
+            ('{"refreshToken": "abc123"}', "abc123"),
+            ("X-AuthToken: abc123", "abc123"),
+            ("client_secret=abc123", "abc123"),
+            ("OPENAI_API_KEY=abc123", "abc123"),
+            ("GITHUB_TOKEN=abc123", "abc123"),
+            ("DATABASE_PASSWORD=hunter2", "hunter2"),
+            ("AWS_SECRET_ACCESS_KEY=abc123", "abc123"),
+            ("secret_access_key=abc123", "abc123"),
+            ("run deploy --token=abc123", "abc123"),
+            ("run deploy --api-key=xy", "xy"),
+            ("run deploy --token abc123", "abc123"),
+            ("run deploy --authToken abc123", "abc123"),
+            ("run deploy --api-key xy", "xy"),
+            ("run deploy --password hunter2", "hunter2"),
+            ("X-Api-Key: xy", "xy"),
+            ("Contact git@example.com: urgent", "git@example.com"),
+            ("Open http://api.localhost:3000/callback", "api.localhost"),
+            ("Open HTTP://jenkins/job", "HTTP://jenkins/job"),
+            ("Open HTTPS://user:pass@localhost/path", "user:pass"),
+            ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Authorization: Token abc123", "abc123"),
+            ("Authorization: ApiKey abc123", "abc123"),
+            ("Authorization: Api-Key abc123", "abc123"),
+            ("Authorization: HMAC abc123", "abc123"),
+            ("Authorization: AWS4-HMAC-SHA256 abc123", "abc123"),
+            ("X-Authorization: Token abc123", "abc123"),
+            ("Proxy-Authorization: ApiKey abc123", "abc123"),
+            ('{"authorization": "Token abc123"}', "abc123"),
+            ('{"authorization": "ApiKey abc123"}', "abc123"),
+            ("Proxy-Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("The password is hunter2.", "hunter2"),
+            ("The secret was abcdef.", "abcdef"),
+            ("The api key set to abcdef123.", "abcdef123"),
+            ("密钥: abc123", "abc123"),
+            ("凭据=abc123", "abc123"),
+            ("客户ID=AcmeCorp", "AcmeCorp"),
+            ("organization_id=OpenAI", "OpenAI"),
+            ("organization_name=Research", "Research"),
+            ("organisation_id=LondonOrg", "LondonOrg"),
+            ("租户ID=tenant123", "tenant123"),
+            ("客户名称=北京公司", "北京公司"),
+            ("租户名称：腾讯云", "腾讯云"),
+            ("组织名=研发一部", "研发一部"),
+            ("Open sftp://user:pass@host/path", "pass"),
+        ]:
+            with self.subTest(redaction_sample=sample):
+                redacted, changed = MODULE.redact(sample)
+                self.assertTrue(changed)
+                self.assertNotIn(secret, redacted)
+
+        for sample in ["organization_id=OpenAI", "organisation_id=LondonOrg", "租户ID=tenant123", "组织名=研发一部"]:
+            with self.subTest(retained_sensitive_sample=sample):
+                self.assertTrue(MODULE.contains_unredacted_sensitive_text(sample, include_safety_markers=False))
+
+    def test_path_redaction_alone_does_not_create_safety_privacy_flag(self) -> None:
+        sample = "Inspect /Users/hoteng/workspace/codex-session-retrospective."
+        _redacted, changed = MODULE.redact(sample)
+
+        self.assertTrue(changed)
+        self.assertNotIn("safety_privacy_flag", MODULE.flags_for_text(sample, redacted_changed=changed))
 
     def test_sensitive_prompt_excerpt_and_topic_are_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -20672,13 +21046,135 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("safety_privacy_flag", rows[0]["issue_flags"])
         self.assertNotIn("joey@example.com", json.dumps(rows[0]))
 
+    def test_rollout_summary_secret_marker_contributes_safety_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {"kind": "session_meta", "timestamp": "2026-05-22T10:00:00Z", "text": "session_id=s1"},
+                    {"kind": "summary", "timestamp": "2026-05-22T10:01:00Z", "text": "secret"},
+                ],
+            )
+
+            turns = MODULE.extract_summary_file(MODULE.Source("remote", root), summary, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("safety_privacy_flag", turns[0].issue_flags)
+
+    def test_rollout_summary_secret_word_sentence_does_not_contribute_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "rollout-summary-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {"kind": "session_meta", "timestamp": "2026-05-22T10:00:00Z", "text": "session_id=s1"},
+                    {"kind": "summary", "timestamp": "2026-05-22T10:01:00Z", "text": "The secret is missing from the test fixture."},
+                ],
+            )
+
+            turns = MODULE.extract_summary_file(MODULE.Source("remote", root), summary, None, None)
+
+        self.assertEqual(turns, [])
+
     def test_remote_probe_redaction_only_sensitive_text_contributes_signal(self) -> None:
         samples = [
             "Contact joey@example.com",
+            "Contact git@example.com",
+            "Contact ssh@example.com",
             "Open https://internal.example/ticket",
-            "Inspect /Users/hoteng/customer/repo",
+            "Open http://jenkins:8080/job",
+            "Open ssh://gitlab/repo",
+            "Open sftp://gitlab/repo",
+            "Open git+ssh://gitlab/repo",
+            "Open http://jenkins:8080",
+            "Open https://grafana",
+            "Open https://grafana.",
+            "Open ssh://gitlab",
             "customer_id=AcmeCorp",
+            "organization_id=OpenAI",
+            "organization_name=Research",
+            "organisation_id=LondonOrg",
             "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+            "Authorization: Basic dXNlcjpwYXNz",
+            "Authorization: Token abc123",
+            "Authorization: ApiKey abc123",
+            "Authorization: Api-Key abc123",
+            "Authorization: HMAC abc123",
+            "Authorization: AWS4-HMAC-SHA256 abc123",
+            "X-Authorization: Token abc123",
+            "Proxy-Authorization: ApiKey abc123",
+            '{"authorization": "Token abc123"}',
+            '{"authorization": "ApiKey abc123"}',
+            "Proxy-Authorization: Basic dXNlcjpwYXNz",
+            "password=x",
+            "token=ab",
+            "api_key=xy",
+            "db.password=hunter2",
+            "settings.api_key=xy",
+            "env.token=abc",
+            "access_token=abc123",
+            "apiToken=abc123",
+            "authToken=abc123",
+            "authToken=required-secret-abc",
+            "authToken=missing:secret-abc",
+            "authToken=Digest abcdef",
+            "clientToken=abc123",
+            "token=Negotiate abcdef",
+            "token=Basic dXNlcjpwYXNz",
+            "authToken=Basic dXNlcjpwYXNz",
+            "authorization=Bearer abc123",
+            "refreshToken=abc123",
+            "refreshToken=missing-token-abc",
+            "idToken=abc123",
+            "sessionToken=abc123",
+            '{"authToken": "abc123"}',
+            '{"refreshToken": "abc123"}',
+            "X-AuthToken: abc123",
+            "client_secret=abc123",
+            "OPENAI_API_KEY=abc123",
+            "GITHUB_TOKEN=abc123",
+            "DATABASE_PASSWORD=hunter2",
+            "AWS_SECRET_ACCESS_KEY=abc123",
+            "secret_access_key=abc123",
+            "run deploy --token=abc123",
+            "run deploy --api-key=xy",
+            "run deploy --token abc123",
+            "run deploy --authToken abc123",
+            "run deploy --api-key xy",
+            "run deploy --password hunter2",
+            "X-Api-Key: xy",
+            '{"password": "hunter2"}',
+            '{"token": "abc"}',
+            '{"api_key": "xy"}',
+            "The password is hunter2.",
+            "The secret was abcdef.",
+            "The api key set to abcdef123.",
+            "密钥: ab",
+            "密钥: abc123",
+            "凭据=abc123",
+            "Open https://github.com/oauth/callback?access_token=abc123",
+            "Open https://github.com/oauth/callback?apiToken=abc123",
+            "Open https://github.com/oauth/callback?authToken=abc123",
+            "Open https://github.com/oauth/callback?clientToken=abc123",
+            "Open https://github.com/oauth/callback?refreshToken=abc123",
+            "Open https://github.com/oauth/callback?idToken=abc123",
+            "Open https://github.com/oauth/callback?sessionToken=abc123",
+            "Open https://example.com/oauth/callback?client_secret=abc123",
+            "Open https://example.com/oauth/callback?refresh_token=abc123",
+            "Open https://example.com/oauth/callback?id_token=abc123",
+            "Open https://example.com/oauth/callback?auth_token=abc123",
+            "Open https://example.com/oauth/callback#access_token=abc123",
+            "Open https://user:pa$$@github.com/org/repo",
+            "Open ssh://user:pass@github.com/org/repo",
+            "Open sftp://user:pass@host/path",
+            "API key leak in logs.",
+            "The private key leaked.",
+            "Leaked password in logs.",
+            "Exposed token in CI.",
+            "Breached credential in output.",
             "Use sk-proj-abcdefghijklmnop123456",
             "github_pat_abcdefghijklmnop1234567890",
             "AKIAABCDEFGHIJKLMNOP",
@@ -20689,14 +21185,128 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "fc00::1",
             "::1",
             "fe80::1",
+            "http://api.localhost:3000/callback",
+            "HTTP://jenkins/job",
+            "HTTPS://user:pass@localhost/path",
             "db01.internal",
+            "db01.internal:5432",
             "svc.corp",
+            "svc.corp/path",
+            "Run rm -fr /tmp/session-retrospective-cache.",
+            "Run rm --force -r /tmp/session-retrospective-cache.",
+            "Run rm -r \\" "\n-f /tmp/session-retrospective-cache.",
+            "delete from users where id=1",
+            "Deploy to production.",
+            "Deploy\nto production.",
+            "Run migration in production.",
+            "Run migration\nin production.",
+            "Rollback production service.",
+            "Rotate production API key.",
+            "Check production auth token.",
+            "Check production password.",
+            "Run against production-db-01.",
+            "Rotate production_api_key.",
+            "Check production-password.",
+            "Rotate prod_password.",
+            "Rotate prod-password.",
+            "customer_id=北京公司",
+            "tenant_name=腾讯云",
+            "客户ID=AcmeCorp",
+            "租户ID=tenant123",
+            "客户名称=北京公司",
+            "租户名称：腾讯云",
+            "组织名=研发一部",
+            "请在生产数据库上运行迁移。",
+            "请轮换生产密码。",
+            "请执行破坏性删除。",
         ]
         for sample in samples:
             with self.subTest(sample=sample):
                 signal = REMOTE_PROBE._safe_summary_text("user_message", sample)
                 self.assertIn("secret", signal)
                 self.assertNotIn(sample, signal)
+
+    def test_remote_probe_ignores_ordinary_redacted_engineering_context(self) -> None:
+        samples = [
+            "Inspect /Users/hoteng/customer/repo",
+            "Please review the production checklist in docs/deploy.md.",
+            "Destructive test coverage is missing from the parser.",
+            "Delete from the list after sorting.",
+            "Privacy design review for ordinary settings UI.",
+            "Keep token budget under control for this retrospective.",
+            "The secret is missing from the test fixture.",
+            "password is required by the integration test.",
+            "token=[REDACTED]",
+            "token=[REDACTED_SECRET]",
+            "authToken=[REDACTED]",
+            "refreshToken=<REDACTED_CREDENTIAL>",
+            "authToken=required",
+            "authToken=required.",
+            "token=missing.",
+            "refreshToken=missing",
+            "refreshToken=missing.",
+            '{"authToken": "[REDACTED]"}',
+            "X-AuthToken: [REDACTED]",
+            "api_key=<REDACTED_CREDENTIAL>",
+            "api_key=<REDACTED-CREDENTIAL>",
+            "token=Bearer [REDACTED]",
+            "authToken=Basic [REDACTED]",
+            "run deploy --token [REDACTED]",
+            "run deploy --api-key <REDACTED_CREDENTIAL>",
+            "run deploy --authToken [REDACTED]",
+            "Keep --token budget under control.",
+            "Open https://foo.locality.com/path",
+            "Open https://corp.example.com/path",
+            "Open https://docs.example.com/path",
+            "Open https://example.com/oauth/callback?access_token=[REDACTED]",
+            "Open https://example.com/oauth/callback#access_token=<REDACTED_CREDENTIAL>",
+            "Open https://example.com/oauth/callback?authToken=[REDACTED]",
+            "Open https://example.com/oauth/callback?refreshToken=<REDACTED_CREDENTIAL>",
+            "password: <masked>",
+            "password: [MASKED_CREDENTIAL]",
+            "password: [MASKED-CREDENTIAL]",
+            "密码: [REDACTED]",
+            "密钥=<REDACTED_CREDENTIAL>",
+            "客户ID=[REDACTED]",
+            "客户ID=[已脱敏]",
+            "客户ID=已脱敏",
+            "授权是必须的。",
+            "令牌是过期的。",
+            "Fetch from ssh://git@github.com/Joey-Tools/codex-workflow-hygiene.git.",
+            "Fetch from sftp://github.com/Joey-Tools/codex-workflow-hygiene.git.",
+            "Fetch from git@github.com:Joey-Tools/codex-workflow-hygiene.git.",
+            "repo_id=codex-workflow-hygiene",
+            "repository_name=codex-workflow-hygiene",
+            "placeholder=<masked-credential>",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                signal = REMOTE_PROBE._safe_summary_text("user_message", sample)
+                self.assertEqual(signal, "user message present")
+
+        for sample in [
+            "Authorization: Bearer [REDACTED]",
+            "Authorization: Bearer <REDACTED_CREDENTIAL>",
+            "Authorization: Basic [REDACTED]",
+            "Authorization: ApiKey [REDACTED]",
+            "Authorization: HMAC <REDACTED_CREDENTIAL>",
+            "token=Bearer [REDACTED]",
+        ]:
+            with self.subTest(redacted_auth_sample=sample):
+                signal = REMOTE_PROBE._safe_summary_text("user_message", sample)
+                self.assertNotIn("secret", signal)
+
+    def test_remote_probe_auth_status_does_not_emit_secret_signal(self) -> None:
+        samples = [
+            "authorization is required for this remote host.",
+            "authorization was denied by the API.",
+            "token was expired during auth preflight.",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                signal = REMOTE_PROBE._safe_summary_text("user_message", sample)
+                self.assertIn("approval", signal)
+                self.assertNotIn("secret", signal)
 
     def test_remote_probe_generated_script_preserves_regex_quantifiers(self) -> None:
         script = REMOTE_PROBE._remote_python_script(
