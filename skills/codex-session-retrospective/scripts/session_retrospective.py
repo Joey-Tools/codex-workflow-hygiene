@@ -244,7 +244,10 @@ LOCAL_ROLLOUT_SUMMARY_LIMIT = 200
 LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS = 1200
 LOCAL_GENERATED_SUMMARY_DIR_SUFFIX = "generated-rollout-summaries"
-LOCAL_GENERATED_SUMMARY_CACHE_DIR = "cached-generated-rollout-summaries"
+LOCAL_GENERATED_SUMMARY_CACHE_DIR = "local-rollout-summary-cache"
+LOCAL_GENERATED_SUMMARY_CACHE_DIR_NAMES = frozenset(
+    {LOCAL_GENERATED_SUMMARY_CACHE_DIR, "cached-generated-rollout-summaries"}
+)
 LOCAL_GENERATED_SUMMARY_CACHE_VERSION = "local-generated-summary-cache-v1"
 LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF = "local_generated_rollout_summary_v1"
 REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = "remote_generated_rollout_summary_v1"
@@ -1353,12 +1356,19 @@ def load_remote_probe_module() -> Any:
     return REMOTE_PROBE_MODULE
 
 
+def generated_summary_dir_name_for_output_name(output_name: str) -> str:
+    candidate = f"{output_name}-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}"
+    if candidate in LOCAL_GENERATED_SUMMARY_CACHE_DIR_NAMES:
+        return f"{output_name}-run-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}"
+    return candidate
+
+
 def generated_summary_base_for_output(output: Path) -> Path:
     expanded = output.expanduser()
     parts = expanded.parts
     if len(parts) >= len(SAFE_OUTPUT_PARTS) and parts[-len(SAFE_OUTPUT_PARTS) :] == SAFE_OUTPUT_PARTS:
         return ensure_safe_output_dir(expanded / LOCAL_GENERATED_SUMMARY_DIR_SUFFIX)
-    return ensure_safe_output_dir(expanded.parent / f"{expanded.name}-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}")
+    return ensure_safe_output_dir(expanded.parent / generated_summary_dir_name_for_output_name(expanded.name))
 
 
 def safe_transient_root_for_output(output: Path) -> Path:
@@ -1379,7 +1389,7 @@ def transient_manifest_path_value(path: Path) -> str:
 
 
 def generated_summary_artifact_path(path: Path) -> bool:
-    if LOCAL_GENERATED_SUMMARY_CACHE_DIR in path.parts:
+    if any(part in LOCAL_GENERATED_SUMMARY_CACHE_DIR_NAMES for part in path.parts):
         return False
     return any(
         part == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX
@@ -1389,7 +1399,7 @@ def generated_summary_artifact_path(path: Path) -> bool:
 
 
 def source_summary_excluded_artifact_path(path: Path) -> bool:
-    return generated_summary_artifact_path(path) or any(part == LOCAL_GENERATED_SUMMARY_CACHE_DIR for part in path.parts)
+    return generated_summary_artifact_path(path) or any(part in LOCAL_GENERATED_SUMMARY_CACHE_DIR_NAMES for part in path.parts)
 
 
 def summary_metadata_scan_max_bytes(path: Path, max_scan_bytes: int) -> int:
