@@ -1364,7 +1364,19 @@ def generated_summary_dir_name_for_output_name(output_name: str) -> str:
     return candidate
 
 
+def path_inside_local_summary_cache(path: Path) -> bool:
+    parts = path.expanduser().parts
+    for index in range(len(parts) - len(SAFE_OUTPUT_PARTS)):
+        if parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS:
+            cache_index = index + len(SAFE_OUTPUT_PARTS)
+            if parts[cache_index] in LOCAL_GENERATED_SUMMARY_CACHE_DIR_NAMES:
+                return True
+    return False
+
+
 def generated_summary_base_for_output(output: Path) -> Path:
+    if path_inside_local_summary_cache(output):
+        raise SystemExit("output directory must not be inside the local rollout summary cache")
     expanded = output.expanduser()
     parts = expanded.parts
     if len(parts) >= len(SAFE_OUTPUT_PARTS) and parts[-len(SAFE_OUTPUT_PARTS) :] == SAFE_OUTPUT_PARTS:
@@ -1382,6 +1394,8 @@ def safe_transient_root_for_output(output: Path) -> Path:
 
 
 def generated_summary_cache_base_for_output(output: Path) -> Path:
+    if path_inside_local_summary_cache(output):
+        raise SystemExit("output directory must not be inside the local rollout summary cache")
     return ensure_safe_output_dir(safe_transient_root_for_output(output) / LOCAL_GENERATED_SUMMARY_CACHE_DIR)
 
 
@@ -1390,7 +1404,7 @@ def transient_manifest_path_value(path: Path) -> str:
 
 
 def generated_summary_artifact_path(path: Path) -> bool:
-    if any(part in LOCAL_GENERATED_SUMMARY_CACHE_DIR_NAMES for part in path.parts):
+    if path_inside_local_summary_cache(path):
         return False
     return any(
         part == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX
@@ -1400,7 +1414,7 @@ def generated_summary_artifact_path(path: Path) -> bool:
 
 
 def source_summary_excluded_artifact_path(path: Path) -> bool:
-    return generated_summary_artifact_path(path) or any(part in LOCAL_GENERATED_SUMMARY_CACHE_DIR_NAMES for part in path.parts)
+    return generated_summary_artifact_path(path) or path_inside_local_summary_cache(path)
 
 
 def summary_metadata_scan_max_bytes(path: Path, max_scan_bytes: int) -> int:
@@ -1708,10 +1722,10 @@ def cached_local_rollout_summary_bytes(
 
 def write_local_rollout_summary_cache(cache_root: Path, cache_key: str, content: bytes) -> None:
     cache_path = local_generated_summary_cache_path(cache_root, cache_key)
-    reject_symlink_ancestors(cache_path.parent, label="generated summary cache path")
     try:
+        reject_symlink_ancestors(cache_path.parent, label="generated summary cache path")
         write_bytes_atomic(cache_path, content)
-    except OSError:
+    except (OSError, SystemExit):
         return
 
 

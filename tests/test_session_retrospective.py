@@ -10790,6 +10790,71 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(MODULE.generated_summary_artifact_path(cache_files[0]))
         self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
 
+    def test_generated_local_summary_allows_ordinary_cache_named_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            outer = Path(raw) / MODULE.LOCAL_GENERATED_SUMMARY_CACHE_DIR
+            root = outer / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(str(outer), "out")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            generated_summary = Path(manifest["sources"][0]["generated_summaries"][0])
+            shard_output = safe_output_dir(str(outer), "shards")
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(output / "shard_manifest.json"),
+                    "--output",
+                    str(shard_output),
+                    "--max-raw-bytes",
+                    "3000",
+                ]
+            )
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertTrue(MODULE.generated_summary_artifact_path(generated_summary))
+        self.assertTrue(any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows))
+
+    def test_generated_local_summary_rejects_output_inside_cache_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw, MODULE.LOCAL_GENERATED_SUMMARY_CACHE_DIR)
+
+            with self.assertRaisesRegex(SystemExit, "must not be inside the local rollout summary cache"):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+
     def test_generated_local_summary_cache_rebuilds_truncated_cached_payload(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -10843,6 +10908,51 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(first_rows, second_rows)
         self.assertGreater(len(rebuilt_cache_lines), 1)
         self.assertIn("local_summary_payload_sha256", rebuilt_meta)
+
+    def test_generated_local_summary_cache_skips_unusable_cache_file_path(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            first_output = safe_output_dir(raw, "cache-unusable-one")
+            second_output = safe_output_dir(raw, "cache-unusable-two")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(first_output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            cache_root = MODULE.generated_summary_cache_root_for_source(
+                MODULE.generated_summary_cache_base_for_output(first_output),
+                MODULE.Source("local", root),
+            )
+            cache_files = list(cache_root.rglob("rollout-summary*.jsonl"))
+            self.assertEqual(len(cache_files), 1)
+            cache_files[0].unlink()
+            cache_files[0].mkdir()
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(second_output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            second_rows = [
+                json.loads(line)
+                for line in (second_output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            unusable_cache_path_still_dir = cache_files[0].is_dir()
+
+        self.assertEqual(len(second_rows), 1)
+        self.assertTrue(unusable_cache_path_still_dir)
 
     def test_generated_local_summary_cache_invalidates_same_size_rollout_change(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
