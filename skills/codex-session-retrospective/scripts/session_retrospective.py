@@ -1379,8 +1379,15 @@ def transient_manifest_path_value(path: Path) -> str:
 
 
 def generated_summary_artifact_path(path: Path) -> bool:
-    generated_dirs = {LOCAL_GENERATED_SUMMARY_DIR_SUFFIX, LOCAL_GENERATED_SUMMARY_CACHE_DIR}
-    return any(part in generated_dirs or part.endswith(f"-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}") for part in path.parts)
+    return any(
+        part == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX
+        or (part != LOCAL_GENERATED_SUMMARY_CACHE_DIR and part.endswith(f"-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}"))
+        for part in path.parts
+    )
+
+
+def source_summary_excluded_artifact_path(path: Path) -> bool:
+    return generated_summary_artifact_path(path) or any(part == LOCAL_GENERATED_SUMMARY_CACHE_DIR for part in path.parts)
 
 
 def summary_metadata_scan_max_bytes(path: Path, max_scan_bytes: int) -> int:
@@ -1894,7 +1901,7 @@ def generate_local_rollout_summaries_for_source(
 def source_summary_candidates(source: Source) -> list[Path]:
     if not source.root.exists() or source.root.is_symlink():
         return []
-    return sorted(path for path in source.root.rglob("rollout-summary*.jsonl") if not generated_summary_artifact_path(path))
+    return sorted(path for path in source.root.rglob("rollout-summary*.jsonl") if not source_summary_excluded_artifact_path(path))
 
 
 def unsafe_source_summaries(source: Source) -> list[Path]:

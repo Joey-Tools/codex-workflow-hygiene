@@ -11323,7 +11323,53 @@ class SessionRetrospectiveTests(unittest.TestCase):
             source_summaries = MODULE.source_summary_files(MODULE.Source("local", source_root))
 
         self.assertEqual(len(cache_files), 1)
+        self.assertFalse(MODULE.generated_summary_artifact_path(cache_files[0]))
         self.assertEqual(source_summaries, [])
+
+    def test_make_shards_rejects_cache_summary_manifest_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw, "cache-manifest")
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            cache_root = MODULE.generated_summary_cache_root_for_source(
+                MODULE.generated_summary_cache_base_for_output(output),
+                MODULE.Source("local", root),
+            )
+            cache_files = list(cache_root.rglob("rollout-summary*.jsonl"))
+            self.assertEqual(len(cache_files), 1)
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            manifest["sources"][0]["generated_summary_root"] = cache_root.as_posix()
+            manifest["sources"][0]["generated_summaries"] = [cache_files[0].as_posix()]
+            bad_manifest = output / "bad-cache-manifest.json"
+            bad_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+            shard_output = safe_output_dir(raw, "cache-manifest-shards")
+
+            with self.assertRaisesRegex(SystemExit, "generated_summaries entries must be generated-summary artifacts"):
+                MODULE.main(
+                    [
+                        "make-shards",
+                        "--manifest",
+                        str(bad_manifest),
+                        "--output",
+                        str(shard_output),
+                        "--max-raw-bytes",
+                        "3000",
+                    ]
+                )
 
     def test_generated_local_summary_hash_detects_same_size_rollout_change(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
