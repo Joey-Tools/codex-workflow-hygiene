@@ -190,7 +190,7 @@ SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 FLAG_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("failed_command", re.compile(r"(?:exit(?:ed)?(?: with)? code [1-9]\d*|failed|traceback|error:|permission denied)", re.I)),
-    ("approval_auth_friction", re.compile(r"(?:approval|require_escalated|sandbox|\bauth(?:entication|orization|[-_ ]?gated)?\b|(?<![\w-])(?!(?:redacted|masked)(?:[_-][a-z0-9]+)*\b)[\w-]*credential|permission denied|TCC)", re.I)),
+    ("approval_auth_friction", re.compile(r"(?:approval|require_escalated|sandbox|\bauth(?:entication|orization|[-_ ]?gated)?\b|(?<![\w-])(?!(?:redacted|masked)(?:[_-][a-z0-9]+)*\b)[\w-]{0,80}credential|permission denied|TCC)", re.I)),
     ("verification_gap", re.compile(r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)", re.I)),
     ("user_correction", re.compile(r"(?:you missed|you forgot|wrong|incorrect|not what I asked|漏了|忘了|不对|错了)", re.I)),
     ("context_loss", re.compile(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", re.I)),
@@ -244,6 +244,7 @@ LOCAL_GENERATED_SUMMARY_SCAN_BYTES = 2 * 1024 * 1024
 LOCAL_ROLLOUT_SUMMARY_LIMIT = 200
 LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS = 1200
+FLAG_SCAN_MAX_CHARS = 1_200
 LOCAL_GENERATED_SUMMARY_DIR_SUFFIX = "generated-rollout-summaries"
 LOCAL_GENERATED_SUMMARY_CACHE_DIR = "local-rollout-summary-cache"
 LOCAL_GENERATED_SUMMARY_CACHE_DIR_NAMES = frozenset({LOCAL_GENERATED_SUMMARY_CACHE_DIR})
@@ -625,6 +626,13 @@ def compact(text: str, limit: int = 600) -> str:
     if len(collapsed) <= limit:
         return collapsed
     return collapsed[: limit - 1].rstrip() + "..."
+
+
+def bounded_flag_probe_text(text: str, limit: int = FLAG_SCAN_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    half = max(1, limit // 2)
+    return text[:half] + "\n[TRUNCATED_FOR_FLAG_SCAN]\n" + text[-half:]
 
 
 def redact(text: str) -> tuple[str, bool]:
@@ -2129,6 +2137,24 @@ def rollout_candidate_relevant(
         except OSError:
             return True
         if max_raw_bytes is not None and size > max_raw_bytes:
+            if (
+                rollout_date
+                and start
+                and rollout_date < start
+                and size > ROLLOUT_TIMESTAMP_SCAN_BYTES
+                and rollout_path_has_archived_sessions_ancestor(path)
+            ):
+                return False
+            relevance = oversized_rollout_relevance(
+                path,
+                start,
+                end,
+                allow_mtime_fallback=allow_mtime_fallback,
+            )
+            if relevance == "relevant":
+                return True
+            if relevance == "irrelevant":
+                return False
             return True
         try:
             return raw_timestamp_in_window(path, start, end)
@@ -2384,6 +2410,10 @@ def rollout_ref_is_archived(ref: str) -> bool:
 def rollout_path_is_archived(path: Path, root: Path) -> bool:
     ref = source_relative_path_ref(path, root)
     return ref is not None and rollout_ref_is_archived(ref)
+
+
+def rollout_path_has_archived_sessions_ancestor(path: Path) -> bool:
+    return "archived_sessions" in path.parts
 
 
 def rollout_duplicate_key_for_ref(ref: str) -> str:
@@ -4639,8 +4669,7 @@ def extract_rollout(
                 current.prompt_improvement = "Ask Codex to report the exact verification run and stop if it cannot complete the requested check."
 
     def flags_from_raw_text(text: str) -> set[str]:
-        _redacted_text, changed = redact(text)
-        return flags_for_text(text, redacted_changed=changed)
+        return flags_for_text(bounded_flag_probe_text(text))
 
     def wrapper_pending_assistant_releasable(text: str) -> bool:
         lowered = text.lower()

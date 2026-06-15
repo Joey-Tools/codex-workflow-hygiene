@@ -3208,6 +3208,41 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("over_exploration", over_flags)
         self.assertIn("under_asking", under_flags)
 
+    def test_bounded_flag_probe_text_keeps_head_and_tail(self) -> None:
+        text = "head failed " + ("x" * 100) + " unable to run tail"
+        probe = MODULE.bounded_flag_probe_text(text, limit=24)
+
+        self.assertTrue(probe.startswith("head failed"))
+        self.assertTrue(probe.endswith("run tail"))
+        self.assertIn("[TRUNCATED_FOR_FLAG_SCAN]", probe)
+        self.assertLess(len(probe), len(text))
+
+    def test_extract_rollout_uses_bounded_flag_probe_for_large_assistant_text(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-large-output.jsonl"
+            assistant_text = "error: failed\n" + ("x" * (MODULE.FLAG_SCAN_MAX_CHARS * 2)) + "\nunable to run"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Fix the failing deployment.", "2026-05-22T10:01:00Z"),
+                    message("assistant", assistant_text, "2026-05-22T10:02:00Z"),
+                ],
+            )
+            real_redact = MODULE.redact
+
+            def guarded_redact(text: str) -> tuple[str, bool]:
+                if len(text) > MODULE.FLAG_SCAN_MAX_CHARS:
+                    raise AssertionError("full raw redaction")
+                return real_redact(text)
+
+            with mock.patch.object(MODULE, "redact", side_effect=guarded_redact):
+                turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("failed_command", turns[0].issue_flags)
+        self.assertIn("verification_gap", turns[0].issue_flags)
+
     def test_safety_privacy_flag_ignores_ordinary_engineering_context(self) -> None:
         samples = [
             "Please review the production checklist in docs/deploy.md.",
@@ -9916,6 +9951,94 @@ class SessionRetrospectiveTests(unittest.TestCase):
         reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
         self.assertNotIn("oversized_rollout_skipped", reasons)
 
+    def test_old_archived_oversized_rollout_does_not_generate_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = home / ".codex"
+            write_local_evidence(root)
+            rollout = root / "archived_sessions" / "rollout-2026-03-19T11-56-46-old-large.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("old archived oversized rollout " + ("x" * 2000), encoding="utf-8")
+            archive_mtime = MODULE.parse_time("2026-06-10T12:00:00Z").timestamp()
+            os.utime(rollout, (archive_mtime, archive_mtime))
+            output = safe_output_dir(raw)
+
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="weekly",
+                    start=MODULE.parse_time("2026-06-08T00:00:00Z"),
+                    end=MODULE.parse_time("2026-06-15T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            generated_root = MODULE.generated_summary_base_for_output(output)
+            generated = list(generated_root.rglob("rollout-summary-*.jsonl"))
+
+        reasons = [gap["reason"] for gap in trend["coverage_gaps"]]
+        self.assertNotIn("oversized_rollout_skipped", reasons)
+        self.assertEqual(generated, [])
+
+    def test_old_archived_oversized_rollout_with_window_timestamp_generates_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = home / ".codex"
+            write_local_evidence(root)
+            rollout = root / "archived_sessions" / "rollout-2026-03-19T11-56-46-old-large.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Archived weekly task.", "2026-06-10T12:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="weekly",
+                    start=MODULE.parse_time("2026-06-08T00:00:00Z"),
+                    end=MODULE.parse_time("2026-06-15T00:00:00Z"),
+                )
+            generated_root = MODULE.generated_summary_base_for_output(output)
+            generated = list(generated_root.rglob("rollout-summary-*.jsonl"))
+            generated_text = generated[0].read_text(encoding="utf-8") if generated else ""
+
+        self.assertEqual(len(generated), 1)
+        self.assertIn('"kind": "user_message"', generated_text)
+        self.assertIn('"timestamp": "2026-06-10T12:00:00Z"', generated_text)
+
+    def test_old_active_oversized_rollout_with_active_mtime_generates_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = home / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T21-07-17-old-large.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(untimestamped_message("user", "Active mtime task."))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            active_mtime = MODULE.parse_time("2026-06-10T12:00:00Z").timestamp()
+            os.utime(rollout, (active_mtime, active_mtime))
+            output = safe_output_dir(raw)
+
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="weekly",
+                    start=MODULE.parse_time("2026-06-08T00:00:00Z"),
+                    end=MODULE.parse_time("2026-06-15T00:00:00Z"),
+                )
+            generated_root = MODULE.generated_summary_base_for_output(output)
+            generated = list(generated_root.rglob("rollout-summary-*.jsonl"))
+            generated_text = generated[0].read_text(encoding="utf-8") if generated else ""
+
+        self.assertEqual(len(generated), 1)
+        self.assertIn('"timestamp": "2026-06-10T12:00:00Z"', generated_text)
+
     def test_scan_does_not_hash_rollouts_without_summary_identity_need(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -10515,6 +10638,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "partial_host_scope")
+
+    def test_old_huge_oversized_rollout_prefilter_does_not_use_bounded_timestamp_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            old_large = root / "archived_sessions" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            old_large.parent.mkdir(parents=True, exist_ok=True)
+            with old_large.open("wb") as handle:
+                handle.write(b"old huge oversized rollout")
+                handle.truncate(MODULE.ROLLOUT_TIMESTAMP_SCAN_BYTES + 1)
+            old_mtime = MODULE.parse_time("2026-01-02T10:00:00Z").timestamp()
+            os.utime(old_large, (old_mtime, old_mtime))
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with mock.patch.object(
+                MODULE,
+                "oversized_rollout_has_timestamp_in_window",
+                side_effect=AssertionError("bounded timestamp scan"),
+            ):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            generated_root = MODULE.generated_summary_base_for_output(output)
+            generated = list(generated_root.rglob("rollout-summary-*.jsonl"))
+
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "partial_host_scope")
+        self.assertEqual(generated, [])
 
     def test_old_file_relevance_prefilters_handle_unreadable_timestamp_scan(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
