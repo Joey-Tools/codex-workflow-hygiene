@@ -1365,7 +1365,7 @@ def generated_summary_dir_name_for_output_name(output_name: str) -> str:
 
 
 def path_inside_local_summary_cache(path: Path) -> bool:
-    parts = path.expanduser().parts
+    parts = Path(os.path.normpath(path.expanduser().as_posix())).parts
     for index in range(len(parts) - len(SAFE_OUTPUT_PARTS)):
         if parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS:
             cache_index = index + len(SAFE_OUTPUT_PARTS)
@@ -1610,7 +1610,8 @@ def local_generated_summary_cache_key(
     source: Source,
     rollout_ref: str,
     source_bytes: int,
-    source_sha256: str,
+    source_sha256: str | None,
+    source_scan_sha256: str,
     mtime_fallback_timestamp: str | None,
 ) -> str:
     payload = {
@@ -1621,7 +1622,8 @@ def local_generated_summary_cache_key(
         "rollout": rollout_ref,
         "scan_bytes": LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
         "source_bytes": source_bytes,
-        "source_sha256": source_sha256,
+        "source_scan_sha256": source_scan_sha256,
+        "source_sha256": source_sha256 or "",
         "summary_limit": LOCAL_ROLLOUT_SUMMARY_LIMIT,
         "tail_records": LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS,
         "version": LOCAL_GENERATED_SUMMARY_CACHE_VERSION,
@@ -1643,10 +1645,10 @@ class LocalRolloutSummaryBuild:
     records: list[dict[str, Any]]
     source_bytes: int
     source_sha256: str | None
+    source_scan_sha256: str
 
 
-def bounded_file_sha256_identity(path: Path, *, max_bytes: int) -> tuple[int, str] | None:
-    digest = hashlib.sha256()
+def bounded_file_sha256_identity(path: Path, *, max_bytes: int) -> tuple[int, str | None, str] | None:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
@@ -1654,13 +1656,18 @@ def bounded_file_sha256_identity(path: Path, *, max_bytes: int) -> tuple[int, st
         return None
     try:
         fd_stat = os.fstat(fd)
-        if not stat.S_ISREG(fd_stat.st_mode) or fd_stat.st_size > max_bytes:
+        if not stat.S_ISREG(fd_stat.st_mode):
             return None
         with os.fdopen(fd, "rb") as handle:
             fd = -1
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return fd_stat.st_size, digest.hexdigest()
+            scan_data = handle.read(max_bytes + 1)
+        source_bytes = max(fd_stat.st_size, len(scan_data))
+        source_scan_sha256 = hashlib.sha256(scan_data).hexdigest()
+        source_sha256: str | None = None
+        if len(scan_data) <= max_bytes and fd_stat.st_size <= max_bytes:
+            source_bytes = len(scan_data)
+            source_sha256 = source_scan_sha256
+        return source_bytes, source_sha256, source_scan_sha256
     except OSError:
         return None
     finally:
@@ -1668,7 +1675,7 @@ def bounded_file_sha256_identity(path: Path, *, max_bytes: int) -> tuple[int, st
             os.close(fd)
 
 
-def cacheable_local_rollout_identity(rollout: Path) -> tuple[int, str] | None:
+def cacheable_local_rollout_identity(rollout: Path) -> tuple[int, str | None, str] | None:
     return bounded_file_sha256_identity(rollout, max_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES)
 
 
@@ -1679,7 +1686,8 @@ def cached_local_rollout_summary_bytes(
     source: Source,
     rollout_ref: str,
     source_bytes: int,
-    source_sha256: str,
+    source_sha256: str | None,
+    source_scan_sha256: str,
 ) -> bytes | None:
     cache_path = local_generated_summary_cache_path(cache_root, cache_key)
     if not safe_source_file(cache_path, cache_root):
@@ -1707,6 +1715,7 @@ def cached_local_rollout_summary_bytes(
         "rollout": rollout_ref,
         "scan_bytes": LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
         "source_bytes": source_bytes,
+        "local_summary_source_scan_sha256": source_scan_sha256,
         "source_sha256": source_sha256,
         "summary_limit": LOCAL_ROLLOUT_SUMMARY_LIMIT,
         "tail_records": LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS,
@@ -1745,6 +1754,7 @@ def build_local_rollout_summary(
         raise ValueError(f"unsafe rollout ref: {rollout_ref}")
     source_bytes = 0
     source_sha256: str | None = None
+    source_scan_sha256: str | None = None
     remote_probe = load_remote_probe_module()
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(rollout, flags)
@@ -1755,10 +1765,11 @@ def build_local_rollout_summary(
         with os.fdopen(fd, "rb") as handle:
             fd = -1
             scan_data = handle.read(LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES + 1)
+            source_scan_sha256 = hashlib.sha256(scan_data).hexdigest()
             source_bytes = max(fd_stat.st_size, len(scan_data))
             if len(scan_data) <= LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES and fd_stat.st_size <= LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES:
                 source_bytes = len(scan_data)
-                source_sha256 = hashlib.sha256(scan_data).hexdigest()
+                source_sha256 = source_scan_sha256
             records, summary_meta = remote_probe._summarize_rollout_records_with_meta(
                 lines=remote_probe._bounded_text_lines(io.BytesIO(scan_data), LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES),
                 keywords=[],
@@ -1790,7 +1801,14 @@ def build_local_rollout_summary(
             if str(record.get("kind") or "") not in {"scan_meta", "session_meta"} and not record.get("timestamp"):
                 record["timestamp"] = mtime_fallback_timestamp
     summary_records = [dict(record, host=source.host, rollout=safe_ref) for record in records]
-    return LocalRolloutSummaryBuild(records=summary_records, source_bytes=source_bytes, source_sha256=source_sha256)
+    if source_scan_sha256 is None:
+        raise OSError("source path could not be scanned")
+    return LocalRolloutSummaryBuild(
+        records=summary_records,
+        source_bytes=source_bytes,
+        source_sha256=source_sha256,
+        source_scan_sha256=source_scan_sha256,
+    )
 
 
 def local_rollout_summary_jsonl_from_build(
@@ -1803,6 +1821,7 @@ def local_rollout_summary_jsonl_from_build(
         records[0]["local_summary_payload_sha256"] = local_summary_payload_sha256(records[1:])
         records[0]["local_summary_cache_key"] = cache_key
         records[0]["local_summary_cache_version"] = LOCAL_GENERATED_SUMMARY_CACHE_VERSION
+        records[0]["local_summary_source_scan_sha256"] = summary.source_scan_sha256
     return jsonl_bytes(records)
 
 
@@ -1839,12 +1858,13 @@ def write_generated_local_rollout_summary(
     source_identity = cacheable_local_rollout_identity(rollout) if cache_root is not None else None
     cache_key: str | None = None
     if source_identity is not None and cache_root is not None:
-        source_bytes, source_sha256 = source_identity
+        source_bytes, source_sha256, source_scan_sha256 = source_identity
         cache_key = local_generated_summary_cache_key(
             source=source,
             rollout_ref=rollout_ref,
             source_bytes=source_bytes,
             source_sha256=source_sha256,
+            source_scan_sha256=source_scan_sha256,
             mtime_fallback_timestamp=mtime_fallback_timestamp,
         )
         cached = cached_local_rollout_summary_bytes(
@@ -1854,6 +1874,7 @@ def write_generated_local_rollout_summary(
             rollout_ref=rollout_ref,
             source_bytes=source_bytes,
             source_sha256=source_sha256,
+            source_scan_sha256=source_scan_sha256,
         )
         if cached is not None:
             write_bytes_atomic(target, cached)
@@ -1864,12 +1885,13 @@ def write_generated_local_rollout_summary(
         rollout_ref,
         mtime_fallback_timestamp=mtime_fallback_timestamp,
     )
-    if cache_root is not None and summary.source_sha256 is not None:
+    if cache_root is not None:
         cache_key = local_generated_summary_cache_key(
             source=source,
             rollout_ref=rollout_ref,
             source_bytes=summary.source_bytes,
             source_sha256=summary.source_sha256,
+            source_scan_sha256=summary.source_scan_sha256,
             mtime_fallback_timestamp=mtime_fallback_timestamp,
         )
     content = local_rollout_summary_jsonl_from_build(summary, cache_key=cache_key)
