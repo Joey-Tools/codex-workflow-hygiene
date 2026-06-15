@@ -10957,6 +10957,51 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(meta["source_sha256"], current_sha256)
         self.assertEqual(meta["local_summary_cache_key"], current_key)
 
+    def test_generated_local_summary_build_hashes_same_bytes_as_summary_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            original_sha256 = MODULE.file_sha256(rollout)
+            original_size = rollout.stat().st_size
+            replacement = MODULE.jsonl_bytes(
+                [
+                    message("user", "Please build the weekly helper for the report.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "y" * 1000, "2026-05-01T10:00:01Z"),
+                ]
+            )
+            self.assertLess(len(replacement), original_size)
+            replacement = replacement[:-1] + (b" " * (original_size - len(replacement))) + b"\n"
+            self.assertEqual(len(replacement), original_size)
+            replacement_sha256 = hashlib.sha256(replacement).hexdigest()
+            self.assertNotEqual(original_sha256, replacement_sha256)
+            source = MODULE.Source("local", root)
+            rollout_ref = MODULE.source_relative_path_ref(rollout, root)
+            self.assertIsNotNone(rollout_ref)
+            remote_probe = MODULE.load_remote_probe_module()
+            original_summarize = remote_probe._summarize_rollout_records_with_meta
+
+            def mutating_summarize(**kwargs: object) -> tuple[list[dict[str, object]], dict[str, object]]:
+                records, summary_meta = original_summarize(**kwargs)
+                rollout.write_bytes(replacement)
+                return records, summary_meta
+
+            with mock.patch.object(remote_probe, "_summarize_rollout_records_with_meta", side_effect=mutating_summarize):
+                summary = MODULE.build_local_rollout_summary(source, rollout, rollout_ref)
+            final_sha256 = MODULE.file_sha256(rollout)
+
+        self.assertEqual(summary.source_sha256, original_sha256)
+        self.assertEqual(final_sha256, replacement_sha256)
+        self.assertNotEqual(summary.source_sha256, final_sha256)
+        self.assertEqual(summary.source_bytes, original_size)
+
     def test_tail_limited_generated_local_summary_uses_backing_rollout_identity(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

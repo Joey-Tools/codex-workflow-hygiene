@@ -8,6 +8,7 @@ import datetime as dt
 import errno
 import hashlib
 import hmac
+import io
 import importlib.util
 import json
 import os
@@ -1733,22 +1734,20 @@ def build_local_rollout_summary(
         fd_stat = os.fstat(fd)
         if not stat.S_ISREG(fd_stat.st_mode):
             raise OSError("source path is not a regular file")
-        source_bytes = fd_stat.st_size
         with os.fdopen(fd, "rb") as handle:
             fd = -1
+            scan_data = handle.read(LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES + 1)
+            source_bytes = max(fd_stat.st_size, len(scan_data))
+            if len(scan_data) <= LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES and fd_stat.st_size <= LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES:
+                source_bytes = len(scan_data)
+                source_sha256 = hashlib.sha256(scan_data).hexdigest()
             records, summary_meta = remote_probe._summarize_rollout_records_with_meta(
-                lines=remote_probe._bounded_text_lines(handle, LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES),
+                lines=remote_probe._bounded_text_lines(io.BytesIO(scan_data), LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES),
                 keywords=[],
                 limit=LOCAL_ROLLOUT_SUMMARY_LIMIT,
                 tail_records=LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS,
                 max_text_chars=LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS,
             )
-            if source_bytes <= LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES:
-                handle.seek(0)
-                digest = hashlib.sha256()
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                source_sha256 = digest.hexdigest()
     finally:
         if fd >= 0:
             os.close(fd)
