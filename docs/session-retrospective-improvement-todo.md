@@ -171,6 +171,23 @@ review gates, and merge before starting the next item.
    - Status: implemented by the safety/privacy calibration change; scope covers
      local rollout flags and remote rollout-summary signal extraction.
 
+8. Weekly dry-run local oversized summary cache
+   - Avoid repeated cold-start summary generation for the same local oversized
+     rollouts across weekly dry-run output directories.
+   - Keep generated summaries per-run and manifest-scoped, but reuse a
+     transient `.codex-local/session-retrospective` cache keyed by backing
+     rollout SHA-256 when available, bounded scan SHA-256 for scan-capped
+     rollouts, source size, rollout ref, host, mtime fallback, and summary
+     parameters.
+   - Do not let cache files become source evidence unless the current run
+     copies a validated cache hit into its generated-summary root and lists it
+     in the transient manifest.
+   - Preserve conservative window semantics for old archived rollouts: only
+     skip when existing bounded timestamp/window checks can prove irrelevance;
+     otherwise use the cache to reduce repeated cost without dropping possible
+     cross-day or cross-month turns.
+   - Status: implemented in the weekly local summary cache change.
+
 ## Retained Readiness Bar
 
 A weekly or baseline run is not retained-ready until:
