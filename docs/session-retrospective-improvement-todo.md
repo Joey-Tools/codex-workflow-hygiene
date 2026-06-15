@@ -176,8 +176,9 @@ review gates, and merge before starting the next item.
      rollouts across weekly dry-run output directories.
    - Keep generated summaries per-run and manifest-scoped, but reuse a
      transient `.codex-local/session-retrospective` cache keyed by backing
-     rollout SHA-256, source size, rollout ref, host, mtime fallback, and
-     summary parameters.
+     rollout SHA-256 when available, bounded scan SHA-256 for scan-capped
+     rollouts, source size, rollout ref, host, mtime fallback, and summary
+     parameters.
    - Do not let cache files become source evidence unless the current run
      copies a validated cache hit into its generated-summary root and lists it
      in the transient manifest.

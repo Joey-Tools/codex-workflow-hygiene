@@ -1640,6 +1640,13 @@ def local_summary_payload_sha256(records: list[dict[str, Any]]) -> str:
     return hashlib.sha256(jsonl_bytes(records)).hexdigest()
 
 
+def local_summary_cache_content_sha256(records: list[dict[str, Any]]) -> str:
+    authenticated_records = [dict(record) for record in records]
+    if authenticated_records:
+        authenticated_records[0].pop("local_summary_content_sha256", None)
+    return hashlib.sha256(jsonl_bytes(authenticated_records)).hexdigest()
+
+
 @dataclasses.dataclass(frozen=True)
 class LocalRolloutSummaryBuild:
     records: list[dict[str, Any]]
@@ -1729,6 +1736,12 @@ def cached_local_rollout_summary_bytes(
         return None
     actual_payload_sha256 = local_summary_payload_sha256(records[1:])
     if not hmac.compare_digest(expected_payload_sha256, actual_payload_sha256):
+        return None
+    expected_content_sha256 = record.get("local_summary_content_sha256")
+    if not isinstance(expected_content_sha256, str):
+        return None
+    actual_content_sha256 = local_summary_cache_content_sha256(records)
+    if not hmac.compare_digest(expected_content_sha256, actual_content_sha256):
         return None
     return content
 
@@ -1822,6 +1835,7 @@ def local_rollout_summary_jsonl_from_build(
         records[0]["local_summary_cache_key"] = cache_key
         records[0]["local_summary_cache_version"] = LOCAL_GENERATED_SUMMARY_CACHE_VERSION
         records[0]["local_summary_source_scan_sha256"] = summary.source_scan_sha256
+        records[0]["local_summary_content_sha256"] = local_summary_cache_content_sha256(records)
     return jsonl_bytes(records)
 
 
