@@ -11789,15 +11789,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             nested_cache_summary = cache_root / "aa" / "evil-generated-rollout-summaries" / "rollout-summary-evil.jsonl"
             nested_cache_summary.parent.mkdir(parents=True, exist_ok=True)
             nested_cache_summary.write_bytes(cache_files[0].read_bytes())
-            legacy_cache_root = cache_root.parent.parent / "cached-generated-rollout-summaries" / cache_root.parent.name / cache_root.name
-            legacy_cache_summary = legacy_cache_root / "aa" / "rollout-summary-legacy.jsonl"
-            legacy_cache_summary.parent.mkdir(parents=True, exist_ok=True)
-            legacy_cache_summary.write_bytes(cache_files[0].read_bytes())
             for index, (manifest_root, candidate) in enumerate(
                 (
                     (cache_root, cache_files[0]),
                     (cache_root, nested_cache_summary),
-                    (legacy_cache_root, legacy_cache_summary),
                 )
             ):
                 self.assertFalse(MODULE.generated_summary_artifact_path(candidate))
@@ -11820,6 +11815,65 @@ class SessionRetrospectiveTests(unittest.TestCase):
                             "3000",
                         ]
                     )
+
+    def test_make_shards_accepts_legacy_cached_output_generated_summary_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw, "legacy-cached-manifest")
+            MODULE.run_discover(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    max_raw_bytes=3000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            generated_root = Path(manifest["sources"][0]["generated_summary_root"])
+            generated_summary = Path(manifest["sources"][0]["generated_summaries"][0])
+            legacy_root = output.parent / "cached-generated-rollout-summaries" / generated_root.parent.name / generated_root.name
+            legacy_summary = legacy_root / generated_summary.relative_to(generated_root)
+            legacy_summary.parent.mkdir(parents=True, exist_ok=True)
+            legacy_summary.write_bytes(generated_summary.read_bytes())
+            manifest["sources"][0]["generated_summary_root"] = legacy_root.as_posix()
+            manifest["sources"][0]["generated_summaries"] = [legacy_summary.as_posix()]
+            legacy_manifest = output / "legacy-cached-shard_manifest.json"
+            legacy_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+            shard_output = safe_output_dir(raw, "legacy-cached-shards")
+
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(legacy_manifest),
+                    "--output",
+                    str(shard_output),
+                    "--max-raw-bytes",
+                    "3000",
+                ]
+            )
+            shard_rows = [
+                json.loads(line)
+                for line in (shard_output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(legacy_root.relative_to(output.parent).parts[0], "cached-generated-rollout-summaries")
+        self.assertTrue(MODULE.generated_summary_artifact_path(legacy_summary))
+        self.assertTrue(
+            any(row.get("kind") == "summary" and row.get("status") == "ready" for row in shard_rows)
+        )
 
     def test_generated_local_summary_hash_detects_same_size_rollout_change(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
