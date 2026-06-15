@@ -10954,6 +10954,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(second_rows), 1)
         self.assertTrue(unusable_cache_path_still_dir)
 
+    def test_generated_local_summary_cache_skips_unsafe_cache_base(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            output = safe_output_dir(raw, "cache-base-symlink")
+            cache_base = safe_output_dir(raw).parent / MODULE.LOCAL_GENERATED_SUMMARY_CACHE_DIR
+            cache_target = Path(raw) / "cache-target"
+            cache_base.parent.mkdir(parents=True, exist_ok=True)
+            cache_target.mkdir()
+            cache_base.symlink_to(cache_target, target_is_directory=True)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            cache_base_still_symlink = cache_base.is_symlink()
+            cache_target_empty = list(cache_target.iterdir()) == []
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(manifest["sources"][0]["generated_summaries"]), 1)
+        self.assertTrue(cache_base_still_symlink)
+        self.assertTrue(cache_target_empty)
+
     def test_generated_local_summary_cache_invalidates_same_size_rollout_change(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

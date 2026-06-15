@@ -1393,10 +1393,14 @@ def safe_transient_root_for_output(output: Path) -> Path:
     raise SystemExit("output directory for transient artifacts must be under .codex-local/session-retrospective")
 
 
-def generated_summary_cache_base_for_output(output: Path) -> Path:
+def generated_summary_cache_base_for_output(output: Path) -> Path | None:
     if path_inside_local_summary_cache(output):
         raise SystemExit("output directory must not be inside the local rollout summary cache")
-    return ensure_safe_output_dir(safe_transient_root_for_output(output) / LOCAL_GENERATED_SUMMARY_CACHE_DIR)
+    cache_base = safe_transient_root_for_output(output) / LOCAL_GENERATED_SUMMARY_CACHE_DIR
+    try:
+        return ensure_safe_output_dir(cache_base)
+    except SystemExit:
+        return None
 
 
 def transient_manifest_path_value(path: Path) -> str:
@@ -7123,7 +7127,11 @@ def run_scan(
             remote_generated_summary_paths=remote_generated_summary_paths,
         )
         source_generated_summary_root = generated_summary_root_for_source(generated_summary_base, source)
-        source_generated_summary_cache_root = generated_summary_cache_root_for_source(generated_summary_cache_base, source)
+        source_generated_summary_cache_root = (
+            generated_summary_cache_root_for_source(generated_summary_cache_base, source)
+            if generated_summary_cache_base is not None
+            else None
+        )
         generated_summaries = generate_local_rollout_summaries_for_source(
             source,
             rollouts,
@@ -7494,7 +7502,11 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             remote_generated_summary_paths=remote_generated_summary_paths,
         )
         source_generated_summary_root = generated_summary_root_for_source(generated_summary_base, source)
-        source_generated_summary_cache_root = generated_summary_cache_root_for_source(generated_summary_cache_base, source)
+        source_generated_summary_cache_root = (
+            generated_summary_cache_root_for_source(generated_summary_cache_base, source)
+            if generated_summary_cache_base is not None
+            else None
+        )
         generated_summaries = generate_local_rollout_summaries_for_source(
             source,
             rollouts,
