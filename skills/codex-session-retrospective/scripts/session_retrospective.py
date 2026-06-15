@@ -1379,9 +1379,11 @@ def transient_manifest_path_value(path: Path) -> str:
 
 
 def generated_summary_artifact_path(path: Path) -> bool:
+    if LOCAL_GENERATED_SUMMARY_CACHE_DIR in path.parts:
+        return False
     return any(
         part == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX
-        or (part != LOCAL_GENERATED_SUMMARY_CACHE_DIR and part.endswith(f"-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}"))
+        or part.endswith(f"-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}")
         for part in path.parts
     )
 
@@ -1603,6 +1605,10 @@ def local_generated_summary_cache_path(cache_root: Path, cache_key: str) -> Path
     return cache_root / cache_key[:2] / f"rollout-summary-{cache_key}.jsonl"
 
 
+def local_summary_payload_sha256(records: list[dict[str, Any]]) -> str:
+    return hashlib.sha256(jsonl_bytes(records)).hexdigest()
+
+
 @dataclasses.dataclass(frozen=True)
 class LocalRolloutSummaryBuild:
     records: list[dict[str, Any]]
@@ -1654,10 +1660,12 @@ def cached_local_rollout_summary_bytes(
     except OSError:
         return None
     try:
-        first_line = next(line for line in content.decode("utf-8").splitlines() if line.strip())
-        record = json.loads(first_line)
+        records = [json.loads(line) for line in content.decode("utf-8").splitlines() if line.strip()]
     except (StopIteration, UnicodeDecodeError, json.JSONDecodeError):
         return None
+    if not records or any(not isinstance(record, dict) for record in records):
+        return None
+    record = records[0]
     if not isinstance(record, dict):
         return None
     if record.get("kind") != "scan_meta":
@@ -1675,6 +1683,14 @@ def cached_local_rollout_summary_bytes(
         "tail_records": LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS,
     }
     if any(record.get(key) != value for key, value in expected_fields.items()):
+        return None
+    if any(cached_record.get("host") != source.host or cached_record.get("rollout") != rollout_ref for cached_record in records):
+        return None
+    expected_payload_sha256 = record.get("local_summary_payload_sha256")
+    if not isinstance(expected_payload_sha256, str):
+        return None
+    actual_payload_sha256 = local_summary_payload_sha256(records[1:])
+    if not hmac.compare_digest(expected_payload_sha256, actual_payload_sha256):
         return None
     return content
 
@@ -1757,6 +1773,7 @@ def local_rollout_summary_jsonl_from_build(
 ) -> bytes:
     records = [dict(record) for record in summary.records]
     if cache_key and records:
+        records[0]["local_summary_payload_sha256"] = local_summary_payload_sha256(records[1:])
         records[0]["local_summary_cache_key"] = cache_key
         records[0]["local_summary_cache_version"] = LOCAL_GENERATED_SUMMARY_CACHE_VERSION
     return jsonl_bytes(records)

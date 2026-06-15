@@ -10738,6 +10738,60 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(first_rows, second_rows)
         self.assertEqual(len(second_manifest["sources"][0]["generated_summaries"]), 1)
 
+    def test_generated_local_summary_cache_rebuilds_truncated_cached_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            first_output = safe_output_dir(raw, "cache-truncated-one")
+            second_output = safe_output_dir(raw, "cache-truncated-two")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(first_output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            cache_root = MODULE.generated_summary_cache_root_for_source(
+                MODULE.generated_summary_cache_base_for_output(first_output),
+                MODULE.Source("local", root),
+            )
+            cache_files = list(cache_root.rglob("rollout-summary*.jsonl"))
+            self.assertEqual(len(cache_files), 1)
+            original_cache_lines = cache_files[0].read_text(encoding="utf-8").splitlines()
+            self.assertGreater(len(original_cache_lines), 1)
+            cache_files[0].write_text(original_cache_lines[0] + "\n", encoding="utf-8")
+
+            with mock.patch.object(MODULE, "build_local_rollout_summary", wraps=MODULE.build_local_rollout_summary) as builder:
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(second_output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            first_rows = [
+                json.loads(line)
+                for line in (first_output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            second_rows = [
+                json.loads(line)
+                for line in (second_output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            rebuilt_cache_lines = cache_files[0].read_text(encoding="utf-8").splitlines()
+            rebuilt_meta = json.loads(rebuilt_cache_lines[0])
+
+        self.assertGreater(builder.call_count, 0)
+        self.assertEqual(first_rows, second_rows)
+        self.assertGreater(len(rebuilt_cache_lines), 1)
+        self.assertIn("local_summary_payload_sha256", rebuilt_meta)
+
     def test_generated_local_summary_cache_invalidates_same_size_rollout_change(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -11351,25 +11405,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             cache_files = list(cache_root.rglob("rollout-summary*.jsonl"))
             self.assertEqual(len(cache_files), 1)
-            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
-            manifest["sources"][0]["generated_summary_root"] = cache_root.as_posix()
-            manifest["sources"][0]["generated_summaries"] = [cache_files[0].as_posix()]
-            bad_manifest = output / "bad-cache-manifest.json"
-            bad_manifest.write_text(json.dumps(manifest), encoding="utf-8")
-            shard_output = safe_output_dir(raw, "cache-manifest-shards")
+            nested_cache_summary = cache_root / "aa" / "evil-generated-rollout-summaries" / "rollout-summary-evil.jsonl"
+            nested_cache_summary.parent.mkdir(parents=True, exist_ok=True)
+            nested_cache_summary.write_bytes(cache_files[0].read_bytes())
+            for index, candidate in enumerate((cache_files[0], nested_cache_summary)):
+                self.assertFalse(MODULE.generated_summary_artifact_path(candidate))
+                manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+                manifest["sources"][0]["generated_summary_root"] = cache_root.as_posix()
+                manifest["sources"][0]["generated_summaries"] = [candidate.as_posix()]
+                bad_manifest = output / f"bad-cache-manifest-{index}.json"
+                bad_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+                shard_output = safe_output_dir(raw, f"cache-manifest-shards-{index}")
 
-            with self.assertRaisesRegex(SystemExit, "generated_summaries entries must be generated-summary artifacts"):
-                MODULE.main(
-                    [
-                        "make-shards",
-                        "--manifest",
-                        str(bad_manifest),
-                        "--output",
-                        str(shard_output),
-                        "--max-raw-bytes",
-                        "3000",
-                    ]
-                )
+                with self.assertRaisesRegex(SystemExit, "generated_summaries entries must be generated-summary artifacts"):
+                    MODULE.main(
+                        [
+                            "make-shards",
+                            "--manifest",
+                            str(bad_manifest),
+                            "--output",
+                            str(shard_output),
+                            "--max-raw-bytes",
+                            "3000",
+                        ]
+                    )
 
     def test_generated_local_summary_hash_detects_same_size_rollout_change(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
