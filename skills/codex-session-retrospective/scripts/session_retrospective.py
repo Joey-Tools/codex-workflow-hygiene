@@ -244,6 +244,8 @@ LOCAL_ROLLOUT_SUMMARY_LIMIT = 200
 LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS = 1200
 LOCAL_GENERATED_SUMMARY_DIR_SUFFIX = "generated-rollout-summaries"
+LOCAL_GENERATED_SUMMARY_CACHE_DIR = "cached-generated-rollout-summaries"
+LOCAL_GENERATED_SUMMARY_CACHE_VERSION = "local-generated-summary-cache-v1"
 LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF = "local_generated_rollout_summary_v1"
 REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = "remote_generated_rollout_summary_v1"
 REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF = "remote_generated_rollout_source_identity_v1"
@@ -1359,12 +1361,26 @@ def generated_summary_base_for_output(output: Path) -> Path:
     return ensure_safe_output_dir(expanded.parent / f"{expanded.name}-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}")
 
 
+def safe_transient_root_for_output(output: Path) -> Path:
+    expanded = output.expanduser()
+    parts = expanded.parts
+    for index in range(len(parts) - len(SAFE_OUTPUT_PARTS) + 1):
+        if parts[index : index + len(SAFE_OUTPUT_PARTS)] == SAFE_OUTPUT_PARTS:
+            return ensure_safe_output_dir(Path(*parts[: index + len(SAFE_OUTPUT_PARTS)]))
+    raise SystemExit("output directory for transient artifacts must be under .codex-local/session-retrospective")
+
+
+def generated_summary_cache_base_for_output(output: Path) -> Path:
+    return ensure_safe_output_dir(safe_transient_root_for_output(output) / LOCAL_GENERATED_SUMMARY_CACHE_DIR)
+
+
 def transient_manifest_path_value(path: Path) -> str:
     return path.expanduser().absolute().as_posix()
 
 
 def generated_summary_artifact_path(path: Path) -> bool:
-    return any(part == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX or part.endswith(f"-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}") for part in path.parts)
+    generated_dirs = {LOCAL_GENERATED_SUMMARY_DIR_SUFFIX, LOCAL_GENERATED_SUMMARY_CACHE_DIR}
+    return any(part in generated_dirs or part.endswith(f"-{LOCAL_GENERATED_SUMMARY_DIR_SUFFIX}") for part in path.parts)
 
 
 def summary_metadata_scan_max_bytes(path: Path, max_scan_bytes: int) -> int:
@@ -1384,6 +1400,10 @@ def generated_summary_root_for_source(base: Path, source: Source) -> Path:
     safe_host = re.sub(r"[^A-Za-z0-9_.-]+", "_", source.host).strip("._-") or "source"
     digest = hashlib.sha256(f"{source.host}\0{source.root.as_posix()}".encode("utf-8")).hexdigest()[:12]
     return base / safe_host[:80] / digest
+
+
+def generated_summary_cache_root_for_source(base: Path, source: Source) -> Path:
+    return generated_summary_root_for_source(base, source)
 
 
 def generated_summary_files(root: Path | None) -> list[Path]:
@@ -1547,13 +1567,127 @@ def remote_generated_summary_files_from_manifest(
     return sorted(summaries)
 
 
-def local_rollout_summary_jsonl_bytes(
+def local_generated_summary_cache_key(
+    *,
+    source: Source,
+    rollout_ref: str,
+    source_bytes: int,
+    source_sha256: str,
+    mtime_fallback_timestamp: str | None,
+) -> str:
+    payload = {
+        "coverage_proof": LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF,
+        "host": source.host,
+        "max_text_chars": LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS,
+        "mtime_fallback_timestamp": mtime_fallback_timestamp or "",
+        "rollout": rollout_ref,
+        "scan_bytes": LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
+        "source_bytes": source_bytes,
+        "source_sha256": source_sha256,
+        "summary_limit": LOCAL_ROLLOUT_SUMMARY_LIMIT,
+        "tail_records": LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS,
+        "version": LOCAL_GENERATED_SUMMARY_CACHE_VERSION,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def local_generated_summary_cache_path(cache_root: Path, cache_key: str) -> Path:
+    return cache_root / cache_key[:2] / f"rollout-summary-{cache_key}.jsonl"
+
+
+@dataclasses.dataclass(frozen=True)
+class LocalRolloutSummaryBuild:
+    records: list[dict[str, Any]]
+    source_bytes: int
+    source_sha256: str | None
+
+
+def bounded_file_sha256_identity(path: Path, *, max_bytes: int) -> tuple[int, str] | None:
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        fd_stat = os.fstat(fd)
+        if not stat.S_ISREG(fd_stat.st_mode) or fd_stat.st_size > max_bytes:
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return fd_stat.st_size, digest.hexdigest()
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def cacheable_local_rollout_identity(rollout: Path) -> tuple[int, str] | None:
+    return bounded_file_sha256_identity(rollout, max_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES)
+
+
+def cached_local_rollout_summary_bytes(
+    cache_root: Path,
+    cache_key: str,
+    *,
+    source: Source,
+    rollout_ref: str,
+    source_bytes: int,
+    source_sha256: str,
+) -> bytes | None:
+    cache_path = local_generated_summary_cache_path(cache_root, cache_key)
+    if not safe_source_file(cache_path, cache_root):
+        return None
+    try:
+        content = cache_path.read_bytes()
+    except OSError:
+        return None
+    try:
+        first_line = next(line for line in content.decode("utf-8").splitlines() if line.strip())
+        record = json.loads(first_line)
+    except (StopIteration, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    if record.get("kind") != "scan_meta":
+        return None
+    expected_fields = {
+        "coverage_proof": LOCAL_GENERATED_SUMMARY_COVERAGE_PROOF,
+        "host": source.host,
+        "local_summary_cache_key": cache_key,
+        "local_summary_cache_version": LOCAL_GENERATED_SUMMARY_CACHE_VERSION,
+        "rollout": rollout_ref,
+        "scan_bytes": LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
+        "source_bytes": source_bytes,
+        "source_sha256": source_sha256,
+        "summary_limit": LOCAL_ROLLOUT_SUMMARY_LIMIT,
+        "tail_records": LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS,
+    }
+    if any(record.get(key) != value for key, value in expected_fields.items()):
+        return None
+    return content
+
+
+def write_local_rollout_summary_cache(cache_root: Path, cache_key: str, content: bytes) -> None:
+    cache_path = local_generated_summary_cache_path(cache_root, cache_key)
+    reject_symlink_ancestors(cache_path.parent, label="generated summary cache path")
+    try:
+        write_bytes_atomic(cache_path, content)
+    except OSError:
+        return
+
+
+def build_local_rollout_summary(
     source: Source,
     rollout: Path,
     rollout_ref: str,
     *,
     mtime_fallback_timestamp: str | None = None,
-) -> bytes:
+) -> LocalRolloutSummaryBuild:
     safe_ref = safe_rollout_backing_ref(rollout_ref)
     if safe_ref is None:
         raise ValueError(f"unsafe rollout ref: {rollout_ref}")
@@ -1606,7 +1740,36 @@ def local_rollout_summary_jsonl_bytes(
             if str(record.get("kind") or "") not in {"scan_meta", "session_meta"} and not record.get("timestamp"):
                 record["timestamp"] = mtime_fallback_timestamp
     summary_records = [dict(record, host=source.host, rollout=safe_ref) for record in records]
-    return jsonl_bytes(summary_records)
+    return LocalRolloutSummaryBuild(records=summary_records, source_bytes=source_bytes, source_sha256=source_sha256)
+
+
+def local_rollout_summary_jsonl_from_build(
+    summary: LocalRolloutSummaryBuild,
+    *,
+    cache_key: str | None = None,
+) -> bytes:
+    records = [dict(record) for record in summary.records]
+    if cache_key and records:
+        records[0]["local_summary_cache_key"] = cache_key
+        records[0]["local_summary_cache_version"] = LOCAL_GENERATED_SUMMARY_CACHE_VERSION
+    return jsonl_bytes(records)
+
+
+def local_rollout_summary_jsonl_bytes(
+    source: Source,
+    rollout: Path,
+    rollout_ref: str,
+    *,
+    mtime_fallback_timestamp: str | None = None,
+    cache_key: str | None = None,
+) -> bytes:
+    summary = build_local_rollout_summary(
+        source,
+        rollout,
+        rollout_ref,
+        mtime_fallback_timestamp=mtime_fallback_timestamp,
+    )
+    return local_rollout_summary_jsonl_from_build(summary, cache_key=cache_key)
 
 
 def write_generated_local_rollout_summary(
@@ -1615,21 +1778,53 @@ def write_generated_local_rollout_summary(
     generated_root: Path,
     *,
     mtime_fallback_timestamp: str | None = None,
+    cache_root: Path | None = None,
 ) -> Path | None:
     rollout_ref = source_relative_path_ref(rollout, source.root)
     if rollout_ref is None or safe_rollout_backing_ref(rollout_ref) is None:
         return None
     target = summary_path_for_rollout(generated_root, rollout_ref)
     reject_symlink_ancestors(target.parent, label="generated summary output path")
-    write_bytes_atomic(
-        target,
-        local_rollout_summary_jsonl_bytes(
-            source,
-            rollout,
-            rollout_ref,
+    source_identity = cacheable_local_rollout_identity(rollout) if cache_root is not None else None
+    cache_key: str | None = None
+    if source_identity is not None and cache_root is not None:
+        source_bytes, source_sha256 = source_identity
+        cache_key = local_generated_summary_cache_key(
+            source=source,
+            rollout_ref=rollout_ref,
+            source_bytes=source_bytes,
+            source_sha256=source_sha256,
             mtime_fallback_timestamp=mtime_fallback_timestamp,
-        ),
+        )
+        cached = cached_local_rollout_summary_bytes(
+            cache_root,
+            cache_key,
+            source=source,
+            rollout_ref=rollout_ref,
+            source_bytes=source_bytes,
+            source_sha256=source_sha256,
+        )
+        if cached is not None:
+            write_bytes_atomic(target, cached)
+            return target
+    summary = build_local_rollout_summary(
+        source,
+        rollout,
+        rollout_ref,
+        mtime_fallback_timestamp=mtime_fallback_timestamp,
     )
+    if cache_root is not None and summary.source_sha256 is not None:
+        cache_key = local_generated_summary_cache_key(
+            source=source,
+            rollout_ref=rollout_ref,
+            source_bytes=summary.source_bytes,
+            source_sha256=summary.source_sha256,
+            mtime_fallback_timestamp=mtime_fallback_timestamp,
+        )
+    content = local_rollout_summary_jsonl_from_build(summary, cache_key=cache_key)
+    write_bytes_atomic(target, content)
+    if cache_key is not None and cache_root is not None:
+        write_local_rollout_summary_cache(cache_root, cache_key, content)
     return target
 
 
@@ -1644,6 +1839,7 @@ def generate_local_rollout_summaries_for_source(
     allow_mtime_fallback: bool,
     archived_duplicate_keys: set[str],
     summary_backed_rollout_keys: set[str],
+    cache_root: Path | None = None,
 ) -> list[Path]:
     if source.host in DEFAULT_REMOTE_HOSTS:
         return []
@@ -1686,6 +1882,7 @@ def generate_local_rollout_summaries_for_source(
                 rollout,
                 generated_root,
                 mtime_fallback_timestamp=iso(active_mtime) if active_mtime is not None else None,
+                cache_root=cache_root,
             )
         except (OSError, ValueError):
             continue
@@ -6795,6 +6992,7 @@ def run_scan(
     max_raw_bytes = require_positive_window(getattr(args, "max_raw_bytes", 512_000), "--max-raw-bytes")
     allow_partial_hosts = getattr(args, "allow_partial_hosts", False)
     generated_summary_base = generated_summary_base_for_output(output)
+    generated_summary_cache_base = generated_summary_cache_base_for_output(output)
 
     def append_oversized_rollout_gap(path: Path, size: int) -> None:
         coverage_gaps.append(source_path_coverage_gap(source, path, "oversized_rollout_skipped", bytes=size))
@@ -6878,10 +7076,12 @@ def run_scan(
             remote_generated_summary_paths=remote_generated_summary_paths,
         )
         source_generated_summary_root = generated_summary_root_for_source(generated_summary_base, source)
+        source_generated_summary_cache_root = generated_summary_cache_root_for_source(generated_summary_cache_base, source)
         generated_summaries = generate_local_rollout_summaries_for_source(
             source,
             rollouts,
             generated_root=source_generated_summary_root,
+            cache_root=source_generated_summary_cache_root,
             gap_start=gap_start,
             end=end,
             max_raw_bytes=max_raw_bytes,
@@ -7165,6 +7365,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
     coverage_gaps: list[dict[str, Any]] = []
     allow_partial_hosts = getattr(args, "allow_partial_hosts", False)
     generated_summary_base = generated_summary_base_for_output(output)
+    generated_summary_cache_base = generated_summary_cache_base_for_output(output)
     for source in sources:
         if not source.root.exists():
             coverage_gaps.append(
@@ -7246,10 +7447,12 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             remote_generated_summary_paths=remote_generated_summary_paths,
         )
         source_generated_summary_root = generated_summary_root_for_source(generated_summary_base, source)
+        source_generated_summary_cache_root = generated_summary_cache_root_for_source(generated_summary_cache_base, source)
         generated_summaries = generate_local_rollout_summaries_for_source(
             source,
             rollouts,
             generated_root=source_generated_summary_root,
+            cache_root=source_generated_summary_cache_root,
             gap_start=start,
             end=end,
             max_raw_bytes=max_raw_bytes,
@@ -9101,7 +9304,7 @@ def validate_output_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     required_files = ("turn_summaries.jsonl", *RETAINED_OUTPUT_FILES)
     allowed = set(TRANSIENT_OUTPUT_FILES) | set(RETAINED_OUTPUT_FILES) | {"state.json"}
     for path in run_dir.iterdir():
-        if path.name == LOCAL_GENERATED_SUMMARY_DIR_SUFFIX:
+        if path.name in {LOCAL_GENERATED_SUMMARY_DIR_SUFFIX, LOCAL_GENERATED_SUMMARY_CACHE_DIR}:
             if path.is_symlink() or not path.is_dir():
                 raise SystemExit(f"unexpected output file: {path}")
             continue

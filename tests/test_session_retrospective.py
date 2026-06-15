@@ -10689,6 +10689,168 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(first_rows[0]["source_hash"], expected_source_hash)
         self.assertEqual(first_rows[0]["source_hash"], second_rows[0]["source_hash"])
 
+    def test_generated_local_summary_cache_reuses_across_output_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            first_output = safe_output_dir(raw, "cache-one")
+            second_output = safe_output_dir(raw, "cache-two")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(first_output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            cache_root = MODULE.generated_summary_cache_root_for_source(
+                MODULE.generated_summary_cache_base_for_output(first_output),
+                MODULE.Source("local", root),
+            )
+            cache_files = list(cache_root.rglob("rollout-summary*.jsonl"))
+            self.assertEqual(len(cache_files), 1)
+
+            with mock.patch.object(MODULE, "build_local_rollout_summary", side_effect=AssertionError("summary builder should use cache")):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(second_output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            first_rows = [
+                json.loads(line)
+                for line in (first_output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            second_rows = [
+                json.loads(line)
+                for line in (second_output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            second_manifest = json.loads((second_output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(first_rows), 1)
+        self.assertEqual(first_rows, second_rows)
+        self.assertEqual(len(second_manifest["sources"][0]["generated_summaries"]), 1)
+
+    def test_generated_local_summary_cache_invalidates_same_size_rollout_change(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            first_output = safe_output_dir(raw, "cache-invalid-one")
+            second_output = safe_output_dir(raw, "cache-invalid-two")
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(first_output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            original_size = rollout.stat().st_size
+            replacement = MODULE.jsonl_bytes(
+                [
+                    message("user", "Please build the weekly helper for the report.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "y" * 1000, "2026-05-01T10:00:01Z"),
+                ]
+            )
+            self.assertLess(len(replacement), original_size)
+            rollout.write_bytes(replacement[:-1] + (b" " * (original_size - len(replacement))) + b"\n")
+            self.assertEqual(rollout.stat().st_size, original_size)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(second_output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            second_rows = [
+                json.loads(line)
+                for line in (second_output / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            cache_root = MODULE.generated_summary_cache_root_for_source(
+                MODULE.generated_summary_cache_base_for_output(second_output),
+                MODULE.Source("local", root),
+            )
+            cache_file_count = len(list(cache_root.rglob("rollout-summary*.jsonl")))
+
+        self.assertEqual(second_rows, [])
+        self.assertEqual(cache_file_count, 2)
+
+    def test_generated_local_summary_cache_miss_uses_current_summary_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            stale_identity = (rollout.stat().st_size, MODULE.file_sha256(rollout))
+            replacement = MODULE.jsonl_bytes(
+                [
+                    message("user", "Please build the weekly helper for the report.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "y" * 1000, "2026-05-01T10:00:01Z"),
+                ]
+            )
+            self.assertLess(len(replacement), stale_identity[0])
+            rollout.write_bytes(replacement[:-1] + (b" " * (stale_identity[0] - len(replacement))) + b"\n")
+            self.assertEqual(rollout.stat().st_size, stale_identity[0])
+            current_sha256 = MODULE.file_sha256(rollout)
+            self.assertNotEqual(current_sha256, stale_identity[1])
+            source = MODULE.Source("local", root)
+            rollout_ref = MODULE.source_relative_path_ref(rollout, root)
+            self.assertIsNotNone(rollout_ref)
+            output = safe_output_dir(raw, "cache-race")
+            generated_root = MODULE.generated_summary_root_for_source(
+                MODULE.generated_summary_base_for_output(output),
+                source,
+            )
+            cache_root = MODULE.generated_summary_cache_root_for_source(
+                MODULE.generated_summary_cache_base_for_output(output),
+                source,
+            )
+
+            with mock.patch.object(MODULE, "cacheable_local_rollout_identity", return_value=stale_identity):
+                target = MODULE.write_generated_local_rollout_summary(source, rollout, generated_root, cache_root=cache_root)
+            self.assertIsNotNone(target)
+            cache_files = list(cache_root.rglob("rollout-summary*.jsonl"))
+            self.assertEqual(len(cache_files), 1)
+            meta = json.loads(cache_files[0].read_text(encoding="utf-8").splitlines()[0])
+            stale_key = MODULE.local_generated_summary_cache_key(
+                source=source,
+                rollout_ref=rollout_ref,
+                source_bytes=stale_identity[0],
+                source_sha256=stale_identity[1],
+                mtime_fallback_timestamp=None,
+            )
+            current_key = MODULE.local_generated_summary_cache_key(
+                source=source,
+                rollout_ref=rollout_ref,
+                source_bytes=rollout.stat().st_size,
+                source_sha256=current_sha256,
+                mtime_fallback_timestamp=None,
+            )
+
+        self.assertNotEqual(current_key, stale_key)
+        self.assertIn(current_key, cache_files[0].name)
+        self.assertEqual(meta["source_sha256"], current_sha256)
+        self.assertEqual(meta["local_summary_cache_key"], current_key)
+
     def test_tail_limited_generated_local_summary_uses_backing_rollout_identity(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -11153,8 +11315,15 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
             )
+            cache_root = MODULE.generated_summary_cache_root_for_source(
+                MODULE.generated_summary_cache_base_for_output(output),
+                MODULE.Source("local", source_root),
+            )
+            cache_files = list(cache_root.rglob("rollout-summary*.jsonl"))
+            source_summaries = MODULE.source_summary_files(MODULE.Source("local", source_root))
 
-        self.assertEqual(MODULE.source_summary_files(MODULE.Source("local", source_root)), [])
+        self.assertEqual(len(cache_files), 1)
+        self.assertEqual(source_summaries, [])
 
     def test_generated_local_summary_hash_detects_same_size_rollout_change(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
