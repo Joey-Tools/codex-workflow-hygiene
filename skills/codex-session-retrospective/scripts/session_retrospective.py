@@ -1012,7 +1012,11 @@ def dated_path_from_parts(path: Path) -> dt.datetime | None:
 def summary_date_from_semantic_path(path: Path) -> dt.datetime | None:
     parts = path.parts
     for index, part in enumerate(parts):
-        if part not in {"sessions", "archived_sessions"} or index + 3 >= len(parts):
+        if (
+            part not in {"sessions", "archived_sessions"}
+            or index + 4 != len(parts) - 1
+            or not path.name.startswith("rollout-summary")
+        ):
             continue
         year, month, day = parts[index + 1 : index + 4]
         if re.fullmatch(r"\d{4}", year) and re.fullmatch(r"\d{2}", month) and re.fullmatch(r"\d{2}", day):
@@ -7269,8 +7273,8 @@ def run_scan(
         if not rollout_path_proves_after_window(path, end):
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_rollout_missing"))
 
-    def append_volatile_summary_gap(path: Path) -> None:
-        if not summary_path_proves_after_window(path, end):
+    def append_volatile_summary_gap(path: Path, *, allow_future_path_filter: bool = True) -> None:
+        if not allow_future_path_filter or not summary_path_proves_after_window(path, end):
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_summary_missing"))
 
     for source in sources:
@@ -7523,6 +7527,7 @@ def run_scan(
                 append_volatile_rollout_gap(rollout)
                 continue
         for summary in summaries:
+            summary_relevance_proven = False
             try:
                 size = summary.stat().st_size
                 summary_scan_cap = summary_metadata_scan_max_bytes_for_generated_remote(
@@ -7610,7 +7615,7 @@ def run_scan(
                     if path_disappeared(summary):
                         append_volatile_summary_gap(summary)
                     continue
-                if not summary_file_relevant_or_backing_ref_relevant(
+                summary_relevant = summary_file_relevant_or_backing_ref_relevant(
                     summary,
                     gap_start,
                     end,
@@ -7618,10 +7623,12 @@ def run_scan(
                     source_root=source.root,
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
-                ):
+                )
+                if not summary_relevant:
                     if path_disappeared(summary):
                         append_volatile_summary_gap(summary)
                     continue
+                summary_relevance_proven = True
                 all_turns.extend(
                     extract_summary_file(
                         source,
@@ -7633,7 +7640,7 @@ def run_scan(
                     )
                 )
             except FileNotFoundError:
-                append_volatile_summary_gap(summary)
+                append_volatile_summary_gap(summary, allow_future_path_filter=not summary_relevance_proven)
                 continue
     if allow_partial_hosts:
         coverage_gaps.append({"host": "scope", "reason": "partial_host_scope"})
@@ -9773,8 +9780,48 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             for match_key in rollout_match_keys_for_ref(current_ref):
                 current_rollout_refs_by_key[match_key].add(current_ref)
 
+        def complete_summary_backed_rollout_coverage(
+            current_rollouts: list[Path],
+        ) -> tuple[dict[str, RolloutSourceIdentity], set[str], set[str]]:
+            selected_identities = rollout_source_identity_by_duplicate_key(current_rollouts, root)
+            backed_refs = complete_summary_backing_rollout_refs(
+                summaries,
+                start,
+                end,
+                source_root=root,
+                max_scan_bytes=max_raw_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
+                generated_summary_paths=generated_summary_paths,
+                remote_generated_summary_paths=remote_generated_summary_paths,
+            )
+            backed_keys = complete_summary_backing_rollout_keys(
+                summaries,
+                current_rollouts,
+                start,
+                end,
+                source_root=root,
+                max_scan_bytes=max_raw_bytes,
+                selected_source_identity_by_key=selected_identities,
+                archived_duplicate_keys=archived_duplicate_keys,
+                generated_summary_paths=generated_summary_paths,
+                remote_generated_summary_paths=remote_generated_summary_paths,
+            )
+            return selected_identities, backed_refs, backed_keys
+
+        (
+            selected_source_identity_by_key,
+            summary_backed_rollout_refs,
+            summary_backed_rollout_keys,
+        ) = complete_summary_backed_rollout_coverage(rollouts)
+
         def manifest_rollout_ref_has_current_match(rollout_ref: str) -> bool:
             if rollout_ref in current_rollout_refs:
+                return True
+            if rollout_ref in summary_backed_rollout_refs or rollout_ref_has_duplicate_key(
+                rollout_ref,
+                summary_backed_rollout_keys,
+            ):
                 return True
             for match_key in rollout_match_keys_for_ref(rollout_ref):
                 for current_ref in current_rollout_refs_by_key.get(match_key, set()):
@@ -9803,6 +9850,11 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     continue
                 append_disappeared_rollout_shard(rollout_path)
         rollouts = sorted(set(rollouts))
+        (
+            selected_source_identity_by_key,
+            summary_backed_rollout_refs,
+            summary_backed_rollout_keys,
+        ) = complete_summary_backed_rollout_coverage(rollouts)
         current_summary_refs = set(source_summary_manifest_refs(source_summaries, root))
         for summary_ref in manifest_source_ref_list(source_entry, "summary_refs", summary=True):
             if summary_ref in current_summary_refs:
@@ -9810,30 +9862,6 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             summary_path = source_summary_declared_path_from_ref(source, summary_ref)
             if summary_path is not None:
                 append_disappeared_summary_shard(summary_path)
-        selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, root)
-        summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
-            summaries,
-            start,
-            end,
-            source_root=root,
-            max_scan_bytes=max_raw_bytes,
-            allow_mtime_fallback=allow_mtime_fallback,
-            archived_duplicate_keys=archived_duplicate_keys,
-            generated_summary_paths=generated_summary_paths,
-            remote_generated_summary_paths=remote_generated_summary_paths,
-        )
-        summary_backed_rollout_keys = complete_summary_backing_rollout_keys(
-            summaries,
-            rollouts,
-            start,
-            end,
-            source_root=root,
-            max_scan_bytes=max_raw_bytes,
-            selected_source_identity_by_key=selected_source_identity_by_key,
-            archived_duplicate_keys=archived_duplicate_keys,
-            generated_summary_paths=generated_summary_paths,
-            remote_generated_summary_paths=remote_generated_summary_paths,
-        )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
             rollouts,

@@ -10185,6 +10185,69 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(any(row.get("coverage_gap") == "rollout disappeared during shard discovery" for row in rows))
         self.assertTrue(any(row.get("status") == "ready" for row in rows))
 
+    def test_make_shards_accepts_summary_backed_archived_duplicate_for_manifest_rollout_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_name = "rollout-2026-04-01T10-00-00-duplicate-large.jsonl"
+            active_ref = f"sessions/2026/04/01/{rollout_name}"
+            archived_ref = f"archived_sessions/2026/04/01/{rollout_name}"
+            archived = root / archived_ref
+            archived.parent.mkdir(parents=True, exist_ok=True)
+            archived.write_text(
+                json.dumps(message("user", "Archived oversized task.", "2026-04-01T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-duplicate-large.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=archived_ref,
+                        source_bytes=archived.stat().st_size,
+                        source_sha256=MODULE.file_sha256(archived),
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:01:00Z",
+                        "rollout": archived_ref,
+                        "text": "You forgot verification for /customer/repo",
+                    },
+                ],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 1,
+                                "rollout_refs": [active_ref],
+                                "summary_count": 1,
+                                "summary_refs": [summary.relative_to(root).as_posix()],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1500"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertFalse(any(row.get("coverage_gap") == "rollout disappeared during shard discovery" for row in rows))
+        self.assertFalse(any(row.get("status") == "oversized" for row in rows))
+        self.assertTrue(any(row.get("path_ref") == MODULE.path_ref(summary) and row.get("status") == "ready" for row in rows))
+
     def test_make_shards_accepts_flat_archived_undated_alias_for_manifest_rollout_ref(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -10605,6 +10668,43 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_undated_root_summary_does_not_use_dated_source_root(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "2026" / "07" / "01" / ".codex"
+            root.mkdir(parents=True)
+            summary_ref = "rollout-summary-undated.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 0,
+                                "rollout_refs": [],
+                                "summary_count": 1,
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIsNone(MODULE.summary_date_from_path(root / summary_ref))
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
+    def test_undated_root_summary_does_not_use_semantic_looking_source_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "sessions" / "2026" / "07" / "01" / ".codex"
             root.mkdir(parents=True)
             summary_ref = "rollout-summary-undated.jsonl"
             manifest = Path(raw) / "manifest.json"
@@ -21884,6 +21984,34 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertIn("oversized_summary_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_run_scan_reports_future_summary_disappearing_after_relevance_proven(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "remote"
+            summary = root / "sessions" / "2026" / "06" / "01" / "rollout-summary-late.jsonl"
+            write_jsonl(
+                summary,
+                [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "permission denied"}],
+            )
+            output = safe_output_dir(raw)
+            real_extract_summary_file = MODULE.extract_summary_file
+
+            def extract_or_disappear(source, path, *args, **kwargs):
+                if path == summary:
+                    summary.unlink()
+                    raise FileNotFoundError(str(summary))
+                return real_extract_summary_file(source, path, *args, **kwargs)
+
+            with mock.patch.object(MODULE, "extract_summary_file", side_effect=extract_or_disappear):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"remote={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("volatile_summary_missing", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_truncated_rollout_summary_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
