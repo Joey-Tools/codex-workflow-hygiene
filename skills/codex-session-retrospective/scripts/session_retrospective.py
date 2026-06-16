@@ -1010,18 +1010,15 @@ def dated_path_from_parts(path: Path) -> dt.datetime | None:
 
 
 def summary_date_from_path(path: Path) -> dt.datetime | None:
-    path_date = dated_path_from_parts(path)
-    if path_date is not None:
-        return path_date
     match = re.search(
         r"^rollout-summary-.*?(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?",
         path.name,
     )
-    if not match:
-        return None
-    if match.group(2):
-        return parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
-    return parse_time(f"{match.group(1)}T00:00:00Z")
+    if match:
+        if match.group(2):
+            return parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+        return parse_time(f"{match.group(1)}T00:00:00Z")
+    return dated_path_from_parts(path)
 
 
 @dataclasses.dataclass(frozen=True)
