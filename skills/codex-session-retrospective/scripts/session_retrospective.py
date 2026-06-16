@@ -7253,7 +7253,25 @@ def rollout_path_proves_after_window(path: Path, end: dt.datetime | None) -> boo
 
 
 def rollout_path_proves_outside_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
-    return not rollout_filename_in_window(path, start, end)
+    match = re.search(
+        r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)",
+        path.name,
+    )
+    if match and match.group(2):
+        rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+        return bool(rollout_time and end and rollout_time >= end)
+    if match:
+        rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
+    else:
+        rollout_date = dated_path_from_parts(path)
+    if rollout_date is None:
+        return False
+    rollout_end = rollout_date + dt.timedelta(days=1)
+    if start and rollout_end <= start:
+        return True
+    if end and rollout_date >= end:
+        return True
+    return False
 
 
 def summary_path_proves_after_window(path: Path, end: dt.datetime | None) -> bool:
