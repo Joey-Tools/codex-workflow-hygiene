@@ -216,6 +216,12 @@ review gates, and merge before starting the next item.
    - Keep old oversized archived rollouts conservative when the bounded
      timestamp scan cannot prove they are outside the window; generate a
      bounded local summary when possible, otherwise preserve the coverage gap.
+   - Exclude generated local summary artifacts from transient `summary_refs`,
+     so `make-shards` does not mistake an existing generated summary for a
+     disappeared source summary when output lives under the source root.
+   - Treat disappearing rollouts during generated-summary preprocessing as a
+     skip for that preprocessing pass; the later scan loop owns volatile gap
+     reporting.
    - Store transient scan-time rollout and summary refs in `shard_manifest.json`
      and compare them during `make-shards`, so files that disappear before
      rediscovery still become volatile shard gaps instead of being silently

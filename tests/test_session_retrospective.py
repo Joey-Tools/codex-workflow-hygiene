@@ -12937,10 +12937,37 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             cache_files = list(cache_root.rglob("rollout-summary*.jsonl"))
             source_summaries = MODULE.source_summary_files(MODULE.Source("local", source_root))
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            generated_summary = Path(manifest["sources"][0]["generated_summaries"][0])
+            shards_dir = source_root / ".codex-local" / "session-retrospective" / "shards"
+            MODULE.main(
+                [
+                    "make-shards",
+                    "--manifest",
+                    str(output / "shard_manifest.json"),
+                    "--output",
+                    str(shards_dir),
+                    "--max-raw-bytes",
+                    "3000",
+                ]
+            )
+            shard_rows = [
+                json.loads(line)
+                for line in (shards_dir / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            generated_summary_exists = generated_summary.exists()
+            generated_summary_ref = generated_summary.relative_to(source_root).as_posix()
+            summary_refs = manifest["sources"][0]["summary_refs"]
+            has_false_disappeared_gap = any(
+                row.get("coverage_gap") == "summary disappeared during shard discovery" for row in shard_rows
+            )
 
         self.assertEqual(len(cache_files), 1)
         self.assertFalse(MODULE.generated_summary_artifact_path(cache_files[0]))
         self.assertEqual(source_summaries, [])
+        self.assertTrue(generated_summary_exists)
+        self.assertNotIn(generated_summary_ref, summary_refs)
+        self.assertFalse(has_false_disappeared_gap)
 
     def test_make_shards_rejects_cache_summary_manifest_paths(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -19810,6 +19837,36 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "volatile_rollout_missing")
         self.assertNotIn("path", trend["coverage_gaps"][0])
         self.assertEqual(retained["coverage_gaps"][0]["reason"], "volatile_rollout_missing")
+
+    def test_generated_summary_preprocess_handles_disappearing_old_oversized_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            old_large = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            old_large.parent.mkdir(parents=True, exist_ok=True)
+            old_large.write_text(
+                json.dumps(message("user", "Old oversized task.", "2026-01-02T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            with mock.patch.object(
+                MODULE,
+                "oversized_rollout_has_timestamp_in_window",
+                side_effect=FileNotFoundError(str(old_large)),
+            ):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            output_exists = (output / "trend_report.json").is_file()
+
+        self.assertTrue(output_exists)
 
     def test_future_rollout_disappearing_after_irrelevance_does_not_report_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

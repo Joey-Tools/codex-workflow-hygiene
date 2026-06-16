@@ -1962,13 +1962,17 @@ def generate_local_rollout_summaries_for_source(
     generated: list[Path] = []
     for rollout in rollouts:
         rollout_mtime_fallback = rollout_path_allows_mtime_fallback(source, rollout, archived_duplicate_keys)
-        if not rollout_candidate_relevant(
-            rollout,
-            gap_start,
-            end,
-            max_raw_bytes=max_raw_bytes,
-            allow_mtime_fallback=rollout_mtime_fallback,
-        ):
+        try:
+            candidate_relevant = rollout_candidate_relevant(
+                rollout,
+                gap_start,
+                end,
+                max_raw_bytes=max_raw_bytes,
+                allow_mtime_fallback=rollout_mtime_fallback,
+            )
+        except OSError:
+            continue
+        if not candidate_relevant:
             continue
         try:
             size = rollout.stat().st_size
@@ -1976,12 +1980,15 @@ def generate_local_rollout_summaries_for_source(
             continue
         if size <= max_raw_bytes:
             continue
-        relevance = oversized_rollout_relevance(
-            rollout,
-            gap_start,
-            end,
-            allow_mtime_fallback=rollout_mtime_fallback,
-        )
+        try:
+            relevance = oversized_rollout_relevance(
+                rollout,
+                gap_start,
+                end,
+                allow_mtime_fallback=rollout_mtime_fallback,
+            )
+        except OSError:
+            continue
         if relevance == "irrelevant":
             continue
         rollout_ref = source_relative_path_ref(rollout, source.root)
@@ -2429,6 +2436,8 @@ def source_rollout_manifest_refs(rollouts: Iterable[Path], root: Path) -> list[s
 def source_summary_manifest_refs(summaries: Iterable[Path], root: Path) -> list[str]:
     refs: set[str] = set()
     for summary in summaries:
+        if source_summary_excluded_artifact_path(summary):
+            continue
         ref = source_relative_path_ref(summary, root)
         if ref is None or safe_relative_summary_ref(ref) is None:
             continue
