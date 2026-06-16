@@ -212,6 +212,7 @@ RETAINED_OUTCOMES = frozenset({"needs_review", "no_issue_observed"})
 RETAINED_FIXED_MODES = frozenset({"daily", "weekly"})
 BASELINE_MODE_PATTERN = re.compile(r"^baseline-[1-9][0-9]{0,3}d$")
 MAX_BASELINE_WINDOW_DAYS = 9999
+TIMESTAMPED_ROLLOUT_CROSS_MIDNIGHT_GRACE = dt.timedelta(hours=2)
 
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 RETAINED_SOURCE_HOST_ALIASES = {
@@ -2186,6 +2187,24 @@ def rollout_has_record_in_window(
     return False
 
 
+def timestamped_rollout_maybe_reaches_start(
+    rollout_time: dt.datetime,
+    rollout_date: dt.datetime | None,
+    start: dt.datetime | None,
+) -> bool:
+    if start is None or rollout_time >= start:
+        return True
+    if rollout_date is None:
+        return True
+    rollout_day_end = rollout_date + dt.timedelta(days=1)
+    if start < rollout_day_end:
+        return True
+    return (
+        rollout_time >= rollout_day_end - TIMESTAMPED_ROLLOUT_CROSS_MIDNIGHT_GRACE
+        and start < rollout_day_end + TIMESTAMPED_ROLLOUT_CROSS_MIDNIGHT_GRACE
+    )
+
+
 def rollout_filename_in_window(
     path: Path,
     start: dt.datetime | None,
@@ -2201,12 +2220,11 @@ def rollout_filename_in_window(
         if match.group(2):
             rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
             rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
-            rollout_end = rollout_date + dt.timedelta(days=1) if rollout_date is not None else None
             if rollout_time is None:
                 return True
             if end and rollout_time >= end:
                 return False
-            if start and rollout_end is not None and rollout_end < start:
+            if start and not timestamped_rollout_maybe_reaches_start(rollout_time, rollout_date, start):
                 return False
             return True
         rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
@@ -2969,12 +2987,11 @@ def rollout_ref_maybe_in_window(ref: str, start: dt.datetime | None, end: dt.dat
     if match and match.group(2):
         rollout_start = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
         rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
-        rollout_end = rollout_date + dt.timedelta(days=1) if rollout_date is not None else None
         if rollout_start is None:
             return False
         if end and rollout_start >= end:
             return False
-        if start and rollout_end is not None and rollout_end < start:
+        if start and not timestamped_rollout_maybe_reaches_start(rollout_start, rollout_date, start):
             return False
         return True
     if match:
@@ -7419,10 +7436,12 @@ def rollout_path_proves_outside_window(
     if match and match.group(2):
         rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
         rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
-        rollout_end = rollout_date + dt.timedelta(days=1) if rollout_date is not None else None
         return bool(
             rollout_time
-            and ((end and rollout_time >= end) or (start and rollout_end is not None and rollout_end < start))
+            and (
+                (end and rollout_time >= end)
+                or (start and not timestamped_rollout_maybe_reaches_start(rollout_time, rollout_date, start))
+            )
         )
     if match:
         rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
@@ -7455,8 +7474,9 @@ def summary_path_proves_outside_window(
     summary_hint = summary_date_hint_from_path(path, source_root=source_root)
     if summary_hint is None:
         return False
-    summary_date, exact_timestamp = summary_hint
-    if exact_timestamp and start and summary_date < start:
+    summary_date, _exact_timestamp = summary_hint
+    summary_end = summary_date.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(days=1)
+    if start and summary_end <= start:
         return True
     if end and summary_date >= end:
         return True
