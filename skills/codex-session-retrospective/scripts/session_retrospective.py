@@ -7259,7 +7259,12 @@ def rollout_path_proves_outside_window(path: Path, start: dt.datetime | None, en
     )
     if match and match.group(2):
         rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
-        return bool(rollout_time and end and rollout_time >= end)
+        rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
+        rollout_end = rollout_date + dt.timedelta(days=1) if rollout_date is not None else None
+        return bool(
+            rollout_time
+            and ((end and rollout_time >= end) or (start and rollout_end is not None and rollout_end <= start))
+        )
     if match:
         rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
     else:

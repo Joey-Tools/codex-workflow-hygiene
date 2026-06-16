@@ -9718,7 +9718,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
             root.mkdir()
-            rollout_ref = "sessions/2026/01/02/rollout-old.jsonl"
+            rollout_ref = "sessions/2026/01/02/rollout-2026-01-02T10-00-00-old.jsonl"
             summary_ref = "sessions/2026/01/02/rollout-summary-old.jsonl"
             manifest = Path(raw) / "manifest.json"
             manifest.write_text(
