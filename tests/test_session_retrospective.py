@@ -6112,6 +6112,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(captured["gap_hosts"], {"miku-bot-dev"})
 
+    def test_repair_ignores_parent_shards_for_standalone_scan_output(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw) / "scan-output"
+            run_dir.mkdir()
+            write_jsonl(Path(raw) / "shards" / "shards.jsonl", [{"coverage_gap": "stale sibling"}])
+
+            selected = MODULE.shards_dir_from_run_dir(run_dir, run_dir)
+
+        self.assertEqual(selected, run_dir / "shards")
+
+    def test_repair_scan_subdir_uses_dry_run_parent_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw) / "weekly-dry-run"
+            scan = run_dir / "scan"
+            shards = run_dir / "shards"
+            scan.mkdir(parents=True)
+            (run_dir / "dry_run_report.json").write_text("{}", encoding="utf-8")
+            write_jsonl(shards / "shards.jsonl", [{"coverage_gap": "fresh nested"}])
+
+            selected = MODULE.shards_dir_from_run_dir(scan, scan)
+
+        self.assertEqual(selected, shards)
+
     def test_weekly_repair_prefers_nested_dry_run_shards_over_stale_top_level(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             run_dir = Path(raw) / "weekly-dry-run"

@@ -9121,7 +9121,15 @@ def shards_dir_from_run_dir(run_dir: Path, scan_dir: Path) -> Path:
     if (nested / "shards.jsonl").is_file():
         return nested
     sibling = scan_dir.parent / "shards"
-    if (sibling / "shards.jsonl").is_file():
+    has_dry_run_report = (run_dir.parent / "dry_run_report.json").is_file() or (
+        run_dir.parent / "dry_run_report.md"
+    ).is_file()
+    dry_run_scan_subdir = (
+        scan_dir == run_dir
+        and run_dir.name == "scan"
+        and has_dry_run_report
+    )
+    if dry_run_scan_subdir and (sibling / "shards.jsonl").is_file():
         return sibling
     if direct.is_file():
         return run_dir
