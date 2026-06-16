@@ -2167,12 +2167,15 @@ def rollout_candidate_relevant(
         except OSError:
             return True
         if max_raw_bytes is not None and size > max_raw_bytes:
-            relevance = oversized_rollout_relevance(
-                path,
-                start,
-                end,
-                allow_mtime_fallback=allow_mtime_fallback,
-            )
+            try:
+                relevance = oversized_rollout_relevance(
+                    path,
+                    start,
+                    end,
+                    allow_mtime_fallback=allow_mtime_fallback,
+                )
+            except OSError:
+                return True
             if relevance == "relevant":
                 return True
             if relevance == "irrelevant":
@@ -7192,17 +7195,18 @@ def path_disappeared(path: Path) -> bool:
 
 
 def rollout_path_hint_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
-    if rollout_window_date(path) is None:
+    rollout_date = rollout_window_date(path)
+    if rollout_date is None:
         return True
-    return rollout_filename_in_window(path, start, end)
+    if end and rollout_date >= end:
+        return False
+    return True
 
 
 def summary_path_hint_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
     summary_date = summary_date_from_path(path)
     if summary_date is None:
         return True
-    if start and summary_date + dt.timedelta(days=1) <= start:
-        return False
     if end and summary_date >= end:
         return False
     return True
@@ -8734,6 +8738,8 @@ def scan_dir_from_run_dir(run_dir: Path) -> Path:
 
 
 def shards_dir_from_run_dir(run_dir: Path, scan_dir: Path) -> Path:
+    if (run_dir / "shards.jsonl").is_file():
+        return run_dir
     nested = run_dir / "shards"
     if (nested / "shards.jsonl").is_file():
         return nested

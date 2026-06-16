@@ -222,6 +222,13 @@ review gates, and merge before starting the next item.
    - Treat disappearing rollouts during generated-summary preprocessing as a
      skip for that preprocessing pass; the later scan loop owns volatile gap
      reporting.
+   - Treat disappeared pre-window rollout and summary refs conservatively in
+     scan and shard planning; a path date before the window does not prove the
+     file lacked in-window records or backing refs.
+   - Catch disappearing oversized rollouts inside the bounded prefilter itself
+     and treat the relevance as unknown instead of aborting the scan.
+   - Read direct `shards.jsonl` files beside a scan `shard_manifest.json` when
+     repairing scan-output runs, not only nested or sibling shard directories.
    - Store transient scan-time rollout and summary refs in `shard_manifest.json`
      and compare them during `make-shards`, so files that disappear before
      rediscovery still become volatile shard gaps instead of being silently

@@ -5909,6 +5909,111 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(captured["gap_hosts"], {"miku-bot-dev"})
 
+    def test_weekly_repair_reads_direct_scan_shards_output(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw) / "scan-output"
+            source_root = Path(raw) / "source"
+            source_root.mkdir()
+            run_dir.mkdir(parents=True)
+            write_jsonl(
+                run_dir / "shards.jsonl",
+                [
+                    {
+                        "host": "miku-bot-dev",
+                        "path_ref": "path_ref_v1:aaaaaaaaaaaaaaaa",
+                        "status": "stale",
+                        "coverage_gap": "remote_source_not_materialized",
+                    }
+                ],
+            )
+            (run_dir / "shard_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "window": {
+                            "mode": "weekly",
+                            "start": "2026-05-01T00:00:00Z",
+                            "end": "2026-05-08T00:00:00Z",
+                        },
+                        "sources": [
+                            {
+                                "host": "miku-bot-dev",
+                                "root": str(source_root),
+                                "root_ref": "path_ref_v1:bbbbbbbbbbbbbbbb",
+                                "status": "ready",
+                                "rollout_count": 1,
+                                "summary_count": 0,
+                            }
+                        ],
+                        "coverage_gaps": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            remote_probe = Path(raw) / "remote_codex_probe.py"
+            remote_probe.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            captured: dict[str, set[str]] = {}
+
+            def fake_materialize_repair_hosts(*, gap_hosts, **_kwargs):
+                captured["gap_hosts"] = set(gap_hosts)
+                return {}, []
+
+            def fake_run_scan(args, **_kwargs):
+                output = Path(args.output)
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "shard_manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "window": {
+                                "mode": "weekly",
+                                "start": "2026-05-01T00:00:00Z",
+                                "end": "2026-05-08T00:00:00Z",
+                            },
+                            "sources": [
+                                {
+                                    "host": "miku-bot-dev",
+                                    "root": str(source_root),
+                                    "status": "ready",
+                                    "rollout_count": 0,
+                                    "summary_count": 0,
+                                }
+                            ],
+                            "coverage_gaps": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            def fake_make_shards(_scan_dir, output, *, max_raw_bytes):
+                self.assertGreater(max_raw_bytes, 0)
+                write_jsonl(Path(output) / "shards.jsonl", [])
+
+            with mock.patch.object(
+                MODULE,
+                "materialize_repair_hosts",
+                side_effect=fake_materialize_repair_hosts,
+            ), mock.patch.object(MODULE, "run_scan", side_effect=fake_run_scan), mock.patch.object(
+                MODULE,
+                "validate_output_run",
+                return_value=({"turn_count": 0, "episode_count": 0}, {}),
+            ), mock.patch.object(MODULE, "run_make_shards_for_scan", side_effect=fake_make_shards):
+                MODULE.run_coverage_repair(
+                    types.SimpleNamespace(
+                        run_dir=str(run_dir),
+                        output=str(safe_output_dir(raw, "weekly-coverage-repair")),
+                        max_raw_bytes=1000,
+                        remote_probe=str(remote_probe),
+                        remote_session_meta_limit=500,
+                        remote_host_jobs=1,
+                        remote_rollout_jobs=1,
+                        skip_remote_materialization=False,
+                        allow_partial_hosts=True,
+                    ),
+                    default_output_name="weekly-coverage-repair",
+                    report_kind="weekly_repair",
+                )
+
+        self.assertEqual(captured["gap_hosts"], {"miku-bot-dev"})
+
     def test_weekly_repair_suggests_higher_raw_limit_when_oversized_gaps_remain(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -9497,6 +9602,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["path"], str(root))
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "unsafe_source_artifact")
+
+    def test_make_shards_reports_missing_pre_window_manifest_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            root.mkdir()
+            rollout_ref = "sessions/2026/01/02/rollout-2026-01-02T10-00-00-old.jsonl"
+            summary_ref = "sessions/2026/01/02/rollout-summary-old.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [rollout_ref],
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(
+            sorted(row.get("coverage_gap") for row in rows),
+            ["rollout disappeared during shard discovery", "summary disappeared during shard discovery"],
+        )
+        self.assertEqual([row.get("kind") for row in rows], [None, "summary"])
 
     def test_make_shards_revalidates_remote_summary_backing_before_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -19868,6 +20011,32 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertTrue(output_exists)
 
+    def test_rollout_candidate_relevant_treats_disappearing_oversized_probe_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Old oversized task.", "2026-01-02T10:00:00Z"))
+                + "\n"
+                + ("x" * 2000),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                MODULE,
+                "oversized_rollout_relevance",
+                side_effect=FileNotFoundError(str(rollout)),
+            ):
+                relevant = MODULE.rollout_candidate_relevant(
+                    rollout,
+                    MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    max_raw_bytes=1000,
+                )
+
+        self.assertTrue(relevant)
+
     def test_future_rollout_disappearing_after_irrelevance_does_not_report_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -19898,7 +20067,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertNotIn("volatile_rollout_missing", [gap["reason"] for gap in trend["coverage_gaps"]])
 
-    def test_lookback_rollout_disappearing_before_emit_start_does_not_report_gap(self) -> None:
+    def test_lookback_rollout_disappearing_before_emit_start_reports_conservative_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
@@ -19927,7 +20096,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
-        self.assertNotIn("volatile_rollout_missing", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertIn("volatile_rollout_missing", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_live_rollout_missing_after_stat_during_scan_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
