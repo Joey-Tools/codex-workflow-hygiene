@@ -6977,7 +6977,11 @@ def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
             return window_start <= parsed < window_end
 
         for rollout in source_rollouts(source):
-            parsed = dated_path_from_parts(rollout) or rollout_date_from_path(rollout)
+            parsed = dated_path_from_parts(source_relative_date_path(rollout, source.root))
+            if parsed is None:
+                filename_date = rollout_date_from_path(rollout)
+                if filename_date is not None:
+                    parsed = filename_date.replace(hour=0, minute=0, second=0, microsecond=0)
             if metadata_covers(parsed) and (earliest is None or parsed < earliest):
                 earliest = parsed
         for summary in source_summary_files(source):
@@ -7266,10 +7270,8 @@ def remote_summary_only_gaps(
                 )
                 ref_has_direct_file = backing_ref_direct_file_exists(source.root, selected_ref)
                 ref_maybe_relevant = rollout_ref_maybe_in_window(selected_ref, start, end)
-                if (
-                    not scan_meta_context_relevant
-                    and not ref_has_direct_coverage
-                    and (ref_has_direct_file or not ref_maybe_relevant)
+                if not ref_has_direct_coverage and (
+                    ref_has_direct_file or (not scan_meta_context_relevant and not ref_maybe_relevant)
                 ):
                     continue
                 if ref in complete_summary_refs or ref_key in complete_summary_keys:
@@ -7428,6 +7430,9 @@ def rollout_path_proves_outside_window(
         rollout_date = dated_path_from_parts(source_relative_date_path(path, source_root))
     if rollout_date is None:
         return False
+    rollout_end = rollout_date + dt.timedelta(days=1)
+    if start and rollout_end <= start:
+        return True
     if end and rollout_date >= end:
         return True
     return False

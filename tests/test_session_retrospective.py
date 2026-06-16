@@ -7758,6 +7758,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(MODULE.iso(earliest), "2025-12-31T23:00:00Z")
 
+    def test_earliest_rollout_date_ignores_semantic_source_root_date_for_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "sessions" / "2026" / "01" / "02"
+            rollout = root / "rollout-2026-05-01T10-00-00-fresh.jsonl"
+            write_jsonl(rollout, [message("user", "Fresh baseline task.", "2026-05-01T10:00:00Z")])
+
+            earliest = MODULE.earliest_rollout_date([MODULE.Source("local", root)])
+
+        self.assertEqual(MODULE.iso(earliest), "2026-05-01T00:00:00Z")
+
     def test_baseline_from_first_ignores_malformed_summary_when_deriving_start(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -9837,6 +9847,39 @@ class SessionRetrospectiveTests(unittest.TestCase):
                             }
                         ],
                         "window": {"start": "2026-05-02T00:00:00Z", "end": "2026-05-03T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows, [])
+
+    def test_make_shards_filters_missing_rollout_ref_in_old_date_bucket(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            root.mkdir()
+            rollout_ref = "sessions/2026/01/02/rollout-undated-old.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [rollout_ref],
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
                     }
                 ),
                 encoding="utf-8",
@@ -20448,6 +20491,48 @@ class SessionRetrospectiveTests(unittest.TestCase):
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_scan_meta_only_summary_ignores_existing_direct_file_without_window_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-stale.jsonl"
+            rollout = remote / rollout_ref
+            write_jsonl(rollout, [message("user", "Stale remote task.", "2026-04-01T10:00:00Z")])
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-scan-meta-only.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        source_sha256=MODULE.file_sha256(rollout),
+                        summary_record_count=0,
+                    ),
+                    {
+                        "kind": "session_meta",
+                        "timestamp": "2026-05-01T10:15:00Z",
+                        "text": "session_id=remote-session cwd_present=true",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"miku-bot-dev={remote}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=1000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T10:00:00Z"),
+                end=MODULE.parse_time("2026-05-01T10:30:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_default_remote_scan_meta_only_summary_ignores_subday_out_of_window_ref(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
