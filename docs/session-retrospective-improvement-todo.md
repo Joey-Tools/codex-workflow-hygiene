@@ -234,6 +234,9 @@ review gates, and merge before starting the next item.
    - Preserve `remote_source_not_materialized` for default remote roots that
      disappear between scan and shard planning, so repair can rematerialize the
      host instead of treating the gap as local `source_root_missing`.
+   - Treat legacy shard rows that say `source root missing` for default remote
+     hosts as `remote_source_not_materialized` during dry-run report and repair
+     planning, so older transient runs remain repairable.
    - Parse dates from root-level `rollout-summary-YYYY-MM-DD...jsonl` filenames
      so future disappeared summaries can be safely suppressed.
    - Store transient scan-time rollout and summary refs in `shard_manifest.json`

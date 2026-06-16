@@ -8082,8 +8082,11 @@ def shard_coverage_gaps(shards_dir: Path) -> list[dict[str, Any]]:
         reason = shard_coverage_gap_reason(row.get("coverage_gap"))
         if reason is None:
             continue
+        host = str(row.get("host") or "unknown")
+        if reason == "source_root_missing" and host in DEFAULT_REMOTE_HOSTS:
+            reason = "remote_source_not_materialized"
         gap: dict[str, Any] = {
-            "host": str(row.get("host") or "unknown"),
+            "host": host,
             "reason": reason,
         }
         if isinstance(row.get("path_ref"), str) and row.get("path_ref"):

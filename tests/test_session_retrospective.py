@@ -5337,6 +5337,39 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(source_coverage["blocked_sources"], 1)
         self.assertIn("Top blockers: volatile_rollout_missing=1", markdown)
 
+    def test_shard_coverage_gaps_treat_default_remote_missing_root_as_materialization_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            shards = Path(raw) / "shards"
+            shards.mkdir()
+            write_jsonl(
+                shards / "shards.jsonl",
+                [
+                    {
+                        "host": "miku-bot-dev",
+                        "root_ref": "path_ref_v1:aaaaaaaaaaaaaaaa",
+                        "status": "missing",
+                        "coverage_gap": "source root missing",
+                    },
+                    {
+                        "host": "custom_source",
+                        "root_ref": "path_ref_v1:bbbbbbbbbbbbbbbb",
+                        "status": "missing",
+                        "coverage_gap": "source root missing",
+                    },
+                ],
+            )
+
+            gaps = MODULE.shard_coverage_gaps(shards)
+
+        self.assertEqual(
+            [(gap["host"], gap["reason"]) for gap in gaps],
+            [
+                ("miku-bot-dev", "remote_source_not_materialized"),
+                ("custom_source", "source_root_missing"),
+            ],
+        )
+        self.assertEqual(MODULE.repair_materialization_gap_hosts(gaps), {"miku-bot-dev"})
+
     def test_dry_run_report_shard_gap_blocks_only_matching_source_root(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "weekly-dry-run"
