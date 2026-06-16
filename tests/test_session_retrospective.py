@@ -3484,6 +3484,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "API key leak in logs.",
             "The private key leaked.",
             "Leaked password in logs.",
+            "Data leaked in logs.",
+            "Sensitive data exposed.",
+            "personally identifiable information in output.",
             "Exposed token in CI.",
             "Breached credential in output.",
             "Use sk-proj-abcdefghijklmnop123456",
@@ -3515,6 +3518,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "客户名称=北京公司",
             "租户名称：腾讯云",
             "组织名=研发一部",
+            "发现敏感数据",
             "请在生产数据库上运行迁移。",
             "请轮换生产密码。",
             "请执行破坏性删除。",
@@ -11725,6 +11729,40 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"HOME": str(home)}):
                 MODULE.run_scan(
                     types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="weekly",
+                    start=MODULE.parse_time("2026-06-08T00:00:00Z"),
+                    end=MODULE.parse_time("2026-06-15T00:00:00Z"),
+                )
+            generated_root = MODULE.generated_summary_base_for_output(output)
+            generated = list(generated_root.rglob("rollout-summary-*.jsonl"))
+            generated_text = generated[0].read_text(encoding="utf-8") if generated else ""
+
+        self.assertEqual(len(generated), 1)
+        self.assertIn('"timestamp": "2026-06-10T12:00:00Z"', generated_text)
+
+    def test_old_active_oversized_rollout_with_active_mtime_generates_summary_when_larger_than_summary_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = home / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "20" / "rollout-2026-05-20T21-07-17-old-large.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(untimestamped_message("user", "Active mtime task."))
+                + "\n"
+                + ("x" * 400),
+                encoding="utf-8",
+            )
+            active_mtime = MODULE.parse_time("2026-06-10T12:00:00Z").timestamp()
+            os.utime(rollout, (active_mtime, active_mtime))
+            output = safe_output_dir(raw)
+
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}),
+                mock.patch.object(MODULE, "LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES", 256),
+            ):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=32, allow_partial_hosts=True),
                     mode="weekly",
                     start=MODULE.parse_time("2026-06-08T00:00:00Z"),
                     end=MODULE.parse_time("2026-06-15T00:00:00Z"),
@@ -24149,6 +24187,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "Destructive test coverage is missing from the parser.",
             "Delete from the list after sorting.",
             "Privacy design review for ordinary settings UI.",
+            "Data model review for ordinary report output.",
             "Keep token budget under control for this retrospective.",
             "The secret is missing from the test fixture.",
             "password is required by the integration test.",

@@ -2017,7 +2017,8 @@ def generate_local_rollout_summaries_for_source(
             continue
         if relevance == "irrelevant":
             continue
-        if relevance == "unknown" and size > LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES:
+        active_mtime = rollout_active_mtime(rollout, gap_start, end) if rollout_mtime_fallback else None
+        if relevance == "unknown" and size > LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES and active_mtime is None:
             continue
         rollout_ref = source_relative_path_ref(rollout, source.root)
         if (
@@ -2026,7 +2027,6 @@ def generate_local_rollout_summaries_for_source(
             or rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys)
         ):
             continue
-        active_mtime = rollout_active_mtime(rollout, gap_start, end) if rollout_mtime_fallback else None
         try:
             summary = write_generated_local_rollout_summary(
                 source,

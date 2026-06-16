@@ -307,13 +307,17 @@ SUMMARY_SENSITIVE_PREFILTER_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:access|api|auth|authorization|client|refresh|id|session|csrf|xsrf|secret)[._-]?(?:token|key|secret|password|passwd|pwd)\b|"
     r"(?<![A-Za-z0-9])(?:aws|github|gitlab|openai|database|db|prod|production|api|private|client|secret|access)[._-]?(?:(?:secret|access|api)[._-]?)*(?:token|key|password|passwd|pwd|credential)\b|"
     r"(?<![A-Za-z0-9])(?:customer|client|tenant|account|org|organization|organisation|personal|pii|privacy)(?:[._-]?(?:id|name|data|info|identifier))?\b|"
+    r"\b(?:pii|personally identifiable information)\b|"
+    r"\bprivacy\s+(?:risk|issue|concern|leak|exposure|breach)\b|"
+    r"\b(?:credential|secret|data|api[-_ ]?key|private[-_ ]?key|token|password|passwd|key)\s+(?:leaks?|leaked|expos(?:ure|ed|e|es)|breach(?:ed|es)?)\b|"
+    r"\b(?:leaks?|leaked|expos(?:ure|ed|e|es)|breach(?:ed|es)?)\s+(?:credential|secret|data|api[-_ ]?key|private[-_ ]?key|token|password|passwd|key)\b|"
     r"\b(?:prod|production)\b|"
     r"\b(?:rm|sudo|kubectl|drop|truncate|delete|reset|deploy|migrate|migration|rollback|restart|apply)\b|"
     r"\b(?:10|100|127|169|172|192)\.|::|f[cd][0-9a-f]{0,2}:|fe[89ab][0-9a-f]?:|"
     r"\b(?:localhost|internal|corp|local|lan|example|invalid|test)\b|"
     r"\b(?:sk|rk)[-_]|gh[pousr]_|github_pat_|AKIA[0-9A-Z]{4,}|eyJ[A-Za-z0-9_-]{10,}|-----BEGIN |"
     r"[0-9a-fA-F]{32}|"
-    r"密码|口令|凭据|凭证|密钥|令牌|授权|客户|客户端|租户|账户|账号|组织|机构|个人信息|隐私|生产|破坏性"
+    r"密码|口令|凭据|凭证|密钥|令牌|授权|客户|客户端|租户|账户|账号|组织|机构|客户数据|客户隐私|个人信息|隐私|隐私风险|隐私泄露|敏感数据|生产|破坏性"
     r")",
     re.I,
 )
