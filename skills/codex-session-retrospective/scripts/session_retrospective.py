@@ -1022,8 +1022,23 @@ def source_relative_date_path(path: Path, source_root: Path | None) -> Path:
             return path
 
 
+def source_relative_summary_hint_path(path: Path, source_root: Path | None) -> Path | None:
+    if source_root is None:
+        return path
+    try:
+        return path.expanduser().resolve(strict=False).relative_to(source_root.expanduser().resolve(strict=False))
+    except (OSError, ValueError):
+        try:
+            return path.expanduser().relative_to(source_root.expanduser())
+        except ValueError:
+            return None
+
+
 def summary_date_from_semantic_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
-    parts = source_relative_date_path(path, source_root).parts
+    relative = source_relative_summary_hint_path(path, source_root)
+    if relative is None:
+        return None
+    parts = relative.parts
     for index, part in enumerate(parts):
         if (
             part not in {"sessions", "archived_sessions"}
@@ -1042,7 +1057,10 @@ def summary_date_from_semantic_path(path: Path, *, source_root: Path | None = No
 def summary_date_from_dated_parent_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
     if not path.name.startswith("rollout-summary"):
         return None
-    parts = source_relative_date_path(path, source_root).parts
+    relative = source_relative_summary_hint_path(path, source_root)
+    if relative is None:
+        return None
+    parts = relative.parts
     if len(parts) < 4:
         return None
     year, month, day = parts[-4:-1]
@@ -2205,6 +2223,19 @@ def timestamped_rollout_maybe_reaches_start(
     )
 
 
+def timestamped_rollout_path_hint(path: Path) -> tuple[dt.datetime, dt.datetime | None] | None:
+    match = re.search(
+        r"^rollout-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})(?:-|\.jsonl$)",
+        path.name,
+    )
+    if not match:
+        return None
+    rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+    if rollout_time is None:
+        return None
+    return rollout_time, parse_time(f"{match.group(1)}T00:00:00Z")
+
+
 def rollout_filename_in_window(
     path: Path,
     start: dt.datetime | None,
@@ -2252,6 +2283,19 @@ def rollout_candidate_relevant(
 ) -> bool:
     if start is None and end is None:
         return True
+    timestamped_hint = timestamped_rollout_path_hint(path)
+    if timestamped_hint is not None:
+        rollout_time, rollout_day_start = timestamped_hint
+        if end and rollout_time >= end:
+            return False
+        if start and rollout_time < start and timestamped_rollout_maybe_reaches_start(
+            rollout_time,
+            rollout_day_start,
+            start,
+        ):
+            rollout_day_end = rollout_day_start + dt.timedelta(days=1) if rollout_day_start is not None else None
+            if rollout_day_end is None or start >= rollout_day_end:
+                return True
     rollout_date = rollout_window_date(path, source_root=source_root)
     if rollout_date and end and rollout_date >= end:
         return False

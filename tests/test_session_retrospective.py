@@ -9893,6 +9893,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
 
+    def test_make_shards_marks_invalid_timestamped_rollout_across_midnight(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            rollout_ref = "sessions/2026/04/30/rollout-2026-04-30T23-30-00-cross-midnight.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text("{not-json\n", encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [rollout_ref],
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:30:00Z", "end": "2026-05-01T01:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(rollout))
+        self.assertEqual(rows[0]["status"], "invalid")
+        self.assertEqual(rows[0]["coverage_gap"], "invalid JSONL; cannot safely hand to extractor shard")
+
     def test_make_shards_filters_missing_timestamped_summary_ref_before_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
@@ -11242,6 +11280,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
+    def test_summary_date_fallback_rejects_paths_outside_source_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            outside = Path(raw) / "2026" / "07" / "01" / "rollout-summary-undated.jsonl"
+            outside.parent.mkdir(parents=True)
+
+            without_source_root = MODULE.summary_date_from_path(outside)
+            with_source_root = MODULE.summary_date_from_path(outside, source_root=root)
+            outside_window_with_source_root = MODULE.summary_path_proves_outside_window(
+                outside,
+                MODULE.parse_time("2026-05-01T00:00:00Z"),
+                MODULE.parse_time("2026-06-01T00:00:00Z"),
+                source_root=root,
+            )
+
+        self.assertEqual(without_source_root, MODULE.parse_time("2026-07-01T00:00:00Z"))
+        self.assertIsNone(with_source_root)
+        self.assertFalse(outside_window_with_source_root)
 
     def test_partial_dated_source_root_does_not_complete_summary_parent_date(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
