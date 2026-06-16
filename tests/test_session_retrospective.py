@@ -3240,20 +3240,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("over_exploration", over_flags)
         self.assertIn("under_asking", under_flags)
 
-    def test_bounded_flag_probe_text_keeps_head_and_tail(self) -> None:
-        text = "head failed " + ("x" * 100) + " unable to run tail"
-        probe = MODULE.bounded_flag_probe_text(text, limit=24)
+    def test_flag_probe_chunks_cover_middle_signals_with_bounded_inputs(self) -> None:
+        text = ("x" * 30) + " permission denied " + ("x" * 30)
+        chunks = list(MODULE.iter_flag_probe_text_chunks(text, limit=40, overlap=20))
 
-        self.assertTrue(probe.startswith("head failed"))
-        self.assertTrue(probe.endswith("run tail"))
-        self.assertIn("[TRUNCATED_FOR_FLAG_SCAN]", probe)
-        self.assertLess(len(probe), len(text))
+        self.assertTrue(all(len(chunk) <= 40 for chunk in chunks))
+        self.assertTrue(any("permission denied" in chunk for chunk in chunks))
+        self.assertIn("approval_auth_friction", MODULE.flags_for_probe_text(text))
 
-    def test_extract_rollout_uses_bounded_flag_probe_for_large_assistant_text(self) -> None:
+    def test_extract_rollout_uses_bounded_chunk_flag_scan_for_large_assistant_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-large-output.jsonl"
-            assistant_text = "error: failed\n" + ("x" * (MODULE.FLAG_SCAN_MAX_CHARS * 2)) + "\nunable to run"
+            assistant_text = (
+                "start\n"
+                + ("x" * MODULE.FLAG_SCAN_MAX_CHARS)
+                + "\npermission denied\n"
+                + ("x" * MODULE.FLAG_SCAN_MAX_CHARS)
+                + "\nend"
+            )
             write_jsonl(
                 rollout,
                 [
@@ -3273,7 +3278,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(turns), 1)
         self.assertIn("failed_command", turns[0].issue_flags)
-        self.assertIn("verification_gap", turns[0].issue_flags)
+        self.assertIn("approval_auth_friction", turns[0].issue_flags)
 
     def test_safety_privacy_flag_ignores_ordinary_engineering_context(self) -> None:
         samples = [
@@ -11631,7 +11636,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "partial_host_scope")
 
-    def test_old_huge_oversized_rollout_prefilter_does_not_use_bounded_timestamp_scan(self) -> None:
+    def test_old_huge_archived_oversized_rollout_reports_conservative_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
@@ -11645,11 +11650,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
-            with mock.patch.object(
-                MODULE,
-                "oversized_rollout_has_timestamp_in_window",
-                side_effect=AssertionError("bounded timestamp scan"),
-            ):
+            with mock.patch.object(MODULE, "ROLLOUT_TIMESTAMP_SCAN_BYTES", 128):
                 MODULE.run_scan(
                     types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
                     mode="daily",
@@ -11657,11 +11658,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     end=MODULE.parse_time("2026-05-02T00:00:00Z"),
                 )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
-            generated_root = MODULE.generated_summary_base_for_output(output)
-            generated = list(generated_root.rglob("rollout-summary-*.jsonl"))
 
-        self.assertEqual(trend["coverage_gaps"][0]["reason"], "partial_host_scope")
-        self.assertEqual(generated, [])
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_old_archived_oversized_rollout_with_late_window_record_generates_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            old_large = root / "archived_sessions" / "rollout-2026-01-02T10-00-00-old-large.jsonl"
+            old_large.parent.mkdir(parents=True, exist_ok=True)
+            write_jsonl(
+                old_large,
+                [
+                    message("user", "Old prelude. " + ("x" * 300), "2026-01-02T10:00:00Z"),
+                    message("user", "Fresh continuation.", "2026-05-01T12:00:00Z"),
+                ],
+            )
+            old_mtime = MODULE.parse_time("2026-01-02T10:00:00Z").timestamp()
+            os.utime(old_large, (old_mtime, old_mtime))
+            output = safe_output_dir(raw)
+
+            with mock.patch.object(MODULE, "ROLLOUT_TIMESTAMP_SCAN_BYTES", 128):
+                MODULE.run_scan(
+                    types.SimpleNamespace(
+                        source=[f"local={root}"],
+                        output=str(output),
+                        state=None,
+                        max_raw_bytes=100,
+                        allow_partial_hosts=True,
+                    ),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(len(manifest["sources"][0]["generated_summaries"]), 1)
 
     def test_old_file_relevance_prefilters_handle_unreadable_timestamp_scan(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

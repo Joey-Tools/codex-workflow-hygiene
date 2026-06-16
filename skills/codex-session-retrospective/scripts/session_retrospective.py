@@ -245,6 +245,7 @@ LOCAL_ROLLOUT_SUMMARY_LIMIT = 200
 LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS = 1200
 FLAG_SCAN_MAX_CHARS = 1_200
+FLAG_SCAN_CHUNK_OVERLAP_CHARS = 256
 LOCAL_GENERATED_SUMMARY_DIR_SUFFIX = "generated-rollout-summaries"
 LOCAL_GENERATED_SUMMARY_CACHE_DIR = "local-rollout-summary-cache"
 LOCAL_GENERATED_SUMMARY_CACHE_DIR_NAMES = frozenset({LOCAL_GENERATED_SUMMARY_CACHE_DIR})
@@ -630,11 +631,31 @@ def compact(text: str, limit: int = 600) -> str:
     return collapsed[: limit - 1].rstrip() + "..."
 
 
-def bounded_flag_probe_text(text: str, limit: int = FLAG_SCAN_MAX_CHARS) -> str:
+def iter_flag_probe_text_chunks(
+    text: str,
+    *,
+    limit: int = FLAG_SCAN_MAX_CHARS,
+    overlap: int = FLAG_SCAN_CHUNK_OVERLAP_CHARS,
+) -> Iterator[str]:
     if len(text) <= limit:
-        return text
-    half = max(1, limit // 2)
-    return text[:half] + "\n[TRUNCATED_FOR_FLAG_SCAN]\n" + text[-half:]
+        yield text
+        return
+    safe_limit = max(1, limit)
+    safe_overlap = min(max(0, overlap), max(0, safe_limit - 1))
+    step = max(1, safe_limit - safe_overlap)
+    start = 0
+    while start < len(text):
+        yield text[start : start + safe_limit]
+        if start + safe_limit >= len(text):
+            return
+        start += step
+
+
+def flags_for_probe_text(text: str) -> set[str]:
+    flags: set[str] = set()
+    for chunk in iter_flag_probe_text_chunks(text):
+        flags.update(flags_for_text(chunk))
+    return flags
 
 
 def redact(text: str) -> tuple[str, bool]:
@@ -2139,14 +2160,6 @@ def rollout_candidate_relevant(
         except OSError:
             return True
         if max_raw_bytes is not None and size > max_raw_bytes:
-            if (
-                rollout_date
-                and start
-                and rollout_date < start
-                and size > ROLLOUT_TIMESTAMP_SCAN_BYTES
-                and rollout_path_has_archived_sessions_ancestor(path)
-            ):
-                return False
             relevance = oversized_rollout_relevance(
                 path,
                 start,
@@ -4735,7 +4748,7 @@ def extract_rollout(
                 current.prompt_improvement = "Ask Codex to report the exact verification run and stop if it cannot complete the requested check."
 
     def flags_from_raw_text(text: str) -> set[str]:
-        return flags_for_text(bounded_flag_probe_text(text))
+        return flags_for_probe_text(text)
 
     def wrapper_pending_assistant_releasable(text: str) -> bool:
         lowered = text.lower()

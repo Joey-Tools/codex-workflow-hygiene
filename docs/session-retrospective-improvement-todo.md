@@ -210,6 +210,12 @@ review gates, and merge before starting the next item.
    - Treat missing date hints conservatively for disappeared files: only
      suppress a volatile gap when the path hint proves the file is outside the
      requested window.
+   - Scan long assistant/tool records for issue flags in bounded overlapping
+     chunks rather than head/tail sampling, so middle-record failure and
+     safety signals are not lost.
+   - Keep old oversized archived rollouts conservative when the bounded
+     timestamp scan cannot prove they are outside the window; generate a
+     bounded local summary when possible, otherwise preserve the coverage gap.
    - Store transient scan-time rollout and summary refs in `shard_manifest.json`
      and compare them during `make-shards`, so files that disappear before
      rediscovery still become volatile shard gaps instead of being silently
