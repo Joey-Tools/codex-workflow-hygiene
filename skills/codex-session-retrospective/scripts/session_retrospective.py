@@ -7149,6 +7149,7 @@ def remote_summary_only_gaps(
                 start,
                 end,
                 max_scan_bytes=summary_scan_bytes,
+                source_root=source.root,
             )
             for ref in scan_meta_refs:
                 if rollout_ref_has_window_hint(ref) and not rollout_ref_in_window(ref, start, end):

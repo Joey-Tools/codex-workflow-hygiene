@@ -10891,6 +10891,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
 
+    def test_session_meta_window_ignores_semantic_source_root_itself(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "sessions" / "2026" / "07" / "01"
+            root.mkdir(parents=True)
+            summary = root / "rollout-summary-undated.jsonl"
+            write_jsonl(summary, [{"kind": "session_meta", "session_id": "session-1"}])
+
+            without_source_root = MODULE.summary_file_has_session_meta_in_window(
+                summary,
+                MODULE.parse_time("2026-07-01T00:00:00Z"),
+                MODULE.parse_time("2026-07-02T00:00:00Z"),
+                max_scan_bytes=1000,
+            )
+            with_source_root = MODULE.summary_file_has_session_meta_in_window(
+                summary,
+                MODULE.parse_time("2026-07-01T00:00:00Z"),
+                MODULE.parse_time("2026-07-02T00:00:00Z"),
+                max_scan_bytes=1000,
+                source_root=root,
+            )
+
+        self.assertTrue(without_source_root)
+        self.assertFalse(with_source_root)
+
     def test_undated_root_summary_does_not_use_semantic_looking_source_root(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "sessions" / "2026" / "07" / "01" / ".codex"
