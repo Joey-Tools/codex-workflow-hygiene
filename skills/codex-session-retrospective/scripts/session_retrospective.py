@@ -1009,7 +1009,18 @@ def dated_path_from_parts(path: Path) -> dt.datetime | None:
     return None
 
 
-def summary_date_from_semantic_path(path: Path) -> dt.datetime | None:
+def path_parent_is_source_root(path: Path, source_root: Path | None) -> bool:
+    if source_root is None:
+        return False
+    try:
+        return path.parent.expanduser().resolve(strict=False) == source_root.expanduser().resolve(strict=False)
+    except OSError:
+        return path.parent.expanduser() == source_root.expanduser()
+
+
+def summary_date_from_semantic_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
+    if path_parent_is_source_root(path, source_root):
+        return None
     parts = path.parts
     for index, part in enumerate(parts):
         if (
@@ -1029,13 +1040,8 @@ def summary_date_from_semantic_path(path: Path) -> dt.datetime | None:
 def summary_date_from_dated_parent_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
     if not path.name.startswith("rollout-summary"):
         return None
-    if source_root is not None:
-        try:
-            if path.parent.expanduser().resolve(strict=False) == source_root.expanduser().resolve(strict=False):
-                return None
-        except OSError:
-            if path.parent.expanduser() == source_root.expanduser():
-                return None
+    if path_parent_is_source_root(path, source_root):
+        return None
     parts = path.parts
     if len(parts) < 4:
         return None
@@ -1054,7 +1060,7 @@ def summary_date_from_path(path: Path, *, source_root: Path | None = None) -> dt
         if match.group(2):
             return parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
         return parse_time(f"{match.group(1)}T00:00:00Z")
-    return summary_date_from_semantic_path(path) or summary_date_from_dated_parent_path(
+    return summary_date_from_semantic_path(path, source_root=source_root) or summary_date_from_dated_parent_path(
         path,
         source_root=source_root,
     )
