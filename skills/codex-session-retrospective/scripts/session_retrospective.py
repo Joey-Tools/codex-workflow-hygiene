@@ -9758,7 +9758,13 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 continue
             rollout_path = source_rollout_declared_path_from_ref(source, rollout_ref)
             if rollout_path is not None:
+                if safe_source_file(rollout_path, root):
+                    rollouts.append(rollout_path)
+                    current_rollout_refs.add(rollout_ref)
+                    current_rollout_keys.update(rollout_match_keys_for_ref(rollout_ref))
+                    continue
                 append_disappeared_rollout_shard(rollout_path)
+        rollouts = sorted(set(rollouts))
         current_summary_refs = set(source_summary_manifest_refs(source_summaries, root))
         for summary_ref in manifest_source_ref_list(source_entry, "summary_refs", summary=True):
             if summary_ref in current_summary_refs:

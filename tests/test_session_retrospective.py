@@ -10098,6 +10098,45 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
 
+    def test_make_shards_keeps_existing_nested_root_scan_rollout_after_search_roots_change(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            (root / "sessions").mkdir(parents=True)
+            rollout_ref = "copied/rollout-2026-05-22T10-00-00-copied.jsonl"
+            write_jsonl(root / rollout_ref, [message("user", "Copied root scan rollout.", "2026-05-22T10:00:00Z")])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 1,
+                                "rollout_refs": [rollout_ref],
+                                "summary_count": 0,
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(root / rollout_ref))
+        self.assertEqual(rows[0]["status"], "ready")
+        self.assertNotIn("coverage_gap", rows[0])
+
     def test_source_rollout_manifest_refs_preserve_nested_root_scan_rollouts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
