@@ -9714,7 +9714,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "unsafe_source_artifact")
 
-    def test_make_shards_ignores_missing_pre_window_manifest_refs(self) -> None:
+    def test_make_shards_reports_missing_pre_window_manifest_refs_conservatively(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
             root.mkdir()
@@ -9746,7 +9746,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertEqual(rows, [])
+        self.assertEqual(
+            sorted(row.get("coverage_gap") for row in rows),
+            ["rollout disappeared during shard discovery", "summary disappeared during shard discovery"],
+        )
+        self.assertEqual([row.get("kind") for row in rows], [None, "summary"])
 
     def test_make_shards_reports_missing_timestamped_rollout_ref_that_started_before_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -9767,6 +9771,107 @@ class SessionRetrospectiveTests(unittest.TestCase):
                             }
                         ],
                         "window": {"start": "2026-05-01T12:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
+    def test_make_shards_reports_missing_timestamped_rollout_ref_across_midnight(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            root.mkdir()
+            rollout_ref = "sessions/2026/04/30/rollout-2026-04-30T23-30-00-cross-midnight.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [rollout_ref],
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-01T01:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
+    def test_make_shards_filters_missing_timestamped_summary_ref_before_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            root.mkdir()
+            summary_ref = "sessions/2026/05/01/rollout-summary-2026-05-01T10-00-00-old.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [],
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-05-02T00:00:00Z", "end": "2026-05-03T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows, [])
+
+    def test_dated_source_root_itself_does_not_date_root_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "2026" / "01" / "02"
+            root.mkdir(parents=True)
+            rollout_ref = "rollout-undated.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [rollout_ref],
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
                     }
                 ),
                 encoding="utf-8",
@@ -10852,11 +10957,89 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
 
+    def test_partial_dated_source_root_does_not_complete_summary_parent_date(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "2026" / "05"
+            root.mkdir(parents=True)
+            summary_ref = "22/rollout-summary-undated.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 0,
+                                "rollout_refs": [],
+                                "summary_count": 1,
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-06-01T00:00:00Z", "end": "2026-06-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIsNone(MODULE.summary_date_from_path(root / summary_ref, source_root=root))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
     def test_semantic_source_root_itself_does_not_date_root_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "sessions" / "2026" / "07" / "01"
             root.mkdir(parents=True)
             summary_ref = "rollout-summary-undated.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 0,
+                                "rollout_refs": [],
+                                "summary_count": 1,
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIsNone(MODULE.summary_date_from_path(root / summary_ref, source_root=root))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
+    def test_partial_semantic_source_root_does_not_complete_summary_date(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "sessions" / "2026"
+            root.mkdir(parents=True)
+            summary_ref = "07/01/rollout-summary-undated.jsonl"
             manifest = Path(raw) / "manifest.json"
             manifest.write_text(
                 json.dumps(

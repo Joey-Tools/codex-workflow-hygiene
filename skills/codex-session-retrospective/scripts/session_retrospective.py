@@ -1009,19 +1009,20 @@ def dated_path_from_parts(path: Path) -> dt.datetime | None:
     return None
 
 
-def path_parent_is_source_root(path: Path, source_root: Path | None) -> bool:
+def source_relative_date_path(path: Path, source_root: Path | None) -> Path:
     if source_root is None:
-        return False
+        return path
     try:
-        return path.parent.expanduser().resolve(strict=False) == source_root.expanduser().resolve(strict=False)
-    except OSError:
-        return path.parent.expanduser() == source_root.expanduser()
+        return path.expanduser().resolve(strict=False).relative_to(source_root.expanduser().resolve(strict=False))
+    except (OSError, ValueError):
+        try:
+            return path.expanduser().relative_to(source_root.expanduser())
+        except ValueError:
+            return path
 
 
 def summary_date_from_semantic_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
-    if path_parent_is_source_root(path, source_root):
-        return None
-    parts = path.parts
+    parts = source_relative_date_path(path, source_root).parts
     for index, part in enumerate(parts):
         if (
             part not in {"sessions", "archived_sessions"}
@@ -1040,9 +1041,7 @@ def summary_date_from_semantic_path(path: Path, *, source_root: Path | None = No
 def summary_date_from_dated_parent_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
     if not path.name.startswith("rollout-summary"):
         return None
-    if path_parent_is_source_root(path, source_root):
-        return None
-    parts = path.parts
+    parts = source_relative_date_path(path, source_root).parts
     if len(parts) < 4:
         return None
     year, month, day = parts[-4:-1]
@@ -1051,19 +1050,29 @@ def summary_date_from_dated_parent_path(path: Path, *, source_root: Path | None 
     return None
 
 
-def summary_date_from_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
+def summary_date_hint_from_path(path: Path, *, source_root: Path | None = None) -> tuple[dt.datetime, bool] | None:
     match = re.search(
         r"^rollout-summary-.*?(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?",
         path.name,
     )
     if match:
         if match.group(2):
-            return parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
-        return parse_time(f"{match.group(1)}T00:00:00Z")
-    return summary_date_from_semantic_path(path, source_root=source_root) or summary_date_from_dated_parent_path(
+            parsed = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+            return (parsed, True) if parsed is not None else None
+        parsed = parse_time(f"{match.group(1)}T00:00:00Z")
+        return (parsed, False) if parsed is not None else None
+    parsed = summary_date_from_semantic_path(path, source_root=source_root) or summary_date_from_dated_parent_path(
         path,
         source_root=source_root,
     )
+    return (parsed, False) if parsed is not None else None
+
+
+def summary_date_from_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
+    hint = summary_date_hint_from_path(path, source_root=source_root)
+    if hint is None:
+        return None
+    return hint[0]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7309,28 +7318,26 @@ def rollout_path_proves_after_window(path: Path, end: dt.datetime | None) -> boo
     return bool(end and rollout_date >= end)
 
 
-def rollout_path_proves_outside_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+def rollout_path_proves_outside_window(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
     match = re.search(
         r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)",
         path.name,
     )
     if match and match.group(2):
         rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
-        rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
-        rollout_end = rollout_date + dt.timedelta(days=1) if rollout_date is not None else None
-        return bool(
-            rollout_time
-            and ((end and rollout_time >= end) or (start and rollout_end is not None and rollout_end <= start))
-        )
+        return bool(rollout_time and end and rollout_time >= end)
     if match:
         rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
     else:
-        rollout_date = dated_path_from_parts(path)
+        rollout_date = dated_path_from_parts(source_relative_date_path(path, source_root))
     if rollout_date is None:
         return False
-    rollout_end = rollout_date + dt.timedelta(days=1)
-    if start and rollout_end <= start:
-        return True
     if end and rollout_date >= end:
         return True
     return False
@@ -7350,11 +7357,11 @@ def summary_path_proves_outside_window(
     *,
     source_root: Path | None = None,
 ) -> bool:
-    summary_date = summary_date_from_path(path, source_root=source_root)
-    if summary_date is None:
+    summary_hint = summary_date_hint_from_path(path, source_root=source_root)
+    if summary_hint is None:
         return False
-    summary_end = summary_date + dt.timedelta(days=1)
-    if start and summary_end <= start:
+    summary_date, exact_timestamp = summary_hint
+    if exact_timestamp and start and summary_date < start:
         return True
     if end and summary_date >= end:
         return True
@@ -7399,7 +7406,7 @@ def run_scan(
         coverage_gaps.append(source_path_coverage_gap(source, path, "oversized_summary_skipped", bytes=size))
 
     def append_volatile_rollout_gap(path: Path) -> None:
-        if not rollout_path_proves_outside_window(path, start, end):
+        if not rollout_path_proves_outside_window(path, start, end, source_root=source.root):
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_rollout_missing"))
 
     def append_volatile_summary_gap(path: Path, *, allow_future_path_filter: bool = True) -> None:
@@ -9688,7 +9695,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         )
 
     def append_disappeared_rollout_shard(rollout: Path) -> None:
-        if rollout_path_proves_outside_window(rollout, start, end):
+        if rollout_path_proves_outside_window(rollout, start, end, source_root=root):
             return
         rows.append(
             shard_row(
@@ -10063,7 +10070,12 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     max_relevance_scan_bytes=max_rollout_relevance_scan_bytes,
                     allow_mtime_fallback=rollout_mtime_fallback,
                 ):
-                    if path_disappeared(rollout) and not rollout_path_proves_outside_window(rollout, start, end):
+                    if path_disappeared(rollout) and not rollout_path_proves_outside_window(
+                        rollout,
+                        start,
+                        end,
+                        source_root=root,
+                    ):
                         append_disappeared_rollout_shard(rollout)
                     continue
                 size = rollout.stat().st_size
