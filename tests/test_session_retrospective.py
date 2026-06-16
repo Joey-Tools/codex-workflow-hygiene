@@ -10732,7 +10732,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertEqual(MODULE.summary_date_from_path(summary), MODULE.parse_time("2026-05-22T00:00:00Z"))
+        self.assertEqual(
+            MODULE.summary_date_from_path(summary, source_root=root),
+            MODULE.parse_time("2026-05-22T00:00:00Z"),
+        )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "ready")
@@ -10806,7 +10809,46 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertIsNone(MODULE.summary_date_from_path(root / summary_ref))
+        self.assertIsNone(MODULE.summary_date_from_path(root / summary_ref, source_root=root))
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
+    def test_dated_source_root_itself_does_not_date_root_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "2026" / "07" / "01"
+            root.mkdir(parents=True)
+            summary_ref = "rollout-summary-undated.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 0,
+                                "rollout_refs": [],
+                                "summary_count": 1,
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIsNone(MODULE.summary_date_from_path(root / summary_ref, source_root=root))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
 
@@ -10843,7 +10885,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertIsNone(MODULE.summary_date_from_path(root / summary_ref))
+        self.assertIsNone(MODULE.summary_date_from_path(root / summary_ref, source_root=root))
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
 
@@ -10880,7 +10922,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertEqual(MODULE.summary_date_from_path(root / summary_ref), MODULE.parse_time("2026-07-01T00:00:00Z"))
+        self.assertEqual(
+            MODULE.summary_date_from_path(root / summary_ref, source_root=root),
+            MODULE.parse_time("2026-07-01T00:00:00Z"),
+        )
         self.assertEqual(rows, [])
 
     def test_make_shards_reports_manifest_summary_ref_missing_before_rediscovery(self) -> None:

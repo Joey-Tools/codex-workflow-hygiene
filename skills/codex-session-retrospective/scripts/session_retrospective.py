@@ -1026,9 +1026,16 @@ def summary_date_from_semantic_path(path: Path) -> dt.datetime | None:
     return None
 
 
-def summary_date_from_dated_parent_path(path: Path) -> dt.datetime | None:
+def summary_date_from_dated_parent_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
     if not path.name.startswith("rollout-summary"):
         return None
+    if source_root is not None:
+        try:
+            if path.parent.expanduser().resolve(strict=False) == source_root.expanduser().resolve(strict=False):
+                return None
+        except OSError:
+            if path.parent.expanduser() == source_root.expanduser():
+                return None
     parts = path.parts
     if len(parts) < 4:
         return None
@@ -1038,7 +1045,7 @@ def summary_date_from_dated_parent_path(path: Path) -> dt.datetime | None:
     return None
 
 
-def summary_date_from_path(path: Path) -> dt.datetime | None:
+def summary_date_from_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
     match = re.search(
         r"^rollout-summary-.*?(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?",
         path.name,
@@ -1047,7 +1054,10 @@ def summary_date_from_path(path: Path) -> dt.datetime | None:
         if match.group(2):
             return parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
         return parse_time(f"{match.group(1)}T00:00:00Z")
-    return summary_date_from_semantic_path(path) or summary_date_from_dated_parent_path(path)
+    return summary_date_from_semantic_path(path) or summary_date_from_dated_parent_path(
+        path,
+        source_root=source_root,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2430,11 +2440,12 @@ def summary_file_relevant_with_scan_cap(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    source_root: Path | None = None,
 ) -> bool:
     metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     if start is None and end is None:
         return True
-    summary_date = summary_date_from_path(path)
+    summary_date = summary_date_from_path(path, source_root=source_root)
     if summary_date is None:
         try:
             found, complete = oversized_rollout_has_timestamp_in_window(
@@ -2850,8 +2861,10 @@ def summary_record_in_window(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
 ) -> bool:
-    parsed_timestamp = summary_timestamp_with_fallback(record, path)
+    parsed_timestamp = summary_timestamp_with_fallback(record, path, source_root=source_root)
     if parsed_timestamp is None:
         return False
     if start and parsed_timestamp < start:
@@ -2948,7 +2961,7 @@ def summary_file_has_relevant_backing_ref(
         if safe_ref is None:
             continue
         if kind != "scan_meta":
-            if summary_record_in_window(record, path, start, end):
+            if summary_record_in_window(record, path, start, end, source_root=source_root):
                 return True
             continue
         if rollout_ref_in_window(safe_ref, start, end) or (
@@ -2982,6 +2995,7 @@ def summary_file_relevant_or_backing_ref_relevant(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     ) or summary_file_has_relevant_backing_ref(
         path,
         start,
@@ -3008,6 +3022,7 @@ def summary_file_maybe_relevant_or_backing_ref_relevant(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     ) or summary_file_has_relevant_backing_ref(
         path,
         start,
@@ -3063,7 +3078,7 @@ def summary_backing_rollout_refs(
             if safe_ref is None:
                 unbacked_record_seen = True
             continue
-        if not summary_record_in_window(record, path, start, end):
+        if not summary_record_in_window(record, path, start, end, source_root=source_root):
             continue
         relevant_record_seen = True
         rollout_ref = record.get("rollout")
@@ -3328,6 +3343,7 @@ def summary_file_has_session_meta_in_window(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    source_root: Path | None = None,
 ) -> bool:
     metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     try:
@@ -3352,7 +3368,7 @@ def summary_file_has_session_meta_in_window(
             continue
         if str(record.get("kind") or "") != "session_meta":
             continue
-        if summary_record_in_window(record, path, start, end):
+        if summary_record_in_window(record, path, start, end, source_root=source_root):
             return True
     return False
 
@@ -3691,11 +3707,13 @@ def complete_scan_meta_backing_rollout_refs(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     ) or summary_file_has_session_meta_in_window(
         summary,
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     )
     refs: set[str] = set()
     for ref in scan_meta_refs:
@@ -4493,10 +4511,16 @@ def remote_summary_fallback_is_extractable(
     return True
 
 
-def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+def summary_file_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
     if start is None and end is None:
         return True
-    summary_date = summary_date_from_path(path)
+    summary_date = summary_date_from_path(path, source_root=source_root)
     if summary_date is None:
         try:
             return raw_timestamp_in_window(path, start, end)
@@ -4514,10 +4538,16 @@ def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetim
     return True
 
 
-def summary_file_maybe_relevant_without_read(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+def summary_file_maybe_relevant_without_read(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
     if start is None and end is None:
         return True
-    summary_date = summary_date_from_path(path)
+    summary_date = summary_date_from_path(path, source_root=source_root)
     if summary_date and end and summary_date >= end:
         return False
     if summary_date and start and summary_date < start:
@@ -4531,10 +4561,17 @@ def summary_file_maybe_relevant_with_scan_cap(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    source_root: Path | None = None,
 ) -> bool:
-    summary_date = summary_date_from_path(path)
+    summary_date = summary_date_from_path(path, source_root=source_root)
     if summary_date is None:
-        return summary_file_relevant_with_scan_cap(path, start, end, max_scan_bytes=max_scan_bytes)
+        return summary_file_relevant_with_scan_cap(
+            path,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+            source_root=source_root,
+        )
     if summary_date and end and summary_date >= end:
         metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
         try:
@@ -4547,7 +4584,7 @@ def summary_file_maybe_relevant_with_scan_cap(
         except OSError:
             return False
         return found or not complete
-    return summary_file_maybe_relevant_without_read(path, start, end)
+    return summary_file_maybe_relevant_without_read(path, start, end, source_root=source_root)
 
 
 def summary_file_has_truncated_scan(path: Path) -> bool:
@@ -4603,13 +4640,15 @@ def summary_file_has_extractable_record_in_window(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
 ) -> bool:
     try:
         for _line_no, record in iter_jsonl(path):
             kind = str(record.get("kind") or "summary")
             if kind in {"session_meta", "scan_meta"}:
                 continue
-            if not summary_record_in_window(record, path, start, end):
+            if not summary_record_in_window(record, path, start, end, source_root=source_root):
                 continue
             if summary_record_has_retained_flags(record):
                 return True
@@ -4622,6 +4661,8 @@ def summary_extractable_backing_refs_in_window(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
 ) -> set[str]:
     refs: set[str] = set()
     try:
@@ -4629,7 +4670,7 @@ def summary_extractable_backing_refs_in_window(
             kind = str(record.get("kind") or "summary")
             if kind in {"session_meta", "scan_meta"}:
                 continue
-            if not summary_record_in_window(record, path, start, end):
+            if not summary_record_in_window(record, path, start, end, source_root=source_root):
                 continue
             if not summary_record_has_retained_flags(record):
                 continue
@@ -4734,8 +4775,17 @@ def summary_backing_rollout_date(record: dict[str, Any]) -> dt.datetime | None:
     return rollout_date_from_path(ref_path) or dated_path_from_parts(ref_path)
 
 
-def summary_timestamp_with_fallback(record: dict[str, Any], path: Path) -> dt.datetime | None:
-    return parse_time(str(record.get("timestamp") or "")) or summary_backing_rollout_date(record) or summary_date_from_path(path)
+def summary_timestamp_with_fallback(
+    record: dict[str, Any],
+    path: Path,
+    *,
+    source_root: Path | None = None,
+) -> dt.datetime | None:
+    return (
+        parse_time(str(record.get("timestamp") or ""))
+        or summary_backing_rollout_date(record)
+        or summary_date_from_path(path, source_root=source_root)
+    )
 
 
 def infer_model_era(model: str | None, timestamp: str | None) -> str:
@@ -5246,7 +5296,7 @@ def extract_summary_file(
 
     for line_no, record in records:
         timestamp = str(record.get("timestamp") or "") or None
-        parsed_timestamp = summary_timestamp_with_fallback(record, path)
+        parsed_timestamp = summary_timestamp_with_fallback(record, path, source_root=source.root)
         text = str(record.get("text") or "")
         kind = str(record.get("kind") or "summary")
         retained_kind = retained_summary_kind(kind)
@@ -6834,7 +6884,7 @@ def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
             if metadata_covers(parsed) and (earliest is None or parsed < earliest):
                 earliest = parsed
         for summary in source_summary_files(source):
-            parsed = summary_date_from_path(summary)
+            parsed = summary_date_from_path(summary, source_root=source.root)
             timestamp = earliest_timestamp_in_file(summary, max_scan_bytes=ROLLOUT_TIMESTAMP_SCAN_BYTES)
             if timestamp and (parsed is None or timestamp < parsed):
                 parsed = timestamp
@@ -7286,8 +7336,14 @@ def summary_path_proves_after_window(path: Path, end: dt.datetime | None) -> boo
     return bool(end and summary_date >= end)
 
 
-def summary_path_proves_outside_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
-    summary_date = summary_date_from_path(path)
+def summary_path_proves_outside_window(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
+    summary_date = summary_date_from_path(path, source_root=source_root)
     if summary_date is None:
         return False
     summary_end = summary_date + dt.timedelta(days=1)
@@ -7340,7 +7396,12 @@ def run_scan(
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_rollout_missing"))
 
     def append_volatile_summary_gap(path: Path, *, allow_future_path_filter: bool = True) -> None:
-        if not allow_future_path_filter or not summary_path_proves_outside_window(path, start, end):
+        if not allow_future_path_filter or not summary_path_proves_outside_window(
+            path,
+            start,
+            end,
+            source_root=source.root,
+        ):
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_summary_missing"))
 
     for source in sources:
@@ -7659,6 +7720,7 @@ def run_scan(
                             gap_start,
                             end,
                             max_scan_bytes=summary_scan_cap,
+                            source_root=source.root,
                         )
                         if jsonl_error.unreadable
                         else summary_file_relevant_or_backing_ref_relevant(
@@ -9602,7 +9664,12 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             )
 
     def append_disappeared_summary_shard(summary: Path, *, allow_future_path_filter: bool = True) -> None:
-        if allow_future_path_filter and summary_path_proves_outside_window(summary, start, end):
+        if allow_future_path_filter and summary_path_proves_outside_window(
+            summary,
+            start,
+            end,
+            source_root=root,
+        ):
             return
         rows.append(
             shard_row(
@@ -9647,7 +9714,12 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and not summary_path_proves_outside_window(summary, start, end):
+                    if path_disappeared(summary) and not summary_path_proves_outside_window(
+                        summary,
+                        start,
+                        end,
+                        source_root=root,
+                    ):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "oversized"
@@ -9718,19 +9790,35 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and not summary_path_proves_outside_window(summary, start, end):
+                    if path_disappeared(summary) and not summary_path_proves_outside_window(
+                        summary,
+                        start,
+                        end,
+                        source_root=root,
+                    ):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "partial"
                 row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
                 rows.append(row)
                 return
-            if path_disappeared(summary) and not summary_path_proves_outside_window(summary, start, end):
+            if path_disappeared(summary) and not summary_path_proves_outside_window(
+                summary,
+                start,
+                end,
+                source_root=root,
+            ):
                 append_disappeared_summary_shard(summary)
                 return
             if jsonl_error is not None:
                 relevant_summary = (
-                    summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=summary_scan_cap)
+                    summary_file_maybe_relevant_with_scan_cap(
+                        summary,
+                        start,
+                        end,
+                        max_scan_bytes=summary_scan_cap,
+                        source_root=root,
+                    )
                     if jsonl_error.unreadable
                     else summary_file_relevant_or_backing_ref_relevant(
                         summary,
@@ -9743,7 +9831,12 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     )
                 )
                 if not relevant_summary:
-                    if path_disappeared(summary) and not summary_path_proves_outside_window(summary, start, end):
+                    if path_disappeared(summary) and not summary_path_proves_outside_window(
+                        summary,
+                        start,
+                        end,
+                        source_root=root,
+                    ):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "invalid"
@@ -9760,10 +9853,15 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 archived_duplicate_keys=archived_duplicate_keys,
             )
             if not relevant_summary:
-                if path_disappeared(summary) and not summary_path_proves_outside_window(summary, start, end):
+                if path_disappeared(summary) and not summary_path_proves_outside_window(
+                    summary,
+                    start,
+                    end,
+                    source_root=root,
+                ):
                     append_disappeared_summary_shard(summary)
                 return
-            if not summary_file_has_extractable_record_in_window(summary, start, end):
+            if not summary_file_has_extractable_record_in_window(summary, start, end, source_root=root):
                 if path_disappeared(summary):
                     append_disappeared_summary_shard(summary, allow_future_path_filter=False)
                 return
