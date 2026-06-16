@@ -5347,6 +5347,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     {
                         "host": "miku-bot-dev",
                         "root_ref": "path_ref_v1:aaaaaaaaaaaaaaaa",
+                        "path_ref": "path_ref_v1:aaaaaaaaaaaaaaaa",
                         "status": "missing",
                         "coverage_gap": "source root missing",
                     },
@@ -5368,6 +5369,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 ("custom_source", "source_root_missing"),
             ],
         )
+        self.assertNotIn("path_ref", gaps[0])
         self.assertEqual(MODULE.repair_materialization_gap_hosts(gaps), {"miku-bot-dev"})
 
     def test_dry_run_report_shard_gap_blocks_only_matching_source_root(self) -> None:
@@ -5475,6 +5477,57 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(report["shard_coverage_gap_counts"], {"oversized_rollout_skipped": 1})
         self.assertEqual(report["repairable_coverage_gap_counts"], {"oversized_rollout_skipped": 1})
         self.assertEqual(report["report_summary"]["retained_readiness"], "repairable_coverage_gaps")
+
+    def test_dry_run_report_deduplicates_legacy_source_root_shard_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            root_ref = "path_ref_v1:aaaaaaaaaaaaaaaa"
+            write_jsonl(
+                shards / "shards.jsonl",
+                [
+                    {
+                        "host": "miku-bot-dev",
+                        "root_ref": root_ref,
+                        "path_ref": root_ref,
+                        "status": "missing",
+                        "coverage_gap": "remote_source_not_materialized",
+                    }
+                ],
+            )
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [
+                        {
+                            "host": "miku-bot-dev",
+                            "root_ref": root_ref,
+                            "status": "ready",
+                            "rollout_count": 0,
+                            "summary_count": 0,
+                        }
+                    ],
+                    "coverage_gaps": [
+                        {"host": "miku-bot-dev", "root_ref": root_ref, "reason": "remote_source_not_materialized"}
+                    ],
+                },
+            )
+
+        self.assertEqual(report["coverage_gap_counts"], {"remote_source_not_materialized": 1})
+        self.assertEqual(report["shard_coverage_gap_counts"], {"remote_source_not_materialized": 1})
+        self.assertEqual(report["repairable_coverage_gap_counts"], {"remote_source_not_materialized": 1})
 
     def test_dry_run_report_shows_non_repairable_gap_note_with_next_command(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -9711,6 +9764,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "missing")
         self.assertEqual(rows[0]["coverage_gap"], "remote_source_not_materialized")
+        self.assertNotIn("path_ref", rows[0])
         self.assertEqual(MODULE.shard_coverage_gap_reason(rows[0]["coverage_gap"]), "remote_source_not_materialized")
 
     def test_make_shards_revalidates_remote_summary_backing_before_handoff(self) -> None:

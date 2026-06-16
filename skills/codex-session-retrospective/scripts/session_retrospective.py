@@ -8089,10 +8089,12 @@ def shard_coverage_gaps(shards_dir: Path) -> list[dict[str, Any]]:
             "host": host,
             "reason": reason,
         }
-        if isinstance(row.get("path_ref"), str) and row.get("path_ref"):
-            gap["path_ref"] = row["path_ref"]
-        if isinstance(row.get("root_ref"), str) and row.get("root_ref"):
-            gap["root_ref"] = row["root_ref"]
+        root_ref = row.get("root_ref")
+        path_ref_value = row.get("path_ref")
+        if isinstance(root_ref, str) and root_ref:
+            gap["root_ref"] = root_ref
+        if isinstance(path_ref_value, str) and path_ref_value and path_ref_value != root_ref:
+            gap["path_ref"] = path_ref_value
         if isinstance(row.get("bytes"), int):
             gap["bytes"] = row["bytes"]
         gaps.append(gap)
@@ -9494,15 +9496,24 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     rows: list[dict[str, Any]] = []
     source_root_ref: str | None = None
 
-    def shard_row(path: Path, **values: Any) -> dict[str, Any]:
-        row = {"host": host, "root_ref": source_root_ref or path_ref(root), "path_ref": path_ref(path), **values}
+    def shard_row(path: Path, *, include_path_ref: bool = True, **values: Any) -> dict[str, Any]:
+        row = {"host": host, "root_ref": source_root_ref or path_ref(root), **values}
+        if include_path_ref:
+            row["path_ref"] = path_ref(path)
         if getattr(args, "include_raw_paths", False):
             row["path"] = path.as_posix()
         return row
 
     def append_source_gap_shards(gaps: list[dict[str, Any]], root: Path) -> None:
         for gap in gaps:
-            rows.append(shard_row(root, status="stale", coverage_gap=str(gap.get("reason") or "unsafe_source_artifact")))
+            rows.append(
+                shard_row(
+                    root,
+                    include_path_ref=False,
+                    status="stale",
+                    coverage_gap=str(gap.get("reason") or "unsafe_source_artifact"),
+                )
+            )
 
     def append_disappeared_summary_shard(summary: Path) -> None:
         if summary_path_proves_after_window(summary, end):
@@ -9719,7 +9730,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not root.exists():
             missing_gap = "remote_source_not_materialized" if str(host) in DEFAULT_REMOTE_HOSTS else "source root missing"
-            rows.append(shard_row(root, status="missing", coverage_gap=missing_gap))
+            rows.append(shard_row(root, include_path_ref=False, status="missing", coverage_gap=missing_gap))
             continue
         symlink_gap = source_root_symlink_gap(source)
         if symlink_gap:
