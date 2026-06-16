@@ -1009,6 +1009,19 @@ def dated_path_from_parts(path: Path) -> dt.datetime | None:
     return None
 
 
+def summary_date_from_semantic_path(path: Path) -> dt.datetime | None:
+    parts = path.parts
+    for index, part in enumerate(parts):
+        if part not in {"sessions", "archived_sessions"} or index + 3 >= len(parts):
+            continue
+        year, month, day = parts[index + 1 : index + 4]
+        if re.fullmatch(r"\d{4}", year) and re.fullmatch(r"\d{2}", month) and re.fullmatch(r"\d{2}", day):
+            parsed = parse_time(f"{year}-{month}-{day}T00:00:00Z")
+            if parsed:
+                return parsed
+    return None
+
+
 def summary_date_from_path(path: Path) -> dt.datetime | None:
     match = re.search(
         r"^rollout-summary-.*?(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?",
@@ -1018,7 +1031,7 @@ def summary_date_from_path(path: Path) -> dt.datetime | None:
         if match.group(2):
             return parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
         return parse_time(f"{match.group(1)}T00:00:00Z")
-    return dated_path_from_parts(path)
+    return summary_date_from_semantic_path(path)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9512,8 +9525,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 )
             )
 
-    def append_disappeared_summary_shard(summary: Path) -> None:
-        if summary_path_proves_after_window(summary, end):
+    def append_disappeared_summary_shard(summary: Path, *, allow_future_path_filter: bool = True) -> None:
+        if allow_future_path_filter and summary_path_proves_after_window(summary, end):
             return
         rows.append(
             shard_row(
@@ -9640,7 +9653,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 append_disappeared_summary_shard(summary)
                 return
             if jsonl_error is not None:
-                if not (
+                relevant_summary = (
                     summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=summary_scan_cap)
                     if jsonl_error.unreadable
                     else summary_file_relevant_or_backing_ref_relevant(
@@ -9652,7 +9665,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                         allow_mtime_fallback=allow_mtime_fallback,
                         archived_duplicate_keys=archived_duplicate_keys,
                     )
-                ):
+                )
+                if not relevant_summary:
                     if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
                         append_disappeared_summary_shard(summary)
                     return
@@ -9660,7 +9674,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
                 rows.append(row)
                 return
-            if not summary_file_relevant_or_backing_ref_relevant(
+            relevant_summary = summary_file_relevant_or_backing_ref_relevant(
                 summary,
                 start,
                 end,
@@ -9668,13 +9682,14 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 source_root=root,
                 allow_mtime_fallback=allow_mtime_fallback,
                 archived_duplicate_keys=archived_duplicate_keys,
-            ):
+            )
+            if not relevant_summary:
                 if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
                     append_disappeared_summary_shard(summary)
                 return
             if not summary_file_has_extractable_record_in_window(summary, start, end):
                 if path_disappeared(summary):
-                    append_disappeared_summary_shard(summary)
+                    append_disappeared_summary_shard(summary, allow_future_path_filter=False)
                 return
             row["status"] = "ready"
             rows.append(row)
@@ -9751,17 +9766,40 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         rollouts = source_rollouts(source)
         source_summaries = source_summary_files(source)
         summaries = sorted([*source_summaries, *generated_summaries])
+        archived_duplicate_keys = archived_rollout_duplicate_keys(root)
         current_rollout_refs = set(source_rollout_manifest_refs(rollouts, root))
-        current_rollout_keys = {key for ref in current_rollout_refs for key in rollout_match_keys_for_ref(ref)}
+        current_rollout_refs_by_key: dict[str, set[str]] = defaultdict(set)
+        for current_ref in current_rollout_refs:
+            for match_key in rollout_match_keys_for_ref(current_ref):
+                current_rollout_refs_by_key[match_key].add(current_ref)
+
+        def manifest_rollout_ref_has_current_match(rollout_ref: str) -> bool:
+            if rollout_ref in current_rollout_refs:
+                return True
+            for match_key in rollout_match_keys_for_ref(rollout_ref):
+                for current_ref in current_rollout_refs_by_key.get(match_key, set()):
+                    if backing_ref_has_materialized_window_coverage(
+                        root,
+                        current_ref,
+                        start,
+                        end,
+                        max_scan_bytes=max_raw_bytes,
+                        allow_mtime_fallback=allow_mtime_fallback,
+                        archived_duplicate_keys=archived_duplicate_keys,
+                    ):
+                        return True
+            return False
+
         for rollout_ref in manifest_source_ref_list(source_entry, "rollout_refs"):
-            if rollout_ref in current_rollout_refs or rollout_match_keys_for_ref(rollout_ref) & current_rollout_keys:
+            if manifest_rollout_ref_has_current_match(rollout_ref):
                 continue
             rollout_path = source_rollout_declared_path_from_ref(source, rollout_ref)
             if rollout_path is not None:
                 if safe_source_file(rollout_path, root):
                     rollouts.append(rollout_path)
                     current_rollout_refs.add(rollout_ref)
-                    current_rollout_keys.update(rollout_match_keys_for_ref(rollout_ref))
+                    for match_key in rollout_match_keys_for_ref(rollout_ref):
+                        current_rollout_refs_by_key[match_key].add(rollout_ref)
                     continue
                 append_disappeared_rollout_shard(rollout_path)
         rollouts = sorted(set(rollouts))
@@ -9772,7 +9810,6 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             summary_path = source_summary_declared_path_from_ref(source, summary_ref)
             if summary_path is not None:
                 append_disappeared_summary_shard(summary_path)
-        archived_duplicate_keys = archived_rollout_duplicate_keys(root)
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, root)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
             summaries,
