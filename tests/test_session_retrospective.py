@@ -9961,6 +9961,76 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "summary")
         self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
 
+    def test_make_shards_reports_missing_timestamped_summary_ref_after_midnight_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            root.mkdir()
+            summary_ref = "sessions/2026/04/30/rollout-summary-2026-04-30T23-30-00-cross-midnight.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [],
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:30:00Z", "end": "2026-05-01T01:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
+    def test_make_shards_reports_missing_same_day_timestamped_summary_ref_after_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            root.mkdir()
+            summary_ref = "sessions/2026/05/01/rollout-summary-2026-05-01T12-00-00-after-window.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [],
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T10:00:00Z", "end": "2026-05-01T11:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
     def test_make_shards_filters_missing_rollout_ref_in_old_date_bucket(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
@@ -19896,6 +19966,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         "timestamp": "2026-05-01T10:01:00Z",
                         "text": "session_id=remote-session cwd_present=true",
                     },
+                ],
+            )
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"miku-bot-dev={remote}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertEqual(manifest["sources"][0]["status"], "stale")
+
+    def test_default_remote_scan_meta_summary_context_reports_undated_missing_backing_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            rollout_ref = "archived_sessions/rollout-undated.jsonl"
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=1200,
+                        summary_record_count=0,
+                    )
                 ],
             )
             output = safe_output_dir(raw)

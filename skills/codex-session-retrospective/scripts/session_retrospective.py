@@ -7257,7 +7257,13 @@ def remote_summary_only_gaps(
             )
             if invalid_scan_meta_ref_seen:
                 return [remote_metadata_gap(source, "remote_source_not_materialized")]
-            scan_meta_context_relevant = summary_file_has_session_meta_in_window(
+            scan_meta_context_relevant = summary_file_relevant_with_scan_cap(
+                summary,
+                start,
+                end,
+                max_scan_bytes=summary_scan_bytes,
+                source_root=source.root,
+            ) or summary_file_has_session_meta_in_window(
                 summary,
                 start,
                 end,
@@ -7474,11 +7480,18 @@ def summary_path_proves_outside_window(
     summary_hint = summary_date_hint_from_path(path, source_root=source_root)
     if summary_hint is None:
         return False
-    summary_date, _exact_timestamp = summary_hint
-    summary_end = summary_date.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(days=1)
-    if start and summary_end <= start:
+    summary_date, exact_timestamp = summary_hint
+    summary_day_start = summary_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    summary_day_end = summary_day_start + dt.timedelta(days=1)
+    if start and exact_timestamp and not timestamped_rollout_maybe_reaches_start(
+        summary_date,
+        summary_day_start,
+        start,
+    ):
         return True
-    if end and summary_date >= end:
+    if start and not exact_timestamp and summary_day_end <= start:
+        return True
+    if end and summary_day_start >= end:
         return True
     return False
 
