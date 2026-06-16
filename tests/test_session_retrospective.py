@@ -24224,23 +24224,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 self.assertIn("secret", signal)
                 self.assertNotIn(sample, signal)
 
-    def test_remote_probe_privacy_risk_signal_bypasses_sensitive_prefilter(self) -> None:
-        class NoMatchPrefilter:
-            def search(self, _text: str) -> None:
-                return None
-
-        samples = [
-            "Data leaked in logs.",
-            "Key leak in output.",
-        ]
-        with mock.patch.object(REMOTE_PROBE, "SUMMARY_SENSITIVE_PREFILTER_RE", NoMatchPrefilter()):
-            for sample in samples:
-                with self.subTest(sample=sample):
-                    signal = REMOTE_PROBE._safe_summary_text("user_message", sample)
-                    self.assertIn("secret", signal)
-                    self.assertNotIn(sample, signal)
-
-    def test_remote_probe_privacy_risk_signal_samples_match_prefilter(self) -> None:
+    def test_remote_probe_privacy_risk_signal_uses_combined_sensitive_pattern(self) -> None:
         samples = [
             "Data leaked in logs.",
             "Key leak in output.",
@@ -24250,7 +24234,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
         for sample in samples:
             with self.subTest(sample=sample):
                 self.assertIsNotNone(REMOTE_PROBE.PRIVACY_RISK_SIGNAL_RE.search(sample))
-                self.assertIsNotNone(REMOTE_PROBE.SUMMARY_SENSITIVE_PREFILTER_RE.search(sample))
+                self.assertIsNotNone(REMOTE_PROBE.SUMMARY_SENSITIVE_SIGNAL_RE.search(sample))
+                signal = REMOTE_PROBE._safe_summary_text("user_message", sample)
+                self.assertIn("secret", signal)
+                self.assertNotIn(sample, signal)
 
     def test_remote_probe_ignores_ordinary_redacted_engineering_context(self) -> None:
         samples = [

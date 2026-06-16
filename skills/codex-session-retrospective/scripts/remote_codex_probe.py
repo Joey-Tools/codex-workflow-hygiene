@@ -300,30 +300,6 @@ SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT = "|".join(
     )
 )
 SUMMARY_SENSITIVE_SIGNAL_RE = re.compile(SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT, re.I)
-SUMMARY_SENSITIVE_PREFILTER_PATTERN_TEXT = (
-    r"(?:"
-    r"https?://|ssh://|sftp://|git\+ssh://|git@|@|"
-    r"(?<![A-Za-z0-9])(?:authorization|bearer|basic|digest|token|secret|password|passwd|pwd|credential|api[-_ ]?key|private[-_ ]?key|client[-_ ]?secret|access[-_ ]?token)(?![A-Za-z0-9])|"
-    r"(?<![A-Za-z0-9])(?:access|api|auth|authorization|client|refresh|id|session|csrf|xsrf|secret)[._-]?(?:token|key|secret|password|passwd|pwd)\b|"
-    r"(?<![A-Za-z0-9])(?:aws|github|gitlab|openai|database|db|prod|production|api|private|client|secret|access)[._-]?(?:(?:secret|access|api)[._-]?)*(?:token|key|password|passwd|pwd|credential)\b|"
-    r"(?<![A-Za-z0-9])(?:customer|client|tenant|account|org|organization|organisation|personal|pii|privacy)(?:[._-]?(?:id|name|data|info|identifier))?\b|"
-    r"\b(?:pii|personally identifiable information)\b|"
-    + PRIVACY_RISK_SIGNAL_RE.pattern
-    + r"|"
-    r"\b(?:prod|production)\b|"
-    r"\b(?:prod|production)[-_][A-Za-z0-9._-]*\b|"
-    r"\b(?:rm|sudo|kubectl|drop|truncate|delete|reset|deploy|migrate|migration|rollback|restart|apply)\b|"
-    r"\b(?:10|100|127|169|172|192)\.|::|f[cd][0-9a-f]{0,2}:|fe[89ab][0-9a-f]?:|"
-    r"\b(?:localhost|internal|corp|local|lan|example|invalid|test)\b|"
-    r"\b(?:sk|rk)[-_]|gh[pousr]_|github_pat_|AKIA[0-9A-Z]{4,}|eyJ[A-Za-z0-9_-]{10,}|-----BEGIN |"
-    r"[0-9a-fA-F]{32}|"
-    r"密码|口令|凭据|凭证|密钥|令牌|授权|客户|客户端|租户|账户|账号|组织|机构|客户数据|客户隐私|个人信息|隐私|隐私风险|隐私泄露|敏感数据|生产|破坏性"
-    r")"
-)
-SUMMARY_SENSITIVE_PREFILTER_RE = re.compile(
-    SUMMARY_SENSITIVE_PREFILTER_PATTERN_TEXT,
-    re.I,
-)
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
 SESSION_META_LIMIT_TRUNCATED_REASON = "session_meta_limit_truncated"
@@ -1161,7 +1137,6 @@ SUMMARY_SIGNAL_CATEGORY_LABELS = tuple(label for label, _pattern in SUMMARY_SIGN
 SUMMARY_SIGNAL_CATEGORY_RES = tuple((label, re.compile(pattern, re.I)) for label, pattern in SUMMARY_SIGNAL_CATEGORY_PATTERNS)
 SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT = {SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT!r}
 SUMMARY_SENSITIVE_SIGNAL_RE = re.compile(SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT, re.I)
-SUMMARY_SENSITIVE_PREFILTER_RE = re.compile({SUMMARY_SENSITIVE_PREFILTER_RE.pattern!r}, re.I)
 REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = {REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF!r}
 REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF = {REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF!r}
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
@@ -1622,11 +1597,7 @@ def summary_category_signals(chunks):
 
 
 def summary_has_sensitive_signal_chunks(chunks):
-    return any(
-        PRIVACY_RISK_SIGNAL_RE.search(chunk)
-        or (SUMMARY_SENSITIVE_PREFILTER_RE.search(chunk) and SUMMARY_SENSITIVE_SIGNAL_RE.search(chunk))
-        for chunk in chunks
-    )
+    return any(SUMMARY_SENSITIVE_SIGNAL_RE.search(chunk) for chunk in chunks)
 
 
 def summary_has_sensitive_signal(text):
@@ -2986,11 +2957,7 @@ def _summary_category_signals(chunks: tuple[str, ...]) -> list[str]:
 
 
 def _summary_has_sensitive_signal_chunks(chunks: tuple[str, ...]) -> bool:
-    return any(
-        PRIVACY_RISK_SIGNAL_RE.search(chunk)
-        or (SUMMARY_SENSITIVE_PREFILTER_RE.search(chunk) and SUMMARY_SENSITIVE_SIGNAL_RE.search(chunk))
-        for chunk in chunks
-    )
+    return any(SUMMARY_SENSITIVE_SIGNAL_RE.search(chunk) for chunk in chunks)
 
 
 def _summary_has_sensitive_signal(text: str) -> bool:

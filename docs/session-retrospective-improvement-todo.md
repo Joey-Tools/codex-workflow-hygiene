@@ -266,8 +266,8 @@ review gates, and merge before starting the next item.
    - Combine sensitive summary signal detection into one compiled pattern so
      local summary generation and remote rollout-summary extraction stay in
      parity.
-   - Use a cheap sensitive-signal prefilter before the heavy sensitive regex
-     on ordinary long tool-output chunks.
+   - Run the combined sensitive-signal pattern once per reused chunk, avoiding
+     lossy prefilters that can hide generic privacy-risk phrases.
    - Use the local-summary scan cap for old oversized rollout relevance before
      generating summaries, and skip partial summaries for larger old rollouts
      when no in-window timestamp is found inside that cap.
