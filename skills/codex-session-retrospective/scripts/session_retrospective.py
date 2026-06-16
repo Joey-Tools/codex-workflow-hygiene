@@ -1026,6 +1026,18 @@ def summary_date_from_semantic_path(path: Path) -> dt.datetime | None:
     return None
 
 
+def summary_date_from_dated_parent_path(path: Path) -> dt.datetime | None:
+    if not path.name.startswith("rollout-summary"):
+        return None
+    parts = path.parts
+    if len(parts) < 4:
+        return None
+    year, month, day = parts[-4:-1]
+    if re.fullmatch(r"\d{4}", year) and re.fullmatch(r"\d{2}", month) and re.fullmatch(r"\d{2}", day):
+        return parse_time(f"{year}-{month}-{day}T00:00:00Z")
+    return None
+
+
 def summary_date_from_path(path: Path) -> dt.datetime | None:
     match = re.search(
         r"^rollout-summary-.*?(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?",
@@ -1035,7 +1047,7 @@ def summary_date_from_path(path: Path) -> dt.datetime | None:
         if match.group(2):
             return parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
         return parse_time(f"{match.group(1)}T00:00:00Z")
-    return summary_date_from_semantic_path(path)
+    return summary_date_from_semantic_path(path) or summary_date_from_dated_parent_path(path)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7240,11 +7252,27 @@ def rollout_path_proves_after_window(path: Path, end: dt.datetime | None) -> boo
     return bool(end and rollout_date >= end)
 
 
+def rollout_path_proves_outside_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    return not rollout_filename_in_window(path, start, end)
+
+
 def summary_path_proves_after_window(path: Path, end: dt.datetime | None) -> bool:
     summary_date = summary_date_from_path(path)
     if summary_date is None:
         return False
     return bool(end and summary_date >= end)
+
+
+def summary_path_proves_outside_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    summary_date = summary_date_from_path(path)
+    if summary_date is None:
+        return False
+    summary_end = summary_date + dt.timedelta(days=1)
+    if start and summary_end <= start:
+        return True
+    if end and summary_date >= end:
+        return True
+    return False
 
 
 def earliest_rollout_sources(sources: list[Source]) -> list[Source]:
@@ -7285,11 +7313,11 @@ def run_scan(
         coverage_gaps.append(source_path_coverage_gap(source, path, "oversized_summary_skipped", bytes=size))
 
     def append_volatile_rollout_gap(path: Path) -> None:
-        if not rollout_path_proves_after_window(path, end):
+        if not rollout_path_proves_outside_window(path, start, end):
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_rollout_missing"))
 
     def append_volatile_summary_gap(path: Path, *, allow_future_path_filter: bool = True) -> None:
-        if not allow_future_path_filter or not summary_path_proves_after_window(path, end):
+        if not allow_future_path_filter or not summary_path_proves_outside_window(path, start, end):
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_summary_missing"))
 
     for source in sources:
@@ -9551,7 +9579,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             )
 
     def append_disappeared_summary_shard(summary: Path, *, allow_future_path_filter: bool = True) -> None:
-        if allow_future_path_filter and summary_path_proves_after_window(summary, end):
+        if allow_future_path_filter and summary_path_proves_outside_window(summary, start, end):
             return
         rows.append(
             shard_row(
@@ -9563,7 +9591,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         )
 
     def append_disappeared_rollout_shard(rollout: Path) -> None:
-        if rollout_path_proves_after_window(rollout, end):
+        if rollout_path_proves_outside_window(rollout, start, end):
             return
         rows.append(
             shard_row(
@@ -9596,7 +9624,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
+                    if path_disappeared(summary) and not summary_path_proves_outside_window(summary, start, end):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "oversized"
@@ -9667,14 +9695,14 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
+                    if path_disappeared(summary) and not summary_path_proves_outside_window(summary, start, end):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "partial"
                 row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
                 rows.append(row)
                 return
-            if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
+            if path_disappeared(summary) and not summary_path_proves_outside_window(summary, start, end):
                 append_disappeared_summary_shard(summary)
                 return
             if jsonl_error is not None:
@@ -9692,7 +9720,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     )
                 )
                 if not relevant_summary:
-                    if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
+                    if path_disappeared(summary) and not summary_path_proves_outside_window(summary, start, end):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "invalid"
@@ -9709,7 +9737,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 archived_duplicate_keys=archived_duplicate_keys,
             )
             if not relevant_summary:
-                if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
+                if path_disappeared(summary) and not summary_path_proves_outside_window(summary, start, end):
                     append_disappeared_summary_shard(summary)
                 return
             if not summary_file_has_extractable_record_in_window(summary, start, end):
@@ -9907,7 +9935,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     max_relevance_scan_bytes=max_rollout_relevance_scan_bytes,
                     allow_mtime_fallback=rollout_mtime_fallback,
                 ):
-                    if path_disappeared(rollout) and not rollout_path_proves_after_window(rollout, end):
+                    if path_disappeared(rollout) and not rollout_path_proves_outside_window(rollout, start, end):
                         append_disappeared_rollout_shard(rollout)
                     continue
                 size = rollout.stat().st_size

@@ -9714,12 +9714,46 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "unsafe_source_artifact")
 
-    def test_make_shards_reports_missing_pre_window_manifest_refs(self) -> None:
+    def test_make_shards_ignores_missing_pre_window_manifest_refs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
             root.mkdir()
             rollout_ref = "sessions/2026/01/02/rollout-2026-01-02T10-00-00-old.jsonl"
             summary_ref = "sessions/2026/01/02/rollout-summary-old.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [rollout_ref],
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows, [])
+
+    def test_make_shards_reports_missing_in_window_manifest_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            root.mkdir()
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-current.jsonl"
+            summary_ref = "sessions/2026/05/01/rollout-summary-current.jsonl"
             manifest = Path(raw) / "manifest.json"
             manifest.write_text(
                 json.dumps(
@@ -10640,6 +10674,34 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(MODULE.summary_date_from_path(root / summary_ref), MODULE.parse_time("2026-07-01T10:00:00Z"))
         self.assertEqual(rows, [])
+
+    def test_make_shards_uses_plain_dated_summary_parent_for_untimestamped_records(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            summary = root / "2026" / "05" / "22" / "rollout-summary-custom.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "text": "permission denied"}])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "custom_source", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(MODULE.summary_date_from_path(summary), MODULE.parse_time("2026-05-22T00:00:00Z"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["status"], "ready")
 
     def test_summary_filename_date_overrides_dated_source_root(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
