@@ -312,6 +312,7 @@ SUMMARY_SENSITIVE_PREFILTER_RE = re.compile(
     r"\b(?:credential|secret|data|api[-_ ]?key|private[-_ ]?key|token|password|passwd|key)\s+(?:leaks?|leaked|expos(?:ure|ed|e|es)|breach(?:ed|es)?)\b|"
     r"\b(?:leaks?|leaked|expos(?:ure|ed|e|es)|breach(?:ed|es)?)\s+(?:credential|secret|data|api[-_ ]?key|private[-_ ]?key|token|password|passwd|key)\b|"
     r"\b(?:prod|production)\b|"
+    r"\b(?:prod|production)[-_][A-Za-z0-9._-]*\b|"
     r"\b(?:rm|sudo|kubectl|drop|truncate|delete|reset|deploy|migrate|migration|rollback|restart|apply)\b|"
     r"\b(?:10|100|127|169|172|192)\.|::|f[cd][0-9a-f]{0,2}:|fe[89ab][0-9a-f]?:|"
     r"\b(?:localhost|internal|corp|local|lan|example|invalid|test)\b|"

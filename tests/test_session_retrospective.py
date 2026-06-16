@@ -3507,6 +3507,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "Check production auth token.",
             "Check production password.",
             "Run against production-db-01.",
+            "Rotate prod_db credentials.",
+            "Review production_data export.",
             "Rotate production_api_key.",
             "Check production-password.",
             "Rotate prod_password.",
@@ -11676,6 +11678,39 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(len(generated), 1)
 
+    def test_old_archived_oversized_rollout_complete_inside_summary_cap_does_not_report_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = home / ".codex"
+            write_local_evidence(root)
+            rollout = root / "archived_sessions" / "rollout-2026-03-19T11-56-46-old-large.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                json.dumps(message("user", "Archived old task.", "2026-03-19T12:00:00Z"))
+                + "\n"
+                + ("x" * 200),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}),
+                mock.patch.object(MODULE, "ROLLOUT_TIMESTAMP_SCAN_BYTES", 64),
+                mock.patch.object(MODULE, "LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES", 1024),
+            ):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=32, allow_partial_hosts=True),
+                    mode="weekly",
+                    start=MODULE.parse_time("2026-06-08T00:00:00Z"),
+                    end=MODULE.parse_time("2026-06-15T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            generated_root = MODULE.generated_summary_base_for_output(output)
+            generated = list(generated_root.rglob("rollout-summary-*.jsonl"))
+
+        self.assertEqual(generated, [])
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_old_archived_oversized_rollout_skips_partial_summary_when_window_timestamp_is_beyond_summary_cap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             home = Path(raw) / "home"
@@ -12382,15 +12417,18 @@ class SessionRetrospectiveTests(unittest.TestCase):
             old_large.parent.mkdir(parents=True, exist_ok=True)
             with old_large.open("wb") as handle:
                 handle.write(b"old huge oversized rollout")
-                handle.truncate(MODULE.ROLLOUT_TIMESTAMP_SCAN_BYTES + 1)
+                handle.truncate(257)
             old_mtime = MODULE.parse_time("2026-01-02T10:00:00Z").timestamp()
             os.utime(old_large, (old_mtime, old_mtime))
             output = safe_output_dir(raw)
             state = safe_output_dir(raw) / "state.json"
 
-            with mock.patch.object(MODULE, "ROLLOUT_TIMESTAMP_SCAN_BYTES", 128):
+            with (
+                mock.patch.object(MODULE, "ROLLOUT_TIMESTAMP_SCAN_BYTES", 128),
+                mock.patch.object(MODULE, "LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES", 256),
+            ):
                 MODULE.run_scan(
-                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=100, allow_partial_hosts=True),
                     mode="daily",
                     start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                     end=MODULE.parse_time("2026-05-02T00:00:00Z"),

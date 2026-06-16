@@ -2042,6 +2042,10 @@ def generate_local_rollout_summaries_for_source(
     return sorted(generated)
 
 
+def local_rollout_relevance_scan_bytes(max_raw_bytes: int) -> int:
+    return max(max_raw_bytes, LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES)
+
+
 def source_summary_candidates(source: Source) -> list[Path]:
     if not source.root.exists() or source.root.is_symlink():
         return []
@@ -2176,6 +2180,7 @@ def rollout_candidate_relevant(
     end: dt.datetime | None,
     *,
     max_raw_bytes: int | None = None,
+    max_relevance_scan_bytes: int | None = None,
     allow_mtime_fallback: bool = False,
 ) -> bool:
     if start is None and end is None:
@@ -2201,6 +2206,7 @@ def rollout_candidate_relevant(
                     start,
                     end,
                     allow_mtime_fallback=allow_mtime_fallback,
+                    max_scan_bytes=max_relevance_scan_bytes,
                 )
             except OSError:
                 return True
@@ -2222,6 +2228,7 @@ def rollout_has_materialized_window_coverage(
     end: dt.datetime | None,
     *,
     max_raw_bytes: int | None = None,
+    max_relevance_scan_bytes: int | None = None,
     allow_mtime_fallback: bool = False,
 ) -> bool:
     if start is None and end is None:
@@ -2240,6 +2247,7 @@ def rollout_has_materialized_window_coverage(
                 start,
                 end,
                 allow_mtime_fallback=allow_mtime_fallback,
+                max_scan_bytes=max_relevance_scan_bytes,
             )
             == "relevant"
         )
@@ -7265,6 +7273,7 @@ def run_scan(
     manifest_sources: list[dict[str, Any]] = []
     coverage_gaps: list[dict[str, Any]] = []
     max_raw_bytes = require_positive_window(getattr(args, "max_raw_bytes", 512_000), "--max-raw-bytes")
+    max_rollout_relevance_scan_bytes = local_rollout_relevance_scan_bytes(max_raw_bytes)
     allow_partial_hosts = getattr(args, "allow_partial_hosts", False)
     generated_summary_base = generated_summary_base_for_output(output)
     generated_summary_cache_base = generated_summary_cache_base_for_output(output)
@@ -7481,6 +7490,7 @@ def run_scan(
                     start,
                     end,
                     max_raw_bytes=max_raw_bytes,
+                    max_relevance_scan_bytes=max_rollout_relevance_scan_bytes,
                     allow_mtime_fallback=rollout_mtime_fallback,
                 ):
                     if path_disappeared(rollout):
@@ -7521,6 +7531,7 @@ def run_scan(
                     gap_start,
                     end,
                     allow_mtime_fallback=rollout_mtime_fallback,
+                    max_scan_bytes=max_rollout_relevance_scan_bytes,
                 )
                 if relevance == "irrelevant":
                     continue
@@ -9509,6 +9520,7 @@ def require_manifest_window_bounds(window: dict[str, Any], label: str) -> tuple[
 
 def cmd_make_shards(args: argparse.Namespace) -> int:
     max_raw_bytes = require_positive_window(args.max_raw_bytes, "--max-raw-bytes")
+    max_rollout_relevance_scan_bytes = local_rollout_relevance_scan_bytes(max_raw_bytes)
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     if manifest.get("retention_safe") is True:
         raise SystemExit("make-shards requires transient shard_manifest.json, not retained_manifest.json")
@@ -9892,6 +9904,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     start,
                     end,
                     max_raw_bytes=max_raw_bytes,
+                    max_relevance_scan_bytes=max_rollout_relevance_scan_bytes,
                     allow_mtime_fallback=rollout_mtime_fallback,
                 ):
                     if path_disappeared(rollout) and not rollout_path_proves_after_window(rollout, end):
@@ -9926,6 +9939,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     start,
                     end,
                     allow_mtime_fallback=rollout_mtime_fallback,
+                    max_scan_bytes=max_rollout_relevance_scan_bytes,
                 )
                 if relevance == "irrelevant":
                     continue
