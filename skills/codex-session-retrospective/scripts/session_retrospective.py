@@ -1010,7 +1010,18 @@ def dated_path_from_parts(path: Path) -> dt.datetime | None:
 
 
 def summary_date_from_path(path: Path) -> dt.datetime | None:
-    return dated_path_from_parts(path)
+    path_date = dated_path_from_parts(path)
+    if path_date is not None:
+        return path_date
+    match = re.search(
+        r"^rollout-summary-.*?(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?",
+        path.name,
+    )
+    if not match:
+        return None
+    if match.group(2):
+        return parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+    return parse_time(f"{match.group(1)}T00:00:00Z")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7194,22 +7205,18 @@ def path_disappeared(path: Path) -> bool:
     return False
 
 
-def rollout_path_hint_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+def rollout_path_proves_after_window(path: Path, end: dt.datetime | None) -> bool:
     rollout_date = rollout_window_date(path)
     if rollout_date is None:
-        return True
-    if end and rollout_date >= end:
         return False
-    return True
+    return bool(end and rollout_date >= end)
 
 
-def summary_path_hint_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+def summary_path_proves_after_window(path: Path, end: dt.datetime | None) -> bool:
     summary_date = summary_date_from_path(path)
     if summary_date is None:
-        return True
-    if end and summary_date >= end:
         return False
-    return True
+    return bool(end and summary_date >= end)
 
 
 def earliest_rollout_sources(sources: list[Source]) -> list[Source]:
@@ -7249,11 +7256,11 @@ def run_scan(
         coverage_gaps.append(source_path_coverage_gap(source, path, "oversized_summary_skipped", bytes=size))
 
     def append_volatile_rollout_gap(path: Path) -> None:
-        if rollout_path_hint_in_window(path, gap_start, end):
+        if not rollout_path_proves_after_window(path, end):
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_rollout_missing"))
 
     def append_volatile_summary_gap(path: Path) -> None:
-        if summary_path_hint_in_window(path, gap_start, end):
+        if not summary_path_proves_after_window(path, end):
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_summary_missing"))
 
     for source in sources:
@@ -8738,7 +8745,8 @@ def scan_dir_from_run_dir(run_dir: Path) -> Path:
 
 
 def shards_dir_from_run_dir(run_dir: Path, scan_dir: Path) -> Path:
-    if (run_dir / "shards.jsonl").is_file():
+    direct = run_dir / "shards.jsonl"
+    if scan_dir == run_dir and direct.is_file():
         return run_dir
     nested = run_dir / "shards"
     if (nested / "shards.jsonl").is_file():
@@ -8746,6 +8754,8 @@ def shards_dir_from_run_dir(run_dir: Path, scan_dir: Path) -> Path:
     sibling = scan_dir.parent / "shards"
     if (sibling / "shards.jsonl").is_file():
         return sibling
+    if direct.is_file():
+        return run_dir
     return nested
 
 
@@ -9492,7 +9502,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             rows.append(shard_row(root, status="stale", coverage_gap=str(gap.get("reason") or "unsafe_source_artifact")))
 
     def append_disappeared_summary_shard(summary: Path) -> None:
-        if not summary_path_hint_in_window(summary, start, end):
+        if summary_path_proves_after_window(summary, end):
             return
         rows.append(
             shard_row(
@@ -9504,7 +9514,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         )
 
     def append_disappeared_rollout_shard(rollout: Path) -> None:
-        if not rollout_path_hint_in_window(rollout, start, end):
+        if rollout_path_proves_after_window(rollout, end):
             return
         rows.append(
             shard_row(
@@ -9537,7 +9547,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and summary_path_hint_in_window(summary, start, end):
+                    if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "oversized"
@@ -9608,14 +9618,14 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and summary_path_hint_in_window(summary, start, end):
+                    if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "partial"
                 row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
                 rows.append(row)
                 return
-            if path_disappeared(summary) and summary_path_hint_in_window(summary, start, end):
+            if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
                 append_disappeared_summary_shard(summary)
                 return
             if jsonl_error is not None:
@@ -9632,7 +9642,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                         archived_duplicate_keys=archived_duplicate_keys,
                     )
                 ):
-                    if path_disappeared(summary) and summary_path_hint_in_window(summary, start, end):
+                    if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "invalid"
@@ -9648,7 +9658,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 allow_mtime_fallback=allow_mtime_fallback,
                 archived_duplicate_keys=archived_duplicate_keys,
             ):
-                if path_disappeared(summary) and summary_path_hint_in_window(summary, start, end):
+                if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
                     append_disappeared_summary_shard(summary)
                 return
             if not summary_file_has_extractable_record_in_window(summary, start, end):
@@ -9705,7 +9715,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         remote_generated_summary_paths = manifest_remote_generated_summary_paths & metadata_remote_generated_summary_paths
         allow_mtime_fallback = source_allows_mtime_fallback(source)
         if not root.exists():
-            rows.append(shard_row(root, status="missing", coverage_gap="source root missing"))
+            missing_gap = "remote_source_not_materialized" if str(host) in DEFAULT_REMOTE_HOSTS else "source root missing"
+            rows.append(shard_row(root, status="missing", coverage_gap=missing_gap))
             continue
         symlink_gap = source_root_symlink_gap(source)
         if symlink_gap:
@@ -9795,7 +9806,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     max_raw_bytes=max_raw_bytes,
                     allow_mtime_fallback=rollout_mtime_fallback,
                 ):
-                    if path_disappeared(rollout) and rollout_path_hint_in_window(rollout, start, end):
+                    if path_disappeared(rollout) and not rollout_path_proves_after_window(rollout, end):
                         append_disappeared_rollout_shard(rollout)
                     continue
                 size = rollout.stat().st_size

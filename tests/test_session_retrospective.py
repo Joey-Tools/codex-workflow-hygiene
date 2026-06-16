@@ -6014,6 +6014,19 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(captured["gap_hosts"], {"miku-bot-dev"})
 
+    def test_weekly_repair_prefers_nested_dry_run_shards_over_stale_top_level(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw) / "weekly-dry-run"
+            scan = run_dir / "scan"
+            nested = run_dir / "shards"
+            scan.mkdir(parents=True)
+            write_jsonl(run_dir / "shards.jsonl", [{"coverage_gap": "stale top-level"}])
+            write_jsonl(nested / "shards.jsonl", [{"coverage_gap": "fresh nested"}])
+
+            selected = MODULE.shards_dir_from_run_dir(run_dir, scan)
+
+        self.assertEqual(selected, nested)
+
     def test_weekly_repair_suggests_higher_raw_limit_when_oversized_gaps_remain(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -9641,6 +9654,32 @@ class SessionRetrospectiveTests(unittest.TestCase):
         )
         self.assertEqual([row.get("kind") for row in rows], [None, "summary"])
 
+    def test_make_shards_missing_default_remote_root_stays_repairable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "missing-miku"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "miku-bot-dev", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "missing")
+        self.assertEqual(rows[0]["coverage_gap"], "remote_source_not_materialized")
+        self.assertEqual(MODULE.shard_coverage_gap_reason(rows[0]["coverage_gap"]), "remote_source_not_materialized")
+
     def test_make_shards_revalidates_remote_summary_backing_before_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "miku-bot-dev"
@@ -10282,6 +10321,42 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
+        self.assertEqual(rows, [])
+
+    def test_make_shards_ignores_future_root_summary_ref_missing_before_rediscovery(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            root.mkdir(parents=True)
+            summary_ref = "rollout-summary-2026-07-01T10-00-00-future.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 0,
+                                "rollout_refs": [],
+                                "summary_count": 1,
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(MODULE.summary_date_from_path(root / summary_ref), MODULE.parse_time("2026-07-01T10:00:00Z"))
         self.assertEqual(rows, [])
 
     def test_make_shards_reports_manifest_summary_ref_missing_before_rediscovery(self) -> None:

@@ -229,6 +229,13 @@ review gates, and merge before starting the next item.
      and treat the relevance as unknown instead of aborting the scan.
    - Read direct `shards.jsonl` files beside a scan `shard_manifest.json` when
      repairing scan-output runs, not only nested or sibling shard directories.
+   - Prefer nested dry-run shard outputs over stale top-level shard files when
+     repairing a weekly or baseline dry-run directory.
+   - Preserve `remote_source_not_materialized` for default remote roots that
+     disappear between scan and shard planning, so repair can rematerialize the
+     host instead of treating the gap as local `source_root_missing`.
+   - Parse dates from root-level `rollout-summary-YYYY-MM-DD...jsonl` filenames
+     so future disappeared summaries can be safely suppressed.
    - Store transient scan-time rollout and summary refs in `shard_manifest.json`
      and compare them during `make-shards`, so files that disappear before
      rediscovery still become volatile shard gaps instead of being silently
