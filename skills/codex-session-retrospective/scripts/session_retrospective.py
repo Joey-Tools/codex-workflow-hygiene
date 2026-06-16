@@ -212,6 +212,7 @@ RETAINED_OUTCOMES = frozenset({"needs_review", "no_issue_observed"})
 RETAINED_FIXED_MODES = frozenset({"daily", "weekly"})
 BASELINE_MODE_PATTERN = re.compile(r"^baseline-[1-9][0-9]{0,3}d$")
 MAX_BASELINE_WINDOW_DAYS = 9999
+TIMESTAMPED_ROLLOUT_CROSS_MIDNIGHT_GRACE = dt.timedelta(hours=2)
 
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 RETAINED_SOURCE_HOST_ALIASES = {
@@ -1009,8 +1010,35 @@ def dated_path_from_parts(path: Path) -> dt.datetime | None:
     return None
 
 
-def summary_date_from_semantic_path(path: Path) -> dt.datetime | None:
-    parts = path.parts
+def source_relative_date_path(path: Path, source_root: Path | None) -> Path:
+    if source_root is None:
+        return path
+    try:
+        return path.expanduser().resolve(strict=False).relative_to(source_root.expanduser().resolve(strict=False))
+    except (OSError, ValueError):
+        try:
+            return path.expanduser().relative_to(source_root.expanduser())
+        except ValueError:
+            return path
+
+
+def source_relative_summary_hint_path(path: Path, source_root: Path | None) -> Path | None:
+    if source_root is None:
+        return path
+    try:
+        return path.expanduser().resolve(strict=False).relative_to(source_root.expanduser().resolve(strict=False))
+    except (OSError, ValueError):
+        try:
+            return path.expanduser().relative_to(source_root.expanduser())
+        except ValueError:
+            return None
+
+
+def summary_date_from_semantic_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
+    relative = source_relative_summary_hint_path(path, source_root)
+    if relative is None:
+        return None
+    parts = relative.parts
     for index, part in enumerate(parts):
         if (
             part not in {"sessions", "archived_sessions"}
@@ -1026,16 +1054,44 @@ def summary_date_from_semantic_path(path: Path) -> dt.datetime | None:
     return None
 
 
-def summary_date_from_path(path: Path) -> dt.datetime | None:
+def summary_date_from_dated_parent_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
+    if not path.name.startswith("rollout-summary"):
+        return None
+    relative = source_relative_summary_hint_path(path, source_root)
+    if relative is None:
+        return None
+    parts = relative.parts
+    if len(parts) < 4:
+        return None
+    year, month, day = parts[-4:-1]
+    if re.fullmatch(r"\d{4}", year) and re.fullmatch(r"\d{2}", month) and re.fullmatch(r"\d{2}", day):
+        return parse_time(f"{year}-{month}-{day}T00:00:00Z")
+    return None
+
+
+def summary_date_hint_from_path(path: Path, *, source_root: Path | None = None) -> tuple[dt.datetime, bool] | None:
     match = re.search(
         r"^rollout-summary-.*?(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?",
         path.name,
     )
     if match:
         if match.group(2):
-            return parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
-        return parse_time(f"{match.group(1)}T00:00:00Z")
-    return summary_date_from_semantic_path(path)
+            parsed = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+            return (parsed, True) if parsed is not None else None
+        parsed = parse_time(f"{match.group(1)}T00:00:00Z")
+        return (parsed, False) if parsed is not None else None
+    parsed = summary_date_from_semantic_path(path, source_root=source_root) or summary_date_from_dated_parent_path(
+        path,
+        source_root=source_root,
+    )
+    return (parsed, False) if parsed is not None else None
+
+
+def summary_date_from_path(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
+    hint = summary_date_hint_from_path(path, source_root=source_root)
+    if hint is None:
+        return None
+    return hint[0]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1994,6 +2050,7 @@ def generate_local_rollout_summaries_for_source(
                 end,
                 max_raw_bytes=max_raw_bytes,
                 allow_mtime_fallback=rollout_mtime_fallback,
+                source_root=source.root,
             )
         except OSError:
             continue
@@ -2012,6 +2069,7 @@ def generate_local_rollout_summaries_for_source(
                 end,
                 allow_mtime_fallback=rollout_mtime_fallback,
                 max_scan_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
+                source_root=source.root,
             )
         except OSError:
             continue
@@ -2110,8 +2168,8 @@ def unsafe_source_search_roots(source: Source) -> list[Path]:
     return sorted(unsafe_roots)
 
 
-def rollout_window_date(path: Path) -> dt.datetime | None:
-    return rollout_date_from_path(path) or dated_path_from_parts(path)
+def rollout_window_date(path: Path, *, source_root: Path | None = None) -> dt.datetime | None:
+    return rollout_date_from_path(path) or dated_path_from_parts(source_relative_date_path(path, source_root))
 
 
 def rollout_has_record_in_window(
@@ -2120,10 +2178,11 @@ def rollout_has_record_in_window(
     end: dt.datetime | None,
     *,
     allow_mtime_fallback: bool = False,
+    source_root: Path | None = None,
 ) -> bool:
     if start is None and end is None:
         return True
-    fallback = rollout_window_date(path)
+    fallback = rollout_window_date(path, source_root=source_root)
     saw_record = False
     saw_record_without_timestamp = False
     for _line_no, record in iter_jsonl(path):
@@ -2146,7 +2205,44 @@ def rollout_has_record_in_window(
     return False
 
 
-def rollout_filename_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+def timestamped_rollout_maybe_reaches_start(
+    rollout_time: dt.datetime,
+    rollout_date: dt.datetime | None,
+    start: dt.datetime | None,
+) -> bool:
+    if start is None or rollout_time >= start:
+        return True
+    if rollout_date is None:
+        return True
+    rollout_day_end = rollout_date + dt.timedelta(days=1)
+    if start < rollout_day_end:
+        return True
+    return (
+        rollout_time >= rollout_day_end - TIMESTAMPED_ROLLOUT_CROSS_MIDNIGHT_GRACE
+        and start < rollout_day_end + TIMESTAMPED_ROLLOUT_CROSS_MIDNIGHT_GRACE
+    )
+
+
+def timestamped_rollout_path_hint(path: Path) -> tuple[dt.datetime, dt.datetime | None] | None:
+    match = re.search(
+        r"^rollout-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})(?:-|\.jsonl$)",
+        path.name,
+    )
+    if not match:
+        return None
+    rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+    if rollout_time is None:
+        return None
+    return rollout_time, parse_time(f"{match.group(1)}T00:00:00Z")
+
+
+def rollout_filename_in_window(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
     match = re.search(
         r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)",
         path.name,
@@ -2154,16 +2250,17 @@ def rollout_filename_in_window(path: Path, start: dt.datetime | None, end: dt.da
     if match:
         if match.group(2):
             rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+            rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
             if rollout_time is None:
                 return True
-            if start and rollout_time < start:
-                return False
             if end and rollout_time >= end:
+                return False
+            if start and not timestamped_rollout_maybe_reaches_start(rollout_time, rollout_date, start):
                 return False
             return True
         rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
     else:
-        rollout_date = dated_path_from_parts(path)
+        rollout_date = dated_path_from_parts(source_relative_date_path(path, source_root))
     if rollout_date is None:
         return True
     rollout_end = rollout_date + dt.timedelta(days=1)
@@ -2182,10 +2279,24 @@ def rollout_candidate_relevant(
     max_raw_bytes: int | None = None,
     max_relevance_scan_bytes: int | None = None,
     allow_mtime_fallback: bool = False,
+    source_root: Path | None = None,
 ) -> bool:
     if start is None and end is None:
         return True
-    rollout_date = rollout_window_date(path)
+    timestamped_hint = timestamped_rollout_path_hint(path)
+    if timestamped_hint is not None:
+        rollout_time, rollout_day_start = timestamped_hint
+        if end and rollout_time >= end:
+            return False
+        if start and rollout_time < start and timestamped_rollout_maybe_reaches_start(
+            rollout_time,
+            rollout_day_start,
+            start,
+        ):
+            rollout_day_end = rollout_day_start + dt.timedelta(days=1) if rollout_day_start is not None else None
+            if rollout_day_end is None or start >= rollout_day_end:
+                return True
+    rollout_date = rollout_window_date(path, source_root=source_root)
     if rollout_date and end and rollout_date >= end:
         return False
     if rollout_date and start and rollout_date < start:
@@ -2207,6 +2318,7 @@ def rollout_candidate_relevant(
                     end,
                     allow_mtime_fallback=allow_mtime_fallback,
                     max_scan_bytes=max_relevance_scan_bytes,
+                    source_root=source_root,
                 )
             except OSError:
                 return True
@@ -2230,10 +2342,11 @@ def rollout_has_materialized_window_coverage(
     max_raw_bytes: int | None = None,
     max_relevance_scan_bytes: int | None = None,
     allow_mtime_fallback: bool = False,
+    source_root: Path | None = None,
 ) -> bool:
     if start is None and end is None:
         return True
-    rollout_date = rollout_window_date(path)
+    rollout_date = rollout_window_date(path, source_root=source_root)
     if rollout_date and end and rollout_date >= end:
         return False
     try:
@@ -2248,6 +2361,7 @@ def rollout_has_materialized_window_coverage(
                 end,
                 allow_mtime_fallback=allow_mtime_fallback,
                 max_scan_bytes=max_relevance_scan_bytes,
+                source_root=source_root,
             )
             == "relevant"
         )
@@ -2259,7 +2373,13 @@ def rollout_has_materialized_window_coverage(
         except OSError:
             return False
     try:
-        return rollout_has_record_in_window(path, start, end, allow_mtime_fallback=allow_mtime_fallback)
+        return rollout_has_record_in_window(
+            path,
+            start,
+            end,
+            allow_mtime_fallback=allow_mtime_fallback,
+            source_root=source_root,
+        )
     except (OSError, ValueError):
         return False
 
@@ -2351,10 +2471,11 @@ def oversized_rollout_relevance(
     *,
     allow_mtime_fallback: bool = False,
     max_scan_bytes: int | None = None,
+    source_root: Path | None = None,
 ) -> str:
     if start is None and end is None:
         return "relevant"
-    rollout_date = rollout_window_date(path)
+    rollout_date = rollout_window_date(path, source_root=source_root)
     if rollout_date and end and rollout_date >= end:
         return "irrelevant"
     if rollout_date and start and rollout_date < start:
@@ -2388,6 +2509,7 @@ def oversized_rollout_relevant(
     end: dt.datetime | None,
     *,
     allow_mtime_fallback: bool = False,
+    source_root: Path | None = None,
 ) -> bool:
     return (
         oversized_rollout_relevance(
@@ -2395,6 +2517,7 @@ def oversized_rollout_relevant(
             start,
             end,
             allow_mtime_fallback=allow_mtime_fallback,
+            source_root=source_root,
         )
         == "relevant"
     )
@@ -2412,18 +2535,30 @@ def raw_timestamp_in_window(path: Path, start: dt.datetime | None, end: dt.datet
     return found
 
 
+def summary_date_hint_maybe_reaches_start(
+    summary_date: dt.datetime,
+    exact_timestamp: bool,
+    start: dt.datetime,
+) -> bool:
+    if exact_timestamp:
+        summary_day_start = summary_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        return timestamped_rollout_maybe_reaches_start(summary_date, summary_day_start, start)
+    return summary_date + dt.timedelta(days=1) > start
+
+
 def summary_file_relevant_with_scan_cap(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    source_root: Path | None = None,
 ) -> bool:
     metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     if start is None and end is None:
         return True
-    summary_date = summary_date_from_path(path)
-    if summary_date is None:
+    summary_hint = summary_date_hint_from_path(path, source_root=source_root)
+    if summary_hint is None:
         try:
             found, complete = oversized_rollout_has_timestamp_in_window(
                 path,
@@ -2434,8 +2569,9 @@ def summary_file_relevant_with_scan_cap(
         except OSError:
             return False
         return found or not complete
+    summary_date, exact_timestamp = summary_hint
     if summary_date and start and summary_date < start:
-        if summary_date + dt.timedelta(days=1) > start:
+        if summary_date_hint_maybe_reaches_start(summary_date, exact_timestamp, start):
             return True
         try:
             if path.stat().st_size > metadata_scan_bytes:
@@ -2838,8 +2974,10 @@ def summary_record_in_window(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
 ) -> bool:
-    parsed_timestamp = summary_timestamp_with_fallback(record, path)
+    parsed_timestamp = summary_timestamp_with_fallback(record, path, source_root=source_root)
     if parsed_timestamp is None:
         return False
     if start and parsed_timestamp < start:
@@ -2894,6 +3032,43 @@ def rollout_ref_has_window_hint(ref: str) -> bool:
     return dated_path_from_parts(ref_path) is not None
 
 
+def rollout_ref_maybe_in_window(ref: str, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    if start is None and end is None:
+        return True
+    ref_path = Path(ref)
+    match = re.search(
+        r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)",
+        ref_path.name,
+    )
+    if match and match.group(2):
+        rollout_start = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+        rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
+        if rollout_start is None:
+            return False
+        if end and rollout_start >= end:
+            return False
+        if start and not timestamped_rollout_maybe_reaches_start(rollout_start, rollout_date, start):
+            return False
+        return True
+    if match:
+        rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
+    else:
+        rollout_date = dated_path_from_parts(ref_path)
+    if rollout_date is None:
+        return False
+    rollout_end = rollout_date + dt.timedelta(days=1)
+    if start and rollout_end <= start:
+        return False
+    if end and rollout_date >= end:
+        return False
+    return True
+
+
+def backing_ref_direct_file_exists(source_root: Path, ref: str) -> bool:
+    rollout = source_root / ref
+    return rollout_ref_is_direct_candidate(source_root, ref) and safe_source_file(rollout, source_root)
+
+
 def summary_file_has_relevant_backing_ref(
     path: Path,
     start: dt.datetime | None,
@@ -2936,21 +3111,27 @@ def summary_file_has_relevant_backing_ref(
         if safe_ref is None:
             continue
         if kind != "scan_meta":
-            if summary_record_in_window(record, path, start, end):
+            if summary_record_in_window(record, path, start, end, source_root=source_root):
                 return True
             continue
-        if rollout_ref_in_window(safe_ref, start, end) or (
-            source_root is not None
-            and backing_ref_has_materialized_window_coverage(
-                source_root,
-                safe_ref,
-                start,
-                end,
-                max_scan_bytes=max_scan_bytes,
-                allow_mtime_fallback=allow_mtime_fallback,
-                archived_duplicate_keys=archived_duplicate_keys,
-            )
-        ):
+        if source_root is None:
+            if rollout_ref_in_window(safe_ref, start, end):
+                return True
+            continue
+        ref_has_direct_coverage = backing_ref_has_materialized_window_coverage(
+            source_root,
+            safe_ref,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+        )
+        if ref_has_direct_coverage:
+            return True
+        if backing_ref_direct_file_exists(source_root, safe_ref):
+            continue
+        if rollout_ref_maybe_in_window(safe_ref, start, end):
             return True
     return False
 
@@ -2970,6 +3151,7 @@ def summary_file_relevant_or_backing_ref_relevant(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     ) or summary_file_has_relevant_backing_ref(
         path,
         start,
@@ -2996,6 +3178,7 @@ def summary_file_maybe_relevant_or_backing_ref_relevant(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     ) or summary_file_has_relevant_backing_ref(
         path,
         start,
@@ -3051,7 +3234,7 @@ def summary_backing_rollout_refs(
             if safe_ref is None:
                 unbacked_record_seen = True
             continue
-        if not summary_record_in_window(record, path, start, end):
+        if not summary_record_in_window(record, path, start, end, source_root=source_root):
             continue
         relevant_record_seen = True
         rollout_ref = record.get("rollout")
@@ -3316,6 +3499,7 @@ def summary_file_has_session_meta_in_window(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    source_root: Path | None = None,
 ) -> bool:
     metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     try:
@@ -3340,7 +3524,7 @@ def summary_file_has_session_meta_in_window(
             continue
         if str(record.get("kind") or "") != "session_meta":
             continue
-        if summary_record_in_window(record, path, start, end):
+        if summary_record_in_window(record, path, start, end, source_root=source_root):
             return True
     return False
 
@@ -3606,7 +3790,12 @@ def complete_summary_backing_rollout_refs(
             max_scan_bytes,
             allow_generated_remote_coverage=allow_generated_remote_coverage,
         )
-        extractable_refs = summary_extractable_backing_refs_in_window(summary, start, end)
+        extractable_refs = summary_extractable_backing_refs_in_window(
+            summary,
+            start,
+            end,
+            source_root=source_root,
+        )
         if extractable_refs:
             source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
                 summary,
@@ -3679,11 +3868,13 @@ def complete_scan_meta_backing_rollout_refs(
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     ) or summary_file_has_session_meta_in_window(
         summary,
         start,
         end,
         max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
     )
     refs: set[str] = set()
     for ref in scan_meta_refs:
@@ -3697,18 +3888,20 @@ def complete_scan_meta_backing_rollout_refs(
             source_bytes=source_bytes,
             source_sha256=source_sha256,
         )
+        ref_has_direct_coverage = backing_ref_has_materialized_window_coverage(
+            source_root,
+            ref,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+        )
+        ref_has_direct_file = backing_ref_direct_file_exists(source_root, ref)
         if not (
-            rollout_ref_in_window(ref, start, end)
-            or backing_ref_has_materialized_window_coverage(
-                source_root,
-                ref,
-                start,
-                end,
-                max_scan_bytes=max_scan_bytes,
-                allow_mtime_fallback=allow_mtime_fallback,
-                archived_duplicate_keys=archived_duplicate_keys,
-            )
+            ref_has_direct_coverage
             or summary_context_relevant
+            or (not ref_has_direct_file and rollout_ref_maybe_in_window(ref, start, end))
         ):
             continue
         if backing_ref_matches_current_or_trusted_summary(
@@ -3856,7 +4049,12 @@ def complete_summary_backing_rollout_keys(
             max_scan_bytes,
             allow_generated_remote_coverage=allow_generated_remote_coverage,
         )
-        extractable_refs = summary_extractable_backing_refs_in_window(summary, start, end)
+        extractable_refs = summary_extractable_backing_refs_in_window(
+            summary,
+            start,
+            end,
+            source_root=source_root,
+        )
         if extractable_refs:
             source_identity_by_ref = complete_summary_backing_source_identity_by_ref(
                 summary,
@@ -4067,6 +4265,7 @@ def backing_ref_has_materialized_window_coverage(
         start,
         end,
         max_raw_bytes=max_scan_bytes,
+        source_root=source_root,
         allow_mtime_fallback=rollout_ref_allows_mtime_fallback(
             ref,
             allow_mtime_fallback=allow_mtime_fallback,
@@ -4101,6 +4300,7 @@ def backing_ref_has_direct_materialized_window_coverage(
         start,
         end,
         max_raw_bytes=max_scan_bytes,
+        source_root=source_root,
         allow_mtime_fallback=rollout_ref_allows_mtime_fallback(
             ref,
             allow_mtime_fallback=allow_mtime_fallback,
@@ -4481,17 +4681,24 @@ def remote_summary_fallback_is_extractable(
     return True
 
 
-def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+def summary_file_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
     if start is None and end is None:
         return True
-    summary_date = summary_date_from_path(path)
-    if summary_date is None:
+    summary_hint = summary_date_hint_from_path(path, source_root=source_root)
+    if summary_hint is None:
         try:
             return raw_timestamp_in_window(path, start, end)
         except OSError:
             return False
+    summary_date, exact_timestamp = summary_hint
     if summary_date and start and summary_date < start:
-        if summary_date + dt.timedelta(days=1) > start:
+        if summary_date_hint_maybe_reaches_start(summary_date, exact_timestamp, start):
             return True
         try:
             return raw_timestamp_in_window(path, start, end)
@@ -4502,14 +4709,25 @@ def summary_file_relevant(path: Path, start: dt.datetime | None, end: dt.datetim
     return True
 
 
-def summary_file_maybe_relevant_without_read(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+def summary_file_maybe_relevant_without_read(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
     if start is None and end is None:
         return True
-    summary_date = summary_date_from_path(path)
+    summary_hint = summary_date_hint_from_path(path, source_root=source_root)
+    if summary_hint is None:
+        return True
+    summary_date, exact_timestamp = summary_hint
     if summary_date and end and summary_date >= end:
         return False
     if summary_date and start and summary_date < start:
-        return True
+        if not exact_timestamp:
+            return True
+        return summary_date_hint_maybe_reaches_start(summary_date, exact_timestamp, start)
     return True
 
 
@@ -4519,10 +4737,17 @@ def summary_file_maybe_relevant_with_scan_cap(
     end: dt.datetime | None,
     *,
     max_scan_bytes: int,
+    source_root: Path | None = None,
 ) -> bool:
-    summary_date = summary_date_from_path(path)
+    summary_date = summary_date_from_path(path, source_root=source_root)
     if summary_date is None:
-        return summary_file_relevant_with_scan_cap(path, start, end, max_scan_bytes=max_scan_bytes)
+        return summary_file_relevant_with_scan_cap(
+            path,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+            source_root=source_root,
+        )
     if summary_date and end and summary_date >= end:
         metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
         try:
@@ -4535,7 +4760,7 @@ def summary_file_maybe_relevant_with_scan_cap(
         except OSError:
             return False
         return found or not complete
-    return summary_file_maybe_relevant_without_read(path, start, end)
+    return summary_file_maybe_relevant_without_read(path, start, end, source_root=source_root)
 
 
 def summary_file_has_truncated_scan(path: Path) -> bool:
@@ -4591,13 +4816,15 @@ def summary_file_has_extractable_record_in_window(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
 ) -> bool:
     try:
         for _line_no, record in iter_jsonl(path):
             kind = str(record.get("kind") or "summary")
             if kind in {"session_meta", "scan_meta"}:
                 continue
-            if not summary_record_in_window(record, path, start, end):
+            if not summary_record_in_window(record, path, start, end, source_root=source_root):
                 continue
             if summary_record_has_retained_flags(record):
                 return True
@@ -4610,6 +4837,8 @@ def summary_extractable_backing_refs_in_window(
     path: Path,
     start: dt.datetime | None,
     end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
 ) -> set[str]:
     refs: set[str] = set()
     try:
@@ -4617,7 +4846,7 @@ def summary_extractable_backing_refs_in_window(
             kind = str(record.get("kind") or "summary")
             if kind in {"session_meta", "scan_meta"}:
                 continue
-            if not summary_record_in_window(record, path, start, end):
+            if not summary_record_in_window(record, path, start, end, source_root=source_root):
                 continue
             if not summary_record_has_retained_flags(record):
                 continue
@@ -4722,8 +4951,17 @@ def summary_backing_rollout_date(record: dict[str, Any]) -> dt.datetime | None:
     return rollout_date_from_path(ref_path) or dated_path_from_parts(ref_path)
 
 
-def summary_timestamp_with_fallback(record: dict[str, Any], path: Path) -> dt.datetime | None:
-    return parse_time(str(record.get("timestamp") or "")) or summary_backing_rollout_date(record) or summary_date_from_path(path)
+def summary_timestamp_with_fallback(
+    record: dict[str, Any],
+    path: Path,
+    *,
+    source_root: Path | None = None,
+) -> dt.datetime | None:
+    return (
+        parse_time(str(record.get("timestamp") or ""))
+        or summary_backing_rollout_date(record)
+        or summary_date_from_path(path, source_root=source_root)
+    )
 
 
 def infer_model_era(model: str | None, timestamp: str | None) -> str:
@@ -5234,7 +5472,7 @@ def extract_summary_file(
 
     for line_no, record in records:
         timestamp = str(record.get("timestamp") or "") or None
-        parsed_timestamp = summary_timestamp_with_fallback(record, path)
+        parsed_timestamp = summary_timestamp_with_fallback(record, path, source_root=source.root)
         text = str(record.get("text") or "")
         kind = str(record.get("kind") or "summary")
         retained_kind = retained_summary_kind(kind)
@@ -6818,11 +7056,15 @@ def earliest_rollout_date(sources: list[Source]) -> dt.datetime | None:
             return window_start <= parsed < window_end
 
         for rollout in source_rollouts(source):
-            parsed = dated_path_from_parts(rollout) or rollout_date_from_path(rollout)
+            parsed = dated_path_from_parts(source_relative_date_path(rollout, source.root))
+            if parsed is None:
+                filename_date = rollout_date_from_path(rollout)
+                if filename_date is not None:
+                    parsed = filename_date.replace(hour=0, minute=0, second=0, microsecond=0)
             if metadata_covers(parsed) and (earliest is None or parsed < earliest):
                 earliest = parsed
         for summary in source_summary_files(source):
-            parsed = summary_date_from_path(summary)
+            parsed = summary_date_from_path(summary, source_root=source.root)
             timestamp = earliest_timestamp_in_file(summary, max_scan_bytes=ROLLOUT_TIMESTAMP_SCAN_BYTES)
             if timestamp and (parsed is None or timestamp < parsed):
                 parsed = timestamp
@@ -7033,6 +7275,7 @@ def remote_summary_only_gaps(
             start,
             end,
             max_raw_bytes=max_scan_bytes,
+            source_root=source.root,
             allow_mtime_fallback=source_allows_mtime_fallback(source),
         ):
             continue
@@ -7076,21 +7319,28 @@ def remote_summary_only_gaps(
             )
             if invalid_scan_meta_ref_seen:
                 return [remote_metadata_gap(source, "remote_source_not_materialized")]
-            scan_meta_context_relevant = summary_file_has_session_meta_in_window(
+            scan_meta_context_relevant = summary_file_relevant_with_scan_cap(
                 summary,
                 start,
                 end,
                 max_scan_bytes=summary_scan_bytes,
+                source_root=source.root,
+            ) or summary_file_has_session_meta_in_window(
+                summary,
+                start,
+                end,
+                max_scan_bytes=summary_scan_bytes,
+                source_root=source.root,
             )
             for ref in scan_meta_refs:
-                if rollout_ref_has_window_hint(ref) and not rollout_ref_in_window(ref, start, end):
+                if rollout_ref_has_window_hint(ref) and not rollout_ref_maybe_in_window(ref, start, end):
                     continue
                 _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
                 selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
                 if (
                     selected_ref != ref
                     and rollout_ref_has_window_hint(selected_ref)
-                    and not rollout_ref_in_window(selected_ref, start, end)
+                    and not rollout_ref_maybe_in_window(selected_ref, start, end)
                 ):
                     continue
                 ref_key = summary_backed_rollout_key_for_ref(selected_ref)
@@ -7103,10 +7353,10 @@ def remote_summary_only_gaps(
                     allow_mtime_fallback=source_allows_mtime_fallback(source),
                     archived_duplicate_keys=archived_duplicate_keys,
                 )
-                if (
-                    not scan_meta_context_relevant
-                    and not rollout_ref_in_window(ref, start, end)
-                    and not ref_has_direct_coverage
+                ref_has_direct_file = backing_ref_direct_file_exists(source.root, selected_ref)
+                ref_maybe_relevant = rollout_ref_maybe_in_window(selected_ref, start, end)
+                if not ref_has_direct_coverage and (
+                    ref_has_direct_file or (not scan_meta_context_relevant and not ref_maybe_relevant)
                 ):
                     continue
                 if ref in complete_summary_refs or ref_key in complete_summary_keys:
@@ -7240,11 +7490,72 @@ def rollout_path_proves_after_window(path: Path, end: dt.datetime | None) -> boo
     return bool(end and rollout_date >= end)
 
 
+def rollout_path_proves_outside_window(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
+    match = re.search(
+        r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)",
+        path.name,
+    )
+    if match and match.group(2):
+        rollout_time = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+        rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
+        return bool(
+            rollout_time
+            and (
+                (end and rollout_time >= end)
+                or (start and not timestamped_rollout_maybe_reaches_start(rollout_time, rollout_date, start))
+            )
+        )
+    if match:
+        rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
+    else:
+        rollout_date = dated_path_from_parts(source_relative_date_path(path, source_root))
+    if rollout_date is None:
+        return False
+    rollout_end = rollout_date + dt.timedelta(days=1)
+    if start and rollout_end <= start:
+        return True
+    if end and rollout_date >= end:
+        return True
+    return False
+
+
 def summary_path_proves_after_window(path: Path, end: dt.datetime | None) -> bool:
     summary_date = summary_date_from_path(path)
     if summary_date is None:
         return False
     return bool(end and summary_date >= end)
+
+
+def summary_path_proves_outside_window(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
+    summary_hint = summary_date_hint_from_path(path, source_root=source_root)
+    if summary_hint is None:
+        return False
+    summary_date, exact_timestamp = summary_hint
+    summary_day_start = summary_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    summary_day_end = summary_day_start + dt.timedelta(days=1)
+    if start and exact_timestamp and not timestamped_rollout_maybe_reaches_start(
+        summary_date,
+        summary_day_start,
+        start,
+    ):
+        return True
+    if start and not exact_timestamp and summary_day_end <= start:
+        return True
+    if end and summary_day_start >= end:
+        return True
+    return False
 
 
 def earliest_rollout_sources(sources: list[Source]) -> list[Source]:
@@ -7285,11 +7596,16 @@ def run_scan(
         coverage_gaps.append(source_path_coverage_gap(source, path, "oversized_summary_skipped", bytes=size))
 
     def append_volatile_rollout_gap(path: Path) -> None:
-        if not rollout_path_proves_after_window(path, end):
+        if not rollout_path_proves_outside_window(path, start, end, source_root=source.root):
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_rollout_missing"))
 
     def append_volatile_summary_gap(path: Path, *, allow_future_path_filter: bool = True) -> None:
-        if not allow_future_path_filter or not summary_path_proves_after_window(path, end):
+        if not allow_future_path_filter or not summary_path_proves_outside_window(
+            path,
+            start,
+            end,
+            source_root=source.root,
+        ):
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_summary_missing"))
 
     for source in sources:
@@ -7492,6 +7808,7 @@ def run_scan(
                     max_raw_bytes=max_raw_bytes,
                     max_relevance_scan_bytes=max_rollout_relevance_scan_bytes,
                     allow_mtime_fallback=rollout_mtime_fallback,
+                    source_root=source.root,
                 ):
                     if path_disappeared(rollout):
                         append_volatile_rollout_gap(rollout)
@@ -7503,7 +7820,12 @@ def run_scan(
                         if jsonl_error.unreadable and path_disappeared(rollout):
                             append_volatile_rollout_gap(rollout)
                             continue
-                        relevant_invalid_rollout = rollout_filename_in_window(rollout, gap_start, end) or (
+                        relevant_invalid_rollout = rollout_filename_in_window(
+                            rollout,
+                            gap_start,
+                            end,
+                            source_root=source.root,
+                        ) or (
                             rollout_mtime_fallback and rollout_mtime_active(rollout, gap_start, end)
                         )
                         if not jsonl_error.unreadable:
@@ -7513,7 +7835,13 @@ def run_scan(
                         if relevant_invalid_rollout:
                             coverage_gaps.append(source_path_coverage_gap(source, rollout, "invalid_jsonl"))
                         continue
-                    if not rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=rollout_mtime_fallback):
+                    if not rollout_has_record_in_window(
+                        rollout,
+                        start,
+                        end,
+                        allow_mtime_fallback=rollout_mtime_fallback,
+                        source_root=source.root,
+                    ):
                         continue
                     all_turns.extend(
                         extract_rollout(
@@ -7532,6 +7860,7 @@ def run_scan(
                     end,
                     allow_mtime_fallback=rollout_mtime_fallback,
                     max_scan_bytes=max_rollout_relevance_scan_bytes,
+                    source_root=source.root,
                 )
                 if relevance == "irrelevant":
                     continue
@@ -7608,6 +7937,7 @@ def run_scan(
                             gap_start,
                             end,
                             max_scan_bytes=summary_scan_cap,
+                            source_root=source.root,
                         )
                         if jsonl_error.unreadable
                         else summary_file_relevant_or_backing_ref_relevant(
@@ -9551,7 +9881,12 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             )
 
     def append_disappeared_summary_shard(summary: Path, *, allow_future_path_filter: bool = True) -> None:
-        if allow_future_path_filter and summary_path_proves_after_window(summary, end):
+        if allow_future_path_filter and summary_path_proves_outside_window(
+            summary,
+            start,
+            end,
+            source_root=root,
+        ):
             return
         rows.append(
             shard_row(
@@ -9563,7 +9898,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         )
 
     def append_disappeared_rollout_shard(rollout: Path) -> None:
-        if rollout_path_proves_after_window(rollout, end):
+        if rollout_path_proves_outside_window(rollout, start, end, source_root=root):
             return
         rows.append(
             shard_row(
@@ -9596,7 +9931,12 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
+                    if path_disappeared(summary) and not summary_path_proves_outside_window(
+                        summary,
+                        start,
+                        end,
+                        source_root=root,
+                    ):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "oversized"
@@ -9667,19 +10007,35 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
+                    if path_disappeared(summary) and not summary_path_proves_outside_window(
+                        summary,
+                        start,
+                        end,
+                        source_root=root,
+                    ):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "partial"
                 row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
                 rows.append(row)
                 return
-            if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
+            if path_disappeared(summary) and not summary_path_proves_outside_window(
+                summary,
+                start,
+                end,
+                source_root=root,
+            ):
                 append_disappeared_summary_shard(summary)
                 return
             if jsonl_error is not None:
                 relevant_summary = (
-                    summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=summary_scan_cap)
+                    summary_file_maybe_relevant_with_scan_cap(
+                        summary,
+                        start,
+                        end,
+                        max_scan_bytes=summary_scan_cap,
+                        source_root=root,
+                    )
                     if jsonl_error.unreadable
                     else summary_file_relevant_or_backing_ref_relevant(
                         summary,
@@ -9692,7 +10048,12 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     )
                 )
                 if not relevant_summary:
-                    if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
+                    if path_disappeared(summary) and not summary_path_proves_outside_window(
+                        summary,
+                        start,
+                        end,
+                        source_root=root,
+                    ):
                         append_disappeared_summary_shard(summary)
                     return
                 row["status"] = "invalid"
@@ -9709,10 +10070,15 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 archived_duplicate_keys=archived_duplicate_keys,
             )
             if not relevant_summary:
-                if path_disappeared(summary) and not summary_path_proves_after_window(summary, end):
+                if path_disappeared(summary) and not summary_path_proves_outside_window(
+                    summary,
+                    start,
+                    end,
+                    source_root=root,
+                ):
                     append_disappeared_summary_shard(summary)
                 return
-            if not summary_file_has_extractable_record_in_window(summary, start, end):
+            if not summary_file_has_extractable_record_in_window(summary, start, end, source_root=root):
                 if path_disappeared(summary):
                     append_disappeared_summary_shard(summary, allow_future_path_filter=False)
                 return
@@ -9906,8 +10272,14 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     max_raw_bytes=max_raw_bytes,
                     max_relevance_scan_bytes=max_rollout_relevance_scan_bytes,
                     allow_mtime_fallback=rollout_mtime_fallback,
+                    source_root=root,
                 ):
-                    if path_disappeared(rollout) and not rollout_path_proves_after_window(rollout, end):
+                    if path_disappeared(rollout) and not rollout_path_proves_outside_window(
+                        rollout,
+                        start,
+                        end,
+                        source_root=root,
+                    ):
                         append_disappeared_rollout_shard(rollout)
                     continue
                 size = rollout.stat().st_size
@@ -9918,7 +10290,12 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                         if jsonl_error.unreadable and path_disappeared(rollout):
                             append_disappeared_rollout_shard(rollout)
                             continue
-                        relevant_invalid_rollout = rollout_filename_in_window(rollout, start, end) or (
+                        relevant_invalid_rollout = rollout_filename_in_window(
+                            rollout,
+                            start,
+                            end,
+                            source_root=root,
+                        ) or (
                             rollout_mtime_fallback and rollout_mtime_active(rollout, start, end)
                         )
                         if not jsonl_error.unreadable:
@@ -9930,7 +10307,13 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                             row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"
                             rows.append(row)
                         continue
-                    if rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=rollout_mtime_fallback):
+                    if rollout_has_record_in_window(
+                        rollout,
+                        start,
+                        end,
+                        allow_mtime_fallback=rollout_mtime_fallback,
+                        source_root=root,
+                    ):
                         row["status"] = "ready"
                         rows.append(row)
                     continue
@@ -9940,6 +10323,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     end,
                     allow_mtime_fallback=rollout_mtime_fallback,
                     max_scan_bytes=max_rollout_relevance_scan_bytes,
+                    source_root=root,
                 )
                 if relevance == "irrelevant":
                     continue
