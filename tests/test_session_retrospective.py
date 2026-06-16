@@ -2427,13 +2427,14 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
     def test_remote_probe_rollout_summary_chunks_signal_text_before_regex(self) -> None:
         captured_lengths: list[int] = []
-        real_search = REMOTE_PROBE.re.search
+        real_chunks = REMOTE_PROBE._summary_signal_chunks
 
-        def fake_search(pattern: str, text: str, flags: int = 0):
-            captured_lengths.append(len(text))
-            return real_search(pattern, text, flags)
+        def capture_chunks(text: str):
+            for chunk in real_chunks(text):
+                captured_lengths.append(len(chunk))
+                yield chunk
 
-        with mock.patch.object(REMOTE_PROBE.re, "search", side_effect=fake_search):
+        with mock.patch.object(REMOTE_PROBE, "_summary_signal_chunks", side_effect=capture_chunks):
             records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
                 lines=[
                     json.dumps(
@@ -2453,6 +2454,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(meta["json_error_count"], 0)
         self.assertTrue(captured_lengths)
         self.assertTrue(all(length <= REMOTE_PROBE.SUMMARY_SIGNAL_CHUNK_CHARS for length in captured_lengths))
+        self.assertLessEqual(len(captured_lengths), 4)
         self.assertTrue(any(record.get("text") == "you missed" for record in records))
 
     def test_remote_probe_rollout_summary_reports_json_error_metadata(self) -> None:
@@ -11638,6 +11640,70 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(generated), 1)
         self.assertIn('"kind": "user_message"', generated_text)
         self.assertIn('"timestamp": "2026-06-10T12:00:00Z"', generated_text)
+
+    def test_old_archived_oversized_rollout_uses_summary_scan_cap_for_relevance(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = home / ".codex"
+            write_local_evidence(root)
+            rollout = root / "archived_sessions" / "rollout-2026-03-19T11-56-46-old-large.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                ("x" * 200)
+                + "\n"
+                + json.dumps(message("user", "Archived weekly task.", "2026-06-10T12:00:00Z")),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}),
+                mock.patch.object(MODULE, "ROLLOUT_TIMESTAMP_SCAN_BYTES", 64),
+                mock.patch.object(MODULE, "LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES", 1024),
+            ):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=32, allow_partial_hosts=True),
+                    mode="weekly",
+                    start=MODULE.parse_time("2026-06-08T00:00:00Z"),
+                    end=MODULE.parse_time("2026-06-15T00:00:00Z"),
+                )
+            generated_root = MODULE.generated_summary_base_for_output(output)
+            generated = list(generated_root.rglob("rollout-summary-*.jsonl"))
+
+        self.assertEqual(len(generated), 1)
+
+    def test_old_archived_oversized_rollout_skips_partial_summary_when_window_timestamp_is_beyond_summary_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            root = home / ".codex"
+            write_local_evidence(root)
+            rollout = root / "archived_sessions" / "rollout-2026-03-19T11-56-46-old-large.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text(
+                ("x" * 400)
+                + "\n"
+                + json.dumps(message("user", "Archived weekly task.", "2026-06-10T12:00:00Z")),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}),
+                mock.patch.object(MODULE, "ROLLOUT_TIMESTAMP_SCAN_BYTES", 64),
+                mock.patch.object(MODULE, "LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES", 256),
+            ):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=32, allow_partial_hosts=True),
+                    mode="weekly",
+                    start=MODULE.parse_time("2026-06-08T00:00:00Z"),
+                    end=MODULE.parse_time("2026-06-15T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            generated_root = MODULE.generated_summary_base_for_output(output)
+            generated = list(generated_root.rglob("rollout-summary-*.jsonl"))
+
+        self.assertEqual(generated, [])
+        self.assertIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_old_active_oversized_rollout_with_active_mtime_generates_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

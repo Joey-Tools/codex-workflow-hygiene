@@ -2011,10 +2011,13 @@ def generate_local_rollout_summaries_for_source(
                 gap_start,
                 end,
                 allow_mtime_fallback=rollout_mtime_fallback,
+                max_scan_bytes=LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
             )
         except OSError:
             continue
         if relevance == "irrelevant":
+            continue
+        if relevance == "unknown" and size > LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES:
             continue
         rollout_ref = source_relative_path_ref(rollout, source.root)
         if (
@@ -2339,6 +2342,7 @@ def oversized_rollout_relevance(
     end: dt.datetime | None,
     *,
     allow_mtime_fallback: bool = False,
+    max_scan_bytes: int | None = None,
 ) -> str:
     if start is None and end is None:
         return "relevant"
@@ -2346,11 +2350,13 @@ def oversized_rollout_relevance(
     if rollout_date and end and rollout_date >= end:
         return "irrelevant"
     if rollout_date and start and rollout_date < start:
+        if max_scan_bytes is None:
+            max_scan_bytes = ROLLOUT_TIMESTAMP_SCAN_BYTES
         found, complete = oversized_rollout_has_timestamp_in_window(
             path,
             start,
             end,
-            max_scan_bytes=ROLLOUT_TIMESTAMP_SCAN_BYTES,
+            max_scan_bytes=max_scan_bytes,
         )
         if found:
             return "relevant"

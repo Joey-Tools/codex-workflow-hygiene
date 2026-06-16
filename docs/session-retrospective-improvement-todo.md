@@ -256,6 +256,26 @@ review gates, and merge before starting the next item.
      normalized between scan and shard planning.
    - Status: implemented in the weekly coverage diagnostics follow-up change.
 
+10. Weekly local summary signal scan performance
+   - Avoid long cold-start weekly dry-runs spending excessive CPU in summary
+     signal regex scans for cross-window oversized flat archived rollouts.
+   - Reuse bounded summary chunks per record instead of rebuilding chunks for
+     every signal category.
+   - Precompile non-sensitive summary signal category patterns while preserving
+     overlapping marker semantics and the existing output order.
+   - Combine sensitive summary signal detection into one compiled pattern so
+     local summary generation and remote rollout-summary extraction stay in
+     parity.
+   - Use a cheap sensitive-signal prefilter before the heavy sensitive regex
+     on ordinary long tool-output chunks.
+   - Use the local-summary scan cap for old oversized rollout relevance before
+     generating summaries, and skip partial summaries for larger old rollouts
+     when no in-window timestamp is found inside that cap.
+   - Keep the behavior conservative for long-lived archived sessions that
+     genuinely contain in-window records; optimize signal extraction rather
+     than skipping cross-day or cross-month evidence.
+   - Status: implemented in the weekly summary signal performance follow-up.
+
 ## Retained Readiness Bar
 
 A weekly or baseline run is not retained-ready until:
