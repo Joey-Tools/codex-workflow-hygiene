@@ -652,10 +652,31 @@ def iter_flag_probe_text_chunks(
         start += step
 
 
+def iter_flag_probe_text_windows(
+    text: str,
+    *,
+    limit: int = FLAG_SCAN_MAX_CHARS,
+    overlap: int = FLAG_SCAN_CHUNK_OVERLAP_CHARS,
+) -> Iterator[str]:
+    if len(text) <= limit:
+        yield text
+        return
+    safe_limit = max(1, limit)
+    safe_overlap = min(max(0, overlap), max(0, safe_limit - 1))
+    step = max(1, safe_limit - safe_overlap)
+    start = 0
+    while start < len(text):
+        prefix_start = max(0, start - safe_overlap)
+        yield text[prefix_start : start + safe_limit]
+        if start + safe_limit >= len(text):
+            return
+        start += step
+
+
 def flags_for_probe_text(text: str) -> set[str]:
     flags: set[str] = set()
-    for chunk in iter_flag_probe_text_chunks(text):
-        flags.update(flags_for_text(chunk))
+    for window in iter_flag_probe_text_windows(text):
+        flags.update(flags_for_text(window))
     return flags
 
 
@@ -2609,6 +2630,107 @@ def source_rollout_manifest_refs(rollouts: Iterable[Path], root: Path) -> list[s
         if ref is not None and safe_relative_rollout_ref(ref) is not None:
             refs.add(ref)
     return sorted(refs)
+
+
+def rollout_has_manifest_ref_relevance(
+    source: Source,
+    rollout: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_raw_bytes: int,
+    max_relevance_scan_bytes: int,
+    allow_mtime_fallback: bool,
+    summary_backed_rollout_keys: set[str],
+) -> bool:
+    try:
+        if not rollout_candidate_relevant(
+            rollout,
+            start,
+            end,
+            max_raw_bytes=max_raw_bytes,
+            max_relevance_scan_bytes=max_relevance_scan_bytes,
+            allow_mtime_fallback=allow_mtime_fallback,
+            source_root=source.root,
+        ):
+            return False
+        size = rollout.stat().st_size
+        if size <= max_raw_bytes:
+            jsonl_error = first_jsonl_error(rollout)
+            if jsonl_error is not None:
+                relevant_invalid_rollout = rollout_filename_in_window(
+                    rollout,
+                    start,
+                    end,
+                    source_root=source.root,
+                ) or (allow_mtime_fallback and rollout_mtime_active(rollout, start, end))
+                if not jsonl_error.unreadable:
+                    relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
+                        rollout,
+                        start,
+                        end,
+                    )
+                return relevant_invalid_rollout
+            return rollout_has_record_in_window(
+                rollout,
+                start,
+                end,
+                allow_mtime_fallback=allow_mtime_fallback,
+                source_root=source.root,
+            )
+        relevance = oversized_rollout_relevance(
+            rollout,
+            start,
+            end,
+            allow_mtime_fallback=allow_mtime_fallback,
+            max_scan_bytes=max_relevance_scan_bytes,
+            source_root=source.root,
+        )
+        if relevance == "irrelevant":
+            return False
+        rollout_ref = source_relative_path_ref(rollout, source.root)
+        if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
+            return False
+        return True
+    except FileNotFoundError:
+        return not rollout_path_proves_outside_window(rollout, start, end, source_root=source.root)
+
+
+def source_window_rollout_manifest_refs(
+    source: Source,
+    rollouts: Iterable[Path],
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_raw_bytes: int,
+    max_relevance_scan_bytes: int,
+    allow_mtime_fallback: bool,
+    archived_duplicate_keys: set[str] | None,
+    summary_backed_rollout_keys: set[str],
+) -> list[str]:
+    def relevant_rollouts() -> Iterable[Path]:
+        for rollout in rollouts:
+            rollout_mtime_fallback = allow_mtime_fallback and rollout_path_allows_mtime_fallback(
+                source,
+                rollout,
+                archived_duplicate_keys,
+            )
+            if rollout_has_manifest_ref_relevance(
+                source,
+                rollout,
+                start,
+                end,
+                max_raw_bytes=max_raw_bytes,
+                max_relevance_scan_bytes=max_relevance_scan_bytes,
+                allow_mtime_fallback=rollout_mtime_fallback,
+                summary_backed_rollout_keys=summary_backed_rollout_keys,
+            ):
+                yield rollout
+
+    return source_rollout_manifest_refs(
+        relevant_rollouts(),
+        source.root,
+    )
 
 
 def source_summary_manifest_refs(summaries: Iterable[Path], root: Path) -> list[str]:
@@ -7553,7 +7675,9 @@ def summary_path_proves_outside_window(
         return True
     if start and not exact_timestamp and summary_day_end <= start:
         return True
-    if end and summary_day_start >= end:
+    if end and exact_timestamp and summary_date >= end:
+        return True
+    if end and not exact_timestamp and summary_day_start >= end:
         return True
     return False
 
@@ -7783,7 +7907,17 @@ def run_scan(
             "root": transient_manifest_path_value(source.root),
             "root_ref": path_ref(source.root),
             "rollout_count": len(rollouts),
-            "rollout_refs": source_rollout_manifest_refs(rollouts, source.root),
+            "rollout_refs": source_window_rollout_manifest_refs(
+                source,
+                rollouts,
+                gap_start,
+                end,
+                max_raw_bytes=max_raw_bytes,
+                max_relevance_scan_bytes=max_rollout_relevance_scan_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
+                summary_backed_rollout_keys=existing_summary_backed_rollout_keys,
+            ),
             "summary_count": len(summaries),
             "summary_refs": source_summary_manifest_refs(summaries, source.root),
             "status": source_manifest_status(rollouts, summaries, blocking_gaps),
@@ -8021,6 +8155,7 @@ def run_scan(
 def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | None, end: dt.datetime) -> int:
     validate_window_bounds(start, end, "discover")
     max_raw_bytes = require_positive_window(getattr(args, "max_raw_bytes", 512_000), "--max-raw-bytes")
+    max_rollout_relevance_scan_bytes = local_rollout_relevance_scan_bytes(max_raw_bytes)
     output = ensure_safe_output_dir(Path(args.output))
     sources = parse_sources(args.source, require_default_hosts=not getattr(args, "allow_partial_hosts", False))
     manifest_sources: list[dict[str, Any]] = []
@@ -8203,7 +8338,17 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             "root": transient_manifest_path_value(source.root),
             "root_ref": path_ref(source.root),
             "rollout_count": len(rollouts),
-            "rollout_refs": source_rollout_manifest_refs(rollouts, source.root),
+            "rollout_refs": source_window_rollout_manifest_refs(
+                source,
+                rollouts,
+                start,
+                end,
+                max_raw_bytes=max_raw_bytes,
+                max_relevance_scan_bytes=max_rollout_relevance_scan_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
+                summary_backed_rollout_keys=existing_summary_backed_rollout_keys,
+            ),
             "summary_count": len(summaries),
             "summary_refs": source_summary_manifest_refs(summaries, source.root),
             "status": source_manifest_status(rollouts, summaries, blocking_gaps),
