@@ -188,6 +188,45 @@ review gates, and merge before starting the next item.
      cross-day or cross-month turns.
    - Status: implemented in the weekly local summary cache change.
 
+9. Weekly coverage diagnostics hardening
+   - Preserve `remote_source_not_materialized` for explicit default remote
+     source paths, so materialization gaps do not degrade into generic missing
+     roots when callers pass default host paths explicitly.
+   - Split report output into repairable and non-repairable coverage gap counts,
+     and make next-command notes clear when repair only covers a subset of the
+     blockers.
+   - When repair leaves oversized coverage gaps and backing byte sizes are
+     known, suggest a follow-up repair command with a higher rounded
+     `--max-raw-bytes` instead of only saying no same-cap command is useful.
+   - Treat live rollouts or summaries that disappear during scan or shard
+     discovery as volatile coverage gaps instead of crashing a weekly run.
+   - Merge shard-only coverage gaps into dry-run and repair reports so
+     `make-shards` blockers cannot disappear after the transient scan.
+   - Preserve source `root_ref` in shard rows so shard-only path gaps block only
+     the matching source root, not sibling sources on the same host.
+   - Filter volatile shard-discovery gaps through rollout and summary date
+     hints before reporting them, so old or future files that vanish after
+     discovery do not block the requested scan window.
+   - Treat missing date hints conservatively for disappeared files: only
+     suppress a volatile gap when the path hint proves the file is outside the
+     requested window.
+   - Store transient scan-time rollout and summary refs in `shard_manifest.json`
+     and compare them during `make-shards`, so files that disappear before
+     rediscovery still become volatile shard gaps instead of being silently
+     treated as retained-ready.
+   - Compare scan-time and rediscovered rollout refs by active/archived
+     duplicate key so a post-scan archive move of the same rollout does not
+     create a false volatile gap.
+   - Compare scan-time and rediscovered rollout refs with the full rollout
+     match-key set, including flat archived undated aliases.
+   - Preserve safe nested root-scan rollout refs in transient manifests so
+     copied or materialized root-level rollout files cannot disappear before
+     shard planning without a volatile gap.
+   - Reuse manifest `root_ref` for shard-only gap rows so source coverage
+     grouping stays aligned with the scan manifest even when raw roots were
+     normalized between scan and shard planning.
+   - Status: implemented in the weekly coverage diagnostics follow-up change.
+
 ## Retained Readiness Bar
 
 A weekly or baseline run is not retained-ready until:

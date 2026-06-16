@@ -87,6 +87,29 @@ def blocked_path_open(target: Path):
     return mock.patch.object(Path, "open", open_or_raise)
 
 
+def missing_stat_after_arm(target: Path, armed: dict[str, bool]):
+    real_stat = Path.stat
+
+    def stat_or_raise(self: Path, *args, **kwargs):
+        if self == target and armed.get("value"):
+            raise FileNotFoundError(str(self))
+        return real_stat(self, *args, **kwargs)
+
+    return mock.patch.object(Path, "stat", stat_or_raise)
+
+
+def missing_open_after_arm(target: Path, armed: dict[str, bool]):
+    real_open = Path.open
+
+    def open_or_raise(self: Path, *args, **kwargs):
+        if self == target and armed.get("value"):
+            target.unlink(missing_ok=True)
+            raise FileNotFoundError(str(self))
+        return real_open(self, *args, **kwargs)
+
+    return mock.patch.object(Path, "open", open_or_raise)
+
+
 def write_local_evidence(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "session_index.jsonl").write_text("{}\n", encoding="utf-8")
@@ -2827,6 +2850,15 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIsNone(sources[1].missing_reason)
         self.assertEqual(sources[2].missing_reason, "remote_source_not_materialized")
 
+    def test_explicit_default_remote_source_path_keeps_materialization_reason(self) -> None:
+        root = MODULE.absolute_default_source_path("miku-bot-dev")
+
+        sources = MODULE.parse_sources([f"miku-bot-dev={root}"], require_default_hosts=False)
+
+        self.assertEqual([source.host for source in sources], ["miku-bot-dev"])
+        self.assertTrue(sources[0].explicit)
+        self.assertEqual(sources[0].missing_reason, "remote_source_not_materialized")
+
     def test_partial_host_default_sources_use_local_only(self) -> None:
         sources = MODULE.parse_sources(None, require_default_hosts=False)
 
@@ -5254,6 +5286,227 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("local:blocked(status=ready", markdown)
         self.assertIn("Top blockers: oversized_rollout_skipped=1", markdown)
 
+    def test_dry_run_report_counts_shard_only_coverage_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(
+                shards / "shards.jsonl",
+                [
+                    {
+                        "host": "local",
+                        "path_ref": "path_ref_v1:aaaaaaaaaaaaaaaa",
+                        "status": "stale",
+                        "coverage_gap": "rollout disappeared during shard discovery",
+                    }
+                ],
+            )
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [{"host": "local", "status": "ready", "rollout_count": 1, "summary_count": 0}],
+                    "coverage_gaps": [],
+                },
+            )
+            markdown = MODULE.dry_run_report_markdown(report)
+
+        source_coverage = report["report_summary"]["source_coverage"]
+        self.assertEqual(report["coverage_gap_counts"], {"volatile_rollout_missing": 1})
+        self.assertEqual(report["shard_coverage_gap_counts"], {"volatile_rollout_missing": 1})
+        self.assertEqual(report["report_summary"]["shard_coverage_gap_counts"], {"volatile_rollout_missing": 1})
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"volatile_rollout_missing": 1})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "blocked_by_coverage_gaps")
+        self.assertEqual(source_coverage["ready_sources"], 0)
+        self.assertEqual(source_coverage["blocked_sources"], 1)
+        self.assertIn("Top blockers: volatile_rollout_missing=1", markdown)
+
+    def test_dry_run_report_shard_gap_blocks_only_matching_source_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(
+                shards / "shards.jsonl",
+                [
+                    {
+                        "host": "custom_source",
+                        "root_ref": "path_ref_v1:aaaaaaaaaaaaaaaa",
+                        "path_ref": "path_ref_v1:bbbbbbbbbbbbbbbb",
+                        "status": "stale",
+                        "coverage_gap": "rollout disappeared during shard discovery",
+                    }
+                ],
+            )
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [
+                        {
+                            "host": "custom_source",
+                            "root_ref": "path_ref_v1:aaaaaaaaaaaaaaaa",
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "summary_count": 0,
+                        },
+                        {
+                            "host": "custom_source",
+                            "root_ref": "path_ref_v1:cccccccccccccccc",
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "summary_count": 0,
+                        },
+                    ],
+                    "coverage_gaps": [],
+                },
+            )
+
+        source_coverage = report["report_summary"]["source_coverage"]
+        self.assertEqual(report["coverage_gap_counts"], {"volatile_rollout_missing": 1})
+        self.assertEqual(source_coverage["ready_sources"], 1)
+        self.assertEqual(source_coverage["blocked_sources"], 1)
+
+    def test_dry_run_report_deduplicates_manifest_and_shard_coverage_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            path_ref = "path_ref_v1:aaaaaaaaaaaaaaaa"
+            write_jsonl(
+                shards / "shards.jsonl",
+                [
+                    {
+                        "host": "local",
+                        "path_ref": path_ref,
+                        "bytes": 123456,
+                        "status": "oversized",
+                        "coverage_gap": "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff",
+                    }
+                ],
+            )
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [{"host": "local", "status": "ready", "rollout_count": 1, "summary_count": 0}],
+                    "coverage_gaps": [
+                        {
+                            "host": "local",
+                            "root_ref": "path_ref_v1:bbbbbbbbbbbbbbbb",
+                            "path_ref": path_ref,
+                            "bytes": 123456,
+                            "reason": "oversized_rollout_skipped",
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(report["coverage_gap_counts"], {"oversized_rollout_skipped": 1})
+        self.assertEqual(report["shard_coverage_gap_counts"], {"oversized_rollout_skipped": 1})
+        self.assertEqual(report["repairable_coverage_gap_counts"], {"oversized_rollout_skipped": 1})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "repairable_coverage_gaps")
+
+    def test_dry_run_report_shows_non_repairable_gap_note_with_next_command(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [{"host": "local", "status": "ready", "rollout_count": 1, "summary_count": 1}],
+                    "coverage_gaps": [
+                        {"host": "local", "reason": "oversized_rollout_skipped"},
+                        {"host": "local", "reason": "truncated_rollout_summary"},
+                    ],
+                },
+                next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run",
+            )
+            markdown = MODULE.dry_run_report_markdown(report)
+
+        self.assertEqual(report["repairable_coverage_gap_counts"], {"oversized_rollout_skipped": 1})
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"truncated_rollout_summary": 1})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "blocked_by_coverage_gaps")
+        self.assertIn("Non-repairable coverage gaps: truncated_rollout_summary=1", markdown)
+        self.assertIn("next command repairs only repairable gaps", report["next_command_note"])
+        self.assertIn("Next command note: next command repairs only repairable gaps", markdown)
+
+    def test_dry_run_report_notes_when_only_non_repairable_gaps_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-repair"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            report = MODULE.dry_run_report(
+                kind="weekly_repair",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [{"host": "local", "status": "stale", "rollout_count": 1, "summary_count": 1}],
+                    "coverage_gaps": [{"host": "local", "reason": "stale_rollout_summary"}],
+                },
+            )
+            markdown = MODULE.dry_run_report_markdown(report)
+
+        self.assertNotIn("next_command", report)
+        self.assertEqual(report["repairable_coverage_gap_counts"], {})
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"stale_rollout_summary": 1})
+        self.assertIn("no transient repair command for non-repairable gaps", report["next_command_note"])
+        self.assertIn("Next command: none (no transient repair command for non-repairable gaps", markdown)
+
     def test_source_path_coverage_gap_includes_source_root_ref(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "source"
@@ -5544,7 +5797,114 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("Before gaps:", markdown)
         self.assertIn("After gaps:", markdown)
 
-    def test_weekly_repair_omits_follow_up_command_when_oversized_gaps_remain(self) -> None:
+    def test_weekly_repair_materializes_hosts_from_shard_only_remote_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw) / "weekly-dry-run"
+            scan = run_dir / "scan"
+            shards = run_dir / "shards"
+            source_root = Path(raw) / "source"
+            source_root.mkdir()
+            scan.mkdir(parents=True)
+            write_jsonl(
+                shards / "shards.jsonl",
+                [
+                    {
+                        "host": "miku-bot-dev",
+                        "path_ref": "path_ref_v1:aaaaaaaaaaaaaaaa",
+                        "status": "stale",
+                        "coverage_gap": "remote_source_not_materialized",
+                    }
+                ],
+            )
+            (scan / "shard_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "window": {
+                            "mode": "weekly",
+                            "start": "2026-05-01T00:00:00Z",
+                            "end": "2026-05-08T00:00:00Z",
+                        },
+                        "sources": [
+                            {
+                                "host": "miku-bot-dev",
+                                "root": str(source_root),
+                                "root_ref": "path_ref_v1:bbbbbbbbbbbbbbbb",
+                                "status": "ready",
+                                "rollout_count": 1,
+                                "summary_count": 0,
+                            }
+                        ],
+                        "coverage_gaps": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            remote_probe = Path(raw) / "remote_codex_probe.py"
+            remote_probe.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            captured: dict[str, set[str]] = {}
+
+            def fake_materialize_repair_hosts(*, gap_hosts, **_kwargs):
+                captured["gap_hosts"] = set(gap_hosts)
+                return {}, []
+
+            def fake_run_scan(args, **_kwargs):
+                output = Path(args.output)
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "shard_manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "window": {
+                                "mode": "weekly",
+                                "start": "2026-05-01T00:00:00Z",
+                                "end": "2026-05-08T00:00:00Z",
+                            },
+                            "sources": [
+                                {
+                                    "host": "miku-bot-dev",
+                                    "root": str(source_root),
+                                    "status": "ready",
+                                    "rollout_count": 0,
+                                    "summary_count": 0,
+                                }
+                            ],
+                            "coverage_gaps": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            def fake_make_shards(_scan_dir, output, *, max_raw_bytes):
+                self.assertGreater(max_raw_bytes, 0)
+                write_jsonl(Path(output) / "shards.jsonl", [])
+
+            with mock.patch.object(
+                MODULE,
+                "materialize_repair_hosts",
+                side_effect=fake_materialize_repair_hosts,
+            ), mock.patch.object(MODULE, "run_scan", side_effect=fake_run_scan), mock.patch.object(
+                MODULE,
+                "validate_output_run",
+                return_value=({"turn_count": 0, "episode_count": 0}, {}),
+            ), mock.patch.object(MODULE, "run_make_shards_for_scan", side_effect=fake_make_shards):
+                MODULE.run_coverage_repair(
+                    types.SimpleNamespace(
+                        run_dir=str(run_dir),
+                        output=str(safe_output_dir(raw, "weekly-coverage-repair")),
+                        max_raw_bytes=1000,
+                        remote_probe=str(remote_probe),
+                        remote_session_meta_limit=500,
+                        remote_host_jobs=1,
+                        remote_rollout_jobs=1,
+                        skip_remote_materialization=False,
+                        allow_partial_hosts=True,
+                    ),
+                    default_output_name="weekly-coverage-repair",
+                    report_kind="weekly_repair",
+                )
+
+        self.assertEqual(captured["gap_hosts"], {"miku-bot-dev"})
+
+    def test_weekly_repair_suggests_higher_raw_limit_when_oversized_gaps_remain(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01T10-00-00-weekly-large.jsonl"
@@ -5591,12 +5951,27 @@ class SessionRetrospectiveTests(unittest.TestCase):
             report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
             markdown = (repair / "repair_report.md").read_text(encoding="utf-8")
 
-        self.assertNotIn("next_command", report)
-        self.assertIsNone(report["report_summary"]["next_command"])
+        expected_script = Path(MODULE.__file__).resolve().as_posix()
+        self.assertEqual(
+            MODULE.shlex.split(report["next_command"]),
+            [
+                "python3",
+                expected_script,
+                "weekly-repair",
+                "--run-dir",
+                repair.absolute().as_posix(),
+                "--max-raw-bytes",
+                "1048576",
+                "--allow-partial-hosts",
+            ],
+        )
+        self.assertEqual(report["report_summary"]["next_command"], report["next_command"])
         self.assertIn("oversized_summary_skipped", report["repairable_coverage_gap_counts"])
         self.assertIn("remaining oversized gaps require a higher --max-raw-bytes than 200", report["next_command_note"])
+        self.assertIn("suggested --max-raw-bytes 1048576", report["next_command_note"])
         self.assertEqual(report["report_summary"]["next_command_note"], report["next_command_note"])
-        self.assertIn("Next command: none (remaining oversized gaps require a higher --max-raw-bytes than 200)", markdown)
+        self.assertIn(report["next_command"], markdown)
+        self.assertIn("Next command note: remaining oversized gaps require a higher --max-raw-bytes than 200", markdown)
 
     def test_weekly_repair_reports_follow_up_command_when_remote_gaps_remain(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -9208,6 +9583,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertNotIn("path", rows[0])
         self.assertIn("path_ref_v1:", rows[0]["path_ref"])
+        self.assertIn("path_ref_v1:", rows[0]["root_ref"])
 
     def test_make_shards_reports_in_window_invalid_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -9262,6 +9638,622 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["status"], "invalid")
         self.assertIn("coverage_gap", rows[0])
+
+    def test_make_shards_reports_live_rollout_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-live.jsonl"
+            write_jsonl(rollout, [message("user", "Live shard race.", "2026-05-22T10:00:00Z")])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            armed = {"value": False}
+            real_remote_summary_only_gaps = MODULE.remote_summary_only_gaps
+
+            def summary_only_gaps_and_arm(*args, **kwargs):
+                result = real_remote_summary_only_gaps(*args, **kwargs)
+                armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "remote_summary_only_gaps",
+                side_effect=summary_only_gaps_and_arm,
+            ), missing_stat_after_arm(rollout, armed):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
+    def test_make_shards_ignores_future_rollout_disappearing_after_irrelevance(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "07" / "01" / "rollout-2026-07-01T10-00-00-future.jsonl"
+            write_jsonl(rollout, [message("user", "Future shard race.", "2026-07-01T10:00:00Z")])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            armed = {"value": False}
+            real_remote_summary_only_gaps = MODULE.remote_summary_only_gaps
+
+            def summary_only_gaps_and_arm(*args, **kwargs):
+                result = real_remote_summary_only_gaps(*args, **kwargs)
+                armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "remote_summary_only_gaps",
+                side_effect=summary_only_gaps_and_arm,
+            ), missing_stat_after_arm(rollout, armed):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows, [])
+
+    def test_make_shards_ignores_future_rollout_disappearing_after_relevance_race(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "07" / "01" / "rollout-2026-07-01T10-00-00-future.jsonl"
+            write_jsonl(rollout, [message("user", "Future shard race.", "2026-07-01T10:00:00Z")])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            armed = {"value": False}
+
+            def relevant_and_arm(path: Path, *args, **kwargs):
+                if path == rollout:
+                    armed["value"] = True
+                return True
+
+            with mock.patch.object(
+                MODULE,
+                "rollout_candidate_relevant",
+                side_effect=relevant_and_arm,
+            ), missing_stat_after_arm(rollout, armed):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows, [])
+
+    def test_make_shards_reports_manifest_rollout_ref_missing_before_rediscovery(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            (root / "sessions" / "2026" / "05" / "22").mkdir(parents=True)
+            rollout_ref = "sessions/2026/05/22/rollout-2026-05-22T10-00-00-live.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "root_ref": "path_ref_v1:aaaaaaaaaaaaaaaa",
+                                "status": "ready",
+                                "rollout_count": 1,
+                                "rollout_refs": [rollout_ref],
+                                "summary_count": 0,
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["root_ref"], "path_ref_v1:aaaaaaaaaaaaaaaa")
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
+    def test_make_shards_reports_nested_root_scan_rollout_ref_missing_before_rediscovery(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            (root / "copied").mkdir(parents=True)
+            rollout_ref = "copied/rollout-2026-05-22T10-00-00-copied.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 1,
+                                "rollout_refs": [rollout_ref],
+                                "summary_count": 0,
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
+    def test_source_rollout_manifest_refs_preserve_nested_root_scan_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "copied" / "rollout-2026-05-22T10-00-00-copied.jsonl"
+            write_jsonl(rollout, [message("user", "Copied root scan rollout.", "2026-05-22T10:00:00Z")])
+
+            refs = MODULE.source_rollout_manifest_refs(MODULE.source_rollouts(MODULE.Source("local", root)), root)
+
+        self.assertEqual(refs, ["copied/rollout-2026-05-22T10-00-00-copied.jsonl"])
+
+    def test_make_shards_accepts_archived_duplicate_for_manifest_rollout_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_name = "rollout-2026-05-22T10-00-00-live.jsonl"
+            active_ref = f"sessions/2026/05/22/{rollout_name}"
+            archived = root / "archived_sessions" / "2026" / "05" / "22" / rollout_name
+            write_jsonl(archived, [message("user", "Archived after scan.", "2026-05-22T10:00:00Z")])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 1,
+                                "rollout_refs": [active_ref],
+                                "summary_count": 0,
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertFalse(any(row.get("coverage_gap") == "rollout disappeared during shard discovery" for row in rows))
+        self.assertTrue(any(row.get("status") == "ready" for row in rows))
+
+    def test_make_shards_accepts_flat_archived_undated_alias_for_manifest_rollout_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_name = "rollout-undated-live.jsonl"
+            active_ref = f"sessions/2026/05/22/{rollout_name}"
+            archived = root / "archived_sessions" / rollout_name
+            write_jsonl(archived, [message("user", "Flat archived undated alias.", "2026-05-22T10:00:00Z")])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 1,
+                                "rollout_refs": [active_ref],
+                                "summary_count": 0,
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertFalse(any(row.get("coverage_gap") == "rollout disappeared during shard discovery" for row in rows))
+        self.assertTrue(any(row.get("status") == "ready" for row in rows))
+
+    def test_make_shards_reports_flat_archived_undated_rollout_ref_missing_before_rediscovery(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            (root / "archived_sessions").mkdir(parents=True)
+            rollout_ref = "archived_sessions/rollout-undated-live.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 1,
+                                "rollout_refs": [rollout_ref],
+                                "summary_count": 0,
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
+    def test_make_shards_ignores_future_manifest_rollout_ref_missing_before_rediscovery(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            (root / "sessions" / "2026" / "07" / "01").mkdir(parents=True)
+            rollout_ref = "sessions/2026/07/01/rollout-2026-07-01T10-00-00-future.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 1,
+                                "rollout_refs": [rollout_ref],
+                                "summary_count": 0,
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows, [])
+
+    def test_make_shards_reports_live_rollout_missing_after_stat(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-live.jsonl"
+            write_jsonl(rollout, [message("user", "Live shard read race.", "2026-05-22T10:00:00Z")])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            armed = {"value": False}
+            real_first_jsonl_error = MODULE.first_jsonl_error
+
+            def first_jsonl_error_and_arm(path: Path):
+                result = real_first_jsonl_error(path)
+                if path == rollout:
+                    armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "first_jsonl_error",
+                side_effect=first_jsonl_error_and_arm,
+            ), missing_open_after_arm(rollout, armed):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
+    def test_make_shards_reports_live_summary_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "05" / "22" / "rollout-summary-live.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-22T10:00:00Z", "text": "Live summary shard race."}])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            armed = {"value": False}
+            real_remote_summary_only_gaps = MODULE.remote_summary_only_gaps
+
+            def summary_only_gaps_and_arm(*args, **kwargs):
+                result = real_remote_summary_only_gaps(*args, **kwargs)
+                armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "remote_summary_only_gaps",
+                side_effect=summary_only_gaps_and_arm,
+            ), missing_stat_after_arm(summary, armed):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
+    def test_make_shards_reports_undated_summary_ref_missing_before_rediscovery(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            root.mkdir(parents=True)
+            summary_ref = "rollout-summary-undated.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 0,
+                                "rollout_refs": [],
+                                "summary_count": 1,
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
+    def test_make_shards_ignores_future_summary_disappearing_after_stat(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "07" / "01" / "rollout-summary-future.jsonl"
+            write_jsonl(
+                summary,
+                [{"kind": "summary", "timestamp": "2026-07-01T10:00:00Z", "text": "Future summary shard race."}],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            armed = {"value": False}
+            real_remote_summary_only_gaps = MODULE.remote_summary_only_gaps
+
+            def summary_only_gaps_and_arm(*args, **kwargs):
+                result = real_remote_summary_only_gaps(*args, **kwargs)
+                armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "remote_summary_only_gaps",
+                side_effect=summary_only_gaps_and_arm,
+            ), missing_stat_after_arm(summary, armed):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows, [])
+
+    def test_make_shards_reports_manifest_summary_ref_missing_before_rediscovery(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            (root / "sessions" / "2026" / "05" / "22").mkdir(parents=True)
+            summary_ref = "sessions/2026/05/22/rollout-summary-live.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_count": 0,
+                                "rollout_refs": [],
+                                "summary_count": 1,
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
+    def test_make_shards_reports_live_summary_missing_after_stat(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "05" / "22" / "rollout-summary-live.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-22T10:00:00Z", "text": "Live summary shard read race."}])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            armed = {"value": False}
+            real_first_jsonl_error = MODULE.first_jsonl_error
+
+            def first_jsonl_error_and_arm(path: Path):
+                result = real_first_jsonl_error(path)
+                if path == summary:
+                    armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "first_jsonl_error",
+                side_effect=first_jsonl_error_and_arm,
+            ), missing_open_after_arm(summary, armed):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
+    def test_make_shards_reports_live_summary_missing_during_extractable_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "05" / "22" / "rollout-summary-live.jsonl"
+            write_jsonl(
+                summary,
+                [{"kind": "summary", "timestamp": "2026-05-22T10:00:00Z", "text": "Live summary extract race."}],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            real_extractable = MODULE.summary_file_has_extractable_record_in_window
+
+            def extractable_and_disappear(path: Path, *args, **kwargs):
+                if path == summary:
+                    summary.unlink()
+                    return False
+                return real_extractable(path, *args, **kwargs)
+
+            with mock.patch.object(
+                MODULE,
+                "summary_file_has_extractable_record_in_window",
+                side_effect=extractable_and_disappear,
+            ):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
 
     def test_make_shards_reports_non_object_jsonl_record(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -16382,6 +17374,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
 
             self.assertEqual(manifest["sources"][0]["rollout_count"], 1)
+            self.assertEqual(
+                manifest["sources"][0]["rollout_refs"],
+                ["sessions/2026/05/01/rollout-2026-05-01T10-00-00-abc.jsonl"],
+            )
             self.assertFalse((output / "turn_summaries.jsonl").exists())
             self.assertTrue((output / "retained_manifest.json").exists())
 
@@ -18746,6 +19742,137 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
         self.assertNotIn("path_ref", trend["coverage_gaps"][0])
 
+    def test_live_rollout_missing_during_scan_reports_gap_and_blocks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Live rollout race.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            armed = {"value": False}
+            real_source_manifest_status = MODULE.source_manifest_status
+
+            def source_manifest_status_and_arm(*args, **kwargs) -> str:
+                result = real_source_manifest_status(*args, **kwargs)
+                armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "source_manifest_status",
+                side_effect=source_manifest_status_and_arm,
+            ), missing_stat_after_arm(rollout, armed):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            retained = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "volatile_rollout_missing")
+        self.assertNotIn("path", trend["coverage_gaps"][0])
+        self.assertEqual(retained["coverage_gaps"][0]["reason"], "volatile_rollout_missing")
+
+    def test_future_rollout_disappearing_after_irrelevance_does_not_report_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "06" / "01" / "rollout-2026-06-01T10-00-00-future.jsonl"
+            write_jsonl(rollout, [message("user", "Future rollout.", "2026-06-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            armed = {"value": False}
+            real_source_manifest_status = MODULE.source_manifest_status
+
+            def source_manifest_status_and_arm(*args, **kwargs) -> str:
+                result = real_source_manifest_status(*args, **kwargs)
+                armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "source_manifest_status",
+                side_effect=source_manifest_status_and_arm,
+            ), missing_stat_after_arm(rollout, armed):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("volatile_rollout_missing", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_lookback_rollout_disappearing_before_emit_start_does_not_report_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "03" / "rollout-2026-05-03T10-00-00-lookback.jsonl"
+            write_jsonl(rollout, [message("user", "Lookback rollout.", "2026-05-03T10:00:00Z")])
+            output = safe_output_dir(raw)
+            armed = {"value": False}
+            real_source_manifest_status = MODULE.source_manifest_status
+
+            def source_manifest_status_and_arm(*args, **kwargs) -> str:
+                result = real_source_manifest_status(*args, **kwargs)
+                armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "source_manifest_status",
+                side_effect=source_manifest_status_and_arm,
+            ), missing_stat_after_arm(rollout, armed):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    emit_start=MODULE.parse_time("2026-05-08T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-15T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("volatile_rollout_missing", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_live_rollout_missing_after_stat_during_scan_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-abc.jsonl"
+            write_jsonl(rollout, [message("user", "Live rollout read race.", "2026-05-01T10:00:00Z")])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            armed = {"value": False}
+            real_first_jsonl_error = MODULE.first_jsonl_error
+
+            def first_jsonl_error_and_arm(path: Path):
+                result = real_first_jsonl_error(path)
+                if path == rollout:
+                    armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "first_jsonl_error",
+                side_effect=first_jsonl_error_and_arm,
+            ), missing_open_after_arm(rollout, armed):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            retained = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "volatile_rollout_missing")
+        self.assertEqual(retained["coverage_gaps"][0]["reason"], "volatile_rollout_missing")
+
     def test_unreadable_rollout_summary_reports_gap_and_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -18767,6 +19894,76 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
         self.assertNotIn("path_ref", trend["coverage_gaps"][0])
+
+    def test_live_summary_missing_during_scan_reports_gap_and_blocks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "Live summary race."}])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            armed = {"value": False}
+            real_remote_summary_only_gaps = MODULE.remote_summary_only_gaps
+
+            def summary_only_gaps_and_arm(*args, **kwargs):
+                result = real_remote_summary_only_gaps(*args, **kwargs)
+                armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "remote_summary_only_gaps",
+                side_effect=summary_only_gaps_and_arm,
+            ), missing_stat_after_arm(summary, armed):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            retained = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "volatile_summary_missing")
+        self.assertNotIn("path", trend["coverage_gaps"][0])
+        self.assertEqual(retained["coverage_gaps"][0]["reason"], "volatile_summary_missing")
+
+    def test_live_summary_missing_after_stat_during_scan_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-current.jsonl"
+            write_jsonl(summary, [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "Live summary read race."}])
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+            armed = {"value": False}
+            real_first_jsonl_error = MODULE.first_jsonl_error
+
+            def first_jsonl_error_and_arm(path: Path):
+                result = real_first_jsonl_error(path)
+                if path == summary:
+                    armed["value"] = True
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "first_jsonl_error",
+                side_effect=first_jsonl_error_and_arm,
+            ), missing_open_after_arm(summary, armed):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            retained = json.loads((output / "retained_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "volatile_summary_missing")
+        self.assertEqual(retained["coverage_gaps"][0]["reason"], "volatile_summary_missing")
 
     def test_non_object_rollout_jsonl_reports_gap_and_blocks_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

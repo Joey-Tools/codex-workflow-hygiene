@@ -548,6 +548,8 @@ RETAINED_COVERAGE_GAP_REASONS = frozenset(
         "truncated_rollout_summary",
         "unreachable",
         "unsafe_source_artifact",
+        "volatile_rollout_missing",
+        "volatile_summary_missing",
     }
 )
 ALLOWED_REMOTE_GAP_REASONS = {
@@ -2402,6 +2404,60 @@ def source_relative_path_ref(path: Path, root: Path) -> str | None:
         return None
 
 
+def source_rollout_manifest_refs(rollouts: Iterable[Path], root: Path) -> list[str]:
+    refs: set[str] = set()
+    for rollout in rollouts:
+        ref = source_relative_path_ref(rollout, root)
+        if ref is not None and safe_relative_rollout_ref(ref) is not None:
+            refs.add(ref)
+    return sorted(refs)
+
+
+def source_summary_manifest_refs(summaries: Iterable[Path], root: Path) -> list[str]:
+    refs: set[str] = set()
+    for summary in summaries:
+        ref = source_relative_path_ref(summary, root)
+        if ref is None or safe_relative_summary_ref(ref) is None:
+            continue
+        if not Path(ref).name.startswith("rollout-summary"):
+            continue
+        refs.add(ref)
+    return sorted(refs)
+
+
+def manifest_source_ref_list(source_entry: dict[str, Any], field: str, *, summary: bool = False) -> list[str]:
+    raw_refs = source_entry.get(field)
+    if raw_refs is None:
+        return []
+    if not isinstance(raw_refs, list):
+        raise SystemExit(f"make-shards requires {field} to be a list")
+    refs: list[str] = []
+    for raw_ref in raw_refs:
+        if not isinstance(raw_ref, str) or not raw_ref:
+            raise SystemExit(f"make-shards requires {field} entries to be relative refs")
+        safe_ref = safe_relative_summary_ref(raw_ref) if summary else safe_relative_rollout_ref(raw_ref)
+        if safe_ref is None:
+            raise SystemExit(f"make-shards requires safe relative refs in {field}")
+        if summary and not Path(safe_ref).name.startswith("rollout-summary"):
+            raise SystemExit(f"make-shards requires rollout-summary refs in {field}")
+        refs.append(safe_ref)
+    return sorted(set(refs))
+
+
+def source_rollout_declared_path_from_ref(source: Source, ref: str) -> Path | None:
+    safe_ref = safe_relative_rollout_ref(ref)
+    if safe_ref is None:
+        return None
+    path = source.root / safe_ref
+    if path_has_disallowed_symlink_component(path.parent) or path.is_symlink():
+        return None
+    try:
+        path.resolve(strict=False).relative_to(source.root.resolve(strict=True))
+    except (OSError, ValueError):
+        return None
+    return path
+
+
 def rollout_ref_is_archived(ref: str) -> bool:
     parts = Path(ref).parts
     return bool(parts and parts[0] == "archived_sessions")
@@ -2688,6 +2744,16 @@ def safe_relative_summary_ref(value: str) -> str | None:
     if not parts or any(part in ("", ".", "..") for part in parts):
         return None
     return candidate.as_posix()
+
+
+def safe_relative_rollout_ref(value: str) -> str | None:
+    ref = safe_relative_summary_ref(value)
+    if ref is None:
+        return None
+    name = Path(ref).name
+    if not name.startswith("rollout-") or name.startswith("rollout-summary") or not name.endswith(".jsonl"):
+        return None
+    return ref
 
 
 def safe_rollout_backing_ref(value: str) -> str | None:
@@ -5286,7 +5352,13 @@ def retained_manifest_from_transient(manifest: dict[str, Any]) -> dict[str, Any]
     for source in manifest.get("sources", []):
         retained_source: dict[str, Any] = {}
         for key, value in source.items():
-            if key in {"generated_summary_root", "generated_summaries", "remote_generated_summaries"}:
+            if key in {
+                "generated_summary_root",
+                "generated_summaries",
+                "remote_generated_summaries",
+                "rollout_refs",
+                "summary_refs",
+            }:
                 continue
             if key in {"root", "path"}:
                 ref_key, ref_value = redacted_path_entry(key, value)
@@ -5797,7 +5869,10 @@ def parse_sources(values: list[str] | None, *, require_default_hosts: bool = Tru
         host, raw_path = value.split("=", 1)
         if not raw_path.strip():
             raise SystemExit("--source PATH must be non-empty")
-        source = Source(retained_source_host(host), Path(raw_path).expanduser(), explicit=True)
+        retained_host = retained_source_host(host)
+        root = Path(raw_path).expanduser()
+        missing_reason = "remote_source_not_materialized" if is_default_remote_source_path(retained_host, root) else None
+        source = Source(retained_host, root, missing_reason, explicit=True)
         key = (source.host, source.root.resolve(strict=False).as_posix())
         if key in seen:
             continue
@@ -5840,6 +5915,12 @@ def absolute_default_source_path(host: str) -> Path:
     if host == "local":
         return Path("~/.codex").expanduser()
     return (Path.cwd() / DEFAULT_REMOTE_SOURCE_ROOT / host).absolute()
+
+
+def is_default_remote_source_path(host: str, root: Path) -> bool:
+    if host not in DEFAULT_REMOTE_HOSTS:
+        return False
+    return root.expanduser().resolve(strict=False) == absolute_default_source_path(host).resolve(strict=False)
 
 
 def baseline_dry_run_source_arg_values(values: list[str] | None, *, require_default_hosts: bool) -> list[str]:
@@ -7078,6 +7159,33 @@ def source_path_coverage_gap(source: Source, path: Path, reason: str, **extra: A
     return gap
 
 
+def path_disappeared(path: Path) -> bool:
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def rollout_path_hint_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    if rollout_window_date(path) is None:
+        return True
+    return rollout_filename_in_window(path, start, end)
+
+
+def summary_path_hint_in_window(path: Path, start: dt.datetime | None, end: dt.datetime | None) -> bool:
+    summary_date = summary_date_from_path(path)
+    if summary_date is None:
+        return True
+    if start and summary_date + dt.timedelta(days=1) <= start:
+        return False
+    if end and summary_date >= end:
+        return False
+    return True
+
+
 def earliest_rollout_sources(sources: list[Source]) -> list[Source]:
     eligible: list[Source] = []
     for source in sources:
@@ -7113,6 +7221,14 @@ def run_scan(
 
     def append_oversized_summary_gap(path: Path, size: int) -> None:
         coverage_gaps.append(source_path_coverage_gap(source, path, "oversized_summary_skipped", bytes=size))
+
+    def append_volatile_rollout_gap(path: Path) -> None:
+        if rollout_path_hint_in_window(path, gap_start, end):
+            coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_rollout_missing"))
+
+    def append_volatile_summary_gap(path: Path) -> None:
+        if summary_path_hint_in_window(path, gap_start, end):
+            coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_summary_missing"))
 
     for source in sources:
         if not source.root.exists():
@@ -7289,7 +7405,9 @@ def run_scan(
             "root": transient_manifest_path_value(source.root),
             "root_ref": path_ref(source.root),
             "rollout_count": len(rollouts),
+            "rollout_refs": source_rollout_manifest_refs(rollouts, source.root),
             "summary_count": len(summaries),
+            "summary_refs": source_summary_manifest_refs(summaries, source.root),
             "status": source_manifest_status(rollouts, summaries, blocking_gaps),
         }
         if generated_summaries:
@@ -7304,63 +7422,106 @@ def run_scan(
             continue
         for rollout in rollouts:
             rollout_mtime_fallback = rollout_path_allows_mtime_fallback(source, rollout, archived_duplicate_keys)
-            if not rollout_candidate_relevant(
-                rollout,
-                start,
-                end,
-                max_raw_bytes=max_raw_bytes,
-                allow_mtime_fallback=rollout_mtime_fallback,
-            ):
-                continue
-            size = rollout.stat().st_size
-            if size <= max_raw_bytes:
-                jsonl_error = first_jsonl_error(rollout)
-                if jsonl_error is not None:
-                    relevant_invalid_rollout = rollout_filename_in_window(rollout, gap_start, end) or (
-                        rollout_mtime_fallback and rollout_mtime_active(rollout, gap_start, end)
-                    )
-                    if not jsonl_error.unreadable:
-                        relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
-                            rollout, gap_start, end
+            try:
+                if not rollout_candidate_relevant(
+                    rollout,
+                    start,
+                    end,
+                    max_raw_bytes=max_raw_bytes,
+                    allow_mtime_fallback=rollout_mtime_fallback,
+                ):
+                    if path_disappeared(rollout):
+                        append_volatile_rollout_gap(rollout)
+                    continue
+                size = rollout.stat().st_size
+                if size <= max_raw_bytes:
+                    jsonl_error = first_jsonl_error(rollout)
+                    if jsonl_error is not None:
+                        if jsonl_error.unreadable and path_disappeared(rollout):
+                            append_volatile_rollout_gap(rollout)
+                            continue
+                        relevant_invalid_rollout = rollout_filename_in_window(rollout, gap_start, end) or (
+                            rollout_mtime_fallback and rollout_mtime_active(rollout, gap_start, end)
                         )
-                    if relevant_invalid_rollout:
-                        coverage_gaps.append(source_path_coverage_gap(source, rollout, "invalid_jsonl"))
-                    continue
-                if not rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=rollout_mtime_fallback):
-                    continue
-                all_turns.extend(
-                    extract_rollout(
-                        source,
-                        rollout,
-                        start,
-                        end,
-                        emit_start=emit_start,
-                        allow_mtime_fallback=rollout_mtime_fallback,
+                        if not jsonl_error.unreadable:
+                            relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
+                                rollout, gap_start, end
+                            )
+                        if relevant_invalid_rollout:
+                            coverage_gaps.append(source_path_coverage_gap(source, rollout, "invalid_jsonl"))
+                        continue
+                    if not rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=rollout_mtime_fallback):
+                        continue
+                    all_turns.extend(
+                        extract_rollout(
+                            source,
+                            rollout,
+                            start,
+                            end,
+                            emit_start=emit_start,
+                            allow_mtime_fallback=rollout_mtime_fallback,
+                        )
                     )
+                    continue
+                relevance = oversized_rollout_relevance(
+                    rollout,
+                    gap_start,
+                    end,
+                    allow_mtime_fallback=rollout_mtime_fallback,
                 )
+                if relevance == "irrelevant":
+                    continue
+                rollout_ref = source_relative_path_ref(rollout, source.root)
+                if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
+                    continue
+                append_oversized_rollout_gap(rollout, size)
                 continue
-            relevance = oversized_rollout_relevance(
-                rollout,
-                gap_start,
-                end,
-                allow_mtime_fallback=rollout_mtime_fallback,
-            )
-            if relevance == "irrelevant":
+            except FileNotFoundError:
+                append_volatile_rollout_gap(rollout)
                 continue
-            rollout_ref = source_relative_path_ref(rollout, source.root)
-            if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
-                continue
-            append_oversized_rollout_gap(rollout, size)
-            continue
         for summary in summaries:
-            size = summary.stat().st_size
-            summary_scan_cap = summary_metadata_scan_max_bytes_for_generated_remote(
-                summary,
-                max_raw_bytes,
-                remote_generated_summary_paths,
-            )
-            if size > summary_scan_cap:
-                if summary_file_maybe_relevant_or_backing_ref_relevant(
+            try:
+                size = summary.stat().st_size
+                summary_scan_cap = summary_metadata_scan_max_bytes_for_generated_remote(
+                    summary,
+                    max_raw_bytes,
+                    remote_generated_summary_paths,
+                )
+                if size > summary_scan_cap:
+                    if summary_file_maybe_relevant_or_backing_ref_relevant(
+                        summary,
+                        gap_start,
+                        end,
+                        max_scan_bytes=summary_scan_cap,
+                        source_root=source.root,
+                        allow_mtime_fallback=allow_mtime_fallback,
+                        archived_duplicate_keys=archived_duplicate_keys,
+                    ):
+                        append_oversized_summary_gap(summary, size)
+                    elif path_disappeared(summary):
+                        append_volatile_summary_gap(summary)
+                    continue
+                if summary in stale_summary_paths and summary not in stale_summary_gap_paths:
+                    if path_disappeared(summary):
+                        append_volatile_summary_gap(summary)
+                    continue
+                jsonl_error = first_jsonl_error(summary)
+                if (
+                    summary_file_has_truncated_scan(summary)
+                    or summary_file_has_record_limit_gap(
+                        summary,
+                        allow_tail_record_limit=summary_allows_generated_local_coverage(
+                            summary,
+                            generated_summary_paths,
+                            max_scan_bytes=max_raw_bytes,
+                        )
+                        or summary_allows_generated_remote_coverage(
+                            summary,
+                            remote_generated_summary_paths,
+                            max_scan_bytes=max_raw_bytes,
+                        ),
+                    )
+                ) and summary_file_maybe_relevant_or_backing_ref_relevant(
                     summary,
                     gap_start,
                     end,
@@ -7369,82 +7530,68 @@ def run_scan(
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    append_oversized_summary_gap(summary, size)
-                continue
-            if summary in stale_summary_paths and summary not in stale_summary_gap_paths:
-                continue
-            jsonl_error = first_jsonl_error(summary)
-            if (
-                summary_file_has_truncated_scan(summary)
-                or summary_file_has_record_limit_gap(
-                    summary,
-                    allow_tail_record_limit=summary_allows_generated_local_coverage(
-                        summary,
-                        generated_summary_paths,
-                        max_scan_bytes=max_raw_bytes,
+                    coverage_gaps.append(
+                        source_path_coverage_gap(source, summary, "truncated_rollout_summary")
                     )
-                    or summary_allows_generated_remote_coverage(
-                        summary,
-                        remote_generated_summary_paths,
-                        max_scan_bytes=max_raw_bytes,
-                    ),
-                )
-            ) and summary_file_maybe_relevant_or_backing_ref_relevant(
-                summary,
-                gap_start,
-                end,
-                max_scan_bytes=summary_scan_cap,
-                source_root=source.root,
-                allow_mtime_fallback=allow_mtime_fallback,
-                archived_duplicate_keys=archived_duplicate_keys,
-            ):
-                coverage_gaps.append(
-                    source_path_coverage_gap(source, summary, "truncated_rollout_summary")
-                )
-            if jsonl_error is not None:
-                if (
-                    summary_file_maybe_relevant_with_scan_cap(summary, gap_start, end, max_scan_bytes=summary_scan_cap)
-                    if jsonl_error.unreadable
-                    else summary_file_relevant_or_backing_ref_relevant(
-                        summary,
-                        gap_start,
-                        end,
-                        max_scan_bytes=summary_scan_cap,
-                        source_root=source.root,
-                        allow_mtime_fallback=allow_mtime_fallback,
-                        archived_duplicate_keys=archived_duplicate_keys,
-                    )
-                ):
-                    coverage_gaps.append(source_path_coverage_gap(source, summary, "invalid_jsonl"))
-                continue
-            if summary in stale_summary_paths and not remote_summary_fallback_is_extractable(
-                source,
-                summary,
-                gap_start,
-                end,
-                max_scan_bytes=summary_scan_cap,
-            ):
-                continue
-            if not summary_file_relevant_or_backing_ref_relevant(
-                summary,
-                gap_start,
-                end,
-                max_scan_bytes=summary_scan_cap,
-                source_root=source.root,
-                allow_mtime_fallback=allow_mtime_fallback,
-                archived_duplicate_keys=archived_duplicate_keys,
-            ):
-                continue
-            all_turns.extend(
-                extract_summary_file(
+                if path_disappeared(summary):
+                    append_volatile_summary_gap(summary)
+                    continue
+                if jsonl_error is not None:
+                    if (
+                        summary_file_maybe_relevant_with_scan_cap(
+                            summary,
+                            gap_start,
+                            end,
+                            max_scan_bytes=summary_scan_cap,
+                        )
+                        if jsonl_error.unreadable
+                        else summary_file_relevant_or_backing_ref_relevant(
+                            summary,
+                            gap_start,
+                            end,
+                            max_scan_bytes=summary_scan_cap,
+                            source_root=source.root,
+                            allow_mtime_fallback=allow_mtime_fallback,
+                            archived_duplicate_keys=archived_duplicate_keys,
+                        )
+                    ):
+                        coverage_gaps.append(source_path_coverage_gap(source, summary, "invalid_jsonl"))
+                    continue
+                if summary in stale_summary_paths and not remote_summary_fallback_is_extractable(
                     source,
                     summary,
-                    start,
+                    gap_start,
                     end,
-                    emit_start=emit_start,
-                    remote_generated_summary_paths=remote_generated_summary_paths,
+                    max_scan_bytes=summary_scan_cap,
+                ):
+                    if path_disappeared(summary):
+                        append_volatile_summary_gap(summary)
+                    continue
+                if not summary_file_relevant_or_backing_ref_relevant(
+                    summary,
+                    gap_start,
+                    end,
+                    max_scan_bytes=summary_scan_cap,
+                    source_root=source.root,
+                    allow_mtime_fallback=allow_mtime_fallback,
+                    archived_duplicate_keys=archived_duplicate_keys,
+                ):
+                    if path_disappeared(summary):
+                        append_volatile_summary_gap(summary)
+                    continue
+                all_turns.extend(
+                    extract_summary_file(
+                        source,
+                        summary,
+                        start,
+                        end,
+                        emit_start=emit_start,
+                        remote_generated_summary_paths=remote_generated_summary_paths,
+                    )
                 )
-            )
+            except FileNotFoundError:
+                append_volatile_summary_gap(summary)
+                continue
     if allow_partial_hosts:
         coverage_gaps.append({"host": "scope", "reason": "partial_host_scope"})
 
@@ -7659,7 +7806,9 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             "root": transient_manifest_path_value(source.root),
             "root_ref": path_ref(source.root),
             "rollout_count": len(rollouts),
+            "rollout_refs": source_rollout_manifest_refs(rollouts, source.root),
             "summary_count": len(summaries),
+            "summary_refs": source_summary_manifest_refs(summaries, source.root),
             "status": source_manifest_status(rollouts, summaries, blocking_gaps),
         }
         if generated_summaries:
@@ -7841,6 +7990,79 @@ def coverage_gap_hosts(gaps: Iterable[dict[str, Any]]) -> set[str]:
     return {str(gap.get("host") or "unknown") for gap in gaps if isinstance(gap, dict)}
 
 
+def shard_coverage_gap_reason(text: Any) -> str | None:
+    value = str(text or "").strip()
+    if not value:
+        return None
+    if value in RETAINED_COVERAGE_GAP_REASONS:
+        return value
+    if value == "source root missing":
+        return "source_root_missing"
+    if value == "summary disappeared during shard discovery":
+        return "volatile_summary_missing"
+    if value == "rollout disappeared during shard discovery":
+        return "volatile_rollout_missing"
+    if value.startswith("summary exceeds "):
+        return "oversized_summary_skipped"
+    if value.startswith("rollout exceeds "):
+        return "oversized_rollout_skipped"
+    if value.startswith("summary source_bytes does not match "):
+        return "stale_rollout_summary"
+    if value.startswith("summary scan incomplete;"):
+        return "truncated_rollout_summary"
+    if value.startswith("invalid summary JSONL;") or value.startswith("invalid JSONL;"):
+        return "invalid_jsonl"
+    return None
+
+
+def coverage_gap_identity(gap: dict[str, Any]) -> tuple[str, str, str, str]:
+    path_ref_value = str(gap.get("path_ref") or "")
+    return (
+        str(gap.get("host") or "unknown"),
+        str(gap.get("reason") or "unknown"),
+        "" if path_ref_value else str(gap.get("root_ref") or ""),
+        path_ref_value,
+    )
+
+
+def merge_coverage_gaps(*gap_lists: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for gaps in gap_lists:
+        for gap in gaps:
+            if not isinstance(gap, dict):
+                continue
+            key = coverage_gap_identity(gap)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(gap)
+    return merged
+
+
+def shard_coverage_gaps(shards_dir: Path) -> list[dict[str, Any]]:
+    shards_file = shards_dir / "shards.jsonl"
+    if not shards_file.exists():
+        return []
+    gaps: list[dict[str, Any]] = []
+    for _line_no, row in iter_jsonl_strict(shards_file):
+        reason = shard_coverage_gap_reason(row.get("coverage_gap"))
+        if reason is None:
+            continue
+        gap: dict[str, Any] = {
+            "host": str(row.get("host") or "unknown"),
+            "reason": reason,
+        }
+        if isinstance(row.get("path_ref"), str) and row.get("path_ref"):
+            gap["path_ref"] = row["path_ref"]
+        if isinstance(row.get("root_ref"), str) and row.get("root_ref"):
+            gap["root_ref"] = row["root_ref"]
+        if isinstance(row.get("bytes"), int):
+            gap["bytes"] = row["bytes"]
+        gaps.append(gap)
+    return gaps
+
+
 def source_coverage_gap_index(
     gaps: Iterable[dict[str, Any]],
 ) -> tuple[set[tuple[str, str]], set[str], set[str]]:
@@ -7958,7 +8180,9 @@ def dry_run_report_summary(
     root: Path,
     window: dict[str, Any],
     coverage_gap_counts: dict[str, int],
+    shard_coverage_gap_counts: dict[str, int],
     repairable_coverage_gap_counts: dict[str, int],
+    non_repairable_coverage_gap_counts: dict[str, int],
     source_coverage: dict[str, Any],
     shard_count: int,
     next_command: str | None,
@@ -7979,9 +8203,11 @@ def dry_run_report_summary(
         ),
         "coverage_gap_counts": coverage_gap_counts,
         "repairable_coverage_gap_counts": repairable_coverage_gap_counts,
+        "non_repairable_coverage_gap_counts": non_repairable_coverage_gap_counts,
         "top_blockers": top_blockers_for_report(coverage_gap_counts, source_status_counts),
         "next_command": next_command,
         "shard_count": shard_count,
+        "shard_coverage_gap_counts": shard_coverage_gap_counts,
         "transient_disk_usage_bytes": directory_size_bytes(root),
         "confidence": confidence_for_report(
             coverage_gap_counts,
@@ -8011,6 +8237,30 @@ def dry_run_report_summary(
     return summary
 
 
+def subtract_count_maps(counts: dict[str, int], subtract: dict[str, int]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for key, value in counts.items():
+        remaining = report_int(value) - report_int(subtract.get(key))
+        if remaining > 0:
+            result[key] = remaining
+    return dict(sorted(result.items()))
+
+
+def non_repairable_coverage_gap_note(counts: dict[str, int], *, has_next_command: bool) -> str | None:
+    actionable_counts = {key: value for key, value in counts.items() if key != "partial_host_scope"}
+    if not actionable_counts:
+        return None
+    formatted = count_lines_for_report(actionable_counts)
+    if has_next_command:
+        return f"next command repairs only repairable gaps; non-repairable gaps still block retained export: {formatted}"
+    return f"no transient repair command for non-repairable gaps: {formatted}"
+
+
+def combine_next_command_notes(*notes: str | None) -> str | None:
+    clean_notes = [note for note in notes if isinstance(note, str) and note]
+    return "; ".join(clean_notes) if clean_notes else None
+
+
 def dry_run_report(
     *,
     kind: str,
@@ -8023,10 +8273,24 @@ def dry_run_report(
     next_command_note: str | None = None,
     repair_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    coverage_gaps = list(manifest.get("coverage_gaps") or [])
+    manifest_coverage_gaps = list(manifest.get("coverage_gaps") or [])
+    shard_gap_rows = shard_coverage_gaps(shards_dir)
+    coverage_gaps = merge_coverage_gaps(manifest_coverage_gaps, shard_gap_rows)
     repairable_gaps = repairable_coverage_gaps(coverage_gaps)
     coverage_gap_counts = gap_counts(coverage_gaps)
+    shard_coverage_gap_counts = gap_counts(shard_gap_rows)
     repairable_coverage_gap_counts = gap_counts(repairable_gaps)
+    non_repairable_coverage_gap_counts = subtract_count_maps(
+        coverage_gap_counts,
+        repairable_coverage_gap_counts,
+    )
+    next_command_note = combine_next_command_notes(
+        next_command_note,
+        non_repairable_coverage_gap_note(
+            non_repairable_coverage_gap_counts,
+            has_next_command=next_command is not None,
+        ),
+    )
     source_coverage = source_coverage_summary(manifest.get("sources") or [], coverage_gaps)
     source_status_count_values = source_status_counts(manifest.get("sources") or [])
     shard_count = count_jsonl_rows(shards_dir / "shards.jsonl")
@@ -8041,7 +8305,9 @@ def dry_run_report(
         "turn_count": trend.get("turn_count", 0),
         "episode_count": trend.get("episode_count", 0),
         "coverage_gap_counts": coverage_gap_counts,
+        "shard_coverage_gap_counts": shard_coverage_gap_counts,
         "repairable_coverage_gap_counts": repairable_coverage_gap_counts,
+        "non_repairable_coverage_gap_counts": non_repairable_coverage_gap_counts,
         "source_status_counts": source_status_count_values,
         "source_coverage": source_coverage,
         "shard_count": shard_count,
@@ -8053,7 +8319,9 @@ def dry_run_report(
             root=root,
             window=window,
             coverage_gap_counts=coverage_gap_counts,
+            shard_coverage_gap_counts=shard_coverage_gap_counts,
             repairable_coverage_gap_counts=repairable_coverage_gap_counts,
+            non_repairable_coverage_gap_counts=non_repairable_coverage_gap_counts,
             source_coverage=source_coverage,
             shard_count=shard_count,
             next_command=next_command,
@@ -8128,6 +8396,11 @@ def dry_run_report_markdown(report: dict[str, Any]) -> str:
     repairable_coverage_gap_counts = (
         report.get("repairable_coverage_gap_counts") if isinstance(report.get("repairable_coverage_gap_counts"), dict) else {}
     )
+    non_repairable_coverage_gap_counts = (
+        report.get("non_repairable_coverage_gap_counts")
+        if isinstance(report.get("non_repairable_coverage_gap_counts"), dict)
+        else {}
+    )
     source_status_counts = report.get("source_status_counts") if isinstance(report.get("source_status_counts"), dict) else {}
     retained = "yes" if report.get("retained_export_created") else "no"
     history = "yes" if report.get("history_commit_created") else "no"
@@ -8153,11 +8426,14 @@ def dry_run_report_markdown(report: dict[str, Any]) -> str:
         f"- Retained readiness: `{summary.get('retained_readiness', 'unknown')}`",
         f"- Coverage gaps: {count_lines_for_report(coverage_gap_counts)}",
         f"- Repairable coverage gaps: {count_lines_for_report(repairable_coverage_gap_counts)}",
+        f"- Non-repairable coverage gaps: {count_lines_for_report(non_repairable_coverage_gap_counts)}",
         f"- Top blockers: {markdown_list_value(summary.get('top_blockers'))}",
         f"- Transient disk usage: `{format_bytes_for_report(summary.get('transient_disk_usage_bytes', 0))}`",
         f"- Confidence: `{summary.get('confidence', 'unknown')}`",
         next_command_line,
     ]
+    if isinstance(next_command, str) and next_command and isinstance(next_command_note, str) and next_command_note:
+        lines.append(f"- Next command note: {next_command_note}")
     if summary_repair is not None:
         before_total = report_int(summary_repair.get("before_gap_total"))
         after_total = report_int(summary_repair.get("after_gap_total"))
@@ -8193,6 +8469,7 @@ def dry_run_report_markdown(report: dict[str, Any]) -> str:
         f"- Shard count: `{report.get('shard_count', 0)}`",
         f"- Coverage gaps: {count_lines_for_report(coverage_gap_counts)}",
         f"- Repairable coverage gaps: {count_lines_for_report(repairable_coverage_gap_counts)}",
+        f"- Non-repairable coverage gaps: {count_lines_for_report(non_repairable_coverage_gap_counts)}",
         f"- Source status: {count_lines_for_report(source_status_counts)}",
         f"- Retained export created: {retained}",
         f"- History commit created: {history}",
@@ -8201,7 +8478,7 @@ def dry_run_report_markdown(report: dict[str, Any]) -> str:
     )
     if isinstance(next_command, str) and next_command:
         lines.append(f"- Next command: `{next_command}`")
-    elif isinstance(next_command_note, str) and next_command_note:
+    if isinstance(next_command_note, str) and next_command_note:
         lines.append(f"- Next command note: {next_command_note}")
     repair = report.get("repair")
     if isinstance(repair, dict):
@@ -8250,8 +8527,43 @@ def oversized_repairable_coverage_gaps(gaps: Iterable[Any]) -> list[dict[str, An
     ]
 
 
-def oversized_repair_next_command_note(*, max_raw_bytes: int) -> str:
+def suggested_max_raw_bytes_for_oversized_gaps(gaps: Iterable[dict[str, Any]], *, current_max_raw_bytes: int) -> int | None:
+    max_gap_bytes = max((report_int(gap.get("bytes")) for gap in gaps), default=0)
+    if max_gap_bytes <= current_max_raw_bytes:
+        return None
+    mebibyte = 1024 * 1024
+    return ((max_gap_bytes + mebibyte - 1) // mebibyte) * mebibyte
+
+
+def oversized_repair_next_command_note(*, max_raw_bytes: int, suggested_max_raw_bytes: int | None = None) -> str:
+    if suggested_max_raw_bytes is not None:
+        return (
+            f"remaining oversized gaps require a higher --max-raw-bytes than {max_raw_bytes}; "
+            f"suggested --max-raw-bytes {suggested_max_raw_bytes}"
+        )
     return f"remaining oversized gaps require a higher --max-raw-bytes than {max_raw_bytes}"
+
+
+def repair_follow_up_command(
+    *,
+    report_kind: str,
+    root: Path,
+    max_raw_bytes: int,
+    allow_partial_hosts: bool,
+) -> str:
+    command_name = "weekly-repair" if report_kind == "weekly_repair" else "repair-coverage"
+    next_command_argv = [
+        "python3",
+        Path(__file__).resolve().as_posix(),
+        command_name,
+        "--run-dir",
+        root.as_posix(),
+        "--max-raw-bytes",
+        str(max_raw_bytes),
+    ]
+    if allow_partial_hosts:
+        next_command_argv.append("--allow-partial-hosts")
+    return shlex.join(next_command_argv)
 
 
 def repair_materialization_gap_hosts(gaps: Iterable[Any]) -> set[str]:
@@ -8311,8 +8623,12 @@ def run_dry_run(
     trend, _retained_manifest = validate_output_run(scan_dir)
     run_make_shards_for_scan(scan_dir, shards_dir, max_raw_bytes=max_raw_bytes)
     manifest = read_json_file(scan_dir / "shard_manifest.json")
+    coverage_gaps = merge_coverage_gaps(
+        list(manifest.get("coverage_gaps") or []),
+        shard_coverage_gaps(shards_dir),
+    )
     next_command = None
-    if repairable_coverage_gaps(manifest.get("coverage_gaps")):
+    if repairable_coverage_gaps(coverage_gaps):
         next_command_argv = [
             "python3",
             Path(__file__).resolve().as_posix(),
@@ -8393,6 +8709,16 @@ def scan_dir_from_run_dir(run_dir: Path) -> Path:
     if (run_dir / "shard_manifest.json").is_file():
         return run_dir
     raise SystemExit("--run-dir must be a baseline-dry-run directory or a scan output directory")
+
+
+def shards_dir_from_run_dir(run_dir: Path, scan_dir: Path) -> Path:
+    nested = run_dir / "shards"
+    if (nested / "shards.jsonl").is_file():
+        return nested
+    sibling = scan_dir.parent / "shards"
+    if (sibling / "shards.jsonl").is_file():
+        return sibling
+    return nested
 
 
 def manifest_window_bounds(manifest: dict[str, Any]) -> tuple[dt.datetime, dt.datetime]:
@@ -8968,7 +9294,12 @@ def run_coverage_repair(
 ) -> Path:
     run_dir = Path(args.run_dir)
     scan_dir = scan_dir_from_run_dir(run_dir)
+    input_shards_dir = shards_dir_from_run_dir(run_dir, scan_dir)
     manifest = read_json_file(scan_dir / "shard_manifest.json")
+    before_gaps = merge_coverage_gaps(
+        list(manifest.get("coverage_gaps") or []),
+        shard_coverage_gaps(input_shards_dir),
+    )
     start, end = manifest_window_bounds(manifest)
     max_raw_bytes = require_positive_window(args.max_raw_bytes, "--max-raw-bytes")
     session_meta_limit = require_positive_window(args.remote_session_meta_limit, "--remote-session-meta-limit")
@@ -8986,7 +9317,7 @@ def run_coverage_repair(
     remote_roots: dict[str, Path] = {}
     materialized_hosts: list[dict[str, Any]] = []
     if not args.skip_remote_materialization:
-        gap_hosts = repair_materialization_gap_hosts(manifest.get("coverage_gaps") or [])
+        gap_hosts = repair_materialization_gap_hosts(before_gaps)
         remote_roots, materialized_hosts = materialize_repair_hosts(
             gap_hosts=gap_hosts,
             root=root,
@@ -9018,32 +9349,44 @@ def run_coverage_repair(
     trend, _retained_manifest = validate_output_run(repaired_scan_dir)
     run_make_shards_for_scan(repaired_scan_dir, repaired_shards_dir, max_raw_bytes=max_raw_bytes)
     repaired_manifest = read_json_file(repaired_scan_dir / "shard_manifest.json")
+    after_gaps = merge_coverage_gaps(
+        list(repaired_manifest.get("coverage_gaps") or []),
+        shard_coverage_gaps(repaired_shards_dir),
+    )
     repair_summary = {
         "input_scan_dir": scan_dir.as_posix(),
-        "before_coverage_gap_counts": gap_counts(manifest.get("coverage_gaps") or []),
-        "after_coverage_gap_counts": gap_counts(repaired_manifest.get("coverage_gaps") or []),
+        "before_coverage_gap_counts": gap_counts(before_gaps),
+        "after_coverage_gap_counts": gap_counts(after_gaps),
         "max_raw_bytes": max_raw_bytes,
         "materialized_hosts": materialized_hosts,
     }
     next_command = None
     next_command_note = None
-    remaining_repairable_gaps = repairable_coverage_gaps(repaired_manifest.get("coverage_gaps"))
-    if oversized_repairable_coverage_gaps(remaining_repairable_gaps):
-        next_command_note = oversized_repair_next_command_note(max_raw_bytes=max_raw_bytes)
+    remaining_repairable_gaps = repairable_coverage_gaps(after_gaps)
+    remaining_oversized_gaps = oversized_repairable_coverage_gaps(remaining_repairable_gaps)
+    if remaining_oversized_gaps:
+        suggested_max_raw_bytes = suggested_max_raw_bytes_for_oversized_gaps(
+            remaining_oversized_gaps,
+            current_max_raw_bytes=max_raw_bytes,
+        )
+        next_command_note = oversized_repair_next_command_note(
+            max_raw_bytes=max_raw_bytes,
+            suggested_max_raw_bytes=suggested_max_raw_bytes,
+        )
+        if suggested_max_raw_bytes is not None:
+            next_command = repair_follow_up_command(
+                report_kind=report_kind,
+                root=root,
+                max_raw_bytes=suggested_max_raw_bytes,
+                allow_partial_hosts=args.allow_partial_hosts,
+            )
     elif remaining_repairable_gaps:
-        command_name = "weekly-repair" if report_kind == "weekly_repair" else "repair-coverage"
-        next_command_argv = [
-            "python3",
-            Path(__file__).resolve().as_posix(),
-            command_name,
-            "--run-dir",
-            root.as_posix(),
-            "--max-raw-bytes",
-            str(max_raw_bytes),
-        ]
-        if args.allow_partial_hosts:
-            next_command_argv.append("--allow-partial-hosts")
-        next_command = shlex.join(next_command_argv)
+        next_command = repair_follow_up_command(
+            report_kind=report_kind,
+            root=root,
+            max_raw_bytes=max_raw_bytes,
+            allow_partial_hosts=args.allow_partial_hosts,
+        )
     report = dry_run_report(
         kind=report_kind,
         root=root,
@@ -9108,9 +9451,10 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     window = manifest.get("window") or {}
     start, end = require_manifest_window_bounds(window, "manifest window")
     rows: list[dict[str, Any]] = []
+    source_root_ref: str | None = None
 
     def shard_row(path: Path, **values: Any) -> dict[str, Any]:
-        row = {"host": host, "path_ref": path_ref(path), **values}
+        row = {"host": host, "root_ref": source_root_ref or path_ref(root), "path_ref": path_ref(path), **values}
         if getattr(args, "include_raw_paths", False):
             row["path"] = path.as_posix()
         return row
@@ -9119,55 +9463,65 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         for gap in gaps:
             rows.append(shard_row(root, status="stale", coverage_gap=str(gap.get("reason") or "unsafe_source_artifact")))
 
-    def append_summary_shard(summary: Path) -> None:
-        row = shard_row(summary, bytes=summary.stat().st_size, kind="summary")
-        summary_scan_cap = summary_metadata_scan_max_bytes_for_generated_remote(
-            summary,
-            max_raw_bytes,
-            remote_generated_summary_paths,
-        )
-        if row["bytes"] > summary_scan_cap:
-            if not summary_file_maybe_relevant_or_backing_ref_relevant(
-                summary,
-                start,
-                end,
-                max_scan_bytes=summary_scan_cap,
-                source_root=root,
-                allow_mtime_fallback=allow_mtime_fallback,
-                archived_duplicate_keys=archived_duplicate_keys,
-            ):
-                return
-            row["status"] = "oversized"
-            row["coverage_gap"] = "summary exceeds max raw shard bytes; regenerate bounded rollout-summary before extractor handoff"
-            rows.append(row)
+    def append_disappeared_summary_shard(summary: Path) -> None:
+        if not summary_path_hint_in_window(summary, start, end):
             return
-        if summary_file_has_stale_backing_source(
-            summary,
-            root,
-            start,
-            end,
-            max_scan_bytes=summary_scan_cap,
-            selected_source_identity_by_key=selected_source_identity_by_key,
-            archived_duplicate_keys=archived_duplicate_keys,
-            allow_tail_record_limit=summary_allows_generated_coverage(
+        rows.append(
+            shard_row(
                 summary,
-                generated_summary_paths,
-                remote_generated_summary_paths,
-                max_scan_bytes=max_raw_bytes,
-            ),
-            allow_summary_only_coverage=summary_allows_generated_remote_coverage(
+                kind="summary",
+                status="stale",
+                coverage_gap="summary disappeared during shard discovery",
+            )
+        )
+
+    def append_disappeared_rollout_shard(rollout: Path) -> None:
+        if not rollout_path_hint_in_window(rollout, start, end):
+            return
+        rows.append(
+            shard_row(
+                rollout,
+                status="stale",
+                coverage_gap="rollout disappeared during shard discovery",
+            )
+        )
+
+    def append_summary_shard(summary: Path) -> None:
+        try:
+            summary_size = summary.stat().st_size
+        except FileNotFoundError:
+            append_disappeared_summary_shard(summary)
+            return
+        row = shard_row(summary, bytes=summary_size, kind="summary")
+        try:
+            summary_scan_cap = summary_metadata_scan_max_bytes_for_generated_remote(
                 summary,
+                max_raw_bytes,
                 remote_generated_summary_paths,
-                max_scan_bytes=max_raw_bytes,
-            ),
-        ):
-            if summary_file_stale_backing_requires_gap(
+            )
+            if row["bytes"] > summary_scan_cap:
+                if not summary_file_maybe_relevant_or_backing_ref_relevant(
+                    summary,
+                    start,
+                    end,
+                    max_scan_bytes=summary_scan_cap,
+                    source_root=root,
+                    allow_mtime_fallback=allow_mtime_fallback,
+                    archived_duplicate_keys=archived_duplicate_keys,
+                ):
+                    if path_disappeared(summary) and summary_path_hint_in_window(summary, start, end):
+                        append_disappeared_summary_shard(summary)
+                    return
+                row["status"] = "oversized"
+                row["coverage_gap"] = "summary exceeds max raw shard bytes; regenerate bounded rollout-summary before extractor handoff"
+                rows.append(row)
+                return
+            if summary_file_has_stale_backing_source(
                 summary,
                 root,
                 start,
                 end,
                 max_scan_bytes=summary_scan_cap,
-                allow_mtime_fallback=allow_mtime_fallback,
                 selected_source_identity_by_key=selected_source_identity_by_key,
                 archived_duplicate_keys=archived_duplicate_keys,
                 allow_tail_record_limit=summary_allows_generated_coverage(
@@ -9182,21 +9536,82 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     max_scan_bytes=max_raw_bytes,
                 ),
             ):
-                row["status"] = "partial"
-                row["coverage_gap"] = "summary source_bytes does not match current backing rollout; regenerate bounded rollout-summary before extractor handoff"
-                rows.append(row)
-            return
-        jsonl_error = first_jsonl_error(summary)
-        if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(
-            summary,
-            allow_tail_record_limit=summary_allows_generated_coverage(
+                if summary_file_stale_backing_requires_gap(
+                    summary,
+                    root,
+                    start,
+                    end,
+                    max_scan_bytes=summary_scan_cap,
+                    allow_mtime_fallback=allow_mtime_fallback,
+                    selected_source_identity_by_key=selected_source_identity_by_key,
+                    archived_duplicate_keys=archived_duplicate_keys,
+                    allow_tail_record_limit=summary_allows_generated_coverage(
+                        summary,
+                        generated_summary_paths,
+                        remote_generated_summary_paths,
+                        max_scan_bytes=max_raw_bytes,
+                    ),
+                    allow_summary_only_coverage=summary_allows_generated_remote_coverage(
+                        summary,
+                        remote_generated_summary_paths,
+                        max_scan_bytes=max_raw_bytes,
+                    ),
+                ):
+                    row["status"] = "partial"
+                    row["coverage_gap"] = "summary source_bytes does not match current backing rollout; regenerate bounded rollout-summary before extractor handoff"
+                    rows.append(row)
+                return
+            jsonl_error = first_jsonl_error(summary)
+            if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(
                 summary,
-                generated_summary_paths,
-                remote_generated_summary_paths,
-                max_scan_bytes=max_raw_bytes,
-            ),
-        ):
-            if not summary_file_maybe_relevant_or_backing_ref_relevant(
+                allow_tail_record_limit=summary_allows_generated_coverage(
+                    summary,
+                    generated_summary_paths,
+                    remote_generated_summary_paths,
+                    max_scan_bytes=max_raw_bytes,
+                ),
+            ):
+                if not summary_file_maybe_relevant_or_backing_ref_relevant(
+                    summary,
+                    start,
+                    end,
+                    max_scan_bytes=summary_scan_cap,
+                    source_root=root,
+                    allow_mtime_fallback=allow_mtime_fallback,
+                    archived_duplicate_keys=archived_duplicate_keys,
+                ):
+                    if path_disappeared(summary) and summary_path_hint_in_window(summary, start, end):
+                        append_disappeared_summary_shard(summary)
+                    return
+                row["status"] = "partial"
+                row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
+                rows.append(row)
+                return
+            if path_disappeared(summary) and summary_path_hint_in_window(summary, start, end):
+                append_disappeared_summary_shard(summary)
+                return
+            if jsonl_error is not None:
+                if not (
+                    summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=summary_scan_cap)
+                    if jsonl_error.unreadable
+                    else summary_file_relevant_or_backing_ref_relevant(
+                        summary,
+                        start,
+                        end,
+                        max_scan_bytes=summary_scan_cap,
+                        source_root=root,
+                        allow_mtime_fallback=allow_mtime_fallback,
+                        archived_duplicate_keys=archived_duplicate_keys,
+                    )
+                ):
+                    if path_disappeared(summary) and summary_path_hint_in_window(summary, start, end):
+                        append_disappeared_summary_shard(summary)
+                    return
+                row["status"] = "invalid"
+                row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
+                rows.append(row)
+                return
+            if not summary_file_relevant_or_backing_ref_relevant(
                 summary,
                 start,
                 end,
@@ -9205,50 +9620,26 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 allow_mtime_fallback=allow_mtime_fallback,
                 archived_duplicate_keys=archived_duplicate_keys,
             ):
+                if path_disappeared(summary) and summary_path_hint_in_window(summary, start, end):
+                    append_disappeared_summary_shard(summary)
                 return
-            row["status"] = "partial"
-            row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
-            rows.append(row)
-            return
-        if jsonl_error is not None:
-            if not (
-                summary_file_maybe_relevant_with_scan_cap(summary, start, end, max_scan_bytes=summary_scan_cap)
-                if jsonl_error.unreadable
-                else summary_file_relevant_or_backing_ref_relevant(
-                    summary,
-                    start,
-                    end,
-                    max_scan_bytes=summary_scan_cap,
-                    source_root=root,
-                    allow_mtime_fallback=allow_mtime_fallback,
-                    archived_duplicate_keys=archived_duplicate_keys,
-                )
-            ):
+            if not summary_file_has_extractable_record_in_window(summary, start, end):
+                if path_disappeared(summary):
+                    append_disappeared_summary_shard(summary)
                 return
-            row["status"] = "invalid"
-            row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
+            row["status"] = "ready"
             rows.append(row)
+        except FileNotFoundError:
+            append_disappeared_summary_shard(summary)
             return
-        if not summary_file_relevant_or_backing_ref_relevant(
-            summary,
-            start,
-            end,
-            max_scan_bytes=summary_scan_cap,
-            source_root=root,
-            allow_mtime_fallback=allow_mtime_fallback,
-            archived_duplicate_keys=archived_duplicate_keys,
-        ):
-            return
-        if not summary_file_has_extractable_record_in_window(summary, start, end):
-            return
-        row["status"] = "ready"
-        rows.append(row)
 
     for source_entry in sources:
         host = source_entry.get("host")
         if not source_entry.get("root"):
             raise SystemExit("make-shards requires transient manifest sources with raw root fields")
         root = Path(source_entry["root"]).expanduser()
+        raw_root_ref = source_entry.get("root_ref")
+        source_root_ref = raw_root_ref if isinstance(raw_root_ref, str) and PATH_REF_PATTERN.fullmatch(raw_root_ref) else path_ref(root)
         status = source_entry.get("status")
         if status is None:
             raise SystemExit("make-shards requires transient manifest sources with status=ready")
@@ -9308,7 +9699,23 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             append_source_gap_shards([remote_metadata_gap(source, "remote_source_not_materialized")], root)
             continue
         rollouts = source_rollouts(source)
-        summaries = sorted([*source_summary_files(source), *generated_summaries])
+        source_summaries = source_summary_files(source)
+        summaries = sorted([*source_summaries, *generated_summaries])
+        current_rollout_refs = set(source_rollout_manifest_refs(rollouts, root))
+        current_rollout_keys = {key for ref in current_rollout_refs for key in rollout_match_keys_for_ref(ref)}
+        for rollout_ref in manifest_source_ref_list(source_entry, "rollout_refs"):
+            if rollout_ref in current_rollout_refs or rollout_match_keys_for_ref(rollout_ref) & current_rollout_keys:
+                continue
+            rollout_path = source_rollout_declared_path_from_ref(source, rollout_ref)
+            if rollout_path is not None:
+                append_disappeared_rollout_shard(rollout_path)
+        current_summary_refs = set(source_summary_manifest_refs(source_summaries, root))
+        for summary_ref in manifest_source_ref_list(source_entry, "summary_refs", summary=True):
+            if summary_ref in current_summary_refs:
+                continue
+            summary_path = source_summary_declared_path_from_ref(source, summary_ref)
+            if summary_path is not None:
+                append_disappeared_summary_shard(summary_path)
         archived_duplicate_keys = archived_rollout_duplicate_keys(root)
         selected_source_identity_by_key = rollout_source_identity_by_duplicate_key(rollouts, root)
         summary_backed_rollout_refs = complete_summary_backing_rollout_refs(
@@ -9352,57 +9759,66 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             continue
         for rollout in rollouts:
             rollout_mtime_fallback = rollout_path_allows_mtime_fallback(source, rollout, archived_duplicate_keys)
-            if not rollout_candidate_relevant(
-                rollout,
-                start,
-                end,
-                max_raw_bytes=max_raw_bytes,
-                allow_mtime_fallback=rollout_mtime_fallback,
-            ):
-                continue
-            size = rollout.stat().st_size
-            row = shard_row(rollout, bytes=size)
-            if size <= max_raw_bytes:
-                jsonl_error = first_jsonl_error(rollout)
-                if jsonl_error is not None:
-                    relevant_invalid_rollout = rollout_filename_in_window(rollout, start, end) or (
-                        rollout_mtime_fallback and rollout_mtime_active(rollout, start, end)
-                    )
-                    if not jsonl_error.unreadable:
-                        relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
-                            rollout, start, end
+            try:
+                if not rollout_candidate_relevant(
+                    rollout,
+                    start,
+                    end,
+                    max_raw_bytes=max_raw_bytes,
+                    allow_mtime_fallback=rollout_mtime_fallback,
+                ):
+                    if path_disappeared(rollout) and rollout_path_hint_in_window(rollout, start, end):
+                        append_disappeared_rollout_shard(rollout)
+                    continue
+                size = rollout.stat().st_size
+                row = shard_row(rollout, bytes=size)
+                if size <= max_raw_bytes:
+                    jsonl_error = first_jsonl_error(rollout)
+                    if jsonl_error is not None:
+                        if jsonl_error.unreadable and path_disappeared(rollout):
+                            append_disappeared_rollout_shard(rollout)
+                            continue
+                        relevant_invalid_rollout = rollout_filename_in_window(rollout, start, end) or (
+                            rollout_mtime_fallback and rollout_mtime_active(rollout, start, end)
                         )
-                    if relevant_invalid_rollout:
-                        row["status"] = "invalid"
-                        row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"
+                        if not jsonl_error.unreadable:
+                            relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
+                                rollout, start, end
+                            )
+                        if relevant_invalid_rollout:
+                            row["status"] = "invalid"
+                            row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"
+                            rows.append(row)
+                        continue
+                    if rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=rollout_mtime_fallback):
+                        row["status"] = "ready"
                         rows.append(row)
                     continue
-                if rollout_has_record_in_window(rollout, start, end, allow_mtime_fallback=rollout_mtime_fallback):
-                    row["status"] = "ready"
-                    rows.append(row)
-                continue
-            relevance = oversized_rollout_relevance(
-                rollout,
-                start,
-                end,
-                allow_mtime_fallback=rollout_mtime_fallback,
-            )
-            if relevance == "irrelevant":
-                continue
-            rollout_ref = source_relative_path_ref(rollout, root)
-            if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
-                continue
-            if relevance == "unknown":
-                row["status"] = "oversized"
-                row["coverage_gap"] = "rollout exceeds timestamp relevance scan; use bounded rollout-summary before extractor handoff"
-                rows.append(row)
-                continue
-            if size > max_raw_bytes:
+                relevance = oversized_rollout_relevance(
+                    rollout,
+                    start,
+                    end,
+                    allow_mtime_fallback=rollout_mtime_fallback,
+                )
+                if relevance == "irrelevant":
+                    continue
+                rollout_ref = source_relative_path_ref(rollout, root)
                 if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
                     continue
-                row["status"] = "oversized"
-                row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"
-                rows.append(row)
+                if relevance == "unknown":
+                    row["status"] = "oversized"
+                    row["coverage_gap"] = "rollout exceeds timestamp relevance scan; use bounded rollout-summary before extractor handoff"
+                    rows.append(row)
+                    continue
+                if size > max_raw_bytes:
+                    if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
+                        continue
+                    row["status"] = "oversized"
+                    row["coverage_gap"] = "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff"
+                    rows.append(row)
+                    continue
+            except FileNotFoundError:
+                append_disappeared_rollout_shard(rollout)
                 continue
         for summary in summaries:
             append_summary_shard(summary)
