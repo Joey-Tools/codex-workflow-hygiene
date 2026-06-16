@@ -1621,7 +1621,8 @@ def summary_category_signals(chunks):
 
 def summary_has_sensitive_signal_chunks(chunks):
     return any(
-        SUMMARY_SENSITIVE_PREFILTER_RE.search(chunk) and SUMMARY_SENSITIVE_SIGNAL_RE.search(chunk)
+        PRIVACY_RISK_SIGNAL_RE.search(chunk)
+        or (SUMMARY_SENSITIVE_PREFILTER_RE.search(chunk) and SUMMARY_SENSITIVE_SIGNAL_RE.search(chunk))
         for chunk in chunks
     )
 
@@ -2984,7 +2985,8 @@ def _summary_category_signals(chunks: tuple[str, ...]) -> list[str]:
 
 def _summary_has_sensitive_signal_chunks(chunks: tuple[str, ...]) -> bool:
     return any(
-        SUMMARY_SENSITIVE_PREFILTER_RE.search(chunk) and SUMMARY_SENSITIVE_SIGNAL_RE.search(chunk)
+        PRIVACY_RISK_SIGNAL_RE.search(chunk)
+        or (SUMMARY_SENSITIVE_PREFILTER_RE.search(chunk) and SUMMARY_SENSITIVE_SIGNAL_RE.search(chunk))
         for chunk in chunks
     )
 

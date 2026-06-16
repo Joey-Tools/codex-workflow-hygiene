@@ -2135,6 +2135,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
         samples = [
             "apiToken=abc123",
             "clientToken=abc123",
+            "Data leaked in logs.",
+            "Key leak in output.",
             "Deploy\nto production.",
             "Run migration\nin production.",
             "Run rm -r \\" "\n-f /tmp/session-retrospective-cache.",
@@ -24221,6 +24223,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 signal = REMOTE_PROBE._safe_summary_text("user_message", sample)
                 self.assertIn("secret", signal)
                 self.assertNotIn(sample, signal)
+
+    def test_remote_probe_privacy_risk_signal_bypasses_sensitive_prefilter(self) -> None:
+        class NoMatchPrefilter:
+            def search(self, _text: str) -> None:
+                return None
+
+        samples = [
+            "Data leaked in logs.",
+            "Key leak in output.",
+        ]
+        with mock.patch.object(REMOTE_PROBE, "SUMMARY_SENSITIVE_PREFILTER_RE", NoMatchPrefilter()):
+            for sample in samples:
+                with self.subTest(sample=sample):
+                    signal = REMOTE_PROBE._safe_summary_text("user_message", sample)
+                    self.assertIn("secret", signal)
+                    self.assertNotIn(sample, signal)
 
     def test_remote_probe_ignores_ordinary_redacted_engineering_context(self) -> None:
         samples = [
