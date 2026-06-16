@@ -6135,6 +6135,19 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(selected, shards)
 
+    def test_repair_scan_subdir_uses_repair_parent_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw) / "weekly-coverage-repair"
+            scan = run_dir / "scan"
+            shards = run_dir / "shards"
+            scan.mkdir(parents=True)
+            (run_dir / "repair_report.json").write_text("{}", encoding="utf-8")
+            write_jsonl(shards / "shards.jsonl", [{"coverage_gap": "remaining repair gap"}])
+
+            selected = MODULE.shards_dir_from_run_dir(scan, scan)
+
+        self.assertEqual(selected, shards)
+
     def test_weekly_repair_prefers_nested_dry_run_shards_over_stale_top_level(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             run_dir = Path(raw) / "weekly-dry-run"
