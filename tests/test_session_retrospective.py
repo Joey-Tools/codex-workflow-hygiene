@@ -24240,6 +24240,18 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     self.assertIn("secret", signal)
                     self.assertNotIn(sample, signal)
 
+    def test_remote_probe_privacy_risk_signal_samples_match_prefilter(self) -> None:
+        samples = [
+            "Data leaked in logs.",
+            "Key leak in output.",
+            "Customer data exposed in trace output.",
+            "Leaked private key in a session summary.",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                self.assertIsNotNone(REMOTE_PROBE.PRIVACY_RISK_SIGNAL_RE.search(sample))
+                self.assertIsNotNone(REMOTE_PROBE.SUMMARY_SENSITIVE_PREFILTER_RE.search(sample))
+
     def test_remote_probe_ignores_ordinary_redacted_engineering_context(self) -> None:
         samples = [
             "Inspect /Users/hoteng/customer/repo",
