@@ -2491,6 +2491,17 @@ def raw_timestamp_in_window(path: Path, start: dt.datetime | None, end: dt.datet
     return found
 
 
+def summary_date_hint_maybe_reaches_start(
+    summary_date: dt.datetime,
+    exact_timestamp: bool,
+    start: dt.datetime,
+) -> bool:
+    if exact_timestamp:
+        summary_day_start = summary_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        return timestamped_rollout_maybe_reaches_start(summary_date, summary_day_start, start)
+    return summary_date + dt.timedelta(days=1) > start
+
+
 def summary_file_relevant_with_scan_cap(
     path: Path,
     start: dt.datetime | None,
@@ -2502,8 +2513,8 @@ def summary_file_relevant_with_scan_cap(
     metadata_scan_bytes = summary_metadata_scan_max_bytes(path, max_scan_bytes)
     if start is None and end is None:
         return True
-    summary_date = summary_date_from_path(path, source_root=source_root)
-    if summary_date is None:
+    summary_hint = summary_date_hint_from_path(path, source_root=source_root)
+    if summary_hint is None:
         try:
             found, complete = oversized_rollout_has_timestamp_in_window(
                 path,
@@ -2514,8 +2525,9 @@ def summary_file_relevant_with_scan_cap(
         except OSError:
             return False
         return found or not complete
+    summary_date, exact_timestamp = summary_hint
     if summary_date and start and summary_date < start:
-        if summary_date + dt.timedelta(days=1) > start:
+        if summary_date_hint_maybe_reaches_start(summary_date, exact_timestamp, start):
             return True
         try:
             if path.stat().st_size > metadata_scan_bytes:
@@ -4634,14 +4646,15 @@ def summary_file_relevant(
 ) -> bool:
     if start is None and end is None:
         return True
-    summary_date = summary_date_from_path(path, source_root=source_root)
-    if summary_date is None:
+    summary_hint = summary_date_hint_from_path(path, source_root=source_root)
+    if summary_hint is None:
         try:
             return raw_timestamp_in_window(path, start, end)
         except OSError:
             return False
+    summary_date, exact_timestamp = summary_hint
     if summary_date and start and summary_date < start:
-        if summary_date + dt.timedelta(days=1) > start:
+        if summary_date_hint_maybe_reaches_start(summary_date, exact_timestamp, start):
             return True
         try:
             return raw_timestamp_in_window(path, start, end)
@@ -4661,11 +4674,16 @@ def summary_file_maybe_relevant_without_read(
 ) -> bool:
     if start is None and end is None:
         return True
-    summary_date = summary_date_from_path(path, source_root=source_root)
+    summary_hint = summary_date_hint_from_path(path, source_root=source_root)
+    if summary_hint is None:
+        return True
+    summary_date, exact_timestamp = summary_hint
     if summary_date and end and summary_date >= end:
         return False
     if summary_date and start and summary_date < start:
-        return True
+        if not exact_timestamp:
+            return True
+        return summary_date_hint_maybe_reaches_start(summary_date, exact_timestamp, start)
     return True
 
 

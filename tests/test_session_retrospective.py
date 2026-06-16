@@ -13219,6 +13219,42 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 )
                 self.assertFalse(MODULE.summary_file_relevant(old_summary, start, end))
 
+    def test_timestamped_summary_relevance_uses_cross_midnight_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            stale_summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01T10-00-00-stale.jsonl"
+            late_summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01T23-30-00-late.jsonl"
+            write_jsonl(stale_summary, [complete_rollout_summary_scan_meta(rollout="rollout-undated-stale.jsonl")])
+            write_jsonl(late_summary, [complete_rollout_summary_scan_meta(rollout="rollout-undated-late.jsonl")])
+            start = MODULE.parse_time("2026-05-02T00:30:00Z")
+            end = MODULE.parse_time("2026-05-02T01:00:00Z")
+
+            self.assertFalse(
+                MODULE.summary_file_maybe_relevant_without_read(
+                    stale_summary,
+                    start,
+                    end,
+                    source_root=root,
+                )
+            )
+            self.assertFalse(
+                MODULE.summary_file_relevant_with_scan_cap(
+                    stale_summary,
+                    start,
+                    end,
+                    max_scan_bytes=1000,
+                    source_root=root,
+                )
+            )
+            self.assertTrue(
+                MODULE.summary_file_maybe_relevant_without_read(
+                    late_summary,
+                    start,
+                    end,
+                    source_root=root,
+                )
+            )
+
     def test_old_oversized_rollout_relevance_uses_bounded_timestamp_scan(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -20654,6 +20690,41 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_scan_meta_only_summary_ignores_old_timestamped_summary_context_after_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            missing_rollout_ref = "rollout-undated-stale.jsonl"
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01T10-00-00-stale.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=missing_rollout_ref,
+                        source_bytes=1200,
+                        source_sha256="a" * 64,
+                        summary_record_count=0,
+                    )
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"miku-bot-dev={remote}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=1000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-02T00:30:00Z"),
+                end=MODULE.parse_time("2026-05-02T01:00:00Z"),
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
