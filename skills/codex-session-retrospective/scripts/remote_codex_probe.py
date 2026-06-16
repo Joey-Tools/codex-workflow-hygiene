@@ -258,6 +258,48 @@ SUMMARY_SIGNAL_MARKERS = (
 )
 SUMMARY_SIGNAL_CHUNK_CHARS = 8192
 SUMMARY_SIGNAL_CHUNK_OVERLAP = 256
+SUMMARY_SIGNAL_CATEGORY_PATTERNS = (
+    ("error:", r"(?:exit(?:ed)?(?: with)? code [1-9]\d*|failed|traceback|error:|permission denied)"),
+    (
+        "approval",
+        r"(?:approval|require_escalated|sandbox|\bauth(?:entication|orization|[-_ ]?gated)?\b|(?<![\w-])(?!(?:redacted|masked)(?:[_-][a-z0-9]+)*\b)[\w-]*credential|permission denied|TCC)",
+    ),
+    ("could not run", r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)"),
+    ("you missed", r"(?:you missed|you forgot|wrong|incorrect|not what I asked|漏了|忘了|不对|错了)"),
+    ("assumed", r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)"),
+    (
+        "over exploration",
+        r"(?:over[-_ ]?explor|over[-_ ]?investigat|over[-_ ]?search|explored too much|too much exploration|unrelated files|unrelated paths)",
+    ),
+    (
+        "under asking",
+        r"(?:under[-_ ]?ask|did not ask|didn't ask|should have asked|without asking|missing clarification|needed clarification)",
+    ),
+)
+SUMMARY_SIGNAL_CATEGORY_LABELS = tuple(label for label, _pattern in SUMMARY_SIGNAL_CATEGORY_PATTERNS)
+SUMMARY_SIGNAL_CATEGORY_RES = tuple((label, re.compile(pattern, re.I)) for label, pattern in SUMMARY_SIGNAL_CATEGORY_PATTERNS)
+SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT = "|".join(
+    f"(?:{pattern})"
+    for pattern in (
+        PRIVATE_IPV4_SIGNAL_RE.pattern,
+        PRIVATE_IPV6_SIGNAL_RE.pattern,
+        INTERNAL_HOSTNAME_SIGNAL_RE.pattern,
+        SECRET_TOKEN_SIGNAL_RE.pattern,
+        COMPACT_TOKEN_ASSIGNMENT_SIGNAL_RE.pattern,
+        CREDENTIAL_ASSIGNMENT_SIGNAL_RE.pattern,
+        CHINESE_CREDENTIAL_ASSIGNMENT_SIGNAL_RE.pattern,
+        SENSITIVE_IDENTIFIER_SIGNAL_RE.pattern,
+        CHINESE_IDENTIFIER_SIGNAL_RE.pattern,
+        URL_CREDENTIAL_SIGNAL_RE.pattern,
+        EMAIL_SIGNAL_RE.pattern,
+        PRIVATE_URL_SIGNAL_RE.pattern,
+        PRIVACY_RISK_SIGNAL_RE.pattern,
+        DESTRUCTIVE_COMMAND_SIGNAL_RE.pattern,
+        PRODUCTION_RISK_SIGNAL_RE.pattern,
+        BARE_64_HEX_SIGNAL_RE.pattern,
+    )
+)
+SUMMARY_SENSITIVE_SIGNAL_RE = re.compile(SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT, re.I)
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
 SESSION_META_LIMIT_TRUNCATED_REASON = "session_meta_limit_truncated"
@@ -1090,6 +1132,11 @@ AUTOMATION_PROMPT_MARKERS = {AUTOMATION_PROMPT_MARKERS!r}
 SUMMARY_SIGNAL_MARKERS = {SUMMARY_SIGNAL_MARKERS!r}
 SUMMARY_SIGNAL_CHUNK_CHARS = {SUMMARY_SIGNAL_CHUNK_CHARS}
 SUMMARY_SIGNAL_CHUNK_OVERLAP = {SUMMARY_SIGNAL_CHUNK_OVERLAP}
+SUMMARY_SIGNAL_CATEGORY_PATTERNS = {SUMMARY_SIGNAL_CATEGORY_PATTERNS!r}
+SUMMARY_SIGNAL_CATEGORY_LABELS = tuple(label for label, _pattern in SUMMARY_SIGNAL_CATEGORY_PATTERNS)
+SUMMARY_SIGNAL_CATEGORY_RES = tuple((label, re.compile(pattern, re.I)) for label, pattern in SUMMARY_SIGNAL_CATEGORY_PATTERNS)
+SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT = {SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT!r}
+SUMMARY_SENSITIVE_SIGNAL_RE = re.compile(SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT, re.I)
 REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = {REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF!r}
 REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF = {REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF!r}
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
@@ -1530,57 +1577,37 @@ def summary_signal_chunks(text):
 
 
 def summary_regex_search(pattern, text, flags=re.I):
-    return any(re.search(pattern, chunk, flags) for chunk in summary_signal_chunks(text))
+    return summary_pattern_search(re.compile(pattern, flags), text)
 
 
 def summary_pattern_search(pattern, text):
     return any(pattern.search(chunk) for chunk in summary_signal_chunks(text))
 
 
+def summary_category_signals(chunks):
+    matched = set()
+    for label, pattern in SUMMARY_SIGNAL_CATEGORY_RES:
+        for chunk in chunks:
+            if pattern.search(chunk):
+                matched.add(label)
+                break
+        if len(matched) == len(SUMMARY_SIGNAL_CATEGORY_LABELS):
+            break
+    return [label for label in SUMMARY_SIGNAL_CATEGORY_LABELS if label in matched]
+
+
+def summary_has_sensitive_signal_chunks(chunks):
+    return any(SUMMARY_SENSITIVE_SIGNAL_RE.search(chunk) for chunk in chunks)
+
+
 def summary_has_sensitive_signal(text):
-    if (
-        summary_pattern_search(PRIVATE_IPV4_SIGNAL_RE, text)
-        or summary_pattern_search(PRIVATE_IPV6_SIGNAL_RE, text)
-        or summary_pattern_search(INTERNAL_HOSTNAME_SIGNAL_RE, text)
-    ):
-        return True
-    return any(
-        summary_pattern_search(pattern, text)
-        for pattern in (
-            SECRET_TOKEN_SIGNAL_RE,
-            COMPACT_TOKEN_ASSIGNMENT_SIGNAL_RE,
-            CREDENTIAL_ASSIGNMENT_SIGNAL_RE,
-            CHINESE_CREDENTIAL_ASSIGNMENT_SIGNAL_RE,
-            SENSITIVE_IDENTIFIER_SIGNAL_RE,
-            CHINESE_IDENTIFIER_SIGNAL_RE,
-            URL_CREDENTIAL_SIGNAL_RE,
-            EMAIL_SIGNAL_RE,
-            PRIVATE_URL_SIGNAL_RE,
-            PRIVACY_RISK_SIGNAL_RE,
-            DESTRUCTIVE_COMMAND_SIGNAL_RE,
-            PRODUCTION_RISK_SIGNAL_RE,
-            BARE_64_HEX_SIGNAL_RE,
-        )
-    )
+    return summary_has_sensitive_signal_chunks(tuple(summary_signal_chunks(text)))
 
 
 def summary_signal_text(kind, text):
-    signals = []
-    if summary_regex_search(r"(?:exit(?:ed)?(?: with)? code [1-9]\\d*|failed|traceback|error:|permission denied)", text):
-        signals.append("error:")
-    if summary_regex_search(r"(?:approval|require_escalated|sandbox|\\bauth(?:entication|orization|[-_ ]?gated)?\\b|(?<![\\w-])(?!(?:redacted|masked)(?:[_-][a-z0-9]+)*\\b)[\\w-]*credential|permission denied|TCC)", text):
-        signals.append("approval")
-    if summary_regex_search(r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)", text):
-        signals.append("could not run")
-    if summary_regex_search(r"(?:you missed|you forgot|wrong|incorrect|not what I asked|漏了|忘了|不对|错了)", text):
-        signals.append("you missed")
-    if summary_regex_search(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", text):
-        signals.append("assumed")
-    if summary_regex_search(r"(?:over[-_ ]?explor|over[-_ ]?investigat|over[-_ ]?search|explored too much|too much exploration|unrelated files|unrelated paths)", text):
-        signals.append("over exploration")
-    if summary_regex_search(r"(?:under[-_ ]?ask|did not ask|didn't ask|should have asked|without asking|missing clarification|needed clarification)", text):
-        signals.append("under asking")
-    if summary_has_sensitive_signal(text):
+    chunks = tuple(summary_signal_chunks(text))
+    signals = summary_category_signals(chunks)
+    if summary_has_sensitive_signal_chunks(chunks):
         signals.append("secret")
     return " ".join(signals) if signals else kind.replace("_", " ") + " present"
 
@@ -2910,57 +2937,37 @@ def _summary_signal_chunks(text: str) -> Iterable[str]:
 
 
 def _summary_regex_search(pattern: str, text: str, flags: int = re.I) -> bool:
-    return any(re.search(pattern, chunk, flags) for chunk in _summary_signal_chunks(text))
+    return _summary_pattern_search(re.compile(pattern, flags), text)
 
 
 def _summary_pattern_search(pattern: re.Pattern[str], text: str) -> bool:
     return any(pattern.search(chunk) for chunk in _summary_signal_chunks(text))
 
 
+def _summary_category_signals(chunks: tuple[str, ...]) -> list[str]:
+    matched: set[str] = set()
+    for label, pattern in SUMMARY_SIGNAL_CATEGORY_RES:
+        for chunk in chunks:
+            if pattern.search(chunk):
+                matched.add(label)
+                break
+        if len(matched) == len(SUMMARY_SIGNAL_CATEGORY_LABELS):
+            break
+    return [label for label in SUMMARY_SIGNAL_CATEGORY_LABELS if label in matched]
+
+
+def _summary_has_sensitive_signal_chunks(chunks: tuple[str, ...]) -> bool:
+    return any(SUMMARY_SENSITIVE_SIGNAL_RE.search(chunk) for chunk in chunks)
+
+
 def _summary_has_sensitive_signal(text: str) -> bool:
-    if (
-        _summary_pattern_search(PRIVATE_IPV4_SIGNAL_RE, text)
-        or _summary_pattern_search(PRIVATE_IPV6_SIGNAL_RE, text)
-        or _summary_pattern_search(INTERNAL_HOSTNAME_SIGNAL_RE, text)
-    ):
-        return True
-    return any(
-        _summary_pattern_search(pattern, text)
-        for pattern in (
-            SECRET_TOKEN_SIGNAL_RE,
-            COMPACT_TOKEN_ASSIGNMENT_SIGNAL_RE,
-            CREDENTIAL_ASSIGNMENT_SIGNAL_RE,
-            CHINESE_CREDENTIAL_ASSIGNMENT_SIGNAL_RE,
-            SENSITIVE_IDENTIFIER_SIGNAL_RE,
-            CHINESE_IDENTIFIER_SIGNAL_RE,
-            URL_CREDENTIAL_SIGNAL_RE,
-            EMAIL_SIGNAL_RE,
-            PRIVATE_URL_SIGNAL_RE,
-            PRIVACY_RISK_SIGNAL_RE,
-            DESTRUCTIVE_COMMAND_SIGNAL_RE,
-            PRODUCTION_RISK_SIGNAL_RE,
-            BARE_64_HEX_SIGNAL_RE,
-        )
-    )
+    return _summary_has_sensitive_signal_chunks(tuple(_summary_signal_chunks(text)))
 
 
 def _summary_signal_text(kind: str, text: str) -> str:
-    signals: list[str] = []
-    if _summary_regex_search(r"(?:exit(?:ed)?(?: with)? code [1-9]\d*|failed|traceback|error:|permission denied)", text):
-        signals.append("error:")
-    if _summary_regex_search(r"(?:approval|require_escalated|sandbox|\bauth(?:entication|orization|[-_ ]?gated)?\b|(?<![\w-])(?!(?:redacted|masked)(?:[_-][a-z0-9]+)*\b)[\w-]*credential|permission denied|TCC)", text):
-        signals.append("approval")
-    if _summary_regex_search(r"(?:not run|did not run|unable to run|could not run|untested|未运行|无法运行)", text):
-        signals.append("could not run")
-    if _summary_regex_search(r"(?:you missed|you forgot|wrong|incorrect|not what I asked|漏了|忘了|不对|错了)", text):
-        signals.append("you missed")
-    if _summary_regex_search(r"(?:lost context|misunderstood|I misunderstood|assumption|assumed|上下文|误解)", text):
-        signals.append("assumed")
-    if _summary_regex_search(r"(?:over[-_ ]?explor|over[-_ ]?investigat|over[-_ ]?search|explored too much|too much exploration|unrelated files|unrelated paths)", text):
-        signals.append("over exploration")
-    if _summary_regex_search(r"(?:under[-_ ]?ask|did not ask|didn't ask|should have asked|without asking|missing clarification|needed clarification)", text):
-        signals.append("under asking")
-    if _summary_has_sensitive_signal(text):
+    chunks = tuple(_summary_signal_chunks(text))
+    signals = _summary_category_signals(chunks)
+    if _summary_has_sensitive_signal_chunks(chunks):
         signals.append("secret")
     return " ".join(signals) if signals else f"{kind.replace('_', ' ')} present"
 
