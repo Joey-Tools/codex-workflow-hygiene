@@ -9766,7 +9766,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "unsafe_source_artifact")
 
-    def test_make_shards_filters_missing_old_timestamped_rollout_and_old_summary(self) -> None:
+    def test_make_shards_reports_missing_old_timestamped_rollout_without_summary_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
             root.mkdir()
@@ -9798,7 +9798,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertEqual(rows, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
 
     def test_make_shards_reports_missing_timestamped_rollout_ref_that_started_before_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -9834,7 +9835,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
 
-    def test_make_shards_filters_missing_timestamped_rollout_ref_at_prior_day_boundary(self) -> None:
+    def test_make_shards_reports_missing_timestamped_rollout_ref_at_prior_day_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
             root.mkdir()
@@ -9865,7 +9866,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertEqual(rows, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
 
     def test_make_shards_reports_missing_timestamped_rollout_ref_across_midnight(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -9935,6 +9937,78 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
 
+    def test_make_shards_reports_missing_timestamped_rollout_ref_beyond_midnight_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            root.mkdir()
+            rollout_ref = "sessions/2026/04/30/rollout-2026-04-30T23-30-00-long-session.jsonl"
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [rollout_ref],
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T03:30:00Z", "end": "2026-05-01T04:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
+    def test_make_shards_marks_invalid_timestamped_rollout_same_day_before_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-same-day.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text("{not-json\n", encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [rollout_ref],
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T11:00:00Z", "end": "2026-05-01T12:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(rollout))
+        self.assertEqual(rows[0]["status"], "invalid")
+        self.assertEqual(rows[0]["coverage_gap"], "invalid JSONL; cannot safely hand to extractor shard")
+
     def test_make_shards_marks_invalid_timestamped_rollout_across_midnight(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
@@ -9973,7 +10047,45 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "invalid")
         self.assertEqual(rows[0]["coverage_gap"], "invalid JSONL; cannot safely hand to extractor shard")
 
-    def test_make_shards_filters_missing_timestamped_summary_ref_before_window(self) -> None:
+    def test_make_shards_marks_invalid_timestamped_rollout_beyond_midnight_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            rollout_ref = "sessions/2026/04/30/rollout-2026-04-30T23-30-00-long-session.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text("{not-json\n", encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                "rollout_refs": [rollout_ref],
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T03:30:00Z", "end": "2026-05-01T04:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(rollout))
+        self.assertEqual(rows[0]["status"], "invalid")
+        self.assertEqual(rows[0]["coverage_gap"], "invalid JSONL; cannot safely hand to extractor shard")
+
+    def test_make_shards_reports_missing_timestamped_summary_ref_before_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
             root.mkdir()
@@ -10004,7 +10116,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertEqual(rows, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
 
     def test_make_shards_reports_missing_same_day_timestamped_summary_ref_before_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -11426,6 +11540,24 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
         )
 
+    def test_exact_summary_path_before_window_start_is_not_path_proven_outside(self) -> None:
+        path = Path("sessions/2026/05/01/rollout-summary-2026-05-01T23-30-00.jsonl")
+
+        self.assertFalse(
+            MODULE.summary_path_proves_outside_window(
+                path,
+                MODULE.parse_time("2026-05-02T03:30:00Z"),
+                MODULE.parse_time("2026-05-02T04:00:00Z"),
+            )
+        )
+        self.assertTrue(
+            MODULE.summary_file_maybe_relevant_without_read(
+                path,
+                MODULE.parse_time("2026-05-02T03:30:00Z"),
+                MODULE.parse_time("2026-05-02T04:00:00Z"),
+            )
+        )
+
     def test_partial_dated_source_root_does_not_complete_summary_parent_date(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "2026" / "05"
@@ -11909,7 +12041,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
 
-    def test_make_shards_skips_exact_timestamp_invalid_rollout_outside_subday_window(self) -> None:
+    def test_make_shards_marks_exact_timestamp_invalid_rollout_before_subday_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-bad.jsonl"
@@ -11928,9 +12060,15 @@ class SessionRetrospectiveTests(unittest.TestCase):
             output = safe_output_dir(raw)
 
             MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
-            rows = list((output / "shards.jsonl").read_text(encoding="utf-8").splitlines())
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
 
-        self.assertEqual(rows, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(rollout))
+        self.assertEqual(rows[0]["status"], "invalid")
+        self.assertEqual(rows[0]["coverage_gap"], "invalid JSONL; cannot safely hand to extractor shard")
 
     def test_make_shards_skips_non_ready_manifest_sources(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -13443,6 +13581,113 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertIn(rollout_ref, manifest["sources"][0]["rollout_refs"])
         self.assertIn("rollout disappeared during shard discovery", [row.get("coverage_gap") for row in rows])
+
+    def test_source_window_manifest_preserves_vanished_timestamped_rollout_ref_for_shard_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-live.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Live rollout race.", "2026-05-01T11:15:00Z")])
+            shards = safe_output_dir(raw, "shards")
+            start = MODULE.parse_time("2026-05-01T11:00:00Z")
+            end = MODULE.parse_time("2026-05-01T12:00:00Z")
+            real_rollout_candidate_relevant = MODULE.rollout_candidate_relevant
+
+            def relevant_then_disappear(path: Path, *args, **kwargs) -> bool:
+                result = real_rollout_candidate_relevant(path, *args, **kwargs)
+                if path == rollout:
+                    rollout.unlink()
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "rollout_candidate_relevant",
+                side_effect=relevant_then_disappear,
+            ):
+                refs = MODULE.source_window_rollout_manifest_refs(
+                    MODULE.Source("local", root),
+                    [rollout],
+                    start,
+                    end,
+                    max_raw_bytes=1000,
+                    max_relevance_scan_bytes=1000,
+                    allow_mtime_fallback=False,
+                    archived_duplicate_keys=None,
+                    summary_backed_rollout_keys=set(),
+                )
+            manifest_path = Path(raw) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(root),
+                                "status": "ready",
+                                MODULE.MANIFEST_REF_RELEVANCE_FIELD: MODULE.MANIFEST_REF_RELEVANCE_POLICY,
+                                "rollout_refs": refs,
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T11:00:00Z", "end": "2026-05-01T12:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            MODULE.main(["make-shards", "--manifest", str(manifest_path), "--output", str(shards)])
+            rows = [
+                json.loads(line)
+                for line in (shards / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIn(rollout_ref, refs)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
+    def test_shard_manifest_omits_existing_summary_backed_oversized_rollout_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-summary-backed-large.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "You missed verification for /customer/repo.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "x" * 5000, "2026-05-01T10:00:01Z"),
+                ],
+            )
+            summary_ref = "sessions/2026/05/01/rollout-summary-summary-backed-large.jsonl"
+            summary = root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        source_sha256=MODULE.file_sha256(rollout),
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "rollout": rollout_ref,
+                        "text": "You missed verification for /customer/repo.",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=3000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn(rollout_ref, manifest["sources"][0]["rollout_refs"])
+        self.assertIn(summary_ref, manifest["sources"][0]["summary_refs"])
 
     def test_old_file_relevance_prefilters_handle_unreadable_timestamp_scan(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -21138,6 +21383,41 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
 
+    def test_default_remote_scan_meta_only_summary_reports_previous_day_timestamped_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            missing_rollout_ref = "sessions/2026/04/30/rollout-2026-04-30T23-30-00-long-running.jsonl"
+            summary = remote / "sessions" / "2026" / "04" / "30" / "rollout-summary-scan-meta-only.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=missing_rollout_ref,
+                        source_bytes=1200,
+                        source_sha256="a" * 64,
+                        summary_record_count=0,
+                    )
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"miku-bot-dev={remote}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=1000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T03:30:00Z"),
+                end=MODULE.parse_time("2026-05-01T04:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
     def test_default_remote_scan_meta_only_summary_ignores_existing_direct_file_without_window_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             remote = Path(raw) / "miku-bot-dev"
@@ -22220,7 +22500,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(state.exists())
         self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
 
-    def test_exact_timestamp_invalid_rollout_before_subday_start_does_not_report_gap(self) -> None:
+    def test_exact_timestamp_invalid_rollout_before_subday_start_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
@@ -22238,7 +22518,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
-        self.assertNotIn("invalid_jsonl", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "invalid_jsonl")
 
     def test_old_invalid_rollout_with_active_mtime_reports_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
