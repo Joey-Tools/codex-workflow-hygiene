@@ -5782,11 +5782,18 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
             markdown = (output / "dry_run_report.md").read_text(encoding="utf-8")
+            next_command_argv = MODULE.shlex.split(report["next_command"])
+            MODULE.main(next_command_argv[2:])
+            repair_trend = json.loads(
+                (output / "weekly-coverage-repair" / "scan" / "trend_report.json").read_text(
+                    encoding="utf-8"
+                )
+            )
 
         expected_root = output.absolute().as_posix()
         expected_script = Path(MODULE.__file__).resolve().as_posix()
         self.assertEqual(
-            MODULE.shlex.split(report["next_command"]),
+            next_command_argv,
             [
                 "python3",
                 expected_script,
@@ -5794,9 +5801,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "--run-dir",
                 expected_root,
                 "--max-raw-bytes",
-                "200",
+                "1048576",
                 "--allow-partial-hosts",
             ],
+        )
+        self.assertNotIn(
+            "oversized_summary_skipped",
+            [gap["reason"] for gap in repair_trend["coverage_gaps"]],
         )
         self.assertIn(report["next_command"], markdown)
 

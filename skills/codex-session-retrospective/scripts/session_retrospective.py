@@ -9592,6 +9592,13 @@ def run_dry_run(
     )
     next_command = None
     if repairable_coverage_gaps(coverage_gaps):
+        repair_max_raw_bytes = max_raw_bytes
+        suggested_max_raw_bytes = suggested_max_raw_bytes_for_oversized_gaps(
+            oversized_repairable_coverage_gaps(coverage_gaps),
+            current_max_raw_bytes=max_raw_bytes,
+        )
+        if suggested_max_raw_bytes is not None:
+            repair_max_raw_bytes = suggested_max_raw_bytes
         next_command_argv = [
             "python3",
             Path(__file__).resolve().as_posix(),
@@ -9599,7 +9606,7 @@ def run_dry_run(
             "--run-dir",
             root.as_posix(),
             "--max-raw-bytes",
-            str(max_raw_bytes),
+            str(repair_max_raw_bytes),
         ]
         if args.allow_partial_hosts:
             next_command_argv.append("--allow-partial-hosts")
