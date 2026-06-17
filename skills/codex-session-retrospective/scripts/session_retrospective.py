@@ -8253,8 +8253,6 @@ def run_scan(
                     allow_mtime_fallback=rollout_mtime_fallback,
                     source_root=source.root,
                 ):
-                    if path_disappeared(rollout):
-                        append_volatile_rollout_gap(rollout)
                     continue
                 size = rollout.stat().st_size
                 if size <= max_raw_bytes:
@@ -8302,8 +8300,6 @@ def run_scan(
                     source_root=source.root,
                 )
                 if relevance == "irrelevant":
-                    if path_disappeared(rollout):
-                        append_volatile_rollout_gap(rollout)
                     continue
                 rollout_ref = source_relative_path_ref(rollout, source.root)
                 if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
@@ -10757,13 +10753,6 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=rollout_mtime_fallback,
                     source_root=root,
                 ):
-                    if path_disappeared(rollout) and not rollout_path_proves_outside_window(
-                        rollout,
-                        start,
-                        end,
-                        source_root=root,
-                    ):
-                        append_disappeared_rollout_shard(rollout)
                     continue
                 size = rollout.stat().st_size
                 row = shard_row(rollout, bytes=size)
@@ -10805,8 +10794,6 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     source_root=root,
                 )
                 if relevance == "irrelevant":
-                    if path_disappeared(rollout):
-                        append_disappeared_rollout_shard(rollout)
                     continue
                 rollout_ref = source_relative_path_ref(rollout, root)
                 if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
