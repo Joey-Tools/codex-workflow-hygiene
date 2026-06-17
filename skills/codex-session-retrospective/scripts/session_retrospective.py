@@ -212,7 +212,7 @@ RETAINED_OUTCOMES = frozenset({"needs_review", "no_issue_observed"})
 RETAINED_FIXED_MODES = frozenset({"daily", "weekly"})
 BASELINE_MODE_PATTERN = re.compile(r"^baseline-[1-9][0-9]{0,3}d$")
 MAX_BASELINE_WINDOW_DAYS = 9999
-TIMESTAMPED_ROLLOUT_CROSS_MIDNIGHT_GRACE = dt.timedelta(hours=2)
+TIMESTAMPED_ROLLOUT_PATH_HINT_GRACE = dt.timedelta(hours=2)
 
 DEFAULT_REMOTE_HOSTS = ("miku-bot-dev", "hoteng-srv-01")
 RETAINED_SOURCE_HOST_ALIASES = {
@@ -2233,6 +2233,16 @@ def timestamped_rollout_maybe_reaches_start(
     rollout_date: dt.datetime | None,
     start: dt.datetime | None,
 ) -> bool:
+    # The path timestamp is a rollout start, not a duration bound.
+    # Only content or backing metadata can prove that it never reaches start.
+    return True
+
+
+def timestamped_rollout_start_within_path_hint_grace(
+    rollout_time: dt.datetime,
+    rollout_date: dt.datetime | None,
+    start: dt.datetime | None,
+) -> bool:
     if start is None or rollout_time >= start:
         return True
     if rollout_date is None:
@@ -2241,9 +2251,37 @@ def timestamped_rollout_maybe_reaches_start(
     if start < rollout_day_end:
         return True
     return (
-        rollout_time >= rollout_day_end - TIMESTAMPED_ROLLOUT_CROSS_MIDNIGHT_GRACE
-        and start < rollout_day_end + TIMESTAMPED_ROLLOUT_CROSS_MIDNIGHT_GRACE
+        rollout_time >= rollout_day_end - TIMESTAMPED_ROLLOUT_PATH_HINT_GRACE
+        and start < rollout_day_end + TIMESTAMPED_ROLLOUT_PATH_HINT_GRACE
     )
+
+
+def timestamped_rollout_start_could_reach_next_day(
+    rollout_time: dt.datetime,
+    rollout_date: dt.datetime | None,
+    start: dt.datetime | None,
+) -> bool:
+    if start is None or rollout_time >= start:
+        return True
+    if rollout_date is None:
+        return True
+    rollout_day_end = rollout_date + dt.timedelta(days=1)
+    return start >= rollout_day_end and start < rollout_day_end + dt.timedelta(days=1)
+
+
+def timestamped_rollout_start_could_reach_relevant_window(
+    rollout_time: dt.datetime,
+    rollout_date: dt.datetime | None,
+    start: dt.datetime | None,
+) -> bool:
+    if start is None or rollout_time >= start:
+        return True
+    if rollout_date is None:
+        return True
+    rollout_day_end = rollout_date + dt.timedelta(days=1)
+    if start < rollout_day_end:
+        return True
+    return timestamped_rollout_start_could_reach_next_day(rollout_time, rollout_date, start)
 
 
 def timestamped_rollout_path_hint(path: Path) -> tuple[dt.datetime, dt.datetime | None] | None:
@@ -2257,6 +2295,86 @@ def timestamped_rollout_path_hint(path: Path) -> tuple[dt.datetime, dt.datetime 
     if rollout_time is None:
         return None
     return rollout_time, parse_time(f"{match.group(1)}T00:00:00Z")
+
+
+def timestamped_invalid_rollout_maybe_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> bool:
+    timestamped_hint = timestamped_rollout_path_hint(path)
+    if timestamped_hint is None:
+        return False
+    rollout_time, rollout_day_start = timestamped_hint
+    if end and rollout_time >= end:
+        return False
+    if start and not timestamped_rollout_start_could_reach_relevant_window(
+        rollout_time,
+        rollout_day_start,
+        start,
+    ):
+        return False
+    jsonl_error = first_jsonl_error(path)
+    return jsonl_error is not None and not jsonl_error.unreadable
+
+
+def timestamped_timestampless_rollout_maybe_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int | None = None,
+) -> bool:
+    return timestamped_timestampless_rollout_relevance(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    ) is True
+
+
+def timestamped_timestampless_rollout_relevance(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int | None = None,
+) -> bool | None:
+    timestamped_hint = timestamped_rollout_path_hint(path)
+    if timestamped_hint is None:
+        return False
+    rollout_time, rollout_day_start = timestamped_hint
+    if end and rollout_time >= end:
+        return False
+    if start and rollout_time < start and not timestamped_rollout_maybe_reaches_start(
+        rollout_time,
+        rollout_day_start,
+        start,
+    ):
+        return False
+    try:
+        if max_scan_bytes is not None and path.stat().st_size > max_scan_bytes:
+            return False
+        for _line_no, record in iter_jsonl(path):
+            if record_timestamp(record) is None:
+                return True
+    except OSError:
+        return None
+    except ValueError:
+        return False
+    return False
+
+
+def disappeared_rollout_candidate_maybe_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
+    if path_disappeared(path) and rollout_path_proves_outside_window(path, start, end, source_root=source_root):
+        return False
+    return True
 
 
 def rollout_filename_in_window(
@@ -2278,7 +2396,7 @@ def rollout_filename_in_window(
                 return True
             if end and rollout_time >= end:
                 return False
-            if start and not timestamped_rollout_maybe_reaches_start(rollout_time, rollout_date, start):
+            if start and not timestamped_rollout_start_within_path_hint_grace(rollout_time, rollout_date, start):
                 return False
             return True
         rollout_date = parse_time(f"{match.group(1)}T00:00:00Z")
@@ -2311,7 +2429,7 @@ def rollout_candidate_relevant(
         rollout_time, rollout_day_start = timestamped_hint
         if end and rollout_time >= end:
             return False
-        if start and rollout_time < start and timestamped_rollout_maybe_reaches_start(
+        if start and rollout_time < start and timestamped_rollout_start_within_path_hint_grace(
             rollout_time,
             rollout_day_start,
             start,
@@ -2326,13 +2444,13 @@ def rollout_candidate_relevant(
         try:
             mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
         except OSError:
-            return True
+            return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
         if allow_mtime_fallback and (not start or mtime >= start) and (not end or mtime < end):
             return True
         try:
             size = path.stat().st_size
         except OSError:
-            return True
+            return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
         if max_raw_bytes is not None and size > max_raw_bytes:
             try:
                 relevance = oversized_rollout_relevance(
@@ -2344,17 +2462,69 @@ def rollout_candidate_relevant(
                     source_root=source_root,
                 )
             except OSError:
-                return True
+                return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
             if relevance == "relevant":
                 return True
             if relevance == "irrelevant":
+                timestampless_relevance = timestamped_timestampless_rollout_relevance(
+                    path,
+                    start,
+                    end,
+                    max_scan_bytes=max_relevance_scan_bytes,
+                )
+                if timestampless_relevance is True:
+                    return True
+                if timestampless_relevance is None:
+                    return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
+                if timestamped_invalid_rollout_maybe_relevant(path, start, end):
+                    return True
                 return False
             return True
         try:
-            return raw_timestamp_in_window(path, start, end)
+            if raw_timestamp_in_window(path, start, end):
+                return True
         except OSError:
+            return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
+        timestampless_relevance = timestamped_timestampless_rollout_relevance(path, start, end)
+        if timestampless_relevance is True:
             return True
+        if timestampless_relevance is None:
+            return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
+        if timestamped_invalid_rollout_maybe_relevant(path, start, end):
+            return True
+        return False
     return True
+
+
+def invalid_rollout_maybe_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+    allow_mtime_fallback: bool = False,
+    unreadable: bool = False,
+) -> bool:
+    timestamped_hint = timestamped_rollout_path_hint(path)
+    if timestamped_hint is not None:
+        rollout_time, rollout_day_start = timestamped_hint
+        if end and rollout_time >= end:
+            return False
+        if start and rollout_time < start:
+            if timestamped_rollout_start_could_reach_relevant_window(rollout_time, rollout_day_start, start):
+                return True
+        else:
+            return True
+    elif rollout_filename_in_window(path, start, end, source_root=source_root):
+        return True
+    if allow_mtime_fallback and rollout_mtime_active(path, start, end):
+        return True
+    if unreadable:
+        return False
+    try:
+        return raw_timestamp_in_window(path, start, end)
+    except OSError:
+        return True
 
 
 def rollout_has_materialized_window_coverage(
@@ -2392,9 +2562,11 @@ def rollout_has_materialized_window_coverage(
         if allow_mtime_fallback and rollout_mtime_active(path, start, end):
             return True
         try:
-            return raw_timestamp_in_window(path, start, end)
+            if raw_timestamp_in_window(path, start, end):
+                return True
         except OSError:
             return False
+        return timestamped_timestampless_rollout_maybe_relevant(path, start, end)
     try:
         return rollout_has_record_in_window(
             path,
@@ -2514,6 +2686,18 @@ def oversized_rollout_relevance(
             return "relevant"
         if not complete:
             return "unknown"
+        timestampless_relevance = timestamped_timestampless_rollout_relevance(
+            path,
+            start,
+            end,
+            max_scan_bytes=max_scan_bytes,
+        )
+        if timestampless_relevance is True:
+            return "relevant"
+        if timestampless_relevance is None:
+            return "unknown"
+        if timestamped_invalid_rollout_maybe_relevant(path, start, end):
+            return "relevant"
         if not allow_mtime_fallback:
             return "irrelevant"
         try:
@@ -2594,11 +2778,11 @@ def summary_file_relevant_with_scan_cap(
         return found or not complete
     summary_date, exact_timestamp = summary_hint
     if summary_date and start and summary_date < start:
-        if summary_date_hint_maybe_reaches_start(summary_date, exact_timestamp, start):
+        if not exact_timestamp and summary_date_hint_maybe_reaches_start(summary_date, exact_timestamp, start):
             return True
         try:
             if path.stat().st_size > metadata_scan_bytes:
-                return False
+                return exact_timestamp
         except OSError:
             return False
         try:
@@ -2645,8 +2829,9 @@ def rollout_has_manifest_ref_relevance(
     allow_mtime_fallback: bool,
     summary_backed_rollout_keys: set[str],
 ) -> bool:
+    preserve_disappeared_ref = False
     try:
-        if not rollout_candidate_relevant(
+        candidate_relevant = rollout_candidate_relevant(
             rollout,
             start,
             end,
@@ -2654,32 +2839,38 @@ def rollout_has_manifest_ref_relevance(
             max_relevance_scan_bytes=max_relevance_scan_bytes,
             allow_mtime_fallback=allow_mtime_fallback,
             source_root=source.root,
-        ):
+        )
+        if not candidate_relevant:
             return False
+        preserve_disappeared_ref = True
         size = rollout.stat().st_size
         if size <= max_raw_bytes:
             jsonl_error = first_jsonl_error(rollout)
             if jsonl_error is not None:
-                relevant_invalid_rollout = rollout_filename_in_window(
+                if jsonl_error.unreadable and path_disappeared(rollout):
+                    return True
+                return invalid_rollout_maybe_relevant(
                     rollout,
                     start,
                     end,
                     source_root=source.root,
-                ) or (allow_mtime_fallback and rollout_mtime_active(rollout, start, end))
-                if not jsonl_error.unreadable:
-                    relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
-                        rollout,
-                        start,
-                        end,
-                    )
-                return relevant_invalid_rollout
-            return rollout_has_record_in_window(
+                    allow_mtime_fallback=allow_mtime_fallback,
+                    unreadable=jsonl_error.unreadable,
+                )
+            if rollout_has_record_in_window(
                 rollout,
                 start,
                 end,
                 allow_mtime_fallback=allow_mtime_fallback,
                 source_root=source.root,
-            )
+            ):
+                return True
+            timestampless_relevance = timestamped_timestampless_rollout_relevance(rollout, start, end)
+            if timestampless_relevance is None:
+                if path_disappeared(rollout):
+                    raise FileNotFoundError(rollout)
+                return True
+            return timestampless_relevance
         relevance = oversized_rollout_relevance(
             rollout,
             start,
@@ -2689,13 +2880,26 @@ def rollout_has_manifest_ref_relevance(
             source_root=source.root,
         )
         if relevance == "irrelevant":
+            if path_disappeared(rollout):
+                preserve_disappeared_ref = False
+                raise FileNotFoundError(rollout)
             return False
         rollout_ref = source_relative_path_ref(rollout, source.root)
         if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
             return False
         return True
     except FileNotFoundError:
-        return not rollout_path_proves_outside_window(rollout, start, end, source_root=source.root)
+        if not preserve_disappeared_ref and rollout_path_proves_outside_window(
+            rollout,
+            start,
+            end,
+            source_root=source.root,
+        ):
+            return False
+        rollout_ref = source_relative_path_ref(rollout, source.root)
+        return rollout_ref is not None and safe_relative_rollout_ref(rollout_ref) is not None
+    except (OSError, ValueError):
+        return False
 
 
 def source_window_rollout_manifest_refs(
@@ -3293,7 +3497,11 @@ def rollout_ref_maybe_in_window(ref: str, start: dt.datetime | None, end: dt.dat
             return False
         if end and rollout_start >= end:
             return False
-        if start and not timestamped_rollout_maybe_reaches_start(rollout_start, rollout_date, start):
+        if start and not timestamped_rollout_start_could_reach_relevant_window(
+            rollout_start,
+            rollout_date,
+            start,
+        ):
             return False
         return True
     if match:
@@ -3308,6 +3516,23 @@ def rollout_ref_maybe_in_window(ref: str, start: dt.datetime | None, end: dt.dat
     if end and rollout_date >= end:
         return False
     return True
+
+
+def complete_identity_ref_can_extend_into_window(
+    ref: str,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> bool:
+    if start is None:
+        return False
+    match = re.search(
+        r"^rollout-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})(?:-|\.jsonl$)",
+        Path(ref).name,
+    )
+    if not match:
+        return False
+    rollout_start = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+    return bool(rollout_start and rollout_start < start and (end is None or rollout_start < end))
 
 
 def backing_ref_direct_file_exists(source_root: Path, ref: str) -> bool:
@@ -7562,6 +7787,17 @@ def remote_summary_only_gaps(
             )
             if invalid_scan_meta_ref_seen:
                 return [remote_metadata_gap(source, "remote_source_not_materialized")]
+            scan_meta_identity_proof = complete_scan_meta_backing_source_bytes_by_ref(
+                summary,
+                start,
+                end,
+                allow_tail_record_limit=True,
+            )
+            scan_meta_complete_identity_refs = (
+                set(scan_meta_identity_proof.source_sha256_by_ref)
+                if scan_meta_identity_proof is not None
+                else set()
+            )
             scan_meta_context_relevant = summary_file_relevant_with_scan_cap(
                 summary,
                 start,
@@ -7576,14 +7812,25 @@ def remote_summary_only_gaps(
                 source_root=source.root,
             )
             for ref in scan_meta_refs:
-                if rollout_ref_has_window_hint(ref) and not rollout_ref_maybe_in_window(ref, start, end):
+                ref_has_complete_identity = ref in scan_meta_complete_identity_refs
+                ref_complete_identity_extends_window = (
+                    ref_has_complete_identity and complete_identity_ref_can_extend_into_window(ref, start, end)
+                )
+                ref_maybe_relevant = rollout_ref_maybe_in_window(ref, start, end)
+                if rollout_ref_has_window_hint(ref) and not ref_maybe_relevant and not ref_complete_identity_extends_window:
                     continue
                 _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
                 selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
+                selected_ref_complete_identity_extends_window = ref_complete_identity_extends_window or (
+                    selected_ref in scan_meta_complete_identity_refs
+                    and complete_identity_ref_can_extend_into_window(selected_ref, start, end)
+                )
+                selected_ref_maybe_relevant = rollout_ref_maybe_in_window(selected_ref, start, end)
                 if (
                     selected_ref != ref
                     and rollout_ref_has_window_hint(selected_ref)
-                    and not rollout_ref_maybe_in_window(selected_ref, start, end)
+                    and not selected_ref_maybe_relevant
+                    and not selected_ref_complete_identity_extends_window
                 ):
                     continue
                 ref_key = summary_backed_rollout_key_for_ref(selected_ref)
@@ -7597,9 +7844,13 @@ def remote_summary_only_gaps(
                     archived_duplicate_keys=archived_duplicate_keys,
                 )
                 ref_has_direct_file = backing_ref_direct_file_exists(source.root, selected_ref)
-                ref_maybe_relevant = rollout_ref_maybe_in_window(selected_ref, start, end)
                 if not ref_has_direct_coverage and (
-                    ref_has_direct_file or (not scan_meta_context_relevant and not ref_maybe_relevant)
+                    ref_has_direct_file
+                    or (
+                        not scan_meta_context_relevant
+                        and not selected_ref_maybe_relevant
+                        and not selected_ref_complete_identity_extends_window
+                    )
                 ):
                     continue
                 if ref in complete_summary_refs or ref_key in complete_summary_keys:
@@ -7726,8 +7977,13 @@ def path_disappeared(path: Path) -> bool:
     return False
 
 
-def rollout_path_proves_after_window(path: Path, end: dt.datetime | None) -> bool:
-    rollout_date = rollout_window_date(path)
+def rollout_path_proves_after_window(
+    path: Path,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
+    rollout_date = rollout_window_date(path, source_root=source_root)
     if rollout_date is None:
         return False
     return bool(end and rollout_date >= end)
@@ -8078,8 +8334,6 @@ def run_scan(
                     allow_mtime_fallback=rollout_mtime_fallback,
                     source_root=source.root,
                 ):
-                    if path_disappeared(rollout):
-                        append_volatile_rollout_gap(rollout)
                     continue
                 size = rollout.stat().st_size
                 if size <= max_raw_bytes:
@@ -8088,18 +8342,14 @@ def run_scan(
                         if jsonl_error.unreadable and path_disappeared(rollout):
                             append_volatile_rollout_gap(rollout)
                             continue
-                        relevant_invalid_rollout = rollout_filename_in_window(
+                        relevant_invalid_rollout = invalid_rollout_maybe_relevant(
                             rollout,
                             gap_start,
                             end,
                             source_root=source.root,
-                        ) or (
-                            rollout_mtime_fallback and rollout_mtime_active(rollout, gap_start, end)
+                            allow_mtime_fallback=rollout_mtime_fallback,
+                            unreadable=jsonl_error.unreadable,
                         )
-                        if not jsonl_error.unreadable:
-                            relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
-                                rollout, gap_start, end
-                            )
                         if relevant_invalid_rollout:
                             coverage_gaps.append(source_path_coverage_gap(source, rollout, "invalid_jsonl"))
                         continue
@@ -8110,6 +8360,17 @@ def run_scan(
                         allow_mtime_fallback=rollout_mtime_fallback,
                         source_root=source.root,
                     ):
+                        timestampless_relevance = timestamped_timestampless_rollout_relevance(
+                            rollout,
+                            gap_start,
+                            end,
+                        )
+                        if timestampless_relevance is True:
+                            coverage_gaps.append(
+                                source_path_coverage_gap(source, rollout, "timestampless_rollout_skipped")
+                            )
+                        elif timestampless_relevance is None:
+                            append_volatile_rollout_gap(rollout)
                         continue
                     all_turns.extend(
                         extract_rollout(
@@ -10584,13 +10845,6 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=rollout_mtime_fallback,
                     source_root=root,
                 ):
-                    if path_disappeared(rollout) and not rollout_path_proves_outside_window(
-                        rollout,
-                        start,
-                        end,
-                        source_root=root,
-                    ):
-                        append_disappeared_rollout_shard(rollout)
                     continue
                 size = rollout.stat().st_size
                 row = shard_row(rollout, bytes=size)
@@ -10600,18 +10854,14 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                         if jsonl_error.unreadable and path_disappeared(rollout):
                             append_disappeared_rollout_shard(rollout)
                             continue
-                        relevant_invalid_rollout = rollout_filename_in_window(
+                        relevant_invalid_rollout = invalid_rollout_maybe_relevant(
                             rollout,
                             start,
                             end,
                             source_root=root,
-                        ) or (
-                            rollout_mtime_fallback and rollout_mtime_active(rollout, start, end)
+                            allow_mtime_fallback=rollout_mtime_fallback,
+                            unreadable=jsonl_error.unreadable,
                         )
-                        if not jsonl_error.unreadable:
-                            relevant_invalid_rollout = relevant_invalid_rollout or raw_timestamp_in_window(
-                                rollout, start, end
-                            )
                         if relevant_invalid_rollout:
                             row["status"] = "invalid"
                             row["coverage_gap"] = "invalid JSONL; cannot safely hand to extractor shard"
@@ -10626,7 +10876,21 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     ):
                         row["status"] = "ready"
                         rows.append(row)
-                    continue
+                        continue
+                    else:
+                        timestampless_relevance = timestamped_timestampless_rollout_relevance(rollout, start, end)
+                        if timestampless_relevance is None:
+                            append_disappeared_rollout_shard(rollout)
+                            continue
+                        if timestampless_relevance is not True:
+                            continue
+                        row["status"] = "partial"
+                        row["coverage_gap"] = (
+                            "rollout has timestampless records with only a start-time path hint; "
+                            "cannot prove window coverage before extractor handoff"
+                        )
+                        rows.append(row)
+                        continue
                 relevance = oversized_rollout_relevance(
                     rollout,
                     start,
