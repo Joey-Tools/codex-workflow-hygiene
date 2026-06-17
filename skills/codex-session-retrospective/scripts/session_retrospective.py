@@ -573,6 +573,7 @@ REPAIRABLE_COVERAGE_GAP_REASONS = frozenset(ALLOWED_REMOTE_GAP_REASONS | OVERSIZ
 REMOTE_MATERIALIZATION_GAP_REASONS = frozenset(
     ALLOWED_REMOTE_GAP_REASONS | {"oversized_rollout_skipped", "oversized_summary_skipped"}
 )
+DEFAULT_REPAIR_MAX_RAW_BYTES = 16 * 1024 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7996,6 +7997,7 @@ def rollout_path_proves_outside_window(
     end: dt.datetime | None,
     *,
     source_root: Path | None = None,
+    allow_timestamped_start_filter: bool = False,
 ) -> bool:
     match = re.search(
         r"^rollout-(\d{4}-\d{2}-\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?(?:-|\.jsonl$)",
@@ -8008,7 +8010,15 @@ def rollout_path_proves_outside_window(
             rollout_time
             and (
                 (end and rollout_time >= end)
-                or (start and not timestamped_rollout_maybe_reaches_start(rollout_time, rollout_date, start))
+                or (
+                    allow_timestamped_start_filter
+                    and start
+                    and not timestamped_rollout_start_could_reach_relevant_window(
+                        rollout_time,
+                        rollout_date,
+                        start,
+                    )
+                )
             )
         )
     if match:
@@ -8038,6 +8048,7 @@ def summary_path_proves_outside_window(
     end: dt.datetime | None,
     *,
     source_root: Path | None = None,
+    allow_exact_timestamp_start_filter: bool = False,
 ) -> bool:
     summary_hint = summary_date_hint_from_path(path, source_root=source_root)
     if summary_hint is None:
@@ -8045,10 +8056,15 @@ def summary_path_proves_outside_window(
     summary_date, exact_timestamp = summary_hint
     summary_day_start = summary_date.replace(hour=0, minute=0, second=0, microsecond=0)
     summary_day_end = summary_day_start + dt.timedelta(days=1)
-    if start and exact_timestamp and not timestamped_rollout_maybe_reaches_start(
-        summary_date,
-        summary_day_start,
-        start,
+    if (
+        start
+        and exact_timestamp
+        and allow_exact_timestamp_start_filter
+        and not timestamped_rollout_start_could_reach_relevant_window(
+            summary_date,
+            summary_day_start,
+            start,
+        )
     ):
         return True
     if start and not exact_timestamp and summary_day_end <= start:
@@ -9491,6 +9507,15 @@ def suggested_max_raw_bytes_for_oversized_gaps(gaps: Iterable[dict[str, Any]], *
     return ((max_gap_bytes + mebibyte - 1) // mebibyte) * mebibyte
 
 
+def dry_run_follow_up_max_raw_bytes(
+    *, current_max_raw_bytes: int, suggested_max_raw_bytes: int | None
+) -> int | None:
+    follow_up_max_raw_bytes = max(current_max_raw_bytes, suggested_max_raw_bytes or 0)
+    if follow_up_max_raw_bytes <= DEFAULT_REPAIR_MAX_RAW_BYTES:
+        return None
+    return follow_up_max_raw_bytes
+
+
 def oversized_repair_next_command_note(*, max_raw_bytes: int, suggested_max_raw_bytes: int | None = None) -> str:
     if suggested_max_raw_bytes is not None:
         return (
@@ -9585,6 +9610,10 @@ def run_dry_run(
     )
     next_command = None
     if repairable_coverage_gaps(coverage_gaps):
+        suggested_max_raw_bytes = suggested_max_raw_bytes_for_oversized_gaps(
+            oversized_repairable_coverage_gaps(coverage_gaps),
+            current_max_raw_bytes=max_raw_bytes,
+        )
         next_command_argv = [
             "python3",
             Path(__file__).resolve().as_posix(),
@@ -9592,6 +9621,12 @@ def run_dry_run(
             "--run-dir",
             root.as_posix(),
         ]
+        follow_up_max_raw_bytes = dry_run_follow_up_max_raw_bytes(
+            current_max_raw_bytes=max_raw_bytes,
+            suggested_max_raw_bytes=suggested_max_raw_bytes,
+        )
+        if follow_up_max_raw_bytes is not None:
+            next_command_argv.extend(["--max-raw-bytes", str(follow_up_max_raw_bytes)])
         if args.allow_partial_hosts:
             next_command_argv.append("--allow-partial-hosts")
         next_command = shlex.join(next_command_argv)
@@ -10443,12 +10478,28 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 )
             )
 
-    def append_disappeared_summary_shard(summary: Path, *, allow_path_window_filter: bool = True) -> None:
-        if allow_path_window_filter and summary_path_proves_outside_window(
+    def summary_path_proves_outside_shard_window(
+        summary: Path,
+        *,
+        allow_exact_timestamp_start_filter: bool = True,
+    ) -> bool:
+        return summary_path_proves_outside_window(
             summary,
             start,
             end,
             source_root=root,
+            allow_exact_timestamp_start_filter=allow_exact_timestamp_start_filter,
+        )
+
+    def append_disappeared_summary_shard(
+        summary: Path,
+        *,
+        allow_path_window_filter: bool = True,
+        allow_exact_timestamp_start_filter: bool = True,
+    ) -> None:
+        if allow_path_window_filter and summary_path_proves_outside_shard_window(
+            summary,
+            allow_exact_timestamp_start_filter=allow_exact_timestamp_start_filter,
         ):
             return
         rows.append(
@@ -10460,8 +10511,28 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             )
         )
 
-    def append_disappeared_rollout_shard(rollout: Path, *, allow_path_window_filter: bool = True) -> None:
-        if allow_path_window_filter and rollout_path_proves_outside_window(rollout, start, end, source_root=root):
+    def append_live_disappeared_summary_shard(summary: Path) -> None:
+        append_disappeared_summary_shard(summary, allow_exact_timestamp_start_filter=False)
+
+    def append_relevance_proven_disappeared_summary_shard(summary: Path) -> None:
+        append_disappeared_summary_shard(summary, allow_path_window_filter=False)
+
+    def live_summary_path_proves_outside_shard_window(summary: Path) -> bool:
+        return summary_path_proves_outside_shard_window(summary, allow_exact_timestamp_start_filter=False)
+
+    def append_disappeared_rollout_shard(
+        rollout: Path,
+        *,
+        allow_path_window_filter: bool = True,
+        allow_timestamped_start_filter: bool = True,
+    ) -> None:
+        if allow_path_window_filter and rollout_path_proves_outside_window(
+            rollout,
+            start,
+            end,
+            source_root=root,
+            allow_timestamped_start_filter=allow_timestamped_start_filter,
+        ):
             return
         rows.append(
             shard_row(
@@ -10471,13 +10542,17 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             )
         )
 
+    def append_live_disappeared_rollout_shard(rollout: Path) -> None:
+        append_disappeared_rollout_shard(rollout, allow_timestamped_start_filter=False)
+
     def append_summary_shard(summary: Path) -> None:
         try:
             summary_size = summary.stat().st_size
         except FileNotFoundError:
-            append_disappeared_summary_shard(summary)
+            append_live_disappeared_summary_shard(summary)
             return
         row = shard_row(summary, bytes=summary_size, kind="summary")
+        summary_relevance_proven = False
         try:
             summary_scan_cap = summary_metadata_scan_max_bytes_for_generated_remote(
                 summary,
@@ -10494,13 +10569,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and not summary_path_proves_outside_window(
-                        summary,
-                        start,
-                        end,
-                        source_root=root,
-                    ):
-                        append_disappeared_summary_shard(summary)
+                    if path_disappeared(summary) and not live_summary_path_proves_outside_shard_window(summary):
+                        append_live_disappeared_summary_shard(summary)
                     return
                 row["status"] = "oversized"
                 row["coverage_gap"] = "summary exceeds max raw shard bytes; regenerate bounded rollout-summary before extractor handoff"
@@ -10570,25 +10640,15 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and not summary_path_proves_outside_window(
-                        summary,
-                        start,
-                        end,
-                        source_root=root,
-                    ):
-                        append_disappeared_summary_shard(summary)
+                    if path_disappeared(summary) and not live_summary_path_proves_outside_shard_window(summary):
+                        append_live_disappeared_summary_shard(summary)
                     return
                 row["status"] = "partial"
                 row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
                 rows.append(row)
                 return
-            if path_disappeared(summary) and not summary_path_proves_outside_window(
-                summary,
-                start,
-                end,
-                source_root=root,
-            ):
-                append_disappeared_summary_shard(summary)
+            if path_disappeared(summary) and not live_summary_path_proves_outside_shard_window(summary):
+                append_live_disappeared_summary_shard(summary)
                 return
             if jsonl_error is not None:
                 relevant_summary = (
@@ -10611,13 +10671,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     )
                 )
                 if not relevant_summary:
-                    if path_disappeared(summary) and not summary_path_proves_outside_window(
-                        summary,
-                        start,
-                        end,
-                        source_root=root,
-                    ):
-                        append_disappeared_summary_shard(summary)
+                    if path_disappeared(summary) and not live_summary_path_proves_outside_shard_window(summary):
+                        append_live_disappeared_summary_shard(summary)
                     return
                 row["status"] = "invalid"
                 row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
@@ -10633,22 +10688,21 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 archived_duplicate_keys=archived_duplicate_keys,
             )
             if not relevant_summary:
-                if path_disappeared(summary) and not summary_path_proves_outside_window(
-                    summary,
-                    start,
-                    end,
-                    source_root=root,
-                ):
-                    append_disappeared_summary_shard(summary)
+                if path_disappeared(summary) and not live_summary_path_proves_outside_shard_window(summary):
+                    append_live_disappeared_summary_shard(summary)
                 return
+            summary_relevance_proven = True
             if not summary_file_has_extractable_record_in_window(summary, start, end, source_root=root):
                 if path_disappeared(summary):
-                    append_disappeared_summary_shard(summary, allow_path_window_filter=False)
+                    append_relevance_proven_disappeared_summary_shard(summary)
                 return
             row["status"] = "ready"
             rows.append(row)
         except FileNotFoundError:
-            append_disappeared_summary_shard(summary)
+            if summary_relevance_proven:
+                append_relevance_proven_disappeared_summary_shard(summary)
+            else:
+                append_live_disappeared_summary_shard(summary)
             return
 
     for source_entry in sources:
@@ -10853,7 +10907,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     jsonl_error = first_jsonl_error(rollout)
                     if jsonl_error is not None:
                         if jsonl_error.unreadable and path_disappeared(rollout):
-                            append_disappeared_rollout_shard(rollout)
+                            append_live_disappeared_rollout_shard(rollout)
                             continue
                         relevant_invalid_rollout = invalid_rollout_maybe_relevant(
                             rollout,
@@ -10881,7 +10935,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     else:
                         timestampless_relevance = timestamped_timestampless_rollout_relevance(rollout, start, end)
                         if timestampless_relevance is None:
-                            append_disappeared_rollout_shard(rollout)
+                            append_live_disappeared_rollout_shard(rollout)
                             continue
                         if timestampless_relevance is not True:
                             continue
@@ -10915,7 +10969,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     rows.append(row)
                     continue
             except FileNotFoundError:
-                append_disappeared_rollout_shard(rollout)
+                append_live_disappeared_rollout_shard(rollout)
                 continue
         for summary in summaries:
             append_summary_shard(summary)
@@ -11271,7 +11325,7 @@ def build_parser() -> argparse.ArgumentParser:
     weekly_dry_run.add_argument(
         "--repair-max-raw-bytes",
         type=int,
-        default=16 * 1024 * 1024,
+        default=DEFAULT_REPAIR_MAX_RAW_BYTES,
         help="Raw rollout size limit for the optional --repair follow-up.",
     )
     weekly_dry_run.add_argument(
@@ -11310,7 +11364,7 @@ def build_parser() -> argparse.ArgumentParser:
     repair_coverage.add_argument(
         "--max-raw-bytes",
         type=int,
-        default=16 * 1024 * 1024,
+        default=DEFAULT_REPAIR_MAX_RAW_BYTES,
         help="Raw rollout size limit for the repaired scan.",
     )
     repair_coverage.add_argument(
@@ -11354,7 +11408,7 @@ def build_parser() -> argparse.ArgumentParser:
     weekly_repair.add_argument(
         "--max-raw-bytes",
         type=int,
-        default=16 * 1024 * 1024,
+        default=DEFAULT_REPAIR_MAX_RAW_BYTES,
         help="Raw rollout size limit for the repaired scan.",
     )
     weekly_repair.add_argument(
