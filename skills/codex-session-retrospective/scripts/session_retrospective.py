@@ -2767,7 +2767,7 @@ def rollout_has_manifest_ref_relevance(
             return False
         return True
     except FileNotFoundError:
-        if rollout_path_proves_after_window(rollout, end):
+        if rollout_path_proves_after_window(rollout, end, source_root=source.root):
             return False
         rollout_ref = source_relative_path_ref(rollout, source.root)
         return rollout_ref is not None and safe_rollout_backing_ref(rollout_ref) is not None
@@ -7807,8 +7807,13 @@ def path_disappeared(path: Path) -> bool:
     return False
 
 
-def rollout_path_proves_after_window(path: Path, end: dt.datetime | None) -> bool:
-    rollout_date = rollout_window_date(path)
+def rollout_path_proves_after_window(
+    path: Path,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
+    rollout_date = rollout_window_date(path, source_root=source_root)
     if rollout_date is None:
         return False
     return bool(end and rollout_date >= end)
