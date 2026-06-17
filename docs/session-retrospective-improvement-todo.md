@@ -276,6 +276,22 @@ review gates, and merge before starting the next item.
      than skipping cross-day or cross-month evidence.
    - Status: implemented in the weekly summary signal performance follow-up.
 
+11. Weekly repair coverage completion and progress visibility
+   - Treat stale and truncated rollout summaries as repairable coverage gaps,
+     because a repair pass with a higher raw-byte cap can rescan the backing
+     rollout directly instead of leaving them as permanent blockers.
+   - Keep invalid, malformed, unbacked, and otherwise unsafe summaries as
+     non-repairable blockers unless another explicit repair path exists.
+   - Add progress output for coverage repair phases, source scanning, rollout
+     scanning, summary scanning, validation, shard planning, and final report
+     writing so long repair runs have visible forward motion.
+   - Reduce expensive large-text safety/privacy regex scans with cheap
+     prefilters while preserving existing true-positive coverage for secrets,
+     credentials, private URLs, sensitive identifiers, production risk, and
+     destructive commands.
+   - Status: implemented in the weekly repair performance and summary-gap
+     follow-up change.
+
 ## Retained Readiness Bar
 
 A weekly or baseline run is not retained-ready until:
