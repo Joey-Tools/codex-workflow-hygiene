@@ -2735,6 +2735,8 @@ def rollout_has_manifest_ref_relevance(
         if size <= max_raw_bytes:
             jsonl_error = first_jsonl_error(rollout)
             if jsonl_error is not None:
+                if jsonl_error.unreadable and path_disappeared(rollout):
+                    return True
                 return invalid_rollout_maybe_relevant(
                     rollout,
                     start,
@@ -2765,7 +2767,8 @@ def rollout_has_manifest_ref_relevance(
             return False
         return True
     except FileNotFoundError:
-        return not rollout_path_proves_outside_window(rollout, start, end, source_root=source.root)
+        rollout_ref = source_relative_path_ref(rollout, source.root)
+        return rollout_ref is not None and safe_rollout_backing_ref(rollout_ref) is not None
     except (OSError, ValueError):
         return False
 

@@ -13645,6 +13645,78 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
 
+    def test_source_window_manifest_preserves_content_relevant_rollout_ref_that_vanishes_after_relevance_check(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01-old-name.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Relevant content despite old path.", "2026-05-03T10:15:00Z")])
+            start = MODULE.parse_time("2026-05-03T10:00:00Z")
+            end = MODULE.parse_time("2026-05-03T11:00:00Z")
+            real_rollout_candidate_relevant = MODULE.rollout_candidate_relevant
+
+            def relevant_then_disappear(path: Path, *args, **kwargs) -> bool:
+                result = real_rollout_candidate_relevant(path, *args, **kwargs)
+                if path == rollout:
+                    rollout.unlink()
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "rollout_candidate_relevant",
+                side_effect=relevant_then_disappear,
+            ):
+                refs = MODULE.source_window_rollout_manifest_refs(
+                    MODULE.Source("local", root),
+                    [rollout],
+                    start,
+                    end,
+                    max_raw_bytes=1000,
+                    max_relevance_scan_bytes=1000,
+                    allow_mtime_fallback=False,
+                    archived_duplicate_keys=None,
+                    summary_backed_rollout_keys=set(),
+                )
+
+        self.assertIn(rollout_ref, refs)
+
+    def test_source_window_manifest_preserves_rollout_ref_that_vanishes_during_jsonl_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01-old-name.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Relevant content before validation race.", "2026-05-03T10:15:00Z")])
+            start = MODULE.parse_time("2026-05-03T10:00:00Z")
+            end = MODULE.parse_time("2026-05-03T11:00:00Z")
+            real_first_jsonl_error = MODULE.first_jsonl_error
+
+            def unreadable_after_disappear(path: Path) -> object:
+                if path == rollout:
+                    rollout.unlink()
+                    return MODULE.JsonlReadIssue(1, unreadable=True)
+                return real_first_jsonl_error(path)
+
+            with mock.patch.object(
+                MODULE,
+                "first_jsonl_error",
+                side_effect=unreadable_after_disappear,
+            ):
+                refs = MODULE.source_window_rollout_manifest_refs(
+                    MODULE.Source("local", root),
+                    [rollout],
+                    start,
+                    end,
+                    max_raw_bytes=1000,
+                    max_relevance_scan_bytes=1000,
+                    allow_mtime_fallback=False,
+                    archived_duplicate_keys=None,
+                    summary_backed_rollout_keys=set(),
+                )
+
+        self.assertIn(rollout_ref, refs)
+
     def test_shard_manifest_omits_existing_summary_backed_oversized_rollout_ref(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
