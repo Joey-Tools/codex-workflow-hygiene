@@ -9507,6 +9507,15 @@ def suggested_max_raw_bytes_for_oversized_gaps(gaps: Iterable[dict[str, Any]], *
     return ((max_gap_bytes + mebibyte - 1) // mebibyte) * mebibyte
 
 
+def dry_run_follow_up_max_raw_bytes(
+    *, current_max_raw_bytes: int, suggested_max_raw_bytes: int | None
+) -> int | None:
+    follow_up_max_raw_bytes = max(current_max_raw_bytes, suggested_max_raw_bytes or 0)
+    if follow_up_max_raw_bytes <= DEFAULT_REPAIR_MAX_RAW_BYTES:
+        return None
+    return follow_up_max_raw_bytes
+
+
 def oversized_repair_next_command_note(*, max_raw_bytes: int, suggested_max_raw_bytes: int | None = None) -> str:
     if suggested_max_raw_bytes is not None:
         return (
@@ -9612,8 +9621,12 @@ def run_dry_run(
             "--run-dir",
             root.as_posix(),
         ]
-        if suggested_max_raw_bytes is not None and suggested_max_raw_bytes > DEFAULT_REPAIR_MAX_RAW_BYTES:
-            next_command_argv.extend(["--max-raw-bytes", str(suggested_max_raw_bytes)])
+        follow_up_max_raw_bytes = dry_run_follow_up_max_raw_bytes(
+            current_max_raw_bytes=max_raw_bytes,
+            suggested_max_raw_bytes=suggested_max_raw_bytes,
+        )
+        if follow_up_max_raw_bytes is not None:
+            next_command_argv.extend(["--max-raw-bytes", str(follow_up_max_raw_bytes)])
         if args.allow_partial_hosts:
             next_command_argv.append("--allow-partial-hosts")
         next_command = shlex.join(next_command_argv)

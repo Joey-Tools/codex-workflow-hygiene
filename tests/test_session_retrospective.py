@@ -5847,6 +5847,76 @@ class SessionRetrospectiveTests(unittest.TestCase):
         )
         self.assertEqual(report["repairable_coverage_gap_counts"], {"source_root_missing": 1})
 
+    def test_weekly_dry_run_preserves_explicit_high_raw_limit_for_remote_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote_root = Path(raw) / "missing-miku"
+            output = safe_output_dir(raw, "weekly-dry-run")
+            max_raw_bytes = MODULE.DEFAULT_REPAIR_MAX_RAW_BYTES * 2
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"miku-bot-dev={remote_root}",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    str(max_raw_bytes),
+                    "--output",
+                    str(output),
+                ]
+            )
+            report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
+
+        expected_root = output.absolute().as_posix()
+        expected_script = Path(MODULE.__file__).resolve().as_posix()
+        self.assertEqual(
+            MODULE.shlex.split(report["next_command"]),
+            [
+                "python3",
+                expected_script,
+                "weekly-repair",
+                "--run-dir",
+                expected_root,
+                "--max-raw-bytes",
+                str(max_raw_bytes),
+                "--allow-partial-hosts",
+            ],
+        )
+        self.assertEqual(report["repairable_coverage_gap_counts"], {"source_root_missing": 1})
+
+    def test_dry_run_follow_up_keeps_repair_default_for_low_raw_limit(self) -> None:
+        self.assertIsNone(
+            MODULE.dry_run_follow_up_max_raw_bytes(
+                current_max_raw_bytes=200,
+                suggested_max_raw_bytes=1024 * 1024,
+            )
+        )
+
+    def test_dry_run_follow_up_preserves_explicit_high_raw_limit(self) -> None:
+        explicit_limit = MODULE.DEFAULT_REPAIR_MAX_RAW_BYTES * 2
+        self.assertEqual(
+            MODULE.dry_run_follow_up_max_raw_bytes(
+                current_max_raw_bytes=explicit_limit,
+                suggested_max_raw_bytes=None,
+            ),
+            explicit_limit,
+        )
+
+    def test_dry_run_follow_up_uses_larger_oversized_suggestion(self) -> None:
+        current_limit = MODULE.DEFAULT_REPAIR_MAX_RAW_BYTES * 2
+        suggested_limit = MODULE.DEFAULT_REPAIR_MAX_RAW_BYTES * 4
+        self.assertEqual(
+            MODULE.dry_run_follow_up_max_raw_bytes(
+                current_max_raw_bytes=current_limit,
+                suggested_max_raw_bytes=suggested_limit,
+            ),
+            suggested_limit,
+        )
+
     def test_weekly_dry_run_keeps_repair_default_raw_limit_for_mixed_remote_and_oversized_gaps(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
