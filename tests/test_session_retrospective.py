@@ -11211,6 +11211,44 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
 
+    def test_make_shards_reports_old_timestamped_rollout_missing_after_relevance_proven(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old.jsonl"
+            write_jsonl(rollout, [message("user", "Old rollout with current evidence.", "2026-05-01T10:00:00Z")])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            real_rollout_candidate_relevant = MODULE.rollout_candidate_relevant
+
+            def relevant_then_disappear(path: Path, *args, **kwargs) -> bool:
+                result = real_rollout_candidate_relevant(path, *args, **kwargs)
+                if path == rollout:
+                    rollout.unlink()
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "rollout_candidate_relevant",
+                side_effect=relevant_then_disappear,
+            ):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
     def test_make_shards_reports_live_summary_missing(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -11240,6 +11278,48 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "remote_summary_only_gaps",
                 side_effect=summary_only_gaps_and_arm,
             ), missing_stat_after_arm(summary, armed):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(rows[0]["status"], "stale")
+        self.assertEqual(rows[0]["kind"], "summary")
+        self.assertEqual(rows[0]["coverage_gap"], "summary disappeared during shard discovery")
+
+    def test_make_shards_reports_old_timestamped_summary_missing_after_live_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            summary = root / "sessions" / "2026" / "01" / "02" / "rollout-summary-2026-01-02T10-00-00-old.jsonl"
+            write_jsonl(
+                summary,
+                [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "Old summary with current evidence."}],
+            )
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+            real_first_jsonl_error = MODULE.first_jsonl_error
+
+            def first_jsonl_error_then_disappear(path: Path):
+                result = real_first_jsonl_error(path)
+                if path == summary:
+                    summary.unlink()
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "first_jsonl_error",
+                side_effect=first_jsonl_error_then_disappear,
+            ):
                 MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output)])
             rows = [
                 json.loads(line)

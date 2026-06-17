@@ -10464,17 +10464,29 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 )
             )
 
-    def summary_path_proves_outside_shard_window(summary: Path) -> bool:
+    def summary_path_proves_outside_shard_window(
+        summary: Path,
+        *,
+        allow_exact_timestamp_start_filter: bool = True,
+    ) -> bool:
         return summary_path_proves_outside_window(
             summary,
             start,
             end,
             source_root=root,
-            allow_exact_timestamp_start_filter=True,
+            allow_exact_timestamp_start_filter=allow_exact_timestamp_start_filter,
         )
 
-    def append_disappeared_summary_shard(summary: Path, *, allow_path_window_filter: bool = True) -> None:
-        if allow_path_window_filter and summary_path_proves_outside_shard_window(summary):
+    def append_disappeared_summary_shard(
+        summary: Path,
+        *,
+        allow_path_window_filter: bool = True,
+        allow_exact_timestamp_start_filter: bool = True,
+    ) -> None:
+        if allow_path_window_filter and summary_path_proves_outside_shard_window(
+            summary,
+            allow_exact_timestamp_start_filter=allow_exact_timestamp_start_filter,
+        ):
             return
         rows.append(
             shard_row(
@@ -10485,13 +10497,27 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             )
         )
 
-    def append_disappeared_rollout_shard(rollout: Path, *, allow_path_window_filter: bool = True) -> None:
+    def append_live_disappeared_summary_shard(summary: Path) -> None:
+        append_disappeared_summary_shard(summary, allow_exact_timestamp_start_filter=False)
+
+    def append_relevance_proven_disappeared_summary_shard(summary: Path) -> None:
+        append_disappeared_summary_shard(summary, allow_path_window_filter=False)
+
+    def live_summary_path_proves_outside_shard_window(summary: Path) -> bool:
+        return summary_path_proves_outside_shard_window(summary, allow_exact_timestamp_start_filter=False)
+
+    def append_disappeared_rollout_shard(
+        rollout: Path,
+        *,
+        allow_path_window_filter: bool = True,
+        allow_timestamped_start_filter: bool = True,
+    ) -> None:
         if allow_path_window_filter and rollout_path_proves_outside_window(
             rollout,
             start,
             end,
             source_root=root,
-            allow_timestamped_start_filter=True,
+            allow_timestamped_start_filter=allow_timestamped_start_filter,
         ):
             return
         rows.append(
@@ -10502,13 +10528,17 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             )
         )
 
+    def append_live_disappeared_rollout_shard(rollout: Path) -> None:
+        append_disappeared_rollout_shard(rollout, allow_timestamped_start_filter=False)
+
     def append_summary_shard(summary: Path) -> None:
         try:
             summary_size = summary.stat().st_size
         except FileNotFoundError:
-            append_disappeared_summary_shard(summary)
+            append_live_disappeared_summary_shard(summary)
             return
         row = shard_row(summary, bytes=summary_size, kind="summary")
+        summary_relevance_proven = False
         try:
             summary_scan_cap = summary_metadata_scan_max_bytes_for_generated_remote(
                 summary,
@@ -10525,8 +10555,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and not summary_path_proves_outside_shard_window(summary):
-                        append_disappeared_summary_shard(summary)
+                    if path_disappeared(summary) and not live_summary_path_proves_outside_shard_window(summary):
+                        append_live_disappeared_summary_shard(summary)
                     return
                 row["status"] = "oversized"
                 row["coverage_gap"] = "summary exceeds max raw shard bytes; regenerate bounded rollout-summary before extractor handoff"
@@ -10596,15 +10626,15 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
                 ):
-                    if path_disappeared(summary) and not summary_path_proves_outside_shard_window(summary):
-                        append_disappeared_summary_shard(summary)
+                    if path_disappeared(summary) and not live_summary_path_proves_outside_shard_window(summary):
+                        append_live_disappeared_summary_shard(summary)
                     return
                 row["status"] = "partial"
                 row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
                 rows.append(row)
                 return
-            if path_disappeared(summary) and not summary_path_proves_outside_shard_window(summary):
-                append_disappeared_summary_shard(summary)
+            if path_disappeared(summary) and not live_summary_path_proves_outside_shard_window(summary):
+                append_live_disappeared_summary_shard(summary)
                 return
             if jsonl_error is not None:
                 relevant_summary = (
@@ -10627,8 +10657,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     )
                 )
                 if not relevant_summary:
-                    if path_disappeared(summary) and not summary_path_proves_outside_shard_window(summary):
-                        append_disappeared_summary_shard(summary)
+                    if path_disappeared(summary) and not live_summary_path_proves_outside_shard_window(summary):
+                        append_live_disappeared_summary_shard(summary)
                     return
                 row["status"] = "invalid"
                 row["coverage_gap"] = "invalid summary JSONL; cannot safely hand to extractor shard"
@@ -10644,17 +10674,21 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 archived_duplicate_keys=archived_duplicate_keys,
             )
             if not relevant_summary:
-                if path_disappeared(summary) and not summary_path_proves_outside_shard_window(summary):
-                    append_disappeared_summary_shard(summary)
+                if path_disappeared(summary) and not live_summary_path_proves_outside_shard_window(summary):
+                    append_live_disappeared_summary_shard(summary)
                 return
+            summary_relevance_proven = True
             if not summary_file_has_extractable_record_in_window(summary, start, end, source_root=root):
                 if path_disappeared(summary):
-                    append_disappeared_summary_shard(summary, allow_path_window_filter=False)
+                    append_relevance_proven_disappeared_summary_shard(summary)
                 return
             row["status"] = "ready"
             rows.append(row)
         except FileNotFoundError:
-            append_disappeared_summary_shard(summary)
+            if summary_relevance_proven:
+                append_relevance_proven_disappeared_summary_shard(summary)
+            else:
+                append_live_disappeared_summary_shard(summary)
             return
 
     for source_entry in sources:
@@ -10859,7 +10893,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     jsonl_error = first_jsonl_error(rollout)
                     if jsonl_error is not None:
                         if jsonl_error.unreadable and path_disappeared(rollout):
-                            append_disappeared_rollout_shard(rollout)
+                            append_live_disappeared_rollout_shard(rollout)
                             continue
                         relevant_invalid_rollout = invalid_rollout_maybe_relevant(
                             rollout,
@@ -10887,7 +10921,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     else:
                         timestampless_relevance = timestamped_timestampless_rollout_relevance(rollout, start, end)
                         if timestampless_relevance is None:
-                            append_disappeared_rollout_shard(rollout)
+                            append_live_disappeared_rollout_shard(rollout)
                             continue
                         if timestampless_relevance is not True:
                             continue
@@ -10921,7 +10955,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     rows.append(row)
                     continue
             except FileNotFoundError:
-                append_disappeared_rollout_shard(rollout)
+                append_live_disappeared_rollout_shard(rollout)
                 continue
         for summary in summaries:
             append_summary_shard(summary)
