@@ -9820,6 +9820,25 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
 
+    def test_exact_rollout_path_far_before_window_requires_explicit_start_filter(self) -> None:
+        path = Path("sessions/2026/01/02/rollout-2026-01-02T10-00-00-old.jsonl")
+
+        self.assertFalse(
+            MODULE.rollout_path_proves_outside_window(
+                path,
+                MODULE.parse_time("2026-05-01T00:00:00Z"),
+                MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+        )
+        self.assertTrue(
+            MODULE.rollout_path_proves_outside_window(
+                path,
+                MODULE.parse_time("2026-05-01T00:00:00Z"),
+                MODULE.parse_time("2026-05-02T00:00:00Z"),
+                allow_timestamped_start_filter=True,
+            )
+        )
+
     def test_make_shards_reports_missing_timestamped_rollout_ref_that_started_before_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
@@ -11577,14 +11596,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
         )
 
-    def test_exact_summary_path_far_before_window_is_path_proven_outside(self) -> None:
+    def test_exact_summary_path_far_before_window_requires_explicit_start_filter(self) -> None:
         path = Path("sessions/2026/05/01/rollout-summary-2026-05-01T23-30-00.jsonl")
 
+        self.assertFalse(
+            MODULE.summary_path_proves_outside_window(
+                path,
+                MODULE.parse_time("2026-05-03T00:00:00Z"),
+                MODULE.parse_time("2026-05-03T01:00:00Z"),
+            )
+        )
         self.assertTrue(
             MODULE.summary_path_proves_outside_window(
                 path,
                 MODULE.parse_time("2026-05-03T00:00:00Z"),
                 MODULE.parse_time("2026-05-03T01:00:00Z"),
+                allow_exact_timestamp_start_filter=True,
             )
         )
 
