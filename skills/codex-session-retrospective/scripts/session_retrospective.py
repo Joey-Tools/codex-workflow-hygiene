@@ -2747,6 +2747,128 @@ def source_summary_manifest_refs(summaries: Iterable[Path], root: Path) -> list[
     return sorted(refs)
 
 
+def summary_has_manifest_ref_relevance(
+    source: Source,
+    summary: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_raw_bytes: int,
+    allow_mtime_fallback: bool,
+    archived_duplicate_keys: set[str] | None,
+    generated_summary_paths: set[Path] | None,
+    remote_generated_summary_paths: set[Path] | None,
+    stale_summary_paths: set[Path],
+    stale_summary_gap_paths: set[Path],
+) -> bool:
+    try:
+        summary_size = summary.stat().st_size
+    except FileNotFoundError:
+        return not summary_path_proves_outside_window(summary, start, end, source_root=source.root)
+    summary_scan_cap = summary_metadata_scan_max_bytes_for_generated_remote(
+        summary,
+        max_raw_bytes,
+        remote_generated_summary_paths,
+    )
+    if summary_size > summary_scan_cap:
+        return summary_file_maybe_relevant_or_backing_ref_relevant(
+            summary,
+            start,
+            end,
+            max_scan_bytes=summary_scan_cap,
+            source_root=source.root,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+        )
+    if summary in stale_summary_paths:
+        return summary in stale_summary_gap_paths
+    jsonl_error = first_jsonl_error(summary)
+    allow_generated_coverage = summary_allows_generated_coverage(
+        summary,
+        generated_summary_paths,
+        remote_generated_summary_paths,
+        max_scan_bytes=max_raw_bytes,
+    )
+    if (
+        summary_file_has_truncated_scan(summary)
+        or summary_file_has_record_limit_gap(summary, allow_tail_record_limit=allow_generated_coverage)
+    ) and summary_file_maybe_relevant_or_backing_ref_relevant(
+        summary,
+        start,
+        end,
+        max_scan_bytes=summary_scan_cap,
+        source_root=source.root,
+        allow_mtime_fallback=allow_mtime_fallback,
+        archived_duplicate_keys=archived_duplicate_keys,
+    ):
+        return True
+    if jsonl_error is not None:
+        if jsonl_error.unreadable:
+            return summary_file_maybe_relevant_with_scan_cap(
+                summary,
+                start,
+                end,
+                max_scan_bytes=summary_scan_cap,
+                source_root=source.root,
+            )
+        return summary_file_relevant_or_backing_ref_relevant(
+            summary,
+            start,
+            end,
+            max_scan_bytes=summary_scan_cap,
+            source_root=source.root,
+            allow_mtime_fallback=allow_mtime_fallback,
+            archived_duplicate_keys=archived_duplicate_keys,
+        )
+    if not summary_file_relevant_or_backing_ref_relevant(
+        summary,
+        start,
+        end,
+        max_scan_bytes=summary_scan_cap,
+        source_root=source.root,
+        allow_mtime_fallback=allow_mtime_fallback,
+        archived_duplicate_keys=archived_duplicate_keys,
+    ):
+        return False
+    return summary_file_has_extractable_record_in_window(summary, start, end, source_root=source.root)
+
+
+def source_window_summary_manifest_refs(
+    source: Source,
+    summaries: Iterable[Path],
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_raw_bytes: int,
+    allow_mtime_fallback: bool,
+    archived_duplicate_keys: set[str] | None,
+    generated_summary_paths: set[Path] | None,
+    remote_generated_summary_paths: set[Path] | None,
+    stale_summary_paths: set[Path],
+    stale_summary_gap_paths: set[Path],
+) -> list[str]:
+    def relevant_summaries() -> Iterable[Path]:
+        for summary in summaries:
+            if source_summary_excluded_artifact_path(summary):
+                continue
+            if summary_has_manifest_ref_relevance(
+                source,
+                summary,
+                start,
+                end,
+                max_raw_bytes=max_raw_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
+                generated_summary_paths=generated_summary_paths,
+                remote_generated_summary_paths=remote_generated_summary_paths,
+                stale_summary_paths=stale_summary_paths,
+                stale_summary_gap_paths=stale_summary_gap_paths,
+            ):
+                yield summary
+
+    return source_summary_manifest_refs(relevant_summaries(), source.root)
+
+
 def manifest_source_ref_list(source_entry: dict[str, Any], field: str, *, summary: bool = False) -> list[str]:
     raw_refs = source_entry.get(field)
     if raw_refs is None:
@@ -7919,7 +8041,19 @@ def run_scan(
                 summary_backed_rollout_keys=existing_summary_backed_rollout_keys,
             ),
             "summary_count": len(summaries),
-            "summary_refs": source_summary_manifest_refs(summaries, source.root),
+            "summary_refs": source_window_summary_manifest_refs(
+                source,
+                summaries,
+                gap_start,
+                end,
+                max_raw_bytes=max_raw_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
+                generated_summary_paths=generated_summary_paths,
+                remote_generated_summary_paths=remote_generated_summary_paths,
+                stale_summary_paths=stale_summary_paths,
+                stale_summary_gap_paths=stale_summary_gap_paths,
+            ),
             "status": source_manifest_status(rollouts, summaries, blocking_gaps),
         }
         if generated_summaries:
@@ -8350,7 +8484,19 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
                 summary_backed_rollout_keys=existing_summary_backed_rollout_keys,
             ),
             "summary_count": len(summaries),
-            "summary_refs": source_summary_manifest_refs(summaries, source.root),
+            "summary_refs": source_window_summary_manifest_refs(
+                source,
+                summaries,
+                start,
+                end,
+                max_raw_bytes=max_raw_bytes,
+                allow_mtime_fallback=allow_mtime_fallback,
+                archived_duplicate_keys=archived_duplicate_keys,
+                generated_summary_paths=generated_summary_paths,
+                remote_generated_summary_paths=remote_generated_summary_paths,
+                stale_summary_paths=stale_summary_paths,
+                stale_summary_gap_paths=stale_summary_gap_paths,
+            ),
             "status": source_manifest_status(rollouts, summaries, blocking_gaps),
         }
         if generated_summaries:
