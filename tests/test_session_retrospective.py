@@ -14133,6 +14133,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
             manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            MODULE.validate_output_run(output)
 
         self.assertIn("timestampless_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
         self.assertIn(rollout_ref, manifest["sources"][0]["rollout_refs"])

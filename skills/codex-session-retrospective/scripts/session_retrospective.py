@@ -549,6 +549,7 @@ RETAINED_COVERAGE_GAP_REASONS = frozenset(
         "source_root_symlink",
         "stale_host",
         "stale_rollout_summary",
+        "timestampless_rollout_skipped",
         "truncated_rollout_summary",
         "unreachable",
         "unsafe_source_artifact",
