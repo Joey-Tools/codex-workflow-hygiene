@@ -13645,6 +13645,41 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
 
+    def test_source_window_manifest_omits_after_window_rollout_ref_that_vanishes_during_relevance_check(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/03/rollout-2026-05-03T10-00-00-future.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Future task.", "2026-05-03T10:15:00Z")])
+            start = MODULE.parse_time("2026-05-01T10:00:00Z")
+            end = MODULE.parse_time("2026-05-01T11:00:00Z")
+
+            def disappear_during_relevance(path: Path, *args, **kwargs) -> bool:
+                if path == rollout:
+                    rollout.unlink()
+                    raise FileNotFoundError(path)
+                return MODULE.rollout_candidate_relevant(path, *args, **kwargs)
+
+            with mock.patch.object(
+                MODULE,
+                "rollout_candidate_relevant",
+                side_effect=disappear_during_relevance,
+            ):
+                refs = MODULE.source_window_rollout_manifest_refs(
+                    MODULE.Source("local", root),
+                    [rollout],
+                    start,
+                    end,
+                    max_raw_bytes=1000,
+                    max_relevance_scan_bytes=1000,
+                    allow_mtime_fallback=False,
+                    archived_duplicate_keys=None,
+                    summary_backed_rollout_keys=set(),
+                )
+
+        self.assertNotIn(rollout_ref, refs)
+
     def test_source_window_manifest_preserves_content_relevant_rollout_ref_that_vanishes_after_relevance_check(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

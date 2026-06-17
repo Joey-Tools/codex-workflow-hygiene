@@ -2767,6 +2767,8 @@ def rollout_has_manifest_ref_relevance(
             return False
         return True
     except FileNotFoundError:
+        if rollout_path_proves_after_window(rollout, end):
+            return False
         rollout_ref = source_relative_path_ref(rollout, source.root)
         return rollout_ref is not None and safe_rollout_backing_ref(rollout_ref) is not None
     except (OSError, ValueError):
