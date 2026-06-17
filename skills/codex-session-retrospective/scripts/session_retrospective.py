@@ -2318,6 +2318,18 @@ def timestamped_invalid_rollout_maybe_relevant(
     return jsonl_error is not None and not jsonl_error.unreadable
 
 
+def disappeared_rollout_candidate_maybe_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    source_root: Path | None = None,
+) -> bool:
+    if path_disappeared(path) and rollout_path_proves_outside_window(path, start, end, source_root=source_root):
+        return False
+    return True
+
+
 def rollout_filename_in_window(
     path: Path,
     start: dt.datetime | None,
@@ -2385,13 +2397,13 @@ def rollout_candidate_relevant(
         try:
             mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
         except OSError:
-            return True
+            return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
         if allow_mtime_fallback and (not start or mtime >= start) and (not end or mtime < end):
             return True
         try:
             size = path.stat().st_size
         except OSError:
-            return True
+            return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
         if max_raw_bytes is not None and size > max_raw_bytes:
             try:
                 relevance = oversized_rollout_relevance(
@@ -2403,7 +2415,7 @@ def rollout_candidate_relevant(
                     source_root=source_root,
                 )
             except OSError:
-                return True
+                return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
             if relevance == "relevant":
                 return True
             if relevance == "irrelevant":
@@ -2415,7 +2427,7 @@ def rollout_candidate_relevant(
             if raw_timestamp_in_window(path, start, end):
                 return True
         except OSError:
-            return True
+            return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
         if timestamped_invalid_rollout_maybe_relevant(path, start, end):
             return True
         return False
@@ -2745,7 +2757,7 @@ def rollout_has_manifest_ref_relevance(
 ) -> bool:
     preserve_disappeared_ref = False
     try:
-        if not rollout_candidate_relevant(
+        candidate_relevant = rollout_candidate_relevant(
             rollout,
             start,
             end,
@@ -2753,9 +2765,8 @@ def rollout_has_manifest_ref_relevance(
             max_relevance_scan_bytes=max_relevance_scan_bytes,
             allow_mtime_fallback=allow_mtime_fallback,
             source_root=source.root,
-        ):
-            if path_disappeared(rollout):
-                raise FileNotFoundError(rollout)
+        )
+        if not candidate_relevant:
             return False
         preserve_disappeared_ref = True
         size = rollout.stat().st_size
@@ -3424,6 +3435,23 @@ def rollout_ref_maybe_in_window(ref: str, start: dt.datetime | None, end: dt.dat
     if end and rollout_date >= end:
         return False
     return True
+
+
+def complete_identity_ref_can_extend_into_window(
+    ref: str,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> bool:
+    if start is None:
+        return False
+    match = re.search(
+        r"^rollout-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})(?:-|\.jsonl$)",
+        Path(ref).name,
+    )
+    if not match:
+        return False
+    rollout_start = parse_time(f"{match.group(1)}T{match.group(2)}:{match.group(3)}:{match.group(4)}Z")
+    return bool(rollout_start and rollout_start < start and (end is None or rollout_start < end))
 
 
 def backing_ref_direct_file_exists(source_root: Path, ref: str) -> bool:
@@ -7704,20 +7732,24 @@ def remote_summary_only_gaps(
             )
             for ref in scan_meta_refs:
                 ref_has_complete_identity = ref in scan_meta_complete_identity_refs
+                ref_complete_identity_extends_window = (
+                    ref_has_complete_identity and complete_identity_ref_can_extend_into_window(ref, start, end)
+                )
                 ref_maybe_relevant = rollout_ref_maybe_in_window(ref, start, end)
-                if rollout_ref_has_window_hint(ref) and not ref_maybe_relevant and not ref_has_complete_identity:
+                if rollout_ref_has_window_hint(ref) and not ref_maybe_relevant and not ref_complete_identity_extends_window:
                     continue
                 _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
                 selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
-                selected_ref_has_complete_identity = (
-                    ref_has_complete_identity or selected_ref in scan_meta_complete_identity_refs
+                selected_ref_complete_identity_extends_window = ref_complete_identity_extends_window or (
+                    selected_ref in scan_meta_complete_identity_refs
+                    and complete_identity_ref_can_extend_into_window(selected_ref, start, end)
                 )
                 selected_ref_maybe_relevant = rollout_ref_maybe_in_window(selected_ref, start, end)
                 if (
                     selected_ref != ref
                     and rollout_ref_has_window_hint(selected_ref)
                     and not selected_ref_maybe_relevant
-                    and not selected_ref_has_complete_identity
+                    and not selected_ref_complete_identity_extends_window
                 ):
                     continue
                 ref_key = summary_backed_rollout_key_for_ref(selected_ref)
@@ -7736,7 +7768,7 @@ def remote_summary_only_gaps(
                     or (
                         not scan_meta_context_relevant
                         and not selected_ref_maybe_relevant
-                        and not selected_ref_has_complete_identity
+                        and not selected_ref_complete_identity_extends_window
                     )
                 ):
                     continue

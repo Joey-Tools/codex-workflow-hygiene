@@ -13766,6 +13766,68 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertNotIn(rollout_ref, refs)
 
+    def test_source_window_manifest_filters_negative_scan_rollout_that_disappears(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/04/30/rollout-2026-04-30T10-00-00-stale.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Stale timestamped task.", "2026-04-30T10:15:00Z")])
+            start = MODULE.parse_time("2026-05-01T10:00:00Z")
+            end = MODULE.parse_time("2026-05-01T11:00:00Z")
+            real_rollout_candidate_relevant = MODULE.rollout_candidate_relevant
+
+            def irrelevant_then_disappear(path: Path, *args, **kwargs) -> bool:
+                result = real_rollout_candidate_relevant(path, *args, **kwargs)
+                if path == rollout:
+                    rollout.unlink()
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "rollout_candidate_relevant",
+                side_effect=irrelevant_then_disappear,
+            ):
+                refs = MODULE.source_window_rollout_manifest_refs(
+                    MODULE.Source("local", root),
+                    [rollout],
+                    start,
+                    end,
+                    max_raw_bytes=1000,
+                    max_relevance_scan_bytes=1000,
+                    allow_mtime_fallback=False,
+                    archived_duplicate_keys=None,
+                    summary_backed_rollout_keys=set(),
+                )
+
+        self.assertNotIn(rollout_ref, refs)
+
+    def test_source_window_manifest_filters_day_scoped_rollout_that_vanishes_during_candidate_stat(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/01/02/rollout-2026-01-02-old.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Old day-scoped task.", "2026-01-02T10:15:00Z")])
+            start = MODULE.parse_time("2026-05-01T10:00:00Z")
+            end = MODULE.parse_time("2026-05-01T11:00:00Z")
+            armed = {"value": True}
+
+            with missing_stat_after_arm(rollout, armed):
+                refs = MODULE.source_window_rollout_manifest_refs(
+                    MODULE.Source("local", root),
+                    [rollout],
+                    start,
+                    end,
+                    max_raw_bytes=1000,
+                    max_relevance_scan_bytes=1000,
+                    allow_mtime_fallback=False,
+                    archived_duplicate_keys=None,
+                    summary_backed_rollout_keys=set(),
+                )
+
+        self.assertNotIn(rollout_ref, refs)
+
     def test_source_window_manifest_preserves_nested_custom_rollout_ref_that_vanishes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
@@ -21796,6 +21858,46 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     complete_rollout_summary_scan_meta(
                         rollout=later_rollout_ref,
                         source_bytes=1200,
+                        summary_record_count=0,
+                    ),
+                    {
+                        "kind": "session_meta",
+                        "timestamp": "2026-05-01T10:15:00Z",
+                        "text": "session_id=remote-session cwd_present=true",
+                    },
+                ],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"miku-bot-dev={remote}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=1000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T10:00:00Z"),
+                end=MODULE.parse_time("2026-05-01T10:30:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("remote_source_not_materialized", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_default_remote_scan_meta_only_summary_ignores_after_window_ref_with_source_sha256(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            remote = Path(raw) / "miku-bot-dev"
+            write_remote_metadata(remote, "miku-bot-dev")
+            later_rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T11-00-00-later.jsonl"
+            summary = remote / "sessions" / "2026" / "05" / "01" / "rollout-summary-scan-meta-only.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=later_rollout_ref,
+                        source_bytes=1200,
+                        source_sha256="a" * 64,
                         summary_record_count=0,
                     ),
                     {
