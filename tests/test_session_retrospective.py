@@ -5787,7 +5787,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
         expected_script = Path(MODULE.__file__).resolve().as_posix()
         self.assertEqual(
             MODULE.shlex.split(report["next_command"]),
-            ["python3", expected_script, "weekly-repair", "--run-dir", expected_root, "--allow-partial-hosts"],
+            [
+                "python3",
+                expected_script,
+                "weekly-repair",
+                "--run-dir",
+                expected_root,
+                "--max-raw-bytes",
+                "200",
+                "--allow-partial-hosts",
+            ],
         )
         self.assertIn(report["next_command"], markdown)
 
@@ -9766,7 +9775,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "stale")
         self.assertEqual(rows[0]["coverage_gap"], "unsafe_source_artifact")
 
-    def test_make_shards_reports_missing_old_timestamped_rollout_without_summary_gap(self) -> None:
+    def test_make_shards_skips_missing_old_timestamped_rollout_without_summary_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "custom-source"
             root.mkdir()
@@ -9798,8 +9807,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+        self.assertEqual(rows, [])
 
     def test_make_shards_reports_missing_timestamped_rollout_ref_that_started_before_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -11555,6 +11563,17 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 path,
                 MODULE.parse_time("2026-05-02T03:30:00Z"),
                 MODULE.parse_time("2026-05-02T04:00:00Z"),
+            )
+        )
+
+    def test_exact_summary_path_far_before_window_is_path_proven_outside(self) -> None:
+        path = Path("sessions/2026/05/01/rollout-summary-2026-05-01T23-30-00.jsonl")
+
+        self.assertTrue(
+            MODULE.summary_path_proves_outside_window(
+                path,
+                MODULE.parse_time("2026-05-03T00:00:00Z"),
+                MODULE.parse_time("2026-05-03T01:00:00Z"),
             )
         )
 

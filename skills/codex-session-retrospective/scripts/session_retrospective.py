@@ -8008,7 +8008,14 @@ def rollout_path_proves_outside_window(
             rollout_time
             and (
                 (end and rollout_time >= end)
-                or (start and not timestamped_rollout_maybe_reaches_start(rollout_time, rollout_date, start))
+                or (
+                    start
+                    and not timestamped_rollout_start_could_reach_relevant_window(
+                        rollout_time,
+                        rollout_date,
+                        start,
+                    )
+                )
             )
         )
     if match:
@@ -8045,7 +8052,7 @@ def summary_path_proves_outside_window(
     summary_date, exact_timestamp = summary_hint
     summary_day_start = summary_date.replace(hour=0, minute=0, second=0, microsecond=0)
     summary_day_end = summary_day_start + dt.timedelta(days=1)
-    if start and exact_timestamp and not timestamped_rollout_maybe_reaches_start(
+    if start and exact_timestamp and not timestamped_rollout_start_could_reach_relevant_window(
         summary_date,
         summary_day_start,
         start,
@@ -9591,6 +9598,8 @@ def run_dry_run(
             next_command_name,
             "--run-dir",
             root.as_posix(),
+            "--max-raw-bytes",
+            str(max_raw_bytes),
         ]
         if args.allow_partial_hosts:
             next_command_argv.append("--allow-partial-hosts")
