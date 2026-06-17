@@ -227,6 +227,8 @@ DEFAULT_REMOTE_SOURCE_ROOT = Path(".codex-local/session-retrospective/remote-sou
 REMOTE_SOURCE_METADATA_FILE = "source_metadata.json"
 LOCAL_EVIDENCE_FILES = ("session_index.jsonl", "history.jsonl")
 SAFE_OUTPUT_PARTS = (".codex-local", "session-retrospective")
+MANIFEST_REF_RELEVANCE_FIELD = "ref_relevance_policy"
+MANIFEST_REF_RELEVANCE_POLICY = "window_filtered_v1"
 PATH_REF_PREFIX = "path_ref_v1"
 PATH_REF_PATTERN = re.compile(r"^path_ref_v1:[0-9a-f]{16}$")
 SESSION_REF_PREFIX = "session_ref_v1"
@@ -4966,12 +4968,8 @@ def summary_file_maybe_relevant_without_read(
     if summary_hint is None:
         return True
     summary_date, exact_timestamp = summary_hint
-    if summary_date and end and summary_date >= end:
+    if summary_date and end and summary_date >= end and not exact_timestamp:
         return False
-    if summary_date and start and summary_date < start:
-        if not exact_timestamp:
-            return True
-        return summary_date_hint_maybe_reaches_start(summary_date, exact_timestamp, start)
     return True
 
 
@@ -5904,6 +5902,7 @@ def retained_manifest_from_transient(manifest: dict[str, Any]) -> dict[str, Any]
                 "remote_generated_summaries",
                 "rollout_refs",
                 "summary_refs",
+                MANIFEST_REF_RELEVANCE_FIELD,
             }:
                 continue
             if key in {"root", "path"}:
@@ -8028,6 +8027,7 @@ def run_scan(
             "host": source.host,
             "root": transient_manifest_path_value(source.root),
             "root_ref": path_ref(source.root),
+            MANIFEST_REF_RELEVANCE_FIELD: MANIFEST_REF_RELEVANCE_POLICY,
             "rollout_count": len(rollouts),
             "rollout_refs": source_window_rollout_manifest_refs(
                 source,
@@ -8471,6 +8471,7 @@ def run_discover(args: argparse.Namespace, *, mode: str, start: dt.datetime | No
             "host": source.host,
             "root": transient_manifest_path_value(source.root),
             "root_ref": path_ref(source.root),
+            MANIFEST_REF_RELEVANCE_FIELD: MANIFEST_REF_RELEVANCE_POLICY,
             "rollout_count": len(rollouts),
             "rollout_refs": source_window_rollout_manifest_refs(
                 source,
@@ -10180,8 +10181,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 )
             )
 
-    def append_disappeared_summary_shard(summary: Path, *, allow_future_path_filter: bool = True) -> None:
-        if allow_future_path_filter and summary_path_proves_outside_window(
+    def append_disappeared_summary_shard(summary: Path, *, allow_path_window_filter: bool = True) -> None:
+        if allow_path_window_filter and summary_path_proves_outside_window(
             summary,
             start,
             end,
@@ -10197,8 +10198,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
             )
         )
 
-    def append_disappeared_rollout_shard(rollout: Path) -> None:
-        if rollout_path_proves_outside_window(rollout, start, end, source_root=root):
+    def append_disappeared_rollout_shard(rollout: Path, *, allow_path_window_filter: bool = True) -> None:
+        if allow_path_window_filter and rollout_path_proves_outside_window(rollout, start, end, source_root=root):
             return
         rows.append(
             shard_row(
@@ -10380,7 +10381,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 return
             if not summary_file_has_extractable_record_in_window(summary, start, end, source_root=root):
                 if path_disappeared(summary):
-                    append_disappeared_summary_shard(summary, allow_future_path_filter=False)
+                    append_disappeared_summary_shard(summary, allow_path_window_filter=False)
                 return
             row["status"] = "ready"
             rows.append(row)
@@ -10458,6 +10459,9 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         source_summaries = source_summary_files(source)
         summaries = sorted([*source_summaries, *generated_summaries])
         archived_duplicate_keys = archived_rollout_duplicate_keys(root)
+        manifest_refs_are_window_filtered = (
+            source_entry.get(MANIFEST_REF_RELEVANCE_FIELD) == MANIFEST_REF_RELEVANCE_POLICY
+        )
         current_rollout_refs = set(source_rollout_manifest_refs(rollouts, root))
         current_rollout_refs_by_key: dict[str, set[str]] = defaultdict(set)
         for current_ref in current_rollout_refs:
@@ -10532,7 +10536,10 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     for match_key in rollout_match_keys_for_ref(rollout_ref):
                         current_rollout_refs_by_key[match_key].add(rollout_ref)
                     continue
-                append_disappeared_rollout_shard(rollout_path)
+                append_disappeared_rollout_shard(
+                    rollout_path,
+                    allow_path_window_filter=not manifest_refs_are_window_filtered,
+                )
         rollouts = sorted(set(rollouts))
         (
             selected_source_identity_by_key,
@@ -10545,7 +10552,10 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 continue
             summary_path = source_summary_declared_path_from_ref(source, summary_ref)
             if summary_path is not None:
-                append_disappeared_summary_shard(summary_path)
+                append_disappeared_summary_shard(
+                    summary_path,
+                    allow_path_window_filter=not manifest_refs_are_window_filtered,
+                )
         source_summary_only_gaps = remote_summary_only_gaps(
             source,
             rollouts,
