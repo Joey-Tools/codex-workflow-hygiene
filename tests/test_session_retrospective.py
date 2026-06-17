@@ -14072,10 +14072,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_timestamped_timestampless_rollout_relevance_is_conservative(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
-            old_rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old.jsonl"
+            old_rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T23-30-00-late.jsonl"
             write_jsonl(old_rollout, [{"type": "event", "payload": {"text": "Continuation without a timestamp."}}])
-            start = MODULE.parse_time("2026-05-01T00:00:00Z")
-            end = MODULE.parse_time("2026-05-02T00:00:00Z")
+            start = MODULE.parse_time("2026-05-02T00:00:00Z")
+            end = MODULE.parse_time("2026-05-03T00:00:00Z")
 
             relevant = MODULE.rollout_candidate_relevant(
                 old_rollout,
@@ -14092,10 +14092,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
     def test_timestamped_timestampless_rollout_disappearance_is_conservative(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
-            old_rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old.jsonl"
+            old_rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T23-30-00-late.jsonl"
             write_jsonl(old_rollout, [{"type": "event", "payload": {"text": "Continuation without a timestamp."}}])
-            start = MODULE.parse_time("2026-05-01T00:00:00Z")
-            end = MODULE.parse_time("2026-05-02T00:00:00Z")
+            start = MODULE.parse_time("2026-05-02T00:00:00Z")
+            end = MODULE.parse_time("2026-05-03T00:00:00Z")
             real_iter_jsonl = MODULE.iter_jsonl
 
             def disappear_during_timestampless_scan(path: Path):
@@ -14120,6 +14120,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T23-30-00-late.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [{"type": "event", "payload": {"text": "Continuation without a timestamp."}}])
+            output = safe_output_dir(raw)
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-03T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+            MODULE.validate_output_run(output)
+
+        self.assertIn("timestampless_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertIn(rollout_ref, manifest["sources"][0]["rollout_refs"])
+
+    def test_scan_skips_timestamped_timestampless_rollout_far_before_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
             rollout_ref = "sessions/2026/01/02/rollout-2026-01-02T10-00-00-old.jsonl"
             rollout = root / rollout_ref
             write_jsonl(rollout, [{"type": "event", "payload": {"text": "Continuation without a timestamp."}}])
@@ -14135,14 +14157,14 @@ class SessionRetrospectiveTests(unittest.TestCase):
             manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
             MODULE.validate_output_run(output)
 
-        self.assertIn("timestampless_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
-        self.assertIn(rollout_ref, manifest["sources"][0]["rollout_refs"])
+        self.assertNotIn("timestampless_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertNotIn(rollout_ref, manifest["sources"][0]["rollout_refs"])
 
     def test_scan_reports_volatile_when_timestamped_timestampless_scan_disappears(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
-            rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old.jsonl"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T23-30-00-late.jsonl"
             write_jsonl(rollout, [{"type": "event", "payload": {"text": "Continuation without a timestamp."}}])
             output = safe_output_dir(raw)
             real_iter_jsonl = MODULE.iter_jsonl
@@ -14157,14 +14179,40 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 MODULE.run_scan(
                     types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
                     mode="daily",
-                    start=MODULE.parse_time("2026-05-01T00:00:00Z"),
-                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    start=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-03T00:00:00Z"),
                 )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
         self.assertIn("volatile_rollout_missing", [gap["reason"] for gap in trend["coverage_gaps"]])
 
     def test_make_shards_reports_timestamped_timestampless_rollout_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T23-30-00-late.jsonl"
+            write_jsonl(rollout, [{"type": "event", "payload": {"text": "Continuation without a timestamp."}}])
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-02T00:00:00Z", "end": "2026-05-03T00:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [json.loads(line) for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "partial")
+        self.assertEqual(rows[0]["coverage_gap"], "timestampless_rollout_skipped")
+        self.assertEqual(MODULE.shard_coverage_gap_reason(rows[0]["coverage_gap"]), "timestampless_rollout_skipped")
+
+    def test_make_shards_skips_timestamped_timestampless_rollout_far_before_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
@@ -14185,22 +14233,20 @@ class SessionRetrospectiveTests(unittest.TestCase):
             MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
             rows = [json.loads(line) for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["status"], "partial")
-        self.assertIn("timestampless records", rows[0]["coverage_gap"])
+        self.assertEqual(rows, [])
 
     def test_make_shards_reports_disappeared_when_timestamped_timestampless_scan_disappears(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             write_local_evidence(root)
-            rollout = root / "sessions" / "2026" / "01" / "02" / "rollout-2026-01-02T10-00-00-old.jsonl"
+            rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T23-30-00-late.jsonl"
             write_jsonl(rollout, [{"type": "event", "payload": {"text": "Continuation without a timestamp."}}])
             manifest = Path(raw) / "manifest.json"
             manifest.write_text(
                 json.dumps(
                     {
                         "sources": [{"host": "local", "root": str(root), "status": "ready"}],
-                        "window": {"start": "2026-05-01T00:00:00Z", "end": "2026-05-02T00:00:00Z"},
+                        "window": {"start": "2026-05-02T00:00:00Z", "end": "2026-05-03T00:00:00Z"},
                     }
                 ),
                 encoding="utf-8",

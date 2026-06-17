@@ -2347,7 +2347,7 @@ def timestamped_timestampless_rollout_relevance(
     rollout_time, rollout_day_start = timestamped_hint
     if end and rollout_time >= end:
         return False
-    if start and rollout_time < start and not timestamped_rollout_maybe_reaches_start(
+    if start and rollout_time < start and not timestamped_rollout_start_could_reach_relevant_window(
         rollout_time,
         rollout_day_start,
         start,
@@ -10886,10 +10886,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                         if timestampless_relevance is not True:
                             continue
                         row["status"] = "partial"
-                        row["coverage_gap"] = (
-                            "rollout has timestampless records with only a start-time path hint; "
-                            "cannot prove window coverage before extractor handoff"
-                        )
+                        row["coverage_gap"] = "timestampless_rollout_skipped"
                         rows.append(row)
                         continue
                 relevance = oversized_rollout_relevance(
