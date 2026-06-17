@@ -2325,6 +2325,21 @@ def timestamped_timestampless_rollout_maybe_relevant(
     *,
     max_scan_bytes: int | None = None,
 ) -> bool:
+    return timestamped_timestampless_rollout_relevance(
+        path,
+        start,
+        end,
+        max_scan_bytes=max_scan_bytes,
+    ) is True
+
+
+def timestamped_timestampless_rollout_relevance(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    *,
+    max_scan_bytes: int | None = None,
+) -> bool | None:
     timestamped_hint = timestamped_rollout_path_hint(path)
     if timestamped_hint is None:
         return False
@@ -2343,7 +2358,9 @@ def timestamped_timestampless_rollout_maybe_relevant(
         for _line_no, record in iter_jsonl(path):
             if record_timestamp(record) is None:
                 return True
-    except (OSError, ValueError):
+    except OSError:
+        return None
+    except ValueError:
         return False
     return False
 
@@ -2449,13 +2466,16 @@ def rollout_candidate_relevant(
             if relevance == "relevant":
                 return True
             if relevance == "irrelevant":
-                if timestamped_timestampless_rollout_maybe_relevant(
+                timestampless_relevance = timestamped_timestampless_rollout_relevance(
                     path,
                     start,
                     end,
                     max_scan_bytes=max_relevance_scan_bytes,
-                ):
+                )
+                if timestampless_relevance is True:
                     return True
+                if timestampless_relevance is None:
+                    return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
                 if timestamped_invalid_rollout_maybe_relevant(path, start, end):
                     return True
                 return False
@@ -2465,8 +2485,11 @@ def rollout_candidate_relevant(
                 return True
         except OSError:
             return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
-        if timestamped_timestampless_rollout_maybe_relevant(path, start, end):
+        timestampless_relevance = timestamped_timestampless_rollout_relevance(path, start, end)
+        if timestampless_relevance is True:
             return True
+        if timestampless_relevance is None:
+            return disappeared_rollout_candidate_maybe_relevant(path, start, end, source_root=source_root)
         if timestamped_invalid_rollout_maybe_relevant(path, start, end):
             return True
         return False
@@ -2663,13 +2686,16 @@ def oversized_rollout_relevance(
             return "relevant"
         if not complete:
             return "unknown"
-        if timestamped_timestampless_rollout_maybe_relevant(
+        timestampless_relevance = timestamped_timestampless_rollout_relevance(
             path,
             start,
             end,
             max_scan_bytes=max_scan_bytes,
-        ):
+        )
+        if timestampless_relevance is True:
             return "relevant"
+        if timestampless_relevance is None:
+            return "unknown"
         if timestamped_invalid_rollout_maybe_relevant(path, start, end):
             return "relevant"
         if not allow_mtime_fallback:
@@ -2831,13 +2857,20 @@ def rollout_has_manifest_ref_relevance(
                     allow_mtime_fallback=allow_mtime_fallback,
                     unreadable=jsonl_error.unreadable,
                 )
-            return rollout_has_record_in_window(
+            if rollout_has_record_in_window(
                 rollout,
                 start,
                 end,
                 allow_mtime_fallback=allow_mtime_fallback,
                 source_root=source.root,
-            ) or timestamped_timestampless_rollout_maybe_relevant(rollout, start, end)
+            ):
+                return True
+            timestampless_relevance = timestamped_timestampless_rollout_relevance(rollout, start, end)
+            if timestampless_relevance is None:
+                if path_disappeared(rollout):
+                    raise FileNotFoundError(rollout)
+                return True
+            return timestampless_relevance
         relevance = oversized_rollout_relevance(
             rollout,
             start,
@@ -8327,10 +8360,17 @@ def run_scan(
                         allow_mtime_fallback=rollout_mtime_fallback,
                         source_root=source.root,
                     ):
-                        if timestamped_timestampless_rollout_maybe_relevant(rollout, gap_start, end):
+                        timestampless_relevance = timestamped_timestampless_rollout_relevance(
+                            rollout,
+                            gap_start,
+                            end,
+                        )
+                        if timestampless_relevance is True:
                             coverage_gaps.append(
                                 source_path_coverage_gap(source, rollout, "timestampless_rollout_skipped")
                             )
+                        elif timestampless_relevance is None:
+                            append_volatile_rollout_gap(rollout)
                         continue
                     all_turns.extend(
                         extract_rollout(
@@ -10836,14 +10876,21 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     ):
                         row["status"] = "ready"
                         rows.append(row)
-                    elif timestamped_timestampless_rollout_maybe_relevant(rollout, start, end):
+                        continue
+                    else:
+                        timestampless_relevance = timestamped_timestampless_rollout_relevance(rollout, start, end)
+                        if timestampless_relevance is None:
+                            append_disappeared_rollout_shard(rollout)
+                            continue
+                        if timestampless_relevance is not True:
+                            continue
                         row["status"] = "partial"
                         row["coverage_gap"] = (
                             "rollout has timestampless records with only a start-time path hint; "
                             "cannot prove window coverage before extractor handoff"
                         )
                         rows.append(row)
-                    continue
+                        continue
                 relevance = oversized_rollout_relevance(
                     rollout,
                     start,
