@@ -7678,6 +7678,17 @@ def remote_summary_only_gaps(
             )
             if invalid_scan_meta_ref_seen:
                 return [remote_metadata_gap(source, "remote_source_not_materialized")]
+            scan_meta_identity_proof = complete_scan_meta_backing_source_bytes_by_ref(
+                summary,
+                start,
+                end,
+                allow_tail_record_limit=True,
+            )
+            scan_meta_complete_identity_refs = (
+                set(scan_meta_identity_proof.source_sha256_by_ref)
+                if scan_meta_identity_proof is not None
+                else set()
+            )
             scan_meta_context_relevant = summary_file_relevant_with_scan_cap(
                 summary,
                 start,
@@ -7692,14 +7703,21 @@ def remote_summary_only_gaps(
                 source_root=source.root,
             )
             for ref in scan_meta_refs:
-                if rollout_ref_has_window_hint(ref) and not rollout_ref_maybe_in_window(ref, start, end):
+                ref_has_complete_identity = ref in scan_meta_complete_identity_refs
+                ref_maybe_relevant = rollout_ref_maybe_in_window(ref, start, end)
+                if rollout_ref_has_window_hint(ref) and not ref_maybe_relevant and not ref_has_complete_identity:
                     continue
                 _, selected_identity = selected_rollout_identity_for_ref(ref, selected_source_identity_by_key)
                 selected_ref = selected_identity.ref if selected_identity is not None and selected_identity.ref is not None else ref
+                selected_ref_has_complete_identity = (
+                    ref_has_complete_identity or selected_ref in scan_meta_complete_identity_refs
+                )
+                selected_ref_maybe_relevant = rollout_ref_maybe_in_window(selected_ref, start, end)
                 if (
                     selected_ref != ref
                     and rollout_ref_has_window_hint(selected_ref)
-                    and not rollout_ref_maybe_in_window(selected_ref, start, end)
+                    and not selected_ref_maybe_relevant
+                    and not selected_ref_has_complete_identity
                 ):
                     continue
                 ref_key = summary_backed_rollout_key_for_ref(selected_ref)
@@ -7713,9 +7731,13 @@ def remote_summary_only_gaps(
                     archived_duplicate_keys=archived_duplicate_keys,
                 )
                 ref_has_direct_file = backing_ref_direct_file_exists(source.root, selected_ref)
-                ref_maybe_relevant = rollout_ref_maybe_in_window(selected_ref, start, end)
                 if not ref_has_direct_coverage and (
-                    ref_has_direct_file or (not scan_meta_context_relevant and not ref_maybe_relevant)
+                    ref_has_direct_file
+                    or (
+                        not scan_meta_context_relevant
+                        and not selected_ref_maybe_relevant
+                        and not selected_ref_has_complete_identity
+                    )
                 ):
                     continue
                 if ref in complete_summary_refs or ref_key in complete_summary_keys:
