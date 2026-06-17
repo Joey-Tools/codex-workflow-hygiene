@@ -2297,6 +2297,26 @@ def timestamped_rollout_path_hint(path: Path) -> tuple[dt.datetime, dt.datetime 
     return rollout_time, parse_time(f"{match.group(1)}T00:00:00Z")
 
 
+def timestamped_invalid_rollout_maybe_relevant(
+    path: Path,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> bool:
+    timestamped_hint = timestamped_rollout_path_hint(path)
+    if timestamped_hint is None:
+        return False
+    rollout_time, rollout_day_start = timestamped_hint
+    if end and rollout_time >= end:
+        return False
+    if start and not timestamped_rollout_start_could_reach_relevant_window(
+        rollout_time,
+        rollout_day_start,
+        start,
+    ):
+        return False
+    return first_jsonl_error(path) is not None
+
+
 def rollout_filename_in_window(
     path: Path,
     start: dt.datetime | None,
@@ -2386,6 +2406,8 @@ def rollout_candidate_relevant(
             if relevance == "relevant":
                 return True
             if relevance == "irrelevant":
+                if timestamped_invalid_rollout_maybe_relevant(path, start, end):
+                    return True
                 return False
             return True
         try:
@@ -2393,10 +2415,8 @@ def rollout_candidate_relevant(
                 return True
         except OSError:
             return True
-        if timestamped_hint is not None:
-            rollout_time, rollout_day_start = timestamped_hint
-            if timestamped_rollout_start_could_reach_relevant_window(rollout_time, rollout_day_start, start):
-                return first_jsonl_error(path) is not None
+        if timestamped_invalid_rollout_maybe_relevant(path, start, end):
+            return True
         return False
     return True
 
@@ -2589,6 +2609,8 @@ def oversized_rollout_relevance(
             return "relevant"
         if not complete:
             return "unknown"
+        if timestamped_invalid_rollout_maybe_relevant(path, start, end):
+            return "relevant"
         if not allow_mtime_fallback:
             return "irrelevant"
         try:

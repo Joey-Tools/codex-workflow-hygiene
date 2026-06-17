@@ -12070,6 +12070,35 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "invalid")
         self.assertEqual(rows[0]["coverage_gap"], "invalid JSONL; cannot safely hand to extractor shard")
 
+    def test_make_shards_marks_prior_day_timestamped_oversized_invalid_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "04" / "30" / "rollout-2026-04-30T23-30-00-bad-large.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n" + ("x" * 2000), encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T03:30:00Z", "end": "2026-05-01T04:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path_ref"], MODULE.path_ref(rollout))
+        self.assertEqual(rows[0]["status"], "oversized")
+        self.assertEqual(rows[0]["coverage_gap"], "rollout exceeds max raw shard bytes; use bounded rollout-summary before extractor handoff")
+
     def test_make_shards_skips_non_ready_manifest_sources(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "miku-bot-dev"
@@ -13417,6 +13446,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 mode="daily",
                 start=MODULE.parse_time("2026-05-01T00:00:00Z"),
                 end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(state.exists())
+        self.assertEqual(trend["coverage_gaps"][0]["reason"], "oversized_rollout_skipped")
+        self.assertNotIn("path_ref", trend["coverage_gaps"][0])
+
+    def test_prior_day_timestamped_oversized_invalid_rollout_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "04" / "30" / "rollout-2026-04-30T23-30-00-bad-large.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n" + ("x" * 2000), encoding="utf-8")
+            output = safe_output_dir(raw)
+            state = safe_output_dir(raw) / "state.json"
+
+            MODULE.run_scan(
+                types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=str(state), max_raw_bytes=1000, allow_partial_hosts=True),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T03:30:00Z"),
+                end=MODULE.parse_time("2026-05-01T04:00:00Z"),
             )
             trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
 
