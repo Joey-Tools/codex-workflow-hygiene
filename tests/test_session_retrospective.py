@@ -13731,6 +13731,102 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertNotIn(rollout_ref, refs)
 
+    def test_source_window_manifest_filters_day_scoped_rollout_that_vanishes_before_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout_ref = "sessions/2026/01/02/rollout-2026-01-02-old.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Old day-scoped task.", "2026-01-02T10:15:00Z")])
+            start = MODULE.parse_time("2026-05-01T10:00:00Z")
+            end = MODULE.parse_time("2026-05-01T11:00:00Z")
+
+            def disappear_during_relevance(path: Path, *args, **kwargs) -> bool:
+                if path == rollout:
+                    rollout.unlink()
+                    raise FileNotFoundError(path)
+                return MODULE.rollout_candidate_relevant(path, *args, **kwargs)
+
+            with mock.patch.object(
+                MODULE,
+                "rollout_candidate_relevant",
+                side_effect=disappear_during_relevance,
+            ):
+                refs = MODULE.source_window_rollout_manifest_refs(
+                    MODULE.Source("local", root),
+                    [rollout],
+                    start,
+                    end,
+                    max_raw_bytes=1000,
+                    max_relevance_scan_bytes=1000,
+                    allow_mtime_fallback=False,
+                    archived_duplicate_keys=None,
+                    summary_backed_rollout_keys=set(),
+                )
+
+        self.assertNotIn(rollout_ref, refs)
+
+    def test_source_window_manifest_preserves_nested_custom_rollout_ref_that_vanishes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "custom-source"
+            rollout_ref = "proj/sub/rollout-2026-05-01T10-00-00-live.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [message("user", "Nested custom rollout race.", "2026-05-01T10:15:00Z")])
+            start = MODULE.parse_time("2026-05-01T10:00:00Z")
+            end = MODULE.parse_time("2026-05-01T11:00:00Z")
+
+            def disappear_during_relevance(path: Path, *args, **kwargs) -> bool:
+                if path == rollout:
+                    rollout.unlink()
+                    raise FileNotFoundError(path)
+                return MODULE.rollout_candidate_relevant(path, *args, **kwargs)
+
+            with mock.patch.object(
+                MODULE,
+                "rollout_candidate_relevant",
+                side_effect=disappear_during_relevance,
+            ):
+                refs = MODULE.source_window_rollout_manifest_refs(
+                    MODULE.Source("custom_source", root),
+                    [rollout],
+                    start,
+                    end,
+                    max_raw_bytes=1000,
+                    max_relevance_scan_bytes=1000,
+                    allow_mtime_fallback=False,
+                    archived_duplicate_keys=None,
+                    summary_backed_rollout_keys=set(),
+                )
+            manifest_path = Path(raw) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "host": "custom_source",
+                                "root": str(root),
+                                "status": "ready",
+                                MODULE.MANIFEST_REF_RELEVANCE_FIELD: MODULE.MANIFEST_REF_RELEVANCE_POLICY,
+                                "rollout_refs": refs,
+                                "summary_refs": [],
+                            }
+                        ],
+                        "window": {"start": "2026-05-01T10:00:00Z", "end": "2026-05-01T11:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            shards = safe_output_dir(raw, "shards")
+            MODULE.main(["make-shards", "--manifest", str(manifest_path), "--output", str(shards)])
+            rows = [
+                json.loads(line)
+                for line in (shards / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIn(rollout_ref, refs)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
     def test_source_window_manifest_does_not_date_vanished_root_rollout_from_source_root(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "sources" / "2026" / "07" / "01" / ".codex"

@@ -2743,6 +2743,7 @@ def rollout_has_manifest_ref_relevance(
     allow_mtime_fallback: bool,
     summary_backed_rollout_keys: set[str],
 ) -> bool:
+    preserve_disappeared_ref = False
     try:
         if not rollout_candidate_relevant(
             rollout,
@@ -2756,6 +2757,7 @@ def rollout_has_manifest_ref_relevance(
             if path_disappeared(rollout):
                 raise FileNotFoundError(rollout)
             return False
+        preserve_disappeared_ref = True
         size = rollout.stat().st_size
         if size <= max_raw_bytes:
             jsonl_error = first_jsonl_error(rollout)
@@ -2787,6 +2789,7 @@ def rollout_has_manifest_ref_relevance(
         )
         if relevance == "irrelevant":
             if path_disappeared(rollout):
+                preserve_disappeared_ref = False
                 raise FileNotFoundError(rollout)
             return False
         rollout_ref = source_relative_path_ref(rollout, source.root)
@@ -2794,10 +2797,15 @@ def rollout_has_manifest_ref_relevance(
             return False
         return True
     except FileNotFoundError:
-        if rollout_path_proves_after_window(rollout, end, source_root=source.root):
+        if not preserve_disappeared_ref and rollout_path_proves_outside_window(
+            rollout,
+            start,
+            end,
+            source_root=source.root,
+        ):
             return False
         rollout_ref = source_relative_path_ref(rollout, source.root)
-        return rollout_ref is not None and safe_rollout_backing_ref(rollout_ref) is not None
+        return rollout_ref is not None and safe_relative_rollout_ref(rollout_ref) is not None
     except (OSError, ValueError):
         return False
 
