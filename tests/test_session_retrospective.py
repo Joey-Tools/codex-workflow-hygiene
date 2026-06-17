@@ -14677,6 +14677,113 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn(generated_summary_ref, summary_refs)
         self.assertFalse(has_false_disappeared_gap)
 
+    def test_scan_manifest_omits_non_extractable_summary_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            summary_ref = "sessions/2026/05/01/rollout-summary-current.jsonl"
+            summary = root / summary_ref
+            write_jsonl(
+                summary,
+                [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "Routine status note."}],
+            )
+            output = safe_output_dir(raw)
+            shards = safe_output_dir(raw, "shards")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=1000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest_path = output / "shard_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            summary.unlink()
+            MODULE.main(["make-shards", "--manifest", str(manifest_path), "--output", str(shards)])
+            shard_rows = [
+                json.loads(line)
+                for line in (shards / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(manifest["sources"][0]["summary_count"], 1)
+        self.assertNotIn(summary_ref, manifest["sources"][0]["summary_refs"])
+        self.assertFalse(
+            any(row.get("coverage_gap") == "summary disappeared during shard discovery" for row in shard_rows)
+        )
+
+    def test_discover_manifest_omits_non_extractable_summary_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            summary_ref = "sessions/2026/05/01/rollout-summary-current.jsonl"
+            summary = root / summary_ref
+            write_jsonl(
+                summary,
+                [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "Routine status note."}],
+            )
+            output = safe_output_dir(raw)
+
+            MODULE.run_discover(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    max_raw_bytes=1000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest = json.loads((output / "shard_manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["sources"][0]["summary_count"], 1)
+        self.assertNotIn(summary_ref, manifest["sources"][0]["summary_refs"])
+
+    def test_scan_manifest_keeps_extractable_summary_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            summary_ref = "sessions/2026/05/01/rollout-summary-current.jsonl"
+            summary = root / summary_ref
+            write_jsonl(
+                summary,
+                [{"kind": "summary", "timestamp": "2026-05-01T10:00:00Z", "text": "Command failed before verification."}],
+            )
+            output = safe_output_dir(raw)
+            shards = safe_output_dir(raw, "shards")
+
+            MODULE.run_scan(
+                types.SimpleNamespace(
+                    source=[f"local={root}"],
+                    output=str(output),
+                    state=None,
+                    max_raw_bytes=1000,
+                    allow_partial_hosts=True,
+                ),
+                mode="daily",
+                start=MODULE.parse_time("2026-05-01T00:00:00Z"),
+                end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+            )
+            manifest_path = output / "shard_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            summary.unlink()
+            MODULE.main(["make-shards", "--manifest", str(manifest_path), "--output", str(shards)])
+            shard_rows = [
+                json.loads(line)
+                for line in (shards / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIn(summary_ref, manifest["sources"][0]["summary_refs"])
+        self.assertTrue(
+            any(row.get("coverage_gap") == "summary disappeared during shard discovery" for row in shard_rows)
+        )
+
     def test_make_shards_rejects_cache_summary_manifest_paths(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
