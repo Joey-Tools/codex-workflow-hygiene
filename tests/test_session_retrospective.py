@@ -22413,6 +22413,93 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertTrue(relevant)
 
+    def test_timestamped_invalid_rollout_maybe_relevant_ignores_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            rollout = Path(raw) / "sessions" / "2026" / "04" / "30" / "rollout-2026-04-30T23-30-00-race.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+
+            with mock.patch.object(
+                MODULE,
+                "first_jsonl_error",
+                return_value=MODULE.JsonlReadIssue(1, unreadable=True),
+            ):
+                relevant = MODULE.timestamped_invalid_rollout_maybe_relevant(
+                    rollout,
+                    MODULE.parse_time("2026-05-01T03:30:00Z"),
+                    MODULE.parse_time("2026-05-01T04:00:00Z"),
+                )
+
+        self.assertFalse(relevant)
+
+    def test_scan_reports_volatile_when_oversized_rollout_disappears_after_relevance(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_local_evidence(root)
+            rollout = root / "sessions" / "2026" / "04" / "30" / "rollout-2026-04-30T23-30-00-race.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n" + ("x" * 2000), encoding="utf-8")
+            output = safe_output_dir(raw)
+
+            def disappear_as_irrelevant(path: Path, *args, **kwargs) -> str:
+                if path == rollout and rollout.exists():
+                    rollout.unlink()
+                    return "irrelevant"
+                return "irrelevant"
+
+            with mock.patch.object(MODULE, "rollout_candidate_relevant", return_value=True), mock.patch.object(
+                MODULE,
+                "oversized_rollout_relevance",
+                side_effect=disappear_as_irrelevant,
+            ):
+                MODULE.run_scan(
+                    types.SimpleNamespace(source=[f"local={root}"], output=str(output), state=None, max_raw_bytes=1000, allow_partial_hosts=True),
+                    mode="daily",
+                    start=MODULE.parse_time("2026-05-01T03:30:00Z"),
+                    end=MODULE.parse_time("2026-05-01T04:00:00Z"),
+                )
+            trend = json.loads((output / "trend_report.json").read_text(encoding="utf-8"))
+
+        self.assertIn("volatile_rollout_missing", [gap["reason"] for gap in trend["coverage_gaps"]])
+        self.assertNotIn("oversized_rollout_skipped", [gap["reason"] for gap in trend["coverage_gaps"]])
+
+    def test_make_shards_reports_disappeared_when_oversized_rollout_disappears_after_relevance(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "04" / "30" / "rollout-2026-04-30T23-30-00-race.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{bad json\n" + ("x" * 2000), encoding="utf-8")
+            manifest = Path(raw) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [{"host": "local", "root": str(root), "status": "ready"}],
+                        "window": {"start": "2026-05-01T03:30:00Z", "end": "2026-05-01T04:00:00Z"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = safe_output_dir(raw)
+
+            def disappear_as_irrelevant(path: Path, *args, **kwargs) -> str:
+                if path == rollout and rollout.exists():
+                    rollout.unlink()
+                    return "irrelevant"
+                return "irrelevant"
+
+            with mock.patch.object(MODULE, "rollout_candidate_relevant", return_value=True), mock.patch.object(
+                MODULE,
+                "oversized_rollout_relevance",
+                side_effect=disappear_as_irrelevant,
+            ):
+                MODULE.main(["make-shards", "--manifest", str(manifest), "--output", str(output), "--max-raw-bytes", "1000"])
+            rows = [
+                json.loads(line)
+                for line in (output / "shards.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["coverage_gap"], "rollout disappeared during shard discovery")
+
     def test_future_rollout_disappearing_after_irrelevance_does_not_report_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

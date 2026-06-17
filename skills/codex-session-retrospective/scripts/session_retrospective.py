@@ -2314,7 +2314,8 @@ def timestamped_invalid_rollout_maybe_relevant(
         start,
     ):
         return False
-    return first_jsonl_error(path) is not None
+    jsonl_error = first_jsonl_error(path)
+    return jsonl_error is not None and not jsonl_error.unreadable
 
 
 def rollout_filename_in_window(
@@ -2752,6 +2753,8 @@ def rollout_has_manifest_ref_relevance(
             allow_mtime_fallback=allow_mtime_fallback,
             source_root=source.root,
         ):
+            if path_disappeared(rollout):
+                raise FileNotFoundError(rollout)
             return False
         size = rollout.stat().st_size
         if size <= max_raw_bytes:
@@ -2783,6 +2786,8 @@ def rollout_has_manifest_ref_relevance(
             source_root=source.root,
         )
         if relevance == "irrelevant":
+            if path_disappeared(rollout):
+                raise FileNotFoundError(rollout)
             return False
         rollout_ref = source_relative_path_ref(rollout, source.root)
         if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
@@ -8235,6 +8240,8 @@ def run_scan(
                     source_root=source.root,
                 )
                 if relevance == "irrelevant":
+                    if path_disappeared(rollout):
+                        append_volatile_rollout_gap(rollout)
                     continue
                 rollout_ref = source_relative_path_ref(rollout, source.root)
                 if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
@@ -10736,6 +10743,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     source_root=root,
                 )
                 if relevance == "irrelevant":
+                    if path_disappeared(rollout):
+                        append_disappeared_rollout_shard(rollout)
                     continue
                 rollout_ref = source_relative_path_ref(rollout, root)
                 if rollout_ref is not None and rollout_ref_has_duplicate_key(rollout_ref, summary_backed_rollout_keys):
