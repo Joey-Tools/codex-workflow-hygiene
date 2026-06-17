@@ -5800,8 +5800,6 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "weekly-repair",
                 "--run-dir",
                 expected_root,
-                "--max-raw-bytes",
-                "1048576",
                 "--allow-partial-hosts",
             ],
         )
@@ -5848,6 +5846,61 @@ class SessionRetrospectiveTests(unittest.TestCase):
             ],
         )
         self.assertEqual(report["repairable_coverage_gap_counts"], {"source_root_missing": 1})
+
+    def test_weekly_dry_run_keeps_repair_default_raw_limit_for_mixed_remote_and_oversized_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            remote_root = Path(raw) / "missing-miku"
+            summary = root / "sessions" / "2026" / "05" / "01" / "rollout-summary-2026-05-01T10-00-00-mixed.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    {
+                        "kind": "summary",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "text": "permission denied " + ("x" * 1000),
+                    }
+                ],
+            )
+            output = safe_output_dir(raw, "weekly-dry-run")
+
+            MODULE.main(
+                [
+                    "weekly-dry-run",
+                    "--days",
+                    "7",
+                    "--end",
+                    "2026-05-02T00:00:00Z",
+                    "--source",
+                    f"local={root}",
+                    "--source",
+                    f"miku-bot-dev={remote_root}",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    "200",
+                    "--output",
+                    str(output),
+                ]
+            )
+            report = json.loads((output / "dry_run_report.json").read_text(encoding="utf-8"))
+
+        expected_root = output.absolute().as_posix()
+        expected_script = Path(MODULE.__file__).resolve().as_posix()
+        self.assertEqual(
+            MODULE.shlex.split(report["next_command"]),
+            [
+                "python3",
+                expected_script,
+                "weekly-repair",
+                "--run-dir",
+                expected_root,
+                "--allow-partial-hosts",
+            ],
+        )
+        self.assertEqual(
+            report["repairable_coverage_gap_counts"],
+            {"oversized_summary_skipped": 1, "source_root_missing": 1},
+        )
 
     def test_weekly_dry_run_repair_ignores_partial_host_scope_only_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

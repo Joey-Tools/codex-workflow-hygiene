@@ -573,6 +573,7 @@ REPAIRABLE_COVERAGE_GAP_REASONS = frozenset(ALLOWED_REMOTE_GAP_REASONS | OVERSIZ
 REMOTE_MATERIALIZATION_GAP_REASONS = frozenset(
     ALLOWED_REMOTE_GAP_REASONS | {"oversized_rollout_skipped", "oversized_summary_skipped"}
 )
+DEFAULT_REPAIR_MAX_RAW_BYTES = 16 * 1024 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9611,7 +9612,7 @@ def run_dry_run(
             "--run-dir",
             root.as_posix(),
         ]
-        if suggested_max_raw_bytes is not None:
+        if suggested_max_raw_bytes is not None and suggested_max_raw_bytes > DEFAULT_REPAIR_MAX_RAW_BYTES:
             next_command_argv.extend(["--max-raw-bytes", str(suggested_max_raw_bytes)])
         if args.allow_partial_hosts:
             next_command_argv.append("--allow-partial-hosts")
@@ -11311,7 +11312,7 @@ def build_parser() -> argparse.ArgumentParser:
     weekly_dry_run.add_argument(
         "--repair-max-raw-bytes",
         type=int,
-        default=16 * 1024 * 1024,
+        default=DEFAULT_REPAIR_MAX_RAW_BYTES,
         help="Raw rollout size limit for the optional --repair follow-up.",
     )
     weekly_dry_run.add_argument(
@@ -11350,7 +11351,7 @@ def build_parser() -> argparse.ArgumentParser:
     repair_coverage.add_argument(
         "--max-raw-bytes",
         type=int,
-        default=16 * 1024 * 1024,
+        default=DEFAULT_REPAIR_MAX_RAW_BYTES,
         help="Raw rollout size limit for the repaired scan.",
     )
     repair_coverage.add_argument(
@@ -11394,7 +11395,7 @@ def build_parser() -> argparse.ArgumentParser:
     weekly_repair.add_argument(
         "--max-raw-bytes",
         type=int,
-        default=16 * 1024 * 1024,
+        default=DEFAULT_REPAIR_MAX_RAW_BYTES,
         help="Raw rollout size limit for the repaired scan.",
     )
     weekly_repair.add_argument(
