@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import importlib.util
 import hashlib
@@ -3290,6 +3291,18 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("failed_command", turns[0].issue_flags)
         self.assertIn("approval_auth_friction", turns[0].issue_flags)
 
+    def test_flag_probe_prefilter_skips_expensive_credential_regex_for_ordinary_large_text(self) -> None:
+        class ExplodingPattern:
+            def search(self, _text: str) -> None:
+                raise AssertionError("credential regex should not run")
+
+        text = ("ordinary compiler output " * 1000) + "done"
+
+        with mock.patch.object(MODULE, "CREDENTIAL_ASSIGNMENT_SIGNAL_PATTERN", ExplodingPattern()):
+            flags = MODULE.flags_for_probe_text(text)
+
+        self.assertEqual(flags, set())
+
     def test_safety_privacy_flag_ignores_ordinary_engineering_context(self) -> None:
         samples = [
             "Please review the production checklist in docs/deploy.md.",
@@ -3408,7 +3421,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "Open https://grafana.",
             "Open ssh://gitlab",
             "db01.internal:5432",
+            "db.internal)",
+            "db.internal?",
             "svc.corp/path",
+            "svc.corp,",
+            "foo.example",
+            "foo.example;",
+            "foo.example#frag",
+            "api.invalid",
+            "fdab::beef",
+            "fc::",
             "customer_id=AcmeCorp",
             "customer_id=北京公司",
             "tenant_name=腾讯云",
@@ -3496,6 +3518,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "Data leak in output.",
             "Key leak in output.",
             "Sensitive data exposed.",
+            "personal data in output.",
             "personally identifiable information in output.",
             "Exposed token in CI.",
             "Breached credential in output.",
@@ -3530,6 +3553,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "客户名称=北京公司",
             "租户名称：腾讯云",
             "组织名=研发一部",
+            "个人信息",
             "发现敏感数据",
             "请在生产数据库上运行迁移。",
             "请轮换生产密码。",
@@ -5547,7 +5571,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(report["shard_coverage_gap_counts"], {"remote_source_not_materialized": 1})
         self.assertEqual(report["repairable_coverage_gap_counts"], {"remote_source_not_materialized": 1})
 
-    def test_dry_run_report_shows_non_repairable_gap_note_with_next_command(self) -> None:
+    def test_dry_run_report_treats_summary_gaps_as_repairable_with_next_command(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "weekly-dry-run"
             scan = root / "scan"
@@ -5555,6 +5579,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
             scan.mkdir(parents=True)
             shards.mkdir()
             write_jsonl(shards / "shards.jsonl", [])
+            source_root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-summary-gap.jsonl"
+            rollout = source_root / rollout_ref
+            write_jsonl(rollout, [message("user", "Repairable summary backing.", "2026-05-01T10:00:00Z")])
+            summary_ref = "sessions/2026/05/01/rollout-summary-summary-gap.jsonl"
+            summary = source_root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size - 1,
+                        scan_truncated=True,
+                    )
+                ],
+            )
             report = MODULE.dry_run_report(
                 kind="weekly_dry_run",
                 root=root,
@@ -5567,22 +5607,967 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         "start": "2026-04-25T00:00:00Z",
                         "end": "2026-05-02T00:00:00Z",
                     },
-                    "sources": [{"host": "local", "status": "ready", "rollout_count": 1, "summary_count": 1}],
+                    "sources": [
+                        {
+                            "host": "local",
+                            "root": str(source_root),
+                            "root_ref": MODULE.path_ref(source_root),
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "rollout_refs": [rollout_ref],
+                            "summary_count": 1,
+                            "summary_refs": [summary_ref],
+                        }
+                    ],
                     "coverage_gaps": [
                         {"host": "local", "reason": "oversized_rollout_skipped"},
-                        {"host": "local", "reason": "truncated_rollout_summary"},
+                        {
+                            "host": "local",
+                            "root_ref": MODULE.path_ref(source_root),
+                            "path_ref": MODULE.path_ref(summary),
+                            "reason": "truncated_rollout_summary",
+                        },
                     ],
                 },
                 next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run",
             )
             markdown = MODULE.dry_run_report_markdown(report)
 
-        self.assertEqual(report["repairable_coverage_gap_counts"], {"oversized_rollout_skipped": 1})
+        self.assertEqual(
+            report["repairable_coverage_gap_counts"],
+            {"oversized_rollout_skipped": 1, "truncated_rollout_summary": 1},
+        )
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "repairable_coverage_gaps")
+        self.assertIn("Repairable coverage gaps: oversized_rollout_skipped=1, truncated_rollout_summary=1", markdown)
+        self.assertNotIn("Next command note:", markdown)
+
+    def test_dry_run_next_command_uses_manifest_for_repairable_summary_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            source_root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-summary-gap.jsonl"
+            rollout = source_root / rollout_ref
+            write_jsonl(rollout, [message("user", "Repairable summary backing.", "2026-05-01T10:00:00Z")])
+            summary_ref = "sessions/2026/05/01/rollout-summary-summary-gap.jsonl"
+            summary = source_root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size - 1,
+                        scan_truncated=True,
+                    )
+                ],
+            )
+            output = safe_output_dir(raw, "weekly-dry-run")
+            window = {
+                "mode": "weekly",
+                "start": "2026-04-25T00:00:00Z",
+                "end": "2026-05-02T00:00:00Z",
+            }
+            manifest = {
+                "schema_version": 1,
+                "mode": "weekly",
+                "window": window,
+                "sources": [
+                    {
+                        "host": "local",
+                        "root": str(source_root),
+                        "root_ref": MODULE.path_ref(source_root),
+                        "status": "ready",
+                        "rollout_count": 1,
+                        "rollout_refs": [rollout_ref],
+                        "summary_count": 1,
+                        "summary_refs": [summary_ref],
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "local",
+                        "root_ref": MODULE.path_ref(source_root),
+                        "path_ref": MODULE.path_ref(summary),
+                        "reason": "truncated_rollout_summary",
+                    },
+                ],
+            }
+
+            def fake_run_scan(scan_args: types.SimpleNamespace, *, mode: str, start: dt.datetime, end: dt.datetime) -> None:
+                scan_dir = Path(scan_args.output)
+                scan_dir.mkdir(parents=True)
+                (scan_dir / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            def fake_run_make_shards_for_scan(scan_dir: Path, shards_dir: Path, *, max_raw_bytes: int) -> None:
+                shards_dir.mkdir(parents=True)
+                write_jsonl(shards_dir / "shards.jsonl", [])
+
+            with (
+                mock.patch.object(MODULE, "run_scan", fake_run_scan),
+                mock.patch.object(MODULE, "validate_output_run", return_value=({"turn_count": 1, "episode_count": 1, "window": window}, {})),
+                mock.patch.object(MODULE, "run_make_shards_for_scan", fake_run_make_shards_for_scan),
+            ):
+                _root, report = MODULE.run_dry_run(
+                    types.SimpleNamespace(
+                        max_raw_bytes=200,
+                        output=str(output),
+                        source=[f"local={source_root}"],
+                        allow_partial_hosts=True,
+                    ),
+                    kind="weekly_dry_run",
+                    mode="weekly",
+                    start=MODULE.parse_time("2026-04-25T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    next_command_name="weekly-repair",
+                )
+
+        expected_root = output.absolute().as_posix()
+        self.assertEqual(report["repairable_coverage_gap_counts"], {"truncated_rollout_summary": 1})
+        self.assertIn("next_command", report)
+        self.assertEqual(
+            MODULE.shlex.split(report["next_command"]),
+            [
+                "python3",
+                Path(MODULE.__file__).resolve().as_posix(),
+                "weekly-repair",
+                "--run-dir",
+                expected_root,
+                "--allow-partial-hosts",
+            ],
+        )
+
+    def test_dry_run_next_command_uses_suggested_cap_for_summary_gap_repairability(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            source_root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-suggested-cap.jsonl"
+            rollout = source_root / rollout_ref
+            write_jsonl(rollout, [message("user", "x" * 5000, "2026-05-01T10:00:00Z")])
+            summary_ref = "sessions/2026/05/01/rollout-summary-suggested-cap.jsonl"
+            summary = source_root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size - 1,
+                        scan_truncated=True,
+                    )
+                ],
+            )
+            output = safe_output_dir(raw, "weekly-dry-run")
+            window = {
+                "mode": "weekly",
+                "start": "2026-04-25T00:00:00Z",
+                "end": "2026-05-02T00:00:00Z",
+            }
+            manifest = {
+                "schema_version": 1,
+                "mode": "weekly",
+                "window": window,
+                "sources": [
+                    {
+                        "host": "local",
+                        "root": str(source_root),
+                        "root_ref": MODULE.path_ref(source_root),
+                        "status": "ready",
+                        "rollout_count": 1,
+                        "rollout_refs": [rollout_ref],
+                        "summary_count": 1,
+                        "summary_refs": [summary_ref],
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "local",
+                        "root_ref": MODULE.path_ref(source_root),
+                        "path_ref": MODULE.path_ref(rollout),
+                        "reason": "oversized_rollout_skipped",
+                        "bytes": rollout.stat().st_size,
+                    },
+                    {
+                        "host": "local",
+                        "root_ref": MODULE.path_ref(source_root),
+                        "path_ref": MODULE.path_ref(summary),
+                        "reason": "truncated_rollout_summary",
+                    },
+                ],
+            }
+
+            def fake_run_scan(scan_args: types.SimpleNamespace, *, mode: str, start: dt.datetime, end: dt.datetime) -> None:
+                scan_dir = Path(scan_args.output)
+                scan_dir.mkdir(parents=True)
+                (scan_dir / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            def fake_run_make_shards_for_scan(scan_dir: Path, shards_dir: Path, *, max_raw_bytes: int) -> None:
+                shards_dir.mkdir(parents=True)
+                write_jsonl(shards_dir / "shards.jsonl", [])
+
+            with (
+                mock.patch.object(MODULE, "DEFAULT_REPAIR_MAX_RAW_BYTES", 4096),
+                mock.patch.object(MODULE, "run_scan", fake_run_scan),
+                mock.patch.object(MODULE, "validate_output_run", return_value=({"turn_count": 1, "episode_count": 1, "window": window}, {})),
+                mock.patch.object(MODULE, "run_make_shards_for_scan", fake_run_make_shards_for_scan),
+            ):
+                _root, report = MODULE.run_dry_run(
+                    types.SimpleNamespace(
+                        max_raw_bytes=200,
+                        output=str(output),
+                        source=[f"local={source_root}"],
+                        allow_partial_hosts=True,
+                    ),
+                    kind="weekly_dry_run",
+                    mode="weekly",
+                    start=MODULE.parse_time("2026-04-25T00:00:00Z"),
+                    end=MODULE.parse_time("2026-05-02T00:00:00Z"),
+                    next_command_name="weekly-repair",
+                )
+
+        self.assertEqual(
+            report["repairable_coverage_gap_counts"],
+            {"oversized_rollout_skipped": 1, "truncated_rollout_summary": 1},
+        )
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {})
+        self.assertEqual(
+            MODULE.shlex.split(report["next_command"]),
+            [
+                "python3",
+                Path(MODULE.__file__).resolve().as_posix(),
+                "weekly-repair",
+                "--run-dir",
+                output.absolute().as_posix(),
+                "--max-raw-bytes",
+                "1048576",
+                "--allow-partial-hosts",
+            ],
+        )
+
+    def test_dry_run_report_keeps_summary_gap_non_repairable_when_backing_rollout_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            source_root = Path(raw) / ".codex"
+            summary_ref = "sessions/2026/05/01/rollout-summary-missing-backing.jsonl"
+            summary = source_root / summary_ref
+            missing_rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-missing.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=missing_rollout_ref,
+                        source_bytes=123,
+                        scan_truncated=True,
+                    )
+                ],
+            )
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [
+                        {
+                            "host": "local",
+                            "root": str(source_root),
+                            "root_ref": MODULE.path_ref(source_root),
+                            "status": "ready",
+                            "rollout_count": 0,
+                            "rollout_refs": [],
+                            "summary_count": 1,
+                            "summary_refs": [summary_ref],
+                        }
+                    ],
+                    "coverage_gaps": [
+                        {
+                            "host": "local",
+                            "root_ref": MODULE.path_ref(source_root),
+                            "path_ref": MODULE.path_ref(summary),
+                            "reason": "truncated_rollout_summary",
+                        },
+                    ],
+                },
+                next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run",
+            )
+            markdown = MODULE.dry_run_report_markdown(report)
+
+        self.assertEqual(report["repairable_coverage_gap_counts"], {})
         self.assertEqual(report["non_repairable_coverage_gap_counts"], {"truncated_rollout_summary": 1})
         self.assertEqual(report["report_summary"]["retained_readiness"], "blocked_by_coverage_gaps")
         self.assertIn("Non-repairable coverage gaps: truncated_rollout_summary=1", markdown)
-        self.assertIn("next command repairs only repairable gaps", report["next_command_note"])
-        self.assertIn("Next command note: next command repairs only repairable gaps", markdown)
+
+    def test_dry_run_report_keeps_summary_gap_non_repairable_when_backing_rollout_has_no_raw_coverage(
+        self,
+    ) -> None:
+        cases = {
+            "empty": "",
+            "malformed": "{not-json\n",
+            "outside-window": json.dumps(message("user", "Too old.", "2026-04-20T10:00:00Z")) + "\n",
+        }
+        for label, content in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / "weekly-dry-run"
+                scan = root / "scan"
+                shards = root / "shards"
+                scan.mkdir(parents=True)
+                shards.mkdir()
+                write_jsonl(shards / "shards.jsonl", [])
+                source_root = Path(raw) / ".codex"
+                rollout_ref = f"sessions/2026/05/01/rollout-2026-05-01T10-00-00-{label}.jsonl"
+                rollout = source_root / rollout_ref
+                rollout.parent.mkdir(parents=True, exist_ok=True)
+                rollout.write_text(content, encoding="utf-8")
+                summary_ref = f"sessions/2026/05/01/rollout-summary-{label}.jsonl"
+                summary = source_root / summary_ref
+                write_jsonl(
+                    summary,
+                    [
+                        complete_rollout_summary_scan_meta(
+                            rollout=rollout_ref,
+                            source_bytes=rollout.stat().st_size,
+                            scan_truncated=True,
+                        )
+                    ],
+                )
+                report = MODULE.dry_run_report(
+                    kind="weekly_dry_run",
+                    root=root,
+                    scan_dir=scan,
+                    shards_dir=shards,
+                    trend={"turn_count": 1, "episode_count": 1},
+                    manifest={
+                        "window": {
+                            "mode": "weekly",
+                            "start": "2026-04-25T00:00:00Z",
+                            "end": "2026-05-02T00:00:00Z",
+                        },
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(source_root),
+                                "root_ref": MODULE.path_ref(source_root),
+                                "status": "ready",
+                                "rollout_count": 1,
+                                "rollout_refs": [rollout_ref],
+                                "summary_count": 1,
+                                "summary_refs": [summary_ref],
+                            }
+                        ],
+                        "coverage_gaps": [
+                            {
+                                "host": "local",
+                                "root_ref": MODULE.path_ref(source_root),
+                                "path_ref": MODULE.path_ref(summary),
+                                "reason": "truncated_rollout_summary",
+                            },
+                        ],
+                    },
+                    next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run",
+                )
+
+                self.assertEqual(report["repairable_coverage_gap_counts"], {})
+                self.assertEqual(report["non_repairable_coverage_gap_counts"], {"truncated_rollout_summary": 1})
+                self.assertEqual(report["report_summary"]["retained_readiness"], "blocked_by_coverage_gaps")
+
+    def test_dry_run_report_keeps_summary_gap_non_repairable_when_old_backing_rollout_is_malformed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            source_root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/04/01/rollout-2026-04-01T10-00-00-malformed-window-timestamp.jsonl"
+            rollout = source_root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text('{"timestamp":"2026-05-01T10:00:00Z",\n', encoding="utf-8")
+            summary_ref = "sessions/2026/05/01/rollout-summary-malformed-old-backing.jsonl"
+            summary = source_root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        scan_truncated=True,
+                    )
+                ],
+            )
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [
+                        {
+                            "host": "local",
+                            "root": str(source_root),
+                            "root_ref": MODULE.path_ref(source_root),
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "rollout_refs": [rollout_ref],
+                            "summary_count": 1,
+                            "summary_refs": [summary_ref],
+                        }
+                    ],
+                    "coverage_gaps": [
+                        {
+                            "host": "local",
+                            "root_ref": MODULE.path_ref(source_root),
+                            "path_ref": MODULE.path_ref(summary),
+                            "reason": "truncated_rollout_summary",
+                        },
+                    ],
+                },
+                next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run",
+            )
+
+        self.assertEqual(report["repairable_coverage_gap_counts"], {})
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"truncated_rollout_summary": 1})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "blocked_by_coverage_gaps")
+
+    def test_summary_limited_scan_raw_coverage_requires_exact_backing_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            source_root = Path(raw) / ".codex"
+            active_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-duplicate.jsonl"
+            archived_ref = "archived_sessions/2026/05/01/rollout-2026-05-01T10-00-00-duplicate.jsonl"
+            summary = source_root / "sessions/2026/05/01/rollout-summary-duplicate.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=archived_ref,
+                        source_bytes=1200,
+                        scan_truncated=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "rollout": archived_ref,
+                        "text": "Archived backing summary.",
+                    },
+                ],
+            )
+
+            self.assertFalse(
+                MODULE.summary_limited_scan_gap_has_raw_coverage(
+                    summary,
+                    source_root=source_root,
+                    max_scan_bytes=summary.stat().st_size + 1024,
+                    materialized_rollout_refs={active_ref},
+                )
+            )
+            self.assertTrue(
+                MODULE.summary_limited_scan_gap_has_raw_coverage(
+                    summary,
+                    source_root=source_root,
+                    max_scan_bytes=summary.stat().st_size + 1024,
+                    materialized_rollout_refs={archived_ref},
+                )
+            )
+
+    def test_dry_run_report_keeps_summary_gap_non_repairable_when_only_alias_rollout_is_rescannable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            source_root = Path(raw) / ".codex"
+            active_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-alias.jsonl"
+            archived_ref = "archived_sessions/2026/05/01/rollout-2026-05-01T10-00-00-alias.jsonl"
+            active = source_root / active_ref
+            write_jsonl(active, [message("user", "Active alias.", "2026-05-01T10:00:00Z")])
+            summary_ref = "sessions/2026/05/01/rollout-summary-alias-backing.jsonl"
+            summary = source_root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=archived_ref,
+                        source_bytes=active.stat().st_size,
+                        scan_truncated=True,
+                    )
+                ],
+            )
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-05-01T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [
+                        {
+                            "host": "local",
+                            "root": str(source_root),
+                            "root_ref": MODULE.path_ref(source_root),
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "rollout_refs": [active_ref],
+                            "summary_count": 1,
+                            "summary_refs": [summary_ref],
+                        }
+                    ],
+                    "coverage_gaps": [
+                        {
+                            "host": "local",
+                            "root_ref": MODULE.path_ref(source_root),
+                            "path_ref": MODULE.path_ref(summary),
+                            "reason": "truncated_rollout_summary",
+                        },
+                    ],
+                },
+                next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run",
+            )
+
+        self.assertEqual(report["repairable_coverage_gap_counts"], {})
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"truncated_rollout_summary": 1})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "blocked_by_coverage_gaps")
+
+    def test_dry_run_report_keeps_summary_gap_non_repairable_when_backing_rollout_exceeds_repair_limit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            source_root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-oversized-backing.jsonl"
+            rollout = source_root / rollout_ref
+            write_jsonl(rollout, [message("user", "x" * 5000, "2026-05-01T10:00:00Z")])
+            summary_ref = "sessions/2026/05/01/rollout-summary-oversized-backing.jsonl"
+            summary = source_root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size - 1,
+                        scan_truncated=True,
+                    )
+                ],
+            )
+            manifest = {
+                "window": {
+                    "mode": "weekly",
+                    "start": "2026-04-25T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "local",
+                        "root": str(source_root),
+                        "root_ref": MODULE.path_ref(source_root),
+                        "status": "ready",
+                        "rollout_count": 1,
+                        "rollout_refs": [rollout_ref],
+                        "summary_count": 1,
+                        "summary_refs": [summary_ref],
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "local",
+                        "root_ref": MODULE.path_ref(source_root),
+                        "path_ref": MODULE.path_ref(summary),
+                        "reason": "truncated_rollout_summary",
+                    },
+                ],
+            }
+
+            with mock.patch.object(MODULE, "DEFAULT_REPAIR_MAX_RAW_BYTES", 4096):
+                report = MODULE.dry_run_report(
+                    kind="weekly_dry_run",
+                    root=root,
+                    scan_dir=scan,
+                    shards_dir=shards,
+                    trend={"turn_count": 1, "episode_count": 1},
+                    manifest=manifest,
+                    next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run",
+                )
+
+        self.assertEqual(report["repairable_coverage_gap_counts"], {})
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"truncated_rollout_summary": 1})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "blocked_by_coverage_gaps")
+
+    def test_dry_run_report_uses_follow_up_cap_for_summary_gap_repairability(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            source_root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-follow-up-cap.jsonl"
+            rollout = source_root / rollout_ref
+            write_jsonl(rollout, [message("user", "x" * 5000, "2026-05-01T10:00:00Z")])
+            summary_ref = "sessions/2026/05/01/rollout-summary-follow-up-cap.jsonl"
+            summary = source_root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size - 1,
+                        scan_truncated=True,
+                    )
+                ],
+            )
+            manifest = {
+                "window": {
+                    "mode": "weekly",
+                    "start": "2026-04-25T00:00:00Z",
+                    "end": "2026-05-02T00:00:00Z",
+                },
+                "sources": [
+                    {
+                        "host": "local",
+                        "root": str(source_root),
+                        "root_ref": MODULE.path_ref(source_root),
+                        "status": "ready",
+                        "rollout_count": 1,
+                        "rollout_refs": [rollout_ref],
+                        "summary_count": 1,
+                        "summary_refs": [summary_ref],
+                    }
+                ],
+                "coverage_gaps": [
+                    {
+                        "host": "local",
+                        "root_ref": MODULE.path_ref(source_root),
+                        "path_ref": MODULE.path_ref(rollout),
+                        "reason": "oversized_rollout_skipped",
+                        "bytes": rollout.stat().st_size,
+                    },
+                    {
+                        "host": "local",
+                        "root_ref": MODULE.path_ref(source_root),
+                        "path_ref": MODULE.path_ref(summary),
+                        "reason": "truncated_rollout_summary",
+                    },
+                ],
+            }
+
+            with mock.patch.object(MODULE, "DEFAULT_REPAIR_MAX_RAW_BYTES", 4096):
+                report = MODULE.dry_run_report(
+                    kind="weekly_dry_run",
+                    root=root,
+                    scan_dir=scan,
+                    shards_dir=shards,
+                    trend={"turn_count": 1, "episode_count": 1},
+                    manifest=manifest,
+                    next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run --max-raw-bytes 8192",
+                    repair_max_raw_bytes=8192,
+                )
+
+        self.assertEqual(
+            report["repairable_coverage_gap_counts"],
+            {"oversized_rollout_skipped": 1, "truncated_rollout_summary": 1},
+        )
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "repairable_coverage_gaps")
+
+    def test_dry_run_report_keeps_summary_gap_non_repairable_when_any_safe_backing_rollout_is_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            source_root = Path(raw) / ".codex"
+            existing_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-existing.jsonl"
+            missing_ref = "sessions/2026/05/01/rollout-2026-05-01T10-05-00-missing.jsonl"
+            existing = source_root / existing_ref
+            write_jsonl(existing, [message("user", "Existing backing.", "2026-05-01T10:00:00Z")])
+            summary_ref = "sessions/2026/05/01/rollout-summary-mixed-backing.jsonl"
+            summary = source_root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=existing_ref,
+                        source_bytes=existing.stat().st_size - 1,
+                        scan_truncated=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:05:00Z",
+                        "rollout": missing_ref,
+                        "text": "Missing safe backing ref should keep this summary non-repairable.",
+                    },
+                ],
+            )
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [
+                        {
+                            "host": "local",
+                            "root": str(source_root),
+                            "root_ref": MODULE.path_ref(source_root),
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "rollout_refs": [existing_ref],
+                            "summary_count": 1,
+                            "summary_refs": [summary_ref],
+                        }
+                    ],
+                    "coverage_gaps": [
+                        {
+                            "host": "local",
+                            "root_ref": MODULE.path_ref(source_root),
+                            "path_ref": MODULE.path_ref(summary),
+                            "reason": "truncated_rollout_summary",
+                        },
+                    ],
+                },
+                next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run",
+            )
+
+        self.assertEqual(report["repairable_coverage_gap_counts"], {})
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"truncated_rollout_summary": 1})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "blocked_by_coverage_gaps")
+
+    def test_dry_run_report_keeps_summary_gap_non_repairable_when_backing_rollout_is_outside_window(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            source_root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/04/01/rollout-2026-04-01T10-00-00-old-backing.jsonl"
+            rollout = source_root / rollout_ref
+            write_jsonl(rollout, [message("user", "Old backing.", "2026-04-01T10:00:00Z")])
+            summary_ref = "sessions/2026/05/01/rollout-summary-old-backing.jsonl"
+            summary = source_root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size - 1,
+                        scan_truncated=True,
+                    )
+                ],
+            )
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [
+                        {
+                            "host": "local",
+                            "root": str(source_root),
+                            "root_ref": MODULE.path_ref(source_root),
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "rollout_refs": [rollout_ref],
+                            "summary_count": 1,
+                            "summary_refs": [summary_ref],
+                        }
+                    ],
+                    "coverage_gaps": [
+                        {
+                            "host": "local",
+                            "root_ref": MODULE.path_ref(source_root),
+                            "path_ref": MODULE.path_ref(summary),
+                            "reason": "truncated_rollout_summary",
+                        },
+                    ],
+                },
+                next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run",
+            )
+
+        self.assertEqual(report["repairable_coverage_gap_counts"], {})
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"truncated_rollout_summary": 1})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "blocked_by_coverage_gaps")
+
+    def test_dry_run_report_keeps_summary_gap_non_repairable_when_summary_has_unsafe_backing_record(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            source_root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-safe.jsonl"
+            rollout = source_root / rollout_ref
+            write_jsonl(rollout, [message("user", "Repairable backing exists.", "2026-05-01T10:00:00Z")])
+            summary_ref = "sessions/2026/05/01/rollout-summary-unsafe-backing-record.jsonl"
+            summary = source_root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size - 1,
+                        scan_truncated=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "rollout": "../rollout-escape.jsonl",
+                        "text": "Unsafe backing ref should keep this summary non-repairable.",
+                    },
+                ],
+            )
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [
+                        {
+                            "host": "local",
+                            "root": str(source_root),
+                            "root_ref": MODULE.path_ref(source_root),
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "rollout_refs": [rollout_ref],
+                            "summary_count": 1,
+                            "summary_refs": [summary_ref],
+                        }
+                    ],
+                    "coverage_gaps": [
+                        {
+                            "host": "local",
+                            "root_ref": MODULE.path_ref(source_root),
+                            "path_ref": MODULE.path_ref(summary),
+                            "reason": "truncated_rollout_summary",
+                        },
+                    ],
+                },
+                next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run",
+            )
+
+        self.assertEqual(report["repairable_coverage_gap_counts"], {})
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"truncated_rollout_summary": 1})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "blocked_by_coverage_gaps")
+
+    def test_dry_run_report_keeps_summary_gap_non_repairable_when_summary_is_malformed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "weekly-dry-run"
+            scan = root / "scan"
+            shards = root / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            source_root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-safe.jsonl"
+            rollout = source_root / rollout_ref
+            write_jsonl(rollout, [message("user", "Repairable backing exists.", "2026-05-01T10:00:00Z")])
+            summary_ref = "sessions/2026/05/01/rollout-summary-malformed.jsonl"
+            summary = source_root / summary_ref
+            summary.parent.mkdir(parents=True, exist_ok=True)
+            summary.write_text(
+                json.dumps(
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size - 1,
+                        scan_truncated=True,
+                    )
+                )
+                + "\n{not json\n",
+                encoding="utf-8",
+            )
+            report = MODULE.dry_run_report(
+                kind="weekly_dry_run",
+                root=root,
+                scan_dir=scan,
+                shards_dir=shards,
+                trend={"turn_count": 1, "episode_count": 1},
+                manifest={
+                    "window": {
+                        "mode": "weekly",
+                        "start": "2026-04-25T00:00:00Z",
+                        "end": "2026-05-02T00:00:00Z",
+                    },
+                    "sources": [
+                        {
+                            "host": "local",
+                            "root": str(source_root),
+                            "root_ref": MODULE.path_ref(source_root),
+                            "status": "ready",
+                            "rollout_count": 1,
+                            "rollout_refs": [rollout_ref],
+                            "summary_count": 1,
+                            "summary_refs": [summary_ref],
+                        }
+                    ],
+                    "coverage_gaps": [
+                        {
+                            "host": "local",
+                            "root_ref": MODULE.path_ref(source_root),
+                            "path_ref": MODULE.path_ref(summary),
+                            "reason": "truncated_rollout_summary",
+                        },
+                    ],
+                },
+                next_command="python3 session_retrospective.py weekly-repair --run-dir weekly-dry-run",
+            )
+
+        self.assertEqual(report["repairable_coverage_gap_counts"], {})
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"truncated_rollout_summary": 1})
+        self.assertEqual(report["report_summary"]["retained_readiness"], "blocked_by_coverage_gaps")
 
     def test_dry_run_report_notes_when_only_non_repairable_gaps_remain(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -5604,15 +6589,15 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         "start": "2026-04-25T00:00:00Z",
                         "end": "2026-05-02T00:00:00Z",
                     },
-                    "sources": [{"host": "local", "status": "stale", "rollout_count": 1, "summary_count": 1}],
-                    "coverage_gaps": [{"host": "local", "reason": "stale_rollout_summary"}],
+                    "sources": [{"host": "local", "status": "stale", "rollout_count": 1, "summary_count": 0}],
+                    "coverage_gaps": [{"host": "local", "reason": "invalid_jsonl"}],
                 },
             )
             markdown = MODULE.dry_run_report_markdown(report)
 
         self.assertNotIn("next_command", report)
         self.assertEqual(report["repairable_coverage_gap_counts"], {})
-        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"stale_rollout_summary": 1})
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {"invalid_jsonl": 1})
         self.assertIn("no transient repair command for non-repairable gaps", report["next_command_note"])
         self.assertIn("Next command: none (no transient repair command for non-repairable gaps", markdown)
 
@@ -6087,6 +7072,200 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("Before gaps:", markdown)
         self.assertIn("After gaps:", markdown)
 
+    def test_weekly_repair_can_clear_stale_and_truncated_summary_gaps_with_direct_raw_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            source_root = Path(raw) / ".codex"
+            write_local_evidence(source_root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-repairable.jsonl"
+            rollout = source_root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            write_jsonl(rollout, [message("user", "Fresh repaired task.", "2026-05-01T10:00:00Z")])
+            with rollout.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(message("assistant", "Done.", "2026-05-01T10:01:00Z")) + "\n")
+                handle.write(json.dumps(message("user", "Follow-up repaired task.", "2026-05-01T10:02:00Z")) + "\n")
+            summary = source_root / "sessions" / "2026" / "05" / "01" / "rollout-summary-repairable.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size - 1,
+                        scan_truncated=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Stale summary should not be used.",
+                    },
+                ],
+            )
+            run_dir = Path(raw) / ".codex-local" / "session-retrospective" / "runs" / "weekly-dry-run"
+            scan = run_dir / "scan"
+            shards = run_dir / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            (scan / "shard_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "mode": "weekly",
+                        "window": {
+                            "mode": "weekly",
+                            "start": "2026-05-01T00:00:00Z",
+                            "end": "2026-05-02T00:00:00Z",
+                        },
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(source_root),
+                                "root_ref": MODULE.path_ref(source_root),
+                                "status": "stale",
+                                "rollout_count": 1,
+                                "summary_count": 1,
+                            }
+                        ],
+                        "coverage_gaps": [
+                            {"host": "local", "reason": "stale_rollout_summary"},
+                            {"host": "local", "reason": "truncated_rollout_summary"},
+                        ],
+                        "redaction_policy_version": "test",
+                        "retention_safe": False,
+                        "retention_note": "test",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            MODULE.main(
+                [
+                    "weekly-repair",
+                    "--run-dir",
+                    str(run_dir),
+                    "--skip-remote-materialization",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    str(rollout.stat().st_size + 1024),
+                ]
+            )
+            repair = run_dir / "weekly-coverage-repair"
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            rows = [
+                json.loads(line)
+                for line in (repair / "scan" / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(report["repair"]["before_coverage_gap_counts"], {"stale_rollout_summary": 1, "truncated_rollout_summary": 1})
+        after_counts = dict(report["repair"]["after_coverage_gap_counts"])
+        after_counts.pop("partial_host_scope", None)
+        self.assertEqual(after_counts, {})
+        self.assertEqual(
+            [gap for gap in trend["coverage_gaps"] if gap.get("reason") != "partial_host_scope"],
+            [],
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertNotIn("Stale summary should not be used.", json.dumps(rows))
+
+    def test_weekly_repair_can_clear_pure_truncated_summary_gap_with_direct_raw_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            source_root = Path(raw) / ".codex"
+            write_local_evidence(source_root)
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-pure-truncated.jsonl"
+            rollout = source_root / rollout_ref
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Pure truncated repair task.", "2026-05-01T10:00:00Z"),
+                    message("assistant", "Done.", "2026-05-01T10:01:00Z"),
+                ],
+            )
+            summary = source_root / "sessions" / "2026" / "05" / "01" / "rollout-summary-pure-truncated.jsonl"
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        scan_truncated=True,
+                    ),
+                    {
+                        "kind": "user_message",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "rollout": rollout_ref,
+                        "text": "Truncated summary should not be used. permission denied",
+                    },
+                ],
+            )
+            run_dir = Path(raw) / ".codex-local" / "session-retrospective" / "runs" / "weekly-dry-run"
+            scan = run_dir / "scan"
+            shards = run_dir / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            write_jsonl(shards / "shards.jsonl", [])
+            (scan / "shard_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "mode": "weekly",
+                        "window": {
+                            "mode": "weekly",
+                            "start": "2026-05-01T00:00:00Z",
+                            "end": "2026-05-02T00:00:00Z",
+                        },
+                        "sources": [
+                            {
+                                "host": "local",
+                                "root": str(source_root),
+                                "root_ref": MODULE.path_ref(source_root),
+                                "status": "stale",
+                                "rollout_count": 1,
+                                "summary_count": 1,
+                            }
+                        ],
+                        "coverage_gaps": [
+                            {"host": "local", "reason": "truncated_rollout_summary"},
+                        ],
+                        "redaction_policy_version": "test",
+                        "retention_safe": False,
+                        "retention_note": "test",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            MODULE.main(
+                [
+                    "weekly-repair",
+                    "--run-dir",
+                    str(run_dir),
+                    "--skip-remote-materialization",
+                    "--allow-partial-hosts",
+                    "--max-raw-bytes",
+                    str(rollout.stat().st_size + 1024),
+                ]
+            )
+            repair = run_dir / "weekly-coverage-repair"
+            report = json.loads((repair / "repair_report.json").read_text(encoding="utf-8"))
+            trend = json.loads((repair / "scan" / "trend_report.json").read_text(encoding="utf-8"))
+            rows = [
+                json.loads(line)
+                for line in (repair / "scan" / "turn_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(report["repair"]["before_coverage_gap_counts"], {"truncated_rollout_summary": 1})
+        after_counts = dict(report["repair"]["after_coverage_gap_counts"])
+        after_counts.pop("partial_host_scope", None)
+        self.assertEqual(after_counts, {})
+        self.assertEqual(
+            [gap for gap in trend["coverage_gaps"] if gap.get("reason") != "partial_host_scope"],
+            [],
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("Truncated summary should not be used.", json.dumps(rows))
+
     def test_weekly_repair_materializes_hosts_from_shard_only_remote_gap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             run_dir = Path(raw) / "weekly-dry-run"
@@ -6516,6 +7695,201 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(dry_report["kind"], "weekly_dry_run")
         self.assertEqual(repair_report["kind"], "weekly_repair")
         self.assertTrue(repaired_shards_exist)
+
+    def test_weekly_dry_run_repair_uses_dry_run_suggested_cap_by_default(self) -> None:
+        cases = [
+            (None, 1048576),
+            (20000, 20000),
+        ]
+        for explicit_cap, expected_cap in cases:
+            with self.subTest(explicit_cap=explicit_cap), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / ".codex-local" / "session-retrospective" / "weekly-dry-run"
+                calls: list[argparse.Namespace] = []
+
+                def fake_run_dry_run(
+                    args: argparse.Namespace,
+                    *,
+                    kind: str,
+                    mode: str,
+                    start: dt.datetime,
+                    end: dt.datetime,
+                    next_command_name: str,
+                ) -> tuple[Path, dict]:
+                    del args, kind, mode, start, end, next_command_name
+                    return root, {
+                        "repairable_coverage_gap_counts": {"oversized_rollout_skipped": 1},
+                        "next_repair_max_raw_bytes": 1048576,
+                    }
+
+                def fake_run_coverage_repair(
+                    args: argparse.Namespace,
+                    *,
+                    default_output_name: str,
+                    report_kind: str,
+                ) -> Path:
+                    del default_output_name, report_kind
+                    calls.append(args)
+                    return Path(args.output)
+
+                with (
+                    mock.patch.object(MODULE, "run_dry_run", fake_run_dry_run),
+                    mock.patch.object(MODULE, "run_coverage_repair", fake_run_coverage_repair),
+                    mock.patch.object(sys, "stdout", io.StringIO()),
+                ):
+                    MODULE.cmd_weekly_dry_run(
+                        argparse.Namespace(
+                            days=7,
+                            end="2026-05-02T00:00:00Z",
+                            repair=True,
+                            repair_output=None,
+                            repair_max_raw_bytes=explicit_cap,
+                            repair_remote_probe=None,
+                            repair_remote_session_meta_limit=500,
+                            repair_remote_host_jobs=2,
+                            repair_remote_rollout_jobs=2,
+                            repair_skip_remote_materialization=True,
+                            allow_partial_hosts=True,
+                        )
+                    )
+
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0].max_raw_bytes, expected_cap)
+
+    def test_repair_report_uses_emitted_follow_up_cap_for_summary_gap_repairability(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            input_run = Path(raw) / ".codex-local" / "session-retrospective" / "weekly-dry-run"
+            scan = input_run / "scan"
+            shards = input_run / "shards"
+            scan.mkdir(parents=True)
+            shards.mkdir()
+            (shards / "shards.jsonl").write_text("", encoding="utf-8")
+            source_root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-follow-up-report-cap.jsonl"
+            rollout = source_root / rollout_ref
+            write_jsonl(rollout, [message("user", "x" * 5000, "2026-05-01T10:00:00Z")])
+            summary_ref = "sessions/2026/05/01/rollout-summary-follow-up-report-cap.jsonl"
+            summary = source_root / summary_ref
+            write_jsonl(
+                summary,
+                [
+                    complete_rollout_summary_scan_meta(
+                        rollout=rollout_ref,
+                        source_bytes=rollout.stat().st_size,
+                        scan_truncated=True,
+                    )
+                ],
+            )
+            source_entry = {
+                "host": "local",
+                "root": str(source_root),
+                "root_ref": MODULE.path_ref(source_root),
+                "status": "ready",
+                "rollout_count": 1,
+                "rollout_refs": [rollout_ref],
+                "summary_count": 1,
+                "summary_refs": [summary_ref],
+            }
+            (scan / "shard_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "mode": "weekly",
+                        "window": {
+                            "mode": "weekly",
+                            "start": "2026-05-01T00:00:00Z",
+                            "end": "2026-05-02T00:00:00Z",
+                        },
+                        "sources": [source_entry],
+                        "coverage_gaps": [
+                            {
+                                "host": "local",
+                                "root_ref": MODULE.path_ref(source_root),
+                                "path_ref": MODULE.path_ref(rollout),
+                                "reason": "oversized_rollout_skipped",
+                                "bytes": rollout.stat().st_size,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_run_scan(args: argparse.Namespace, *, mode: str, start: dt.datetime, end: dt.datetime) -> None:
+                del mode, start, end
+                output = Path(args.output)
+                output.mkdir(parents=True)
+                (output / "shard_manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "mode": "weekly",
+                            "window": {
+                                "mode": "weekly",
+                                "start": "2026-05-01T00:00:00Z",
+                                "end": "2026-05-02T00:00:00Z",
+                            },
+                            "sources": [source_entry],
+                            "coverage_gaps": [
+                                {
+                                    "host": "local",
+                                    "root_ref": MODULE.path_ref(source_root),
+                                    "path_ref": MODULE.path_ref(rollout),
+                                    "reason": "oversized_rollout_skipped",
+                                    "bytes": rollout.stat().st_size,
+                                },
+                                {
+                                    "host": "local",
+                                    "root_ref": MODULE.path_ref(source_root),
+                                    "path_ref": MODULE.path_ref(summary),
+                                    "reason": "truncated_rollout_summary",
+                                },
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            def fake_run_make_shards_for_scan(scan_dir: Path, output: Path, *, max_raw_bytes: int) -> None:
+                del scan_dir, max_raw_bytes
+                output.mkdir(parents=True)
+                (output / "shards.jsonl").write_text("", encoding="utf-8")
+
+            with (
+                mock.patch.object(MODULE, "run_scan", fake_run_scan),
+                mock.patch.object(MODULE, "validate_output_run", return_value=({"turn_count": 0, "episode_count": 0}, {})),
+                mock.patch.object(MODULE, "run_make_shards_for_scan", fake_run_make_shards_for_scan),
+                mock.patch.object(sys, "stderr", io.StringIO()) as stderr,
+            ):
+                root = MODULE.run_coverage_repair(
+                    argparse.Namespace(
+                        run_dir=str(input_run),
+                        output=None,
+                        max_raw_bytes=200,
+                        remote_probe=None,
+                        remote_session_meta_limit=500,
+                        remote_host_jobs=2,
+                        remote_rollout_jobs=2,
+                        skip_remote_materialization=True,
+                        allow_partial_hosts=True,
+                    ),
+                    default_output_name="weekly-coverage-repair",
+                    report_kind="weekly_repair",
+                )
+                progress = stderr.getvalue()
+
+            report = json.loads((root / "repair_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            report["repairable_coverage_gap_counts"],
+            {"oversized_rollout_skipped": 1, "truncated_rollout_summary": 1},
+        )
+        self.assertEqual(report["non_repairable_coverage_gap_counts"], {})
+        self.assertEqual(report["next_repair_max_raw_bytes"], 1048576)
+        self.assertIn("--max-raw-bytes 1048576", report["next_command"])
+        self.assertIn("run_ref=path_ref_v1:", progress)
+        self.assertIn("output_ref=path_ref_v1:", progress)
+        self.assertNotIn(input_run.as_posix(), progress)
+        self.assertNotIn(root.as_posix(), progress)
 
     def test_baseline_dry_run_stores_absolute_source_roots_for_repair(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

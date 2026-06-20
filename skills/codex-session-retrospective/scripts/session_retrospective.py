@@ -249,6 +249,43 @@ LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 LOCAL_ROLLOUT_SUMMARY_MAX_TEXT_CHARS = 1200
 FLAG_SCAN_MAX_CHARS = 1_200
 FLAG_SCAN_CHUNK_OVERLAP_CHARS = 256
+SAFETY_PRIVACY_PREFILTER_PATTERN = re.compile(
+    r"(?:"
+    r"@|://|git@|localhost|-----BEGIN|(?<![A-Za-z0-9])(?:sk|rk)[-_]|gh[pousr]_|github_pat_|AKIA|eyJ|"
+    r"(?:^|[.\s:/_-])(?:internal|corp|local|lan|example|invalid|test)(?:$|[.\s:/?#_,;)>\]\"'_-])|"
+    r"auth(?:ori[sz]ation|Token|[\s_-]?token)?|api(?:[\s_-]?key|Token)|access[\s_-]?token|"
+    r"client(?:[\s_-]?secret|Token)?|refreshToken|idToken|sessionToken|csrfToken|xsrfToken|"
+    r"secret|token|credential|password|passwd|pwd|private[\s_-]?key|aws|bearer|basic|digest|negotiate|"
+    r"hmac|signature|oauth|customer(?:[_-]?(?:id|name)|\s+data)?|"
+    r"client(?:[_-]?(?:id|name)|\s+data)?|account[_-]?(?:id|name)?|tenant[_-]?(?:id|name)?|"
+    r"org(?:ani[sz]ation)?[_-]?(?:id|name)?|pii|personal\s+data|personally identifiable information|privacy|"
+    r"leak(?:ed)?|expos(?:e|ed|ure)?|breach(?:ed)?|sensitive|production|prod(?:[-_]|\b)|"
+    r"database|migration|migrate|rollback|deploy|rm\b|reset|delete|drop|truncate|"
+    r"密码|口令|凭据|凭证|密钥|令牌|授权|客户|客户端|租户|账户|账号|组织|机构|敏感|隐私|个人信息|生产|破坏性"
+    r")",
+    re.I,
+)
+CREDENTIAL_ASSIGNMENT_PREFILTER_PATTERN = re.compile(
+    r"(?:"
+    r"-----BEGIN|(?<![A-Za-z0-9])(?:sk|rk)[-_]|gh[pousr]_|github_pat_|AKIA|eyJ|"
+    r"auth(?:ori[sz]ation|Token|[\s_-]?token)?|api(?:[\s_-]?key|Token)|access[\s_-]?token|"
+    r"client(?:[\s_-]?secret|Token)?|refreshToken|idToken|sessionToken|csrfToken|xsrfToken|"
+    r"secret(?:[\s_-]?access[\s_-]?key|[\s_-]?key)?|token|credential|password|passwd|pwd|private[\s_-]?key|aws|"
+    r"bearer|basic|digest|negotiate|hmac|signature|oauth|--(?:api-key|token|password|passwd|pwd|credential)|"
+    r"密码|口令|凭据|凭证|密钥|令牌|授权"
+    r")",
+    re.I,
+)
+SENSITIVE_IDENTIFIER_PREFILTER_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:customer|client|account|tenant|org|organi[sz]ation)(?:[_-]?(?:id|name))?(?![A-Za-z0-9])|"
+    r"客户|客户端|租户|账户|账号|组织|机构",
+    re.I,
+)
+PRODUCTION_OR_DESTRUCTIVE_PREFILTER_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:prod(?:uction)?)(?:\b|[-_])|"
+    r"\b(?:database|migration|migrate|rollback|deploy|rm|reset|delete|drop|truncate)\b|生产|破坏性",
+    re.I,
+)
 LOCAL_GENERATED_SUMMARY_DIR_SUFFIX = "generated-rollout-summaries"
 LOCAL_GENERATED_SUMMARY_CACHE_DIR = "local-rollout-summary-cache"
 LOCAL_GENERATED_SUMMARY_CACHE_DIR_NAMES = frozenset({LOCAL_GENERATED_SUMMARY_CACHE_DIR})
@@ -569,7 +606,10 @@ ALLOWED_REMOTE_GAP_REASONS = {
     "unreachable",
 }
 OVERSIZED_REPAIRABLE_GAP_REASONS = frozenset({"oversized_rollout_skipped", "oversized_summary_skipped"})
-REPAIRABLE_COVERAGE_GAP_REASONS = frozenset(ALLOWED_REMOTE_GAP_REASONS | OVERSIZED_REPAIRABLE_GAP_REASONS)
+SUMMARY_REPAIRABLE_GAP_REASONS = frozenset({"stale_rollout_summary", "truncated_rollout_summary"})
+REPAIRABLE_COVERAGE_GAP_REASONS = frozenset(
+    ALLOWED_REMOTE_GAP_REASONS | OVERSIZED_REPAIRABLE_GAP_REASONS | SUMMARY_REPAIRABLE_GAP_REASONS
+)
 REMOTE_MATERIALIZATION_GAP_REASONS = frozenset(
     ALLOWED_REMOTE_GAP_REASONS | {"oversized_rollout_skipped", "oversized_summary_skipped"}
 )
@@ -654,6 +694,11 @@ def iter_flag_probe_text_chunks(
         if start + safe_limit >= len(text):
             return
         start += step
+
+
+def progress_message(label: str | None, message: str) -> None:
+    if label:
+        print(f"[session-retrospective:{label}] {message}", file=sys.stderr, flush=True)
 
 
 def iter_flag_probe_text_windows(
@@ -1148,6 +1193,15 @@ def iter_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
     yield from iter_jsonl_strict(path)
 
 
+def jsonl_file_is_parseable(path: Path) -> bool:
+    try:
+        for _line_no, _record in iter_jsonl_strict(path):
+            pass
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def iter_jsonl_strict(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
     try:
         with path.open(encoding="utf-8") as handle:
@@ -1308,24 +1362,41 @@ def duplicate_user_turn(current_text: str, current_time: str, previous: tuple[st
 
 
 def has_safety_privacy_signal(text: str) -> bool:
-    return bool(
+    if BARE_64_HEX_PATTERN.search(text):
+        return True
+    if ":" in text and PRIVATE_IPV6_PATTERN.search(text):
+        return True
+    if any(char.isdigit() for char in text) and PRIVATE_IPV4_PATTERN.search(text):
+        return True
+    if not SAFETY_PRIVACY_PREFILTER_PATTERN.search(text):
+        return False
+    if CREDENTIAL_ASSIGNMENT_PREFILTER_PATTERN.search(text) and (
         SECRET_TOKEN_SIGNAL_PATTERN.search(text)
         or COMPACT_TOKEN_ASSIGNMENT_SIGNAL_PATTERN.search(text)
         or CREDENTIAL_ASSIGNMENT_SIGNAL_PATTERN.search(text)
         or CHINESE_CREDENTIAL_ASSIGNMENT_SIGNAL_PATTERN.search(text)
-        or SENSITIVE_IDENTIFIER_SIGNAL_PATTERN.search(text)
-        or CHINESE_IDENTIFIER_SIGNAL_PATTERN.search(text)
-        or URL_CREDENTIAL_SIGNAL_PATTERN.search(text)
-        or EMAIL_SIGNAL_PATTERN.search(text)
-        or PRIVATE_URL_SIGNAL_PATTERN.search(text)
-        or PRIVACY_RISK_SIGNAL_PATTERN.search(text)
-        or DESTRUCTIVE_COMMAND_SIGNAL_PATTERN.search(text)
-        or PRODUCTION_RISK_SIGNAL_PATTERN.search(text)
-        or BARE_64_HEX_PATTERN.search(text)
-        or PRIVATE_IPV4_PATTERN.search(text)
-        or PRIVATE_IPV6_PATTERN.search(text)
-        or INTERNAL_HOSTNAME_PATTERN.search(text)
-    )
+    ):
+        return True
+    if "://" in text and URL_CREDENTIAL_SIGNAL_PATTERN.search(text):
+        return True
+    if SENSITIVE_IDENTIFIER_PREFILTER_PATTERN.search(text) and (
+        SENSITIVE_IDENTIFIER_SIGNAL_PATTERN.search(text) or CHINESE_IDENTIFIER_SIGNAL_PATTERN.search(text)
+    ):
+        return True
+    if ("@" in text and EMAIL_SIGNAL_PATTERN.search(text)) or (
+        ("://" in text or "git@" in text or "localhost" in text or ".internal" in text or ".corp" in text or ".local" in text)
+        and PRIVATE_URL_SIGNAL_PATTERN.search(text)
+    ):
+        return True
+    if PRIVACY_RISK_SIGNAL_PATTERN.search(text):
+        return True
+    if PRODUCTION_OR_DESTRUCTIVE_PREFILTER_PATTERN.search(text) and (
+        DESTRUCTIVE_COMMAND_SIGNAL_PATTERN.search(text) or PRODUCTION_RISK_SIGNAL_PATTERN.search(text)
+    ):
+        return True
+    if INTERNAL_HOSTNAME_PATTERN.search(text):
+        return True
+    return False
 
 
 def flags_for_text(text: str, *, redacted_changed: bool = False) -> set[str]:
@@ -8106,6 +8177,9 @@ def run_scan(
     allow_partial_hosts = getattr(args, "allow_partial_hosts", False)
     generated_summary_base = generated_summary_base_for_output(output)
     generated_summary_cache_base = generated_summary_cache_base_for_output(output)
+    progress_label = getattr(args, "progress_label", None)
+    progress_every = int(getattr(args, "progress_every", 100) or 0)
+    progress_message(progress_label, f"scan start mode={mode} sources={len(sources)} max_raw_bytes={max_raw_bytes}")
 
     def append_oversized_rollout_gap(path: Path, size: int) -> None:
         coverage_gaps.append(source_path_coverage_gap(source, path, "oversized_rollout_skipped", bytes=size))
@@ -8126,7 +8200,8 @@ def run_scan(
         ):
             coverage_gaps.append(source_path_coverage_gap(source, path, "volatile_summary_missing"))
 
-    for source in sources:
+    for source_index, source in enumerate(sources, start=1):
+        progress_message(progress_label, f"source {source_index}/{len(sources)} host={source.host} start")
         if not source.root.exists():
             coverage_gaps.append(
                 {
@@ -8181,6 +8256,10 @@ def run_scan(
             continue
         rollouts = source_rollouts(source)
         summaries = source_summary_files(source)
+        progress_message(
+            progress_label,
+            f"source {source_index}/{len(sources)} host={source.host} candidates rollouts={len(rollouts)} summaries={len(summaries)}",
+        )
         (
             remote_generated_summaries,
             declared_remote_generated_summaries,
@@ -8339,7 +8418,20 @@ def run_scan(
         manifest_sources.append(manifest_source)
         if source_materialization_gaps:
             continue
-        for rollout in rollouts:
+        materialized_rollout_refs: set[str] = set()
+
+        def mark_materialized_rollout(rollout_path: Path) -> None:
+            rollout_ref = source_relative_path_ref(rollout_path, source.root)
+            if rollout_ref is None or safe_relative_rollout_ref(rollout_ref) is None:
+                return
+            materialized_rollout_refs.add(rollout_ref)
+
+        for rollout_index, rollout in enumerate(rollouts, start=1):
+            if progress_label and progress_every > 0 and (rollout_index == 1 or rollout_index % progress_every == 0):
+                progress_message(
+                    progress_label,
+                    f"source {source_index}/{len(sources)} host={source.host} rollout {rollout_index}/{len(rollouts)}",
+                )
             rollout_mtime_fallback = rollout_path_allows_mtime_fallback(source, rollout, archived_duplicate_keys)
             try:
                 if not rollout_candidate_relevant(
@@ -8354,6 +8446,11 @@ def run_scan(
                     continue
                 size = rollout.stat().st_size
                 if size <= max_raw_bytes:
+                    if progress_label and size > DEFAULT_REPAIR_MAX_RAW_BYTES:
+                        progress_message(
+                            progress_label,
+                            f"source {source_index}/{len(sources)} host={source.host} scanning large rollout {rollout_index}/{len(rollouts)} bytes={size}",
+                        )
                     jsonl_error = first_jsonl_error(rollout)
                     if jsonl_error is not None:
                         if jsonl_error.unreadable and path_disappeared(rollout):
@@ -8389,6 +8486,7 @@ def run_scan(
                         elif timestampless_relevance is None:
                             append_volatile_rollout_gap(rollout)
                         continue
+                    mark_materialized_rollout(rollout)
                     all_turns.extend(
                         extract_rollout(
                             source,
@@ -8418,7 +8516,12 @@ def run_scan(
             except FileNotFoundError:
                 append_volatile_rollout_gap(rollout)
                 continue
-        for summary in summaries:
+        for summary_index, summary in enumerate(summaries, start=1):
+            if progress_label and progress_every > 0 and (summary_index == 1 or summary_index % progress_every == 0):
+                progress_message(
+                    progress_label,
+                    f"source {source_index}/{len(sources)} host={source.host} summary {summary_index}/{len(summaries)}",
+                )
             summary_relevance_proven = False
             try:
                 size = summary.stat().st_size
@@ -8446,7 +8549,7 @@ def run_scan(
                         append_volatile_summary_gap(summary)
                     continue
                 jsonl_error = first_jsonl_error(summary)
-                if (
+                summary_limited_scan_gap = (
                     summary_file_has_truncated_scan(summary)
                     or summary_file_has_record_limit_gap(
                         summary,
@@ -8461,7 +8564,8 @@ def run_scan(
                             max_scan_bytes=max_raw_bytes,
                         ),
                     )
-                ) and summary_file_maybe_relevant_or_backing_ref_relevant(
+                )
+                summary_limited_scan_has_relevant_backing = summary_file_maybe_relevant_or_backing_ref_relevant(
                     summary,
                     gap_start,
                     end,
@@ -8469,7 +8573,18 @@ def run_scan(
                     source_root=source.root,
                     allow_mtime_fallback=allow_mtime_fallback,
                     archived_duplicate_keys=archived_duplicate_keys,
+                )
+                if (
+                    summary_limited_scan_gap
+                    and summary_limited_scan_has_relevant_backing
                 ):
+                    if summary_limited_scan_gap_has_raw_coverage(
+                        summary,
+                        source_root=source.root,
+                        max_scan_bytes=summary_scan_cap,
+                        materialized_rollout_refs=materialized_rollout_refs,
+                    ):
+                        continue
                     coverage_gaps.append(
                         source_path_coverage_gap(source, summary, "truncated_rollout_summary")
                     )
@@ -9244,11 +9359,17 @@ def dry_run_report(
     next_command: str | None = None,
     next_command_note: str | None = None,
     repair_report: dict[str, Any] | None = None,
+    repair_max_raw_bytes: int | None = None,
 ) -> dict[str, Any]:
+    effective_repair_max_raw_bytes = repair_max_raw_bytes or DEFAULT_REPAIR_MAX_RAW_BYTES
     manifest_coverage_gaps = list(manifest.get("coverage_gaps") or [])
     shard_gap_rows = shard_coverage_gaps(shards_dir)
     coverage_gaps = merge_coverage_gaps(manifest_coverage_gaps, shard_gap_rows)
-    repairable_gaps = repairable_coverage_gaps(coverage_gaps)
+    repairable_gaps = repairable_coverage_gaps(
+        coverage_gaps,
+        manifest=manifest,
+        max_raw_bytes=effective_repair_max_raw_bytes,
+    )
     coverage_gap_counts = gap_counts(coverage_gaps)
     shard_coverage_gap_counts = gap_counts(shard_gap_rows)
     repairable_coverage_gap_counts = gap_counts(repairable_gaps)
@@ -9286,6 +9407,7 @@ def dry_run_report(
         "retained_export_created": False,
         "history_commit_created": False,
         "state_advanced": False,
+        "next_repair_max_raw_bytes": effective_repair_max_raw_bytes,
         "report_summary": dry_run_report_summary(
             kind=kind,
             root=root,
@@ -9478,17 +9600,217 @@ def write_dry_run_report_pair(root: Path, name: str, report: dict[str, Any]) -> 
     write_bytes_atomic(root / f"{name}.md", dry_run_report_markdown(report).encode("utf-8"))
 
 
-def is_repairable_coverage_gap(gap: Any) -> bool:
+def manifest_source_entries_for_gap(manifest: dict[str, Any] | None, gap: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(manifest, dict):
+        return []
+    host = str(gap.get("host") or "")
+    root_ref = gap.get("root_ref")
+    entries: list[dict[str, Any]] = []
+    for entry in manifest.get("sources") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("host") or "") != host:
+            continue
+        if isinstance(root_ref, str) and root_ref and entry.get("root_ref") != root_ref:
+            continue
+        entries.append(entry)
+    return entries
+
+
+def summary_repair_backing_rollout_refs(summary: Path, *, source_root: Path, max_scan_bytes: int) -> tuple[set[str], bool]:
+    refs, invalid_ref_seen = summary_scan_meta_backing_rollout_refs(summary, max_scan_bytes=max_scan_bytes)
+    backing_refs, complete, _relevant_record_seen, unbacked_record_seen = summary_backing_rollout_refs(
+        summary,
+        None,
+        None,
+        max_scan_bytes=max_scan_bytes,
+        source_root=source_root,
+    )
+    return refs | backing_refs, not invalid_ref_seen and complete and not unbacked_record_seen
+
+
+def summary_limited_scan_gap_has_raw_coverage(
+    summary: Path,
+    *,
+    source_root: Path,
+    max_scan_bytes: int,
+    materialized_rollout_refs: set[str],
+) -> bool:
+    if not materialized_rollout_refs:
+        return False
+    backing_refs, repair_safe = summary_repair_backing_rollout_refs(
+        summary,
+        source_root=source_root,
+        max_scan_bytes=max_scan_bytes,
+    )
+    if not repair_safe or not backing_refs:
+        return False
+    return backing_refs.issubset(materialized_rollout_refs)
+
+
+def source_rollout_path_is_rescannable(
+    source: Source,
+    path: Path,
+    *,
+    start: dt.datetime,
+    end: dt.datetime,
+    max_raw_bytes: int,
+) -> bool:
+    if not safe_source_file(path, source.root):
+        return False
+    try:
+        if path.stat().st_size > max_raw_bytes:
+            return False
+        if not jsonl_file_is_parseable(path):
+            return False
+        archived_duplicate_keys = archived_rollout_duplicate_keys(source.root)
+        allow_mtime_fallback = rollout_path_allows_mtime_fallback(source, path, archived_duplicate_keys)
+        return rollout_has_materialized_window_coverage(
+            path,
+            start,
+            end,
+            max_raw_bytes=max_raw_bytes,
+            max_relevance_scan_bytes=local_rollout_relevance_scan_bytes(max_raw_bytes),
+            allow_mtime_fallback=allow_mtime_fallback,
+            source_root=source.root,
+        )
+    except OSError:
+        return False
+
+
+def manifest_source_has_rescannable_rollout_ref(
+    source: Source,
+    source_entry: dict[str, Any],
+    backing_ref: str,
+    *,
+    start: dt.datetime,
+    end: dt.datetime,
+    max_raw_bytes: int,
+) -> bool:
+    rollout_path = source_rollout_declared_path_from_ref(source, backing_ref)
+    if rollout_path is not None and source_rollout_path_is_rescannable(
+        source,
+        rollout_path,
+        start=start,
+        end=end,
+        max_raw_bytes=max_raw_bytes,
+    ):
+        return True
+    try:
+        rollout_refs = manifest_source_ref_list(source_entry, "rollout_refs")
+    except SystemExit:
+        return False
+    for rollout_ref in rollout_refs:
+        if rollout_ref == backing_ref:
+            candidate = source_rollout_declared_path_from_ref(source, rollout_ref)
+            if candidate is not None and source_rollout_path_is_rescannable(
+                source,
+                candidate,
+                start=start,
+                end=end,
+                max_raw_bytes=max_raw_bytes,
+            ):
+                return True
+    return False
+
+
+def local_summary_gap_has_rescannable_backing_rollout(
+    gap: dict[str, Any],
+    manifest: dict[str, Any] | None,
+    *,
+    max_raw_bytes: int,
+) -> bool:
+    path_ref_value = gap.get("path_ref")
+    if not isinstance(path_ref_value, str) or not path_ref_value:
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    try:
+        start, end = manifest_window_bounds(manifest)
+    except SystemExit:
+        return False
+    for source_entry in manifest_source_entries_for_gap(manifest, gap):
+        raw_root = source_entry.get("root")
+        if not isinstance(raw_root, str) or not raw_root:
+            continue
+        source = Source(str(source_entry.get("host") or ""), Path(raw_root).expanduser())
+        try:
+            summary_refs = manifest_source_ref_list(source_entry, "summary_refs", summary=True)
+        except SystemExit:
+            continue
+        for summary_ref in summary_refs:
+            summary = source_summary_declared_path_from_ref(source, summary_ref)
+            if summary is None or path_ref(summary) != path_ref_value:
+                continue
+            if not safe_source_file(summary, source.root):
+                return False
+            backing_refs, repair_safe = summary_repair_backing_rollout_refs(
+                summary,
+                source_root=source.root,
+                max_scan_bytes=max_raw_bytes,
+            )
+            if not repair_safe:
+                return False
+            if not backing_refs:
+                return False
+            for backing_ref in backing_refs:
+                if not manifest_source_has_rescannable_rollout_ref(
+                    source,
+                    source_entry,
+                    backing_ref,
+                    start=start,
+                    end=end,
+                    max_raw_bytes=max_raw_bytes,
+                ):
+                    return False
+            return True
+    return False
+
+
+def summary_coverage_gap_is_repairable(
+    gap: dict[str, Any],
+    manifest: dict[str, Any] | None,
+    *,
+    max_raw_bytes: int,
+) -> bool:
+    host = str(gap.get("host") or "")
+    if host in DEFAULT_REMOTE_HOSTS:
+        return True
+    return local_summary_gap_has_rescannable_backing_rollout(gap, manifest, max_raw_bytes=max_raw_bytes)
+
+
+def is_repairable_coverage_gap(
+    gap: Any,
+    *,
+    manifest: dict[str, Any] | None = None,
+    max_raw_bytes: int | None = None,
+) -> bool:
     if not isinstance(gap, dict):
         return False
     reason = str(gap.get("reason") or "")
     if reason in OVERSIZED_REPAIRABLE_GAP_REASONS:
         return True
+    if reason in SUMMARY_REPAIRABLE_GAP_REASONS:
+        return summary_coverage_gap_is_repairable(
+            gap,
+            manifest,
+            max_raw_bytes=max_raw_bytes or DEFAULT_REPAIR_MAX_RAW_BYTES,
+        )
     return reason in ALLOWED_REMOTE_GAP_REASONS and str(gap.get("host") or "") in DEFAULT_REMOTE_HOSTS
 
 
-def repairable_coverage_gaps(gaps: Any) -> list[dict[str, Any]]:
-    return [gap for gap in gaps or [] if is_repairable_coverage_gap(gap)]
+def repairable_coverage_gaps(
+    gaps: Any,
+    *,
+    manifest: dict[str, Any] | None = None,
+    max_raw_bytes: int | None = None,
+) -> list[dict[str, Any]]:
+    effective_max_raw_bytes = max_raw_bytes or DEFAULT_REPAIR_MAX_RAW_BYTES
+    return [
+        gap
+        for gap in gaps or []
+        if is_repairable_coverage_gap(gap, manifest=manifest, max_raw_bytes=effective_max_raw_bytes)
+    ]
 
 
 def oversized_repairable_coverage_gaps(gaps: Iterable[Any]) -> list[dict[str, Any]]:
@@ -9554,7 +9876,7 @@ def repair_materialization_gap_hosts(gaps: Iterable[Any]) -> set[str]:
         if (
             isinstance(gap, dict)
             and str(gap.get("host") or "") in DEFAULT_REMOTE_HOSTS
-            and str(gap.get("reason") or "") in REMOTE_MATERIALIZATION_GAP_REASONS
+            and str(gap.get("reason") or "") in (REMOTE_MATERIALIZATION_GAP_REASONS | SUMMARY_REPAIRABLE_GAP_REASONS)
         )
     }
 
@@ -9609,11 +9931,16 @@ def run_dry_run(
         shard_coverage_gaps(shards_dir),
     )
     next_command = None
-    if repairable_coverage_gaps(coverage_gaps):
-        suggested_max_raw_bytes = suggested_max_raw_bytes_for_oversized_gaps(
-            oversized_repairable_coverage_gaps(coverage_gaps),
-            current_max_raw_bytes=max_raw_bytes,
-        )
+    suggested_max_raw_bytes = suggested_max_raw_bytes_for_oversized_gaps(
+        oversized_repairable_coverage_gaps(coverage_gaps),
+        current_max_raw_bytes=max_raw_bytes,
+    )
+    follow_up_max_raw_bytes = dry_run_follow_up_max_raw_bytes(
+        current_max_raw_bytes=max_raw_bytes,
+        suggested_max_raw_bytes=suggested_max_raw_bytes,
+    )
+    repair_max_raw_bytes = follow_up_max_raw_bytes or DEFAULT_REPAIR_MAX_RAW_BYTES
+    if repairable_coverage_gaps(coverage_gaps, manifest=manifest, max_raw_bytes=repair_max_raw_bytes):
         next_command_argv = [
             "python3",
             Path(__file__).resolve().as_posix(),
@@ -9621,10 +9948,6 @@ def run_dry_run(
             "--run-dir",
             root.as_posix(),
         ]
-        follow_up_max_raw_bytes = dry_run_follow_up_max_raw_bytes(
-            current_max_raw_bytes=max_raw_bytes,
-            suggested_max_raw_bytes=suggested_max_raw_bytes,
-        )
         if follow_up_max_raw_bytes is not None:
             next_command_argv.extend(["--max-raw-bytes", str(follow_up_max_raw_bytes)])
         if args.allow_partial_hosts:
@@ -9638,6 +9961,7 @@ def run_dry_run(
         trend=trend,
         manifest=manifest,
         next_command=next_command,
+        repair_max_raw_bytes=repair_max_raw_bytes,
     )
     write_dry_run_report_pair(root, "dry_run_report", report)
     return root, report
@@ -9675,11 +9999,14 @@ def cmd_weekly_dry_run(args: argparse.Namespace) -> int:
     )
     if args.repair and has_repairable_gap_counts(report.get("repairable_coverage_gap_counts")):
         repair_output = Path(args.repair_output).expanduser() if args.repair_output else root / "weekly-coverage-repair"
+        repair_max_raw_bytes = args.repair_max_raw_bytes
+        if repair_max_raw_bytes is None:
+            repair_max_raw_bytes = report_int(report.get("next_repair_max_raw_bytes")) or DEFAULT_REPAIR_MAX_RAW_BYTES
         run_coverage_repair(
             argparse.Namespace(
                 run_dir=str(root),
                 output=str(repair_output),
-                max_raw_bytes=args.repair_max_raw_bytes,
+                max_raw_bytes=repair_max_raw_bytes,
                 remote_probe=args.repair_remote_probe,
                 remote_session_meta_limit=args.repair_remote_session_meta_limit,
                 remote_host_jobs=args.repair_remote_host_jobs,
@@ -10319,10 +10646,16 @@ def run_coverage_repair(
     if not remote_probe.is_file():
         raise SystemExit(f"remote probe helper not found: {remote_probe}")
 
+    progress_label = report_kind
+    progress_message(
+        progress_label,
+        f"repair start run_ref={path_ref(run_dir)} output_ref={path_ref(root)} before_gaps={len(before_gaps)}",
+    )
     remote_roots: dict[str, Path] = {}
     materialized_hosts: list[dict[str, Any]] = []
     if not args.skip_remote_materialization:
         gap_hosts = repair_materialization_gap_hosts(before_gaps)
+        progress_message(progress_label, f"remote materialization start hosts={','.join(sorted(gap_hosts)) or 'none'}")
         remote_roots, materialized_hosts = materialize_repair_hosts(
             gap_hosts=gap_hosts,
             root=root,
@@ -10334,11 +10667,15 @@ def run_coverage_repair(
             host_jobs=remote_host_jobs,
             rollout_jobs=remote_rollout_jobs,
         )
+        progress_message(progress_label, f"remote materialization done hosts={len(materialized_hosts)}")
+    else:
+        progress_message(progress_label, "remote materialization skipped")
 
     repaired_scan_dir = root / "scan"
     repaired_shards_dir = root / "shards"
     source_args = source_args_from_manifest(manifest, remote_roots=remote_roots)
     mode = str(manifest.get("mode") or (manifest.get("window") or {}).get("mode") or "baseline-repair")
+    progress_message(progress_label, f"scan start sources={len(source_args)}")
     run_scan(
         argparse.Namespace(
             source=source_args,
@@ -10346,13 +10683,18 @@ def run_coverage_repair(
             output=str(repaired_scan_dir),
             max_raw_bytes=max_raw_bytes,
             allow_partial_hosts=args.allow_partial_hosts,
+            progress_label=f"{report_kind}:scan",
+            progress_every=100,
         ),
         mode=mode,
         start=start,
         end=end,
     )
+    progress_message(progress_label, "scan done; validating output")
     trend, _retained_manifest = validate_output_run(repaired_scan_dir)
+    progress_message(progress_label, "make-shards start")
     run_make_shards_for_scan(repaired_scan_dir, repaired_shards_dir, max_raw_bytes=max_raw_bytes)
+    progress_message(progress_label, "make-shards done")
     repaired_manifest = read_json_file(repaired_scan_dir / "shard_manifest.json")
     after_gaps = merge_coverage_gaps(
         list(repaired_manifest.get("coverage_gaps") or []),
@@ -10367,13 +10709,27 @@ def run_coverage_repair(
     }
     next_command = None
     next_command_note = None
-    remaining_repairable_gaps = repairable_coverage_gaps(after_gaps)
-    remaining_oversized_gaps = oversized_repairable_coverage_gaps(remaining_repairable_gaps)
-    if remaining_oversized_gaps:
-        suggested_max_raw_bytes = suggested_max_raw_bytes_for_oversized_gaps(
+    remaining_oversized_gaps = oversized_repairable_coverage_gaps(after_gaps)
+    suggested_max_raw_bytes = (
+        suggested_max_raw_bytes_for_oversized_gaps(
             remaining_oversized_gaps,
             current_max_raw_bytes=max_raw_bytes,
         )
+        if remaining_oversized_gaps
+        else None
+    )
+    follow_up_max_raw_bytes = dry_run_follow_up_max_raw_bytes(
+        current_max_raw_bytes=max_raw_bytes,
+        suggested_max_raw_bytes=suggested_max_raw_bytes,
+    )
+    repair_max_raw_bytes = suggested_max_raw_bytes or follow_up_max_raw_bytes or max_raw_bytes
+    remaining_repairable_gaps = repairable_coverage_gaps(
+        after_gaps,
+        manifest=repaired_manifest,
+        max_raw_bytes=repair_max_raw_bytes,
+    )
+    remaining_oversized_gaps = oversized_repairable_coverage_gaps(remaining_repairable_gaps)
+    if remaining_oversized_gaps:
         next_command_note = oversized_repair_next_command_note(
             max_raw_bytes=max_raw_bytes,
             suggested_max_raw_bytes=suggested_max_raw_bytes,
@@ -10402,8 +10758,10 @@ def run_coverage_repair(
         next_command=next_command,
         next_command_note=next_command_note,
         repair_report=repair_summary,
+        repair_max_raw_bytes=repair_max_raw_bytes,
     )
     write_dry_run_report_pair(root, "repair_report", report)
+    progress_message(progress_label, f"repair report written after_gaps={len(after_gaps)}")
     return root
 
 
@@ -10458,6 +10816,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
     start, end = require_manifest_window_bounds(window, "manifest window")
     rows: list[dict[str, Any]] = []
     source_root_ref: str | None = None
+    materialized_rollout_refs: set[str] = set()
 
     def shard_row(path: Path, *, include_path_ref: bool = True, **values: Any) -> dict[str, Any]:
         row = {"host": host, "root_ref": source_root_ref or path_ref(root), **values}
@@ -10622,7 +10981,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     rows.append(row)
                 return
             jsonl_error = first_jsonl_error(summary)
-            if summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(
+            summary_limited_scan_gap = summary_file_has_truncated_scan(summary) or summary_file_has_record_limit_gap(
                 summary,
                 allow_tail_record_limit=summary_allows_generated_coverage(
                     summary,
@@ -10630,7 +10989,8 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                     remote_generated_summary_paths,
                     max_scan_bytes=max_raw_bytes,
                 ),
-            ):
+            )
+            if summary_limited_scan_gap:
                 if not summary_file_maybe_relevant_or_backing_ref_relevant(
                     summary,
                     start,
@@ -10642,6 +11002,13 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                 ):
                     if path_disappeared(summary) and not live_summary_path_proves_outside_shard_window(summary):
                         append_live_disappeared_summary_shard(summary)
+                    return
+                if summary_limited_scan_gap_has_raw_coverage(
+                    summary,
+                    source_root=root,
+                    max_scan_bytes=summary_scan_cap,
+                    materialized_rollout_refs=materialized_rollout_refs,
+                ):
                     return
                 row["status"] = "partial"
                 row["coverage_gap"] = "summary scan incomplete; regenerate complete bounded evidence before extractor handoff"
@@ -10888,6 +11255,14 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
         if source_summary_only_gaps:
             append_source_gap_shards(source_summary_only_gaps, root)
             continue
+        materialized_rollout_refs = set()
+
+        def mark_materialized_rollout_shard(rollout_path: Path) -> None:
+            rollout_ref = source_relative_path_ref(rollout_path, root)
+            if rollout_ref is None or safe_relative_rollout_ref(rollout_ref) is None:
+                return
+            materialized_rollout_refs.add(rollout_ref)
+
         for rollout in rollouts:
             rollout_mtime_fallback = rollout_path_allows_mtime_fallback(source, rollout, archived_duplicate_keys)
             try:
@@ -10930,6 +11305,7 @@ def cmd_make_shards(args: argparse.Namespace) -> int:
                         source_root=root,
                     ):
                         row["status"] = "ready"
+                        mark_materialized_rollout_shard(rollout)
                         rows.append(row)
                         continue
                     else:
@@ -11325,8 +11701,8 @@ def build_parser() -> argparse.ArgumentParser:
     weekly_dry_run.add_argument(
         "--repair-max-raw-bytes",
         type=int,
-        default=DEFAULT_REPAIR_MAX_RAW_BYTES,
-        help="Raw rollout size limit for the optional --repair follow-up.",
+        default=None,
+        help="Raw rollout size limit for the optional --repair follow-up. Defaults to the dry-run suggested repair cap.",
     )
     weekly_dry_run.add_argument(
         "--repair-remote-probe",
