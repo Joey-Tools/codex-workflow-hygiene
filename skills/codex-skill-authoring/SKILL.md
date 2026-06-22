@@ -40,7 +40,8 @@ Keep `AGENTS.md` as the short policy/index layer, keep `SKILL.md` procedural, an
 ## Use These Creation Defaults
 
 - Prefer `python3 "$HOME/.codex/skills/.system/skill-creator/scripts/init_skill.py" <skill-name> --path ~/.codex/skills` for personal skills, or `python3 "$HOME/.codex/skills/.system/skill-creator/scripts/init_skill.py" <skill-name> --path .agents/skills` for repo-local skills.
-- Prefer `uv run --isolated --with pyyaml python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" ...` to validate it without depending on the current environment.
+- Prefer `"$HOME/.codex/skills/codex-skill-authoring/scripts/codex_skill_validate.py" ...` to validate one or more skills through the local wrapper. The wrapper calls the installed OpenAI validator at `$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py`; do not edit or mirror OpenAI's validator for user-specific workflow changes.
+- If the wrapper is unavailable, fall back to `uv run --isolated --with pyyaml python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" ...` for direct single-skill validation.
 - Fall back to `python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" ...` only when the needed dependency is already available locally or when `uv` is not the right tool for the environment.
 - Use the Python entrypoint directly if the helper wrapper exists but is not executable in the current environment.
 
@@ -54,7 +55,7 @@ Keep `AGENTS.md` as the short policy/index layer, keep `SKILL.md` procedural, an
 
 ## Validate And Iterate
 
-- Run quick validation before installation or commit.
+- Run quick validation before installation or commit. For many skills, use `"$HOME/.codex/skills/codex-skill-authoring/scripts/codex_skill_validate.py" --report .codex-tmp/skill-validation/report.json <skill> [...]` so stdout stays compact and complete results go to a task-scoped file.
 - Smoke-test any newly added script with at least one real invocation.
 - If `quick_validate.py` cannot run directly because local dependencies such as `PyYAML` are missing, first retry via `uv run --isolated --with pyyaml ...`.
 - If the `uv` path is unavailable, inappropriate, or still fails, fall back to explicit checks: parse `agents/openai.yaml`, verify `SKILL.md` frontmatter/body structure, and confirm referenced resources exist.
