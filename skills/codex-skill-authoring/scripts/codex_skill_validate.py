@@ -18,6 +18,23 @@ EXIT_RUNTIME_ERROR = 2
 MAX_SUMMARY_MESSAGE_LENGTH = 240
 VALIDATOR_RELATIVE_PATH = Path(".system/skill-creator/scripts/quick_validate.py")
 DEFAULT_VALIDATOR = Path("~/.codex/skills") / VALIDATOR_RELATIVE_PATH
+PYTHON_RUNTIME_ERROR_PATTERNS = (
+    "Traceback (most recent call last):",
+    "SyntaxError:",
+    "IndentationError:",
+    "TabError:",
+    "ModuleNotFoundError:",
+    "ImportError:",
+)
+UV_SETUP_FAILURE_PATTERNS = (
+    "error: Request failed",
+    "Failed to fetch:",
+    "Failed to initialize cache",
+    "No solution found",
+    "failed to download",
+    "failed to resolve",
+    "dns error",
+)
 
 
 def default_validator_candidates() -> list[Path]:
@@ -109,14 +126,13 @@ def validator_environment(*, use_uv: bool) -> dict[str, str] | None:
 
 
 def run_validator(validator: Path, skill_path: Path, *, use_uv: bool) -> dict[str, object]:
-    result = subprocess.run(
-        validator_command(validator, skill_path, use_uv=use_uv),
-        check=False,
-        env=validator_environment(use_uv=use_uv),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    result = run_validator_process(validator, skill_path, use_uv=use_uv)
+    attempts = [attempt_payload(result, use_uv=use_uv)]
+    if use_uv and uv_setup_failed(result):
+        fallback = run_validator_process(validator, skill_path, use_uv=False)
+        attempts.append(attempt_payload(fallback, use_uv=False))
+        result = fallback
+
     message = result.stdout.strip() or result.stderr.strip() or f"validator exited {result.returncode}"
     runtime_error = validator_runtime_error(result.returncode, result.stdout, result.stderr)
     return {
@@ -128,13 +144,41 @@ def run_validator(validator: Path, skill_path: Path, *, use_uv: bool) -> dict[st
         "message": message,
         "stdout": result.stdout,
         "stderr": result.stderr,
+        "attempts": attempts,
     }
+
+
+def run_validator_process(validator: Path, skill_path: Path, *, use_uv: bool) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        validator_command(validator, skill_path, use_uv=use_uv),
+        check=False,
+        env=validator_environment(use_uv=use_uv),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return result
+
+
+def attempt_payload(result: subprocess.CompletedProcess[str], *, use_uv: bool) -> dict[str, object]:
+    return {
+        "mode": "uv" if use_uv else "python",
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def uv_setup_failed(result: subprocess.CompletedProcess[str]) -> bool:
+    combined = f"{result.stdout}\n{result.stderr}"
+    return result.returncode != 0 and any(pattern in combined for pattern in UV_SETUP_FAILURE_PATTERNS)
 
 
 def validator_runtime_error(returncode: int, stdout: str, stderr: str) -> bool:
     if returncode not in (0, 1):
         return True
-    return returncode == 1 and "Traceback (most recent call last):" in f"{stdout}\n{stderr}"
+    combined = f"{stdout}\n{stderr}"
+    return returncode == 1 and any(pattern in combined for pattern in PYTHON_RUNTIME_ERROR_PATTERNS)
 
 
 def summarize(results: list[dict[str, object]]) -> dict[str, int]:

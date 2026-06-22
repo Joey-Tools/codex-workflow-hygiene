@@ -171,6 +171,34 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         self.assertTrue(payload["results"][1]["runtime_error"])
         self.assertIn("Traceback (most recent call last):", payload["results"][1]["stderr"])
 
+    def test_validator_syntax_error_is_runtime_error(self) -> None:
+        report = self.root / "report.json"
+        broken_validator = self.root / "broken_validator.py"
+        broken_validator.write_text("def broken(:\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(WRAPPER),
+                "--no-uv",
+                "--validator",
+                str(broken_validator),
+                "--report",
+                str(report),
+                str(self.valid_skill),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(payload["summary"]["runtime_errors"], 1)
+        self.assertTrue(payload["results"][0]["runtime_error"])
+        self.assertIn("SyntaxError:", payload["results"][0]["stderr"])
+
     def test_missing_installed_validator_is_runtime_error(self) -> None:
         missing = self.root / "missing.py"
         result = subprocess.run(
@@ -238,6 +266,52 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(Path(capture.read_text(encoding="utf-8")).resolve(), expected_cache.resolve())
         self.assertTrue(expected_cache.is_dir())
+
+    def test_uv_setup_failure_falls_back_to_direct_python(self) -> None:
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        fake_uv = bin_dir / "uv"
+        fake_uv.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import sys
+
+                print("error: Request failed after 3 retries", file=sys.stderr)
+                print("  Caused by: Failed to fetch: `https://pypi.org/simple/pyyaml/`", file=sys.stderr)
+                raise SystemExit(2)
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_uv.chmod(0o755)
+        report = self.root / "report.json"
+        env = os.environ.copy()
+        env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(WRAPPER),
+                "--validator",
+                str(self.validator),
+                "--report",
+                str(report),
+                str(self.valid_skill),
+            ],
+            check=False,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "Skill is valid!")
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        attempts = payload["results"][0]["attempts"]
+        self.assertEqual([attempt["mode"] for attempt in attempts], ["uv", "python"])
+        self.assertEqual([attempt["returncode"] for attempt in attempts], [2, 0])
 
 
 if __name__ == "__main__":
