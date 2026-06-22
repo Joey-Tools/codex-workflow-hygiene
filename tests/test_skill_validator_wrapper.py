@@ -41,6 +41,12 @@ class SkillValidatorWrapperTests(unittest.TestCase):
                     raise SystemExit(1)
                 if skill.name.startswith("crash"):
                     raise RuntimeError("validator setup failed")
+                if skill.name.startswith("syntax-text"):
+                    print('description: "SyntaxError: still a validation message"')
+                    raise SystemExit(1)
+                if skill.name.startswith("uv-text"):
+                    print("Failed to fetch: still a validation message")
+                    raise SystemExit(1)
                 print("Name should be hyphen-case")
                 raise SystemExit(1)
                 """
@@ -52,10 +58,14 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         self.invalid_skill = self.root / "invalid-skill"
         self.verbose_skill = self.root / "verbose-skill"
         self.crash_skill = self.root / "crash-skill"
+        self.syntax_text_skill = self.root / "syntax-text-skill"
+        self.uv_text_skill = self.root / "uv-text-skill"
         self.valid_skill.mkdir()
         self.invalid_skill.mkdir()
         self.verbose_skill.mkdir()
         self.crash_skill.mkdir()
+        self.syntax_text_skill.mkdir()
+        self.uv_text_skill.mkdir()
 
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
@@ -199,6 +209,17 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         self.assertTrue(payload["results"][0]["runtime_error"])
         self.assertIn("SyntaxError:", payload["results"][0]["stderr"])
 
+    def test_python_error_token_on_stdout_is_validation_failure(self) -> None:
+        report = self.root / "report.json"
+
+        result = self.run_wrapper("--report", str(report), str(self.syntax_text_skill))
+
+        self.assertEqual(result.returncode, 1)
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(payload["summary"]["failed"], 1)
+        self.assertEqual(payload["summary"]["runtime_errors"], 0)
+        self.assertFalse(payload["results"][0]["runtime_error"])
+
     def test_missing_installed_validator_is_runtime_error(self) -> None:
         missing = self.root / "missing.py"
         result = subprocess.run(
@@ -312,6 +333,49 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         attempts = payload["results"][0]["attempts"]
         self.assertEqual([attempt["mode"] for attempt in attempts], ["uv", "python"])
         self.assertEqual([attempt["returncode"] for attempt in attempts], [2, 0])
+
+    def test_uv_setup_detection_ignores_validator_stdout(self) -> None:
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        fake_uv = bin_dir / "uv"
+        fake_uv.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import subprocess
+                import sys
+
+                raise SystemExit(subprocess.run(sys.argv[5:]).returncode)
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_uv.chmod(0o755)
+        report = self.root / "report.json"
+        env = os.environ.copy()
+        env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(WRAPPER),
+                "--validator",
+                str(self.validator),
+                "--report",
+                str(report),
+                str(self.uv_text_skill),
+            ],
+            check=False,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(payload["summary"]["failed"], 1)
+        self.assertEqual([attempt["mode"] for attempt in payload["results"][0]["attempts"]], ["uv"])
 
 
 if __name__ == "__main__":

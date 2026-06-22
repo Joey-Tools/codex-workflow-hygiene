@@ -170,15 +170,13 @@ def attempt_payload(result: subprocess.CompletedProcess[str], *, use_uv: bool) -
 
 
 def uv_setup_failed(result: subprocess.CompletedProcess[str]) -> bool:
-    combined = f"{result.stdout}\n{result.stderr}"
-    return result.returncode != 0 and any(pattern in combined for pattern in UV_SETUP_FAILURE_PATTERNS)
+    return result.returncode != 0 and any(pattern in result.stderr for pattern in UV_SETUP_FAILURE_PATTERNS)
 
 
 def validator_runtime_error(returncode: int, stdout: str, stderr: str) -> bool:
     if returncode not in (0, 1):
         return True
-    combined = f"{stdout}\n{stderr}"
-    return returncode == 1 and any(pattern in combined for pattern in PYTHON_RUNTIME_ERROR_PATTERNS)
+    return returncode == 1 and any(pattern in stderr for pattern in PYTHON_RUNTIME_ERROR_PATTERNS)
 
 
 def summarize(results: list[dict[str, object]]) -> dict[str, int]:
