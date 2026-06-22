@@ -16,12 +16,34 @@ import tempfile
 EXIT_VALIDATION_FAILED = 1
 EXIT_RUNTIME_ERROR = 2
 MAX_SUMMARY_MESSAGE_LENGTH = 240
-DEFAULT_VALIDATOR = Path("~/.codex/skills/.system/skill-creator/scripts/quick_validate.py")
+VALIDATOR_RELATIVE_PATH = Path(".system/skill-creator/scripts/quick_validate.py")
+DEFAULT_VALIDATOR = Path("~/.codex/skills") / VALIDATOR_RELATIVE_PATH
+
+
+def default_validator_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        base = Path(codex_home).expanduser()
+        candidates.extend([base / "skills" / VALIDATOR_RELATIVE_PATH, base / VALIDATOR_RELATIVE_PATH])
+    candidates.append(DEFAULT_VALIDATOR.expanduser())
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            deduped.append(candidate)
+            seen.add(key)
+    return deduped
 
 
 def default_validator_path() -> Path:
     raw = os.environ.get("CODEX_SKILL_VALIDATOR")
-    return Path(raw).expanduser() if raw else DEFAULT_VALIDATOR.expanduser()
+    if raw:
+        return Path(raw).expanduser()
+    candidates = default_validator_candidates()
+    return next((candidate for candidate in candidates if candidate.exists()), candidates[0])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,26 +118,30 @@ def run_validator(validator: Path, skill_path: Path, *, use_uv: bool) -> dict[st
         stderr=subprocess.PIPE,
     )
     message = result.stdout.strip() or result.stderr.strip() or f"validator exited {result.returncode}"
+    runtime_error = validator_runtime_error(result.returncode, result.stdout, result.stderr)
     return {
         "path": str(skill_path),
         "resolved_path": str(skill_path.resolve(strict=False)),
-        "valid": result.returncode == 0,
+        "valid": result.returncode == 0 and not runtime_error,
         "returncode": result.returncode,
+        "runtime_error": runtime_error,
         "message": message,
         "stdout": result.stdout,
         "stderr": result.stderr,
     }
 
 
+def validator_runtime_error(returncode: int, stdout: str, stderr: str) -> bool:
+    if returncode not in (0, 1):
+        return True
+    return returncode == 1 and "Traceback (most recent call last):" in f"{stdout}\n{stderr}"
+
+
 def summarize(results: list[dict[str, object]]) -> dict[str, int]:
     total = len(results)
     passed = sum(1 for result in results if result["valid"])
-    failed = total - passed
-    runtime_errors = sum(
-        1
-        for result in results
-        if isinstance(result["returncode"], int) and result["returncode"] not in (0, 1)
-    )
+    runtime_errors = sum(1 for result in results if result["runtime_error"])
+    failed = total - passed - runtime_errors
     return {"total": total, "passed": passed, "failed": failed, "runtime_errors": runtime_errors}
 
 
@@ -133,14 +159,13 @@ def print_summary(results: list[dict[str, object]]) -> None:
         print(results[0]["message"])
         return
     for result in results:
-        status = "PASS" if result["valid"] else "FAIL"
+        status = "ERROR" if result["runtime_error"] else "PASS" if result["valid"] else "FAIL"
         print(f"{status}\t{result['path']}\t{compact_message(result)}")
     summary = summarize(results)
-    print(
-        "Summary: "
-        f"{summary['passed']}/{summary['total']} skills valid; "
-        f"{summary['failed']} failed."
-    )
+    details = f"{summary['passed']}/{summary['total']} skills valid; {summary['failed']} failed"
+    if summary["runtime_errors"]:
+        details += f"; {summary['runtime_errors']} runtime errors"
+    print(f"Summary: {details}.")
 
 
 def write_report(report_path: str, results: list[dict[str, object]]) -> None:
@@ -155,6 +180,11 @@ def main(argv: list[str] | None = None) -> int:
     validator = Path(args.validator).expanduser() if args.validator else default_validator_path()
     if not validator.exists():
         print(f"Installed skill validator not found: {validator}", file=sys.stderr)
+        if not args.validator:
+            print(
+                "Checked: " + ", ".join(str(candidate) for candidate in default_validator_candidates()),
+                file=sys.stderr,
+            )
         return EXIT_RUNTIME_ERROR
 
     use_uv = not args.no_uv and shutil.which("uv") is not None

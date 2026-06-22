@@ -39,6 +39,8 @@ class SkillValidatorWrapperTests(unittest.TestCase):
                     print("Second diagnostic line")
                     print("x" * 300)
                     raise SystemExit(1)
+                if skill.name.startswith("crash"):
+                    raise RuntimeError("validator setup failed")
                 print("Name should be hyphen-case")
                 raise SystemExit(1)
                 """
@@ -49,9 +51,11 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         self.valid_skill = self.root / "valid-skill"
         self.invalid_skill = self.root / "invalid-skill"
         self.verbose_skill = self.root / "verbose-skill"
+        self.crash_skill = self.root / "crash-skill"
         self.valid_skill.mkdir()
         self.invalid_skill.mkdir()
         self.verbose_skill.mkdir()
+        self.crash_skill.mkdir()
 
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
@@ -99,6 +103,39 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["failed"], 1)
         self.assertEqual(payload["summary"]["runtime_errors"], 0)
 
+    def test_default_validator_respects_codex_home(self) -> None:
+        layouts = [
+            Path("skills/.system/skill-creator/scripts/quick_validate.py"),
+            Path(".system/skill-creator/scripts/quick_validate.py"),
+        ]
+        for index, relative_path in enumerate(layouts):
+            with self.subTest(relative_path=relative_path):
+                codex_home = self.root / f"codex-home-{index}"
+                validator = codex_home / relative_path
+                validator.parent.mkdir(parents=True)
+                validator.write_text(self.validator.read_text(encoding="utf-8"), encoding="utf-8")
+                validator.chmod(0o755)
+                env = os.environ.copy()
+                env["CODEX_HOME"] = str(codex_home)
+                env.pop("CODEX_SKILL_VALIDATOR", None)
+
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(WRAPPER),
+                        "--no-uv",
+                        str(self.valid_skill),
+                    ],
+                    check=False,
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "Skill is valid!")
+
     def test_multiple_skill_stdout_uses_compact_messages(self) -> None:
         report = self.root / "report.json"
 
@@ -115,6 +152,24 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         self.assertNotIn("Second diagnostic line", result.stdout)
         payload = json.loads(report.read_text(encoding="utf-8"))
         self.assertIn("Second diagnostic line", payload["results"][1]["stdout"])
+
+    def test_validator_traceback_is_runtime_error(self) -> None:
+        report = self.root / "report.json"
+
+        result = self.run_wrapper(
+            "--report",
+            str(report),
+            str(self.valid_skill),
+            str(self.crash_skill),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ERROR\t", result.stdout)
+        self.assertIn("Summary: 1/2 skills valid; 0 failed; 1 runtime errors.", result.stdout)
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(payload["summary"]["runtime_errors"], 1)
+        self.assertTrue(payload["results"][1]["runtime_error"])
+        self.assertIn("Traceback (most recent call last):", payload["results"][1]["stderr"])
 
     def test_missing_installed_validator_is_runtime_error(self) -> None:
         missing = self.root / "missing.py"
