@@ -447,7 +447,7 @@ PATH_REF_KEY: bytes | None = None
 REMOTE_PROBE_MODULE: Any | None = None
 ROLLOUT_TIMESTAMP_SCAN_BYTES = 1024 * 1024
 RETAINED_SUMMARY_KINDS = frozenset(("summary", "function_call_output", "user_message"))
-RETAINED_MODEL_IDS = frozenset(("gpt-5.5", "gpt-5.4", "gpt-5.3-codex"))
+RETAINED_MODEL_IDS = frozenset(("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5", "gpt-5.4", "gpt-5.3-codex"))
 RETAINED_MODEL_ERAS = frozenset((*RETAINED_MODEL_IDS, "other-model", "pre-gpt-5.3-codex", "unknown"))
 RETAINED_OUTPUT_FILES = ("episodes.jsonl", "turn_flags.jsonl", "trend_report.json", "retained_manifest.json")
 TRANSIENT_OUTPUT_FILES = ("turn_summaries.jsonl", "shard_manifest.json", "shards.jsonl")
@@ -5506,6 +5506,10 @@ def summary_timestamp_with_fallback(
 
 def infer_model_era(model: str | None, timestamp: str | None) -> str:
     if model:
+        if "gpt-5.6-sol" in model:
+            return "gpt-5.6-sol"
+        if "gpt-5.6-terra" in model:
+            return "gpt-5.6-terra"
         if "gpt-5.5" in model:
             return "gpt-5.5"
         if "gpt-5.4" in model:

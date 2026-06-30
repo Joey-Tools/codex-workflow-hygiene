@@ -29425,6 +29425,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("redactions=applied", rows[0]["redacted_user_prompt_summary"])
 
     def test_unsafe_model_id_is_bucketed_for_retained_outputs(self) -> None:
+        self.assertEqual(MODULE.infer_model_era("openai/gpt-5.6-sol", None), "gpt-5.6-sol")
+        self.assertEqual(MODULE.retained_model_id("openai/gpt-5.6-sol"), "gpt-5.6-sol")
+        self.assertEqual(MODULE.infer_model_era("openai/gpt-5.6-terra", None), "gpt-5.6-terra")
+        self.assertEqual(MODULE.retained_model_id("openai/gpt-5.6-terra"), "gpt-5.6-terra")
         self.assertIsNone(MODULE.retained_model_id("customer_acme_model"))
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
