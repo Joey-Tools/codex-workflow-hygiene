@@ -514,6 +514,12 @@ PY
 ## 3. Audit Repeated Skill Friction
 
 - First list the sessions in scope.
+- Detect resumed or forked replay before counting new activity:
+  - Count records by session and measure the timestamp span before printing details. Hundreds of thousands of records or old user tasks appearing within seconds are replay signals, not evidence that the work happened again.
+  - Emit a bounded sequence of `session_meta`, `turn_context`, `task_started`, and user-message summaries around each resume point. Do not orient with the full rollout.
+  - Compare the suspicious prefix with earlier source history using a stable fingerprint over record type, role or call name, and normalized selected content. Keep the source path and ordering in the comparison.
+  - Choose the latest genuine resume boundary, exclude only the matching replay prefix, and retain later human follow-ups. Do not deduplicate a real repeated short prompt solely because its text matches an earlier prompt.
+  - Report replayed and genuinely new record counts separately so the audit remains reviewable.
 - Then look for the smallest decisive evidence:
   - user asked for a skill explicitly but it was not used
   - a helper or auth preflight was rediscovered manually

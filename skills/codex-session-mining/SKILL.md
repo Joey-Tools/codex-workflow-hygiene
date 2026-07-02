@@ -48,6 +48,9 @@ Use this skill for:
 - Do not treat skill names that appear only inside those wrappers or pasted `SKILL.md` bodies as proof that the skill was actually invoked or even relevant to the user's real request.
 - When a session continues another thread, pick the first meaningful user request after that wrapper noise instead of blindly classifying the first user message.
 - Use `event_msg` only when aborts, retries, or mode changes matter.
+- Before counting records as new activity, check whether a resumed, forked, compacted, or restored rollout copied and restamped earlier history into the current file. A strict record-timestamp filter is not sufficient for these rollouts.
+- Treat an implausibly dense burst, repeated `session_meta` / `task_started` boundaries, old PR or task references reappearing at nearly identical timestamps, and thousands of historical tool calls emitted within seconds as replay signals.
+- Establish the latest genuine resume boundary from bounded `session_meta`, `turn_context`, `task_started`, and nearby `event_msg` user records. Deduplicate only the replayed prefix against earlier source history or stable record fingerprints; keep later human follow-ups in the same rollout.
 
 4. Classify before proposing a skill or `AGENTS.md` change.
 - Separate one-off mistakes from repeated patterns across multiple sessions.
@@ -75,6 +78,7 @@ Keep the work read-only unless the user explicitly asks to modify `~/.codex`.
 - Do not combine `session_index.jsonl`, `history.jsonl`, and `~/.codex/sessions` in one raw `rg`; if the ID appears inside a nested tool output, the match can dump an entire rollout JSON record back into context.
 - For broad keyword, prompt-shape, or review-lane searches in `history.jsonl`, `session_index.jsonl`, `sessions/**/rollout-*.jsonl`, or `archived_sessions/*.jsonl`, use `rg -l` / counts to find candidate files, then parse JSON and print selected fields plus short snippets.
 - Broad raw `rg` across transcript JSONL is a trap: it easily matches injected `AGENTS.md`, `<skills_instructions>`, pasted `SKILL.md` bodies, or huge nested `function_call_output` blobs and can create false skill hits or bury the decisive lines. `--max-count` / `-m` only limits matches per file, not total output.
+- Do not count a copied or restamped replay prefix as new friction merely because its outer record timestamps fall inside the audit window. Report replay volume separately from genuinely new records.
 - Do not confuse local transcript evidence with current repo truth; once the session points to a live file, repo, or remote artifact, that source becomes authoritative for the underlying technical question.
 - Do not silently mix local-only conclusions into tasks that may need remote-host coverage.
 - Do not recreate a second remote-access workflow here; this skill owns local extraction and interpretation after remote evidence is materialized.

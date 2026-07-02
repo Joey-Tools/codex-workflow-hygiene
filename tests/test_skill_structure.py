@@ -81,6 +81,31 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("Do not run keyword `rg -n ... ~/.codex`", workflow)
         self.assertIn("installed skills, overlays, caches, and package payloads", workflow)
 
+    def test_session_mining_requires_replay_boundary_detection(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+
+        self.assertIn("copied and restamped earlier history", skill)
+        self.assertIn("A strict record-timestamp filter is not sufficient", skill)
+        self.assertIn("latest genuine resume boundary", skill)
+        self.assertIn("Detect resumed or forked replay", workflow)
+        self.assertIn("stable fingerprint", workflow)
+        self.assertIn("Do not deduplicate a real repeated short prompt", workflow)
+        self.assertIn("replayed and genuinely new record counts separately", workflow)
+
+    def test_session_retrospective_bounds_operator_output(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "skills/codex-session-retrospective/SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn("task-scoped ignored log", skill)
+        self.assertIn("progress markers", skill)
+        self.assertIn("do not poll with 30k+ visible output caps", skill)
+        self.assertIn("`pgrep -af`", skill)
+        self.assertIn("`ps -p`", skill)
+        self.assertIn("`ps -eo` / `ps -axo`", skill)
+        self.assertIn("full `sample` output", skill)
+
     def test_session_mining_recent_turn_recipe_reads_both_indexes(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
