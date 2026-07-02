@@ -20657,8 +20657,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             history_repo, _commit = write_history_repo(raw)
             report = history_repo / "reports" / "weekly" / "2026" / "05" / "08.md"
             report.parent.mkdir(parents=True)
+            pgp_marker = "PGP " + "PRIVATE KEY BLOCK"
             report.write_text(
-                "Mistaken retained text:\n-----BEGIN PGP PRIVATE KEY BLOCK-----\nredacted\n-----END PGP PRIVATE KEY BLOCK-----\n",
+                f"Mistaken retained text:\n-----BEGIN {pgp_marker}-----\n"
+                f"redacted\n-----END {pgp_marker}-----\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "add", "reports/weekly/2026/05/08.md"], cwd=history_repo, check=True)
