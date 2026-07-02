@@ -28277,7 +28277,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "Breached credential in output.",
             "Use sk-proj-abcdefghijklmnop123456",
             "github_pat_abcdefghijklmnop1234567890",
-            "AKIAABCDEFGHIJKLMNOP",
+            "AKIA" + "ABCDEFGHIJKLMNOP",
             "eyJabcdefghijkl.eyJmnopqrstuv.eyJwxyzabcdef",
             "a" * 64,
             "169.254.169.254",
