@@ -48,11 +48,14 @@ Keep the full retained artifact under a task-scoped directory such as `.codex-tm
 
 For verbose `xcodebuild`, Swift, package-manager, or container builds, create the log path first and redirect both stdout and stderr before the process begins. A live PTY does not bound output by itself.
 
+Before launch, set both a finite wall-clock deadline and a maximum byte count across the entire retained-log set. Enforce the byte limit with a quota-bounded sink, a rotation policy that caps both aggregate bytes and segment count and removes or reuses old segments before writing more, or a supervisor that terminates the producer as soon as the limit is reached; ordinary unbounded rotation, post-exit size checks, and periodic `wc -c` observations are not enforcement. The deadline must terminate the producer with a bounded grace period. Byte enforcement must either keep the whole retained set below its fixed ceiling or terminate the producer with the same bounded grace period. Treat any terminated or evicted stream as incomplete when the workflow requires the full log, reject that result, and retain only bounded diagnostic evidence.
+
 For carriage-return or spinner-heavy tools such as `/usr/local/bin/container build`, do not rely on `--progress plain` or a visible-output cap. Keep the spinner stream in the task-scoped log and poll only compact state such as:
 
 - whether the process is still alive
 - elapsed time
 - log byte count
+- configured deadline and remaining retained-byte budget
 - a byte-bounded recent tail with carriage returns normalized before limiting lines
 
 For example, bound the byte window before normalizing spinner redraws:
@@ -68,6 +71,7 @@ Do not repeatedly poll with the entire accumulated log or a large output allowan
 Before presenting command-derived evidence, confirm:
 
 - the producer input was scoped or the complete output was captured away from the conversation
+- potentially unbounded producers had enforced time and retained-byte ceilings plus a defined termination action
 - the visible excerpt is compact and directly relevant
 - the exit status is known
 - an empty result is distinguishable from a failed command

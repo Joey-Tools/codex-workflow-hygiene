@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-15
 updated: 2026-07-15
 branch: codex/daily-skill-friction-20260715-codex-workflow-hygiene-bounded-command-output
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/41
 supersedes: []
 superseded_by:
 ---
@@ -20,6 +20,7 @@ superseded_by:
 
 - Search, inventory, log, artifact, process, build, test, and spinner-heavy command patterns share one cross-cutting skill.
 - Domain skills continue to own diagnosis, delivery, and review decisions; stricter domain contracts take precedence.
+- Potentially unbounded producers require enforced wall-clock and retained-byte ceilings; rotation qualifies only when the whole retained set has fixed aggregate-byte and segment-count caps with old segments removed or reused. Otherwise the producer must terminate at the ceiling. Task-scoped redirection and byte-count polling alone are only observability.
 
 ## Next Steps
 

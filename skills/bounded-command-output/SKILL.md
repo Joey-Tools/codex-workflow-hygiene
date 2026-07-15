@@ -24,6 +24,8 @@ This skill controls command shape and output handling only. It does not own diag
 3. Choose the output sink deliberately.
 - Let compact commands return directly.
 - When full output may be large or useful for later inspection, redirect stdout and stderr to a task-scoped file before starting the command.
+- Before launch, set a finite wall-clock deadline and an enforced ceiling across all retained artifacts. Use a hard quota or bounded sink, rotation with fixed aggregate-byte and segment-count caps that removes or reuses old segments before writing more, or a supervisor that terminates the producer at the byte ceiling. The deadline must terminate the producer; byte enforcement must either keep the retained set below its fixed ceiling or terminate the producer.
+- A task-scoped path and byte-count polling do not by themselves bound disk growth.
 - Treat UI or tool output caps as display backstops, not as execution-time bounds.
 - Start any long-running command that may need polling, interruption, or final-output harvesting with a pollable TTY or PTY shape while keeping the live stream in the task-scoped file.
 - Do not assume a later poll can attach to a plain-pipe session after stdin closes.
@@ -47,6 +49,7 @@ This skill controls command shape and output handling only. It does not own diag
 ## Guardrails
 
 - Do not run an unbounded producer and assume a small display cap made the work bounded.
+- Do not call a redirected log bounded unless its time and retained-byte ceilings are enforced while the producer runs.
 - Do not treat per-file match limits such as `rg --max-count` as a total-output cap across many files.
 - Do not print a whole long line when a filename, count, bounded match, length, or structured snippet would answer the question.
 - Do not redirect a small interactive command when doing so would hide a prompt or other required interaction.
