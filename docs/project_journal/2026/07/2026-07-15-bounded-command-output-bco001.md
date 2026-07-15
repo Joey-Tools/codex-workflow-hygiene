@@ -19,6 +19,7 @@ superseded_by:
 ## Current State
 
 - Search, inventory, log, artifact, process, build, test, and spinner-heavy command patterns share one cross-cutting skill.
+- Large repository and review-range inventories first use a streaming total counter with an explicit path-sample cap; short per-file lines do not make a complete inventory bounded.
 - Domain skills continue to own diagnosis, delivery, and review decisions; stricter domain contracts take precedence.
 - Potentially unbounded producers require enforced wall-clock and retained-byte ceilings; rotation qualifies only when the whole retained set has fixed aggregate-byte and segment-count caps with old segments removed or reused. Otherwise the producer must terminate at the ceiling. Task-scoped redirection and byte-count polling alone are only observability.
 

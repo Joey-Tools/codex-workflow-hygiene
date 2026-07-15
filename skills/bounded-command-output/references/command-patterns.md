@@ -6,10 +6,10 @@ Use these patterns after the main skill decides that a command needs an output b
 
 | Situation | Start with | Open next | Avoid |
 | --- | --- | --- | --- |
-| Large repository or generated-output-heavy tree | `rg --files <exact-dir>` with repo-appropriate exclude globs, then `rg -l` or `rg --count` | One exact file, symbol window, or small explicit file list | Raw broad `rg -n` across the repo |
-| High-frequency identifier or large alternation | Candidate filenames or counts | A bounded match against one exact file | A line-producing multi-file search as the first probe |
-| Large review range | `git diff --stat`, `git diff --numstat`, and `git diff --name-only` | Selected-file or selected-hunk diffs | One wide whole-range diff |
-| Potentially large untracked set | `git status --short --untracked-files=no`, then count or sample `git ls-files --others --exclude-standard` | Explicit candidate paths | Full untracked or ignored inventory first |
+| Large repository or generated-output-heavy tree | Stream `rg --files <exact-dir>` through a total counter plus an explicit `N`-path sampler, with repo-appropriate exclude globs | One exact file, symbol window, or small explicit file list | Printing the full file inventory or running raw broad `rg -n` |
+| High-frequency identifier or large alternation | A total count plus an explicit `N`-filename sample | A bounded match against one exact file | A line-producing multi-file search as the first probe |
+| Large review range | Stream `git diff --numstat` or `git diff --name-only` through aggregate counters plus an explicit `N`-path sampler | Selected-file or selected-hunk diffs; save a full stat only to an enforced bounded sink when required | Printing a full stat/name inventory or one wide whole-range diff |
+| Potentially large untracked set | `git status --short --untracked-files=no`, then stream `git ls-files --others --exclude-standard` through a total counter plus an explicit `N`-path sampler | Explicit candidate paths | Full untracked or ignored inventory first |
 | Sibling repository or reference checkout | Choose one exact repository and bounded file list; exclude generated output and dependency lockfiles unless relevant | Selected files only | Searching a broad parent directory or multiple repository roots |
 | Package metadata, cache JSON, lockfile, or binary | Check file type and size; use a structured parser or candidate-key extraction | Selected keys, symbols, or snippets | Raw broad search or unbounded `strings` output |
 
@@ -24,7 +24,9 @@ Common generated-tree excludes include:
 !**/vendor/**
 ```
 
-For embedded payloads, minified bundles, or other very long lines, prefer `rg -l`, bounded `rg -o`, counts, or structured length/snippet extraction. `rg --max-count` limits matches per file, so it does not replace a bounded candidate file set.
+An inventory command is not bounded merely because each item is short. Consume it with a streaming counter/sampler that retains at most `N` items and emits only the total plus those items; preserve the producer's exit status with the shell's pipeline-status mechanism. Do not print the complete inventory before counting or sampling it.
+
+For embedded payloads, minified bundles, or other very long lines, prefer counts, stream `rg -l` through the total-counter/`N`-filename sampler, or use bounded `rg -o` or structured length/snippet extraction. `rg --max-count` limits matches per file, so it does not replace a bounded candidate file set.
 
 ## Logs, Artifacts, And Manuals
 

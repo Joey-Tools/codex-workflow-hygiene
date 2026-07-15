@@ -19,7 +19,7 @@ This skill controls command shape and output handling only. It does not own diag
 2. Bound the producer before running it.
 - Narrow directories, files, time windows, predicates, identifiers, or changed paths.
 - Exclude dependency trees, generated output, archives, and lockfiles unless they are the target.
-- Start with counts, metadata, candidate filenames, or status summaries before printing matching lines or full records.
+- Start with counts, metadata, an explicitly capped candidate-filename sample, or status summaries before printing matching lines or full records.
 
 3. Choose the output sink deliberately.
 - Let compact commands return directly.
@@ -32,7 +32,7 @@ This skill controls command shape and output handling only. It does not own diag
 
 4. Surface compact evidence.
 - Poll process state, elapsed time, file byte counts, and a byte-bounded short tail instead of replaying the full stream.
-- Extract only the decisive counts, filenames, key lines, or short snippets needed for the task.
+- Extract only the decisive counts, bounded filename samples, key lines, or short snippets needed for the task.
 - Preserve the command's exit status and enough stderr context to distinguish failure from an empty result.
 
 5. Clean up task artifacts.
