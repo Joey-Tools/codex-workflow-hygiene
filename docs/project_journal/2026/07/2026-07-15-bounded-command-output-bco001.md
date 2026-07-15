@@ -30,3 +30,4 @@ superseded_by:
 - `skills/bounded-command-output/SKILL.md`
 - `skills/bounded-command-output/references/command-patterns.md`
 - `tests/test_skill_structure.py`
+- `tests/test_session_retrospective.py` preserves the fake GitHub token test value through runtime composition so frozen review preflight does not mistake the tracked fixture for a credential.
