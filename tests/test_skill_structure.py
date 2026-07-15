@@ -31,6 +31,37 @@ class SkillStructureTests(unittest.TestCase):
             self.assertIn("\nname:", frontmatter, path)
             self.assertIn("\ndescription:", frontmatter, path)
 
+    def test_bounded_command_output_contract(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill_root = root / "skills/bounded-command-output"
+        skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        patterns = (skill_root / "references/command-patterns.md").read_text(encoding="utf-8")
+        interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
+
+        for trigger in (
+            "broad searches or inventories",
+            "large Jenkins, GitHub Actions, artifact, manual, diff, or review-range reads",
+            "broad or noisy process diagnostics",
+            "verbose xcodebuild or other tests and builds",
+            "spinner-heavy container builds",
+        ):
+            self.assertIn(trigger, skill)
+        self.assertIn("Apply alongside the domain skill", skill)
+        self.assertIn("controls command shape and output handling only", skill)
+        self.assertIn("display backstops, not as execution-time bounds", skill)
+        self.assertIn("pollable TTY or PTY shape", skill)
+        self.assertIn("plain-pipe session after stdin closes", skill)
+        self.assertIn("## Searches And Inventories", patterns)
+        self.assertIn("## Logs, Artifacts, And Manuals", patterns)
+        self.assertIn("## Process And System Diagnostics", patterns)
+        self.assertIn("## Builds, Tests, And Polling", patterns)
+        self.assertIn("/usr/local/bin/container build", patterns)
+        self.assertIn("tail -c 8192 <task-log>", patterns)
+        self.assertIn("tr '\\r' '\\n'", patterns)
+        self.assertIn("$bounded-command-output", interface)
+        self.assertIn("allow_implicit_invocation: true", interface)
+        self.assertNotIn("TODO", skill)
+
     def test_session_mining_avoids_per_record_jsonl_key_dumps(self) -> None:
         root = Path(__file__).resolve().parents[1]
         skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
