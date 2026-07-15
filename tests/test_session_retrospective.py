@@ -28276,7 +28276,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "Exposed token in CI.",
             "Breached credential in output.",
             "Use sk-proj-abcdefghijklmnop123456",
-            "github_pat_abcdefghijklmnop1234567890",
+            "github_" + "pat_abcdefghijklmnop1234567890",
             "AKIA" + "ABCDEFGHIJKLMNOP",
             "eyJabcdefghijkl.eyJmnopqrstuv.eyJwxyzabcdef",
             "a" * 64,
