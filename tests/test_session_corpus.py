@@ -1475,11 +1475,12 @@ class SessionCorpusTests(unittest.TestCase):
                     [record("2026-07-16T01:00:00Z", "user_message", text="old")],
                 )
                 candidate = CORPUS.inventory_root(root)[0]
-                path.unlink()
+                replacement = temp / "replacement.jsonl"
                 write_rollout(
-                    path,
+                    replacement,
                     [record("2026-07-16T01:00:00Z", "user_message", text="new")],
                 )
+                replacement.replace(path)
 
                 with self.assertRaisesRegex(
                     CORPUS.CorpusError,
