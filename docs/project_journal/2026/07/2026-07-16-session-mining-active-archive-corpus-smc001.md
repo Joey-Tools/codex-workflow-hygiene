@@ -58,6 +58,7 @@ superseded_by:
 - Replay ordering now establishes provenance from the earliest of all known record timestamps before comparing per-position coverage, so an old source with a missing opening timestamp still precedes its fully restamped copy.
 - Wrapped `session_meta` records now derive lifecycle identity only from the actual payload, preventing generated outer envelope IDs from splitting an active/archive replay pair.
 - Fingerprints and JSON artifacts now use stable ASCII escapes, so valid JSON containing an isolated Unicode surrogate cannot terminate the helper with an uncaught UTF-8 encoding error.
+- The reference recipes use the same ASCII-escaped JSON output, so an optional index hint containing an isolated surrogate cannot abort before the authoritative rollout-root search.
 
 ## Next Steps
 

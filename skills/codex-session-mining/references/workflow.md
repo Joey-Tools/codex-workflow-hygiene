@@ -36,7 +36,7 @@ for path in (codex_root / 'session_index.jsonl', codex_root / 'history.jsonl'):
                 text = ' '.join(str(row.get('text') or '').split())[:300]
                 if text:
                     selected['text'] = text
-                print(f'{path}:{line_no}:{json.dumps(selected, ensure_ascii=False, sort_keys=True)}')
+                print(f'{path}:{line_no}:{json.dumps(selected, ensure_ascii=True, sort_keys=True)}')
     except OSError:
         print(f'warning: unable to read optional index {path}', file=sys.stderr)
         continue
@@ -109,7 +109,7 @@ for path in (Path('~/.codex/history.jsonl'), Path('~/.codex/session_index.jsonl'
         text = ' '.join(str(row.get('text') or row.get('thread_name') or '').split())[:240]
         if text:
             selected['text'] = text
-        print(f'{path}:{line_no}:{json.dumps(selected, ensure_ascii=False, sort_keys=True)}')
+        print(f'{path}:{line_no}:{json.dumps(selected, ensure_ascii=True, sort_keys=True)}')
 PY
 ```
 
@@ -329,7 +329,7 @@ print(json.dumps({
     'line_count': line_count,
     'first_record_keys': sorted(first.keys()) if isinstance(first, dict) else [],
     'unique_keys': sorted(keys),
-}, ensure_ascii=False, sort_keys=True))
+}, ensure_ascii=True, sort_keys=True))
 PY
 ```
 

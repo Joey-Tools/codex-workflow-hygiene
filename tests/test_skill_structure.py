@@ -278,6 +278,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("except OSError:", recipe)
         self.assertIn("except json.JSONDecodeError:", recipe)
         self.assertIn("warning: unable to read optional index", recipe)
+        self.assertNotIn("ensure_ascii=False", workflow)
+        self.assertGreaterEqual(workflow.count("ensure_ascii=True"), 3)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -311,7 +313,12 @@ class SkillStructureTests(unittest.TestCase):
             session_index = codex_home / "session_index.jsonl"
             session_index.write_text(
                 f"not-json-{session_id}\n"
-                + json.dumps({"session_id": session_id, "text": "matching index row"})
+                + json.dumps(
+                    {
+                        "session_id": session_id,
+                        "text": "matching \ud800 index row",
+                    }
+                )
                 + "\n",
                 encoding="utf-8",
             )
@@ -331,6 +338,7 @@ class SkillStructureTests(unittest.TestCase):
             self.assertIn(str(active), malformed.stdout)
             self.assertIn(str(archived), malformed.stdout)
             self.assertIn(f"{session_index}:2:", malformed.stdout)
+            self.assertIn("\\ud800", malformed.stdout)
             self.assertNotIn("not-json", malformed.stdout)
 
             opaque_id = "Opaque*?[ID]"
