@@ -351,6 +351,14 @@ class SessionCorpusTests(unittest.TestCase):
                     cwd="/old/worktree",
                     model="gpt-old",
                     model_id="model-old",
+                    model_provider="old-provider",
+                    originator="codex_cli_rs",
+                    source="cli",
+                    thread_source="old-terminal",
+                    context_window=100_000,
+                    history_mode="legacy",
+                    base_instructions="old instructions",
+                    git={"branch": "old", "commit_hash": "old-commit"},
                 ),
                 record(
                     "2026-01-01T01:01:00Z",
@@ -374,6 +382,14 @@ class SessionCorpusTests(unittest.TestCase):
                     cwd="/new/worktree",
                     model="gpt-new",
                     model_id="model-new",
+                    model_provider="new-provider",
+                    originator="codex_exec",
+                    source="exec",
+                    thread_source="new-subagent",
+                    context_window=200_000,
+                    history_mode="forked",
+                    base_instructions="new instructions",
+                    git={"branch": "new", "commit_hash": "new-commit"},
                 ),
                 record(
                     "2026-07-16T01:01:00Z",
@@ -669,6 +685,62 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(entries[0]["path"], str(active))
             self.assertEqual(entries[0]["accepted_line_ranges"], [[1, 2]])
             self.assertEqual(entries[0]["replayed_prefix_records"], 0)
+
+    def test_replay_prefix_stops_before_repeated_human_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6ba6-6b81-7cb1-bb7e-4b8ab4dc66ce"
+            archived = (
+                codex_home / "archived_sessions" / f"rollout-old-{session_id}.jsonl"
+            )
+            active = (
+                codex_home / "sessions/2026/07/16" / f"rollout-new-{session_id}.jsonl"
+            )
+
+            def branch_rows(day: str) -> list[dict[str, object]]:
+                return [
+                    record(f"{day}T01:00:00Z", "session_meta", id=session_id),
+                    record(
+                        f"{day}T01:01:00Z",
+                        "response_item",
+                        role="user",
+                        text="original task",
+                    ),
+                    record(
+                        f"{day}T01:02:00Z",
+                        "response_item",
+                        role="assistant",
+                        text="shared answer",
+                    ),
+                    record(
+                        f"{day}T01:03:00Z",
+                        "response_item",
+                        role="user",
+                        text="repeat request after the fork",
+                    ),
+                ]
+
+            write_rollout(archived, branch_rows("2026-01-01"))
+            write_rollout(active, branch_rows("2026-07-16"))
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["path"], str(active))
+            self.assertEqual(entries[0]["accepted_line_ranges"], [[4, 4]])
+            self.assertEqual(entries[0]["replayed_prefix_records"], 3)
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 0)
 
     def test_filename_id_is_only_a_candidate_key_without_matching_fingerprints(
         self,

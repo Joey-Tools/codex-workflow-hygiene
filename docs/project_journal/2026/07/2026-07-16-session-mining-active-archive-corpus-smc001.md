@@ -39,6 +39,8 @@ superseded_by:
 - Final GitHub review lexically normalizes `.` and `..` before descriptor-based output traversal, without resolving symlinks, so canceled path components are never created and the no-follow boundary remains intact.
 - Final independent review bound every inventoried root and rollout to device/inode/size metadata, reopened both passes through root-relative no-follow descriptors, and rejected root/file replacement or truncation while preserving verified append-only prefix reads.
 - The final inventory pass also snapshots and revalidates every traversed directory identity and entry set, so a root or pending subtree replacement cannot silently turn a complete corpus into an empty or partial result.
+- Non-byte-identical branch prefixes now stop at the last matching assistant/tool execution record, preserving a repeated human prompt typed after a fork even when its normalized content also appears in another branch.
+- Session metadata fingerprints now retain explicit lifecycle IDs while discarding runtime context such as Git state, originator/source, model/provider, thread source, context window, history mode, and base instructions, so restored history still matches across entry points and worktrees.
 
 ## Next Steps
 

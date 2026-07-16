@@ -29,7 +29,6 @@ ROLLOUT_TIMESTAMP_RE = re.compile(
     r"T(?P<hour>\d{2})-(?P<minute>\d{2})-(?P<second>\d{2})(?:-|\.jsonl$)"
 )
 VOLATILE_KEYS = frozenset({"timestamp", "ts", "created_at", "updated_at"})
-SESSION_META_CONTEXT_KEYS = frozenset({"cli_version", "cwd", "model", "model_id"})
 REPLAY_EVIDENCE_TYPES = frozenset(
     {
         "agent_message",
@@ -306,10 +305,10 @@ def record_fingerprint(
     )
     record_type = payload_type or stable.get("type")
     if record_type == "session_meta":
-        for key in SESSION_META_CONTEXT_KEYS:
-            stable.pop(key, None)
-            if isinstance(stable_payload, dict):
-                stable_payload.pop(key, None)
+        stable = {
+            "type": "session_meta",
+            "lifecycle_ids": record_lifecycle_ids(stable),
+        }
     else:
         state = canonicalizer or GeneratedIdCanonicalizer()
         normalize_generated_ids(stable, record_type, state)
@@ -922,8 +921,9 @@ def confirmed_replay_prefix_length(left: Rollout, right: Rollout) -> int:
         return 0
     if left.content_sha256 == right.content_sha256:
         return prefix
-    if any(record.replay_evidence for record in left.records[:prefix]):
-        return prefix
+    for index in range(prefix - 1, -1, -1):
+        if left.records[index].replay_evidence and right.records[index].replay_evidence:
+            return index + 1
     return 0
 
 

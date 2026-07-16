@@ -57,6 +57,8 @@ Use this skill for:
 - Treat an implausibly dense burst, repeated `session_meta` / `task_started` boundaries, old PR or task references reappearing at nearly identical timestamps, and thousands of historical tool calls emitted within seconds as replay signals.
 - Establish the latest genuine resume boundary from bounded `session_meta`, `turn_context`, `task_started`, and nearby `event_msg` user records. Deduplicate only the replayed prefix against earlier source history or stable record fingerprints; keep later human follow-ups in the same rollout.
 - Across active and archived roots, group candidates by lifecycle session ID when available and compare ordered stable record fingerprints. Collapse only byte-identical copies or matching replay prefixes; retain every distinct suffix, especially later genuine human follow-ups. Do not deduplicate by basename alone.
+- Fingerprint `session_meta` records from their explicit lifecycle IDs, not runtime context such as cwd, Git state, model/provider, originator/source, thread source, context window, history mode, or base instructions. Preserve unknown and nested domain evidence on non-session records.
+- For non-byte-identical branches, stop replay-prefix collapse at the last matching assistant/tool execution record. A matching human prompt after that boundary is genuine evidence even when its normalized text also appears in another branch.
 
 4. Classify before proposing a skill or `AGENTS.md` change.
 - Separate one-off mistakes from repeated patterns across multiple sessions.
