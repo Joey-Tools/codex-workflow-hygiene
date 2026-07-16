@@ -853,6 +853,297 @@ class SessionCorpusTests(unittest.TestCase):
                 groups_by_lifecycle[lifecycle_ids[2]],
             )
 
+    def test_conflicting_lifecycle_ids_isolate_restored_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            first_id = "019f6c4c-4f35-7139-a601-54d91db64c3a"
+            second_id = "019f6c4c-4f35-7139-a601-54d91db64c3b"
+            first = (
+                codex_home / "sessions/2026/07/16" / f"rollout-first-{first_id}.jsonl"
+            )
+            restored = (
+                codex_home / "archived_sessions" / f"rollout-restored-{second_id}.jsonl"
+            )
+            second = (
+                codex_home / "sessions/2026/07/16" / f"rollout-second-{second_id}.jsonl"
+            )
+            first_rows = [
+                record("2026-07-16T01:00:00Z", "session_meta", id=first_id),
+                record(
+                    "2026-07-16T01:01:00Z",
+                    "response_item",
+                    role="user",
+                    text="first task",
+                ),
+                record(
+                    "2026-07-16T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="first result",
+                ),
+            ]
+            restored_rows = [
+                *first_rows,
+                record("2026-07-16T02:00:00Z", "session_meta", id=second_id),
+                record(
+                    "2026-07-16T02:01:00Z",
+                    "response_item",
+                    role="user",
+                    text="restored task",
+                ),
+            ]
+            second_rows = [
+                record("2026-07-16T03:00:00Z", "session_meta", id=second_id),
+                record(
+                    "2026-07-16T03:01:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="second result",
+                ),
+            ]
+            write_rollout(first, first_rows)
+            write_rollout(restored, restored_rows)
+            write_rollout(second, second_rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 3)
+            by_path = {entry["path"]: entry for entry in entries}
+            self.assertEqual(by_path[str(first)]["lifecycle_ids"], [first_id])
+            self.assertEqual(by_path[str(second)]["lifecycle_ids"], [second_id])
+            self.assertIsNone(by_path[str(restored)]["lifecycle_id"])
+            self.assertEqual(
+                by_path[str(restored)]["lifecycle_ids"],
+                [first_id, second_id],
+            )
+            self.assertEqual(
+                by_path[str(restored)]["accepted_line_ranges"],
+                [[1, 5]],
+            )
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["replayed_prefix_records"], 0)
+            self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 0)
+
+    def test_matching_multi_lifecycle_sets_remain_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            first_id = "019f6c4c-4f35-7139-a601-54d91db64c3a"
+            second_id = "019f6c4c-4f35-7139-a601-54d91db64c3b"
+            active = codex_home / "sessions/2026/07/16" / f"rollout-a-{first_id}.jsonl"
+            archived = codex_home / "archived_sessions" / f"rollout-b-{second_id}.jsonl"
+            shared = record(
+                "2026-07-16T01:00:00Z",
+                "response_item",
+                role="assistant",
+                text="shared execution evidence",
+            )
+            write_rollout(
+                active,
+                [
+                    shared,
+                    record("2026-07-16T01:01:00Z", "session_meta", id=first_id),
+                    record("2026-07-16T01:02:00Z", "session_meta", id=second_id),
+                ],
+            )
+            write_rollout(
+                archived,
+                [
+                    shared,
+                    record("2026-07-16T01:01:00Z", "session_meta", id=second_id),
+                    record("2026-07-16T01:02:00Z", "session_meta", id=first_id),
+                ],
+            )
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(
+                {tuple(entry["lifecycle_ids"]) for entry in entries},
+                {(first_id, second_id)},
+            )
+            self.assertEqual(
+                {entry["accepted_record_count"] for entry in entries},
+                {3},
+            )
+            self.assertEqual(len({entry["group"] for entry in entries}), 2)
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["replayed_prefix_records"], 0)
+            self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 0)
+
+    def test_identical_ambiguous_multi_lifecycle_copies_are_collapsed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            first_id = "019f6c4c-4f35-7139-a601-54d91db64c3a"
+            filename_id = "019f6c4c-4f35-7139-a601-54d91db64c3b"
+            active = (
+                codex_home
+                / "sessions/2026/07/16"
+                / f"rollout-active-{filename_id}.jsonl"
+            )
+            archived = (
+                codex_home
+                / "archived_sessions"
+                / f"rollout-archived-{filename_id}.jsonl"
+            )
+            rows = [
+                record("2026-07-16T01:00:00Z", "session_meta", id=first_id),
+                record("2026-07-16T01:01:00Z", "session_meta", id=filename_id),
+                record(
+                    "2026-07-16T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="restored suffix",
+                ),
+            ]
+            write_rollout(active, rows)
+            write_rollout(archived, rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 1)
+            self.assertIsNone(entries[0]["owner_id"])
+            self.assertEqual(entries[0]["lifecycle_ids"], [first_id, filename_id])
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 1)
+            self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
+
+    def test_multi_lifecycle_copies_with_same_owner_are_collapsed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            owner_id = "019f6c4c-4f35-7139-a601-54d91db64c3a"
+            foreign_id = "019f6c4c-4f35-7139-a601-54d91db64c3b"
+            active = (
+                codex_home / "sessions/2026/07/16" / f"rollout-active-{owner_id}.jsonl"
+            )
+            archived = (
+                codex_home / "archived_sessions" / f"rollout-archived-{owner_id}.jsonl"
+            )
+            rows = [
+                record("2026-07-16T01:00:00Z", "session_meta", id=owner_id),
+                record("2026-07-16T01:01:00Z", "session_meta", id=foreign_id),
+                record(
+                    "2026-07-16T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="same owner suffix",
+                ),
+            ]
+            write_rollout(active, rows)
+            write_rollout(archived, rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["owner_id"], owner_id)
+            self.assertEqual(entries[0]["lifecycle_ids"], [owner_id, foreign_id])
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 1)
+            self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
+
+    def test_session_meta_collects_conflicting_identity_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            owner_id = "019f6c4c-4f35-7139-a601-54d91db64c3a"
+            alias_id = "019f6c4c-4f35-7139-a601-54d91db64c3b"
+            pure = codex_home / "sessions/2026/07/16" / f"rollout-pure-{owner_id}.jsonl"
+            ambiguous = (
+                codex_home / "archived_sessions" / f"rollout-aliases-{owner_id}.jsonl"
+            )
+            shared = record(
+                "2026-07-16T00:59:00Z",
+                "response_item",
+                role="assistant",
+                text="shared execution evidence",
+            )
+            write_rollout(
+                pure,
+                [
+                    shared,
+                    record(
+                        "2026-07-16T01:00:00Z",
+                        "session_meta",
+                        id=owner_id,
+                    ),
+                ],
+            )
+            write_rollout(
+                ambiguous,
+                [
+                    shared,
+                    record(
+                        "2026-07-16T01:00:00Z",
+                        "session_meta",
+                        id=owner_id,
+                        session_id=alias_id,
+                    ),
+                ],
+            )
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 2)
+            by_path = {entry["path"]: entry for entry in entries}
+            self.assertEqual(by_path[str(pure)]["owner_id"], owner_id)
+            self.assertIsNone(by_path[str(ambiguous)]["owner_id"])
+            self.assertEqual(
+                by_path[str(ambiguous)]["lifecycle_ids"],
+                [owner_id, alias_id],
+            )
+            self.assertEqual(len({entry["group"] for entry in entries}), 2)
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["replayed_prefix_records"], 0)
+            self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 0)
+
     def test_identical_content_without_shared_identity_is_not_collapsed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -1023,6 +1314,100 @@ class SessionCorpusTests(unittest.TestCase):
                 )
             )
 
+    def test_empty_timestamp_less_rollouts_are_not_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6c4c-4f35-7139-a601-54d91db64c39"
+            active = (
+                codex_home
+                / "sessions/2026/07/16"
+                / f"rollout-2026-07-16T01-00-00-{session_id}.jsonl"
+            )
+            archived = (
+                codex_home
+                / "archived_sessions"
+                / f"rollout-2026-07-16T01-00-00-{session_id}.jsonl"
+            )
+            write_rollout(active, [])
+            write_rollout(archived, [])
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual((output / "corpus.jsonl").read_text(encoding="utf-8"), "")
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["active_accepted"], 0)
+            self.assertEqual(manifest["counts"]["archived_accepted"], 0)
+            self.assertEqual(manifest["counts"]["union_accepted"], 0)
+            self.assertEqual(manifest["counts"]["union_accepted_groups"], 0)
+
+            write_rollout(
+                archived,
+                [
+                    {
+                        "type": "response_item",
+                        "payload": {"role": "user", "text": "real task"},
+                    }
+                ],
+            )
+            mixed_output = temp / "mixed-out"
+            mixed = self.run_corpus(codex_home, mixed_output)
+            self.assertEqual(mixed.returncode, 0, mixed.stderr)
+            mixed_manifest = json.loads(
+                (mixed_output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(mixed_manifest["counts"]["active_accepted"], 0)
+            self.assertEqual(mixed_manifest["counts"]["archived_accepted"], 1)
+            self.assertEqual(mixed_manifest["counts"]["union_accepted"], 1)
+            self.assertEqual(mixed_manifest["counts"]["union_accepted_groups"], 1)
+            mixed_entries = [
+                json.loads(line)
+                for line in (mixed_output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(mixed_entries), 1)
+            self.assertEqual(mixed_entries[0]["path"], str(archived))
+            self.assertEqual(mixed_entries[0]["accepted_record_count"], 1)
+
+            write_rollout(archived, [])
+            accepted = (
+                codex_home
+                / "sessions/2026/07/16"
+                / f"rollout-2026-07-16T02-00-00-copy-{session_id}.jsonl"
+            )
+            write_rollout(
+                accepted,
+                [
+                    {
+                        "type": "response_item",
+                        "payload": {"role": "user", "text": "real task"},
+                    }
+                ],
+            )
+            metrics_output = temp / "metrics-out"
+            metrics = self.run_corpus(codex_home, metrics_output)
+            self.assertEqual(metrics.returncode, 0, metrics.stderr)
+            metrics_manifest = json.loads(
+                (metrics_output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metrics_manifest["counts"]["union_accepted"], 1)
+            self.assertEqual(
+                metrics_manifest["counts"]["union_accepted_groups"],
+                1,
+            )
+            self.assertEqual(
+                metrics_manifest["counts"]["cross_root_duplicate_groups"],
+                0,
+            )
+            self.assertEqual(
+                metrics_manifest["counts"]["duplicate_rollouts_collapsed"],
+                0,
+            )
+
     def test_invalid_json_and_invalid_window_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -1121,6 +1506,12 @@ class SessionCorpusTests(unittest.TestCase):
             finally:
                 CORPUS.os.close(directory_fd)
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+
+            normalized_output = temp / "canceled" / ".." / "normalized-output"
+            normalized = self.run_corpus(codex_home, normalized_output)
+            self.assertEqual(normalized.returncode, 0, normalized.stderr)
+            self.assertTrue((temp / "normalized-output" / "manifest.json").is_file())
+            self.assertFalse((temp / "canceled").exists())
 
     def test_out_of_window_cross_root_group_skips_fingerprint_loading(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

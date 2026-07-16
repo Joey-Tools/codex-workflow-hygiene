@@ -35,6 +35,8 @@ superseded_by:
 - Replay collapse now requires byte identity or assistant/tool execution evidence inside the normalized prefix; prompt-only matches remain visible even under one lifecycle. Root inspection uses `lstat` so a dangling active or archive symlink fails closed instead of reporting an empty root.
 - Filename UUIDs no longer bridge components containing two explicit different lifecycle IDs, including through a lifecycle-less intermediate rollout. Corpus output requires a fresh path created through no-follow directory descriptors and uses exclusive no-follow artifact creation, while cross-root groups with no in-window candidate skip the fingerprint-loading pass.
 - Final PR review preserved second-level filename timestamps for timestamp-less rollouts and made replay fingerprints stable across narrow `session_meta` runtime-context drift plus regenerated response/call/turn IDs. The canonicalizer preserves lifecycle identity, generated-ID reference relationships, unknown fields, and nested domain IDs from tool results.
+- Independent final review made multi-lifecycle rollouts retain every explicit identity and use a filename/first-lifecycle agreement as the owner boundary; owner-later or otherwise ambiguous histories cannot prefix-bridge sessions, while byte-identical copies with the same complete ID set still collapse. Empty timestamp-less files remain counted as candidates but no longer create zero-record accepted entries or duplicate metrics.
+- Final GitHub review lexically normalizes `.` and `..` before descriptor-based output traversal, without resolving symlinks, so canceled path components are never created and the no-follow boundary remains intact.
 
 ## Next Steps
 

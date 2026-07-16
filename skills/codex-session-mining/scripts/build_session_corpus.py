@@ -75,7 +75,8 @@ class Record:
 class RolloutMetadata:
     path: Path
     source: str
-    lifecycle_id: str | None
+    lifecycle_ids: frozenset[str]
+    first_lifecycle_id: str | None
     filename_session_id: str | None
     content_sha256: str
     source_bytes: int
@@ -90,17 +91,59 @@ class RolloutMetadata:
     def accepted(self) -> bool:
         return self.has_in_window_record or self.fallback_accepted
 
+    @property
+    def lifecycle_id(self) -> str | None:
+        if len(self.lifecycle_ids) != 1:
+            return None
+        return next(iter(self.lifecycle_ids))
+
+    @property
+    def owner_id(self) -> str | None:
+        if self.first_lifecycle_id is None:
+            return None
+        if self.filename_session_id is None:
+            return self.lifecycle_id
+        if self.first_lifecycle_id == self.filename_session_id:
+            return self.filename_session_id
+        return None
+
+    @property
+    def identity_ambiguous(self) -> bool:
+        return bool(self.lifecycle_ids) and self.owner_id is None
+
 
 @dataclass(frozen=True, slots=True)
 class Rollout:
     path: Path
     source: str
     records: tuple[Record, ...]
-    lifecycle_id: str | None
+    lifecycle_ids: frozenset[str]
+    first_lifecycle_id: str | None
     filename_session_id: str | None
     content_sha256: str
     fallback_timestamp: dt.datetime | None
     first_timestamp: dt.datetime | None
+    window_accepted: bool
+
+    @property
+    def lifecycle_id(self) -> str | None:
+        if len(self.lifecycle_ids) != 1:
+            return None
+        return next(iter(self.lifecycle_ids))
+
+    @property
+    def owner_id(self) -> str | None:
+        if self.first_lifecycle_id is None:
+            return None
+        if self.filename_session_id is None:
+            return self.lifecycle_id
+        if self.first_lifecycle_id == self.filename_session_id:
+            return self.filename_session_id
+        return None
+
+    @property
+    def identity_ambiguous(self) -> bool:
+        return bool(self.lifecycle_ids) and self.owner_id is None
 
 
 class UnionFind:
@@ -251,20 +294,21 @@ def record_timestamp(row: dict[str, Any]) -> dt.datetime | None:
     return None
 
 
-def record_lifecycle_id(row: dict[str, Any]) -> str | None:
+def record_lifecycle_ids(row: dict[str, Any]) -> tuple[str, ...]:
     payload = row.get("payload")
     payload_type = payload.get("type") if isinstance(payload, dict) else None
     if row.get("type") != "session_meta" and payload_type != "session_meta":
-        return None
+        return ()
+    values: list[str] = []
     sources = [payload, row]
     for source in sources:
         if not isinstance(source, dict):
             continue
         for key in ("id", "session_id", "thread_id"):
             value = source.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
+            if isinstance(value, str) and value.strip() and value.strip() not in values:
+                values.append(value.strip())
+    return tuple(values)
 
 
 def record_replay_evidence(row: dict[str, Any]) -> bool:
@@ -392,7 +436,9 @@ def scan_rollout_metadata(
     start: dt.datetime,
     end: dt.datetime,
 ) -> RolloutMetadata:
-    lifecycle_id: str | None = None
+    lifecycle_ids: set[str] = set()
+    first_lifecycle_id: str | None = None
+    saw_lifecycle_record = False
     digest = hashlib.sha256()
     source_bytes = 0
     first_timestamp: dt.datetime | None = None
@@ -414,7 +460,14 @@ def scan_rollout_metadata(
                     ) from error
                 if not isinstance(row, dict):
                     raise CorpusError(f"non-object rollout record at {path}:{line_no}")
-                lifecycle_id = lifecycle_id or record_lifecycle_id(row)
+                record_ids = record_lifecycle_ids(row)
+                if record_ids:
+                    if not saw_lifecycle_record:
+                        first_lifecycle_id = (
+                            record_ids[0] if len(record_ids) == 1 else None
+                        )
+                        saw_lifecycle_record = True
+                    lifecycle_ids.update(record_ids)
                 timestamp = record_timestamp(row)
                 record_count += 1
                 if timestamp is not None:
@@ -435,7 +488,8 @@ def scan_rollout_metadata(
     return RolloutMetadata(
         path=path,
         source=source,
-        lifecycle_id=lifecycle_id,
+        lifecycle_ids=frozenset(lifecycle_ids),
+        first_lifecycle_id=first_lifecycle_id,
         filename_session_id=filename_session_id(path),
         content_sha256=digest.hexdigest(),
         source_bytes=source_bytes,
@@ -444,7 +498,9 @@ def scan_rollout_metadata(
         has_record_timestamp=has_record_timestamp,
         has_in_window_record=has_in_window_record,
         fallback_accepted=(
-            not has_record_timestamp and in_window(fallback_timestamp, start, end)
+            record_count > 0
+            and not has_record_timestamp
+            and in_window(fallback_timestamp, start, end)
         ),
         record_count=record_count,
     )
@@ -502,11 +558,13 @@ def load_rollout_records(metadata: RolloutMetadata) -> Rollout:
         path=metadata.path,
         source=metadata.source,
         records=tuple(records),
-        lifecycle_id=metadata.lifecycle_id,
+        lifecycle_ids=metadata.lifecycle_ids,
+        first_lifecycle_id=metadata.first_lifecycle_id,
         filename_session_id=metadata.filename_session_id,
         content_sha256=metadata.content_sha256,
         fallback_timestamp=metadata.fallback_timestamp,
         first_timestamp=metadata.first_timestamp,
+        window_accepted=metadata.accepted,
     )
 
 
@@ -530,6 +588,32 @@ def confirmed_replay_prefix_length(left: Rollout, right: Rollout) -> int:
     return 0
 
 
+def filename_candidates_compatible(
+    left_owner: str | None,
+    right_owner: str | None,
+    left_ambiguous: bool,
+    right_ambiguous: bool,
+) -> bool:
+    if left_ambiguous or right_ambiguous:
+        return False
+    return len({owner for owner in (left_owner, right_owner) if owner}) <= 1
+
+
+def content_identity(
+    owner_id: str | None,
+    lifecycle_ids: frozenset[str],
+    filename_id: str | None,
+    identity_ambiguous: bool,
+) -> tuple[str, str] | None:
+    if owner_id is not None:
+        return ("owner", owner_id)
+    if identity_ambiguous:
+        return ("ambiguous-lifecycles", "\0".join(sorted(lifecycle_ids)))
+    if filename_id is not None:
+        return ("filename", filename_id)
+    return None
+
+
 def group_metadata(metadata: list[RolloutMetadata]) -> list[list[RolloutMetadata]]:
     """Build broad groups before loading fingerprint sequences.
 
@@ -539,22 +623,36 @@ def group_metadata(metadata: list[RolloutMetadata]) -> list[list[RolloutMetadata
 
     union_find = UnionFind(len(metadata))
     lifecycle_owner: dict[str, int] = {}
-    content_owner: dict[tuple[str, str], int] = {}
-    filename_owner: dict[str, int] = {}
+    content_owner: dict[tuple[tuple[str, str], str], int] = {}
+    filename_members: dict[str, list[int]] = {}
     for index, rollout in enumerate(metadata):
-        if rollout.lifecycle_id is not None:
-            owner = lifecycle_owner.setdefault(rollout.lifecycle_id, index)
+        if rollout.owner_id is not None:
+            owner = lifecycle_owner.setdefault(rollout.owner_id, index)
             union_find.union(owner, index)
-        content_identity = rollout.lifecycle_id or rollout.filename_session_id
-        if content_identity is not None:
+        identity = content_identity(
+            rollout.owner_id,
+            rollout.lifecycle_ids,
+            rollout.filename_session_id,
+            rollout.identity_ambiguous,
+        )
+        if identity is not None:
             owner = content_owner.setdefault(
-                (content_identity, rollout.content_sha256),
+                (identity, rollout.content_sha256),
                 index,
             )
             union_find.union(owner, index)
         if rollout.filename_session_id is not None:
-            owner = filename_owner.setdefault(rollout.filename_session_id, index)
-            union_find.union(owner, index)
+            filename_members.setdefault(rollout.filename_session_id, []).append(index)
+    for members in filename_members.values():
+        for offset, left_index in enumerate(members):
+            for right_index in members[offset + 1 :]:
+                if filename_candidates_compatible(
+                    metadata[left_index].owner_id,
+                    metadata[right_index].owner_id,
+                    metadata[left_index].identity_ambiguous,
+                    metadata[right_index].identity_ambiguous,
+                ):
+                    union_find.union(left_index, right_index)
     groups: dict[int, list[RolloutMetadata]] = {}
     for index, rollout in enumerate(metadata):
         groups.setdefault(union_find.find(index), []).append(rollout)
@@ -563,8 +661,8 @@ def group_metadata(metadata: list[RolloutMetadata]) -> list[list[RolloutMetadata
 
 def group_rollouts(rollouts: list[Rollout]) -> list[list[Rollout]]:
     union_find = UnionFind(len(rollouts))
-    component_lifecycles = [
-        {rollout.lifecycle_id} if rollout.lifecycle_id is not None else set()
+    component_owners = [
+        {rollout.owner_id} if rollout.owner_id is not None else set()
         for rollout in rollouts
     ]
 
@@ -574,19 +672,24 @@ def group_rollouts(rollouts: list[Rollout]) -> list[list[Rollout]]:
         if left_root == right_root:
             return
         union_find.union(left_root, right_root)
-        component_lifecycles[left_root].update(component_lifecycles[right_root])
+        component_owners[left_root].update(component_owners[right_root])
 
     lifecycle_owner: dict[str, int] = {}
-    content_owner: dict[tuple[str, str], int] = {}
+    content_owner: dict[tuple[tuple[str, str], str], int] = {}
     filename_members: dict[str, list[int]] = {}
     for index, rollout in enumerate(rollouts):
-        if rollout.lifecycle_id is not None:
-            owner = lifecycle_owner.setdefault(rollout.lifecycle_id, index)
+        if rollout.owner_id is not None:
+            owner = lifecycle_owner.setdefault(rollout.owner_id, index)
             union_components(owner, index)
-        content_identity = rollout.lifecycle_id or rollout.filename_session_id
-        if content_identity is not None:
+        identity = content_identity(
+            rollout.owner_id,
+            rollout.lifecycle_ids,
+            rollout.filename_session_id,
+            rollout.identity_ambiguous,
+        )
+        if identity is not None:
             owner = content_owner.setdefault(
-                (content_identity, rollout.content_sha256),
+                (identity, rollout.content_sha256),
                 index,
             )
             union_components(owner, index)
@@ -595,9 +698,14 @@ def group_rollouts(rollouts: list[Rollout]) -> list[list[Rollout]]:
     for members in filename_members.values():
         for offset, left_index in enumerate(members):
             for right_index in members[offset + 1 :]:
-                left_lifecycles = component_lifecycles[union_find.find(left_index)]
-                right_lifecycles = component_lifecycles[union_find.find(right_index)]
-                if len(left_lifecycles | right_lifecycles) > 1:
+                left_owners = component_owners[union_find.find(left_index)]
+                right_owners = component_owners[union_find.find(right_index)]
+                if not filename_candidates_compatible(
+                    next(iter(left_owners), None),
+                    next(iter(right_owners), None),
+                    rollouts[left_index].identity_ambiguous,
+                    rollouts[right_index].identity_ambiguous,
+                ):
                     continue
                 if (
                     common_prefix_length(rollouts[left_index], rollouts[right_index])
@@ -644,6 +752,9 @@ def union_entries(
     for group_index, group in enumerate(ordered_groups, group_start):
         histories: list[Rollout] = []
         group_accepted = False
+        group_window_accepted = any(rollout.window_accepted for rollout in group)
+        group_replayed_record_count = 0
+        group_collapsed_rollout_count = 0
         for rollout in sorted(group, key=rollout_sort_key):
             prefix = max(
                 (
@@ -652,7 +763,7 @@ def union_entries(
                 ),
                 default=0,
             )
-            replayed_record_count += prefix
+            group_replayed_record_count += prefix
             unique_records = rollout.records[prefix:]
             relevant_lines = [
                 record.line_no
@@ -662,13 +773,13 @@ def union_entries(
             fallback_accepted = (
                 not any(record.timestamp is not None for record in rollout.records)
                 and in_window(rollout.fallback_timestamp, start, end)
-                and (bool(unique_records) or not rollout.records)
+                and bool(unique_records)
                 and not (histories and prefix == len(rollout.records))
             )
             if fallback_accepted:
                 relevant_lines = [record.line_no for record in unique_records]
             if prefix == len(rollout.records) and histories:
-                collapsed_rollout_count += 1
+                group_collapsed_rollout_count += 1
             if relevant_lines or fallback_accepted:
                 group_accepted = True
                 entries.append(
@@ -678,6 +789,8 @@ def union_entries(
                         "fallback_date_used": fallback_accepted,
                         "group": group_index,
                         "lifecycle_id": rollout.lifecycle_id,
+                        "lifecycle_ids": sorted(rollout.lifecycle_ids),
+                        "owner_id": rollout.owner_id,
                         "path": rollout.path.as_posix(),
                         "replayed_prefix_records": prefix,
                         "root": rollout.source,
@@ -687,6 +800,9 @@ def union_entries(
             histories.append(rollout)
         if group_accepted:
             accepted_group_count += 1
+        if group_window_accepted:
+            replayed_record_count += group_replayed_record_count
+            collapsed_rollout_count += group_collapsed_rollout_count
     return entries, replayed_record_count, collapsed_rollout_count, accepted_group_count
 
 
@@ -818,7 +934,7 @@ def create_fresh_directory_at(parent_fd: int, name: str, path: Path) -> int:
 
 
 def create_output_directory(output: Path) -> int:
-    absolute = output.absolute()
+    absolute = Path(os.path.normpath(os.fspath(output.absolute())))
     components = list(absolute.parts[1:])
     if not components:
         raise CorpusError("output directory must not be the filesystem root")
@@ -895,22 +1011,24 @@ def build_corpus(
         refined_groups = group_rollouts(
             [load_rollout_records(rollout) for rollout in broad_group]
         )
-        cross_root_duplicate_groups += sum(
-            1
-            for group in refined_groups
-            if {rollout.source for rollout in group} == {"active", "archived"}
-        )
-        new_entries, new_replayed, new_collapsed, new_accepted_groups = union_entries(
-            refined_groups,
-            start,
-            end,
-            next_group,
-        )
-        entries.extend(new_entries)
-        replayed_count += new_replayed
-        collapsed_count += new_collapsed
-        accepted_group_count += new_accepted_groups
-        next_group += len(refined_groups)
+        for refined_group in refined_groups:
+            new_entries, new_replayed, new_collapsed, new_accepted_groups = (
+                union_entries(
+                    [refined_group],
+                    start,
+                    end,
+                    next_group,
+                )
+            )
+            entries.extend(new_entries)
+            replayed_count += new_replayed
+            collapsed_count += new_collapsed
+            accepted_group_count += new_accepted_groups
+            if any(rollout.window_accepted for rollout in refined_group) and {
+                rollout.source for rollout in refined_group
+            } == {"active", "archived"}:
+                cross_root_duplicate_groups += 1
+            next_group += 1
     counts = {
         "active_accepted": len(active_accepted),
         "active_candidate": len(active_paths),
