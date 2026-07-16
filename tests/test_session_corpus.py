@@ -211,6 +211,56 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(entries[0]["accepted_line_ranges"], [[3, 3]])
             self.assertEqual(entries[0]["replayed_prefix_records"], 2)
 
+    def test_older_long_source_owns_short_restamped_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6b90-f29c-7b92-8479-ec64017caeca"
+            archived = (
+                codex_home
+                / "archived_sessions"
+                / f"rollout-source-{session_id}.jsonl"
+            )
+            active = (
+                codex_home
+                / "sessions/2026/07/16"
+                / f"rollout-restamped-{session_id}.jsonl"
+            )
+            archived_rows = [
+                record("2026-01-01T01:00:00Z", "session_meta", id=session_id),
+                record(
+                    "2026-01-01T01:01:00Z",
+                    "response_item",
+                    role="user",
+                    text="old task",
+                ),
+                record(
+                    "2026-01-01T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="old result",
+                ),
+            ]
+            active_rows = [
+                record("2026-07-16T01:00:00Z", "session_meta", id=session_id),
+                record(
+                    "2026-07-16T01:01:00Z",
+                    "response_item",
+                    role="user",
+                    text="old task",
+                ),
+            ]
+            write_rollout(archived, archived_rows)
+            write_rollout(active, active_rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual((output / "corpus.jsonl").read_text(encoding="utf-8"), "")
+            manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
+            self.assertEqual(manifest["counts"]["replayed_prefix_records"], 2)
+
     def test_filename_id_is_only_a_candidate_key_without_matching_fingerprints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -240,10 +290,9 @@ class SessionCorpusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             codex_home = temp / ".codex"
-            active = codex_home / "sessions/2026/07/16/rollout-unrelated-active.jsonl"
+            active = codex_home / "sessions/2026/07/16/rollout-unrelated.jsonl"
             archived = (
-                codex_home
-                / "archived_sessions/2026/07/16/rollout-unrelated-archived.jsonl"
+                codex_home / "archived_sessions/2026/07/16/rollout-unrelated.jsonl"
             )
             rows = [record("2026-07-16T05:00:00Z", "response_item", role="user", text="same")]
             write_rollout(active, rows)

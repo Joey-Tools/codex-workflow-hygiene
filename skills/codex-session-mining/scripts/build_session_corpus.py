@@ -383,11 +383,13 @@ def group_metadata(metadata: list[RolloutMetadata]) -> list[list[RolloutMetadata
         if rollout.lifecycle_id is not None:
             owner = lifecycle_owner.setdefault(rollout.lifecycle_id, index)
             union_find.union(owner, index)
-        content_identity = (
-            rollout.lifecycle_id or rollout.filename_session_id or rollout.path.name
-        )
-        owner = content_owner.setdefault((content_identity, rollout.content_sha256), index)
-        union_find.union(owner, index)
+        content_identity = rollout.lifecycle_id or rollout.filename_session_id
+        if content_identity is not None:
+            owner = content_owner.setdefault(
+                (content_identity, rollout.content_sha256),
+                index,
+            )
+            union_find.union(owner, index)
         if rollout.filename_session_id is not None:
             owner = filename_owner.setdefault(rollout.filename_session_id, index)
             union_find.union(owner, index)
@@ -406,11 +408,13 @@ def group_rollouts(rollouts: list[Rollout]) -> list[list[Rollout]]:
         if rollout.lifecycle_id is not None:
             owner = lifecycle_owner.setdefault(rollout.lifecycle_id, index)
             union_find.union(owner, index)
-        content_identity = (
-            rollout.lifecycle_id or rollout.filename_session_id or rollout.path.name
-        )
-        owner = content_owner.setdefault((content_identity, rollout.content_sha256), index)
-        union_find.union(owner, index)
+        content_identity = rollout.lifecycle_id or rollout.filename_session_id
+        if content_identity is not None:
+            owner = content_owner.setdefault(
+                (content_identity, rollout.content_sha256),
+                index,
+            )
+            union_find.union(owner, index)
         if rollout.filename_session_id is not None:
             filename_members.setdefault(rollout.filename_session_id, []).append(index)
     for members in filename_members.values():
@@ -438,10 +442,10 @@ def line_ranges(lines: list[int]) -> list[list[int]]:
     return ranges
 
 
-def rollout_sort_key(rollout: Rollout) -> tuple[int, dt.datetime, int, str]:
+def rollout_sort_key(rollout: Rollout) -> tuple[dt.datetime, int, int, str]:
     first = rollout.first_timestamp or dt.datetime.max.replace(tzinfo=UTC)
     source_rank = 0 if rollout.source == "active" else 1
-    return (len(rollout.records), first, source_rank, rollout.path.as_posix())
+    return (first, len(rollout.records), source_rank, rollout.path.as_posix())
 
 
 def union_entries(
