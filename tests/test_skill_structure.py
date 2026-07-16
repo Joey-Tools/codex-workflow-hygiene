@@ -333,13 +333,15 @@ class SkillStructureTests(unittest.TestCase):
             self.assertIn(f"{session_index}:2:", malformed.stdout)
             self.assertNotIn("not-json", malformed.stdout)
 
-            opaque_id = "Opaque-Session-ID"
+            opaque_id = "Opaque*?[ID]"
             opaque = codex_home / f"archived_sessions/rollout-opaque-{opaque_id}.jsonl"
             wrong_case = codex_home / (
                 f"archived_sessions/rollout-opaque-{opaque_id.lower()}.jsonl"
             )
+            glob_decoy = codex_home / "archived_sessions/rollout-opaque-OpaqueXYZI.jsonl"
             opaque.write_text("{}\n", encoding="utf-8")
             wrong_case.write_text("{}\n", encoding="utf-8")
+            glob_decoy.write_text("{}\n", encoding="utf-8")
             opaque_recipe = recipe.replace(
                 f"SESSION_ID='{session_id}'", f"SESSION_ID='{opaque_id}'", 1
             )

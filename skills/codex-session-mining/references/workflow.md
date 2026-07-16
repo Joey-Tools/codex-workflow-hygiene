@@ -43,22 +43,33 @@ for path in (codex_root / 'session_index.jsonl', codex_root / 'history.jsonl'):
 PY
 matches_file=$(mktemp)
 trap 'rm -f "$matches_file"' EXIT
-find_name_predicate=-name
-if [[ "$SESSION_ID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
-    find_name_predicate=-iname
-fi
 for root in "$CODEX_ROOT/sessions" "$CODEX_ROOT/archived_sessions"; do
     if [ -d "$root" ]; then
-        find "$root" -type f "$find_name_predicate" "rollout-*${SESSION_ID}*.jsonl" -print0 >> "$matches_file"
+        find "$root" -type f -name 'rollout-*.jsonl' -print0 >> "$matches_file"
     fi
 done
-python3 - "$matches_file" <<'PY'
+python3 - "$matches_file" "$SESSION_ID" <<'PY'
 from pathlib import Path
 import os
+import re
 import sys
 
 raw_paths = Path(sys.argv[1]).read_bytes().split(b'\0')
-paths = [os.fsdecode(raw_path) for raw_path in raw_paths if raw_path]
+session_id = sys.argv[2]
+uuid_shaped = re.fullmatch(
+    r'[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}',
+    session_id,
+) is not None
+needle = session_id.lower() if uuid_shaped else session_id
+paths = []
+for raw_path in raw_paths:
+    if not raw_path:
+        continue
+    path = os.fsdecode(raw_path)
+    basename = os.path.basename(path)
+    candidate = basename.lower() if uuid_shaped else basename
+    if needle in candidate:
+        paths.append(path)
 if any(any(not character.isprintable() for character in path) for path in paths):
     print('error: rollout path contains non-printable characters', file=sys.stderr)
     raise SystemExit(2)
@@ -69,7 +80,7 @@ PY
 
 Search both existing roots because an exact session can move from the active date tree to either a flat or date-nested archive layout. Do not append either rollout root to a raw `rg`. A raw rollout match prints the whole JSONL record, and a nested `function_call_output` match can expand into hundreds of thousands of tokens before the useful path is visible.
 
-The recipe keeps `find` output NUL-delimited until every candidate path is validated and rejects non-printable path components before printing any rollout match. It matches complete UUID-shaped session IDs case-insensitively, consistent with lifecycle normalization, while preserving exact case for opaque IDs.
+The recipe keeps `find` output NUL-delimited until Python applies a literal basename substring match and validates every selected path, then rejects non-printable path components before printing any rollout match. It matches complete UUID-shaped session IDs case-insensitively, consistent with lifecycle normalization, while preserving exact characters and case for opaque IDs, including glob metacharacters.
 
 Treat `session_index.jsonl` and `history.jsonl` as optional hints: a missing, unreadable, or malformed index record must not prevent the rollout-root search, and warnings must never include the raw line.
 
@@ -133,7 +144,7 @@ The helper reports `active candidate count`, `archived candidate count`, `union 
 - Do not deduplicate by basename or path precedence alone. Prefer the lifecycle session ID from `session_meta`; when it is unavailable, use the filename session ID only as a candidate key and confirm equivalence with ordered stable record fingerprints. Normalize complete UUID-shaped lifecycle aliases to lowercase before comparing them with filename UUIDs, while preserving non-UUID opaque IDs exactly.
 - Treat shared lifecycle or filename identity as a required candidate boundary before fingerprint-prefix collapse. Do not merge different session identities from matching content alone: two intentional runs can have identical wrappers and user prompts. Investigate suspected cross-identity fork replay separately with bounded source-history evidence.
 - Collapse a byte-identical second file completely, including mixed owner/ambiguous filename cases when both copies carry the same complete lifecycle-ID set. For a non-byte-identical branch, collapse its normalized prefix only through the last matching assistant/tool replay-evidence record; preserve every matching human prompt after that boundary as an uncertain genuine suffix. Fingerprint `session_meta` from explicit lifecycle IDs alone and `turn_context` from its wrapper type, and canonicalize known generated item, call, response, and turn IDs by per-rollout order while preserving their reference relationships, including computer-call outputs. Keep provenance IDs, unknown substantive record fields, and nested IDs or timestamps inside content and tool results. Identical wrappers plus a repeated user prompt are not sufficient replay evidence.
-- Choose canonical history by the complete record-order timestamp source, not only the earliest timestamp. A short partially restamped copy that retains one old opening timestamp must follow the older full source, while an exact old prefix still precedes its longer genuine continuation.
+- Choose canonical history by the complete record-order timestamp source and timestamp-presence positions, not only the earliest timestamp. A short partially restamped copy that retains one old opening timestamp must follow the older full source, a sparse-timestamp copy must not outrank a complete source, and an exact old prefix still precedes its longer genuine continuation.
 - When a filename UUID is unavailable, use a single identity from the first lifecycle record as the owner and retain later lifecycle aliases as provenance. Keep a rollout ambiguous when that first record itself exposes conflicting aliases.
 - Recognize `time` alongside `timestamp`, `ts`, `created_at`, and `updated_at` for window filtering, and remove those volatile fields from replay fingerprints. Report a cross-root duplicate group only when candidates from different roots actually share a collapsed copy or removed replay prefix; same-root overlap in a mixed group is not cross-root duplication.
 - Apply replay detection after the cross-root grouping. A copied and restamped prefix does not become new activity merely because it moved into `archived_sessions`, while a later direct human turn remains new evidence.

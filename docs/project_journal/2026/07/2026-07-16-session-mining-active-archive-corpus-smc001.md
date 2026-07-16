@@ -52,6 +52,7 @@ superseded_by:
 - Exact-session recipe tests now clear an ambient `CODEX_HOME` when they intentionally exercise a temporary `$HOME/.codex` fixture.
 - Final pinned review made byte-identical copies with the same complete lifecycle-ID set collapse even when one filename confirms the owner and the other leaves identity ambiguous; non-identical mixed histories remain isolated.
 - Final independent review aligned exact-session filename lookup with UUID lifecycle normalization by matching complete UUIDs case-insensitively while retaining exact case for opaque session IDs.
+- Final pinned review preserved per-record timestamp coverage when ordering replay sources, so a sparse copy cannot hide valid window records from a complete copy, and moved opaque exact-session matching out of shell glob semantics into a literal basename filter.
 
 ## Next Steps
 

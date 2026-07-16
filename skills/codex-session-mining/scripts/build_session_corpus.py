@@ -1116,15 +1116,15 @@ def line_ranges(lines: list[int]) -> list[list[int]]:
 
 def rollout_sort_key(
     rollout: Rollout,
-) -> tuple[tuple[dt.datetime, ...], int, int, str]:
+) -> tuple[tuple[tuple[bool, dt.datetime], ...], int, int, str]:
+    missing_timestamp = dt.datetime.max.replace(tzinfo=UTC)
     timestamp_source = tuple(
-        record.timestamp
+        (record.timestamp is None, record.timestamp or missing_timestamp)
         for record in rollout.records
-        if record.timestamp is not None
     )
     if not timestamp_source:
         timestamp_source = (
-            rollout.fallback_timestamp or dt.datetime.max.replace(tzinfo=UTC),
+            (False, rollout.fallback_timestamp or missing_timestamp),
         )
     source_rank = 0 if rollout.source == "active" else 1
     return (
