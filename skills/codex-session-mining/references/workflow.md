@@ -89,29 +89,81 @@ Recent prior turn or "read your rollout":
 ```bash
 python3 - <<'PY'
 from pathlib import Path
+import heapq
 import json
 
 per_source_limit = 12
+max_record_bytes = 1024 * 1024
+max_field_chars = 240
+
+
+def bounded_jsonl(handle):
+    line_no = 0
+    while True:
+        raw_line = handle.readline(max_record_bytes + 1)
+        if not raw_line:
+            return
+        line_no += 1
+        if len(raw_line) > max_record_bytes:
+            while raw_line and not raw_line.endswith((b'\n', b'\r')):
+                raw_line = handle.readline(max_record_bytes + 1)
+            continue
+        yield line_no, raw_line
+
+
+def bounded_scalar(value):
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if not isinstance(value, str):
+        return '<non-scalar>'
+    output = []
+    pending_space = False
+    for character in value.replace('\r', '\n'):
+        if character.isspace():
+            pending_space = bool(output)
+            continue
+        if pending_space:
+            output.append(' ')
+            pending_space = False
+        output.append(character)
+        if len(output) >= max_field_chars:
+            break
+    return ''.join(output)[:max_field_chars]
+
+
 for path in (Path('~/.codex/history.jsonl'), Path('~/.codex/session_index.jsonl')):
     path = path.expanduser()
     if not path.exists():
         continue
-    rows = []
-    with path.open(encoding='utf-8', errors='replace') as handle:
-        for line_no, line in enumerate(handle, 1):
+    latest = []
+    with path.open('rb') as handle:
+        for line_no, raw_line in bounded_jsonl(handle):
             try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
+                row = json.loads(raw_line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
-            rows.append((row.get('ts') or row.get('updated_at') or '', line_no, row))
-    for _, line_no, row in sorted(rows, reverse=True)[:per_source_limit]:
-        selected = {key: row.get(key) for key in ('session_id', 'id', 'ts', 'updated_at', 'cwd')}
-        text = ' '.join(str(row.get('text') or row.get('thread_name') or '').split())[:240]
-        if text:
-            selected['text'] = text
-        print(f'{path}:{line_no}:{json.dumps(selected, ensure_ascii=True, sort_keys=True)}')
+            if not isinstance(row, dict):
+                continue
+            selected = {
+                key: bounded_scalar(row.get(key))
+                for key in ('session_id', 'id', 'ts', 'updated_at', 'cwd')
+            }
+            text = bounded_scalar(row.get('text') or row.get('thread_name') or '')
+            if text:
+                selected['text'] = text
+            timestamp = str(selected.get('ts') or selected.get('updated_at') or '')
+            projection = json.dumps(selected, ensure_ascii=True, sort_keys=True)
+            item = (timestamp, line_no, projection)
+            if len(latest) < per_source_limit:
+                heapq.heappush(latest, item)
+            elif item[:2] > latest[0][:2]:
+                heapq.heapreplace(latest, item)
+    for _, line_no, projection in sorted(latest, reverse=True):
+        print(f'{path}:{line_no}:{projection}')
 PY
 ```
+
+The heap retains at most `per_source_limit` bounded projections per source. The reader rejects oversized JSONL records after draining them in fixed-size chunks, so neither one huge record nor a long source file can turn recent-turn orientation into unbounded retained state.
 
 Do not run keyword `rg -n ... ~/.codex` or `rg -n ... "$CODEX_HOME"` to recover a recent command, password hint, or rollout memory. The whole tree includes retained transcript output plus installed skills, overlays, caches, and package payloads; a single match can print irrelevant or enormous records. Use the recent index rows above, a known session ID, or a bounded date directory to select rollout files first.
 
