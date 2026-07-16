@@ -418,11 +418,18 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("`ps -p`", skill)
         self.assertIn("`ps -eo` / `ps -axo`", skill)
         self.assertIn("full `sample` output", skill)
+        self.assertIn("one open descriptor snapshot", skill)
+        self.assertIn("session-metadata record crosses its byte budget", skill)
+        self.assertIn("complete normalized signal", skill)
 
     def test_session_mining_recent_turn_recipe_reads_both_indexes(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
         code = extract_python_block_after(workflow, 'Recent prior turn or "read your rollout":')
+
+        self.assertIn("heapq.heapreplace(latest, item)", code)
+        self.assertIn("handle.readline(max_record_bytes + 1)", code)
+        self.assertNotIn("rows.append(", code)
 
         with tempfile.TemporaryDirectory() as home:
             codex_home = Path(home) / ".codex"
@@ -431,15 +438,26 @@ class SkillStructureTests(unittest.TestCase):
                 {"session_id": f"history-{index}", "ts": f"2026-06-04T00:{index:02d}:00Z", "text": f"history row {index}"}
                 for index in range(20)
             ]
+            oversized_marker = "oversized-record-marker"
+            oversized_record = json_dumps(
+                {
+                    "session_id": oversized_marker,
+                    "ts": "2026-06-04T00:59:00Z",
+                    "text": "x" * (1024 * 1024 + 128),
+                }
+            )
+            history_lines = [json_dumps(row) for row in history_rows]
+            history_lines.append(oversized_record)
             (codex_home / "history.jsonl").write_text(
-                "\n".join(json_dumps(row) for row in history_rows) + "\n",
+                "\n".join(history_lines) + "\n",
                 encoding="utf-8",
             )
+            long_index_value = "z" * 1000
             (codex_home / "session_index.jsonl").write_text(
                 json_dumps({
                     "session_id": "index-session",
                     "updated_at": "2026-06-03T00:00:00Z",
-                    "cwd": "/tmp/index-repo",
+                    "cwd": f"/tmp/{long_index_value}",
                     "thread_name": "session index row",
                 }) + "\n",
                 encoding="utf-8",
@@ -458,6 +476,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("history-19", result.stdout)
         self.assertIn("index-session", result.stdout)
         self.assertIn("session_index.jsonl", result.stdout)
+        self.assertNotIn(oversized_marker, result.stdout)
+        self.assertNotIn(long_index_value, result.stdout)
 
     def test_session_mining_exact_probe_handles_real_record_shapes(self) -> None:
         root = Path(__file__).resolve().parents[1]

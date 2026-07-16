@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import importlib.util
 import hashlib
@@ -286,6 +287,14 @@ def event_user_message(text: str, timestamp: str) -> dict:
             "text_elements": [],
         },
     }
+
+
+def embedded_probe_namespace(payload: dict[str, object]) -> dict[str, object]:
+    script = REMOTE_PROBE._remote_python_script(payload)
+    definitions = script.split('\nif CONFIG["mode"] ==', 1)[0]
+    namespace: dict[str, object] = {"__name__": "embedded_remote_codex_probe"}
+    exec(compile(definitions, "<embedded-remote-codex-probe>", "exec"), namespace)
+    return namespace
 
 
 class SessionRetrospectiveTests(unittest.TestCase):
@@ -2260,6 +2269,401 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertNotEqual(result, 0)
             self.assertFalse((outside / "rollout.jsonl").exists())
 
+    def test_remote_probe_full_fetch_rejects_append_with_bounded_read(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(
+                rollout,
+                [message("user", "Initial snapshot.", "2026-05-01T10:00:00Z")],
+            )
+            initial_size = rollout.stat().st_size
+            real_fdopen = REMOTE_PROBE.os.fdopen
+            read_sizes: list[int] = []
+
+            class MutatingReader:
+                def __init__(self, handle: object) -> None:
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args: object) -> None:
+                    self.handle.close()
+
+                def fileno(self) -> int:
+                    return self.handle.fileno()
+
+                def read(self, size: int = -1) -> bytes:
+                    read_sizes.append(size)
+                    with rollout.open("ab") as output:
+                        output.write(b"appended-after-stat\n")
+                    return self.handle.read(size)
+
+            def mutating_fdopen(fd: int, mode: str):
+                return MutatingReader(real_fdopen(fd, mode))
+
+            with mock.patch.object(REMOTE_PROBE.os, "fdopen", side_effect=mutating_fdopen):
+                with self.assertRaisesRegex(ValueError, "identity changed"):
+                    REMOTE_PROBE._read_local_rollout_bytes(
+                        root,
+                        REMOTE_PROBE.pathlib.PurePosixPath(rollout_ref),
+                        max_bytes=initial_size,
+                    )
+
+        self.assertEqual(read_sizes, [initial_size + 1])
+
+    def test_remote_probe_full_fetch_rejects_replace_with_bounded_read(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(
+                rollout,
+                [message("user", "Initial snapshot.", "2026-05-01T10:00:00Z")],
+            )
+            initial_size = rollout.stat().st_size
+            real_fdopen = REMOTE_PROBE.os.fdopen
+            read_sizes: list[int] = []
+
+            class MutatingReader:
+                def __init__(self, handle: object) -> None:
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args: object) -> None:
+                    self.handle.close()
+
+                def fileno(self) -> int:
+                    return self.handle.fileno()
+
+                def read(self, size: int = -1) -> bytes:
+                    read_sizes.append(size)
+                    replacement = rollout.with_suffix(".replacement")
+                    replacement.write_bytes(rollout.read_bytes())
+                    os.replace(replacement, rollout)
+                    return self.handle.read(size)
+
+            def mutating_fdopen(fd: int, mode: str):
+                return MutatingReader(real_fdopen(fd, mode))
+
+            with mock.patch.object(REMOTE_PROBE.os, "fdopen", side_effect=mutating_fdopen):
+                with self.assertRaisesRegex(ValueError, "identity changed"):
+                    REMOTE_PROBE._read_local_rollout_bytes(
+                        root,
+                        REMOTE_PROBE.pathlib.PurePosixPath(rollout_ref),
+                        max_bytes=initial_size,
+                    )
+
+        self.assertEqual(read_sizes, [initial_size + 1])
+
+    def test_remote_probe_embedded_full_fetch_rejects_append_with_bounded_read(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(
+                rollout,
+                [message("user", "Initial snapshot.", "2026-05-01T10:00:00Z")],
+            )
+            initial_size = rollout.stat().st_size
+            namespace = embedded_probe_namespace(
+                {
+                    "mode": "fetch-rollout",
+                    "rollout": rollout_ref,
+                    "codex_root": str(root),
+                    "max_fetch_rollout_bytes": initial_size,
+                }
+            )
+            embedded_os = namespace["os"]
+            real_fdopen = embedded_os.fdopen
+            read_sizes: list[int] = []
+
+            class MutatingReader:
+                def __init__(self, handle: object) -> None:
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args: object) -> None:
+                    self.handle.close()
+
+                def fileno(self) -> int:
+                    return self.handle.fileno()
+
+                def read(self, size: int = -1) -> bytes:
+                    read_sizes.append(size)
+                    with rollout.open("ab") as output:
+                        output.write(b"appended-after-stat\n")
+                    return self.handle.read(size)
+
+            def mutating_fdopen(fd: int, mode: str):
+                return MutatingReader(real_fdopen(fd, mode))
+
+            with mock.patch.object(embedded_os, "fdopen", side_effect=mutating_fdopen):
+                with self.assertRaisesRegex(ValueError, "identity changed"):
+                    namespace["read_rollout_bytes"](rollout, initial_size)
+
+        self.assertEqual(read_sizes, [initial_size + 1])
+
+    def test_remote_probe_embedded_full_fetch_rejects_replace_with_bounded_read(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(
+                rollout,
+                [message("user", "Initial snapshot.", "2026-05-01T10:00:00Z")],
+            )
+            initial_size = rollout.stat().st_size
+            namespace = embedded_probe_namespace(
+                {
+                    "mode": "fetch-rollout",
+                    "rollout": rollout_ref,
+                    "codex_root": str(root),
+                    "max_fetch_rollout_bytes": initial_size,
+                }
+            )
+            embedded_os = namespace["os"]
+            real_fdopen = embedded_os.fdopen
+            read_sizes: list[int] = []
+
+            class MutatingReader:
+                def __init__(self, handle: object) -> None:
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args: object) -> None:
+                    self.handle.close()
+
+                def fileno(self) -> int:
+                    return self.handle.fileno()
+
+                def read(self, size: int = -1) -> bytes:
+                    read_sizes.append(size)
+                    replacement = rollout.with_suffix(".replacement")
+                    replacement.write_bytes(rollout.read_bytes())
+                    os.replace(replacement, rollout)
+                    return self.handle.read(size)
+
+            def mutating_fdopen(fd: int, mode: str):
+                return MutatingReader(real_fdopen(fd, mode))
+
+            with mock.patch.object(embedded_os, "fdopen", side_effect=mutating_fdopen):
+                with self.assertRaisesRegex(ValueError, "identity changed"):
+                    namespace["read_rollout_bytes"](rollout, initial_size)
+
+        self.assertEqual(read_sizes, [initial_size + 1])
+
+    def test_remote_probe_remote_full_fetch_uses_bounded_parent_capture(self) -> None:
+        source = b"{}\n"
+        payload = base64.b64encode(source).decode("ascii")
+        remote_result = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout="\n".join(
+                [
+                    REMOTE_PROBE.REMOTE_FETCH_ROLLOUT_BEGIN,
+                    json.dumps({"ok": True, "bytes": len(source)}),
+                    payload,
+                    REMOTE_PROBE.REMOTE_FETCH_ROLLOUT_END,
+                    "",
+                ]
+            ),
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            task_output_root = Path(raw).resolve() / "task-output"
+            task_output_root.mkdir(parents=True)
+
+            with mock.patch.object(
+                REMOTE_PROBE,
+                "_task_output_root",
+                return_value=task_output_root,
+            ), mock.patch.object(
+                REMOTE_PROBE,
+                "_run_remote_python_bounded",
+                return_value=remote_result,
+            ) as run_remote:
+                result = REMOTE_PROBE.cmd_fetch_rollout(
+                    types.SimpleNamespace(
+                        host="miku-bot-dev",
+                        rollout="sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+                        output="rollout.jsonl",
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            run_remote.call_args.kwargs["max_stdout_bytes"],
+            4 * ((REMOTE_PROBE.MAX_FETCH_ROLLOUT_BYTES + 2) // 3)
+            + REMOTE_PROBE.REMOTE_FETCH_FRAME_OVERHEAD_BYTES,
+        )
+
+    def test_remote_probe_rollout_summary_rejects_snapshot_mutation_without_output(self) -> None:
+        for mutation in ("append", "replace"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / ".codex"
+                rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl"
+                rollout = root / rollout_ref
+                write_jsonl(
+                    rollout,
+                    [message("assistant", "Initial snapshot.", "2026-05-01T10:00:00Z")],
+                )
+                real_summarize = REMOTE_PROBE._summarize_rollout_records_with_meta
+
+                def summarize_then_mutate(*args: object, **kwargs: object):
+                    result = real_summarize(*args, **kwargs)
+                    if mutation == "append":
+                        with rollout.open("ab") as output:
+                            output.write(b"{}\n")
+                    else:
+                        replacement = rollout.with_suffix(".replacement")
+                        replacement.write_bytes(rollout.read_bytes())
+                        os.replace(replacement, rollout)
+                    return result
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    REMOTE_PROBE,
+                    "_local_codex_root",
+                    return_value=root,
+                ), mock.patch.object(
+                    REMOTE_PROBE,
+                    "_summarize_rollout_records_with_meta",
+                    side_effect=summarize_then_mutate,
+                ), mock.patch.object(sys, "stdout", stdout), mock.patch.object(
+                    sys, "stderr", stderr
+                ):
+                    result = REMOTE_PROBE.cmd_rollout_summary(
+                        types.SimpleNamespace(
+                            host="local",
+                            rollout=rollout_ref,
+                            keyword=[],
+                            limit=10,
+                            tail_records=1,
+                            max_text_chars=80,
+                        )
+                    )
+
+                self.assertEqual(result, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("identity changed after summary scan", stderr.getvalue())
+
+    def test_remote_probe_embedded_rollout_summary_rejects_snapshot_mutation(self) -> None:
+        for mutation in ("append", "replace"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / ".codex"
+                rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl"
+                rollout = root / rollout_ref
+                write_jsonl(
+                    rollout,
+                    [message("assistant", "Initial snapshot.", "2026-05-01T10:00:00Z")],
+                )
+                namespace = embedded_probe_namespace(
+                    {
+                        "mode": "rollout-summary",
+                        "rollout": rollout_ref,
+                        "codex_root": str(root),
+                        "summary_keywords": [],
+                        "summary_limit": 10,
+                        "summary_scan_bytes": REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
+                        "summary_tail_records": 1,
+                        "summary_max_text_chars": 80,
+                    }
+                )
+                real_lines = namespace["bounded_text_lines"]
+
+                def lines_then_mutate(handle: object, max_scan_bytes: int):
+                    yield from real_lines(handle, max_scan_bytes)
+                    if mutation == "append":
+                        with rollout.open("ab") as output:
+                            output.write(b"{}\n")
+                    else:
+                        replacement = rollout.with_suffix(".replacement")
+                        replacement.write_bytes(rollout.read_bytes())
+                        os.replace(replacement, rollout)
+
+                namespace["bounded_text_lines"] = lines_then_mutate
+                stdout = io.StringIO()
+                with mock.patch.object(sys, "stdout", stdout):
+                    namespace["summarize_rollout"]()
+
+                self.assertIn('"ok":false', stdout.getvalue())
+                self.assertIn("identity changed after summary scan", stdout.getvalue())
+                self.assertNotIn('"ok":true', stdout.getvalue())
+
+    def test_remote_probe_keyword_match_uses_full_normalized_signal_without_retention(self) -> None:
+        long_signal = ("x" * 4096) + " late\n\tneedle"
+        records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
+            lines=[
+                json.dumps(message("assistant", long_signal, "2026-05-01T10:00:00Z")),
+                json.dumps(message("assistant", "Final update.", "2026-05-01T10:01:00Z")),
+            ],
+            keywords=["late needle"],
+            limit=10,
+            tail_records=0,
+            max_text_chars=80,
+        )
+
+        self.assertTrue(meta["keyword_filter_applied"])
+        self.assertEqual([record["line"] for record in records], [1, 2])
+        self.assertTrue(all(len(record["text"]) <= 80 for record in records))
+        self.assertNotIn("_keyword_matched", json.dumps(records))
+        self.assertNotIn(long_signal, json.dumps(records))
+
+    def test_remote_probe_embedded_keyword_match_uses_full_normalized_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl"
+            long_signal = ("x" * 4096) + " late\n\tneedle"
+            write_jsonl(
+                root / rollout_ref,
+                [
+                    message("assistant", long_signal, "2026-05-01T10:00:00Z"),
+                    message("assistant", "Final update.", "2026-05-01T10:01:00Z"),
+                ],
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "rollout": rollout_ref,
+                    "codex_root": str(root),
+                    "summary_keywords": ["late needle"],
+                    "summary_limit": 10,
+                    "summary_scan_bytes": REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
+                    "summary_tail_records": 0,
+                    "summary_max_text_chars": 80,
+                }
+            )
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            rows = [
+                json.loads(line)
+                for line in result.stdout.splitlines()
+                if line.startswith("{")
+                and "line" in json.loads(line)
+                and json.loads(line).get("kind") != "scan_meta"
+            ]
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([record["line"] for record in rows], [1, 2])
+        self.assertTrue(all(len(record["text"]) <= 80 for record in rows))
+        self.assertNotIn("_keyword_matched", result.stdout)
+        self.assertNotIn(long_signal, result.stdout)
+
     def test_remote_probe_rollout_summary_preserves_bounded_user_signal(self) -> None:
         records = REMOTE_PROBE._summarize_rollout_records(
             lines=[
@@ -3023,7 +3427,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(turns[0].session_id, MODULE.opaque_session_id(raw_session))
 
-    def test_remote_probe_session_meta_uses_bounded_input_scan(self) -> None:
+    def test_remote_probe_session_meta_fails_closed_on_truncated_record(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T10-00-00-large.jsonl"
@@ -3042,15 +3446,86 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with mock.patch.object(REMOTE_PROBE, "MAX_SESSION_META_SCAN_BYTES", len(first) - 1):
-                rows = REMOTE_PROBE._iter_session_meta_records(
-                    codex_root=root,
-                    dates=[dt.date(2026, 5, 1)],
-                    limit=10,
-                    host="local",
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE,
+                "MAX_SESSION_META_SCAN_BYTES",
+                len(first) - 1,
+            ), mock.patch.object(
+                REMOTE_PROBE,
+                "_local_codex_root",
+                return_value=root,
+            ), mock.patch.object(sys, "stdout", stdout), mock.patch.object(
+                sys, "stderr", stderr
+            ):
+                result = REMOTE_PROBE.cmd_session_meta(
+                    types.SimpleNamespace(
+                        host=["local"],
+                        date=["2026/05/01"],
+                        from_date=None,
+                        to_date=None,
+                        limit=10,
+                    )
                 )
 
-        self.assertEqual(rows, [])
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("host=local", stderr.getvalue())
+        self.assertIn(f"rollout={rollout.relative_to(root).as_posix()}", stderr.getvalue())
+        self.assertIn("error=session metadata scan truncated", stderr.getvalue())
+
+    def test_remote_probe_embedded_session_meta_fails_closed_on_truncated_record(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-large.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True)
+            first = json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "output": "x" * 256,
+                    },
+                }
+            ) + "\n"
+            rollout.write_text(
+                first
+                + json.dumps(
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "late-session", "cwd": "/redacted/repo"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "session-meta",
+                    "codex_root": str(root),
+                    "dates": ["2026/05/01"],
+                    "limit": 10,
+                    "session_meta_scan_bytes": len(first) - 1,
+                }
+            )
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(REMOTE_PROBE.REMOTE_SESSION_META_BEGIN, result.stdout)
+        self.assertIn('"kind":"error"', result.stdout)
+        self.assertIn('"error":"session metadata scan truncated', result.stdout)
+        self.assertIn(f'"rollout":"{rollout_ref}"', result.stdout)
+        self.assertIn(REMOTE_PROBE.REMOTE_SESSION_META_END, result.stdout)
+        self.assertNotIn("late-session", result.stdout)
 
     def test_explicit_sources_still_require_default_host_coverage(self) -> None:
         sources = MODULE.parse_sources(["local=/tmp/local", "miku-bot-dev=/tmp/miku"])
@@ -26228,11 +26703,15 @@ class SessionRetrospectiveTests(unittest.TestCase):
             timestamp="2026-05-22T10:01:00Z",
             max_text_chars=1200,
             session_id="s1",
+            search_keywords=["actionable findings"],
         )
 
         self.assertIsNotNone(record)
         assert record is not None
-        self.assertEqual(record["_match_text"], prompt)
+        self.assertEqual(record["text"], "user message present")
+        self.assertTrue(record["_keyword_matched"])
+        self.assertNotIn("_match_text", record)
+        self.assertNotIn(prompt, json.dumps(record))
 
     def test_remote_probe_detects_signal_in_middle_of_long_text_before_truncating(self) -> None:
         text = ("a" * 9000) + " you missed verification " + ("b" * 9000)

@@ -105,6 +105,7 @@ Do not run `scan-*`, `discover`, or `make-shards` output directly into a tracked
 - Do not treat wrapper-only user messages as real user intent.
 - Do not silently drop remote hosts; report unreachable, stale, missing `~/.codex`, or oversized rollout gates.
 - Do not store unredacted raw text in the private history repository.
+- Bind rollout fetches and summary hashes/scans/proofs to one open descriptor snapshot; verify the descriptor and path identity after reading, and fail closed on append or replacement. Also fail closed when a session-metadata record crosses its byte budget. Apply keyword filters to the complete normalized signal before output truncation, then retain only the bounded output and match result.
 - For long `weekly-dry-run`, `weekly-repair`, `baseline*`, and full-test commands, use a pollable process shape and capture complete stdout/stderr in a task-scoped ignored log. Surface only progress markers, targeted failure lines, or a short tail; do not poll with 30k+ visible output caps or repeatedly reprint the same buffered output.
 - Diagnose stalls with PID/name-scoped `pgrep -af`, `ps -p`, or `lsof -nP -p` first. Do not dump `ps -eo` / `ps -axo`, raw `find` inventories, or full `sample` output into the conversation; write unavoidable full diagnostics to a task-scoped file and extract counts, top stacks, or a short summary.
 - Do not turn one-off friction into AGENTS.md or skill changes without repeated evidence or a single high-signal safety issue.
