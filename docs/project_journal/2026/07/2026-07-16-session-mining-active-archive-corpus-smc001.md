@@ -3,7 +3,7 @@ id: 20260716-smc001
 title: Active And Archived Session Corpus
 status: completed
 created: 2026-07-16
-updated: 2026-07-16
+updated: 2026-07-17
 branch: codex/daily-skill-friction-20260716-codex-workflow-hygiene-session-mining-active-archive-corpus
 pr:
 supersedes: []
@@ -59,6 +59,7 @@ superseded_by:
 - Wrapped `session_meta` records now derive lifecycle identity only from the actual payload, preventing generated outer envelope IDs from splitting an active/archive replay pair.
 - Fingerprints and JSON artifacts now use stable ASCII escapes, so valid JSON containing an isolated Unicode surrogate cannot terminate the helper with an uncaught UTF-8 encoding error.
 - The reference recipes use the same ASCII-escaped JSON output, so an optional index hint containing an isolated surrogate cannot abort before the authoritative rollout-root search.
+- Fixed-range follow-up review capped every serialized JSONL record at 16 MiB in both corpus read passes. Oversized committed records and active-writer fragments now fail closed after a bounded `limit + 1` read instead of letting `readline()` allocate the rollout's remaining size.
 
 ## Next Steps
 
@@ -74,4 +75,5 @@ superseded_by:
 - `tests/test_session_corpus.py`
 - `tests/test_skill_structure.py`
 - Full repository validation: 915 tests passed with 1 skipped; the session-corpus and skill-structure slice passed 64 tests.
+- Record-limit follow-up validation: 56 session-corpus tests and 18 skill-structure tests passed; Python compilation, Ruff lint, and both the Joey wrapper and isolated PyYAML skill validators passed.
 - Real corpus smoke for `2026-07-14T19:25:24Z..2026-07-16T01:11:28Z`: 5,207 active plus 6,305 archived candidates, 891 accepted rollouts, and zero collapsed copies or replay prefixes.
