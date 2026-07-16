@@ -13,10 +13,11 @@ from pathlib import Path
 import re
 import stat
 import sys
-from typing import Any, Iterable
+from typing import Any, BinaryIO, Iterable
 
 
 UTC = dt.timezone.utc
+MAX_ROLLOUT_RECORD_BYTES = 16 * 1024 * 1024
 SESSION_ID_RE = re.compile(
     r"(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
@@ -546,6 +547,21 @@ def open_rollout_candidate(
         os.close(root_fd)
 
 
+def read_bounded_rollout_line(
+    handle: BinaryIO,
+    remaining: int,
+    path: Path,
+    line_no: int,
+) -> bytes:
+    raw_line = handle.readline(min(remaining, MAX_ROLLOUT_RECORD_BYTES + 1))
+    if len(raw_line) > MAX_ROLLOUT_RECORD_BYTES:
+        raise CorpusError(
+            "rollout JSONL record exceeds "
+            f"{MAX_ROLLOUT_RECORD_BYTES} bytes at {path}:{line_no}"
+        )
+    return raw_line
+
+
 def validate_inventory_directories(
     root: Path,
     snapshots: dict[tuple[str, ...], InventoryDirectory],
@@ -787,7 +803,12 @@ def scan_rollout_metadata(
             remaining = snapshot_bytes
             line_no = 0
             while remaining:
-                raw_line = handle.readline(remaining)
+                raw_line = read_bounded_rollout_line(
+                    handle,
+                    remaining,
+                    rollout_path,
+                    line_no + 1,
+                )
                 if not raw_line:
                     raise CorpusError(
                         f"rollout was truncated during metadata scan: {rollout_path}"
@@ -893,7 +914,12 @@ def load_rollout_records(metadata: RolloutMetadata) -> Rollout:
             remaining = metadata.source_bytes
             line_no = 0
             while remaining:
-                raw_line = handle.readline(remaining)
+                raw_line = read_bounded_rollout_line(
+                    handle,
+                    remaining,
+                    metadata.path,
+                    line_no + 1,
+                )
                 if not raw_line:
                     raise CorpusError(
                         f"rollout was truncated during corpus construction: {metadata.path}"

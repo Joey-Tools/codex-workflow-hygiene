@@ -2294,6 +2294,95 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(invalid_window.returncode, 2)
             self.assertIn("window start must be earlier", invalid_window.stderr)
 
+    def test_bounded_line_never_requests_rollout_remaining_size(self) -> None:
+        handle = mock.Mock()
+        handle.readline.return_value = b"x" * 129
+
+        with mock.patch.object(CORPUS, "MAX_ROLLOUT_RECORD_BYTES", 128):
+            with self.assertRaisesRegex(
+                CORPUS.CorpusError,
+                r"rollout JSONL record exceeds 128 bytes at rollout.jsonl:7",
+            ):
+                CORPUS.read_bounded_rollout_line(
+                    handle,
+                    1024 * 1024,
+                    Path("rollout.jsonl"),
+                    7,
+                )
+
+        handle.readline.assert_called_once_with(129)
+
+    def test_record_byte_limit_bounds_both_read_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            root = temp / "sessions"
+            path = root / "2026/07/16/rollout-large-record.jsonl"
+            row = record(
+                "2026-07-16T01:00:00Z",
+                "user_message",
+                text="x" * 256,
+            )
+            raw_line = f"{json.dumps(row, sort_keys=True)}\n".encode()
+            path.parent.mkdir(parents=True)
+            path.write_bytes(raw_line)
+            start = CORPUS.parse_instant("2026-07-16T00:00:00Z")
+            end = CORPUS.parse_instant("2026-07-17T00:00:00Z")
+
+            with mock.patch.object(CORPUS, "MAX_ROLLOUT_RECORD_BYTES", 128):
+                with self.assertRaisesRegex(
+                    CORPUS.CorpusError,
+                    r"rollout JSONL record exceeds 128 bytes at .*:1",
+                ):
+                    CORPUS.scan_rollout_metadata(
+                        path,
+                        "active",
+                        root,
+                        start,
+                        end,
+                    )
+
+            with mock.patch.object(
+                CORPUS,
+                "MAX_ROLLOUT_RECORD_BYTES",
+                len(raw_line),
+            ):
+                metadata = CORPUS.scan_rollout_metadata(
+                    path,
+                    "active",
+                    root,
+                    start,
+                    end,
+                )
+            with mock.patch.object(CORPUS, "MAX_ROLLOUT_RECORD_BYTES", 128):
+                with self.assertRaisesRegex(
+                    CORPUS.CorpusError,
+                    r"rollout JSONL record exceeds 128 bytes at .*:1",
+                ):
+                    CORPUS.load_rollout_records(metadata)
+
+    def test_record_byte_limit_precedes_active_fragment_deferral(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            root = temp / "sessions"
+            path = root / "2026/07/16/rollout-large-fragment.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b'{"timestamp":"' + b"x" * 256)
+            start = CORPUS.parse_instant("2026-07-16T00:00:00Z")
+            end = CORPUS.parse_instant("2026-07-17T00:00:00Z")
+
+            with mock.patch.object(CORPUS, "MAX_ROLLOUT_RECORD_BYTES", 128):
+                with self.assertRaisesRegex(
+                    CORPUS.CorpusError,
+                    r"rollout JSONL record exceeds 128 bytes at .*:1",
+                ):
+                    CORPUS.scan_rollout_metadata(
+                        path,
+                        "active",
+                        root,
+                        start,
+                        end,
+                    )
+
     def test_inventory_propagates_walk_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "sessions"
