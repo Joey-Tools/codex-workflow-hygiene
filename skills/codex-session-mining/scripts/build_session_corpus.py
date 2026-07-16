@@ -328,7 +328,7 @@ def record_fingerprint(
             normalize_generated_ids(stable_payload, record_type, state)
     encoded = json.dumps(
         stable,
-        ensure_ascii=False,
+        ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
@@ -354,7 +354,10 @@ def record_lifecycle_ids(row: dict[str, Any]) -> tuple[str, ...]:
     if row.get("type") != "session_meta" and payload_type != "session_meta":
         return ()
     values: list[str] = []
-    sources = [payload, row]
+    if isinstance(payload, dict):
+        sources = [payload]
+    else:
+        sources = [row]
     for source in sources:
         if not isinstance(source, dict):
             continue
@@ -1258,7 +1261,7 @@ def write_lines(directory_fd: int, name: str, values: Iterable[str]) -> None:
 
 
 def write_json(directory_fd: int, name: str, value: object) -> None:
-    content = f"{json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)}\n"
+    content = f"{json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True)}\n"
     write_artifact(directory_fd, name, content)
 
 
@@ -1521,7 +1524,7 @@ def build_corpus(
             directory_fd,
             "corpus.jsonl",
             (
-                json.dumps(entry, ensure_ascii=False, sort_keys=True)
+                json.dumps(entry, ensure_ascii=True, sort_keys=True)
                 for entry in entries
             ),
         )

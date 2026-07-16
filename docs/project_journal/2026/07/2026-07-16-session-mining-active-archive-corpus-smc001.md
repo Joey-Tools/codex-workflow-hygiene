@@ -56,6 +56,8 @@ superseded_by:
 - Final independent review made non-empty timestamp-less histories use filename/path fallback provenance during replay ordering, preventing an active restamp from winning only because of source priority.
 - A missing fallback remains unknown rather than masquerading as known maximum-time provenance, so a later sparse copy with a genuine in-window timestamp cannot be swallowed as replay.
 - Replay ordering now establishes provenance from the earliest of all known record timestamps before comparing per-position coverage, so an old source with a missing opening timestamp still precedes its fully restamped copy.
+- Wrapped `session_meta` records now derive lifecycle identity only from the actual payload, preventing generated outer envelope IDs from splitting an active/archive replay pair.
+- Fingerprints and JSON artifacts now use stable ASCII escapes, so valid JSON containing an isolated Unicode surrogate cannot terminate the helper with an uncaught UTF-8 encoding error.
 
 ## Next Steps
 

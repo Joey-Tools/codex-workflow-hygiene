@@ -1887,6 +1887,86 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(manifest["counts"]["replayed_prefix_records"], 0)
             self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 0)
 
+    def test_wrapped_session_meta_ignores_outer_envelope_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6c4c-4f35-7139-a601-54d91db64c3c"
+            archived = (
+                codex_home
+                / "archived_sessions"
+                / f"rollout-source-{session_id}.jsonl"
+            )
+            active = (
+                codex_home
+                / "sessions"
+                / f"rollout-restamped-{session_id}.jsonl"
+            )
+
+            def wrapped_meta(timestamp: str, envelope_id: str) -> dict[str, object]:
+                return {
+                    "timestamp": timestamp,
+                    "type": "event_msg",
+                    "id": envelope_id,
+                    "payload": {"type": "session_meta", "id": session_id},
+                }
+
+            archived_rows = [
+                wrapped_meta("2026-01-01T01:00:00Z", "old-envelope"),
+                record(
+                    "2026-01-01T01:01:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="shared result",
+                ),
+            ]
+            active_rows = [
+                wrapped_meta("2026-07-16T01:00:00Z", "new-envelope"),
+                record(
+                    "2026-07-16T01:01:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="shared result",
+                ),
+            ]
+            write_rollout(archived, archived_rows)
+            write_rollout(active, active_rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual((output / "corpus.jsonl").read_text(encoding="utf-8"), "")
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
+            self.assertEqual(manifest["counts"]["replayed_prefix_records"], 2)
+
+    def test_surrogate_lifecycle_id_is_stably_escaped_in_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            rollout = codex_home / "sessions" / "rollout-surrogate.jsonl"
+            surrogate_id = "\ud800"
+            write_rollout(
+                rollout,
+                [
+                    record(
+                        "2026-07-16T01:00:00Z",
+                        "session_meta",
+                        id=surrogate_id,
+                    )
+                ],
+            )
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            corpus_text = (output / "corpus.jsonl").read_text(encoding="utf-8")
+            self.assertIn("\\ud800", corpus_text)
+            entry = json.loads(corpus_text)
+            self.assertEqual(entry["lifecycle_ids"], [surrogate_id])
+
     def test_identical_content_without_shared_identity_is_not_collapsed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
