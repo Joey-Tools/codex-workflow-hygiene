@@ -41,6 +41,7 @@ superseded_by:
 - The final inventory pass also snapshots and revalidates every traversed directory identity and entry set, so a root or pending subtree replacement cannot silently turn a complete corpus into an empty or partial result.
 - Non-byte-identical branch prefixes now stop at the last matching assistant/tool execution record, preserving a repeated human prompt typed after a fork even when its normalized content also appears in another branch.
 - Session metadata fingerprints now retain explicit lifecycle IDs while discarding runtime context such as Git state, originator/source, model/provider, thread source, context window, history mode, and base instructions, so restored history still matches across entry points and worktrees.
+- Complete UUID-shaped lifecycle aliases are normalized to lowercase like filename UUIDs, while non-UUID opaque IDs retain their original form, so casing alone cannot make one session owner appear ambiguous.
 
 ## Next Steps
 

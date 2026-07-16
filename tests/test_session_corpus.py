@@ -268,6 +268,88 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(entries[0]["accepted_line_ranges"], [[4, 4]])
             self.assertEqual(entries[0]["replayed_prefix_records"], 3)
 
+    def test_uppercase_lifecycle_uuid_matches_lowercase_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6b7e-a3dd-7193-acaf-18ef0a912d1c"
+            archived = (
+                codex_home / "archived_sessions" / f"rollout-old-{session_id}.jsonl"
+            )
+            active = (
+                codex_home
+                / "sessions/2026/07/16"
+                / f"rollout-continued-{session_id}.jsonl"
+            )
+            archived_rows = [
+                record("2026-01-01T01:00:00Z", "session_meta", id=session_id),
+                record(
+                    "2026-01-01T01:01:00Z",
+                    "response_item",
+                    role="user",
+                    text="old task",
+                ),
+                record(
+                    "2026-01-01T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="old result",
+                ),
+            ]
+            active_rows = [
+                record(
+                    "2026-07-16T01:00:00Z",
+                    "session_meta",
+                    id=session_id.upper(),
+                ),
+                record(
+                    "2026-07-16T01:01:00Z",
+                    "response_item",
+                    role="user",
+                    text="old task",
+                ),
+                record(
+                    "2026-07-16T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="old result",
+                ),
+                record(
+                    "2026-07-16T02:00:00Z",
+                    "response_item",
+                    role="user",
+                    text="genuine suffix",
+                ),
+            ]
+            write_rollout(archived, archived_rows)
+            write_rollout(active, active_rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["path"], str(active))
+            self.assertEqual(entries[0]["owner_id"], session_id)
+            self.assertEqual(entries[0]["accepted_line_ranges"], [[4, 4]])
+            self.assertEqual(entries[0]["replayed_prefix_records"], 3)
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 1)
+
+    def test_opaque_lifecycle_ids_preserve_case(self) -> None:
+        upper = record("2026-07-16T01:00:00Z", "session_meta", id="Opaque-ID")
+        lower = record("2026-07-16T01:00:00Z", "session_meta", id="opaque-id")
+
+        self.assertEqual(CORPUS.record_lifecycle_ids(upper), ("Opaque-ID",))
+        self.assertEqual(CORPUS.record_lifecycle_ids(lower), ("opaque-id",))
+
     def test_older_long_source_owns_short_restamped_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

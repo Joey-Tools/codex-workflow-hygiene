@@ -348,8 +348,13 @@ def record_lifecycle_ids(row: dict[str, Any]) -> tuple[str, ...]:
             continue
         for key in ("id", "session_id", "thread_id"):
             value = source.get(key)
-            if isinstance(value, str) and value.strip() and value.strip() not in values:
-                values.append(value.strip())
+            if not isinstance(value, str) or not value.strip():
+                continue
+            normalized = value.strip()
+            if match := SESSION_ID_RE.fullmatch(normalized):
+                normalized = match.group("id").lower()
+            if normalized not in values:
+                values.append(normalized)
     return tuple(values)
 
 
