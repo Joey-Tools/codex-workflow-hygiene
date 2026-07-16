@@ -28278,7 +28278,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "Use sk-proj-abcdefghijklmnop123456",
             "github_" + "pat_abcdefghijklmnop1234567890",
             "AKIA" + "ABCDEFGHIJKLMNOP",
-            "eyJabcdefghijkl.eyJmnopqrstuv.eyJwxyzabcdef",
+            ".".join(
+                (
+                    "eyJabcdefghijkl",
+                    "eyJmnopqrstuv",
+                    "eyJwxyzabcdef",
+                )
+            ),
             "a" * 64,
             "169.254.169.254",
             "100.64.0.1",

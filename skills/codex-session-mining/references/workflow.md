@@ -7,6 +7,8 @@ Use these recipes when the task is to recover prior work, map a session ID to a 
 Exact session ID:
 
 ```bash
+set -euo pipefail
+
 SESSION_ID='019ce6e8-a5e3-76e1-91a2-799837c70d1e'
 python3 - "$SESSION_ID" <<'PY'
 from pathlib import Path
@@ -16,20 +18,38 @@ import sys
 session_id = sys.argv[1]
 for path in (Path('~/.codex/session_index.jsonl'), Path('~/.codex/history.jsonl')):
     path = path.expanduser()
-    for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
-        if session_id not in line:
-            continue
-        row = json.loads(line)
-        selected = {key: row.get(key) for key in ('id', 'session_id', 'thread_name', 'updated_at', 'ts', 'cwd')}
-        text = ' '.join(str(row.get('text') or '').split())[:300]
-        if text:
-            selected['text'] = text
-        print(f'{path}:{line_no}:{json.dumps(selected, ensure_ascii=False, sort_keys=True)}')
+    if not path.is_file():
+        continue
+    try:
+        with path.open(encoding='utf-8', errors='replace') as handle:
+            for line_no, line in enumerate(handle, 1):
+                if session_id not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                selected = {key: row.get(key) for key in ('id', 'session_id', 'thread_name', 'updated_at', 'ts', 'cwd')}
+                text = ' '.join(str(row.get('text') or '').split())[:300]
+                if text:
+                    selected['text'] = text
+                print(f'{path}:{line_no}:{json.dumps(selected, ensure_ascii=False, sort_keys=True)}')
+    except OSError:
+        print(f'warning: unable to read optional index {path}', file=sys.stderr)
+        continue
 PY
-find ~/.codex/sessions -type f -name "rollout-*${SESSION_ID}*.jsonl"
+for root in "$HOME/.codex/sessions" "$HOME/.codex/archived_sessions"; do
+    if [ -d "$root" ]; then
+        find "$root" -type f -name "rollout-*${SESSION_ID}*.jsonl"
+    fi
+done | sort -u
 ```
 
-Do not append `~/.codex/sessions` to a raw `rg`. A raw rollout match prints the whole JSONL record, and a nested `function_call_output` match can expand into hundreds of thousands of tokens before the useful path is visible.
+Search both existing roots because an exact session can move from the active date tree to either a flat or date-nested archive layout. Do not append either rollout root to a raw `rg`. A raw rollout match prints the whole JSONL record, and a nested `function_call_output` match can expand into hundreds of thousands of tokens before the useful path is visible.
+
+Treat `session_index.jsonl` and `history.jsonl` as optional hints: a missing, unreadable, or malformed index record must not prevent the rollout-root search, and warnings must never include the raw line.
 
 Recent prior turn or "read your rollout":
 
@@ -62,15 +82,51 @@ PY
 
 Do not run keyword `rg -n ... ~/.codex` or `rg -n ... "$CODEX_HOME"` to recover a recent command, password hint, or rollout memory. The whole tree includes retained transcript output plus installed skills, overlays, caches, and package payloads; a single match can print irrelevant or enormous records. Use the recent index rows above, a known session ID, or a bounded date directory to select rollout files first.
 
-Bounded date range:
+Bounded date range and current-host corpus inventory:
 
 ```bash
-find ~/.codex/sessions/2026/03/12 ~/.codex/sessions/2026/03/13 -type f -name 'rollout-*.jsonl' | sort
+set -euo pipefail
+
+TASK_DIR=.codex-tmp/session-mining-20260312-20260313
+ACTIVE_PATHS="$TASK_DIR/active-paths.txt"
+ARCHIVED_PATHS="$TASK_DIR/archived-paths.txt"
+UNION_PATHS="$TASK_DIR/corpus-paths.txt"
+mkdir -p "$TASK_DIR"
+: > "$ACTIVE_PATHS"
+: > "$ARCHIVED_PATHS"
+
+if [ -d "$HOME/.codex/sessions" ]; then
+    find "$HOME/.codex/sessions" -type f -name 'rollout-*.jsonl' \
+        | sort -u > "$ACTIVE_PATHS"
+fi
+if [ -d "$HOME/.codex/archived_sessions" ]; then
+    find "$HOME/.codex/archived_sessions" -type f -name 'rollout-*.jsonl' \
+        | sort -u > "$ARCHIVED_PATHS"
+fi
+sort -u "$ACTIVE_PATHS" "$ARCHIVED_PATHS" > "$UNION_PATHS"
+
+printf 'active candidate count: '
+wc -l < "$ACTIVE_PATHS"
+printf 'archived candidate count: '
+wc -l < "$ARCHIVED_PATHS"
+printf 'union candidate count: '
+wc -l < "$UNION_PATHS"
+sed -n '1,20p' "$UNION_PATHS"
 ```
 
-Prefer filename timestamps or date-tree boundaries over `find -mtime` when the requested window is strict.
+Inventory every rollout under both existing roots before the structured scanner applies the requested lower and upper bounds to record or lifecycle timestamps. This full-root inventory is required for both active and archived rollouts: a rollout created before the window can resume with a genuine human suffix inside it. Do not exclude a file because its dated path or filename predates the window. Prefer record timestamps and lifecycle boundaries over `find -mtime`; archive moves, copies, or metadata updates make mtime unsuitable as the only filter.
 
-Broad keyword searches across `history.jsonl`, `session_index.jsonl`, `sessions/**/rollout-*.jsonl`, or `archived_sessions/*.jsonl` should not print raw JSONL matches. Use `rg -l` or counts to locate candidate files, then parse records and emit selected fields:
+After structured filtering, also report `active accepted count`, `archived accepted count`, and `union accepted count`. The per-root accepted counts identify rollouts with relevant in-window record or lifecycle timestamps; the union accepted count is the resulting cross-root corpus after lifecycle/fingerprint deduplication. Keep the complete path lists in task-scoped artifacts and surface only the counts plus a short union sample before parsing selected fields.
+
+### Current-Host Union And Deduplication
+
+- Treat the existing active and archived roots as one union corpus. Record per-root candidate and accepted counts so a missing root or unexpected zero cannot disappear into a combined total.
+- Do not deduplicate by basename or path precedence alone. Prefer the lifecycle session ID from `session_meta`; when it is unavailable, use the filename session ID only as a candidate key and confirm equivalence with ordered stable record fingerprints.
+- Collapse a second file only when it is byte-identical or its relevant records are an already-accounted-for replay prefix. If either copy has a distinct suffix, retain that suffix, especially later genuine human follow-ups.
+- Apply replay detection after the cross-root grouping. A copied and restamped prefix does not become new activity merely because it moved into `archived_sessions`, while a later direct human turn remains new evidence.
+- Filter injected `AGENTS.md`, skill, environment, and automation wrapper records when reconstructing user intent. Exclude synthetic child, subagent, and external-review prompts from main-task counts, but do not drop a main rollout solely because its first user-shaped record is an automation wrapper; inspect and retain its later genuine human suffix.
+
+Broad keyword searches across `history.jsonl`, `session_index.jsonl`, `sessions/**/rollout-*.jsonl`, or `archived_sessions/**/rollout-*.jsonl` should not print raw JSONL matches. Use `rg -l` or counts to locate candidate files, then parse records and emit selected fields:
 
 ```bash
 python3 - <<'PY'
@@ -513,12 +569,14 @@ PY
 
 ## 3. Audit Repeated Skill Friction
 
-- First list the sessions in scope.
+- First inventory both existing current-host transcript roots and list the sessions in scope. Report active, archived, union, and accepted-after-deduplication counts separately.
 - Detect resumed or forked replay before counting new activity:
   - Count records by session and measure the timestamp span before printing details. Hundreds of thousands of records or old user tasks appearing within seconds are replay signals, not evidence that the work happened again.
   - Emit a bounded sequence of `session_meta`, `turn_context`, `task_started`, and user-message summaries around each resume point. Do not orient with the full rollout.
   - Compare the suspicious prefix with earlier source history using a stable fingerprint over record type, role or call name, and normalized selected content. Keep the source path and ordering in the comparison.
   - Choose the latest genuine resume boundary, exclude only the matching replay prefix, and retain later human follow-ups. Do not deduplicate a real repeated short prompt solely because its text matches an earlier prompt.
+  - When the same lifecycle session appears under active and archived roots, compare ordered stable record fingerprints across both files and retain any distinct later suffix instead of choosing one path wholesale.
+  - Exclude synthetic child/reviewer task prompts from main-task classification, but keep later genuine human follow-ups in a main rollout even when its initial turn was automation boilerplate.
   - Report replayed and genuinely new record counts separately so the audit remains reviewable.
 - Then look for the smallest decisive evidence:
   - user asked for a skill explicitly but it was not used
