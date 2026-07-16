@@ -83,6 +83,18 @@ WINDOW_START = "2026-07-06T00:00:00Z"
 WINDOW_END = "2026-07-13T00:00:00Z"
 DAILY_END = "2026-07-07T00:00:00Z"
 REMOTE_HOST = "miku-bot-dev"
+REMOTE_HOST_CONTEXT_HELPER_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "remote_host_context_helper.py"
+)
+
+
+def bind_remote_host_context_helper_fixture(test_case: unittest.TestCase) -> None:
+    patcher = mock.patch(
+        "retrospective_v2.transport_remote.remote_host_context_helper_path",
+        return_value=REMOTE_HOST_CONTEXT_HELPER_FIXTURE,
+    )
+    patcher.start()
+    test_case.addCleanup(patcher.stop)
 
 
 def execution_provenance(
@@ -107,7 +119,9 @@ def execution_provenance(
         "schema": orchestrator_module.EXECUTION_CONTRACT_SCHEMA,
         "transport": {
             "remote_host_context_helper_commitment": (
-                transport.remote_host_context_helper_commitment()
+                transport.remote_host_context_helper_commitment(
+                    REMOTE_HOST_CONTEXT_HELPER_FIXTURE
+                )
             ),
             "source_transport_schema": transport.SOURCE_TRANSPORT_STREAM_SCHEMA,
         },
@@ -669,6 +683,7 @@ class CheckpointStoreTests(unittest.TestCase):
 
 class OrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
+        bind_remote_host_context_helper_fixture(self)
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
         os.chmod(self.root, 0o700)
@@ -1391,6 +1406,59 @@ class OrchestratorTests(unittest.TestCase):
         invalid_prompt["prompt"]["digest"] = "0" * 64
         with self.assertRaisesRegex(InvalidInputError, "executable instructions"):
             self.start_daily("configuration-invalid", provenance=invalid_prompt)
+
+    def test_run_ref_is_bound_to_the_specification_digest(self) -> None:
+        first = self.coordinator("run-ref-first")
+        first_authority = self.start_authority()
+        first_result = first.start(
+            mode=RunMode.DAILY,
+            start=WINDOW_START,
+            end=DAILY_END,
+            hosts=DEFAULT_HOSTS,
+            created_at="2026-07-14T12:00:00Z",
+            **first_authority,
+        )
+        run_ref = first_result["run_ref"]
+
+        resumed = first.start(
+            mode=RunMode.DAILY,
+            start=WINDOW_START,
+            end=DAILY_END,
+            hosts=DEFAULT_HOSTS,
+            run_ref=run_ref,
+            created_at="2026-07-14T12:00:00Z",
+            **first_authority,
+        )
+        self.assertTrue(resumed["resumed"])
+
+        second_authority = self.start_authority()
+        second_authority["provenance"] = execution_provenance(
+            model="gpt-5.6-sol-2026-07-15"
+        )
+        with self.assertRaisesRegex(
+            InvalidInputError,
+            "current specification digest",
+        ):
+            self.coordinator("run-ref-second").start(
+                mode=RunMode.DAILY,
+                start=WINDOW_START,
+                end=DAILY_END,
+                hosts=DEFAULT_HOSTS,
+                run_ref=run_ref,
+                created_at="2026-07-14T12:00:00Z",
+                **second_authority,
+            )
+
+    def test_created_at_cannot_override_the_trusted_clock(self) -> None:
+        with self.assertRaisesRegex(InvalidInputError, "trusted clock"):
+            self.coordinator("future-created-at").start(
+                mode=RunMode.DAILY,
+                start=WINDOW_START,
+                end=DAILY_END,
+                hosts=DEFAULT_HOSTS,
+                created_at="2099-01-01T00:00:00Z",
+                **self.start_authority(),
+            )
 
     def test_source_session_model_era_is_preserved_without_execution_fallback(
         self,

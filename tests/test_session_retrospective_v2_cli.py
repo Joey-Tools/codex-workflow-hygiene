@@ -32,6 +32,7 @@ from retrospective_v2 import safe_io  # noqa: E402
 from tests.test_retrospective_v2_orchestrator import (  # noqa: E402
     activity_manifest,
     authenticated_receipt,
+    bind_remote_host_context_helper_fixture,
     execution_provenance,
     no_activity_manifest,
 )
@@ -43,6 +44,7 @@ WINDOW_END = "2026-07-07T00:00:00Z"
 
 class CliContractTests(unittest.TestCase):
     def setUp(self) -> None:
+        bind_remote_host_context_helper_fixture(self)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         os.chmod(self.root, 0o700)
@@ -204,6 +206,7 @@ class CliContractTests(unittest.TestCase):
     ) -> RetrospectiveOrchestrator:
         coordinator = RetrospectiveOrchestrator(
             run_dir,
+            clock=lambda: "2026-07-14T12:00:00Z",
             identity_path=self.identity_path,
         )
         coordinator.start(
@@ -830,6 +833,7 @@ class CliContractTests(unittest.TestCase):
     def test_accept_source_exact_command_replays_after_lost_response(self) -> None:
         coordinator = RetrospectiveOrchestrator(
             self.run_dir,
+            clock=lambda: "2026-07-14T12:00:00Z",
             identity_path=self.identity_path,
         )
         coordinator.start(

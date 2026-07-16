@@ -37,6 +37,7 @@ from retrospective_v2.orchestrator import (  # noqa: E402
     RetrospectiveOrchestrator,
 )
 from tests.test_retrospective_v2_orchestrator import (  # noqa: E402
+    bind_remote_host_context_helper_fixture,
     execution_provenance,
 )
 
@@ -47,6 +48,7 @@ WINDOW_END = "2026-07-07T00:00:00Z"
 
 class SourceTransportProtocolTests(unittest.TestCase):
     def setUp(self) -> None:
+        bind_remote_host_context_helper_fixture(self)
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
         os.chmod(self.root, 0o700)
@@ -147,6 +149,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
     ) -> RetrospectiveOrchestrator:
         coordinator = RetrospectiveOrchestrator(
             self.root / name,
+            clock=lambda: "2026-07-15T00:00:00Z",
             identity_path=self.root / "identity-v2.key",
         )
         coordinator.start(

@@ -460,6 +460,24 @@ class ResultValidationTests(unittest.TestCase):
             (),
         )
 
+    def test_post_redaction_covers_posix_paths_under_unlisted_roots(self) -> None:
+        for source_path in (
+            "/root/acme/customer.txt",
+            "/usr/local/share/private.dat",
+            "/workspace/project/review.log",
+        ):
+            with self.subTest(source_path=source_path):
+                value = extractor_result()
+                value["turns"][0]["generalized_working_text"] = (
+                    f"Read {source_path} before continuing."
+                )
+
+                result = validate_extractor_result(value, ALL_REFS)
+
+                text = result["turns"][0]["generalized_working_text"]
+                self.assertEqual(text, "Read [REDACTED_PATH] before continuing.")
+                self.assertEqual(scan_for_leaks(result), ())
+
     def test_leak_scan_reports_locations_without_secret_values(self) -> None:
         secret = "s" + "k-abcdefghijklmnopqrstuvwxyz123456"
         findings = scan_for_leaks({"safe": f"credential {secret}"})

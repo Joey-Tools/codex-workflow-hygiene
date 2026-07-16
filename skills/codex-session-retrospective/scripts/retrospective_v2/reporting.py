@@ -217,7 +217,9 @@ _HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
 _URL_RE = re.compile(r"(?i)(?:https?|ssh|file|vscode)://|git@")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _ABSOLUTE_PATH_RE = re.compile(
-    r"(?:^|[\s'\"`])(?:/Users/|/home/|/private/|/var/|/tmp/|~[/\\]|[A-Za-z]:\\)"
+    r"(?:(?<![A-Za-z0-9_])/(?!/)"
+    r"[A-Za-z0-9._~+@%=-]+(?:/[A-Za-z0-9._~+@%=-]+)*|"
+    r"(?:^|[\s'\"`])(?:~[/\\]|[A-Za-z]:\\))"
 )
 _SECRET_RE = re.compile(
     r"(?i)(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:AKIA|ASIA)[A-Z0-9]{12,}\b|"

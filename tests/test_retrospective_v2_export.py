@@ -1195,6 +1195,13 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
         with self.assertRaisesRegex(RetainedPrivacyError, "URL"):
             assemble_retained_artifacts(run_state(), locator_review)
 
+        path_review = review_data()
+        path_review["turn_findings"][1]["rewritten_prompt"] = (
+            "Inspect /root/acme/customer.txt before continuing."
+        )
+        with self.assertRaisesRegex(RetainedPrivacyError, "local path"):
+            assemble_retained_artifacts(run_state(), path_review)
+
         untyped_review = review_data()
         untyped_review["turn_findings"][0]["note"] = "source_literal"
         with self.assertRaises(RetainedPrivacyError):

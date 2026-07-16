@@ -46,6 +46,7 @@ from retrospective_v2.orchestrator import (  # noqa: E402
 )
 from tests.test_retrospective_v2_orchestrator import (  # noqa: E402
     authenticated_receipt,
+    bind_remote_host_context_helper_fixture,
     execution_provenance,
     no_activity_manifest,
     synthesis_result,
@@ -241,6 +242,7 @@ class DurablePublicationTests(unittest.TestCase):
         cls.key_fixture.cleanup()
 
     def setUp(self) -> None:
+        bind_remote_host_context_helper_fixture(self)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         os.chmod(self.root, 0o700)
@@ -489,6 +491,7 @@ class DurablePublicationTests(unittest.TestCase):
     ]:
         coordinator = RetrospectiveOrchestrator(
             self.root / "shadow-gate-runs" / name,
+            clock=lambda: "2026-07-15T00:00:00Z",
             identity_path=self.identity_path,
             require_existing_identity=True,
         )
@@ -656,6 +659,7 @@ class DurablePublicationTests(unittest.TestCase):
     ) -> tuple[RetrospectiveOrchestrator, Path]:
         coordinator = RetrospectiveOrchestrator(
             self.root / "runs" / name,
+            clock=lambda: "2026-07-15T00:00:00Z",
             identity_path=self.identity_path,
             require_existing_identity=True,
         )

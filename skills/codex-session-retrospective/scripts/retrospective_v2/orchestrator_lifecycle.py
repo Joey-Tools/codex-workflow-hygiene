@@ -121,7 +121,7 @@ class RunLifecycleOperations(OrchestratorComponent):
             raise InvalidInputError("allow_partial must be a boolean")
         if not isinstance(shadow, bool):
             raise InvalidInputError("shadow must be a boolean")
-        if history_repo is None or history_target_ref is None:
+        if None in (history_repo, history_target_ref):
             raise InvalidInputError(
                 "start requires the configured durable history repository and ref"
             )
@@ -164,7 +164,7 @@ class RunLifecycleOperations(OrchestratorComponent):
 
         start_value = window_start if window_start is not None else start
         end_value = window_end if window_end is not None else end
-        if start_value is None or end_value is None:
+        if None in (start_value, end_value):
             raise InvalidInputError("start and end are required")
         normalized_start = _normalize_timestamp(start_value, label="window start")
         normalized_end = _normalize_timestamp(end_value, label="window end")
@@ -483,11 +483,18 @@ class RunLifecycleOperations(OrchestratorComponent):
             "window": {"end": normalized_end, "start": normalized_start},
         }
         specification_digest = content_digest(specification)
-        normalized_run_ref = (
-            self._ref(RefType.RUN, "run", specification_digest)
-            if run_ref is None
-            else self._state._validate_ref(run_ref, RefType.RUN, label="run_ref")
-        )
+        derived_run_ref = self._ref(RefType.RUN, "run", specification_digest)
+        if run_ref is not None:
+            supplied_run_ref = self._state._validate_ref(
+                run_ref,
+                RefType.RUN,
+                label="run_ref",
+            )
+            if supplied_run_ref != derived_run_ref:
+                raise InvalidInputError(
+                    "run_ref does not match the current specification digest"
+                )
+        normalized_run_ref = derived_run_ref
         requested_creation_time = (
             _normalize_timestamp(created_at, label="created_at")
             if created_at is not None
@@ -510,7 +517,12 @@ class RunLifecycleOperations(OrchestratorComponent):
             response.update({"action": "start", "created": False, "resumed": True})
             return response
 
-        creation_time = requested_creation_time or self._state._now()
+        creation_time = self._state._now()
+        if (
+            requested_creation_time is not None
+            and requested_creation_time != creation_time
+        ):
+            raise InvalidInputError("created_at does not match the trusted clock")
         creation_datetime = _parse_timestamp(creation_time, label="created_at")
         state = self._initial_state(
             run_ref=normalized_run_ref,

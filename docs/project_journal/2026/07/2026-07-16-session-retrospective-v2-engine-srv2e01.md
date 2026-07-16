@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-16
 updated: 2026-07-16
 branch: wip/session-retrospective-v2-engine-clean
-pr:
+pr: 43
 supersedes: []
 superseded_by:
 ---
@@ -76,6 +76,14 @@ superseded_by:
   allowlisted reason and recovery fields.
 - The v1 helper remains available only for migration-time non-publishing
   comparison until the separate shadow, cutover, and baseline work completes.
+- Tests bind a checked-in read-only `remote-host-context` fixture instead of an
+  operator-installed helper, so CI validates the adapter contract without
+  depending on `/home/runner` machine state.
+- Retained path detection now recognizes absolute POSIX paths independently of
+  the first directory component, including `/root`, `/usr`, and `/workspace`.
+- Run creation derives `run_ref` from the frozen specification and rejects a
+  caller-supplied mismatch. The trusted clock owns `created_at`; an optional
+  caller value is only an equality assertion and cannot extend raw retention.
 
 ## Next Steps
 
@@ -92,7 +100,7 @@ superseded_by:
 - `skills/codex-session-retrospective/references/v2-*.md`
 - `tests/test_retrospective_v2_*.py`
 - `tests/test_session_retrospective_v2_cli.py`
-- Final full suite: 1,257 tests in 613.208 seconds, `OK (skipped=1)`.
+- Final full suite: 1,318 tests in 627.187 seconds, `OK (skipped=1)`.
 - Publication transaction suite: 30 tests, `OK`.
 - Official v2 CLI suite: 26 tests in 27.279 seconds, `OK`.
 - Source-transport suite: 29 tests, `OK`; orchestrator suite: 56 tests, `OK`;

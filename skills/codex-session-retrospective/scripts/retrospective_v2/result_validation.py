@@ -299,8 +299,8 @@ _PRIVATE_KEY_BOUNDARY_RE = re.compile(
     r"PRIVATE KEY\s*-----"
 )
 _UNIX_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_])/(?:Users|home|tmp|private|var|etc|opt|Volumes|mnt|srv)"
-    r"(?:/[^\s\"'<>:;,]+)+"
+    r"(?<![A-Za-z0-9_])/(?!/)"
+    r"[A-Za-z0-9._~+@%=-]+(?:/[A-Za-z0-9._~+@%=-]+)*"
 )
 _WINDOWS_PATH_RE = re.compile(
     r"(?i)\b[A-Z]:\\(?:[^\\\s\"'<>:|?*]+\\)*[^\\\s\"'<>:|?*]+"
