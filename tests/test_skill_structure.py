@@ -263,6 +263,9 @@ class SkillStructureTests(unittest.TestCase):
             encoding="utf-8"
         )
         recipe = extract_bash_block_after(workflow, "Exact session ID:")
+        self.assertIn("matches_file=$(mktemp)", recipe)
+        self.assertIn("trap 'rm -f \"$matches_file\"' EXIT", recipe)
+        self.assertNotIn("done | sort -u", recipe)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

@@ -40,11 +40,14 @@ for path in (Path('~/.codex/session_index.jsonl'), Path('~/.codex/history.jsonl'
         print(f'warning: unable to read optional index {path}', file=sys.stderr)
         continue
 PY
+matches_file=$(mktemp)
+trap 'rm -f "$matches_file"' EXIT
 for root in "$HOME/.codex/sessions" "$HOME/.codex/archived_sessions"; do
     if [ -d "$root" ]; then
-        find "$root" -type f -name "rollout-*${SESSION_ID}*.jsonl"
+        find "$root" -type f -name "rollout-*${SESSION_ID}*.jsonl" >> "$matches_file"
     fi
-done | sort -u
+done
+sort -u "$matches_file"
 ```
 
 Search both existing roots because an exact session can move from the active date tree to either a flat or date-nested archive layout. Do not append either rollout root to a raw `rg`. A raw rollout match prints the whole JSONL record, and a nested `function_call_output` match can expand into hundreds of thousands of tokens before the useful path is visible.
