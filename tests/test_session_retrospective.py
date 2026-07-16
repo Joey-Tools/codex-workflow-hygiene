@@ -1033,6 +1033,107 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "archived_sessions/rollout-2026-05-01T10-00-00-flat.jsonl",
         )
 
+    def test_remote_probe_session_meta_preserves_distinct_lifecycle_paths_with_same_session_id(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            basename = "rollout-2026-05-01T10-00-00-shared.jsonl"
+            lifecycle_rows = {
+                Path(basename): ("/root", "Root follow-up only."),
+                Path("sessions/2026/05/01") / basename: (
+                    "/active",
+                    "Active follow-up only.",
+                ),
+                Path("archived_sessions/2026/05/01") / basename: (
+                    "/dated",
+                    "Dated archive follow-up only.",
+                ),
+                Path("archived_sessions") / basename: (
+                    "/flat",
+                    "Flat archive follow-up only.",
+                ),
+            }
+            for relative_path, (cwd, followup) in lifecycle_rows.items():
+                write_jsonl(
+                    root / relative_path,
+                    [
+                        {
+                            "type": "session_meta",
+                            "timestamp": "2026-05-01T10:00:00Z",
+                            "payload": {"id": "shared-session", "cwd": cwd},
+                        },
+                        message("user", followup, "2026-05-01T10:01:00Z"),
+                    ],
+                )
+                self.assertIn(
+                    followup,
+                    (root / relative_path).read_text(encoding="utf-8"),
+                )
+
+            local_scan = REMOTE_PROBE._scan_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1), dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "session-meta",
+                    "codex_root": str(root),
+                    "dates": ["2026/05/01", "2026/05/01"],
+                    "limit": 10,
+                    "session_meta_scan_bytes": 1024 * 1024,
+                }
+            )
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertFalse(local_scan.truncated)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                result.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_SESSION_META_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_SESSION_META_END,
+                host="embedded",
+                command="session-meta",
+            )
+        ]
+        expected = {
+            ("shared-session", cwd, relative_path.as_posix())
+            for relative_path, (cwd, _followup) in lifecycle_rows.items()
+        }
+        self.assertEqual(
+            {
+                (row["session_id"], row["cwd"], row["rollout"])
+                for row in local_scan.rows
+            },
+            expected,
+        )
+        self.assertEqual(
+            {
+                (row["session_id"], row["cwd"], row["rollout"])
+                for row in embedded_rows
+            },
+            expected,
+        )
+        self.assertEqual(
+            {
+                REMOTE_PROBE._session_meta_rollout_dedupe_key(
+                    REMOTE_PROBE.pathlib.PurePosixPath(relative_path.as_posix())
+                )
+                for relative_path in lifecycle_rows
+            },
+            {relative_path.as_posix() for relative_path in lifecycle_rows},
+        )
+
     def test_remote_probe_session_meta_includes_flat_archived_undated_rollout_by_record_timestamp(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -1101,7 +1202,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual([row["session_id"] for row in unknown_rows], ["flat-undated-session"])
         self.assertEqual(known_rows, [])
 
-    def test_remote_probe_session_meta_prefers_root_rollout_over_flat_archived_duplicate(self) -> None:
+    def test_remote_probe_session_meta_preserves_root_and_flat_archived_paths(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout_name = "rollout-2026-05-01T10-00-00-duplicate.jsonl"
@@ -1133,9 +1234,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 host="local",
             )
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["cwd"], "/active/repo")
-        self.assertEqual(rows[0]["rollout"], rollout_name)
+        self.assertEqual(
+            {(row["cwd"], row["rollout"]) for row in rows},
+            {
+                ("/active/repo", rollout_name),
+                ("/archived/repo", f"archived_sessions/{rollout_name}"),
+            },
+        )
 
     def test_remote_probe_session_meta_includes_timestampless_dated_rollout_by_path_date(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1163,7 +1268,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(rows[0]["session_id"], "timestampless-session")
         self.assertEqual(rows[0]["rollout"], "sessions/2026/05/01/rollout-undated.jsonl")
 
-    def test_remote_probe_session_meta_filter_skips_flat_archived_undated_active_copy(self) -> None:
+    def test_remote_probe_session_meta_preserves_identical_undated_lifecycle_paths(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout_name = "rollout-undated.jsonl"
@@ -1178,21 +1285,21 @@ class SessionRetrospectiveTests(unittest.TestCase):
             ]
             write_jsonl(active, rows)
             write_jsonl(archived, rows)
-            resolved_root = root.resolve()
-            active = active.resolve()
-            archived = archived.resolve()
-            selected = {
-                REMOTE_PROBE._session_meta_rollout_dedupe_key(
-                    REMOTE_PROBE.pathlib.PurePosixPath(active.relative_to(resolved_root).as_posix())
-                ): active,
-                REMOTE_PROBE._session_meta_rollout_dedupe_key(
-                    REMOTE_PROBE.pathlib.PurePosixPath(archived.relative_to(resolved_root).as_posix())
-                ): archived,
-            }
+            scan = REMOTE_PROBE._scan_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=10,
+                host="local",
+            )
 
-            filtered = REMOTE_PROBE._filter_session_meta_flat_archived_rollouts(selected, resolved_root)
-
-        self.assertEqual(list(filtered.values()), [active])
+        self.assertFalse(scan.truncated)
+        self.assertEqual(
+            {row["rollout"] for row in scan.rows},
+            {
+                "sessions/2026/05/01/rollout-undated.jsonl",
+                "archived_sessions/rollout-undated.jsonl",
+            },
+        )
 
     def test_remote_probe_session_meta_sorts_selected_duplicate_before_limit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1241,7 +1348,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(scan.rows[0]["session_id"], "new-session")
         self.assertEqual(scan.rows[0]["rollout"], "rollout-2026-05-01T23-00-00-new.jsonl")
 
-    def test_remote_probe_session_meta_prefers_dated_session_rollout_over_root_duplicate(self) -> None:
+    def test_remote_probe_session_meta_preserves_dated_session_and_root_paths(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout_name = "rollout-2026-05-01T10-00-00-duplicate.jsonl"
@@ -1273,9 +1380,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 host="local",
             )
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["cwd"], "/sessions/repo")
-        self.assertEqual(rows[0]["rollout"], f"sessions/2026/05/01/{rollout_name}")
+        self.assertEqual(
+            {(row["cwd"], row["rollout"]) for row in rows},
+            {
+                ("/root/repo", rollout_name),
+                (
+                    "/sessions/repo",
+                    f"sessions/2026/05/01/{rollout_name}",
+                ),
+            },
+        )
 
     def test_remote_probe_session_meta_filters_by_rollout_filename_window(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1464,7 +1578,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
             "sessions/2026/05/01/rollout-2026-05-01T10-00-00-raw.jsonl",
         )
 
-    def test_remote_probe_session_meta_deduplicates_archived_rollout_names_before_limit(self) -> None:
+    def test_remote_probe_session_meta_preserves_flat_and_dated_archive_paths_before_limit(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             dated_duplicate = root / "archived_sessions" / "2026" / "05" / "01" / "rollout-2026-05-01T12-00-00-dup.jsonl"
@@ -1501,14 +1617,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 ],
             )
 
-            rows = REMOTE_PROBE._iter_session_meta_records(
+            scan = REMOTE_PROBE._scan_session_meta_records(
                 codex_root=root,
                 dates=[dt.date(2026, 5, 1)],
-                limit=2,
+                limit=3,
                 host="local",
             )
 
-        self.assertEqual([row["session_id"] for row in rows], ["duplicate-dated-session", "unique-session"])
+        self.assertFalse(scan.truncated)
+        self.assertEqual(
+            {row["rollout"] for row in scan.rows},
+            {
+                "archived_sessions/2026/05/01/rollout-2026-05-01T12-00-00-dup.jsonl",
+                "archived_sessions/rollout-2026-05-01T12-00-00-dup.jsonl",
+                "archived_sessions/rollout-2026-05-01T11-00-00-unique.jsonl",
+            },
+        )
 
     def test_remote_probe_session_meta_rejects_local_limit_truncation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1701,17 +1825,33 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertFalse(any(call[0] == dt.date(2026, 5, 1) and call[1] == "known" for call in calls))
         self.assertEqual({row.split("\t")[2] for row in stdout.getvalue().strip().splitlines()[1:]}, {"session-1", "session-2"})
 
-    def test_remote_probe_session_meta_auto_split_keeps_latest_rollout_for_duplicate_session(self) -> None:
+    def test_remote_probe_session_meta_auto_split_preserves_same_session_lifecycle_paths(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
-            for hour in (1, 2):
-                rollout = root / "sessions" / "2026" / "05" / "01" / f"rollout-2026-05-01T{hour:02d}-00-00-same.jsonl"
+            lifecycle_paths = (
+                Path("rollout-2026-05-01T01-00-00-root.jsonl"),
+                Path("sessions/2026/05/01/rollout-2026-05-01T07-00-00-active.jsonl"),
+                Path(
+                    "archived_sessions/2026/05/01/"
+                    "rollout-2026-05-01T13-00-00-dated.jsonl"
+                ),
+                Path(
+                    "archived_sessions/"
+                    "rollout-2026-05-01T19-00-00-flat.jsonl"
+                ),
+            )
+            for relative_path in lifecycle_paths:
+                timestamp = REMOTE_PROBE._rollout_filename_window(
+                    REMOTE_PROBE.pathlib.PurePosixPath(relative_path.as_posix())
+                )[0]
                 write_jsonl(
-                    rollout,
+                    root / relative_path,
                     [
                         {
                             "type": "session_meta",
-                            "timestamp": f"2026-05-01T{hour:02d}:00:00Z",
+                            "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
                             "payload": {"id": "session-same", "cwd": "/redacted/repo"},
                         }
                     ],
@@ -1739,10 +1879,15 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         rows = stdout.getvalue().strip().splitlines()
         self.assertEqual(rows[0], "host\tdate\tsession_id\tcwd\trollout")
-        self.assertEqual(len(rows), 2)
-        fields = rows[1].split("\t")
-        self.assertEqual(fields[2], "session-same")
-        self.assertEqual(fields[4], "sessions/2026/05/01/rollout-2026-05-01T02-00-00-same.jsonl")
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(
+            {row.split("\t")[2] for row in rows[1:]},
+            {"session-same"},
+        )
+        self.assertEqual(
+            {row.split("\t")[4] for row in rows[1:]},
+            {relative_path.as_posix() for relative_path in lifecycle_paths},
+        )
 
     def test_remote_probe_session_meta_rejects_remote_limit_marker(self) -> None:
         row = json.dumps(
@@ -1831,6 +1976,76 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn('[ -d "$codex_root" ]', command[-1])
         self.assertEqual(row["codex_root"], "/home/hoteng/.codex")
         self.assertEqual(row["codex"], "present")
+
+    def test_remote_probe_private_output_rejects_parent_symlink_swap_after_resolution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw:
+            root = Path(raw).resolve()
+            output_parent = root / "output"
+            output_parent.mkdir()
+            output = REMOTE_PROBE._resolve_output_path(
+                str(output_parent / "chunk.jsonl")
+            )
+            moved_parent = root / "moved-output"
+            escape_parent = root / "escape"
+            escape_parent.mkdir()
+            os.replace(output_parent, moved_parent)
+            output_parent.symlink_to(escape_parent, target_is_directory=True)
+
+            with self.assertRaises(OSError):
+                REMOTE_PROBE._write_private_bytes(output, b"sensitive\n")
+
+            self.assertFalse((escape_parent / output.name).exists())
+            self.assertFalse((moved_parent / output.name).exists())
+
+    def test_remote_probe_private_output_rename_stays_on_pinned_parent_descriptor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw:
+            root = Path(raw).resolve()
+            output_parent = root / "output"
+            output_parent.mkdir()
+            output = REMOTE_PROBE._resolve_output_path(
+                str(output_parent / "chunk.jsonl")
+            )
+            moved_parent = root / "moved-output"
+            escape_parent = root / "escape"
+            escape_parent.mkdir()
+            real_replace = os.replace
+            replace_dir_fds: list[tuple[int | None, int | None]] = []
+
+            def swap_parent_then_replace(
+                src: str,
+                dst: str,
+                *,
+                src_dir_fd: int | None = None,
+                dst_dir_fd: int | None = None,
+            ) -> None:
+                replace_dir_fds.append((src_dir_fd, dst_dir_fd))
+                real_replace(output_parent, moved_parent)
+                output_parent.symlink_to(escape_parent, target_is_directory=True)
+                real_replace(
+                    src,
+                    dst,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                )
+
+            with mock.patch.object(
+                REMOTE_PROBE.os,
+                "replace",
+                side_effect=swap_parent_then_replace,
+            ):
+                REMOTE_PROBE._write_private_bytes(output, b"sensitive\n")
+
+            written_output = moved_parent / output.name
+            self.assertEqual(written_output.read_bytes(), b"sensitive\n")
+            self.assertEqual(written_output.stat().st_mode & 0o777, 0o600)
+            self.assertFalse((escape_parent / output.name).exists())
+            self.assertEqual(len(replace_dir_fds), 1)
+            self.assertIsNotNone(replace_dir_fds[0][0])
+            self.assertEqual(replace_dir_fds[0][0], replace_dir_fds[0][1])
 
     def test_remote_probe_fetch_rollout_writes_private_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -26946,7 +27161,6 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 + ("x" * 2000),
                 encoding="utf-8",
             )
-            root_rollout_size = root_rollout.stat().st_size
             write_jsonl(archived, [message("user", "Archived distinct task.", "2026-05-01T10:00:00Z")])
             summary = root / "archived_sessions" / "rollout-summary-undated.jsonl"
             write_jsonl(
@@ -28686,7 +28900,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn('"rollout":"archived_sessions/rollout-undated.jsonl"', result.stdout)
         self.assertNotIn('"date":"2026/05/02"', result.stdout)
 
-    def test_remote_probe_generated_session_meta_prefers_root_rollout_over_flat_archived_duplicate(self) -> None:
+    def test_remote_probe_generated_session_meta_preserves_root_and_flat_archived_paths(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout_name = "rollout-2026-05-01T10-00-00-duplicate.jsonl"
@@ -28731,7 +28947,11 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"cwd":"/active/repo"', result.stdout)
         self.assertIn(f'"rollout":"{rollout_name}"', result.stdout)
-        self.assertNotIn("/archived/repo", result.stdout)
+        self.assertIn('"cwd":"/archived/repo"', result.stdout)
+        self.assertIn(
+            f'"rollout":"archived_sessions/{rollout_name}"',
+            result.stdout,
+        )
 
     def test_remote_probe_generated_session_meta_sorts_selected_duplicate_before_limit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -28790,7 +29010,9 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn('"kind":"truncation"', result.stdout)
         self.assertNotIn('"session_id":"old-session"', result.stdout)
 
-    def test_remote_probe_generated_session_meta_prefers_dated_session_rollout_over_root_duplicate(self) -> None:
+    def test_remote_probe_generated_session_meta_preserves_dated_session_and_root_paths(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout_name = "rollout-2026-05-01T10-00-00-duplicate.jsonl"
@@ -28835,7 +29057,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"cwd":"/sessions/repo"', result.stdout)
         self.assertIn(f'"rollout":"sessions/2026/05/01/{rollout_name}"', result.stdout)
-        self.assertNotIn("/root/repo", result.stdout)
+        self.assertIn('"cwd":"/root/repo"', result.stdout)
+        self.assertIn(f'"rollout":"{rollout_name}"', result.stdout)
 
     def test_remote_probe_generated_session_meta_filters_rollout_filename_mode(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
