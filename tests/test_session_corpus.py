@@ -644,6 +644,42 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(entries[0]["accepted_line_ranges"], [[5, 5]])
             self.assertEqual(entries[0]["replayed_prefix_records"], 4)
 
+    def test_computer_call_outputs_normalize_call_ids_and_are_replay_evidence(
+        self,
+    ) -> None:
+        for call_type, output_type in (
+            ("computer_call", "computer_call_output"),
+            ("computer_tool_call", "computer_tool_call_output"),
+        ):
+            with self.subTest(output_type=output_type):
+                def fingerprints(prefix: str) -> tuple[list[str], dict[str, object]]:
+                    rows = [
+                        record(
+                            "2026-07-16T01:00:00Z",
+                            call_type,
+                            id=f"item-{prefix}",
+                            call_id=f"call-{prefix}",
+                            action={"type": "screenshot"},
+                        ),
+                        record(
+                            "2026-07-16T01:01:00Z",
+                            output_type,
+                            call_id=f"call-{prefix}",
+                            output="same screenshot",
+                        ),
+                    ]
+                    state = CORPUS.GeneratedIdCanonicalizer()
+                    return (
+                        [CORPUS.record_fingerprint(row, state) for row in rows],
+                        rows[1],
+                    )
+
+                old_fingerprints, old_output = fingerprints("old")
+                new_fingerprints, new_output = fingerprints("new")
+                self.assertEqual(old_fingerprints, new_fingerprints)
+                self.assertTrue(CORPUS.record_replay_evidence(old_output))
+                self.assertTrue(CORPUS.record_replay_evidence(new_output))
+
     def test_nested_domain_ids_remain_in_replay_fingerprints(self) -> None:
         first = record(
             "2026-07-16T01:00:00Z",
@@ -1367,6 +1403,50 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(len(entries), 1)
             self.assertIsNone(entries[0]["owner_id"])
             self.assertEqual(entries[0]["lifecycle_ids"], [first_id, filename_id])
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 1)
+            self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
+
+    def test_identical_mixed_owner_and_ambiguous_copies_are_collapsed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            owner_id = "019f6c4c-4f35-7139-a601-54d91db64c3a"
+            foreign_id = "019f6c4c-4f35-7139-a601-54d91db64c3b"
+            active = (
+                codex_home / "sessions/2026/07/16" / f"rollout-owner-{owner_id}.jsonl"
+            )
+            archived = (
+                codex_home
+                / "archived_sessions"
+                / f"rollout-ambiguous-{foreign_id}.jsonl"
+            )
+            rows = [
+                record("2026-07-16T01:00:00Z", "session_meta", id=owner_id),
+                record("2026-07-16T01:01:00Z", "session_meta", id=foreign_id),
+                record(
+                    "2026-07-16T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="identical restored history",
+                ),
+            ]
+            write_rollout(active, rows)
+            write_rollout(archived, rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["lifecycle_ids"], [owner_id, foreign_id])
             manifest = json.loads(
                 (output / "manifest.json").read_text(encoding="utf-8")
             )

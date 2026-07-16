@@ -255,6 +255,7 @@ class SkillStructureTests(unittest.TestCase):
             fake_find.chmod(0o755)
             environment = os.environ.copy()
             environment["HOME"] = str(home)
+            environment.pop("CODEX_HOME", None)
             environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
             completed = subprocess.run(
                 ["bash", "-c", recipe],
@@ -352,6 +353,7 @@ class SkillStructureTests(unittest.TestCase):
 
             environment = os.environ.copy()
             environment["HOME"] = str(home)
+            environment.pop("CODEX_HOME", None)
             completed = subprocess.run(
                 ["bash", "-c", recipe],
                 cwd=temp,

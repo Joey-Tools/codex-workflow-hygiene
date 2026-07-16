@@ -48,6 +48,9 @@ superseded_by:
 - Cross-root duplicate metrics now require an actual collapsed copy or removed replay prefix between candidates from different roots; same-root overlap in a mixed lifecycle group no longer inflates the count.
 - Final exact-range review made exact-session filename discovery NUL-delimited and rejects non-printable paths before printing any rollout match.
 - Final independent review made the first pass stop at the last complete active JSONL record while an append is in progress; the old metadata continues to verify only that prefix, and a fresh scan sees the completed record.
+- GitHub review added computer-call output records to generated call-ID linkage and replay evidence, so regenerated `call_id` values cannot make a repeated screenshot or output look new.
+- Exact-session recipe tests now clear an ambient `CODEX_HOME` when they intentionally exercise a temporary `$HOME/.codex` fixture.
+- Final pinned review made byte-identical copies with the same complete lifecycle-ID set collapse even when one filename confirms the owner and the other leaves identity ambiguous; non-identical mixed histories remain isolated.
 
 ## Next Steps
 
@@ -62,5 +65,5 @@ superseded_by:
 - `skills/codex-session-mining/scripts/build_session_corpus.py`
 - `tests/test_session_corpus.py`
 - `tests/test_skill_structure.py`
-- Full repository validation: 913 tests passed with 1 skipped; the session-corpus and skill-structure slice passed 62 tests.
-- Real corpus smoke for `2026-07-14T19:25:24Z..2026-07-16T01:11:28Z`: 5,193 active plus 6,305 archived candidates, 891 accepted rollouts, and zero collapsed copies or replay prefixes.
+- Full repository validation: 915 tests passed with 1 skipped; the session-corpus and skill-structure slice passed 64 tests.
+- Real corpus smoke for `2026-07-14T19:25:24Z..2026-07-16T01:11:28Z`: 5,207 active plus 6,305 archived candidates, 891 accepted rollouts, and zero collapsed copies or replay prefixes.

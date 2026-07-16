@@ -34,7 +34,9 @@ REPLAY_EVIDENCE_TYPES = frozenset(
     {
         "agent_message",
         "computer_call",
+        "computer_call_output",
         "computer_tool_call",
+        "computer_tool_call_output",
         "custom_tool_call",
         "custom_tool_call_output",
         "function_call",
@@ -56,7 +58,14 @@ CALL_DEFINITION_TYPES = frozenset(
         "web_search_call",
     }
 )
-CALL_REFERENCE_TYPES = frozenset({"custom_tool_call_output", "function_call_output"})
+CALL_REFERENCE_TYPES = frozenset(
+    {
+        "computer_call_output",
+        "computer_tool_call_output",
+        "custom_tool_call_output",
+        "function_call_output",
+    }
+)
 
 
 class CorpusError(RuntimeError):
@@ -976,6 +985,8 @@ def content_identity(
     filename_id: str | None,
     identity_ambiguous: bool,
 ) -> tuple[str, str] | None:
+    if lifecycle_ids:
+        return ("lifecycle-set", "\0".join(sorted(lifecycle_ids)))
     if owner_id is not None:
         return ("owner", owner_id)
     if identity_ambiguous:
