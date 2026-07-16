@@ -23,6 +23,20 @@ SESSION_ID_RE = re.compile(
 )
 ROLLOUT_DATE_RE = re.compile(r"rollout-(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})")
 VOLATILE_KEYS = frozenset({"timestamp", "ts", "created_at", "updated_at"})
+REPLAY_EVIDENCE_TYPES = frozenset(
+    {
+        "agent_message",
+        "computer_call",
+        "computer_tool_call",
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "function_call",
+        "function_call_output",
+        "reasoning",
+        "task_complete",
+        "web_search_call",
+    }
+)
 
 
 class CorpusError(RuntimeError):
@@ -34,6 +48,7 @@ class Record:
     line_no: int
     fingerprint: str
     timestamp: dt.datetime | None
+    replay_evidence: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +181,21 @@ def record_lifecycle_id(row: dict[str, Any]) -> str | None:
     return None
 
 
+def record_replay_evidence(row: dict[str, Any]) -> bool:
+    payload = row.get("payload")
+    sources = [payload, row]
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        role = source.get("role")
+        if role == "assistant":
+            return True
+        record_type = source.get("type")
+        if isinstance(record_type, str) and record_type in REPLAY_EVIDENCE_TYPES:
+            return True
+    return False
+
+
 def filename_session_id(path: Path) -> str | None:
     match = SESSION_ID_RE.search(path.name)
     return match.group("id").lower() if match else None
@@ -199,9 +229,13 @@ def fallback_path_timestamp(path: Path, root: Path) -> dt.datetime | None:
 
 
 def inventory_root(root: Path) -> list[Path]:
-    if not root.exists():
+    try:
+        root_mode = root.lstat().st_mode
+    except FileNotFoundError:
         return []
-    if root.is_symlink() or not root.is_dir():
+    except OSError as error:
+        raise CorpusError(f"unable to inspect rollout root {root}: {error}") from error
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
         raise CorpusError(f"unsafe rollout root: {root}")
     resolved_root = root.resolve(strict=True)
     paths: list[Path] = []
@@ -339,6 +373,7 @@ def load_rollout_records(metadata: RolloutMetadata) -> Rollout:
                         line_no=line_no,
                         fingerprint=record_fingerprint(row),
                         timestamp=record_timestamp(row),
+                        replay_evidence=record_replay_evidence(row),
                     )
                 )
     except OSError as error:
@@ -366,6 +401,17 @@ def common_prefix_length(left: Rollout, right: Rollout) -> int:
             break
         count += 1
     return count
+
+
+def confirmed_replay_prefix_length(left: Rollout, right: Rollout) -> int:
+    prefix = common_prefix_length(left, right)
+    if prefix == 0:
+        return 0
+    if left.content_sha256 == right.content_sha256:
+        return prefix
+    if any(record.replay_evidence for record in left.records[:prefix]):
+        return prefix
+    return 0
 
 
 def group_metadata(metadata: list[RolloutMetadata]) -> list[list[RolloutMetadata]]:
@@ -464,7 +510,10 @@ def union_entries(
         group_accepted = False
         for rollout in sorted(group, key=rollout_sort_key):
             prefix = max(
-                (common_prefix_length(rollout, previous) for previous in histories),
+                (
+                    confirmed_replay_prefix_length(rollout, previous)
+                    for previous in histories
+                ),
                 default=0,
             )
             replayed_record_count += prefix

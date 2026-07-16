@@ -95,10 +95,22 @@ class SessionCorpusTests(unittest.TestCase):
             original_rows = [
                 record("2026-01-01T01:00:00Z", "session_meta", id=first_id),
                 record("2026-01-01T01:01:00Z", "response_item", role="user", text="old task"),
+                record(
+                    "2026-01-01T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="old result",
+                ),
             ]
             continuation_rows = [
                 record("2026-07-16T01:00:00Z", "session_meta", id=first_id),
                 record("2026-07-16T01:01:00Z", "response_item", role="user", text="old task"),
+                record(
+                    "2026-07-16T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="old result",
+                ),
                 record(
                     "2026-07-16T02:00:00Z",
                     "response_item",
@@ -135,7 +147,7 @@ class SessionCorpusTests(unittest.TestCase):
                     "archived_parsed": 2,
                     "cross_root_duplicate_groups": 2,
                     "duplicate_rollouts_collapsed": 1,
-                    "replayed_prefix_records": 4,
+                    "replayed_prefix_records": 5,
                     "union_accepted": 2,
                     "union_accepted_groups": 2,
                     "union_candidate": 4,
@@ -148,16 +160,16 @@ class SessionCorpusTests(unittest.TestCase):
             ]
             by_path = {entry["path"]: entry for entry in entries}
             self.assertEqual(set(by_path), {str(archived_continuation), str(old_path_followup)})
-            self.assertEqual(by_path[str(archived_continuation)]["accepted_line_ranges"], [[3, 3]])
+            self.assertEqual(by_path[str(archived_continuation)]["accepted_line_ranges"], [[4, 4]])
             self.assertEqual(by_path[str(archived_continuation)]["accepted_record_count"], 1)
-            self.assertEqual(by_path[str(archived_continuation)]["replayed_prefix_records"], 2)
+            self.assertEqual(by_path[str(archived_continuation)]["replayed_prefix_records"], 3)
             self.assertEqual(by_path[str(old_path_followup)]["accepted_line_ranges"], [[1, 2]])
             self.assertEqual(by_path[str(old_path_followup)]["accepted_record_count"], 2)
             self.assertNotIn(str(active_original), (output / "corpus-paths.txt").read_text())
             self.assertRegex(completed.stdout, r"active candidate count: 2")
             self.assertRegex(completed.stdout, r"archived accepted count: 2")
             self.assertRegex(completed.stdout, r"union accepted count: 2")
-            self.assertIn("accepted_records=1:line_ranges=[[3, 3]]", completed.stdout)
+            self.assertIn("accepted_records=1:line_ranges=[[4, 4]]", completed.stdout)
 
     def test_short_archived_prefix_owns_replay_before_long_active_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -180,6 +192,12 @@ class SessionCorpusTests(unittest.TestCase):
                     role="user",
                     text="old task",
                 ),
+                record(
+                    "2026-01-01T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="old result",
+                ),
             ]
             active_rows = [
                 archived_rows[0],
@@ -188,6 +206,12 @@ class SessionCorpusTests(unittest.TestCase):
                     "response_item",
                     role="user",
                     text="old task",
+                ),
+                record(
+                    "2026-07-16T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="old result",
                 ),
                 record(
                     "2026-07-16T02:00:00Z",
@@ -208,8 +232,8 @@ class SessionCorpusTests(unittest.TestCase):
             ]
             self.assertEqual(len(entries), 1)
             self.assertEqual(entries[0]["path"], str(active))
-            self.assertEqual(entries[0]["accepted_line_ranges"], [[3, 3]])
-            self.assertEqual(entries[0]["replayed_prefix_records"], 2)
+            self.assertEqual(entries[0]["accepted_line_ranges"], [[4, 4]])
+            self.assertEqual(entries[0]["replayed_prefix_records"], 3)
 
     def test_older_long_source_owns_short_restamped_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -240,6 +264,11 @@ class SessionCorpusTests(unittest.TestCase):
                     role="assistant",
                     text="old result",
                 ),
+                record(
+                    "2026-01-01T01:03:00Z",
+                    "function_call_output",
+                    output="old tool result",
+                ),
             ]
             active_rows = [
                 record("2026-07-16T01:00:00Z", "session_meta", id=session_id),
@@ -248,6 +277,12 @@ class SessionCorpusTests(unittest.TestCase):
                     "response_item",
                     role="user",
                     text="old task",
+                ),
+                record(
+                    "2026-07-16T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="old result",
                 ),
             ]
             write_rollout(archived, archived_rows)
@@ -259,7 +294,55 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual((output / "corpus.jsonl").read_text(encoding="utf-8"), "")
             manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
-            self.assertEqual(manifest["counts"]["replayed_prefix_records"], 2)
+            self.assertEqual(manifest["counts"]["replayed_prefix_records"], 3)
+
+    def test_prompt_only_repeat_under_one_lifecycle_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6ba6-6b81-7cb1-bb7e-4b8ab4dc66cd"
+            archived = (
+                codex_home / "archived_sessions" / f"rollout-old-{session_id}.jsonl"
+            )
+            active = (
+                codex_home / "sessions/2026/07/16" / f"rollout-new-{session_id}.jsonl"
+            )
+            write_rollout(
+                archived,
+                [
+                    record("2026-01-01T01:00:00Z", "session_meta", id=session_id),
+                    record(
+                        "2026-01-01T01:01:00Z",
+                        "response_item",
+                        role="user",
+                        text="retry task",
+                    ),
+                ],
+            )
+            write_rollout(
+                active,
+                [
+                    record("2026-07-16T01:00:00Z", "session_meta", id=session_id),
+                    record(
+                        "2026-07-16T01:01:00Z",
+                        "response_item",
+                        role="user",
+                        text="retry task",
+                    ),
+                ],
+            )
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["path"], str(active))
+            self.assertEqual(entries[0]["accepted_line_ranges"], [[1, 2]])
+            self.assertEqual(entries[0]["replayed_prefix_records"], 0)
 
     def test_filename_id_is_only_a_candidate_key_without_matching_fingerprints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -342,8 +425,8 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(len(entries), 2)
             by_path = {entry["path"]: entry for entry in entries}
             self.assertEqual(by_path[str(active)]["accepted_line_ranges"], [[1, 2]])
-            self.assertEqual(by_path[str(archived)]["accepted_line_ranges"], [[2, 2]])
-            self.assertEqual(by_path[str(archived)]["replayed_prefix_records"], 1)
+            self.assertEqual(by_path[str(archived)]["accepted_line_ranges"], [[1, 2]])
+            self.assertEqual(by_path[str(archived)]["replayed_prefix_records"], 0)
 
     def test_date_path_fallback_locates_every_unique_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -416,6 +499,15 @@ class SessionCorpusTests(unittest.TestCase):
                     "unable to inventory rollout root.*blocked subtree",
                 ):
                     CORPUS.inventory_root(root)
+
+    def test_inventory_rejects_dangling_root_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            root = temp / "archived_sessions"
+            root.symlink_to(temp / "missing", target_is_directory=True)
+
+            with self.assertRaisesRegex(CORPUS.CorpusError, "unsafe rollout root"):
+                CORPUS.inventory_root(root)
 
     def test_second_pass_accepts_append_only_growth_but_rejects_prefix_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
