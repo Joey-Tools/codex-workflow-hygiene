@@ -43,9 +43,13 @@ for path in (codex_root / 'session_index.jsonl', codex_root / 'history.jsonl'):
 PY
 matches_file=$(mktemp)
 trap 'rm -f "$matches_file"' EXIT
+find_name_predicate=-name
+if [[ "$SESSION_ID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+    find_name_predicate=-iname
+fi
 for root in "$CODEX_ROOT/sessions" "$CODEX_ROOT/archived_sessions"; do
     if [ -d "$root" ]; then
-        find "$root" -type f -name "rollout-*${SESSION_ID}*.jsonl" -print0 >> "$matches_file"
+        find "$root" -type f "$find_name_predicate" "rollout-*${SESSION_ID}*.jsonl" -print0 >> "$matches_file"
     fi
 done
 python3 - "$matches_file" <<'PY'
@@ -65,7 +69,7 @@ PY
 
 Search both existing roots because an exact session can move from the active date tree to either a flat or date-nested archive layout. Do not append either rollout root to a raw `rg`. A raw rollout match prints the whole JSONL record, and a nested `function_call_output` match can expand into hundreds of thousands of tokens before the useful path is visible.
 
-The recipe keeps `find` output NUL-delimited until every candidate path is validated and rejects non-printable path components before printing any rollout match.
+The recipe keeps `find` output NUL-delimited until every candidate path is validated and rejects non-printable path components before printing any rollout match. It matches complete UUID-shaped session IDs case-insensitively, consistent with lifecycle normalization, while preserving exact case for opaque IDs.
 
 Treat `session_index.jsonl` and `history.jsonl` as optional hints: a missing, unreadable, or malformed index record must not prevent the rollout-root search, and warnings must never include the raw line.
 

@@ -285,8 +285,11 @@ class SkillStructureTests(unittest.TestCase):
             codex_home = temp / "custom-codex"
             session_id = "019ce6e8-a5e3-76e1-91a2-799837c70d1e"
             active = codex_home / f"sessions/2026/03/12/rollout-active-{session_id}.jsonl"
+            uppercase = codex_home / (
+                f"sessions/2026/03/13/rollout-uppercase-{session_id.upper()}.jsonl"
+            )
             archived = codex_home / f"archived_sessions/rollout-archived-{session_id}.jsonl"
-            expected = {active, archived}
+            expected = {active, uppercase, archived}
             for path in expected:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("{}\n", encoding="utf-8")
@@ -329,6 +332,29 @@ class SkillStructureTests(unittest.TestCase):
             self.assertIn(str(archived), malformed.stdout)
             self.assertIn(f"{session_index}:2:", malformed.stdout)
             self.assertNotIn("not-json", malformed.stdout)
+
+            opaque_id = "Opaque-Session-ID"
+            opaque = codex_home / f"archived_sessions/rollout-opaque-{opaque_id}.jsonl"
+            wrong_case = codex_home / (
+                f"archived_sessions/rollout-opaque-{opaque_id.lower()}.jsonl"
+            )
+            opaque.write_text("{}\n", encoding="utf-8")
+            wrong_case.write_text("{}\n", encoding="utf-8")
+            opaque_recipe = recipe.replace(
+                f"SESSION_ID='{session_id}'", f"SESSION_ID='{opaque_id}'", 1
+            )
+            opaque_result = subprocess.run(
+                ["bash", "-c", opaque_recipe],
+                cwd=temp,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(opaque_result.returncode, 0, opaque_result.stderr)
+            self.assertEqual(
+                {Path(line) for line in opaque_result.stdout.splitlines()}, {opaque}
+            )
 
     def test_session_mining_exact_session_recipe_rejects_non_printable_paths(
         self,

@@ -51,6 +51,7 @@ superseded_by:
 - GitHub review added computer-call output records to generated call-ID linkage and replay evidence, so regenerated `call_id` values cannot make a repeated screenshot or output look new.
 - Exact-session recipe tests now clear an ambient `CODEX_HOME` when they intentionally exercise a temporary `$HOME/.codex` fixture.
 - Final pinned review made byte-identical copies with the same complete lifecycle-ID set collapse even when one filename confirms the owner and the other leaves identity ambiguous; non-identical mixed histories remain isolated.
+- Final independent review aligned exact-session filename lookup with UUID lifecycle normalization by matching complete UUIDs case-insensitively while retaining exact case for opaque session IDs.
 
 ## Next Steps
 
