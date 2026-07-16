@@ -1461,6 +1461,164 @@ class SessionCorpusTests(unittest.TestCase):
             with self.assertRaisesRegex(CORPUS.CorpusError, "unsafe rollout root"):
                 CORPUS.inventory_root(root)
 
+    def test_inventory_identity_rejects_root_and_candidate_swaps(self) -> None:
+        start = CORPUS.parse_instant("2026-07-16T00:00:00Z")
+        end = CORPUS.parse_instant("2026-07-17T00:00:00Z")
+
+        with self.subTest("candidate inode replacement"):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp = Path(temp_dir)
+                root = temp / "sessions"
+                path = root / "2026/07/16/rollout-swap.jsonl"
+                write_rollout(
+                    path,
+                    [record("2026-07-16T01:00:00Z", "user_message", text="old")],
+                )
+                candidate = CORPUS.inventory_root(root)[0]
+                path.unlink()
+                write_rollout(
+                    path,
+                    [record("2026-07-16T01:00:00Z", "user_message", text="new")],
+                )
+
+                with self.assertRaisesRegex(
+                    CORPUS.CorpusError,
+                    "rollout candidate changed after inventory",
+                ):
+                    CORPUS.scan_rollout_metadata(
+                        candidate,
+                        "active",
+                        root,
+                        start,
+                        end,
+                    )
+
+        with self.subTest("candidate symlink replacement"):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp = Path(temp_dir)
+                root = temp / "sessions"
+                path = root / "2026/07/16/rollout-swap.jsonl"
+                outside = temp / "outside.jsonl"
+                write_rollout(
+                    path,
+                    [record("2026-07-16T01:00:00Z", "user_message", text="old")],
+                )
+                write_rollout(
+                    outside,
+                    [record("2026-07-16T01:00:00Z", "user_message", text="secret")],
+                )
+                candidate = CORPUS.inventory_root(root)[0]
+                path.unlink()
+                path.symlink_to(outside)
+
+                with self.assertRaisesRegex(
+                    CORPUS.CorpusError,
+                    "rollout candidate changed after inventory",
+                ):
+                    CORPUS.scan_rollout_metadata(
+                        candidate,
+                        "active",
+                        root,
+                        start,
+                        end,
+                    )
+
+        with self.subTest("intermediate directory symlink replacement"):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp = Path(temp_dir)
+                root = temp / "sessions"
+                relative = Path("2026/07/16/rollout-swap.jsonl")
+                path = root / relative
+                write_rollout(
+                    path,
+                    [record("2026-07-16T01:00:00Z", "user_message", text="old")],
+                )
+                candidate = CORPUS.inventory_root(root)[0]
+                (root / "2026").rename(temp / "inventoried-2026")
+                outside_year = temp / "outside-2026"
+                write_rollout(
+                    outside_year / "07/16/rollout-swap.jsonl",
+                    [
+                        record(
+                            "2026-07-16T01:00:00Z",
+                            "user_message",
+                            text="secret",
+                        )
+                    ],
+                )
+                (root / "2026").symlink_to(
+                    outside_year,
+                    target_is_directory=True,
+                )
+
+                with self.assertRaisesRegex(
+                    CORPUS.CorpusError,
+                    "rollout candidate changed after inventory",
+                ):
+                    CORPUS.scan_rollout_metadata(
+                        candidate,
+                        "active",
+                        root,
+                        start,
+                        end,
+                    )
+
+        with self.subTest("root replacement"):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp = Path(temp_dir)
+                root = temp / "sessions"
+                relative = Path("2026/07/16/rollout-swap.jsonl")
+                path = root / relative
+                write_rollout(
+                    path,
+                    [record("2026-07-16T01:00:00Z", "user_message", text="old")],
+                )
+                candidate = CORPUS.inventory_root(root)[0]
+                root.rename(temp / "inventoried-sessions")
+                write_rollout(
+                    root / relative,
+                    [record("2026-07-16T01:00:00Z", "user_message", text="new")],
+                )
+
+                with self.assertRaisesRegex(
+                    CORPUS.CorpusError,
+                    "rollout root changed after inventory",
+                ):
+                    CORPUS.scan_rollout_metadata(
+                        candidate,
+                        "active",
+                        root,
+                        start,
+                        end,
+                    )
+
+    def test_second_pass_rejects_candidate_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            root = temp / "sessions"
+            path = root / "2026/07/16/rollout-swap.jsonl"
+            outside = temp / "outside.jsonl"
+            rows = [record("2026-07-16T01:00:00Z", "user_message", text="original")]
+            write_rollout(path, rows)
+            write_rollout(outside, rows)
+            start = CORPUS.parse_instant("2026-07-16T00:00:00Z")
+            end = CORPUS.parse_instant("2026-07-17T00:00:00Z")
+            metadata = CORPUS.scan_rollout_metadata(
+                path,
+                "active",
+                root,
+                start,
+                end,
+            )
+            path.unlink()
+            path.symlink_to(outside)
+
+            with self.assertRaisesRegex(
+                CORPUS.CorpusError,
+                "rollout candidate changed after inventory",
+            ):
+                CORPUS.load_rollout_records(metadata)
+
     def test_output_rejects_symlink_and_existing_artifact_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -1582,6 +1740,50 @@ class SessionCorpusTests(unittest.TestCase):
             write_rollout(path, changed + [appended])
             with self.assertRaisesRegex(CORPUS.CorpusError, "rollout prefix changed"):
                 CORPUS.load_rollout_records(metadata)
+
+    def test_first_pass_pins_growth_after_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            root = temp / "sessions"
+            path = root / "2026/07/16/rollout-growing.jsonl"
+            first = record(
+                "2026-07-16T06:00:00Z",
+                "response_item",
+                role="user",
+                text="first",
+            )
+            second = record(
+                "2026-07-16T06:01:00Z",
+                "response_item",
+                role="assistant",
+                text="second",
+            )
+            third = record(
+                "2026-07-16T06:02:00Z",
+                "response_item",
+                role="user",
+                text="third",
+            )
+            write_rollout(path, [first])
+            candidate = CORPUS.inventory_root(root)[0]
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{json.dumps(second, sort_keys=True)}\n")
+            start = CORPUS.parse_instant("2026-07-16T00:00:00Z")
+            end = CORPUS.parse_instant("2026-07-17T00:00:00Z")
+
+            metadata = CORPUS.scan_rollout_metadata(
+                candidate,
+                "active",
+                root,
+                start,
+                end,
+            )
+            self.assertEqual(metadata.record_count, 2)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{json.dumps(third, sort_keys=True)}\n")
+
+            rollout = CORPUS.load_rollout_records(metadata)
+            self.assertEqual(len(rollout.records), 2)
 
 
 if __name__ == "__main__":

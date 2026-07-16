@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import datetime as dt
 import hashlib
 import json
@@ -72,8 +72,20 @@ class Record:
 
 
 @dataclass(frozen=True, slots=True)
-class RolloutMetadata:
+class RolloutCandidate:
     path: Path
+    root: Path
+    relative_parts: tuple[str, ...]
+    root_device: int
+    root_inode: int
+    file_device: int
+    file_inode: int
+    file_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutMetadata:
+    candidate: RolloutCandidate
     source: str
     lifecycle_ids: frozenset[str]
     first_lifecycle_id: str | None
@@ -86,6 +98,10 @@ class RolloutMetadata:
     has_in_window_record: bool
     fallback_accepted: bool
     record_count: int
+
+    @property
+    def path(self) -> Path:
+        return self.candidate.path
 
     @property
     def accepted(self) -> bool:
@@ -372,17 +388,122 @@ def fallback_path_timestamp(path: Path, root: Path) -> dt.datetime | None:
     return None
 
 
-def inventory_root(root: Path) -> list[Path]:
+def lexical_absolute(path: Path) -> Path:
+    return Path(os.path.normpath(os.fspath(path.absolute())))
+
+
+def capture_rollout_candidate(
+    path: Path,
+    root: Path,
+    *,
+    root_metadata: os.stat_result | None = None,
+    file_metadata: os.stat_result | None = None,
+) -> RolloutCandidate:
+    root = lexical_absolute(root)
+    path = lexical_absolute(path)
     try:
-        root_mode = root.lstat().st_mode
+        relative_parts = path.relative_to(root).parts
+    except ValueError as error:
+        raise CorpusError(f"rollout candidate escapes root: {path}") from error
+    if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+        raise CorpusError(f"unsafe rollout candidate path: {path}")
+    try:
+        root_metadata = root_metadata or root.lstat()
+        file_metadata = file_metadata or path.lstat()
+    except OSError as error:
+        raise CorpusError(
+            f"unable to inspect rollout candidate {path}: {error}"
+        ) from error
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise CorpusError(f"unsafe rollout root: {root}")
+    if stat.S_ISLNK(file_metadata.st_mode) or not stat.S_ISREG(file_metadata.st_mode):
+        raise CorpusError(f"unsafe rollout candidate: {path}")
+    return RolloutCandidate(
+        path=path,
+        root=root,
+        relative_parts=relative_parts,
+        root_device=root_metadata.st_dev,
+        root_inode=root_metadata.st_ino,
+        file_device=file_metadata.st_dev,
+        file_inode=file_metadata.st_ino,
+        file_size=file_metadata.st_size,
+    )
+
+
+def open_rollout_candidate(
+    candidate: RolloutCandidate,
+) -> tuple[int, os.stat_result]:
+    try:
+        root_fd = os.open(candidate.root, directory_open_flags())
+    except OSError as error:
+        raise CorpusError(
+            f"rollout root changed after inventory: {candidate.root}: {error}"
+        ) from error
+    current_fd = root_fd
+    try:
+        root_metadata = os.fstat(root_fd)
+        if (root_metadata.st_dev, root_metadata.st_ino) != (
+            candidate.root_device,
+            candidate.root_inode,
+        ):
+            raise CorpusError(f"rollout root changed after inventory: {candidate.root}")
+        for component in candidate.relative_parts[:-1]:
+            try:
+                next_fd = os.open(component, directory_open_flags(), dir_fd=current_fd)
+            except OSError as error:
+                raise CorpusError(
+                    f"rollout candidate changed after inventory: {candidate.path}: {error}"
+                ) from error
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(
+                candidate.relative_parts[-1],
+                flags,
+                dir_fd=current_fd,
+            )
+        except OSError as error:
+            raise CorpusError(
+                f"rollout candidate changed after inventory: {candidate.path}: {error}"
+            ) from error
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or (
+                metadata.st_dev,
+                metadata.st_ino,
+            ) != (candidate.file_device, candidate.file_inode):
+                raise CorpusError(
+                    f"rollout candidate changed after inventory: {candidate.path}"
+                )
+            if metadata.st_size < candidate.file_size:
+                raise CorpusError(
+                    f"rollout was truncated after inventory: {candidate.path}"
+                )
+            return descriptor, metadata
+        except BaseException:
+            os.close(descriptor)
+            raise
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
+def inventory_root(root: Path) -> list[RolloutCandidate]:
+    root = lexical_absolute(root)
+    try:
+        root_metadata = root.lstat()
     except FileNotFoundError:
         return []
     except OSError as error:
         raise CorpusError(f"unable to inspect rollout root {root}: {error}") from error
-    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
         raise CorpusError(f"unsafe rollout root: {root}")
     resolved_root = root.resolve(strict=True)
-    paths: list[Path] = []
+    candidates: list[RolloutCandidate] = []
 
     def traversal_error(error: OSError) -> None:
         raise CorpusError(
@@ -412,8 +533,10 @@ def inventory_root(root: Path) -> list[Path]:
                 if filename.startswith("rollout-summary"):
                     continue
                 path = current_path / filename
-                mode = path.lstat().st_mode
-                if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+                file_metadata = path.lstat()
+                if stat.S_ISLNK(file_metadata.st_mode) or not stat.S_ISREG(
+                    file_metadata.st_mode
+                ):
                     raise CorpusError(f"unsafe rollout candidate: {path}")
                 try:
                     path.resolve(strict=True).relative_to(resolved_root)
@@ -421,21 +544,36 @@ def inventory_root(root: Path) -> list[Path]:
                     raise CorpusError(
                         f"rollout candidate escapes root: {path}"
                     ) from error
-                paths.append(path)
+                candidates.append(
+                    capture_rollout_candidate(
+                        path,
+                        root,
+                        root_metadata=root_metadata,
+                        file_metadata=file_metadata,
+                    )
+                )
     except OSError as error:
         raise CorpusError(
             f"unable to inventory rollout root {root}: {error}"
         ) from error
-    return sorted(paths)
+    return sorted(candidates, key=lambda candidate: candidate.path.as_posix())
 
 
 def scan_rollout_metadata(
-    path: Path,
+    path: Path | RolloutCandidate,
     source: str,
     root: Path,
     start: dt.datetime,
     end: dt.datetime,
 ) -> RolloutMetadata:
+    candidate = (
+        path
+        if isinstance(path, RolloutCandidate)
+        else capture_rollout_candidate(path, root)
+    )
+    if candidate.root != lexical_absolute(root):
+        raise CorpusError(f"rollout candidate root mismatch: {candidate.path}")
+    rollout_path = candidate.path
     lifecycle_ids: set[str] = set()
     first_lifecycle_id: str | None = None
     saw_lifecycle_record = False
@@ -446,8 +584,24 @@ def scan_rollout_metadata(
     has_in_window_record = False
     record_count = 0
     try:
-        with path.open("rb") as handle:
-            for line_no, raw_line in enumerate(handle, 1):
+        descriptor, opened_metadata = open_rollout_candidate(candidate)
+        snapshot_bytes = opened_metadata.st_size
+        try:
+            rollout_handle = os.fdopen(descriptor, "rb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with rollout_handle as handle:
+            remaining = snapshot_bytes
+            line_no = 0
+            while remaining:
+                raw_line = handle.readline(remaining)
+                if not raw_line:
+                    raise CorpusError(
+                        f"rollout was truncated during metadata scan: {rollout_path}"
+                    )
+                remaining -= len(raw_line)
+                line_no += 1
                 digest.update(raw_line)
                 source_bytes += len(raw_line)
                 if not raw_line.strip():
@@ -456,10 +610,12 @@ def scan_rollout_metadata(
                     row = json.loads(raw_line)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
                     raise CorpusError(
-                        f"invalid rollout JSON at {path}:{line_no}"
+                        f"invalid rollout JSON at {rollout_path}:{line_no}"
                     ) from error
                 if not isinstance(row, dict):
-                    raise CorpusError(f"non-object rollout record at {path}:{line_no}")
+                    raise CorpusError(
+                        f"non-object rollout record at {rollout_path}:{line_no}"
+                    )
                 record_ids = record_lifecycle_ids(row)
                 if record_ids:
                     if not saw_lifecycle_record:
@@ -482,15 +638,27 @@ def scan_rollout_metadata(
                         start,
                         end,
                     )
+            final_metadata = os.fstat(handle.fileno())
     except OSError as error:
-        raise CorpusError(f"unable to read rollout {path}: {error}") from error
-    fallback_timestamp = fallback_path_timestamp(path, root)
+        raise CorpusError(f"unable to read rollout {rollout_path}: {error}") from error
+    if (
+        (final_metadata.st_dev, final_metadata.st_ino)
+        != (candidate.file_device, candidate.file_inode)
+        or final_metadata.st_size < snapshot_bytes
+        or source_bytes != snapshot_bytes
+    ):
+        raise CorpusError(f"rollout changed during metadata scan: {rollout_path}")
+    scanned_candidate = replace(
+        candidate,
+        file_size=snapshot_bytes,
+    )
+    fallback_timestamp = fallback_path_timestamp(rollout_path, candidate.root)
     return RolloutMetadata(
-        path=path,
+        candidate=scanned_candidate,
         source=source,
         lifecycle_ids=frozenset(lifecycle_ids),
         first_lifecycle_id=first_lifecycle_id,
-        filename_session_id=filename_session_id(path),
+        filename_session_id=filename_session_id(rollout_path),
         content_sha256=digest.hexdigest(),
         source_bytes=source_bytes,
         fallback_timestamp=fallback_timestamp,
@@ -511,7 +679,13 @@ def load_rollout_records(metadata: RolloutMetadata) -> Rollout:
     digest = hashlib.sha256()
     fingerprint_ids = GeneratedIdCanonicalizer()
     try:
-        with metadata.path.open("rb") as handle:
+        descriptor, _ = open_rollout_candidate(metadata.candidate)
+        try:
+            rollout_handle = os.fdopen(descriptor, "rb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with rollout_handle as handle:
             remaining = metadata.source_bytes
             line_no = 0
             while remaining:
@@ -543,12 +717,16 @@ def load_rollout_records(metadata: RolloutMetadata) -> Rollout:
                         replay_evidence=record_replay_evidence(row),
                     )
                 )
+            final_metadata = os.fstat(handle.fileno())
     except OSError as error:
         raise CorpusError(
             f"unable to reread rollout {metadata.path}: {error}"
         ) from error
     if (
-        digest.hexdigest() != metadata.content_sha256
+        (final_metadata.st_dev, final_metadata.st_ino)
+        != (metadata.candidate.file_device, metadata.candidate.file_inode)
+        or final_metadata.st_size < metadata.source_bytes
+        or digest.hexdigest() != metadata.content_sha256
         or len(records) != metadata.record_count
     ):
         raise CorpusError(
@@ -982,15 +1160,15 @@ def build_corpus(
         raise CorpusError("window start must be earlier than window end")
     active_root = codex_home / "sessions"
     archived_root = codex_home / "archived_sessions"
-    active_paths = inventory_root(active_root)
-    archived_paths = inventory_root(archived_root)
+    active_candidates = inventory_root(active_root)
+    archived_candidates = inventory_root(archived_root)
     active_metadata = [
-        scan_rollout_metadata(path, "active", active_root, start, end)
-        for path in active_paths
+        scan_rollout_metadata(candidate, "active", active_root, start, end)
+        for candidate in active_candidates
     ]
     archived_metadata = [
-        scan_rollout_metadata(path, "archived", archived_root, start, end)
-        for path in archived_paths
+        scan_rollout_metadata(candidate, "archived", archived_root, start, end)
+        for candidate in archived_candidates
     ]
     metadata = active_metadata + archived_metadata
     active_accepted = [rollout for rollout in active_metadata if rollout.accepted]
@@ -1031,10 +1209,10 @@ def build_corpus(
             next_group += 1
     counts = {
         "active_accepted": len(active_accepted),
-        "active_candidate": len(active_paths),
+        "active_candidate": len(active_candidates),
         "active_parsed": len(active_metadata),
         "archived_accepted": len(archived_accepted),
-        "archived_candidate": len(archived_paths),
+        "archived_candidate": len(archived_candidates),
         "archived_parsed": len(archived_metadata),
         "cross_root_duplicate_groups": cross_root_duplicate_groups,
         "duplicate_rollouts_collapsed": collapsed_count,
@@ -1054,12 +1232,14 @@ def build_corpus(
     directory_fd = create_output_directory(output)
     try:
         write_lines(
-            directory_fd, "active-paths.txt", (path.as_posix() for path in active_paths)
+            directory_fd,
+            "active-paths.txt",
+            (candidate.path.as_posix() for candidate in active_candidates),
         )
         write_lines(
             directory_fd,
             "archived-paths.txt",
-            (path.as_posix() for path in archived_paths),
+            (candidate.path.as_posix() for candidate in archived_candidates),
         )
         write_lines(
             directory_fd,
