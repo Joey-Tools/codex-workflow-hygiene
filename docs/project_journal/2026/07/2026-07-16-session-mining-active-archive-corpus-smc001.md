@@ -55,6 +55,7 @@ superseded_by:
 - Final pinned review preserved per-record timestamp coverage when ordering replay sources, so a sparse copy cannot hide valid window records from a complete copy, and moved opaque exact-session matching out of shell glob semantics into a literal basename filter.
 - Final independent review made non-empty timestamp-less histories use filename/path fallback provenance during replay ordering, preventing an active restamp from winning only because of source priority.
 - A missing fallback remains unknown rather than masquerading as known maximum-time provenance, so a later sparse copy with a genuine in-window timestamp cannot be swallowed as replay.
+- Replay ordering now establishes provenance from the earliest of all known record timestamps before comparing per-position coverage, so an old source with a missing opening timestamp still precedes its fully restamped copy.
 
 ## Next Steps
 
