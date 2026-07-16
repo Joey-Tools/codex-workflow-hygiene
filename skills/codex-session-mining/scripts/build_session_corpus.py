@@ -28,7 +28,8 @@ ROLLOUT_TIMESTAMP_RE = re.compile(
     r"^rollout-(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
     r"T(?P<hour>\d{2})-(?P<minute>\d{2})-(?P<second>\d{2})(?:-|\.jsonl$)"
 )
-VOLATILE_KEYS = frozenset({"timestamp", "ts", "created_at", "updated_at"})
+TIMESTAMP_KEYS = ("timestamp", "ts", "time", "created_at", "updated_at")
+VOLATILE_KEYS = frozenset(TIMESTAMP_KEYS)
 REPLAY_EVIDENCE_TYPES = frozenset(
     {
         "agent_message",
@@ -144,7 +145,7 @@ class RolloutMetadata:
         if self.first_lifecycle_id is None:
             return None
         if self.filename_session_id is None:
-            return self.lifecycle_id
+            return self.first_lifecycle_id
         if self.first_lifecycle_id == self.filename_session_id:
             return self.filename_session_id
         return None
@@ -178,7 +179,7 @@ class Rollout:
         if self.first_lifecycle_id is None:
             return None
         if self.filename_session_id is None:
-            return self.lifecycle_id
+            return self.first_lifecycle_id
         if self.first_lifecycle_id == self.filename_session_id:
             return self.filename_session_id
         return None
@@ -309,6 +310,8 @@ def record_fingerprint(
             "type": "session_meta",
             "lifecycle_ids": record_lifecycle_ids(stable),
         }
+    elif record_type == "turn_context":
+        stable = {"type": "turn_context"}
     else:
         state = canonicalizer or GeneratedIdCanonicalizer()
         normalize_generated_ids(stable, record_type, state)
@@ -329,7 +332,7 @@ def record_timestamp(row: dict[str, Any]) -> dt.datetime | None:
     if isinstance(payload, dict):
         sources.append(payload)
     for source in sources:
-        for key in ("timestamp", "ts", "created_at", "updated_at"):
+        for key in TIMESTAMP_KEYS:
             parsed = maybe_instant(source.get(key))
             if parsed is not None:
                 return parsed
@@ -423,6 +426,10 @@ def lexical_absolute(path: Path) -> Path:
     return Path(os.path.normpath(os.fspath(path.absolute())))
 
 
+def path_has_non_printable_characters(path: Path) -> bool:
+    return any(not character.isprintable() for character in os.fspath(path))
+
+
 def capture_rollout_candidate(
     path: Path,
     root: Path,
@@ -432,6 +439,10 @@ def capture_rollout_candidate(
 ) -> RolloutCandidate:
     root = lexical_absolute(root)
     path = lexical_absolute(path)
+    if path_has_non_printable_characters(root):
+        raise CorpusError("rollout root path contains non-printable characters")
+    if path_has_non_printable_characters(path):
+        raise CorpusError("rollout candidate path contains non-printable characters")
     try:
         relative_parts = path.relative_to(root).parts
     except ValueError as error:
@@ -596,6 +607,8 @@ def validate_inventory_directories(
 
 def inventory_root(root: Path) -> list[RolloutCandidate]:
     root = lexical_absolute(root)
+    if path_has_non_printable_characters(root):
+        raise CorpusError("rollout root path contains non-printable characters")
     try:
         root_metadata = root.lstat()
     except FileNotFoundError:
@@ -1087,11 +1100,12 @@ def union_entries(
     start: dt.datetime,
     end: dt.datetime,
     group_start: int,
-) -> tuple[list[dict[str, object]], int, int, int]:
+) -> tuple[list[dict[str, object]], int, int, int, int]:
     entries: list[dict[str, object]] = []
     replayed_record_count = 0
     collapsed_rollout_count = 0
     accepted_group_count = 0
+    cross_root_duplicate_group_count = 0
     ordered_groups = sorted(groups, key=lambda item: min(map(rollout_sort_key, item)))
     for group_index, group in enumerate(ordered_groups, group_start):
         histories: list[Rollout] = []
@@ -1099,13 +1113,16 @@ def union_entries(
         group_window_accepted = any(rollout.window_accepted for rollout in group)
         group_replayed_record_count = 0
         group_collapsed_rollout_count = 0
+        group_cross_root_duplicate = False
         for rollout in sorted(group, key=rollout_sort_key):
-            prefix = max(
-                (
-                    confirmed_replay_prefix_length(rollout, previous)
-                    for previous in histories
-                ),
-                default=0,
+            previous_prefixes = [
+                (confirmed_replay_prefix_length(rollout, previous), previous)
+                for previous in histories
+            ]
+            prefix = max((length for length, _ in previous_prefixes), default=0)
+            group_cross_root_duplicate = group_cross_root_duplicate or any(
+                length > 0 and previous.source != rollout.source
+                for length, previous in previous_prefixes
             )
             group_replayed_record_count += prefix
             unique_records = rollout.records[prefix:]
@@ -1147,7 +1164,15 @@ def union_entries(
         if group_window_accepted:
             replayed_record_count += group_replayed_record_count
             collapsed_rollout_count += group_collapsed_rollout_count
-    return entries, replayed_record_count, collapsed_rollout_count, accepted_group_count
+            if group_cross_root_duplicate:
+                cross_root_duplicate_group_count += 1
+    return (
+        entries,
+        replayed_record_count,
+        collapsed_rollout_count,
+        accepted_group_count,
+        cross_root_duplicate_group_count,
+    )
 
 
 def write_artifact(directory_fd: int, name: str, content: str) -> None:
@@ -1356,22 +1381,23 @@ def build_corpus(
             [load_rollout_records(rollout) for rollout in broad_group]
         )
         for refined_group in refined_groups:
-            new_entries, new_replayed, new_collapsed, new_accepted_groups = (
-                union_entries(
-                    [refined_group],
-                    start,
-                    end,
-                    next_group,
-                )
+            (
+                new_entries,
+                new_replayed,
+                new_collapsed,
+                new_accepted_groups,
+                new_cross_root_duplicates,
+            ) = union_entries(
+                [refined_group],
+                start,
+                end,
+                next_group,
             )
             entries.extend(new_entries)
             replayed_count += new_replayed
             collapsed_count += new_collapsed
             accepted_group_count += new_accepted_groups
-            if any(rollout.window_accepted for rollout in refined_group) and {
-                rollout.source for rollout in refined_group
-            } == {"active", "archived"}:
-                cross_root_duplicate_groups += 1
+            cross_root_duplicate_groups += new_cross_root_duplicates
             next_group += 1
     counts = {
         "active_accepted": len(active_accepted),

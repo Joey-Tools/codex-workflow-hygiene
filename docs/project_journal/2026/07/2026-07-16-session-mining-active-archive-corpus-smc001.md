@@ -42,6 +42,10 @@ superseded_by:
 - Non-byte-identical branch prefixes now stop at the last matching assistant/tool execution record, preserving a repeated human prompt typed after a fork even when its normalized content also appears in another branch.
 - Session metadata fingerprints now retain explicit lifecycle IDs while discarding runtime context such as Git state, originator/source, model/provider, thread source, context window, history mode, and base instructions, so restored history still matches across entry points and worktrees.
 - Complete UUID-shaped lifecycle aliases are normalized to lowercase like filename UUIDs, while non-UUID opaque IDs retain their original form, so casing alone cannot make one session owner appear ambiguous.
+- Non-printable rollout path components now fail closed before line-delimited path artifacts or terminal samples are emitted, preventing a filename from injecting apparent corpus entries.
+- `turn_context` runtime drift no longer defeats replay matching, and `time` is now treated as both a record timestamp and a volatile fingerprint field.
+- Without a filename UUID, a single first lifecycle identity owns the rollout while later aliases remain provenance; conflicting aliases in the first lifecycle record still fail the owner boundary.
+- Cross-root duplicate metrics now require an actual collapsed copy or removed replay prefix between candidates from different roots; same-root overlap in a mixed lifecycle group no longer inflates the count.
 
 ## Next Steps
 

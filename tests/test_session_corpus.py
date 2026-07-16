@@ -509,6 +509,69 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(entries[0]["accepted_line_ranges"], [[4, 4]])
             self.assertEqual(entries[0]["replayed_prefix_records"], 3)
 
+    def test_replay_prefix_ignores_turn_context_runtime_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6c4c-4f35-7139-a601-54d91db64c39"
+            archived = (
+                codex_home / "archived_sessions" / f"rollout-old-{session_id}.jsonl"
+            )
+            active = (
+                codex_home
+                / "sessions/2026/07/16"
+                / f"rollout-restamped-{session_id}.jsonl"
+            )
+
+            def replayed_rows(day: str, cwd: str, model: str) -> list[dict[str, object]]:
+                return [
+                    record(f"{day}T01:00:00Z", "session_meta", id=session_id),
+                    record(
+                        f"{day}T01:01:00Z",
+                        "turn_context",
+                        cwd=cwd,
+                        model=model,
+                        sandbox_policy="read-only" if day < "2026-07-16" else "workspace-write",
+                        base_instructions=f"instructions for {cwd}",
+                    ),
+                    record(
+                        f"{day}T01:02:00Z",
+                        "response_item",
+                        role="assistant",
+                        text="old result",
+                    ),
+                ]
+
+            write_rollout(
+                archived,
+                replayed_rows("2026-01-01", "/old/worktree", "gpt-old"),
+            )
+            active_rows = replayed_rows(
+                "2026-07-16", "/new/worktree", "gpt-new"
+            )
+            active_rows.append(
+                record(
+                    "2026-07-16T02:00:00Z",
+                    "response_item",
+                    role="user",
+                    text="genuine suffix",
+                )
+            )
+            write_rollout(active, active_rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["accepted_line_ranges"], [[4, 4]])
+            self.assertEqual(entries[0]["replayed_prefix_records"], 3)
+
     def test_replay_prefix_ignores_incidental_response_and_call_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -767,6 +830,123 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(entries[0]["path"], str(active))
             self.assertEqual(entries[0]["accepted_line_ranges"], [[1, 2]])
             self.assertEqual(entries[0]["replayed_prefix_records"], 0)
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 0)
+
+    def test_cross_root_metric_requires_replay_or_collapsed_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6ba6-6b81-7cb1-bb7e-4b8ab4dc66cf"
+            active = (
+                codex_home / "sessions/2026/07/16" / f"rollout-a-{session_id}.jsonl"
+            )
+            archived = (
+                codex_home / "archived_sessions" / f"rollout-b-{session_id}.jsonl"
+            )
+            write_rollout(
+                active,
+                [
+                    record("2026-07-16T01:00:00Z", "session_meta", id=session_id),
+                    record(
+                        "2026-07-16T01:01:00Z",
+                        "response_item",
+                        role="user",
+                        text="active task",
+                    ),
+                ],
+            )
+            write_rollout(
+                archived,
+                [
+                    record("2026-07-16T02:00:00Z", "session_meta", id=session_id),
+                    record(
+                        "2026-07-16T02:01:00Z",
+                        "response_item",
+                        role="user",
+                        text="different archived task",
+                    ),
+                ],
+            )
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["union_accepted"], 2)
+            self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 0)
+            self.assertEqual(manifest["counts"]["replayed_prefix_records"], 0)
+            self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 0)
+
+    def test_cross_root_metric_ignores_same_root_duplicate_in_mixed_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6ba6-6b81-7cb1-bb7e-4b8ab4dc66d0"
+            active_original = (
+                codex_home
+                / "sessions/2026/07/16"
+                / f"rollout-a-{session_id}.jsonl"
+            )
+            active_copy = (
+                codex_home
+                / "sessions/2026/07/16"
+                / f"rollout-b-{session_id}.jsonl"
+            )
+            archived_branch = (
+                codex_home / "archived_sessions" / f"rollout-c-{session_id}.jsonl"
+            )
+            write_rollout(
+                active_original,
+                [
+                    record("2026-07-16T01:00:00Z", "session_meta", id=session_id),
+                    record(
+                        "2026-07-16T01:01:00Z",
+                        "response_item",
+                        role="assistant",
+                        text="same-root result",
+                    ),
+                ],
+            )
+            write_rollout(
+                active_copy,
+                [
+                    record("2026-07-16T02:00:00Z", "session_meta", id=session_id),
+                    record(
+                        "2026-07-16T02:01:00Z",
+                        "response_item",
+                        role="assistant",
+                        text="same-root result",
+                    ),
+                ],
+            )
+            write_rollout(
+                archived_branch,
+                [
+                    record("2026-07-16T03:00:00Z", "session_meta", id=session_id),
+                    record(
+                        "2026-07-16T03:01:00Z",
+                        "response_item",
+                        role="user",
+                        text="different archived branch",
+                    ),
+                ],
+            )
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["union_accepted"], 2)
+            self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 0)
+            self.assertEqual(manifest["counts"]["replayed_prefix_records"], 2)
+            self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
 
     def test_replay_prefix_stops_before_repeated_human_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1235,6 +1415,57 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(manifest["counts"]["cross_root_duplicate_groups"], 1)
             self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
 
+    def test_first_lifecycle_record_owns_rollout_without_filename_uuid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            owner_id = "019f6c4c-4f35-7139-a601-54d91db64c3c"
+            alias_id = "019f6c4c-4f35-7139-a601-54d91db64c3d"
+            archived = codex_home / "archived_sessions/rollout-original.jsonl"
+            active = codex_home / "sessions/2026/07/16/rollout-continued.jsonl"
+            archived_rows = [
+                record("2026-01-01T01:00:00Z", "session_meta", id=owner_id),
+                record(
+                    "2026-01-01T01:01:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="old result",
+                ),
+            ]
+            active_rows = [
+                record("2026-07-16T01:00:00Z", "session_meta", id=owner_id),
+                record(
+                    "2026-07-16T01:01:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="old result",
+                ),
+                record("2026-07-16T01:02:00Z", "session_meta", id=alias_id),
+                record(
+                    "2026-07-16T01:03:00Z",
+                    "response_item",
+                    role="user",
+                    text="genuine suffix",
+                ),
+            ]
+            write_rollout(archived, archived_rows)
+            write_rollout(active, active_rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["owner_id"], owner_id)
+            self.assertEqual(entries[0]["lifecycle_ids"], [owner_id, alias_id])
+            self.assertEqual(entries[0]["accepted_line_ranges"], [[3, 4]])
+            self.assertEqual(entries[0]["replayed_prefix_records"], 2)
+
     def test_session_meta_collects_conflicting_identity_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -1437,6 +1668,47 @@ class SessionCorpusTests(unittest.TestCase):
             ]
             self.assertEqual(len(entries), 1)
             self.assertTrue(entries[0]["fallback_date_used"])
+
+    def test_time_field_is_a_timestamp_and_volatile_fingerprint_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            path = codex_home / "archived_sessions/rollout-time.jsonl"
+            row = {
+                "time": "2026-07-16T15:00:00Z",
+                "type": "user_message",
+                "payload": {
+                    "type": "user_message",
+                    "role": "user",
+                    "text": "in-window task",
+                },
+            }
+            write_rollout(path, [row])
+
+            output = temp / "out"
+            completed = self.run_corpus(
+                codex_home,
+                output,
+                start="2026-07-16T14:00:00Z",
+                end="2026-07-16T16:00:00Z",
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["accepted_line_ranges"], [[1, 1]])
+            self.assertFalse(entries[0]["fallback_date_used"])
+
+            restamped = dict(row)
+            restamped["time"] = "2026-07-16T15:30:00Z"
+            self.assertEqual(
+                CORPUS.record_fingerprint(row),
+                CORPUS.record_fingerprint(restamped),
+            )
             self.assertEqual(entries[0]["accepted_line_ranges"], [[1, 1]])
 
     def test_filename_fallback_validation_and_priority(self) -> None:
@@ -1615,6 +1887,38 @@ class SessionCorpusTests(unittest.TestCase):
 
             with self.assertRaisesRegex(CORPUS.CorpusError, "unsafe rollout root"):
                 CORPUS.inventory_root(root)
+
+    def test_inventory_rejects_non_printable_rollout_path_components(self) -> None:
+        unsafe_paths = (
+            Path("2026/07/16/rollout-bad\nspoof.jsonl"),
+            Path("2026/07\x1bspoof/rollout-safe.jsonl"),
+        )
+        for relative_path in unsafe_paths:
+            with self.subTest(relative_path=repr(relative_path)):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp = Path(temp_dir)
+                    codex_home = temp / ".codex"
+                    write_rollout(
+                        codex_home / "sessions" / relative_path,
+                        [
+                            record(
+                                "2026-07-16T01:00:00Z",
+                                "user_message",
+                                text="task",
+                            )
+                        ],
+                    )
+
+                    output = temp / "out"
+                    completed = self.run_corpus(codex_home, output)
+
+                    self.assertEqual(completed.returncode, 2)
+                    self.assertEqual(
+                        completed.stderr,
+                        "error: rollout candidate path contains "
+                        "non-printable characters\n",
+                    )
+                    self.assertFalse(output.exists())
 
     def test_inventory_rejects_directory_replacement_during_walk(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
