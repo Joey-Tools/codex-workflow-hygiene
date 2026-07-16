@@ -572,6 +572,63 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
             self.assertEqual(manifest["counts"]["replayed_prefix_records"], 3)
 
+    def test_missing_fallback_does_not_hide_sparse_window_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6b90-f29c-7b92-8479-ec64017caece"
+            unknown = (
+                codex_home
+                / "archived_sessions"
+                / f"rollout-unknown-{session_id}.jsonl"
+            )
+            sparse = (
+                codex_home
+                / "sessions"
+                / f"rollout-sparse-{session_id}.jsonl"
+            )
+            rows = [
+                record("2026-01-01T01:00:00Z", "session_meta", id=session_id),
+                record(
+                    "2026-01-01T01:01:00Z",
+                    "response_item",
+                    role="user",
+                    text="current task",
+                ),
+                record(
+                    "2026-07-16T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="current result",
+                ),
+            ]
+            unknown_rows = [dict(row) for row in rows]
+            for row in unknown_rows:
+                row.pop("timestamp")
+            sparse_rows = [dict(row) for row in unknown_rows]
+            sparse_rows[2]["timestamp"] = "2026-07-16T01:02:00Z"
+            write_rollout(unknown, unknown_rows)
+            write_rollout(sparse, sparse_rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["path"], str(sparse))
+            self.assertEqual(entries[0]["accepted_line_ranges"], [[3, 3]])
+            self.assertEqual(entries[0]["accepted_record_count"], 1)
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
+            self.assertEqual(manifest["counts"]["replayed_prefix_records"], 3)
+
     def test_replay_prefix_ignores_session_meta_environment_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

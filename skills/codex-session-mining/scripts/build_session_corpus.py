@@ -1124,7 +1124,8 @@ def rollout_sort_key(
     if rollout.records and not has_record_timestamp:
         fallback_timestamp = rollout.fallback_timestamp or missing_timestamp
         timestamp_source = tuple(
-            (False, fallback_timestamp) for _record in rollout.records
+            (rollout.fallback_timestamp is None, fallback_timestamp)
+            for _record in rollout.records
         )
     else:
         timestamp_source = tuple(
@@ -1133,7 +1134,10 @@ def rollout_sort_key(
         )
     if not timestamp_source:
         timestamp_source = (
-            (False, rollout.fallback_timestamp or missing_timestamp),
+            (
+                rollout.fallback_timestamp is None,
+                rollout.fallback_timestamp or missing_timestamp,
+            ),
         )
     source_rank = 0 if rollout.source == "active" else 1
     return (

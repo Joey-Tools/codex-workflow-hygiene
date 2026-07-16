@@ -54,6 +54,7 @@ superseded_by:
 - Final independent review aligned exact-session filename lookup with UUID lifecycle normalization by matching complete UUIDs case-insensitively while retaining exact case for opaque session IDs.
 - Final pinned review preserved per-record timestamp coverage when ordering replay sources, so a sparse copy cannot hide valid window records from a complete copy, and moved opaque exact-session matching out of shell glob semantics into a literal basename filter.
 - Final independent review made non-empty timestamp-less histories use filename/path fallback provenance during replay ordering, preventing an active restamp from winning only because of source priority.
+- A missing fallback remains unknown rather than masquerading as known maximum-time provenance, so a later sparse copy with a genuine in-window timestamp cannot be swallowed as replay.
 
 ## Next Steps
 
