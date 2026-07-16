@@ -166,7 +166,7 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("A rollout in either root may have an old dated path or filename", skill)
         self.assertIn("group candidates by lifecycle session ID", skill)
         self.assertIn("Do not deduplicate by basename alone", skill)
-        self.assertIn('for root in "$HOME/.codex/sessions" "$HOME/.codex/archived_sessions"', workflow)
+        self.assertIn('for root in "$CODEX_ROOT/sessions" "$CODEX_ROOT/archived_sessions"', workflow)
         self.assertIn("current-host corpus inventory", workflow)
         self.assertIn("set -euo pipefail", workflow)
         self.assertIn("scripts/build_session_corpus.py", skill)
@@ -187,6 +187,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("Inventory every rollout under both existing roots", workflow)
         self.assertIn("active and archived roots as one union corpus", workflow)
         self.assertIn("ordered stable record fingerprints", workflow)
+        self.assertIn("required candidate boundary", workflow)
+        self.assertIn("Do not merge different session identities", workflow)
         self.assertIn("retain that suffix, especially later genuine human follow-ups", workflow)
         self.assertIn("synthetic child, subagent, and external-review prompts", workflow)
         self.assertIn("first user-shaped record is an automation wrapper", workflow)
@@ -218,6 +220,8 @@ class SkillStructureTests(unittest.TestCase):
             encoding="utf-8"
         )
         recipe = extract_bash_block_after(workflow, "Exact session ID:")
+        self.assertIn('CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"', recipe)
+        self.assertIn('python3 - "$SESSION_ID" "$CODEX_ROOT"', recipe)
         self.assertIn("matches_file=$(mktemp)", recipe)
         self.assertIn("trap 'rm -f \"$matches_file\"' EXIT", recipe)
         self.assertNotIn("done | sort -u", recipe)
@@ -266,7 +270,7 @@ class SkillStructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             home = temp / "home"
-            codex_home = home / ".codex"
+            codex_home = temp / "custom-codex"
             session_id = "019ce6e8-a5e3-76e1-91a2-799837c70d1e"
             active = codex_home / f"sessions/2026/03/12/rollout-active-{session_id}.jsonl"
             archived = codex_home / f"archived_sessions/rollout-archived-{session_id}.jsonl"
@@ -277,6 +281,7 @@ class SkillStructureTests(unittest.TestCase):
 
             environment = os.environ.copy()
             environment["HOME"] = str(home)
+            environment["CODEX_HOME"] = str(codex_home)
             missing = subprocess.run(
                 ["bash", "-c", recipe],
                 cwd=temp,

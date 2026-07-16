@@ -10,14 +10,15 @@ Exact session ID:
 set -euo pipefail
 
 SESSION_ID='019ce6e8-a5e3-76e1-91a2-799837c70d1e'
-python3 - "$SESSION_ID" <<'PY'
+CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
+python3 - "$SESSION_ID" "$CODEX_ROOT" <<'PY'
 from pathlib import Path
 import json
 import sys
 
 session_id = sys.argv[1]
-for path in (Path('~/.codex/session_index.jsonl'), Path('~/.codex/history.jsonl')):
-    path = path.expanduser()
+codex_root = Path(sys.argv[2]).expanduser()
+for path in (codex_root / 'session_index.jsonl', codex_root / 'history.jsonl'):
     if not path.is_file():
         continue
     try:
@@ -42,7 +43,7 @@ for path in (Path('~/.codex/session_index.jsonl'), Path('~/.codex/history.jsonl'
 PY
 matches_file=$(mktemp)
 trap 'rm -f "$matches_file"' EXIT
-for root in "$HOME/.codex/sessions" "$HOME/.codex/archived_sessions"; do
+for root in "$CODEX_ROOT/sessions" "$CODEX_ROOT/archived_sessions"; do
     if [ -d "$root" ]; then
         find "$root" -type f -name "rollout-*${SESSION_ID}*.jsonl" >> "$matches_file"
     fi
@@ -112,6 +113,7 @@ The helper reports `active candidate count`, `archived candidate count`, `union 
 
 - Treat the existing active and archived roots as one union corpus. Record per-root candidate and accepted counts so a missing root or unexpected zero cannot disappear into a combined total.
 - Do not deduplicate by basename or path precedence alone. Prefer the lifecycle session ID from `session_meta`; when it is unavailable, use the filename session ID only as a candidate key and confirm equivalence with ordered stable record fingerprints.
+- Treat shared lifecycle or filename identity as a required candidate boundary before fingerprint-prefix collapse. Do not merge different session identities from matching content alone: two intentional runs can have identical wrappers and user prompts. Investigate suspected cross-identity fork replay separately with bounded source-history evidence.
 - Collapse a second file only when it is byte-identical or its relevant records are an already-accounted-for replay prefix. If either copy has a distinct suffix, retain that suffix, especially later genuine human follow-ups.
 - Apply replay detection after the cross-root grouping. A copied and restamped prefix does not become new activity merely because it moved into `archived_sessions`, while a later direct human turn remains new evidence.
 - Filter injected `AGENTS.md`, skill, environment, and automation wrapper records when reconstructing user intent. Exclude synthetic child, subagent, and external-review prompts from main-task counts, but do not drop a main rollout solely because its first user-shaped record is an automation wrapper; inspect and retain its later genuine human suffix.

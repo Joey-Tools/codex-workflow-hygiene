@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -158,6 +159,58 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertRegex(completed.stdout, r"union accepted count: 2")
             self.assertIn("accepted_records=1:line_ranges=[[3, 3]]", completed.stdout)
 
+    def test_short_archived_prefix_owns_replay_before_long_active_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6b7e-a3dd-7193-acaf-18ef0a912d1b"
+            archived = (
+                codex_home / "archived_sessions" / f"rollout-old-{session_id}.jsonl"
+            )
+            active = (
+                codex_home
+                / "sessions/2026/07/16"
+                / f"rollout-continued-{session_id}.jsonl"
+            )
+            archived_rows = [
+                record("2026-01-01T01:00:00Z", "session_meta", id=session_id),
+                record(
+                    "2026-01-01T01:01:00Z",
+                    "response_item",
+                    role="user",
+                    text="old task",
+                ),
+            ]
+            active_rows = [
+                archived_rows[0],
+                record(
+                    "2026-07-16T01:01:00Z",
+                    "response_item",
+                    role="user",
+                    text="old task",
+                ),
+                record(
+                    "2026-07-16T02:00:00Z",
+                    "response_item",
+                    role="user",
+                    text="genuine suffix",
+                ),
+            ]
+            write_rollout(archived, archived_rows)
+            write_rollout(active, active_rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            entries = [
+                json.loads(line)
+                for line in (output / "corpus.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["path"], str(active))
+            self.assertEqual(entries[0]["accepted_line_ranges"], [[3, 3]])
+            self.assertEqual(entries[0]["replayed_prefix_records"], 2)
+
     def test_filename_id_is_only_a_candidate_key_without_matching_fingerprints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -292,6 +345,28 @@ class SessionCorpusTests(unittest.TestCase):
             )
             self.assertEqual(invalid_window.returncode, 2)
             self.assertIn("window start must be earlier", invalid_window.stderr)
+
+    def test_inventory_propagates_walk_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "sessions"
+            root.mkdir()
+
+            def failing_walk(
+                *_args: object,
+                onerror: object,
+                **_kwargs: object,
+            ) -> list[object]:
+                if not callable(onerror):
+                    raise AssertionError("os.walk must receive an error callback")
+                onerror(PermissionError("blocked subtree"))
+                return []
+
+            with mock.patch.object(CORPUS.os, "walk", side_effect=failing_walk):
+                with self.assertRaisesRegex(
+                    CORPUS.CorpusError,
+                    "unable to inventory rollout root.*blocked subtree",
+                ):
+                    CORPUS.inventory_root(root)
 
     def test_second_pass_accepts_append_only_growth_but_rejects_prefix_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

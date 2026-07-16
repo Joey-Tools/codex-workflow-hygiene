@@ -8,8 +8,10 @@ from dataclasses import dataclass
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import sys
 from typing import Any, Iterable
 
@@ -203,18 +205,39 @@ def inventory_root(root: Path) -> list[Path]:
         raise CorpusError(f"unsafe rollout root: {root}")
     resolved_root = root.resolve(strict=True)
     paths: list[Path] = []
+
+    def traversal_error(error: OSError) -> None:
+        raise CorpusError(f"unable to inventory rollout root {root}: {error}") from error
+
     try:
-        candidates = root.rglob("rollout-*.jsonl")
-        for path in candidates:
-            if path.name.startswith("rollout-summary"):
-                continue
-            if path.is_symlink() or not path.is_file():
-                raise CorpusError(f"unsafe rollout candidate: {path}")
-            try:
-                path.resolve(strict=True).relative_to(resolved_root)
-            except (OSError, ValueError) as error:
-                raise CorpusError(f"rollout candidate escapes root: {path}") from error
-            paths.append(path)
+        for current, directories, filenames in os.walk(
+            root,
+            topdown=True,
+            onerror=traversal_error,
+            followlinks=False,
+        ):
+            directories.sort()
+            filenames.sort()
+            current_path = Path(current)
+            for directory in directories:
+                path = current_path / directory
+                mode = path.lstat().st_mode
+                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                    raise CorpusError(f"unsafe rollout directory: {path}")
+            for filename in filenames:
+                if not filename.startswith("rollout-") or not filename.endswith(".jsonl"):
+                    continue
+                if filename.startswith("rollout-summary"):
+                    continue
+                path = current_path / filename
+                mode = path.lstat().st_mode
+                if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+                    raise CorpusError(f"unsafe rollout candidate: {path}")
+                try:
+                    path.resolve(strict=True).relative_to(resolved_root)
+                except (OSError, ValueError) as error:
+                    raise CorpusError(f"rollout candidate escapes root: {path}") from error
+                paths.append(path)
     except OSError as error:
         raise CorpusError(f"unable to inventory rollout root {root}: {error}") from error
     return sorted(paths)
@@ -415,10 +438,10 @@ def line_ranges(lines: list[int]) -> list[list[int]]:
     return ranges
 
 
-def rollout_sort_key(rollout: Rollout) -> tuple[dt.datetime, int, str]:
+def rollout_sort_key(rollout: Rollout) -> tuple[int, dt.datetime, int, str]:
     first = rollout.first_timestamp or dt.datetime.max.replace(tzinfo=UTC)
     source_rank = 0 if rollout.source == "active" else 1
-    return (first, source_rank, rollout.path.as_posix())
+    return (len(rollout.records), first, source_rank, rollout.path.as_posix())
 
 
 def union_entries(

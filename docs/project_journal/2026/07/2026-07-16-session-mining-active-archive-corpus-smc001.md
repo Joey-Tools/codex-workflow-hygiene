@@ -30,6 +30,7 @@ superseded_by:
 - Follow-up review made the exact-session cross-root lookup propagate `find` failures and retain their stderr evidence.
 - Exact-session index hints now tolerate missing, unreadable, and malformed inputs without blocking the authoritative rollout-root search or echoing raw records.
 - Final PR review found that the original inventory recipe described structured filtering without implementing it. The executable helper and fixture-backed tests now pin old dated paths with new records, flat and nested archives, lifecycle grouping, restamped prefix removal, distinct suffix retention, filename-ID confirmation, and append-only growth.
+- Final frozen-range review also made traversal errors fail closed, made shorter source histories own shared prefixes before longer continuations, and aligned exact-session lookup with `CODEX_HOME`. Content-only matches across different session identities remain deliberately separate because repeated wrappers and prompts are not sufficient proof of replay.
 
 ## Next Steps
 
