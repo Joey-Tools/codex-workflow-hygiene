@@ -1,0 +1,90 @@
+# Session Retrospective v2 Engine Architecture
+
+## Coordinator model
+
+The v2 engine is a deterministic coordinator. `RetrospectiveOrchestrator` owns
+the authenticated checkpoint store, identity, run directory, clock, and shard
+limits. Its capability classes are stateless and have no constructors. They
+operate on that single coordinator context and do not import one another:
+
+| Module | Responsibility |
+| --- | --- |
+| `orchestrator.py` | Stable facade, coordinator context, and CLI-compatible exports |
+| `orchestrator_support.py` | Source-frame consumption, shared contracts, and runtime readiness |
+| `orchestrator_state.py` | Authenticated checkpoint identity and state access primitives |
+| `orchestrator_projection.py` | Read-only status, metrics, references, and next actions |
+| `orchestrator_jobs.py` | Agent attempt, claim, sink, and envelope lifecycle |
+| `orchestrator_reduction.py` | Catalog materialization and episode/topic/synthesis hierarchies |
+| `orchestrator_history.py` | Result validation and retained history projection |
+| `orchestrator_source.py` | Source transport admission and leased agent result handling |
+| `orchestrator_lifecycle.py` | Run creation, publication claims, retention, and raw cleanup |
+| `orchestrator_scheduler.py` | Stage transitions, task creation, and bounded envelope scheduling |
+
+Publication uses an explicit side-effect boundary:
+
+| Module | Responsibility |
+| --- | --- |
+| `finalize.py` | Stable publication facade |
+| `publication_transaction.py` | Durable publication state machine and recovery |
+| `publication_git.py` | Constrained local Git provider and compare-and-swap effects |
+| `publication_support.py` | Immutable contracts, anchored I/O, and pure validation |
+
+The transport program commitment includes every runtime module above. Adding a
+module without adding it to the closed allowlist fails source transport.
+
+## Architecture inventory
+
+The inventory uses physical lines, Python AST function boundaries (including
+nested functions), and a branch proxy that counts `if`, loops, `try`, `match`,
+boolean branches, conditional expressions, and comprehensions. Exact duplicate
+groups hash normalized AST function bodies of at least eight lines.
+
+| Metric | Before boundary refactor | After boundary refactor |
+| --- | ---: | ---: |
+| Engine Python modules | 20 | 32 |
+| Engine Python lines | 44,954 | 45,469 |
+| Nonblank, non-comment lines | 42,234 | 42,808 |
+| Functions | 1,206 | 1,191 |
+| Functions over 100 lines | 71 | 75 |
+| Functions over 200 lines | 18 | 18 |
+| Branch proxy total | 6,667 | 6,776 |
+| Exact duplicate function-body groups | 0 | 0 |
+| `orchestrator.py` lines | 11,819 | 654 |
+| Largest orchestrator capability | 11,819 | 3,101 |
+| `finalize.py` lines | 7,271 | 87 |
+| Largest publication module | 7,271 | 3,186 |
+
+The package inventory includes transport and excludes the 1,892-line public CLI
+entrypoint. The current largest modules are:
+
+| Module | Lines | Functions | Branch proxy | Largest function |
+| --- | ---: | ---: | ---: | ---: |
+| `transport.py` | 4,839 | 119 | 713 | 542 |
+| `reporting.py` | 4,067 | 77 | 704 | 399 |
+| `publication_support.py` | 3,186 | 113 | 529 | 236 |
+| `orchestrator_lifecycle.py` | 3,101 | 48 | 465 | 474 |
+| `authority.py` | 2,985 | 61 | 424 | 200 |
+| `result_validation.py` | 2,978 | 62 | 451 | 231 |
+| `publication_git.py` | 2,296 | 78 | 282 | 112 |
+| `orchestrator_reduction.py` | 2,234 | 40 | 393 | 184 |
+| `orchestrator_source.py` | 1,995 | 30 | 292 | 389 |
+| `publication_transaction.py` | 1,907 | 58 | 256 | 172 |
+| `episode_review.py` | 1,653 | 49 | 291 | 158 |
+| `export.py` | 1,652 | 54 | 253 | 128 |
+
+The net lines add explicit bounded task, state, relay, authority, conservation,
+and recovery contracts rather than duplicated state machines. The refactor
+changes ownership boundaries without deleting fail-closed validation. The audit
+finds no exact generated function-body duplication of eight or more lines.
+Shared result, hierarchy, row-shape, and privacy validators remain centralized
+instead of being mechanically repeated at call sites. Only `__init__.py`,
+`orchestrator.py`, and `finalize.py` publish explicit wildcard interfaces;
+internal modules are explicit-import-only.
+
+`tests/test_retrospective_v2_module_boundaries.py` enforces total and per-module
+line limits, a 600-line function ceiling, aggregate branch and long-function
+budgets, zero exact duplicate function bodies of eight or more lines, facade
+sizes, stateless capability ownership, dependency direction, publication facade
+identity, and transport closure. Import enforcement walks the complete AST and
+includes constant-target `importlib.import_module` and `__import__` calls, so
+function-, class-, `try`-, and dynamic-import escapes remain covered.
