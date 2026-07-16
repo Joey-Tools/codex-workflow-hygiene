@@ -189,7 +189,14 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("ordered stable record fingerprints", workflow)
         self.assertIn("required candidate boundary", workflow)
         self.assertIn("Do not merge different session identities", workflow)
-        self.assertIn("retain that suffix, especially later genuine human follow-ups", workflow)
+        self.assertIn(
+            "revalidates every traversed directory plus each entry identity", workflow
+        )
+        self.assertIn("last matching assistant/tool replay-evidence record", workflow)
+        self.assertIn(
+            "preserve every matching human prompt after that boundary", workflow
+        )
+        self.assertIn("`session_meta` from explicit lifecycle IDs alone", workflow)
         self.assertIn("synthetic child, subagent, and external-review prompts", workflow)
         self.assertIn("first user-shaped record is an automation wrapper", workflow)
         self.assertIn("active, archived, union, and accepted-after-deduplication counts", workflow)
