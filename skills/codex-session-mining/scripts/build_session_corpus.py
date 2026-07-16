@@ -21,8 +21,15 @@ SESSION_ID_RE = re.compile(
     r"(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
-ROLLOUT_DATE_RE = re.compile(r"rollout-(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})")
+ROLLOUT_DATE_RE = re.compile(
+    r"^rollout-(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})(?:-|\.jsonl$)"
+)
+ROLLOUT_TIMESTAMP_RE = re.compile(
+    r"^rollout-(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
+    r"T(?P<hour>\d{2})-(?P<minute>\d{2})-(?P<second>\d{2})(?:-|\.jsonl$)"
+)
 VOLATILE_KEYS = frozenset({"timestamp", "ts", "created_at", "updated_at"})
+SESSION_META_CONTEXT_KEYS = frozenset({"cli_version", "cwd", "model", "model_id"})
 REPLAY_EVIDENCE_TYPES = frozenset(
     {
         "agent_message",
@@ -37,6 +44,19 @@ REPLAY_EVIDENCE_TYPES = frozenset(
         "web_search_call",
     }
 )
+GENERATED_ID_RECORD_TYPES = REPLAY_EVIDENCE_TYPES | frozenset(
+    {"event_msg", "message", "response_item", "task_started", "user_message"}
+)
+CALL_DEFINITION_TYPES = frozenset(
+    {
+        "computer_call",
+        "computer_tool_call",
+        "custom_tool_call",
+        "function_call",
+        "web_search_call",
+    }
+)
+CALL_REFERENCE_TYPES = frozenset({"custom_tool_call_output", "function_call_output"})
 
 
 class CorpusError(RuntimeError):
@@ -100,6 +120,26 @@ class UnionFind:
             self.parents[right_root] = left_root
 
 
+class GeneratedIdCanonicalizer:
+    def __init__(self) -> None:
+        self.values: dict[str, dict[str, int]] = {}
+
+    def define(self, namespace: str, value: object) -> object:
+        if not isinstance(value, str) or not value:
+            return value
+        mapping = self.values.setdefault(namespace, {})
+        ordinal = mapping.setdefault(value, len(mapping) + 1)
+        return {"$generated_id": namespace, "ordinal": ordinal}
+
+    def reference(self, namespace: str, value: object) -> object:
+        if not isinstance(value, str) or not value:
+            return value
+        ordinal = self.values.get(namespace, {}).get(value)
+        if ordinal is None:
+            return value
+        return {"$generated_id": namespace, "ordinal": ordinal}
+
+
 def parse_instant(value: str) -> dt.datetime:
     text = value.strip()
     if text.endswith("Z"):
@@ -135,16 +175,60 @@ def normalized_fingerprint_value(value: object) -> object:
     return value
 
 
-def record_fingerprint(row: dict[str, Any]) -> str:
-    stable = normalized_fingerprint_value(row)
-    if not isinstance(stable, dict):
+def normalize_generated_ids(
+    container: dict[str, object],
+    record_type: object,
+    canonicalizer: GeneratedIdCanonicalizer,
+) -> None:
+    if not isinstance(record_type, str) or record_type not in GENERATED_ID_RECORD_TYPES:
+        return
+    if "id" in container:
+        container["id"] = canonicalizer.define("item", container["id"])
+    if "item_id" in container:
+        container["item_id"] = canonicalizer.reference("item", container["item_id"])
+    if "response_id" in container:
+        container["response_id"] = canonicalizer.define(
+            "response", container["response_id"]
+        )
+    if "call_id" in container:
+        if record_type in CALL_DEFINITION_TYPES:
+            container["call_id"] = canonicalizer.define("call", container["call_id"])
+        elif record_type in CALL_REFERENCE_TYPES:
+            container["call_id"] = canonicalizer.reference("call", container["call_id"])
+    if "turn_id" in container:
+        container["turn_id"] = canonicalizer.define("turn", container["turn_id"])
+    metadata = container.get("internal_chat_message_metadata_passthrough")
+    if isinstance(metadata, dict) and "turn_id" in metadata:
+        metadata["turn_id"] = canonicalizer.define("turn", metadata["turn_id"])
+
+
+def record_fingerprint(
+    row: dict[str, Any],
+    canonicalizer: GeneratedIdCanonicalizer | None = None,
+) -> str:
+    normalized = normalized_fingerprint_value(row)
+    if not isinstance(normalized, dict):
         raise TypeError("normalized rollout record must remain an object")
+    stable: dict[str, object] = normalized
+    stable_payload = stable.get("payload")
     for key in VOLATILE_KEYS:
         stable.pop(key, None)
-    payload = stable.get("payload")
-    if isinstance(payload, dict):
-        for key in VOLATILE_KEYS:
-            payload.pop(key, None)
+        if isinstance(stable_payload, dict):
+            stable_payload.pop(key, None)
+    payload_type = (
+        stable_payload.get("type") if isinstance(stable_payload, dict) else None
+    )
+    record_type = payload_type or stable.get("type")
+    if record_type == "session_meta":
+        for key in SESSION_META_CONTEXT_KEYS:
+            stable.pop(key, None)
+            if isinstance(stable_payload, dict):
+                stable_payload.pop(key, None)
+    else:
+        state = canonicalizer or GeneratedIdCanonicalizer()
+        normalize_generated_ids(stable, record_type, state)
+        if isinstance(stable_payload, dict):
+            normalize_generated_ids(stable_payload, record_type, state)
     encoded = json.dumps(
         stable,
         ensure_ascii=False,
@@ -208,6 +292,31 @@ def fallback_path_timestamp(path: Path, root: Path) -> dt.datetime | None:
         relative_parts = path.relative_to(root).parts
     except ValueError:
         return None
+    timestamp_match = ROLLOUT_TIMESTAMP_RE.search(path.name)
+    if timestamp_match is not None:
+        try:
+            return dt.datetime(
+                int(timestamp_match.group("year")),
+                int(timestamp_match.group("month")),
+                int(timestamp_match.group("day")),
+                int(timestamp_match.group("hour")),
+                int(timestamp_match.group("minute")),
+                int(timestamp_match.group("second")),
+                tzinfo=UTC,
+            )
+        except ValueError:
+            pass
+    date_match = ROLLOUT_DATE_RE.search(path.name)
+    if date_match is not None:
+        try:
+            return dt.datetime(
+                int(date_match.group("year")),
+                int(date_match.group("month")),
+                int(date_match.group("day")),
+                tzinfo=UTC,
+            )
+        except ValueError:
+            pass
     for index in range(max(0, len(relative_parts) - 3)):
         year, month, day = relative_parts[index : index + 3]
         if not (year.isdigit() and month.isdigit() and day.isdigit()):
@@ -216,18 +325,7 @@ def fallback_path_timestamp(path: Path, root: Path) -> dt.datetime | None:
             return dt.datetime(int(year), int(month), int(day), tzinfo=UTC)
         except ValueError:
             continue
-    match = ROLLOUT_DATE_RE.search(path.name)
-    if match is None:
-        return None
-    try:
-        return dt.datetime(
-            int(match.group("year")),
-            int(match.group("month")),
-            int(match.group("day")),
-            tzinfo=UTC,
-        )
-    except ValueError:
-        return None
+    return None
 
 
 def inventory_root(root: Path) -> list[Path]:
@@ -355,6 +453,7 @@ def scan_rollout_metadata(
 def load_rollout_records(metadata: RolloutMetadata) -> Rollout:
     records: list[Record] = []
     digest = hashlib.sha256()
+    fingerprint_ids = GeneratedIdCanonicalizer()
     try:
         with metadata.path.open("rb") as handle:
             remaining = metadata.source_bytes
@@ -383,7 +482,7 @@ def load_rollout_records(metadata: RolloutMetadata) -> Rollout:
                 records.append(
                     Record(
                         line_no=line_no,
-                        fingerprint=record_fingerprint(row),
+                        fingerprint=record_fingerprint(row, fingerprint_ids),
                         timestamp=record_timestamp(row),
                         replay_evidence=record_replay_evidence(row),
                     )
