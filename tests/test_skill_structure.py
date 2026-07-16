@@ -21,6 +21,13 @@ def extract_python_block_after(
     return workflow[code_start : workflow.index("\nPY\n```", code_start)]
 
 
+def extract_bash_block_after(workflow: str, heading: str) -> str:
+    section_start = workflow.index(heading)
+    marker = "```bash\n"
+    code_start = workflow.index(marker, section_start) + len(marker)
+    return workflow[code_start : workflow.index("\n```", code_start)]
+
+
 class SkillStructureTests(unittest.TestCase):
     def test_skills_have_frontmatter(self) -> None:
         root = Path(__file__).resolve().parents[1] / "skills"
@@ -178,6 +185,260 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("stable fingerprint", workflow)
         self.assertIn("Do not deduplicate a real repeated short prompt", workflow)
         self.assertIn("replayed and genuinely new record counts separately", workflow)
+
+    def test_session_mining_requires_active_and_archived_union_corpus(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        corpus_helper = root / "skills/codex-session-mining/scripts/build_session_corpus.py"
+
+        self.assertIn("inventory both `~/.codex/sessions/` and `~/.codex/archived_sessions/`", skill)
+        self.assertIn("build one union corpus", skill)
+        self.assertIn("flat or date-nested archive layouts", skill)
+        self.assertIn("inventory every rollout under both existing active and archived roots first", skill)
+        self.assertIn("A rollout in either root may have an old dated path or filename", skill)
+        self.assertIn("group candidates by lifecycle session ID", skill)
+        self.assertIn("Do not deduplicate by basename alone", skill)
+        self.assertIn('for root in "$CODEX_ROOT/sessions" "$CODEX_ROOT/archived_sessions"', workflow)
+        self.assertIn("current-host corpus inventory", workflow)
+        self.assertIn("set -euo pipefail", workflow)
+        self.assertIn("scripts/build_session_corpus.py", skill)
+        self.assertTrue(corpus_helper.is_file())
+        self.assertTrue(os.access(corpus_helper, os.X_OK))
+        self.assertIn('python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py"', workflow)
+        self.assertIn('--codex-home "$CODEX_ROOT"', workflow)
+        self.assertIn('--start "$LOWER_BOUND"', workflow)
+        self.assertIn('--end "$UPPER_BOUND"', workflow)
+        self.assertNotIn('find "$HOME/.codex/sessions/2026/', workflow)
+        self.assertNotIn("2>/dev/null", workflow)
+        self.assertIn("active candidate count", workflow)
+        self.assertIn("archived candidate count", workflow)
+        self.assertIn("union candidate count", workflow)
+        self.assertIn("active accepted count", workflow)
+        self.assertIn("archived accepted count", workflow)
+        self.assertIn("union accepted count", workflow)
+        self.assertIn("Inventory every rollout under both existing roots", workflow)
+        self.assertIn("active and archived roots as one union corpus", workflow)
+        self.assertIn("ordered stable record fingerprints", workflow)
+        self.assertIn("required candidate boundary", workflow)
+        self.assertIn("Do not merge different session identities", workflow)
+        self.assertIn(
+            "revalidates every traversed directory plus each entry identity", workflow
+        )
+        self.assertIn("last matching assistant/tool replay-evidence record", workflow)
+        self.assertIn(
+            "preserve every matching human prompt after that boundary", workflow
+        )
+        self.assertIn("`session_meta` from explicit lifecycle IDs alone", workflow)
+        self.assertIn("synthetic child, subagent, and external-review prompts", workflow)
+        self.assertIn("first user-shaped record is an automation wrapper", workflow)
+        self.assertIn("active, archived, union, and accepted-after-deduplication counts", workflow)
+        recursive_archive_glob = "archived_sessions/**/rollout-*.jsonl"
+        self.assertIn(recursive_archive_glob, skill)
+        self.assertIn(recursive_archive_glob, workflow)
+        self.assertNotIn("archived_sessions/*.jsonl", skill)
+        self.assertNotIn("archived_sessions/*.jsonl", workflow)
+
+    def test_session_mining_corpus_recipe_uses_structured_helper(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        recipe = extract_bash_block_after(
+            workflow,
+            "Bounded date range and current-host corpus inventory:",
+        )
+        self.assertIn("LOWER_BOUND=2026-03-12T00:00:00Z", recipe)
+        self.assertIn("UPPER_BOUND=2026-03-14T00:00:00Z", recipe)
+        self.assertIn('CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"', recipe)
+        self.assertIn('python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py"', recipe)
+        self.assertIn('--sample-limit 20', recipe)
+
+    def test_session_mining_exact_session_recipe_propagates_find_failure(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        recipe = extract_bash_block_after(workflow, "Exact session ID:")
+        self.assertIn('CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"', recipe)
+        self.assertIn('python3 - "$SESSION_ID" "$CODEX_ROOT"', recipe)
+        self.assertIn("matches_file=$(mktemp)", recipe)
+        self.assertIn("trap 'rm -f \"$matches_file\"' EXIT", recipe)
+        self.assertIn("-print0", recipe)
+        self.assertIn("split(b'\\0')", recipe)
+        self.assertIn("character.isprintable()", recipe)
+        self.assertNotIn('sort -u "$matches_file"', recipe)
+        self.assertNotIn("done | sort -u", recipe)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            home = temp / "home"
+            codex_home = home / ".codex"
+            (codex_home / "sessions").mkdir(parents=True)
+            for index_name in ("session_index.jsonl", "history.jsonl"):
+                (codex_home / index_name).write_text("", encoding="utf-8")
+
+            fake_bin = temp / "fake-bin"
+            fake_bin.mkdir()
+            fake_find = fake_bin / "find"
+            fake_find.write_text(
+                "#!/bin/sh\nprintf 'find-failed\\n' >&2\nexit 23\n",
+                encoding="utf-8",
+            )
+            fake_find.chmod(0o755)
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment.pop("CODEX_HOME", None)
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            completed = subprocess.run(
+                ["bash", "-c", recipe],
+                cwd=temp,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 23)
+            self.assertIn("find-failed", completed.stderr)
+
+    def test_session_mining_exact_session_recipe_tolerates_missing_and_malformed_indexes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        recipe = extract_bash_block_after(workflow, "Exact session ID:")
+        self.assertIn("if not path.is_file():", recipe)
+        self.assertIn("except OSError:", recipe)
+        self.assertIn("except json.JSONDecodeError:", recipe)
+        self.assertIn("warning: unable to read optional index", recipe)
+        self.assertNotIn("ensure_ascii=False", workflow)
+        self.assertGreaterEqual(workflow.count("ensure_ascii=True"), 3)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            home = temp / "home"
+            codex_home = temp / "custom-codex"
+            session_id = "019ce6e8-a5e3-76e1-91a2-799837c70d1e"
+            active = codex_home / f"sessions/2026/03/12/rollout-active-{session_id}.jsonl"
+            uppercase = codex_home / (
+                f"sessions/2026/03/13/rollout-uppercase-{session_id.upper()}.jsonl"
+            )
+            archived = codex_home / f"archived_sessions/rollout-archived-{session_id}.jsonl"
+            expected = {active, uppercase, archived}
+            for path in expected:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["CODEX_HOME"] = str(codex_home)
+            missing = subprocess.run(
+                ["bash", "-c", recipe],
+                cwd=temp,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(missing.returncode, 0, missing.stderr)
+            self.assertEqual({Path(line) for line in missing.stdout.splitlines()}, expected)
+
+            session_index = codex_home / "session_index.jsonl"
+            session_index.write_text(
+                f"not-json-{session_id}\n"
+                + json.dumps(
+                    {
+                        "session_id": session_id,
+                        "text": "matching \ud800 index row",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (codex_home / "history.jsonl").write_text(
+                f"also-not-json-{session_id}\n",
+                encoding="utf-8",
+            )
+            malformed = subprocess.run(
+                ["bash", "-c", recipe],
+                cwd=temp,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(malformed.returncode, 0, malformed.stderr)
+            self.assertIn(str(active), malformed.stdout)
+            self.assertIn(str(archived), malformed.stdout)
+            self.assertIn(f"{session_index}:2:", malformed.stdout)
+            self.assertIn("\\ud800", malformed.stdout)
+            self.assertNotIn("not-json", malformed.stdout)
+
+            opaque_id = "Opaque*?[ID]"
+            opaque = codex_home / f"archived_sessions/rollout-opaque-{opaque_id}.jsonl"
+            wrong_case = codex_home / (
+                f"archived_sessions/rollout-opaque-{opaque_id.lower()}.jsonl"
+            )
+            glob_decoy = codex_home / "archived_sessions/rollout-opaque-OpaqueXYZI.jsonl"
+            opaque.write_text("{}\n", encoding="utf-8")
+            wrong_case.write_text("{}\n", encoding="utf-8")
+            glob_decoy.write_text("{}\n", encoding="utf-8")
+            opaque_recipe = recipe.replace(
+                f"SESSION_ID='{session_id}'", f"SESSION_ID='{opaque_id}'", 1
+            )
+            opaque_result = subprocess.run(
+                ["bash", "-c", opaque_recipe],
+                cwd=temp,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(opaque_result.returncode, 0, opaque_result.stderr)
+            self.assertEqual(
+                {Path(line) for line in opaque_result.stdout.splitlines()}, {opaque}
+            )
+
+    def test_session_mining_exact_session_recipe_rejects_non_printable_paths(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        recipe = extract_bash_block_after(workflow, "Exact session ID:")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            home = temp / "home"
+            codex_home = home / ".codex"
+            session_id = "019ce6e8-a5e3-76e1-91a2-799837c70d1e"
+            archived = codex_home / "archived_sessions"
+            archived.mkdir(parents=True)
+            safe = archived / f"rollout-safe-{session_id}.jsonl"
+            unsafe = archived / f"rollout-unsafe\nforged-{session_id}.jsonl"
+            safe.write_text("{}\n", encoding="utf-8")
+            unsafe.write_text("{}\n", encoding="utf-8")
+
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment.pop("CODEX_HOME", None)
+            completed = subprocess.run(
+                ["bash", "-c", recipe],
+                cwd=temp,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(completed.stdout, "")
+            self.assertEqual(
+                completed.stderr,
+                "error: rollout path contains non-printable characters\n",
+            )
+            self.assertNotIn(str(safe), completed.stdout)
+            self.assertNotIn("forged", completed.stdout)
 
     def test_session_retrospective_bounds_operator_output(self) -> None:
         root = Path(__file__).resolve().parents[1]
