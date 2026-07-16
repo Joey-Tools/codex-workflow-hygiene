@@ -22,7 +22,7 @@ superseded_by:
 - Date-window audits use record and lifecycle timestamps for archived candidates instead of treating filename or mtime as authoritative.
 - Cross-root deduplication groups lifecycle session identities and compares ordered stable record fingerprints while retaining later genuine human suffixes.
 - The bundled `build_session_corpus.py` helper performs the full-root inventory, inclusive/exclusive timestamp filtering, two-pass fingerprint loading, replay-prefix removal, and per-root/union artifact generation instead of leaving those semantics to an unspecified scanner.
-- The helper snapshots each first-pass byte prefix so append-only active rollout growth cannot invalidate a long scan; truncation, replacement, malformed JSON, unsafe paths, and prefix rewrites still fail closed.
+- The helper snapshots each first-pass complete-record prefix so an unterminated active-writer fragment is deferred without invalidating a long scan; truncation, replacement, committed malformed JSON, malformed archived tails, unsafe paths, and prefix rewrites still fail closed.
 - Automation wrappers, replay prefixes, and synthetic child or review prompts are excluded narrowly without dropping later human follow-ups in the same main rollout.
 - Contract tests pin the active/archive union, deduplication, and intent-reconstruction boundaries.
 - The inherited credential-shaped regression fixture is assembled from segments at runtime so the exact legacy preflight can enforce a count-monotonic `1 -> 0` cleanup without changing test semantics.
@@ -46,6 +46,8 @@ superseded_by:
 - `turn_context` runtime drift no longer defeats replay matching, and `time` is now treated as both a record timestamp and a volatile fingerprint field.
 - Without a filename UUID, a single first lifecycle identity owns the rollout while later aliases remain provenance; conflicting aliases in the first lifecycle record still fail the owner boundary.
 - Cross-root duplicate metrics now require an actual collapsed copy or removed replay prefix between candidates from different roots; same-root overlap in a mixed lifecycle group no longer inflates the count.
+- Final exact-range review made exact-session filename discovery NUL-delimited and rejects non-printable paths before printing any rollout match.
+- Final independent review made the first pass stop at the last complete active JSONL record while an append is in progress; the old metadata continues to verify only that prefix, and a fresh scan sees the completed record.
 
 ## Next Steps
 
@@ -60,3 +62,5 @@ superseded_by:
 - `skills/codex-session-mining/scripts/build_session_corpus.py`
 - `tests/test_session_corpus.py`
 - `tests/test_skill_structure.py`
+- Full repository validation: 913 tests passed with 1 skipped; the session-corpus and skill-structure slice passed 62 tests.
+- Real corpus smoke for `2026-07-14T19:25:24Z..2026-07-16T01:11:28Z`: 5,193 active plus 6,305 archived candidates, 891 accepted rollouts, and zero collapsed copies or replay prefixes.

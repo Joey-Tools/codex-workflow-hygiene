@@ -45,13 +45,27 @@ matches_file=$(mktemp)
 trap 'rm -f "$matches_file"' EXIT
 for root in "$CODEX_ROOT/sessions" "$CODEX_ROOT/archived_sessions"; do
     if [ -d "$root" ]; then
-        find "$root" -type f -name "rollout-*${SESSION_ID}*.jsonl" >> "$matches_file"
+        find "$root" -type f -name "rollout-*${SESSION_ID}*.jsonl" -print0 >> "$matches_file"
     fi
 done
-sort -u "$matches_file"
+python3 - "$matches_file" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+raw_paths = Path(sys.argv[1]).read_bytes().split(b'\0')
+paths = [os.fsdecode(raw_path) for raw_path in raw_paths if raw_path]
+if any(any(not character.isprintable() for character in path) for path in paths):
+    print('error: rollout path contains non-printable characters', file=sys.stderr)
+    raise SystemExit(2)
+for path in sorted(set(paths)):
+    print(path)
+PY
 ```
 
 Search both existing roots because an exact session can move from the active date tree to either a flat or date-nested archive layout. Do not append either rollout root to a raw `rg`. A raw rollout match prints the whole JSONL record, and a nested `function_call_output` match can expand into hundreds of thousands of tokens before the useful path is visible.
+
+The recipe keeps `find` output NUL-delimited until every candidate path is validated and rejects non-printable path components before printing any rollout match.
 
 Treat `session_index.jsonl` and `history.jsonl` as optional hints: a missing, unreadable, or malformed index record must not prevent the rollout-root search, and warnings must never include the raw line.
 
@@ -107,7 +121,7 @@ python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py" \
 
 Inventory every rollout under both existing roots before applying the requested lower and upper bounds to record or lifecycle timestamps; the helper above enforces that order. This full-root inventory is required for both active and archived rollouts: a rollout created before the window can resume with a genuine human suffix inside it. Do not exclude a file because its dated path or filename predates the window. When a rollout has no record timestamps, the helper prefers the full second-level timestamp or date encoded in its rollout filename, then falls back to a dated directory; archive moves, copies, or metadata updates make mtime unsuitable as the filter.
 
-The helper reports `active candidate count`, `archived candidate count`, `union candidate count`, matching parsed counts, `active accepted count`, `archived accepted count`, `union accepted count`, cross-root duplicate groups among accepted candidate groups, collapsed duplicate rollouts, and replayed-prefix records. It requires a fresh nonexistent output directory, lexically normalizes dot segments before traversal, rejects untrusted symlink ancestors, and creates the complete candidate and accepted path lists, `manifest.json`, `corpus-paths.txt`, and `corpus.jsonl` there without following or replacing existing artifact paths. Inventory snapshots and revalidates every traversed directory plus each entry identity and file type; both read passes reopen candidate files from the root directory descriptor with no-follow components and reject replacement or truncation. Non-printable rollout path components fail closed before line-delimited path artifacts or terminal samples are emitted. The first pass pins the length observed when it opens each same-inode rollout, and the second pass consumes only that verified unchanged prefix, so normal append-only growth remains safe. It prints only the counts plus a bounded union sample. Each `corpus.jsonl` entry retains a distinct suffix, the inferred `owner_id`, all observed `lifecycle_ids`, its in-window `accepted_record_count`, and compact `accepted_line_ranges`; use those locators plus narrowly selected nearby context when reconstructing the real task. For a multi-ID rollout, the filename UUID is accepted as owner only when every identity alias in its first lifecycle record agrees; later foreign IDs are retained as embedded provenance. Owner-later or otherwise ambiguous histories cannot prefix-bridge sessions, although byte-identical copies with the same complete lifecycle-ID set are still safely collapsed. Timestamp-less empty files stay visible in candidate/parsed counts but are not accepted as zero-record tasks. Invalid JSON, unsafe path shapes, and inventory or read failures stop the scan instead of silently shrinking the corpus. Groups with no record or fallback timestamp inside the requested window stay in candidate/parsed counts but do not enter the fingerprint-loading pass.
+The helper reports `active candidate count`, `archived candidate count`, `union candidate count`, matching parsed counts, `active accepted count`, `archived accepted count`, `union accepted count`, cross-root duplicate groups among accepted candidate groups, collapsed duplicate rollouts, and replayed-prefix records. It requires a fresh nonexistent output directory, lexically normalizes dot segments before traversal, rejects untrusted symlink ancestors, and creates the complete candidate and accepted path lists, `manifest.json`, `corpus-paths.txt`, and `corpus.jsonl` there without following or replacing existing artifact paths. Inventory snapshots and revalidates every traversed directory plus each entry identity and file type; both read passes reopen candidate files from the root directory descriptor with no-follow components and reject replacement or truncation. Non-printable rollout path components fail closed before line-delimited path artifacts or terminal samples are emitted. The first pass pins the complete-record prefix observed when it opens each same-inode rollout, deferring only an unterminated invalid final fragment from an active rollout; the second pass consumes only that verified unchanged prefix, so normal append-only growth remains safe. It prints only the counts plus a bounded union sample. Each `corpus.jsonl` entry retains a distinct suffix, the inferred `owner_id`, all observed `lifecycle_ids`, its in-window `accepted_record_count`, and compact `accepted_line_ranges`; use those locators plus narrowly selected nearby context when reconstructing the real task. For a multi-ID rollout, the filename UUID is accepted as owner only when every identity alias in its first lifecycle record agrees; later foreign IDs are retained as embedded provenance. Owner-later or otherwise ambiguous histories cannot prefix-bridge sessions, although byte-identical copies with the same complete lifecycle-ID set are still safely collapsed. Timestamp-less empty files stay visible in candidate/parsed counts but are not accepted as zero-record tasks. Committed invalid JSON, any invalid archived tail, unsafe path shapes, and inventory or read failures stop the scan instead of silently shrinking the corpus. Groups with no record or fallback timestamp inside the requested window stay in candidate/parsed counts but do not enter the fingerprint-loading pass.
 
 ### Current-Host Union And Deduplication
 

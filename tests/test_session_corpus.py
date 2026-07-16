@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -2307,6 +2308,110 @@ class SessionCorpusTests(unittest.TestCase):
 
             rollout = CORPUS.load_rollout_records(metadata)
             self.assertEqual(len(rollout.records), 2)
+
+    def test_first_pass_defers_active_unterminated_fragment_at_record_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            root = temp / "sessions"
+            path = root / "2026/07/16/rollout-growing.jsonl"
+            first = record(
+                "2026-07-16T06:00:00Z",
+                "response_item",
+                role="user",
+                text="first",
+            )
+            second = record(
+                "2026-07-16T06:01:00Z",
+                "response_item",
+                role="assistant",
+                text="second",
+            )
+            first_line = f"{json.dumps(first, sort_keys=True)}\n".encode()
+            second_line = f"{json.dumps(second, sort_keys=True)}\n".encode()
+            split_at = len(second_line) // 2
+            path.parent.mkdir(parents=True)
+            path.write_bytes(first_line + second_line[:split_at])
+            start = CORPUS.parse_instant("2026-07-16T00:00:00Z")
+            end = CORPUS.parse_instant("2026-07-17T00:00:00Z")
+
+            metadata = CORPUS.scan_rollout_metadata(
+                path,
+                "active",
+                root,
+                start,
+                end,
+            )
+            self.assertEqual(metadata.record_count, 1)
+            self.assertEqual(metadata.source_bytes, len(first_line))
+            self.assertEqual(metadata.candidate.file_size, len(first_line))
+            self.assertEqual(
+                metadata.content_sha256, hashlib.sha256(first_line).hexdigest()
+            )
+            self.assertEqual(len(CORPUS.load_rollout_records(metadata).records), 1)
+
+            with path.open("ab") as handle:
+                handle.write(second_line[split_at:])
+            self.assertEqual(len(CORPUS.load_rollout_records(metadata).records), 1)
+            refreshed = CORPUS.scan_rollout_metadata(
+                path,
+                "active",
+                root,
+                start,
+                end,
+            )
+            self.assertEqual(refreshed.record_count, 2)
+
+    def test_unterminated_fragment_deferral_is_active_and_json_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            start = CORPUS.parse_instant("2026-07-16T00:00:00Z")
+            end = CORPUS.parse_instant("2026-07-17T00:00:00Z")
+            first = record(
+                "2026-07-16T06:00:00Z",
+                "response_item",
+                role="user",
+                text="first",
+            )
+            first_line = f"{json.dumps(first, sort_keys=True)}\n".encode()
+
+            active_root = temp / "sessions"
+            committed_bad = active_root / "rollout-committed-bad.jsonl"
+            committed_bad.parent.mkdir(parents=True)
+            committed_bad.write_bytes(first_line + b"not-json\n")
+            with self.assertRaisesRegex(CORPUS.CorpusError, "invalid rollout JSON"):
+                CORPUS.scan_rollout_metadata(
+                    committed_bad,
+                    "active",
+                    active_root,
+                    start,
+                    end,
+                )
+
+            non_object = active_root / "rollout-non-object.jsonl"
+            non_object.write_bytes(first_line + b"[]")
+            with self.assertRaisesRegex(CORPUS.CorpusError, "non-object rollout"):
+                CORPUS.scan_rollout_metadata(
+                    non_object,
+                    "active",
+                    active_root,
+                    start,
+                    end,
+                )
+
+            archived_root = temp / "archived_sessions"
+            archived_partial = archived_root / "rollout-partial.jsonl"
+            archived_partial.parent.mkdir(parents=True)
+            archived_partial.write_bytes(first_line + b'{"timestamp":')
+            with self.assertRaisesRegex(CORPUS.CorpusError, "invalid rollout JSON"):
+                CORPUS.scan_rollout_metadata(
+                    archived_partial,
+                    "archived",
+                    archived_root,
+                    start,
+                    end,
+                )
 
 
 if __name__ == "__main__":

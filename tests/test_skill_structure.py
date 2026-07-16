@@ -231,6 +231,10 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn('python3 - "$SESSION_ID" "$CODEX_ROOT"', recipe)
         self.assertIn("matches_file=$(mktemp)", recipe)
         self.assertIn("trap 'rm -f \"$matches_file\"' EXIT", recipe)
+        self.assertIn("-print0", recipe)
+        self.assertIn("split(b'\\0')", recipe)
+        self.assertIn("character.isprintable()", recipe)
+        self.assertNotIn('sort -u "$matches_file"', recipe)
         self.assertNotIn("done | sort -u", recipe)
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -324,6 +328,46 @@ class SkillStructureTests(unittest.TestCase):
             self.assertIn(str(archived), malformed.stdout)
             self.assertIn(f"{session_index}:2:", malformed.stdout)
             self.assertNotIn("not-json", malformed.stdout)
+
+    def test_session_mining_exact_session_recipe_rejects_non_printable_paths(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        recipe = extract_bash_block_after(workflow, "Exact session ID:")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            home = temp / "home"
+            codex_home = home / ".codex"
+            session_id = "019ce6e8-a5e3-76e1-91a2-799837c70d1e"
+            archived = codex_home / "archived_sessions"
+            archived.mkdir(parents=True)
+            safe = archived / f"rollout-safe-{session_id}.jsonl"
+            unsafe = archived / f"rollout-unsafe\nforged-{session_id}.jsonl"
+            safe.write_text("{}\n", encoding="utf-8")
+            unsafe.write_text("{}\n", encoding="utf-8")
+
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            completed = subprocess.run(
+                ["bash", "-c", recipe],
+                cwd=temp,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(completed.stdout, "")
+            self.assertEqual(
+                completed.stderr,
+                "error: rollout path contains non-printable characters\n",
+            )
+            self.assertNotIn(str(safe), completed.stdout)
+            self.assertNotIn("forged", completed.stdout)
 
     def test_session_retrospective_bounds_operator_output(self) -> None:
         root = Path(__file__).resolve().parents[1]

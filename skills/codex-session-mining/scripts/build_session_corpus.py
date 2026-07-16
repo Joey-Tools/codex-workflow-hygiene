@@ -756,11 +756,13 @@ def scan_rollout_metadata(
     first_lifecycle_id: str | None = None
     saw_lifecycle_record = False
     digest = hashlib.sha256()
+    captured_bytes = 0
     source_bytes = 0
     first_timestamp: dt.datetime | None = None
     has_record_timestamp = False
     has_in_window_record = False
     record_count = 0
+    ignored_trailing_fragment = False
     try:
         descriptor, opened_metadata = open_rollout_candidate(candidate)
         snapshot_bytes = opened_metadata.st_size
@@ -780,13 +782,21 @@ def scan_rollout_metadata(
                     )
                 remaining -= len(raw_line)
                 line_no += 1
-                digest.update(raw_line)
-                source_bytes += len(raw_line)
+                captured_bytes += len(raw_line)
                 if not raw_line.strip():
+                    digest.update(raw_line)
+                    source_bytes += len(raw_line)
                     continue
                 try:
                     row = json.loads(raw_line)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    if (
+                        source == "active"
+                        and remaining == 0
+                        and not raw_line.endswith(b"\n")
+                    ):
+                        ignored_trailing_fragment = True
+                        break
                     raise CorpusError(
                         f"invalid rollout JSON at {rollout_path}:{line_no}"
                     ) from error
@@ -794,6 +804,8 @@ def scan_rollout_metadata(
                     raise CorpusError(
                         f"non-object rollout record at {rollout_path}:{line_no}"
                     )
+                digest.update(raw_line)
+                source_bytes += len(raw_line)
                 record_ids = record_lifecycle_ids(row)
                 if record_ids:
                     if not saw_lifecycle_record:
@@ -823,12 +835,14 @@ def scan_rollout_metadata(
         (final_metadata.st_dev, final_metadata.st_ino)
         != (candidate.file_device, candidate.file_inode)
         or final_metadata.st_size < snapshot_bytes
-        or source_bytes != snapshot_bytes
+        or captured_bytes != snapshot_bytes
+        or source_bytes > snapshot_bytes
+        or (source_bytes != snapshot_bytes and not ignored_trailing_fragment)
     ):
         raise CorpusError(f"rollout changed during metadata scan: {rollout_path}")
     scanned_candidate = replace(
         candidate,
-        file_size=snapshot_bytes,
+        file_size=source_bytes,
     )
     fallback_timestamp = fallback_path_timestamp(rollout_path, candidate.root)
     return RolloutMetadata(
