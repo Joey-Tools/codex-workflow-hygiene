@@ -1114,10 +1114,25 @@ def line_ranges(lines: list[int]) -> list[list[int]]:
     return ranges
 
 
-def rollout_sort_key(rollout: Rollout) -> tuple[dt.datetime, int, int, str]:
-    first = rollout.first_timestamp or dt.datetime.max.replace(tzinfo=UTC)
+def rollout_sort_key(
+    rollout: Rollout,
+) -> tuple[tuple[dt.datetime, ...], int, int, str]:
+    timestamp_source = tuple(
+        record.timestamp
+        for record in rollout.records
+        if record.timestamp is not None
+    )
+    if not timestamp_source:
+        timestamp_source = (
+            rollout.fallback_timestamp or dt.datetime.max.replace(tzinfo=UTC),
+        )
     source_rank = 0 if rollout.source == "active" else 1
-    return (first, len(rollout.records), source_rank, rollout.path.as_posix())
+    return (
+        timestamp_source,
+        len(rollout.records),
+        source_rank,
+        rollout.path.as_posix(),
+    )
 
 
 def union_entries(
