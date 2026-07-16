@@ -37,11 +37,13 @@ Use this skill for:
 - For an exact session ID or thread ID, start with `session_index.jsonl`, `history.jsonl`, or a filename search under both existing transcript roots for `rollout-*<id>*.jsonl`; do not append either rollout tree to the same raw `rg` command.
 - When the user asks to "read your rollout", recover prior commands, or find a value from a recent Codex turn, treat it as a session lookup first. Do not start with keyword `rg -n` over all of `$CODEX_HOME` / `~/.codex`; that tree includes history/session JSONL, retained tool outputs, installed skills, release overlays, caches, and package payloads. First identify a candidate session or date-bounded rollout set, then parse selected fields.
 - For a bounded date range, inventory every rollout under both existing active and archived roots first, including flat and date-nested archive layouts, then filter the union by record or lifecycle timestamps. A rollout in either root may have an old dated path or filename but a later genuine continuation inside the requested window.
+- Use `scripts/build_session_corpus.py` for a complete current-host date-window audit. It writes per-root candidate, parsed, and accepted path lists plus a deduplicated `corpus.jsonl`; each union entry identifies compact accepted line ranges after replay-prefix removal so a restamped copy cannot turn old history into new evidence.
 - Do not trust `find -mtime` as the only date filter when precision matters; copies, indexing, or later metadata updates can give older rollout files a fresh mtime.
 - Verify which transcript roots and archive layouts exist on the current host instead of assuming `archived_sessions` is either present or obsolete.
 
 3. Extract only the records and fields needed for the question.
 - Before printing details from a large rollout, count record shapes or line count, then add an explicit selector and row cap.
+- Treat `corpus.jsonl` as a locator, not transcript output: inspect its accepted line numbers and a small amount of necessary nearby context instead of printing every accepted rollout.
 - Use `session_meta` and `turn_context` for `cwd`, date, model, sandbox, and approval context.
 - Use `response_item` messages for user intent, assistant decisions, and explicit skill mentions.
 - Use `function_call_output` and tool error lines when auditing failures, approval friction, or outdated helper guidance.

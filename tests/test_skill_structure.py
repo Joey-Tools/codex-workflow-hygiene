@@ -157,6 +157,7 @@ class SkillStructureTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        corpus_helper = root / "skills/codex-session-mining/scripts/build_session_corpus.py"
 
         self.assertIn("inventory both `~/.codex/sessions/` and `~/.codex/archived_sessions/`", skill)
         self.assertIn("build one union corpus", skill)
@@ -168,10 +169,13 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn('for root in "$HOME/.codex/sessions" "$HOME/.codex/archived_sessions"', workflow)
         self.assertIn("current-host corpus inventory", workflow)
         self.assertIn("set -euo pipefail", workflow)
-        self.assertIn('ACTIVE_PATHS="$TASK_DIR/active-paths.txt"', workflow)
-        self.assertIn('ARCHIVED_PATHS="$TASK_DIR/archived-paths.txt"', workflow)
-        self.assertIn('find "$HOME/.codex/sessions" -type f -name \'rollout-*.jsonl\'', workflow)
-        self.assertIn('find "$HOME/.codex/archived_sessions" -type f -name \'rollout-*.jsonl\'', workflow)
+        self.assertIn("scripts/build_session_corpus.py", skill)
+        self.assertTrue(corpus_helper.is_file())
+        self.assertTrue(os.access(corpus_helper, os.X_OK))
+        self.assertIn('python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py"', workflow)
+        self.assertIn('--codex-home "$CODEX_ROOT"', workflow)
+        self.assertIn('--start "$LOWER_BOUND"', workflow)
+        self.assertIn('--end "$UPPER_BOUND"', workflow)
         self.assertNotIn('find "$HOME/.codex/sessions/2026/', workflow)
         self.assertNotIn("2>/dev/null", workflow)
         self.assertIn("active candidate count", workflow)
@@ -193,7 +197,7 @@ class SkillStructureTests(unittest.TestCase):
         self.assertNotIn("archived_sessions/*.jsonl", skill)
         self.assertNotIn("archived_sessions/*.jsonl", workflow)
 
-    def test_session_mining_corpus_recipe_inventories_both_roots_and_propagates_find_failure(self) -> None:
+    def test_session_mining_corpus_recipe_uses_structured_helper(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
             encoding="utf-8"
@@ -202,60 +206,11 @@ class SkillStructureTests(unittest.TestCase):
             workflow,
             "Bounded date range and current-host corpus inventory:",
         )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp = Path(temp_dir)
-            home = temp / "home"
-            active_old = home / ".codex/sessions/2026/02/01/rollout-active-old.jsonl"
-            active_current = home / ".codex/sessions/2026/03/13/rollout-active-current.jsonl"
-            archived_flat = home / ".codex/archived_sessions/rollout-archived-flat.jsonl"
-            archived_nested = (
-                home / ".codex/archived_sessions/2026/01/01/rollout-archived-nested.jsonl"
-            )
-            expected = {active_old, active_current, archived_flat, archived_nested}
-            for path in expected:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("{}\n", encoding="utf-8")
-
-            environment = os.environ.copy()
-            environment["HOME"] = str(home)
-            completed = subprocess.run(
-                ["bash", "-c", recipe],
-                cwd=temp,
-                env=environment,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertRegex(completed.stdout, r"active candidate count:\s+2")
-            self.assertRegex(completed.stdout, r"archived candidate count:\s+2")
-            self.assertRegex(completed.stdout, r"union candidate count:\s+4")
-            corpus_paths = {
-                Path(line)
-                for line in (
-                    temp / ".codex-tmp/session-mining-20260312-20260313/corpus-paths.txt"
-                )
-                .read_text(encoding="utf-8")
-                .splitlines()
-            }
-            self.assertEqual(corpus_paths, expected)
-
-            fake_bin = temp / "fake-bin"
-            fake_bin.mkdir()
-            fake_find = fake_bin / "find"
-            fake_find.write_text("#!/bin/sh\nexit 23\n", encoding="utf-8")
-            fake_find.chmod(0o755)
-            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-            failed = subprocess.run(
-                ["bash", "-c", recipe],
-                cwd=temp,
-                env=environment,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(failed.returncode, 23)
+        self.assertIn("LOWER_BOUND=2026-03-12T00:00:00Z", recipe)
+        self.assertIn("UPPER_BOUND=2026-03-14T00:00:00Z", recipe)
+        self.assertIn('CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"', recipe)
+        self.assertIn('python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py"', recipe)
+        self.assertIn('--sample-limit 20', recipe)
 
     def test_session_mining_exact_session_recipe_propagates_find_failure(self) -> None:
         root = Path(__file__).resolve().parents[1]

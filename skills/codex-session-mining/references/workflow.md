@@ -91,35 +91,22 @@ Bounded date range and current-host corpus inventory:
 set -euo pipefail
 
 TASK_DIR=.codex-tmp/session-mining-20260312-20260313
-ACTIVE_PATHS="$TASK_DIR/active-paths.txt"
-ARCHIVED_PATHS="$TASK_DIR/archived-paths.txt"
-UNION_PATHS="$TASK_DIR/corpus-paths.txt"
-mkdir -p "$TASK_DIR"
-: > "$ACTIVE_PATHS"
-: > "$ARCHIVED_PATHS"
+LOWER_BOUND=2026-03-12T00:00:00Z
+UPPER_BOUND=2026-03-14T00:00:00Z
+CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
+SESSION_MINING_SKILL="$CODEX_ROOT/skills/codex-session-mining"
 
-if [ -d "$HOME/.codex/sessions" ]; then
-    find "$HOME/.codex/sessions" -type f -name 'rollout-*.jsonl' \
-        | sort -u > "$ACTIVE_PATHS"
-fi
-if [ -d "$HOME/.codex/archived_sessions" ]; then
-    find "$HOME/.codex/archived_sessions" -type f -name 'rollout-*.jsonl' \
-        | sort -u > "$ARCHIVED_PATHS"
-fi
-sort -u "$ACTIVE_PATHS" "$ARCHIVED_PATHS" > "$UNION_PATHS"
-
-printf 'active candidate count: '
-wc -l < "$ACTIVE_PATHS"
-printf 'archived candidate count: '
-wc -l < "$ARCHIVED_PATHS"
-printf 'union candidate count: '
-wc -l < "$UNION_PATHS"
-sed -n '1,20p' "$UNION_PATHS"
+python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py" \
+    --codex-home "$CODEX_ROOT" \
+    --start "$LOWER_BOUND" \
+    --end "$UPPER_BOUND" \
+    --output "$TASK_DIR" \
+    --sample-limit 20
 ```
 
-Inventory every rollout under both existing roots before the structured scanner applies the requested lower and upper bounds to record or lifecycle timestamps. This full-root inventory is required for both active and archived rollouts: a rollout created before the window can resume with a genuine human suffix inside it. Do not exclude a file because its dated path or filename predates the window. Prefer record timestamps and lifecycle boundaries over `find -mtime`; archive moves, copies, or metadata updates make mtime unsuitable as the only filter.
+Inventory every rollout under both existing roots before applying the requested lower and upper bounds to record or lifecycle timestamps; the helper above enforces that order. This full-root inventory is required for both active and archived rollouts: a rollout created before the window can resume with a genuine human suffix inside it. Do not exclude a file because its dated path or filename predates the window. The helper uses dated paths only as a fallback when a rollout has no record timestamps; archive moves, copies, or metadata updates make mtime unsuitable as the filter.
 
-After structured filtering, also report `active accepted count`, `archived accepted count`, and `union accepted count`. The per-root accepted counts identify rollouts with relevant in-window record or lifecycle timestamps; the union accepted count is the resulting cross-root corpus after lifecycle/fingerprint deduplication. Keep the complete path lists in task-scoped artifacts and surface only the counts plus a short union sample before parsing selected fields.
+The helper reports `active candidate count`, `archived candidate count`, `union candidate count`, matching parsed counts, `active accepted count`, `archived accepted count`, `union accepted count`, cross-root duplicate groups, collapsed duplicate rollouts, and replayed-prefix records. It writes the complete candidate and accepted path lists, `manifest.json`, `corpus-paths.txt`, and `corpus.jsonl` under the task directory while printing only the counts plus a bounded union sample. Each `corpus.jsonl` entry retains a distinct suffix, its in-window `accepted_record_count`, and compact `accepted_line_ranges`; use those locators plus narrowly selected nearby context when reconstructing the real task. Invalid JSON, unsafe path shapes, and inventory or read failures stop the scan instead of silently shrinking the corpus.
 
 ### Current-Host Union And Deduplication
 
