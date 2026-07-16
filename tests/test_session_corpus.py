@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 import importlib.util
 import json
 from pathlib import Path
@@ -1460,6 +1461,69 @@ class SessionCorpusTests(unittest.TestCase):
 
             with self.assertRaisesRegex(CORPUS.CorpusError, "unsafe rollout root"):
                 CORPUS.inventory_root(root)
+
+    def test_inventory_rejects_directory_replacement_during_walk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            root = temp / "sessions"
+            path = root / "2026/07/16/rollout-swap.jsonl"
+            write_rollout(
+                path,
+                [record("2026-07-16T01:00:00Z", "user_message", text="old")],
+            )
+            original_walk = CORPUS.os.walk
+
+            def swapping_walk(
+                *args: object,
+                **kwargs: object,
+            ) -> Iterator[tuple[str, list[str], list[str]]]:
+                for index, entry in enumerate(original_walk(*args, **kwargs)):
+                    yield entry
+                    if index == 0:
+                        (root / "2026").rename(temp / "inventoried-2026")
+                        (root / "2026").mkdir()
+
+            with mock.patch.object(CORPUS.os, "walk", swapping_walk):
+                with self.assertRaisesRegex(
+                    CORPUS.CorpusError,
+                    "rollout inventory changed during traversal",
+                ):
+                    CORPUS.inventory_root(root)
+
+    def test_inventory_rejects_file_to_directory_swap_during_walk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            root = temp / "sessions"
+            root.mkdir()
+            original_entry = root / "2026"
+            original_entry.write_text("not a directory\n", encoding="utf-8")
+            original_walk = CORPUS.os.walk
+
+            def swapping_walk(
+                *args: object,
+                **kwargs: object,
+            ) -> Iterator[tuple[str, list[str], list[str]]]:
+                for index, entry in enumerate(original_walk(*args, **kwargs)):
+                    yield entry
+                    if index == 0:
+                        original_entry.rename(temp / "inventoried-2026-file")
+                        write_rollout(
+                            root / "2026/07/16/rollout-hidden.jsonl",
+                            [
+                                record(
+                                    "2026-07-16T01:00:00Z",
+                                    "user_message",
+                                    text="hidden",
+                                )
+                            ],
+                        )
+
+            with mock.patch.object(CORPUS.os, "walk", swapping_walk):
+                with self.assertRaisesRegex(
+                    CORPUS.CorpusError,
+                    "rollout inventory changed during traversal",
+                ):
+                    CORPUS.inventory_root(root)
 
     def test_inventory_identity_rejects_root_and_candidate_swaps(self) -> None:
         start = CORPUS.parse_instant("2026-07-16T00:00:00Z")

@@ -84,6 +84,33 @@ class RolloutCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class InventoryEntry:
+    name: str
+    device: int
+    inode: int
+    file_type: int
+
+
+@dataclass(frozen=True, slots=True)
+class InventoryDirectory:
+    device: int
+    inode: int
+    entries: tuple[InventoryEntry, ...] | None
+
+
+def capture_inventory_entry(
+    name: str,
+    metadata: os.stat_result,
+) -> InventoryEntry:
+    return InventoryEntry(
+        name=name,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        file_type=stat.S_IFMT(metadata.st_mode),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RolloutMetadata:
     candidate: RolloutCandidate
     source: str
@@ -492,6 +519,77 @@ def open_rollout_candidate(
         os.close(root_fd)
 
 
+def validate_inventory_directories(
+    root: Path,
+    snapshots: dict[tuple[str, ...], InventoryDirectory],
+) -> None:
+    try:
+        root_fd = os.open(root, directory_open_flags())
+    except OSError as error:
+        raise CorpusError(
+            f"rollout inventory changed during traversal: {root}: {error}"
+        ) from error
+    try:
+        for relative_parts, snapshot in sorted(snapshots.items()):
+            if snapshot.entries is None:
+                path = root.joinpath(*relative_parts)
+                raise CorpusError(
+                    f"rollout inventory did not visit listed directory: {path}"
+                )
+            current_fd = root_fd
+            try:
+                for component in relative_parts:
+                    try:
+                        next_fd = os.open(
+                            component,
+                            directory_open_flags(),
+                            dir_fd=current_fd,
+                        )
+                    except OSError as error:
+                        path = root.joinpath(*relative_parts)
+                        raise CorpusError(
+                            "rollout inventory changed during traversal: "
+                            f"{path}: {error}"
+                        ) from error
+                    if current_fd != root_fd:
+                        os.close(current_fd)
+                    current_fd = next_fd
+                metadata = os.fstat(current_fd)
+                path = root.joinpath(*relative_parts)
+                if (metadata.st_dev, metadata.st_ino) != (
+                    snapshot.device,
+                    snapshot.inode,
+                ):
+                    raise CorpusError(
+                        f"rollout inventory changed during traversal: {path}"
+                    )
+                try:
+                    current_entries = []
+                    for name in sorted(os.listdir(current_fd)):
+                        entry_metadata = os.stat(
+                            name,
+                            dir_fd=current_fd,
+                            follow_symlinks=False,
+                        )
+                        current_entries.append(
+                            capture_inventory_entry(name, entry_metadata)
+                        )
+                except OSError as error:
+                    raise CorpusError(
+                        "unable to revalidate rollout inventory directory "
+                        f"{path}: {error}"
+                    ) from error
+                if tuple(current_entries) != snapshot.entries:
+                    raise CorpusError(
+                        f"rollout inventory changed during traversal: {path}"
+                    )
+            finally:
+                if current_fd != root_fd:
+                    os.close(current_fd)
+    finally:
+        os.close(root_fd)
+
+
 def inventory_root(root: Path) -> list[RolloutCandidate]:
     root = lexical_absolute(root)
     try:
@@ -504,6 +602,13 @@ def inventory_root(root: Path) -> list[RolloutCandidate]:
         raise CorpusError(f"unsafe rollout root: {root}")
     resolved_root = root.resolve(strict=True)
     candidates: list[RolloutCandidate] = []
+    directory_snapshots: dict[tuple[str, ...], InventoryDirectory] = {
+        (): InventoryDirectory(
+            device=root_metadata.st_dev,
+            inode=root_metadata.st_ino,
+            entries=None,
+        )
+    }
 
     def traversal_error(error: OSError) -> None:
         raise CorpusError(
@@ -519,12 +624,67 @@ def inventory_root(root: Path) -> list[RolloutCandidate]:
         ):
             directories.sort()
             filenames.sort()
-            current_path = Path(current)
+            current_path = lexical_absolute(Path(current))
+            try:
+                current_parts = current_path.relative_to(root).parts
+                current_metadata = current_path.lstat()
+            except (OSError, ValueError) as error:
+                raise CorpusError(
+                    f"unable to inspect rollout directory {current_path}: {error}"
+                ) from error
+            expected_current = directory_snapshots.get(current_parts)
+            if expected_current is not None and (
+                current_metadata.st_dev,
+                current_metadata.st_ino,
+            ) != (expected_current.device, expected_current.inode):
+                raise CorpusError(
+                    f"rollout inventory changed during traversal: {current_path}"
+                )
+            if stat.S_ISLNK(current_metadata.st_mode) or not stat.S_ISDIR(
+                current_metadata.st_mode
+            ):
+                raise CorpusError(f"unsafe rollout directory: {current_path}")
+            directory_names = set(directories)
+            entry_metadata: dict[str, os.stat_result] = {}
+            entries: list[InventoryEntry] = []
+            for name in sorted([*directories, *filenames]):
+                metadata = (current_path / name).lstat()
+                if name in directory_names:
+                    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(
+                        metadata.st_mode
+                    ):
+                        raise CorpusError(
+                            f"unsafe rollout directory: {current_path / name}"
+                        )
+                elif stat.S_ISDIR(metadata.st_mode):
+                    raise CorpusError(
+                        "rollout inventory changed during traversal: "
+                        f"{current_path / name}"
+                    )
+                entry_metadata[name] = metadata
+                entries.append(capture_inventory_entry(name, metadata))
+            directory_snapshots[current_parts] = InventoryDirectory(
+                device=current_metadata.st_dev,
+                inode=current_metadata.st_ino,
+                entries=tuple(entries),
+            )
             for directory in directories:
                 path = current_path / directory
-                mode = path.lstat().st_mode
-                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-                    raise CorpusError(f"unsafe rollout directory: {path}")
+                metadata = entry_metadata[directory]
+                relative_parts = path.relative_to(root).parts
+                expected = directory_snapshots.get(relative_parts)
+                if expected is not None and (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ) != (expected.device, expected.inode):
+                    raise CorpusError(
+                        f"rollout inventory changed during traversal: {path}"
+                    )
+                directory_snapshots[relative_parts] = InventoryDirectory(
+                    device=metadata.st_dev,
+                    inode=metadata.st_ino,
+                    entries=expected.entries if expected is not None else None,
+                )
             for filename in filenames:
                 if not filename.startswith("rollout-") or not filename.endswith(
                     ".jsonl"
@@ -533,7 +693,7 @@ def inventory_root(root: Path) -> list[RolloutCandidate]:
                 if filename.startswith("rollout-summary"):
                     continue
                 path = current_path / filename
-                file_metadata = path.lstat()
+                file_metadata = entry_metadata[filename]
                 if stat.S_ISLNK(file_metadata.st_mode) or not stat.S_ISREG(
                     file_metadata.st_mode
                 ):
@@ -556,6 +716,7 @@ def inventory_root(root: Path) -> list[RolloutCandidate]:
         raise CorpusError(
             f"unable to inventory rollout root {root}: {error}"
         ) from error
+    validate_inventory_directories(root, directory_snapshots)
     return sorted(candidates, key=lambda candidate: candidate.path.as_posix())
 
 
