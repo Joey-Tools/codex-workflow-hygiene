@@ -33,6 +33,7 @@ superseded_by:
 - Final frozen-range review also made traversal errors fail closed, made shorter source histories own shared prefixes before longer continuations, and aligned exact-session lookup with `CODEX_HOME`. Content-only matches across different session identities remain deliberately separate because repeated wrappers and prompts are not sufficient proof of replay.
 - The final ordering rule uses earliest provenance first and history length as its tie-breaker, covering both a short original prefix followed by a longer continuation and a short restamped truncation of older longer history. Basenames are never used as identity when lifecycle and filename UUIDs are absent.
 - Replay collapse now requires byte identity or assistant/tool execution evidence inside the normalized prefix; prompt-only matches remain visible even under one lifecycle. Root inspection uses `lstat` so a dangling active or archive symlink fails closed instead of reporting an empty root.
+- Filename UUIDs no longer bridge components containing two explicit different lifecycle IDs, including through a lifecycle-less intermediate rollout. Corpus output requires a fresh path created through no-follow directory descriptors and uses exclusive no-follow artifact creation, while cross-root groups with no in-window candidate skip the fingerprint-loading pass.
 
 ## Next Steps
 

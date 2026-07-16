@@ -107,7 +107,9 @@ def parse_instant(value: str) -> dt.datetime:
     try:
         parsed = dt.datetime.fromisoformat(text)
     except ValueError as error:
-        raise argparse.ArgumentTypeError(f"invalid ISO-8601 timestamp: {value}") from error
+        raise argparse.ArgumentTypeError(
+            f"invalid ISO-8601 timestamp: {value}"
+        ) from error
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
@@ -241,7 +243,9 @@ def inventory_root(root: Path) -> list[Path]:
     paths: list[Path] = []
 
     def traversal_error(error: OSError) -> None:
-        raise CorpusError(f"unable to inventory rollout root {root}: {error}") from error
+        raise CorpusError(
+            f"unable to inventory rollout root {root}: {error}"
+        ) from error
 
     try:
         for current, directories, filenames in os.walk(
@@ -259,7 +263,9 @@ def inventory_root(root: Path) -> list[Path]:
                 if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
                     raise CorpusError(f"unsafe rollout directory: {path}")
             for filename in filenames:
-                if not filename.startswith("rollout-") or not filename.endswith(".jsonl"):
+                if not filename.startswith("rollout-") or not filename.endswith(
+                    ".jsonl"
+                ):
                     continue
                 if filename.startswith("rollout-summary"):
                     continue
@@ -270,10 +276,14 @@ def inventory_root(root: Path) -> list[Path]:
                 try:
                     path.resolve(strict=True).relative_to(resolved_root)
                 except (OSError, ValueError) as error:
-                    raise CorpusError(f"rollout candidate escapes root: {path}") from error
+                    raise CorpusError(
+                        f"rollout candidate escapes root: {path}"
+                    ) from error
                 paths.append(path)
     except OSError as error:
-        raise CorpusError(f"unable to inventory rollout root {root}: {error}") from error
+        raise CorpusError(
+            f"unable to inventory rollout root {root}: {error}"
+        ) from error
     return sorted(paths)
 
 
@@ -301,7 +311,9 @@ def scan_rollout_metadata(
                 try:
                     row = json.loads(raw_line)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise CorpusError(f"invalid rollout JSON at {path}:{line_no}") from error
+                    raise CorpusError(
+                        f"invalid rollout JSON at {path}:{line_no}"
+                    ) from error
                 if not isinstance(row, dict):
                     raise CorpusError(f"non-object rollout record at {path}:{line_no}")
                 lifecycle_id = lifecycle_id or record_lifecycle_id(row)
@@ -377,8 +389,13 @@ def load_rollout_records(metadata: RolloutMetadata) -> Rollout:
                     )
                 )
     except OSError as error:
-        raise CorpusError(f"unable to reread rollout {metadata.path}: {error}") from error
-    if digest.hexdigest() != metadata.content_sha256 or len(records) != metadata.record_count:
+        raise CorpusError(
+            f"unable to reread rollout {metadata.path}: {error}"
+        ) from error
+    if (
+        digest.hexdigest() != metadata.content_sha256
+        or len(records) != metadata.record_count
+    ):
         raise CorpusError(
             f"rollout prefix changed during corpus construction: {metadata.path}"
         )
@@ -447,27 +464,47 @@ def group_metadata(metadata: list[RolloutMetadata]) -> list[list[RolloutMetadata
 
 def group_rollouts(rollouts: list[Rollout]) -> list[list[Rollout]]:
     union_find = UnionFind(len(rollouts))
+    component_lifecycles = [
+        {rollout.lifecycle_id} if rollout.lifecycle_id is not None else set()
+        for rollout in rollouts
+    ]
+
+    def union_components(left: int, right: int) -> None:
+        left_root = union_find.find(left)
+        right_root = union_find.find(right)
+        if left_root == right_root:
+            return
+        union_find.union(left_root, right_root)
+        component_lifecycles[left_root].update(component_lifecycles[right_root])
+
     lifecycle_owner: dict[str, int] = {}
     content_owner: dict[tuple[str, str], int] = {}
     filename_members: dict[str, list[int]] = {}
     for index, rollout in enumerate(rollouts):
         if rollout.lifecycle_id is not None:
             owner = lifecycle_owner.setdefault(rollout.lifecycle_id, index)
-            union_find.union(owner, index)
+            union_components(owner, index)
         content_identity = rollout.lifecycle_id or rollout.filename_session_id
         if content_identity is not None:
             owner = content_owner.setdefault(
                 (content_identity, rollout.content_sha256),
                 index,
             )
-            union_find.union(owner, index)
+            union_components(owner, index)
         if rollout.filename_session_id is not None:
             filename_members.setdefault(rollout.filename_session_id, []).append(index)
     for members in filename_members.values():
         for offset, left_index in enumerate(members):
             for right_index in members[offset + 1 :]:
-                if common_prefix_length(rollouts[left_index], rollouts[right_index]) > 0:
-                    union_find.union(left_index, right_index)
+                left_lifecycles = component_lifecycles[union_find.find(left_index)]
+                right_lifecycles = component_lifecycles[union_find.find(right_index)]
+                if len(left_lifecycles | right_lifecycles) > 1:
+                    continue
+                if (
+                    common_prefix_length(rollouts[left_index], rollouts[right_index])
+                    > 0
+                ):
+                    union_components(left_index, right_index)
     groups: dict[int, list[Rollout]] = {}
     for index, rollout in enumerate(rollouts):
         groups.setdefault(union_find.find(index), []).append(rollout)
@@ -554,16 +591,169 @@ def union_entries(
     return entries, replayed_record_count, collapsed_rollout_count, accepted_group_count
 
 
-def write_lines(path: Path, values: Iterable[str]) -> None:
+def write_artifact(directory_fd: int, name: str, content: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+        handle.write(content)
+
+
+def write_lines(directory_fd: int, name: str, values: Iterable[str]) -> None:
     content = "".join(f"{value}\n" for value in values)
-    path.write_text(content, encoding="utf-8")
+    write_artifact(directory_fd, name, content)
 
 
-def write_json(path: Path, value: object) -> None:
-    path.write_text(
-        f"{json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)}\n",
-        encoding="utf-8",
-    )
+def write_json(directory_fd: int, name: str, value: object) -> None:
+    content = f"{json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)}\n"
+    write_artifact(directory_fd, name, content)
+
+
+def directory_open_flags() -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+    return flags | getattr(os, "O_NOFOLLOW", 0)
+
+
+def unsafe_symlink_at(parent_fd: int, name: str) -> bool:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISLNK(metadata.st_mode)
+
+
+def open_or_create_directory_at(parent_fd: int, name: str, path: Path) -> int:
+    flags = directory_open_flags()
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        if unsafe_symlink_at(parent_fd, name):
+            raise CorpusError(f"unsafe output path uses a symlink: {path}") from error
+        raise CorpusError(f"unable to open output ancestor {path}: {error}") from error
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        try:
+            return os.open(name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            if unsafe_symlink_at(parent_fd, name):
+                raise CorpusError(
+                    f"unsafe output path uses a symlink: {path}"
+                ) from error
+            raise CorpusError(
+                f"unable to open output ancestor {path}: {error}"
+            ) from error
+    except OSError as error:
+        raise CorpusError(
+            f"unable to create output ancestor {path}: {error}"
+        ) from error
+    try:
+        expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        raise CorpusError(
+            f"unable to open created output ancestor {path}: {error}"
+        ) from error
+    actual = os.fstat(descriptor)
+    if (expected.st_dev, expected.st_ino) != (actual.st_dev, actual.st_ino):
+        os.close(descriptor)
+        raise CorpusError(f"output ancestor changed during creation: {path}")
+    return descriptor
+
+
+def expand_trusted_root_symlinks(root_fd: int, components: list[str]) -> list[str]:
+    expanded = list(components)
+    for _ in range(8):
+        if not expanded:
+            return expanded
+        try:
+            metadata = os.stat(expanded[0], dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return expanded
+        except OSError as error:
+            raise CorpusError(
+                f"unable to inspect output path /{expanded[0]}: {error}"
+            ) from error
+        if not stat.S_ISLNK(metadata.st_mode):
+            return expanded
+        if metadata.st_uid != 0:
+            raise CorpusError(f"unsafe output path uses a symlink: /{expanded[0]}")
+        try:
+            target = os.readlink(expanded[0], dir_fd=root_fd)
+        except OSError as error:
+            raise CorpusError(
+                f"unable to inspect output path /{expanded[0]}: {error}"
+            ) from error
+        normalized = Path(os.path.normpath(f"/{target.lstrip('/')}"))
+        expanded = [*normalized.parts[1:], *expanded[1:]]
+    raise CorpusError("too many trusted root symlinks in output path")
+
+
+def create_fresh_directory_at(parent_fd: int, name: str, path: Path) -> int:
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+    except FileExistsError as error:
+        if unsafe_symlink_at(parent_fd, name):
+            raise CorpusError(f"unsafe output path uses a symlink: {path}") from error
+        raise CorpusError(
+            f"output directory must be fresh and nonexistent: {path}"
+        ) from error
+    except OSError as error:
+        raise CorpusError(
+            f"unable to create output directory {path}: {error}"
+        ) from error
+    try:
+        expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(name, directory_open_flags(), dir_fd=parent_fd)
+    except OSError as error:
+        raise CorpusError(
+            f"unable to open created output directory {path}: {error}"
+        ) from error
+    actual = os.fstat(descriptor)
+    if (expected.st_dev, expected.st_ino) != (actual.st_dev, actual.st_ino):
+        os.close(descriptor)
+        raise CorpusError(f"output directory changed during creation: {path}")
+    return descriptor
+
+
+def create_output_directory(output: Path) -> int:
+    absolute = output.absolute()
+    components = list(absolute.parts[1:])
+    if not components:
+        raise CorpusError("output directory must not be the filesystem root")
+    try:
+        root_fd = os.open("/", directory_open_flags())
+    except OSError as error:
+        raise CorpusError(f"unable to open filesystem root: {error}") from error
+    try:
+        components = expand_trusted_root_symlinks(root_fd, components)
+        if not components:
+            raise CorpusError("output directory resolves to the filesystem root")
+        current_fd = root_fd
+        try:
+            current_path = Path("/")
+            for component in components[:-1]:
+                current_path /= component
+                next_fd = open_or_create_directory_at(
+                    current_fd,
+                    component,
+                    current_path,
+                )
+                if current_fd != root_fd:
+                    os.close(current_fd)
+                current_fd = next_fd
+            return create_fresh_directory_at(
+                current_fd,
+                components[-1],
+                absolute,
+            )
+        finally:
+            if current_fd != root_fd:
+                os.close(current_fd)
+    finally:
+        os.close(root_fd)
 
 
 def build_corpus(
@@ -601,11 +791,7 @@ def build_corpus(
         key=lambda group: min(rollout.path.as_posix() for rollout in group),
     )
     for broad_group in broad_groups:
-        sources = {rollout.source for rollout in broad_group}
-        if not any(rollout.accepted for rollout in broad_group) and sources != {
-            "active",
-            "archived",
-        }:
+        if not any(rollout.accepted for rollout in broad_group):
             continue
         refined_groups = group_rollouts(
             [load_rollout_records(rollout) for rollout in broad_group]
@@ -648,26 +834,46 @@ def build_corpus(
             "start_inclusive": start.isoformat().replace("+00:00", "Z"),
         },
     }
+    directory_fd = create_output_directory(output)
     try:
-        output.mkdir(parents=True, exist_ok=True)
-        write_lines(output / "active-paths.txt", (path.as_posix() for path in active_paths))
-        write_lines(output / "archived-paths.txt", (path.as_posix() for path in archived_paths))
         write_lines(
-            output / "active-accepted-paths.txt",
+            directory_fd, "active-paths.txt", (path.as_posix() for path in active_paths)
+        )
+        write_lines(
+            directory_fd,
+            "archived-paths.txt",
+            (path.as_posix() for path in archived_paths),
+        )
+        write_lines(
+            directory_fd,
+            "active-accepted-paths.txt",
             (rollout.path.as_posix() for rollout in active_accepted),
         )
         write_lines(
-            output / "archived-accepted-paths.txt",
+            directory_fd,
+            "archived-accepted-paths.txt",
             (rollout.path.as_posix() for rollout in archived_accepted),
         )
-        write_lines(output / "corpus-paths.txt", (str(entry["path"]) for entry in entries))
         write_lines(
-            output / "corpus.jsonl",
-            (json.dumps(entry, ensure_ascii=False, sort_keys=True) for entry in entries),
+            directory_fd,
+            "corpus-paths.txt",
+            (str(entry["path"]) for entry in entries),
         )
-        write_json(output / "manifest.json", manifest)
+        write_lines(
+            directory_fd,
+            "corpus.jsonl",
+            (
+                json.dumps(entry, ensure_ascii=False, sort_keys=True)
+                for entry in entries
+            ),
+        )
+        write_json(directory_fd, "manifest.json", manifest)
     except OSError as error:
-        raise CorpusError(f"unable to write corpus artifacts under {output}: {error}") from error
+        raise CorpusError(
+            f"unable to write corpus artifacts under {output}: {error}"
+        ) from error
+    finally:
+        os.close(directory_fd)
     for key in (
         "active_candidate",
         "archived_candidate",
