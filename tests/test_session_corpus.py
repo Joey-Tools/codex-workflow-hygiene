@@ -526,6 +526,52 @@ class SessionCorpusTests(unittest.TestCase):
             self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
             self.assertEqual(manifest["counts"]["replayed_prefix_records"], 3)
 
+    def test_fallback_provenance_orders_timestamp_less_restamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            codex_home = temp / ".codex"
+            session_id = "019f6b90-f29c-7b92-8479-ec64017caecd"
+            archived = (
+                codex_home
+                / "archived_sessions"
+                / f"rollout-2026-01-01T01-00-00-{session_id}.jsonl"
+            )
+            active = (
+                codex_home
+                / "sessions/2026/07/16"
+                / f"rollout-2026-07-16T01-00-00-{session_id}.jsonl"
+            )
+            rows = [
+                record("2026-01-01T01:00:00Z", "session_meta", id=session_id),
+                record(
+                    "2026-01-01T01:01:00Z",
+                    "response_item",
+                    role="user",
+                    text="old task",
+                ),
+                record(
+                    "2026-01-01T01:02:00Z",
+                    "response_item",
+                    role="assistant",
+                    text="old result",
+                ),
+            ]
+            timestamp_less_rows = [dict(row) for row in rows]
+            for row in timestamp_less_rows:
+                row.pop("timestamp")
+            write_rollout(archived, timestamp_less_rows)
+            write_rollout(active, timestamp_less_rows)
+
+            output = temp / "out"
+            completed = self.run_corpus(codex_home, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual((output / "corpus.jsonl").read_text(encoding="utf-8"), "")
+            manifest = json.loads(
+                (output / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["counts"]["duplicate_rollouts_collapsed"], 1)
+            self.assertEqual(manifest["counts"]["replayed_prefix_records"], 3)
+
     def test_replay_prefix_ignores_session_meta_environment_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

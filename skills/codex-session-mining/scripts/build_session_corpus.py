@@ -1118,10 +1118,19 @@ def rollout_sort_key(
     rollout: Rollout,
 ) -> tuple[tuple[tuple[bool, dt.datetime], ...], int, int, str]:
     missing_timestamp = dt.datetime.max.replace(tzinfo=UTC)
-    timestamp_source = tuple(
-        (record.timestamp is None, record.timestamp or missing_timestamp)
-        for record in rollout.records
+    has_record_timestamp = any(
+        record.timestamp is not None for record in rollout.records
     )
+    if rollout.records and not has_record_timestamp:
+        fallback_timestamp = rollout.fallback_timestamp or missing_timestamp
+        timestamp_source = tuple(
+            (False, fallback_timestamp) for _record in rollout.records
+        )
+    else:
+        timestamp_source = tuple(
+            (record.timestamp is None, record.timestamp or missing_timestamp)
+            for record in rollout.records
+        )
     if not timestamp_source:
         timestamp_source = (
             (False, rollout.fallback_timestamp or missing_timestamp),
