@@ -973,7 +973,7 @@ def _assert_append_only_rollout_checkpoint(
         descriptor_final,
         phase=phase,
     )
-    return current_final, advanced_proof, verified_snapshot
+    return current, advanced_proof, verified_snapshot
 
 
 def _open_pinned_regular_file_from_fd(
@@ -2178,7 +2178,7 @@ def assert_append_only_rollout_checkpoint(
     except (FileNotFoundError, ValueError) as error:
         raise ValueError("rollout identity changed " + phase) from error
     assert_append_only_rollout_identity(current_final, descriptor_final, phase)
-    return current_final, advanced_proof, verified_snapshot
+    return current, advanced_proof, verified_snapshot
 
 
 def open_pinned_regular_file_from_fd(

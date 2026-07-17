@@ -525,6 +525,99 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                             else:
                                 self.assertIn("identity changed", error)
 
+    def test_active_append_after_verified_checkpoint_uses_aligned_snapshot(
+        self,
+    ) -> None:
+        for scope in ("local", "embedded"):
+            for layout in ("sessions", "root"):
+                with self.subTest(
+                    scope=scope,
+                    layout=layout,
+                ), tempfile.TemporaryDirectory() as temp_dir:
+                    rollout_ref = (
+                        ROLLOUT_REF
+                        if layout == "sessions"
+                        else "rollout-2026-05-26T10-00-00-root.jsonl"
+                    )
+                    codex_root = Path(temp_dir) / ".codex"
+                    rollout = write_rollout(codex_root, rollout_ref=rollout_ref)
+                    original_size = rollout.stat().st_size
+                    read_calls = 0
+                    mutated = False
+
+                    if scope == "local":
+                        real_read = MODULE._read_rollout_prefix_proof
+
+                        def run_scan() -> object:
+                            return MODULE._scan_session_meta_records(
+                                codex_root=codex_root,
+                                dates=[dt.date(2026, 5, 26)],
+                                limit=10,
+                                host="local",
+                            )
+
+                    else:
+                        namespace = embedded_probe_namespace(
+                            {
+                                "mode": "session-meta",
+                                "dates": ["2026/05/26"],
+                                "limit": 10,
+                                "codex_root": str(codex_root),
+                                "session_meta_scan_bytes": (
+                                    MODULE.MAX_SESSION_META_SCAN_BYTES
+                                ),
+                            }
+                        )
+                        real_read = namespace["read_rollout_prefix_proof"]
+
+                        def run_scan() -> object:
+                            return namespace["iter_session_meta"]()
+
+                    def append_after_verified_read(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> object:
+                        nonlocal read_calls, mutated
+                        result = real_read(*args, **kwargs)
+                        read_calls += 1
+                        if read_calls == 5:
+                            with rollout.open("ab") as handle:
+                                handle.write(b"{}\n")
+                            mutated = True
+                        return result
+
+                    if scope == "local":
+                        patcher = mock.patch.object(
+                            MODULE,
+                            "_read_rollout_prefix_proof",
+                            side_effect=append_after_verified_read,
+                        )
+                    else:
+                        patcher = mock.patch.dict(
+                            namespace,
+                            {
+                                "read_rollout_prefix_proof": (
+                                    append_after_verified_read
+                                )
+                            },
+                        )
+
+                    output = io.StringIO()
+                    with patcher, redirect_stdout(output):
+                        scan = run_scan()
+
+                    if scope == "local":
+                        session_ids = [row["session_id"] for row in scan.rows]
+                    else:
+                        session_ids = [
+                            json.loads(line)["session_id"]
+                            for line in output.getvalue().splitlines()[1:-1]
+                        ]
+                    self.assertTrue(mutated)
+                    self.assertGreaterEqual(read_calls, 7)
+                    self.assertGreater(rollout.stat().st_size, original_size)
+                    self.assertEqual(session_ids, ["trusted-session"])
+
     def test_active_prefix_proof_capture_fails_closed_on_growth(self) -> None:
         for scope in ("local", "embedded"):
             for layout in ("sessions", "root"):

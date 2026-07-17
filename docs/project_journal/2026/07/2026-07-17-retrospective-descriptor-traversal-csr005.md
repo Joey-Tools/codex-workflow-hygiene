@@ -34,8 +34,8 @@ superseded_by:
 - `skills/codex-session-retrospective/scripts/remote_codex_probe.py`
 - `skills/codex-session-retrospective/SKILL.md`
 - `tests/test_remote_codex_probe.py`
-- `python3 -m unittest -b tests.test_session_retrospective tests.test_remote_codex_probe`: 893 tests passed after pull-request review fixes.
-- `python3 -m unittest discover -s tests -p 'test_*.py' -b`: 982 tests passed after pull-request review fixes.
-- `python3 tests/test_remote_codex_probe.py`: 24 descriptor and race tests passed.
+- `python3 -m unittest -b tests.test_session_retrospective tests.test_remote_codex_probe`: 894 tests passed after pull-request review fixes.
+- `python3 -m unittest discover -s tests -p 'test_*.py' -b`: 983 tests passed after pull-request review fixes.
+- `python3 tests/test_remote_codex_probe.py`: 25 descriptor and race tests passed.
 - Skill validation, project-journal validation, Python compilation, Ruff, and `git diff --check` passed.
-- Pre-commit inspections and fixed-range reviews found and closed enumeration, append, descriptor-budget, FIFO-test, scope-order, and archive-snapshot gaps. Pull-request review then found a delayed final-entry stat race and incomplete append-only baselines; follow-up reviews found an open-to-scan handoff gap, rewrite-and-grow bypass, live-read substitution window, unbounded aggregate proof work, a root-resolution symlink race, and a mixed-candidate proof-budget auto-split bypass. All are covered by local/embedded regressions and the final review result is recorded in the pull request.
+- Pre-commit inspections and fixed-range reviews found and closed enumeration, append, descriptor-budget, FIFO-test, scope-order, and archive-snapshot gaps. Pull-request review then found a delayed final-entry stat race and incomplete append-only baselines; follow-up reviews found an open-to-scan handoff gap, rewrite-and-grow bypass, live-read substitution window, unbounded aggregate proof work, a root-resolution symlink race, a mixed-candidate proof-budget auto-split bypass, and a false rejection when a valid append landed after the verified checkpoint snapshot. All are covered by local/embedded regressions and the final review result is recorded in the pull request.
