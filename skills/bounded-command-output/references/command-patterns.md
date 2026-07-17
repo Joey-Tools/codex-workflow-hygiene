@@ -46,6 +46,11 @@ Keep the full retained artifact under a task-scoped directory such as `.codex-tm
 - Use a count or a small explicit sample before any wider process inventory.
 - Avoid full `ps aux`, `ps -ef`, `ps -A`, `ps -e`, `ps axww`, or broad `ps -axo ...` output unless the task specifically requires the complete process table.
 
+## Database And Filesystem Scans
+
+- SQLite `.timeout` controls how long the client waits for a busy lock; it is not a query-execution deadline. On a large or actively written database, start with metadata, `sqlite_sequence`, schema/index inspection, or a narrow indexed range. Put any broad aggregate behind an outer hard wall-clock deadline, and treat a terminated query as incomplete rather than as an empty result.
+- Broad macOS `du` walks under `$HOME`, `/System/Volumes/Data`, Containers, or FileProvider-backed trees require a hard deadline before launch. A PTY and repeated polling make the walk interruptible but do not bound its runtime. Split the scan into explicit top-level directories or narrower branches, and report every timed-out branch as unknown or incomplete instead of inferring a total from the surviving branches.
+
 ## Builds, Tests, And Polling
 
 For verbose `xcodebuild`, Swift, package-manager, or container builds, create the log path first and redirect both stdout and stderr before the process begins. A live PTY does not bound output by itself.
