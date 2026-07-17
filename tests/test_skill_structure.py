@@ -439,6 +439,8 @@ class SkillStructureTests(unittest.TestCase):
                 for index in range(20)
             ]
             oversized_marker = "oversized-record-marker"
+            bare_cr_tail_marker = "bare-cr-tail-marker"
+            post_oversized_marker = "post-oversized-marker"
             oversized_record = json_dumps(
                 {
                     "session_id": oversized_marker,
@@ -448,10 +450,27 @@ class SkillStructureTests(unittest.TestCase):
             )
             history_lines = [json_dumps(row) for row in history_rows]
             history_lines.append(oversized_record)
-            (codex_home / "history.jsonl").write_text(
-                "\n".join(history_lines) + "\n",
-                encoding="utf-8",
-            )
+            history_payload = ("\n".join(history_lines) + "\n").encode("utf-8")
+            history_payload += b"x" * (1024 * 1024) + b"\r"
+            history_payload += (
+                json_dumps(
+                    {
+                        "session_id": bare_cr_tail_marker,
+                        "ts": "2026-06-04T01:00:00Z",
+                        "text": "must remain part of the oversized physical line",
+                    }
+                )
+                + "\n"
+                + json_dumps(
+                    {
+                        "session_id": post_oversized_marker,
+                        "ts": "2026-06-04T01:01:00Z",
+                        "text": "valid record after the oversized physical line",
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+            (codex_home / "history.jsonl").write_bytes(history_payload)
             long_index_value = "z" * 1000
             (codex_home / "session_index.jsonl").write_text(
                 json_dumps({
@@ -477,6 +496,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("index-session", result.stdout)
         self.assertIn("session_index.jsonl", result.stdout)
         self.assertNotIn(oversized_marker, result.stdout)
+        self.assertNotIn(bare_cr_tail_marker, result.stdout)
+        self.assertIn(post_oversized_marker, result.stdout)
         self.assertNotIn(long_index_value, result.stdout)
 
     def test_session_mining_exact_probe_handles_real_record_shapes(self) -> None:
