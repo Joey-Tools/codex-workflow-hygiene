@@ -23,6 +23,8 @@ superseded_by:
 - Broad aggregates require an outer hard wall-clock deadline and produce incomplete evidence when terminated.
 - Broad macOS `du` walks require a hard deadline before launch; PTY polling alone is not a runtime bound.
 - Timed-out filesystem branches remain explicitly unknown or incomplete.
+- macOS single-process scans have a system-Perl direct-`exec` deadline pattern that preserves ordinary exit statuses and maps `SIGALRM` to an explicit incomplete result.
+- Producers that detach descendants still require task-scoped supervision or OS containment for the whole process unit.
 
 ## Next Steps
 

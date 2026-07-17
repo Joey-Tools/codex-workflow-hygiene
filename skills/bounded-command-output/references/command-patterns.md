@@ -51,6 +51,21 @@ Keep the full retained artifact under a task-scoped directory such as `.codex-tm
 - SQLite `.timeout` controls how long the client waits for a busy lock; it is not a query-execution deadline. On a large or actively written database, start with metadata, `sqlite_sequence`, schema/index inspection, or a narrow indexed range. Put any broad aggregate behind an outer hard wall-clock deadline, and treat a terminated query as incomplete rather than as an empty result.
 - Broad macOS `du` walks under `$HOME`, `/System/Volumes/Data`, Containers, or FileProvider-backed trees require a hard deadline before launch. A PTY and repeated polling make the walk interruptible but do not bound its runtime. Split the scan into explicit top-level directories or narrower branches, and report every timed-out branch as unknown or incomplete instead of inferring a total from the surviving branches.
 
+macOS does not ship GNU `timeout`, but its system Perl can put a direct single-process producer under a real deadline without a shell-inside-a-shell wrapper. For example, this 60-second SQLite probe preserves ordinary exit statuses, turns `SIGALRM` into an explicit incomplete result, and terminates the producer itself:
+
+```bash
+/usr/bin/perl -e 'alarm shift; exec @ARGV or die qq(exec failed: $!\n)' \
+  60 /usr/bin/sqlite3 /exact/path/database.sqlite 'SELECT count(*) FROM events;'
+status=$?
+if (( status == 142 )); then
+  printf '%s\n' 'deadline exceeded; result incomplete' >&2
+  exit 124
+fi
+exit "$status"
+```
+
+Use the same prefix with `/usr/bin/du -xhd 1 /exact/path` for a bounded filesystem walk. This direct-`exec` pattern is for producers such as `sqlite3` and `du` that do not detach a process tree. If a tool launches descendants, use a task-scoped supervisor or OS containment that terminates and reaps the entire unit instead.
+
 ## Builds, Tests, And Polling
 
 For verbose `xcodebuild`, Swift, package-manager, or container builds, create the log path first and redirect both stdout and stderr before the process begins. A live PTY does not bound output by itself.
