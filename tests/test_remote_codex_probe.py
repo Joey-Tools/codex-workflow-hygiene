@@ -86,28 +86,58 @@ def embedded_probe_namespace(payload: dict[str, object]) -> dict[str, object]:
     return namespace
 
 
-def entry_mutating_scandir(
-    real_scandir: Callable[..., Any],
+def candidate_mutating_stat(
+    real_stat: Callable[..., os.stat_result],
     target_name: str,
     mutate: Callable[[], None],
     *,
-    before_stat: bool = False,
+    before_call: int | None = None,
+    after_call: int | None = None,
+) -> Callable[..., Any]:
+    matching_calls = 0
+
+    def mutating_stat(
+        path: object,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal matching_calls
+        matches_candidate = (
+            path == target_name
+            and dir_fd is not None
+            and follow_symlinks is False
+        )
+        if matches_candidate:
+            matching_calls += 1
+            if matching_calls == before_call:
+                mutate()
+        result = real_stat(
+            path,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+        if matches_candidate and matching_calls == after_call:
+            mutate()
+        return result
+
+    return mutating_stat
+
+
+def metadata_poisoned_scandir(
+    real_scandir: Callable[..., Any],
+    observed_names: list[str],
 ) -> Callable[..., Any]:
     class EntryProxy:
         def __init__(self, entry: Any) -> None:
-            self._entry = entry
             self.name = entry.name
+            observed_names.append(self.name)
+
+        def inode(self) -> int:
+            raise AssertionError("session-meta must not read DirEntry.inode()")
 
         def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
-            if before_stat:
-                mutate()
-            result = self._entry.stat(follow_symlinks=follow_symlinks)
-            if not before_stat:
-                mutate()
-            return result
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self._entry, name)
+            raise AssertionError("session-meta must not read DirEntry.stat()")
 
     class ScandirProxy:
         def __init__(self, iterator: Any) -> None:
@@ -115,28 +145,25 @@ def entry_mutating_scandir(
 
         def __enter__(self) -> Any:
             entries = self._iterator.__enter__()
-            return (
-                EntryProxy(entry) if entry.name == target_name else entry
-                for entry in entries
-            )
+            return (EntryProxy(entry) for entry in entries)
 
         def __exit__(self, *args: object) -> object:
             return self._iterator.__exit__(*args)
 
-    def mutating_scandir(path: object) -> Any:
+    def poisoned_scandir(path: object) -> Any:
         return ScandirProxy(real_scandir(path))
 
-    return mutating_scandir
+    return poisoned_scandir
 
 
 class RemoteCodexProbeDescriptorTests(unittest.TestCase):
-    def test_session_meta_binds_identity_captured_during_scandir(self) -> None:
+    def test_session_meta_binds_identity_with_descriptor_relative_stats(self) -> None:
         for scope in ("local", "embedded"):
             for mutation in (
-                "delete_before_stat",
-                "replace_before_stat",
-                "delete_after_stat",
-                "replace_after_stat",
+                "delete_before_first_stat",
+                "replace_before_first_stat",
+                "delete_between_stats",
+                "replace_between_stats",
             ):
                 with self.subTest(
                     scope=scope,
@@ -186,18 +213,23 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         def run_scan() -> object:
                             return namespace["iter_session_meta"]()
 
-                    mutating_scandir = entry_mutating_scandir(
-                        target_os.scandir,
+                    mutating_stat = candidate_mutating_stat(
+                        target_os.stat,
                         rollout.name,
                         mutate,
-                        before_stat=mutation.endswith("before_stat"),
+                        before_call=(
+                            1 if mutation.endswith("before_first_stat") else None
+                        ),
+                        after_call=(
+                            1 if mutation.endswith("between_stats") else None
+                        ),
                     )
                     output = io.StringIO()
                     if scope == "local":
                         with mock.patch.object(
                             target_os,
-                            "scandir",
-                            side_effect=mutating_scandir,
+                            "stat",
+                            side_effect=mutating_stat,
                         ), self.assertRaises(
                             MODULE.SessionMetaRolloutError
                         ) as raised:
@@ -207,8 +239,8 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                     else:
                         with mock.patch.object(
                             target_os,
-                            "scandir",
-                            side_effect=mutating_scandir,
+                            "stat",
+                            side_effect=mutating_stat,
                         ), redirect_stdout(output), self.assertRaises(
                             SystemExit
                         ) as raised:
@@ -226,7 +258,7 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                     self.assertEqual(error_rollout, ROLLOUT_REF)
                     self.assertNotIn("replacement-session", output.getvalue())
 
-    def test_session_meta_filters_scope_before_abnormal_entry_stat(self) -> None:
+    def test_session_meta_filters_scope_before_abnormal_candidate_open(self) -> None:
         for scope in ("local", "embedded"):
             for layout in ("root", "flat_archive"):
                 for in_scope in (False, True):
@@ -250,12 +282,6 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         outside = Path(temp_dir) / "outside.jsonl"
                         outside.write_text("outside\n", encoding="utf-8")
                         abnormal.symlink_to(outside)
-
-                        stat_called = False
-
-                        def record_stat() -> None:
-                            nonlocal stat_called
-                            stat_called = True
 
                         output = io.StringIO()
                         if scope == "local":
@@ -283,30 +309,45 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                             def run_scan() -> object:
                                 return namespace["iter_session_meta"]()
 
-                        mutating_scandir = entry_mutating_scandir(
-                            target_os.scandir,
-                            abnormal.name,
-                            record_stat,
-                        )
+                        real_open = target_os.open
+                        candidate_opened = False
+
+                        def tracking_open(
+                            path: object,
+                            flags: int,
+                            mode: int = 0o777,
+                            *,
+                            dir_fd: int | None = None,
+                        ) -> int:
+                            nonlocal candidate_opened
+                            if path == abnormal.name and dir_fd is not None:
+                                candidate_opened = True
+                            return real_open(path, flags, mode, dir_fd=dir_fd)
+
                         with mock.patch.object(
                             target_os,
-                            "scandir",
-                            side_effect=mutating_scandir,
+                            "open",
+                            side_effect=tracking_open,
                         ), redirect_stdout(output):
                             if in_scope and scope == "local":
-                                with self.assertRaisesRegex(
-                                    MODULE.SessionMetaRolloutError,
-                                    "symlink",
-                                ):
+                                with self.assertRaises(
+                                    MODULE.SessionMetaRolloutError
+                                ) as raised:
                                     run_scan()
+                                error = raised.exception.error
                             elif in_scope:
                                 with self.assertRaises(SystemExit) as raised:
                                     run_scan()
                                 self.assertEqual(raised.exception.code, 0)
+                                error = json.loads(
+                                    output.getvalue().splitlines()[1]
+                                )["error"]
                             else:
                                 scan = run_scan()
 
-                        self.assertEqual(stat_called, in_scope)
+                        self.assertEqual(candidate_opened, in_scope)
+                        if in_scope:
+                            self.assertEqual(error, "rollout path is a symlink")
                         if scope == "local":
                             if not in_scope:
                                 self.assertEqual(
@@ -323,13 +364,79 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                                     records[0]["rollout"],
                                     abnormal.relative_to(codex_root).as_posix(),
                                 )
-                                self.assertIn("symlink", records[0]["error"])
+                                self.assertEqual(
+                                    records[0]["error"],
+                                    "rollout path is a symlink",
+                                )
                             else:
                                 self.assertEqual(
                                     [record["session_id"] for record in records],
                                     ["trusted-session"],
                                 )
                                 self.assertNotIn("outside", output.getvalue())
+
+    def test_session_meta_scandir_uses_names_only_local_and_embedded(self) -> None:
+        for scope in ("local", "embedded"):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temp_dir:
+                codex_root = Path(temp_dir) / ".codex"
+                rollout = write_rollout(codex_root)
+                observed_names: list[str] = []
+                output = io.StringIO()
+
+                if scope == "local":
+                    target_os = MODULE.os
+
+                    def run_scan() -> object:
+                        return MODULE._scan_session_meta_records(
+                            codex_root=codex_root,
+                            dates=[dt.date(2026, 5, 26)],
+                            limit=10,
+                            host="local",
+                        )
+
+                else:
+                    namespace = embedded_probe_namespace(
+                        {
+                            "mode": "session-meta",
+                            "dates": ["2026/05/26"],
+                            "limit": 10,
+                            "codex_root": str(codex_root),
+                            "session_meta_scan_bytes": (
+                                MODULE.MAX_SESSION_META_SCAN_BYTES
+                            ),
+                        }
+                    )
+                    target_os = namespace["os"]
+
+                    def run_scan() -> object:
+                        return namespace["iter_session_meta"]()
+
+                poisoned_scandir = metadata_poisoned_scandir(
+                    target_os.scandir,
+                    observed_names,
+                )
+                with mock.patch.object(
+                    target_os,
+                    "scandir",
+                    side_effect=poisoned_scandir,
+                ), redirect_stdout(output):
+                    scan = run_scan()
+
+                self.assertIn(rollout.name, observed_names)
+                if scope == "local":
+                    self.assertEqual(
+                        [row["session_id"] for row in scan.rows],
+                        ["trusted-session"],
+                    )
+                else:
+                    records = [
+                        json.loads(line)
+                        for line in output.getvalue().splitlines()[1:-1]
+                    ]
+                    self.assertEqual(
+                        [record["session_id"] for record in records],
+                        ["trusted-session"],
+                    )
 
     def test_active_session_meta_enforces_append_only_policy(self) -> None:
         for scope in ("local", "embedded"):
@@ -1505,14 +1612,16 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                                 return namespace["iter_session_meta"]()
 
                         if phase == "before_open":
+                            mutating_stat = candidate_mutating_stat(
+                                target_os.stat,
+                                rollout.name,
+                                mutate,
+                                after_call=2,
+                            )
                             patcher = mock.patch.object(
                                 target_os,
-                                "scandir",
-                                side_effect=entry_mutating_scandir(
-                                    target_os.scandir,
-                                    rollout.name,
-                                    mutate,
-                                ),
+                                "stat",
+                                side_effect=mutating_stat,
                             )
                         elif scope == "local":
                             real_lines = MODULE._bounded_session_meta_lines
@@ -2061,35 +2170,30 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
         secret = "/sensitive/dup-failure"
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_root = Path(temp_dir) / ".codex"
-            rollout = write_rollout(codex_root)
-            real_open = MODULE.os.open
+            write_rollout(codex_root)
+            real_final_open = MODULE._open_pinned_regular_file_from_fd
             real_dup = MODULE.os.dup
-            rollout_fds: list[int] = []
-            final_opened = False
+            final_fd: int | None = None
 
-            def tracking_open(
-                path: object,
-                flags: int,
-                mode: int = 0o777,
-                *,
-                dir_fd: int | None = None,
-            ) -> int:
-                nonlocal final_opened
-                fd = real_open(path, flags, mode, dir_fd=dir_fd)
-                if path == rollout.name and dir_fd is not None:
-                    rollout_fds.append(fd)
-                    final_opened = len(rollout_fds) >= 2
-                return fd
+            def tracking_final_open(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[object, ...]:
+                nonlocal final_fd
+                result = real_final_open(*args, **kwargs)
+                if kwargs.get("expected_identity") is not None:
+                    final_fd = result[0]
+                return result
 
             def fail_final_parent_dup(fd: int) -> int:
-                if final_opened:
+                if final_fd is not None:
                     raise OSError(24, "Too many open files", secret)
                 return real_dup(fd)
 
             with mock.patch.object(
-                MODULE.os,
-                "open",
-                side_effect=tracking_open,
+                MODULE,
+                "_open_pinned_regular_file_from_fd",
+                side_effect=tracking_final_open,
             ), mock.patch.object(
                 MODULE.os,
                 "dup",
@@ -2105,10 +2209,9 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
         self.assertEqual(raised.exception.error, "rollout unreadable")
         self.assertEqual(raised.exception.rollout, ROLLOUT_REF)
         self.assertNotIn(secret, str(raised.exception))
-        self.assertEqual(len(rollout_fds), 2)
-        for rollout_fd in rollout_fds:
-            with self.assertRaises(OSError):
-                os.fstat(rollout_fd)
+        self.assertIsNotNone(final_fd)
+        with self.assertRaises(OSError):
+            os.fstat(final_fd)
 
     def test_root_rollout_window_and_auto_split_semantics_remain_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
