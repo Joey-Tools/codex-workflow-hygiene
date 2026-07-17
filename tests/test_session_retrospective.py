@@ -2758,6 +2758,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("stdout exceeded capture limit", stderr.getvalue())
         parser.assert_not_called()
 
+    def test_remote_probe_bounded_subprocess_enforces_exact_stdout_boundary(self) -> None:
+        capture_limit = 17
+        exact = REMOTE_PROBE._run_subprocess_text_bounded(
+            [
+                sys.executable,
+                "-c",
+                f"import os; os.write(1, b'x' * {capture_limit})",
+            ],
+            timeout_seconds=5,
+            max_stdout_bytes=capture_limit,
+            max_stderr_bytes=capture_limit,
+        )
+
+        self.assertEqual(exact.returncode, 0)
+        self.assertEqual(exact.stdout, "x" * capture_limit)
+        self.assertEqual(exact.stderr, "")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            rf"stdout exceeded {capture_limit}-byte capture limit",
+        ):
+            REMOTE_PROBE._run_subprocess_text_bounded(
+                [
+                    sys.executable,
+                    "-c",
+                    f"import os; os.write(1, b'x' * {capture_limit + 1})",
+                ],
+                timeout_seconds=5,
+                max_stdout_bytes=capture_limit,
+                max_stderr_bytes=capture_limit,
+            )
+
     def test_remote_probe_session_meta_serialized_row_boundary_local_and_embedded(self) -> None:
         rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-row-budget.jsonl"
         base_item = {"date": "2026/05/01", "session_id": "bounded-row", "cwd": "", "rollout": rollout_ref}
