@@ -1044,7 +1044,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         with mock.patch.object(
             REMOTE_PROBE,
-            "_run_remote_python",
+            "_run_remote_python_bounded",
             return_value=subprocess.CompletedProcess(
                 args=["ssh"],
                 returncode=0,
@@ -1069,7 +1069,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         with mock.patch.object(
             REMOTE_PROBE,
-            "_run_remote_python",
+            "_run_remote_python_bounded",
             return_value=subprocess.CompletedProcess(
                 args=["ssh"],
                 returncode=1,
@@ -2088,7 +2088,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         with mock.patch.object(
             REMOTE_PROBE,
-            "_run_remote_python",
+            "_run_remote_python_bounded",
             return_value=subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout=remote_output, stderr=""),
         ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(sys, "stdout", stdout):
             result = REMOTE_PROBE.cmd_session_meta(
@@ -2128,7 +2128,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
             with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
                 REMOTE_PROBE,
-                "_run_remote_python",
+                "_run_remote_python_bounded",
                 return_value=subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout=remote_output, stderr=""),
             ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(sys, "stdout", stdout):
                 result = REMOTE_PROBE.cmd_session_meta(
@@ -2684,6 +2684,382 @@ class SessionRetrospectiveTests(unittest.TestCase):
             4 * ((REMOTE_PROBE.MAX_FETCH_ROLLOUT_BYTES + 2) // 3)
             + REMOTE_PROBE.REMOTE_FETCH_FRAME_OVERHEAD_BYTES,
         )
+
+    def test_remote_probe_remote_session_meta_uses_exact_bounded_parent_capture(self) -> None:
+        remote_result = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=f"{REMOTE_PROBE.REMOTE_SESSION_META_BEGIN}\n{REMOTE_PROBE.REMOTE_SESSION_META_END}\n",
+            stderr="",
+        )
+        args = types.SimpleNamespace(host=["miku-bot-dev"], date=["2026/05/01"], from_date=None, to_date=None, limit=10)
+        stdout = io.StringIO()
+        with mock.patch.object(REMOTE_PROBE, "_run_remote_python_bounded", return_value=remote_result) as bounded_run, mock.patch.object(
+            sys, "stdout", stdout
+        ):
+            result = REMOTE_PROBE.cmd_session_meta(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(REMOTE_PROBE.MAX_REMOTE_SESSION_META_STDOUT_BYTES, 32_899_072)
+        self.assertEqual(bounded_run.call_args.kwargs["max_stdout_bytes"], 32_899_072)
+        self.assertFalse(hasattr(REMOTE_PROBE, "_run_remote_python"))
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            REMOTE_PROBE,
+            "_run_remote_python_bounded",
+            side_effect=RuntimeError("command stdout exceeded capture limit"),
+        ), mock.patch.object(REMOTE_PROBE, "_extract_framed_lines") as parser, mock.patch.object(
+            sys, "stdout", stdout
+        ), mock.patch.object(sys, "stderr", stderr):
+            result = REMOTE_PROBE.cmd_session_meta(args)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("stdout exceeded capture limit", stderr.getvalue())
+        parser.assert_not_called()
+
+    def test_remote_probe_remote_rollout_summary_uses_exact_bounded_parent_capture(self) -> None:
+        remote_result = subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout="unused", stderr="")
+        args = types.SimpleNamespace(
+            host="miku-bot-dev",
+            rollout="sessions/2026/05/01/rollout-2026-05-01T10-00-00.jsonl",
+            keyword=[],
+            limit=20,
+            tail_records=4,
+            max_text_chars=200,
+        )
+        stdout = io.StringIO()
+        with mock.patch.object(REMOTE_PROBE, "_run_remote_python_bounded", return_value=remote_result) as bounded_run, mock.patch.object(
+            REMOTE_PROBE, "_extract_framed_rollout_summary_records", return_value=[]
+        ), mock.patch.object(sys, "stdout", stdout):
+            result = REMOTE_PROBE.cmd_rollout_summary(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_SCAN_BYTES, 16 * 1024 * 1024)
+        self.assertEqual(bounded_run.call_args.args[1]["summary_scan_bytes"], REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_SCAN_BYTES)
+        self.assertEqual(REMOTE_PROBE.MAX_REMOTE_ROLLOUT_SUMMARY_STDOUT_BYTES, 26_542_080)
+        self.assertEqual(bounded_run.call_args.kwargs["max_stdout_bytes"], 26_542_080)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            REMOTE_PROBE,
+            "_run_remote_python_bounded",
+            side_effect=RuntimeError("command stdout exceeded capture limit"),
+        ), mock.patch.object(REMOTE_PROBE, "_extract_framed_rollout_summary_records") as parser, mock.patch.object(
+            sys, "stdout", stdout
+        ), mock.patch.object(sys, "stderr", stderr):
+            result = REMOTE_PROBE.cmd_rollout_summary(args)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("stdout exceeded capture limit", stderr.getvalue())
+        parser.assert_not_called()
+
+    def test_remote_probe_bounded_subprocess_enforces_exact_stdout_boundary(self) -> None:
+        capture_limit = 17
+        exact = REMOTE_PROBE._run_subprocess_text_bounded(
+            [
+                sys.executable,
+                "-c",
+                f"import os; os.write(1, b'x' * {capture_limit})",
+            ],
+            timeout_seconds=5,
+            max_stdout_bytes=capture_limit,
+            max_stderr_bytes=capture_limit,
+        )
+
+        self.assertEqual(exact.returncode, 0)
+        self.assertEqual(exact.stdout, "x" * capture_limit)
+        self.assertEqual(exact.stderr, "")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            rf"stdout exceeded {capture_limit}-byte capture limit",
+        ):
+            REMOTE_PROBE._run_subprocess_text_bounded(
+                [
+                    sys.executable,
+                    "-c",
+                    f"import os; os.write(1, b'x' * {capture_limit + 1})",
+                ],
+                timeout_seconds=5,
+                max_stdout_bytes=capture_limit,
+                max_stderr_bytes=capture_limit,
+            )
+
+    def test_remote_probe_session_meta_serialized_row_boundary_local_and_embedded(self) -> None:
+        rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-row-budget.jsonl"
+        base_item = {"date": "2026/05/01", "session_id": "bounded-row", "cwd": "", "rollout": rollout_ref}
+        base_size = len(json.dumps(base_item, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        exact_cwd_size = REMOTE_PROBE.MAX_REMOTE_SESSION_META_SERIALIZED_ROW_BYTES - base_size
+
+        for extra_byte in (0, 1):
+            with self.subTest(extra_byte=extra_byte), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / ".codex"
+                cwd = "x" * (exact_cwd_size + extra_byte)
+                write_jsonl(
+                    root / rollout_ref,
+                    [{"type": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "payload": {"id": "bounded-row", "cwd": cwd}}],
+                )
+                if extra_byte == 0:
+                    local_scan = REMOTE_PROBE._scan_session_meta_records(
+                        codex_root=root, dates=[dt.date(2026, 5, 1)], limit=10, host="local"
+                    )
+                else:
+                    with self.assertRaises(REMOTE_PROBE.SessionMetaRolloutError) as local_raised:
+                        REMOTE_PROBE._scan_session_meta_records(
+                            codex_root=root, dates=[dt.date(2026, 5, 1)], limit=10, host="local"
+                        )
+                    local_stdout = io.StringIO()
+                    local_stderr = io.StringIO()
+                    with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                        sys, "stdout", local_stdout
+                    ), mock.patch.object(sys, "stderr", local_stderr):
+                        local_result = REMOTE_PROBE.cmd_session_meta(
+                            types.SimpleNamespace(host=["local"], date=["2026/05/01"], from_date=None, to_date=None, limit=10)
+                        )
+                script = REMOTE_PROBE._remote_python_script(
+                    {
+                        "mode": "session-meta",
+                        "codex_root": str(root),
+                        "dates": ["2026/05/01"],
+                        "limit": 10,
+                        "session_meta_scan_bytes": REMOTE_PROBE.MAX_SESSION_META_SCAN_BYTES,
+                    }
+                )
+                result = subprocess.run([sys.executable, "-"], input=script, text=True, capture_output=True, check=False)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload_lines = REMOTE_PROBE._extract_framed_lines(
+                result.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_SESSION_META_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_SESSION_META_END,
+                host="embedded",
+                command="session-meta",
+            )
+            records = [json.loads(line) for line in payload_lines]
+            if extra_byte == 0:
+                self.assertEqual(local_scan.rows[0]["cwd"], cwd)
+                self.assertEqual(len(payload_lines[0].encode("utf-8")), 64 * 1024)
+                self.assertEqual(records[0]["cwd"], cwd)
+            else:
+                self.assertEqual(local_raised.exception.error, REMOTE_PROBE.SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR)
+                self.assertEqual(local_result, 1)
+                self.assertEqual(local_stdout.getvalue(), "")
+                self.assertIn(REMOTE_PROBE.SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR, local_stderr.getvalue())
+                self.assertEqual(
+                    records,
+                    [{"kind": "error", "error": REMOTE_PROBE.SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR}],
+                )
+                self.assertNotIn("x" * 1024, result.stdout)
+
+    def test_remote_probe_session_meta_limit_truncation_precedes_oversized_extra_row_local_and_embedded(self) -> None:
+        accepted_ref = "sessions/2026/05/01/rollout-2026-05-01T11-00-00-limit.jsonl"
+        oversized_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-limit.jsonl"
+        oversized_item = {
+            "date": "2026/05/01",
+            "session_id": "oversized-extra",
+            "cwd": "",
+            "rollout": oversized_ref,
+        }
+        base_size = len(json.dumps(oversized_item, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        oversized_cwd = "x" * (REMOTE_PROBE.MAX_REMOTE_SESSION_META_SERIALIZED_ROW_BYTES - base_size + 1)
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_jsonl(
+                root / accepted_ref,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T11:00:00Z",
+                        "payload": {"id": "accepted", "cwd": "/repo"},
+                    }
+                ],
+            )
+            write_jsonl(
+                root / oversized_ref,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "oversized-extra", "cwd": oversized_cwd},
+                    }
+                ],
+            )
+
+            local_scan = REMOTE_PROBE._scan_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=1,
+                host="local",
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "session-meta",
+                    "codex_root": str(root),
+                    "dates": ["2026/05/01"],
+                    "limit": 1,
+                    "session_meta_scan_bytes": REMOTE_PROBE.MAX_SESSION_META_SCAN_BYTES,
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertTrue(local_scan.truncated)
+        self.assertEqual([row["session_id"] for row in local_scan.rows], ["accepted"])
+        self.assertEqual(embedded.returncode, 0, embedded.stderr)
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                embedded.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_SESSION_META_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_SESSION_META_END,
+                host="embedded",
+                command="session-meta",
+            )
+        ]
+        self.assertEqual(embedded_rows[0]["session_id"], "accepted")
+        self.assertEqual(
+            embedded_rows[1],
+            {
+                "date": "2026/05/01",
+                "kind": "truncation",
+                "limit": 1,
+                "reason": REMOTE_PROBE.SESSION_META_LIMIT_TRUNCATED_REASON,
+            },
+        )
+        self.assertNotIn("oversized-extra", embedded.stdout)
+        self.assertNotIn("x" * 1024, embedded.stdout)
+
+    def test_remote_probe_embedded_rollout_summary_serialized_record_boundary(self) -> None:
+        rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-summary-row-budget.jsonl"
+        timestamp = "2026-05-01T10:00:00Z"
+        base_record = {
+            "kind": "session_meta",
+            "line": 1,
+            "rollout": rollout_ref,
+            "session_id": "",
+            "text": "session meta present",
+            "timestamp": timestamp,
+        }
+        base_size = len(json.dumps(base_record, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        exact_session_id_size = REMOTE_PROBE.MAX_REMOTE_ROLLOUT_SUMMARY_SERIALIZED_RECORD_BYTES - base_size - 1
+
+        for extra_byte in (0, 1):
+            with self.subTest(extra_byte=extra_byte), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / ".codex"
+                session_id = "s" * (exact_session_id_size + extra_byte)
+                write_jsonl(
+                    root / rollout_ref,
+                    [{"type": "session_meta", "timestamp": timestamp, "payload": {"id": session_id, "cwd": "/repo"}}],
+                )
+                script = REMOTE_PROBE._remote_python_script(
+                    {
+                        "mode": "rollout-summary",
+                        "rollout": rollout_ref,
+                        "codex_root": str(root),
+                        "summary_keywords": [],
+                        "summary_limit": 10,
+                        "summary_scan_bytes": REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
+                        "summary_line_bytes": REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_LINE_BYTES,
+                        "summary_tail_records": 0,
+                        "summary_max_text_chars": 200,
+                    }
+                )
+                result = subprocess.run([sys.executable, "-"], input=script, text=True, capture_output=True, check=False)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload_lines = REMOTE_PROBE._extract_framed_lines(
+                result.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                host="embedded",
+                command="rollout-summary",
+            )
+            if extra_byte == 0:
+                session_meta_line = next(line for line in payload_lines if json.loads(line).get("kind") == "session_meta")
+                self.assertEqual(len(session_meta_line.encode("utf-8")) + 1, 64 * 1024)
+            else:
+                self.assertEqual(
+                    [json.loads(line) for line in payload_lines],
+                    [{"ok": False, "error": REMOTE_PROBE.ROLLOUT_SUMMARY_OUTPUT_TOO_LARGE_ERROR}],
+                )
+                self.assertNotIn("scan_meta", result.stdout)
+                self.assertNotIn("s" * 1024, result.stdout)
+
+    def test_remote_probe_embedded_rollout_summary_total_budget_boundary_has_no_partial_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-summary-total-budget.jsonl"
+            write_jsonl(
+                root / rollout_ref,
+                [{"type": "session_meta", "timestamp": "2026-05-01T10:00:00Z", "payload": {"id": "must-not-leak", "cwd": "/repo"}}],
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "rollout": rollout_ref,
+                    "codex_root": str(root),
+                    "summary_keywords": [],
+                    "summary_limit": 10,
+                    "summary_scan_bytes": REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
+                    "summary_line_bytes": REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_LINE_BYTES,
+                    "summary_tail_records": 0,
+                    "summary_max_text_chars": 200,
+                }
+            )
+            baseline = subprocess.run([sys.executable, "-"], input=script, text=True, capture_output=True, check=False)
+            baseline_lines = REMOTE_PROBE._extract_framed_lines(
+                baseline.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                host="embedded",
+                command="rollout-summary",
+            )
+            exact_budget = sum(len(line.encode("utf-8")) + 1 for line in baseline_lines)
+            assignment = f"ROLLOUT_SUMMARY_SERIALIZED_BYTES = {REMOTE_PROBE.MAX_REMOTE_ROLLOUT_SUMMARY_SERIALIZED_BYTES}"
+            self.assertEqual(script.count(assignment), 1)
+            exact = subprocess.run(
+                [sys.executable, "-"],
+                input=script.replace(assignment, f"ROLLOUT_SUMMARY_SERIALIZED_BYTES = {exact_budget}"),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            below = subprocess.run(
+                [sys.executable, "-"],
+                input=script.replace(assignment, f"ROLLOUT_SUMMARY_SERIALIZED_BYTES = {exact_budget - 1}"),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        self.assertEqual(exact.returncode, 0, exact.stderr)
+        self.assertEqual(below.returncode, 0, below.stderr)
+        self.assertEqual(exact.stdout, baseline.stdout)
+        below_lines = REMOTE_PROBE._extract_framed_lines(
+            below.stdout,
+            begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+            end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+            host="embedded",
+            command="rollout-summary",
+        )
+        self.assertEqual(
+            [json.loads(line) for line in below_lines],
+            [{"ok": False, "error": REMOTE_PROBE.ROLLOUT_SUMMARY_OUTPUT_TOO_LARGE_ERROR}],
+        )
+        self.assertNotIn("scan_meta", below.stdout)
+        self.assertNotIn("must-not-leak", below.stdout)
 
     def test_remote_probe_rollout_summary_rejects_snapshot_mutation_without_output(self) -> None:
         for mutation in ("append", "replace"):
@@ -3698,6 +4074,152 @@ class SessionRetrospectiveTests(unittest.TestCase):
             turns = MODULE.extract_summary_file(MODULE.Source("remote", root), summary, None, None)
 
         self.assertEqual(turns[0].session_id, MODULE.opaque_session_id(raw_session))
+
+    def test_remote_probe_session_meta_raw_reads_stay_within_cap_and_accept_no_lf_eof(self) -> None:
+        first_line = json.dumps(
+            {"type": "response_item", "payload": {"type": "function_call_output", "output": "x" * 70_000}},
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        session_meta = json.dumps(
+            {
+                "type": "session_meta",
+                "timestamp": "2026-05-01T10:00:00Z",
+                "payload": {"id": "no-lf-eof", "cwd": "/repo"},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload = first_line + session_meta
+        scan_bytes = len(payload)
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-no-lf.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True)
+            rollout.write_bytes(payload)
+            real_read = REMOTE_PROBE.os.read
+            read_requests: list[int] = []
+            read_returns: list[int] = []
+
+            def bounded_read(file_descriptor: int, size: int) -> bytes:
+                self.assertLessEqual(size, scan_bytes - sum(read_returns))
+                data = real_read(file_descriptor, size)
+                read_requests.append(size)
+                read_returns.append(len(data))
+                self.assertLessEqual(sum(read_returns), scan_bytes)
+                return data
+
+            with mock.patch.object(REMOTE_PROBE, "MAX_SESSION_META_SCAN_BYTES", scan_bytes), mock.patch.object(
+                REMOTE_PROBE.os, "read", bounded_read
+            ):
+                scan = REMOTE_PROBE._scan_session_meta_records(
+                    codex_root=root, dates=[dt.date(2026, 5, 1)], limit=10, host="local"
+                )
+
+            self.assertEqual([row["session_id"] for row in scan.rows], ["no-lf-eof"])
+            self.assertEqual(sum(read_returns), scan_bytes)
+            self.assertEqual(
+                read_requests,
+                [REMOTE_PROBE.SESSION_META_READ_CHUNK_BYTES, scan_bytes - REMOTE_PROBE.SESSION_META_READ_CHUNK_BYTES],
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "session-meta",
+                    "codex_root": str(root),
+                    "dates": ["2026/05/01"],
+                    "limit": 10,
+                    "session_meta_scan_bytes": scan_bytes,
+                }
+            )
+            marker = 'if CONFIG["mode"] == "session-meta":\n'
+            injection = (
+                "_real_session_meta_read = os.read\n"
+                "_session_meta_read_total = 0\n"
+                "def guarded_session_meta_read(file_descriptor, size):\n"
+                "    global _session_meta_read_total\n"
+                "    remaining = SESSION_META_SCAN_BYTES - _session_meta_read_total\n"
+                "    if size > remaining:\n"
+                "        raise AssertionError('embedded os.read exceeded remaining cap')\n"
+                "    data = _real_session_meta_read(file_descriptor, size)\n"
+                "    _session_meta_read_total += len(data)\n"
+                "    if _session_meta_read_total > SESSION_META_SCAN_BYTES:\n"
+                "        raise AssertionError('embedded os.read exceeded cumulative cap')\n"
+                "    return data\n"
+                "os.read = guarded_session_meta_read\n\n"
+            )
+            self.assertEqual(script.count(marker), 1)
+            self.assertIn("os.read(file_descriptor, read_size)", script)
+            self.assertNotIn("readline(remaining", script)
+            embedded = subprocess.run(
+                [sys.executable, "-"], input=script.replace(marker, injection + marker), text=True, capture_output=True, check=False
+            )
+
+        self.assertEqual(embedded.returncode, 0, embedded.stderr)
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                embedded.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_SESSION_META_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_SESSION_META_END,
+                host="embedded",
+                command="session-meta",
+            )
+        ]
+        self.assertEqual([row["session_id"] for row in embedded_rows], ["no-lf-eof"])
+
+    def test_remote_probe_session_meta_rejects_trailing_bytes_at_exact_cap_local_and_embedded(self) -> None:
+        session_id = "exact-cap-must-not-escape"
+        record = json.dumps(
+            {
+                "type": "session_meta",
+                "timestamp": "2026-05-01T10:00:00Z",
+                "payload": {"id": session_id, "cwd": "/repo"},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        for line_ending in (b"\n", b""):
+            with self.subTest(line_ending=line_ending), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / ".codex"
+                rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-exact-cap.jsonl"
+                rollout = root / rollout_ref
+                rollout.parent.mkdir(parents=True)
+                bounded_prefix = record + line_ending
+                rollout.write_bytes(bounded_prefix + b"trailing-byte")
+                scan_bytes = len(bounded_prefix)
+                with mock.patch.object(REMOTE_PROBE, "MAX_SESSION_META_SCAN_BYTES", scan_bytes), self.assertRaises(
+                    REMOTE_PROBE.SessionMetaRolloutError
+                ) as raised:
+                    REMOTE_PROBE._scan_session_meta_records(
+                        codex_root=root, dates=[dt.date(2026, 5, 1)], limit=10, host="local"
+                    )
+                self.assertIn("session metadata scan truncated", raised.exception.error)
+                script = REMOTE_PROBE._remote_python_script(
+                    {
+                        "mode": "session-meta",
+                        "codex_root": str(root),
+                        "dates": ["2026/05/01"],
+                        "limit": 10,
+                        "session_meta_scan_bytes": scan_bytes,
+                    }
+                )
+                embedded = subprocess.run([sys.executable, "-"], input=script, text=True, capture_output=True, check=False)
+
+            self.assertEqual(embedded.returncode, 0, embedded.stderr)
+            embedded_rows = [
+                json.loads(line)
+                for line in REMOTE_PROBE._extract_framed_lines(
+                    embedded.stdout,
+                    begin_marker=REMOTE_PROBE.REMOTE_SESSION_META_BEGIN,
+                    end_marker=REMOTE_PROBE.REMOTE_SESSION_META_END,
+                    host="embedded",
+                    command="session-meta",
+                )
+            ]
+            self.assertEqual(len(embedded_rows), 1)
+            self.assertEqual(embedded_rows[0]["kind"], "error")
+            self.assertIn("session metadata scan truncated", embedded_rows[0]["error"])
+            self.assertNotIn(session_id, embedded.stdout)
 
     def test_remote_probe_session_meta_fails_closed_on_truncated_record(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

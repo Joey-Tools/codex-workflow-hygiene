@@ -27,13 +27,30 @@ DATE_FORMAT = "%Y/%m/%d"
 MAX_SESSION_META_LIMIT = 500
 MAX_SESSION_META_DATE_COUNT = 31
 MAX_FETCH_ROLLOUT_BYTES = 16 * 1024 * 1024
+MAX_REMOTE_SESSION_META_SERIALIZED_ROW_BYTES = 64 * 1024
+REMOTE_SESSION_META_FRAME_OVERHEAD_BYTES = 64 * 1024
+MAX_REMOTE_SESSION_META_STDOUT_BYTES = (
+    (MAX_SESSION_META_LIMIT + 1) * MAX_REMOTE_SESSION_META_SERIALIZED_ROW_BYTES
+    + REMOTE_SESSION_META_FRAME_OVERHEAD_BYTES
+)
 MAX_ROLLOUT_SUMMARY_LIMIT = 200
 MAX_ROLLOUT_SUMMARY_SCAN_BYTES = MAX_FETCH_ROLLOUT_BYTES
 MAX_ROLLOUT_SUMMARY_LINE_BYTES = 1024 * 1024
 MAX_ROLLOUT_SUMMARY_TAIL_RECORDS = 50
 MAX_ROLLOUT_SUMMARY_TEXT_CHARS = 1200
+MAX_REMOTE_ROLLOUT_SUMMARY_SERIALIZED_RECORD_BYTES = 64 * 1024
+MAX_REMOTE_ROLLOUT_SUMMARY_SERIALIZED_BYTES = (
+    (2 * MAX_ROLLOUT_SUMMARY_LIMIT + 4)
+    * MAX_REMOTE_ROLLOUT_SUMMARY_SERIALIZED_RECORD_BYTES
+)
+REMOTE_ROLLOUT_SUMMARY_FRAME_OVERHEAD_BYTES = 64 * 1024
+MAX_REMOTE_ROLLOUT_SUMMARY_STDOUT_BYTES = (
+    MAX_REMOTE_ROLLOUT_SUMMARY_SERIALIZED_BYTES
+    + REMOTE_ROLLOUT_SUMMARY_FRAME_OVERHEAD_BYTES
+)
 MAX_REMOTE_STDERR_BYTES = 64 * 1024
 REMOTE_FETCH_FRAME_OVERHEAD_BYTES = 64 * 1024
+SESSION_META_READ_CHUNK_BYTES = 64 * 1024
 REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF = "remote_generated_rollout_summary_v1"
 REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF = "remote_generated_rollout_source_identity_v1"
 SOURCE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -307,10 +324,12 @@ SUMMARY_SENSITIVE_SIGNAL_RE = re.compile(SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT, 
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
 SESSION_META_LIMIT_TRUNCATED_REASON = "session_meta_limit_truncated"
+SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR = "session-meta output row too large"
 REMOTE_FETCH_ROLLOUT_BEGIN = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_BEGIN__"
 REMOTE_FETCH_ROLLOUT_END = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_END__"
 REMOTE_ROLLOUT_SUMMARY_BEGIN = "__REMOTE_CODEX_PROBE_ROLLOUT_SUMMARY_BEGIN__"
 REMOTE_ROLLOUT_SUMMARY_END = "__REMOTE_CODEX_PROBE_ROLLOUT_SUMMARY_END__"
+ROLLOUT_SUMMARY_OUTPUT_TOO_LARGE_ERROR = "rollout summary output too large"
 
 HOSTS: dict[str, dict[str, str]] = {
     "local": {"kind": "local", "label": "local", "codex_root": "~/.codex"},
@@ -1251,12 +1270,18 @@ LIMIT = int(CONFIG.get("limit", 0))
 ROOT = pathlib.Path(CONFIG["codex_root"]).expanduser()
 MAX_FETCH_ROLLOUT_BYTES = int(CONFIG.get("max_fetch_rollout_bytes", 0))
 SESSION_META_SCAN_BYTES = int(CONFIG.get("session_meta_scan_bytes", 0))
+SESSION_META_READ_CHUNK_BYTES = {SESSION_META_READ_CHUNK_BYTES}
+SESSION_META_SERIALIZED_ROW_BYTES = {MAX_REMOTE_SESSION_META_SERIALIZED_ROW_BYTES}
+SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR = {SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR!r}
 SUMMARY_LIMIT = int(CONFIG.get("summary_limit", 0))
 SUMMARY_SCAN_BYTES = int(CONFIG.get("summary_scan_bytes", 0))
 SUMMARY_LINE_BYTES = int(CONFIG.get("summary_line_bytes", 0)) or {MAX_ROLLOUT_SUMMARY_LINE_BYTES}
 SUMMARY_TAIL_RECORDS = int(CONFIG.get("summary_tail_records", 0))
 SUMMARY_MAX_TEXT_CHARS = int(CONFIG.get("summary_max_text_chars", 0))
 SUMMARY_MAX_TEXT_CHARS_LIMIT = {MAX_ROLLOUT_SUMMARY_TEXT_CHARS}
+ROLLOUT_SUMMARY_SERIALIZED_BYTES = {MAX_REMOTE_ROLLOUT_SUMMARY_SERIALIZED_BYTES}
+ROLLOUT_SUMMARY_SERIALIZED_RECORD_BYTES = {MAX_REMOTE_ROLLOUT_SUMMARY_SERIALIZED_RECORD_BYTES}
+ROLLOUT_SUMMARY_OUTPUT_TOO_LARGE_ERROR = {ROLLOUT_SUMMARY_OUTPUT_TOO_LARGE_ERROR!r}
 SUMMARY_KEYWORDS = [str(value) for value in CONFIG.get("summary_keywords", [])]
 ROLLOUT_START = CONFIG.get("rollout_start")
 ROLLOUT_END = CONFIG.get("rollout_end")
@@ -1619,6 +1644,15 @@ def session_meta_date_overlaps_window(date_text):
     return True
 
 
+def emit_session_meta_item(item):
+    serialized = json.dumps(item, separators=(",", ":"), sort_keys=True)
+    if len(serialized.encode("utf-8")) > SESSION_META_SERIALIZED_ROW_BYTES:
+        print(json.dumps({{"kind": "error", "error": SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR}}, separators=(",", ":"), sort_keys=True))
+        return False
+    print(serialized)
+    return True
+
+
 def session_meta_from_rollout(rel, date_text=None, require_record_date_match=False):
     try:
         target = safe_rollout_path(rel)
@@ -1627,7 +1661,7 @@ def session_meta_from_rollout(rel, date_text=None, require_record_date_match=Fal
     try:
         handle = open_rollout_text(target)
     except OSError:
-        print(json.dumps({{"kind": "error", "error": "rollout unreadable", "rollout": rel.as_posix()}}, separators=(",", ":"), sort_keys=True))
+        emit_session_meta_item({{"kind": "error", "error": "rollout unreadable", "rollout": rel.as_posix()}})
         print(SESSION_META_END)
         raise SystemExit(0)
     try:
@@ -1662,7 +1696,7 @@ def session_meta_from_rollout(rel, date_text=None, require_record_date_match=Fal
                     meta_date = timestamp.strftime("%Y/%m/%d")
                 return meta_date, session_id, cwd, timestamp
     except ValueError as error:
-        print(json.dumps({{"kind": "error", "error": str(error), "rollout": rel.as_posix()}}, separators=(",", ":"), sort_keys=True))
+        emit_session_meta_item({{"kind": "error", "error": str(error), "rollout": rel.as_posix()}})
         print(SESSION_META_END)
         raise SystemExit(0)
     return None
@@ -1829,17 +1863,56 @@ def summary_record_has_signal(record):
 def bounded_session_meta_lines(handle, max_scan_bytes):
     if max_scan_bytes < 1:
         raise ValueError("session metadata scan budget must be positive")
+    try:
+        file_descriptor = handle.fileno()
+    except (AttributeError, OSError, ValueError):
+        file_descriptor = None
     scanned = 0
+    buffer = bytearray()
+    buffer_offset = 0
     while True:
         remaining = max_scan_bytes - scanned
-        raw_line = handle.readline(remaining + 1)
-        if not raw_line:
+        if remaining <= 0:
             return
-        raw_bytes = raw_line.encode("utf-8", "surrogatepass") if isinstance(raw_line, str) else bytes(raw_line)
-        if len(raw_bytes) > remaining:
-            raise ValueError("session metadata scan truncated at " + str(max_scan_bytes) + " bytes")
+        read_size = min(SESSION_META_READ_CHUNK_BYTES, remaining)
+        chunk = os.read(file_descriptor, read_size) if file_descriptor is not None else handle.read(read_size)
+        if not chunk:
+            if buffer:
+                yield bytes(buffer).decode("utf-8", "replace")
+            return
+        raw_bytes = chunk.encode("utf-8", "surrogatepass") if isinstance(chunk, str) else bytes(chunk)
+        if len(raw_bytes) > read_size:
+            raise ValueError("session metadata reader exceeded requested byte count")
         scanned += len(raw_bytes)
-        yield raw_bytes.decode("utf-8", "replace")
+        buffer.extend(raw_bytes)
+        cap_has_unread_bytes = False
+        if scanned == max_scan_bytes:
+            try:
+                if file_descriptor is not None:
+                    position = os.lseek(file_descriptor, 0, os.SEEK_CUR)
+                    cap_has_unread_bytes = os.fstat(file_descriptor).st_size > position
+                else:
+                    cap_has_unread_bytes = len(handle.getbuffer()) > handle.tell()
+            except (AttributeError, OSError, TypeError, ValueError):
+                cap_has_unread_bytes = True
+        while True:
+            line_end = buffer.find(b"\\n")
+            if line_end < 0:
+                break
+            line_size = line_end + 1
+            absolute_line_end = buffer_offset + line_size
+            if cap_has_unread_bytes and absolute_line_end == max_scan_bytes:
+                raise ValueError("session metadata scan truncated at " + str(max_scan_bytes) + " bytes")
+            line = bytes(buffer[:line_size])
+            del buffer[:line_size]
+            buffer_offset = absolute_line_end
+            yield line.decode("utf-8", "replace")
+        if scanned == max_scan_bytes:
+            if cap_has_unread_bytes:
+                raise ValueError("session metadata scan truncated at " + str(max_scan_bytes) + " bytes")
+            if buffer:
+                yield bytes(buffer).decode("utf-8", "replace")
+            return
 
 
 def bounded_text_lines(handle, max_scan_bytes):
@@ -2063,7 +2136,26 @@ def summarize_rollout():
 
     target_sha256 = hashing_reader.hexdigest() if hashing_reader.bytes_read == target_size else None
 
-    print(json.dumps({{"ok": True}}, separators=(",", ":"), sort_keys=True))
+    serialized_lines = []
+    serialized_bytes = 0
+    output_too_large = False
+
+    def append_serialized(item):
+        nonlocal serialized_bytes, output_too_large
+        if output_too_large:
+            return
+        line = json.dumps(item, separators=(",", ":"), sort_keys=True)
+        line_bytes = len(line.encode("utf-8")) + 1
+        if (
+            line_bytes > ROLLOUT_SUMMARY_SERIALIZED_RECORD_BYTES
+            or serialized_bytes + line_bytes > ROLLOUT_SUMMARY_SERIALIZED_BYTES
+        ):
+            output_too_large = True
+            return
+        serialized_lines.append(line)
+        serialized_bytes += line_bytes
+
+    append_serialized({{"ok": True}})
     keyword_filter_applied = bool(keywords)
     record_limit_reached = bool(signal_record_limit_reached or matched_record_limit_reached)
     planned_emitted = set()
@@ -2142,7 +2234,7 @@ def summarize_rollout():
         scan_meta["source_identity_proof"] = REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF
     if source_identity_proven and scan_meta.get("tail_record_limit_reached") is False:
         scan_meta["coverage_proof"] = REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF
-    print(json.dumps(scan_meta, separators=(",", ":"), sort_keys=True))
+    append_serialized(scan_meta)
     emitted = set()
 
     def emit(record):
@@ -2154,7 +2246,7 @@ def summarize_rollout():
         payload = dict(record)
         payload.pop("_keyword_matched", None)
         payload["rollout"] = normalized
-        print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        append_serialized(payload)
         emitted.add(key)
 
     emit(session_meta_record)
@@ -2169,6 +2261,12 @@ def summarize_rollout():
     emit(last_assistant_record)
     if last_assistant_record is None:
         emit(last_task_complete_record)
+    if output_too_large:
+        print(json.dumps({{"ok": False, "error": ROLLOUT_SUMMARY_OUTPUT_TOO_LARGE_ERROR}}, separators=(",", ":"), sort_keys=True))
+        print(ROLLOUT_SUMMARY_END)
+        return
+    for line in serialized_lines:
+        print(line)
     print(ROLLOUT_SUMMARY_END)
 
 
@@ -2182,7 +2280,7 @@ def iter_session_meta():
     print(SESSION_META_BEGIN)
 
     def session_directory_unreadable():
-        print(json.dumps({{"kind": "error", "error": "session directory unreadable"}}, separators=(",", ":"), sort_keys=True))
+        emit_session_meta_item({{"kind": "error", "error": "session directory unreadable"}})
         print(SESSION_META_END)
         raise SystemExit(0)
 
@@ -2294,10 +2392,12 @@ def iter_session_meta():
             if session_id:
                 count += 1
                 if LIMIT and count > LIMIT:
-                    print(json.dumps({{"kind": "truncation", "reason": SESSION_META_LIMIT_TRUNCATED_REASON, "date": date_text, "limit": LIMIT}}, separators=(",", ":"), sort_keys=True))
+                    emit_session_meta_item({{"kind": "truncation", "reason": SESSION_META_LIMIT_TRUNCATED_REASON, "date": date_text, "limit": LIMIT}})
                     print(SESSION_META_END)
                     return
-                print(json.dumps({{"date": date_text, "session_id": session_id, "cwd": cwd, "rollout": rollout.relative_to(root).as_posix()}}, separators=(",", ":"), sort_keys=True))
+                if not emit_session_meta_item({{"date": date_text, "session_id": session_id, "cwd": cwd, "rollout": rollout.relative_to(root).as_posix()}}):
+                    print(SESSION_META_END)
+                    return
     print(SESSION_META_END)
 
 
@@ -2363,14 +2463,6 @@ def _remote_python_argv(alias: str) -> list[str]:
     ]
 
 
-def _run_remote_python(alias: str, payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
-    return _run_subprocess_text(
-        _remote_python_argv(alias),
-        input_text=_remote_python_script(payload),
-        timeout_seconds=REMOTE_COMMAND_TIMEOUT_SECONDS,
-    )
-
-
 def _run_remote_python_bounded(
     alias: str,
     payload: dict[str, object],
@@ -2384,6 +2476,20 @@ def _run_remote_python_bounded(
         max_stdout_bytes=max_stdout_bytes,
         max_stderr_bytes=MAX_REMOTE_STDERR_BYTES,
     )
+
+
+def _validated_session_meta_output_item(
+    *,
+    date: str,
+    session_id: str,
+    cwd: str,
+    rollout: str,
+) -> dict[str, str]:
+    item = {"date": date, "session_id": session_id, "cwd": cwd, "rollout": rollout}
+    serialized = json.dumps(item, separators=(",", ":"), sort_keys=True)
+    if len(serialized.encode("utf-8")) > MAX_REMOTE_SESSION_META_SERIALIZED_ROW_BYTES:
+        raise ValueError(SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR)
+    return item
 
 
 def _scan_session_meta_records(
@@ -2546,17 +2652,18 @@ def _scan_session_meta_records(
                 _meta_date, session_id, cwd, _timestamp = meta
             if not session_id:
                 continue
-            rows.append(
-                {
-                    "host": host,
-                    "date": date_value.strftime(DATE_FORMAT),
-                    "session_id": session_id,
-                    "cwd": cwd,
-                    "rollout": rollout_path.relative_to(resolved_root).as_posix(),
-                }
-            )
-            if limit and len(rows) > limit:
-                return SessionMetaScan(rows=rows[:limit], truncated=True)
+            if limit and len(rows) >= limit:
+                return SessionMetaScan(rows=rows, truncated=True)
+            try:
+                item = _validated_session_meta_output_item(
+                    date=date_value.strftime(DATE_FORMAT),
+                    session_id=session_id,
+                    cwd=cwd,
+                    rollout=rollout_relative_key,
+                )
+            except ValueError as exc:
+                raise SessionMetaRolloutError(str(exc), rollout=rollout_relative_key) from exc
+            rows.append({"host": host, **item})
     return SessionMetaScan(rows=rows, truncated=False)
 
 
@@ -2756,13 +2863,13 @@ def _session_meta_row_from_item(item: dict[str, Any], *, host: str) -> dict[str,
         raise ValueError(
             f"remote helper returned incomplete session-meta payload for host {host}: missing {', '.join(missing)}"
         )
-    return {
-        "host": host,
-        "date": str(item["date"]),
-        "session_id": str(item["session_id"]),
-        "cwd": str(item["cwd"]),
-        "rollout": str(item["rollout"]),
-    }
+    validated = _validated_session_meta_output_item(
+        date=str(item["date"]),
+        session_id=str(item["session_id"]),
+        cwd=str(item["cwd"]),
+        rollout=str(item["rollout"]),
+    )
+    return {"host": host, **validated}
 
 
 def _is_session_meta_truncation_item(item: dict[str, Any]) -> bool:
@@ -2823,7 +2930,11 @@ def _scan_host_session_meta(
         payload["rollout_end"] = _iso_utc(rollout_end)
     if rollout_filename_mode != "all":
         payload["rollout_filename_mode"] = rollout_filename_mode
-    result = _run_remote_python(alias, payload)
+    result = _run_remote_python_bounded(
+        alias,
+        payload,
+        max_stdout_bytes=MAX_REMOTE_SESSION_META_STDOUT_BYTES,
+    )
     if result.returncode != 0:
         raise RuntimeError("remote session-meta failed")
     rows: list[dict[str, str]] = []
@@ -3303,23 +3414,60 @@ def _build_summary_record(
 def _bounded_session_meta_lines(handle: Any, max_scan_bytes: int) -> Iterable[str]:
     if max_scan_bytes < 1:
         raise ValueError("session metadata scan budget must be positive")
+    try:
+        file_descriptor = handle.fileno()
+    except (AttributeError, OSError, ValueError):
+        file_descriptor = None
     scanned = 0
+    buffer = bytearray()
+    buffer_offset = 0
     while True:
         remaining = max_scan_bytes - scanned
-        raw_line = handle.readline(remaining + 1)
-        if not raw_line:
+        if remaining <= 0:
+            return
+        read_size = min(SESSION_META_READ_CHUNK_BYTES, remaining)
+        chunk = os.read(file_descriptor, read_size) if file_descriptor is not None else handle.read(read_size)
+        if not chunk:
+            if buffer:
+                yield bytes(buffer).decode("utf-8", "replace")
             return
         raw_bytes = (
-            raw_line.encode("utf-8", "surrogatepass")
-            if isinstance(raw_line, str)
-            else bytes(raw_line)
+            chunk.encode("utf-8", "surrogatepass")
+            if isinstance(chunk, str)
+            else bytes(chunk)
         )
-        if len(raw_bytes) > remaining:
-            raise ValueError(
-                f"session metadata scan truncated at {max_scan_bytes} bytes"
-            )
+        if len(raw_bytes) > read_size:
+            raise ValueError("session metadata reader exceeded requested byte count")
         scanned += len(raw_bytes)
-        yield raw_bytes.decode("utf-8", "replace")
+        buffer.extend(raw_bytes)
+        cap_has_unread_bytes = False
+        if scanned == max_scan_bytes:
+            try:
+                if file_descriptor is not None:
+                    position = os.lseek(file_descriptor, 0, os.SEEK_CUR)
+                    cap_has_unread_bytes = os.fstat(file_descriptor).st_size > position
+                else:
+                    cap_has_unread_bytes = len(handle.getbuffer()) > handle.tell()
+            except (AttributeError, OSError, TypeError, ValueError):
+                cap_has_unread_bytes = True
+        while True:
+            line_end = buffer.find(b"\n")
+            if line_end < 0:
+                break
+            line_size = line_end + 1
+            absolute_line_end = buffer_offset + line_size
+            if cap_has_unread_bytes and absolute_line_end == max_scan_bytes:
+                raise ValueError(f"session metadata scan truncated at {max_scan_bytes} bytes")
+            line = bytes(buffer[:line_size])
+            del buffer[:line_size]
+            buffer_offset = absolute_line_end
+            yield line.decode("utf-8", "replace")
+        if scanned == max_scan_bytes:
+            if cap_has_unread_bytes:
+                raise ValueError(f"session metadata scan truncated at {max_scan_bytes} bytes")
+            if buffer:
+                yield bytes(buffer).decode("utf-8", "replace")
+            return
 
 
 def _bounded_text_lines(handle: Any, max_scan_bytes: int) -> Iterable[str]:
@@ -3741,7 +3889,11 @@ def cmd_rollout_summary(args: argparse.Namespace) -> int:
                 "summary_max_text_chars": args.max_text_chars,
             }
             try:
-                result = _run_remote_python(alias, payload)
+                result = _run_remote_python_bounded(
+                    alias,
+                    payload,
+                    max_stdout_bytes=MAX_REMOTE_ROLLOUT_SUMMARY_STDOUT_BYTES,
+                )
             except RuntimeError as error:
                 print(f"host={alias}", file=sys.stderr)
                 print(f"rollout={rollout_ref}", file=sys.stderr)
