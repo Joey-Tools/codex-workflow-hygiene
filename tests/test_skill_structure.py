@@ -130,7 +130,6 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("elif item_type == 'task_complete'", workflow)
         self.assertIn("payload.get('message')", workflow)
         self.assertIn("last_agent_message", workflow)
-        self.assertIn("record_kind = item_type or obj.get('type') or 'history'", workflow)
         self.assertNotIn("text = json.dumps(payload", workflow)
         self.assertNotIn("snippet = ' '.join(text.split())[:", workflow)
         self.assertIn("path.open('rb')", keyword_recipe)
@@ -139,10 +138,29 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("def iter_text(value):", keyword_recipe)
         self.assertIn("def normalized_characters(parts):", keyword_recipe)
         self.assertIn("yield from iter_text(item)", keyword_recipe)
-        self.assertIn("snippet = hit_window(iter_record_text(", keyword_recipe)
+        self.assertIn("snippet = hit_window(", keyword_recipe)
+        self.assertIn(
+            "iter_record_text(obj, payload, item_type, safe_item_type)",
+            keyword_recipe,
+        )
+        self.assertIn("def bounded_output_field(value, fallback):", keyword_recipe)
+        self.assertIn(
+            "item_type_value if isinstance(item_type_value, str) else None",
+            keyword_recipe,
+        )
+        self.assertIn(
+            "safe_item_type = bounded_output_field(item_type, '')", keyword_recipe
+        )
+        self.assertIn(
+            "record_kind = safe_item_type or bounded_output_field(", keyword_recipe
+        )
+        self.assertIn(
+            "timestamp = bounded_output_field(timestamp_value, '')", keyword_recipe
+        )
         self.assertNotIn("text_parts", keyword_recipe)
         self.assertNotIn("' '.join(' '.join(", keyword_recipe)
         self.assertNotIn("collect_text(", keyword_recipe)
+        self.assertNotIn("str(item_type", keyword_recipe)
 
     def test_session_mining_avoids_whole_codex_home_searches(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -678,6 +696,64 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn(f"{rollout}:2:", result.stdout)
         self.assertIn(normal_marker, result.stdout)
         self.assertNotIn(decoy_marker, result.stdout)
+
+    def test_session_mining_exact_probe_bounds_and_escapes_untrusted_metadata(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
+        start = workflow.index(marker) + len(marker)
+        code = workflow[start : workflow.index("\nPY\n" + (chr(96) * 3), start)]
+        row = {
+            "type": "outer\nkind\x00" + ("T" * 220_000),
+            "timestamp": {
+                "nested": "timestamp-dict-marker-" + ("Q" * 220_000)
+            },
+            "ts": "2026-07-17T00:00:00Z\nforged-ts-line\x1b" + ("Z" * 110_000),
+            "payload": {
+                "type": {
+                    "nested": "payload-type-dict-marker-" + ("P" * 330_000),
+                    "control": "\nforged-payload-type-line",
+                },
+                "content": {
+                    "nested": [
+                        "metadata safe needle",
+                        "bounded metadata tail",
+                    ]
+                },
+            },
+        }
+        raw_record = (json_dumps(row) + "\n").encode("utf-8")
+        self.assertLessEqual(len(raw_record), 1024 * 1024)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout-untrusted-metadata.jsonl"
+            rollout.write_bytes(raw_record)
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(rollout), "metadata safe needle"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertLess(len(result.stdout.encode("utf-8")), 1000)
+        self.assertIn("metadata safe needle", result.stdout)
+        self.assertIn("bounded metadata tail", result.stdout)
+        self.assertIn("\\u0000", result.stdout)
+        self.assertIn("\\u001b", result.stdout)
+        self.assertNotIn("\x00", result.stdout)
+        self.assertNotIn("\x1b", result.stdout)
+        self.assertNotIn("forged-ts-line\n", result.stdout)
+        self.assertNotIn("timestamp-dict-marker", result.stdout)
+        self.assertNotIn("payload-type-dict-marker", result.stdout)
+        self.assertNotIn("T" * 256, result.stdout)
+        self.assertNotIn("Q" * 256, result.stdout)
+        self.assertNotIn("P" * 256, result.stdout)
+        self.assertNotIn("Z" * 256, result.stdout)
 
     def test_session_mining_failure_probe_handles_event_message_fields(self) -> None:
         root = Path(__file__).resolve().parents[1]

@@ -298,6 +298,7 @@ printed = 0
 max_record_bytes = 1024 * 1024
 before_chars = 180
 after_chars = 220
+max_metadata_chars = 80
 
 
 def bounded_jsonl(handle):
@@ -362,8 +363,46 @@ def iter_top_level_fields(obj):
         yield from iter_text(value)
 
 
-def iter_record_text(obj, payload, item_type):
-    yield str(item_type or '')
+def bounded_output_field(value, fallback):
+    if not isinstance(value, str):
+        return fallback
+    fragments = []
+    length = 0
+    pending_space = False
+    truncated = False
+    for character in value:
+        if character.isspace():
+            pending_space = bool(fragments)
+            continue
+        encoded = json.dumps(character, ensure_ascii=True)[1:-1]
+        candidates = (' ', encoded) if pending_space else (encoded,)
+        for fragment in candidates:
+            if length + len(fragment) > max_metadata_chars:
+                truncated = True
+                break
+            fragments.append(fragment)
+            length += len(fragment)
+        if truncated:
+            break
+        pending_space = False
+    if not fragments:
+        return fallback
+    if truncated:
+        while fragments and length + 3 > max_metadata_chars:
+            length -= len(fragments.pop())
+        fragments.append('...')
+    return ''.join(fragments)
+
+
+def first_string_value(*values):
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def iter_record_text(obj, payload, item_type, safe_item_type):
+    yield safe_item_type
     if item_type == 'message':
         yield from iter_text(payload.get('content') or [])
     elif item_type == 'function_call':
@@ -453,19 +492,26 @@ with path.open('rb') as handle:
         payload = obj.get('payload') or {}
         if not isinstance(payload, dict):
             payload = {}
-        item_type = payload.get('type')
-        record_kind = item_type or obj.get('type') or 'history'
-        snippet = hit_window(iter_record_text(obj, payload, item_type), needle)
+        item_type_value = payload.get('type')
+        item_type = item_type_value if isinstance(item_type_value, str) else None
+        safe_item_type = bounded_output_field(item_type, '')
+        record_kind = safe_item_type or bounded_output_field(obj.get('type'), 'history')
+        timestamp_value = first_string_value(obj.get('timestamp'), obj.get('ts'))
+        timestamp = bounded_output_field(timestamp_value, '')
+        snippet = hit_window(
+            iter_record_text(obj, payload, item_type, safe_item_type),
+            needle,
+        )
         if snippet is None:
             continue
-        print(f'{path}:{line_no}:{obj.get("timestamp") or obj.get("ts")}:{record_kind}:{snippet}')
+        print(f'{path}:{line_no}:{timestamp}:{record_kind}:{snippet}')
         printed += 1
         if printed >= 20:
             break
 PY
 ```
 
-The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the selected nested strings incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory.
+The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the selected nested strings incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
 
 For JSONL schema checks, inspect one record or aggregate unique keys once. Do not run `jq -R 'fromjson | keys' file.jsonl`, because it prints the same key list for every line and can produce massive output on retained artifacts such as `turn_flags.jsonl`.
 

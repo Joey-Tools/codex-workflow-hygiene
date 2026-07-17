@@ -2195,6 +2195,8 @@ def iter_session_meta():
                     if entry.name.startswith("rollout-") and entry.name.endswith(".jsonl")
                 ]
             return sorted(paths, reverse=True)
+        except FileNotFoundError:
+            return []
         except OSError:
             session_directory_unreadable()
 
@@ -2413,6 +2415,8 @@ def _scan_session_meta_records(
                     and entry.name.endswith(".jsonl")
                 ]
             return sorted(paths, reverse=True)
+        except FileNotFoundError:
+            return []
         except OSError as exc:
             raise SessionMetaRolloutError("session directory unreadable") from exc
 

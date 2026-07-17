@@ -894,6 +894,49 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     self.assertNotIn("blocked", stderr.getvalue())
                     self.assertNotIn("I/O error", stderr.getvalue())
 
+    def test_remote_probe_session_meta_tolerates_directory_disappearing_after_validation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            date_dir = root / "sessions" / "2026" / "05" / "01"
+            date_dir.mkdir(parents=True)
+            resolved_date_dir = date_dir.resolve()
+            real_scandir = os.scandir
+            hit_target = {"value": False}
+
+            def scandir_or_disappear(path: object):
+                if Path(path) == resolved_date_dir:
+                    hit_target["value"] = True
+                    raise FileNotFoundError("directory disappeared after validation")
+                return real_scandir(path)
+
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE, "_local_codex_root", return_value=root
+            ), mock.patch.object(
+                REMOTE_PROBE.os, "scandir", scandir_or_disappear
+            ), mock.patch.object(
+                sys, "stderr", stderr
+            ), mock.patch.object(
+                sys, "stdout", stdout
+            ):
+                result = REMOTE_PROBE.cmd_session_meta(
+                    types.SimpleNamespace(
+                        host=["local"],
+                        date=["2026/05/01"],
+                        from_date=None,
+                        to_date=None,
+                        limit=10,
+                    )
+                )
+
+        self.assertTrue(hit_target["value"])
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout.getvalue(), "host\tdate\tsession_id\tcwd\trollout\n")
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_remote_probe_embedded_session_meta_frames_directory_enumeration_errors(
         self,
     ) -> None:
@@ -942,6 +985,50 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 self.assertNotIn("/home/hoteng/.codex", output)
                 self.assertNotIn("blocked", output)
                 self.assertNotIn("I/O error", output)
+
+    def test_remote_probe_embedded_session_meta_tolerates_directory_disappearing_after_validation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            date_dir = root / "sessions" / "2026" / "05" / "01"
+            date_dir.mkdir(parents=True)
+            resolved_date_dir = date_dir.resolve()
+            namespace = embedded_probe_namespace(
+                {
+                    "mode": "session-meta",
+                    "codex_root": str(root),
+                    "dates": ["2026/05/01"],
+                    "limit": 10,
+                    "session_meta_scan_bytes": 1024 * 1024,
+                }
+            )
+            real_scandir = os.scandir
+            hit_target = {"value": False}
+
+            def scandir_or_disappear(path: object):
+                if Path(path) == resolved_date_dir:
+                    hit_target["value"] = True
+                    raise FileNotFoundError("directory disappeared after validation")
+                return real_scandir(path)
+
+            stdout = io.StringIO()
+            with mock.patch.object(
+                namespace["os"], "scandir", scandir_or_disappear
+            ), mock.patch.object(sys, "stdout", stdout):
+                namespace["iter_session_meta"]()
+
+        output = stdout.getvalue()
+        self.assertTrue(hit_target["value"])
+        self.assertEqual(
+            output.splitlines(),
+            [
+                REMOTE_PROBE.REMOTE_SESSION_META_BEGIN,
+                REMOTE_PROBE.REMOTE_SESSION_META_END,
+            ],
+        )
+        self.assertNotIn('"kind":"error"', output)
+        self.assertNotIn("disappeared", output)
 
     def test_remote_probe_session_meta_reports_unreadable_remote_rollout_without_remote_path(self) -> None:
         marker = json.dumps(
