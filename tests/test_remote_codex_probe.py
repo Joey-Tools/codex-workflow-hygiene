@@ -218,10 +218,10 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         rollout.name,
                         mutate,
                         before_call=(
-                            1 if mutation.endswith("before_first_stat") else None
+                            3 if mutation.endswith("before_first_stat") else None
                         ),
                         after_call=(
-                            1 if mutation.endswith("between_stats") else None
+                            3 if mutation.endswith("between_stats") else None
                         ),
                     )
                     output = io.StringIO()
@@ -258,7 +258,9 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                     self.assertEqual(error_rollout, ROLLOUT_REF)
                     self.assertNotIn("replacement-session", output.getvalue())
 
-    def test_session_meta_filters_scope_before_abnormal_candidate_open(self) -> None:
+    def test_session_meta_filters_scope_before_abnormal_candidate_metadata(
+        self,
+    ) -> None:
         for scope in ("local", "embedded"):
             for layout in ("root", "flat_archive"):
                 for in_scope in (False, True):
@@ -310,7 +312,9 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                                 return namespace["iter_session_meta"]()
 
                         real_open = target_os.open
+                        real_stat = target_os.stat
                         candidate_opened = False
+                        candidate_statted = False
 
                         def tracking_open(
                             path: object,
@@ -324,10 +328,33 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                                 candidate_opened = True
                             return real_open(path, flags, mode, dir_fd=dir_fd)
 
+                        def tracking_stat(
+                            path: object,
+                            *,
+                            dir_fd: int | None = None,
+                            follow_symlinks: bool = True,
+                        ) -> os.stat_result:
+                            nonlocal candidate_statted
+                            if (
+                                path == abnormal.name
+                                and dir_fd is not None
+                                and follow_symlinks is False
+                            ):
+                                candidate_statted = True
+                            return real_stat(
+                                path,
+                                dir_fd=dir_fd,
+                                follow_symlinks=follow_symlinks,
+                            )
+
                         with mock.patch.object(
                             target_os,
                             "open",
                             side_effect=tracking_open,
+                        ), mock.patch.object(
+                            target_os,
+                            "stat",
+                            side_effect=tracking_stat,
                         ), redirect_stdout(output):
                             if in_scope and scope == "local":
                                 with self.assertRaises(
@@ -347,7 +374,8 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                             else:
                                 scan = run_scan()
 
-                        self.assertEqual(candidate_opened, in_scope)
+                        self.assertEqual(candidate_statted, in_scope)
+                        self.assertFalse(candidate_opened)
                         if in_scope:
                             self.assertEqual(error, "rollout path is a symlink")
                         if scope == "local":
@@ -522,6 +550,190 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                 self.assertGreater(rollout.stat().st_size, original_size)
                 self.assertEqual(session_ids, ["trusted-session"])
 
+    def test_active_replacement_between_inventory_and_consumption_is_rejected(
+        self,
+    ) -> None:
+        for scope in ("local", "embedded"):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temp_dir:
+                codex_root = Path(temp_dir) / ".codex"
+                rollout = write_rollout(codex_root)
+                replacement = rollout.with_suffix(".replacement")
+                replacement.write_text(
+                    json.dumps(session_meta_row("replacement-session")) + "\n",
+                    encoding="utf-8",
+                )
+                replaced = False
+                output = io.StringIO()
+
+                if scope == "local":
+                    real_capture = (
+                        MODULE._capture_active_rollout_candidate_identity_from_parent_fd
+                    )
+
+                    def run_scan() -> object:
+                        return MODULE._scan_session_meta_records(
+                            codex_root=codex_root,
+                            dates=[dt.date(2026, 5, 26)],
+                            limit=10,
+                            host="local",
+                        )
+
+                else:
+                    namespace = embedded_probe_namespace(
+                        {
+                            "mode": "session-meta",
+                            "dates": ["2026/05/26"],
+                            "limit": 10,
+                            "codex_root": str(codex_root),
+                            "session_meta_scan_bytes": (
+                                MODULE.MAX_SESSION_META_SCAN_BYTES
+                            ),
+                        }
+                    )
+                    real_capture = namespace[
+                        "capture_active_rollout_candidate_identity_from_parent_fd"
+                    ]
+
+                    def run_scan() -> object:
+                        return namespace["iter_session_meta"]()
+
+                def replace_before_capture(
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    nonlocal replaced
+                    if not replaced:
+                        os.replace(replacement, rollout)
+                        replaced = True
+                    return real_capture(*args, **kwargs)
+
+                if scope == "local":
+                    patcher = mock.patch.object(
+                        MODULE,
+                        "_capture_active_rollout_candidate_identity_from_parent_fd",
+                        side_effect=replace_before_capture,
+                    )
+                else:
+                    patcher = mock.patch.dict(
+                        namespace,
+                        {
+                            "capture_active_rollout_candidate_identity_from_parent_fd": (
+                                replace_before_capture
+                            )
+                        },
+                    )
+
+                with patcher, redirect_stdout(output):
+                    if scope == "local":
+                        with self.assertRaises(
+                            MODULE.SessionMetaRolloutError
+                        ) as raised:
+                            run_scan()
+                        error = raised.exception.error
+                    else:
+                        with self.assertRaises(SystemExit) as raised:
+                            run_scan()
+                        self.assertEqual(raised.exception.code, 0)
+                        error = json.loads(output.getvalue().splitlines()[1])["error"]
+
+                self.assertTrue(replaced)
+                self.assertIn("identity changed after enumeration", error)
+                self.assertNotIn("replacement-session", output.getvalue())
+
+    def test_archive_replacement_between_inventory_and_consumption_is_rejected(
+        self,
+    ) -> None:
+        rollout_ref = (
+            "archived_sessions/2026/05/26/"
+            "rollout-2026-05-26T10-00-00-archive.jsonl"
+        )
+        for scope in ("local", "embedded"):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temp_dir:
+                codex_root = Path(temp_dir) / ".codex"
+                rollout = write_rollout(codex_root, rollout_ref=rollout_ref)
+                replacement = rollout.with_suffix(".replacement")
+                replacement.write_text(
+                    json.dumps(session_meta_row("replacement-session")) + "\n",
+                    encoding="utf-8",
+                )
+                replaced = False
+                output = io.StringIO()
+
+                if scope == "local":
+                    real_capture = (
+                        MODULE._capture_rollout_candidate_identity_from_parent_fd
+                    )
+
+                    def run_scan() -> object:
+                        return MODULE._scan_session_meta_records(
+                            codex_root=codex_root,
+                            dates=[dt.date(2026, 5, 26)],
+                            limit=10,
+                            host="local",
+                        )
+
+                else:
+                    namespace = embedded_probe_namespace(
+                        {
+                            "mode": "session-meta",
+                            "dates": ["2026/05/26"],
+                            "limit": 10,
+                            "codex_root": str(codex_root),
+                            "session_meta_scan_bytes": (
+                                MODULE.MAX_SESSION_META_SCAN_BYTES
+                            ),
+                        }
+                    )
+                    real_capture = namespace[
+                        "capture_rollout_candidate_identity_from_parent_fd"
+                    ]
+
+                    def run_scan() -> object:
+                        return namespace["iter_session_meta"]()
+
+                def replace_before_capture(
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    nonlocal replaced
+                    if not replaced:
+                        os.replace(replacement, rollout)
+                        replaced = True
+                    return real_capture(*args, **kwargs)
+
+                if scope == "local":
+                    patcher = mock.patch.object(
+                        MODULE,
+                        "_capture_rollout_candidate_identity_from_parent_fd",
+                        side_effect=replace_before_capture,
+                    )
+                else:
+                    patcher = mock.patch.dict(
+                        namespace,
+                        {
+                            "capture_rollout_candidate_identity_from_parent_fd": (
+                                replace_before_capture
+                            )
+                        },
+                    )
+
+                with patcher, redirect_stdout(output):
+                    if scope == "local":
+                        with self.assertRaises(
+                            MODULE.SessionMetaRolloutError
+                        ) as raised:
+                            run_scan()
+                        error = raised.exception.error
+                    else:
+                        with self.assertRaises(SystemExit) as raised:
+                            run_scan()
+                        self.assertEqual(raised.exception.code, 0)
+                        error = json.loads(output.getvalue().splitlines()[1])["error"]
+
+                self.assertTrue(replaced)
+                self.assertIn("identity changed after enumeration", error)
+                self.assertNotIn("replacement-session", output.getvalue())
+
     def test_active_capture_stage_growth_requires_unchanged_prefix(self) -> None:
         for scope in ("local", "embedded"):
             for mutation in ("append", "rewrite_grow"):
@@ -579,7 +791,7 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         target_os.stat,
                         rollout.name,
                         mutate,
-                        before_call=1,
+                        before_call=3,
                     )
                     with mock.patch.object(
                         target_os,
