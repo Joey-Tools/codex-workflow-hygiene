@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-17
 updated: 2026-07-17
 branch: codex/daily-skill-friction-20260717-codex-workflow-hygiene-retrospective-byte-hash-invariant
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/48
 supersedes: []
 superseded_by:
 ---
@@ -28,6 +28,7 @@ superseded_by:
 
 ## Evidence
 
+- https://github.com/Joey-Tools/codex-workflow-hygiene/pull/48
 - Three targeted hashing-reader and raw-byte summary tests
 - `python3 -m unittest discover -s tests -p 'test_*.py'` (941 passed, 1 skipped)
 - `quick_validate.py skills/codex-session-retrospective`
