@@ -4087,7 +4087,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(turns[0].session_id, MODULE.opaque_session_id(raw_session))
 
-    def test_remote_probe_session_meta_raw_reads_stay_within_cap_and_accept_no_lf_eof(self) -> None:
+    def test_remote_probe_session_meta_prefix_preads_stay_within_cap_and_accept_no_lf_eof(self) -> None:
         first_line = json.dumps(
             {"type": "response_item", "payload": {"type": "function_call_output", "output": "x" * 70_000}},
             separators=(",", ":"),
@@ -4109,31 +4109,42 @@ class SessionRetrospectiveTests(unittest.TestCase):
             rollout = root / rollout_ref
             rollout.parent.mkdir(parents=True)
             rollout.write_bytes(payload)
-            real_read = REMOTE_PROBE.os.read
-            read_requests: list[int] = []
-            read_returns: list[int] = []
+            real_pread = REMOTE_PROBE.os.pread
+            pread_calls: list[tuple[int, int, int]] = []
 
-            def bounded_read(file_descriptor: int, size: int) -> bytes:
-                self.assertLessEqual(size, scan_bytes - sum(read_returns))
-                data = real_read(file_descriptor, size)
-                read_requests.append(size)
-                read_returns.append(len(data))
-                self.assertLessEqual(sum(read_returns), scan_bytes)
+            def bounded_pread(file_descriptor: int, size: int, offset: int) -> bytes:
+                self.assertGreaterEqual(offset, 0)
+                self.assertLess(offset, scan_bytes)
+                self.assertLessEqual(
+                    size,
+                    min(
+                        REMOTE_PROBE.SESSION_META_READ_CHUNK_BYTES,
+                        scan_bytes - offset,
+                    ),
+                )
+                data = real_pread(file_descriptor, size, offset)
+                pread_calls.append((size, offset, len(data)))
                 return data
 
             with mock.patch.object(REMOTE_PROBE, "MAX_SESSION_META_SCAN_BYTES", scan_bytes), mock.patch.object(
-                REMOTE_PROBE.os, "read", bounded_read
+                REMOTE_PROBE.os, "pread", bounded_pread
+            ), mock.patch.object(
+                REMOTE_PROBE.os,
+                "read",
+                side_effect=AssertionError("active session-meta must parse its verified snapshot"),
             ):
                 scan = REMOTE_PROBE._scan_session_meta_records(
                     codex_root=root, dates=[dt.date(2026, 5, 1)], limit=10, host="local"
                 )
 
             self.assertEqual([row["session_id"] for row in scan.rows], ["no-lf-eof"])
-            self.assertEqual(sum(read_returns), scan_bytes)
+            expected_offsets = [0, REMOTE_PROBE.SESSION_META_READ_CHUNK_BYTES]
+            self.assertGreaterEqual(len(pread_calls), len(expected_offsets))
             self.assertEqual(
-                read_requests,
-                [REMOTE_PROBE.SESSION_META_READ_CHUNK_BYTES, scan_bytes - REMOTE_PROBE.SESSION_META_READ_CHUNK_BYTES],
+                [offset for _size, offset, _returned in pread_calls],
+                expected_offsets * (len(pread_calls) // len(expected_offsets)),
             )
+            self.assertTrue(all(size == returned for size, _offset, returned in pread_calls))
             script = REMOTE_PROBE._remote_python_script(
                 {
                     "mode": "session-meta",
@@ -4145,22 +4156,22 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             marker = 'if CONFIG["mode"] == "session-meta":\n'
             injection = (
-                "_real_session_meta_read = os.read\n"
-                "_session_meta_read_total = 0\n"
-                "def guarded_session_meta_read(file_descriptor, size):\n"
-                "    global _session_meta_read_total\n"
-                "    remaining = SESSION_META_SCAN_BYTES - _session_meta_read_total\n"
-                "    if size > remaining:\n"
-                "        raise AssertionError('embedded os.read exceeded remaining cap')\n"
-                "    data = _real_session_meta_read(file_descriptor, size)\n"
-                "    _session_meta_read_total += len(data)\n"
-                "    if _session_meta_read_total > SESSION_META_SCAN_BYTES:\n"
-                "        raise AssertionError('embedded os.read exceeded cumulative cap')\n"
-                "    return data\n"
-                "os.read = guarded_session_meta_read\n\n"
+                "_real_session_meta_pread = os.pread\n"
+                "def guarded_session_meta_pread(file_descriptor, size, offset):\n"
+                "    if offset < 0 or offset >= SESSION_META_SCAN_BYTES:\n"
+                "        raise AssertionError('embedded os.pread offset exceeded cap')\n"
+                "    remaining = SESSION_META_SCAN_BYTES - offset\n"
+                "    if size > min(SESSION_META_READ_CHUNK_BYTES, remaining):\n"
+                "        raise AssertionError('embedded os.pread exceeded bounded request')\n"
+                "    return _real_session_meta_pread(file_descriptor, size, offset)\n"
+                "def forbidden_session_meta_read(*_args, **_kwargs):\n"
+                "    raise AssertionError('embedded active session-meta used live os.read')\n"
+                "os.pread = guarded_session_meta_pread\n"
+                "os.read = forbidden_session_meta_read\n\n"
             )
             self.assertEqual(script.count(marker), 1)
-            self.assertIn("os.read(file_descriptor, read_size)", script)
+            self.assertIn("os.pread(fd, requested, offset)", script)
+            self.assertIn("io.BytesIO(verified_snapshot + unread_sentinel)", script)
             self.assertNotIn("readline(remaining", script)
             embedded = subprocess.run(
                 [sys.executable, "-"], input=script.replace(marker, injection + marker), text=True, capture_output=True, check=False
