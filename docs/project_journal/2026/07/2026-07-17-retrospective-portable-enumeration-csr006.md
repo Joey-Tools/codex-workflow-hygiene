@@ -22,6 +22,7 @@ superseded_by:
 
 - Enumeration no longer depends on filesystem-specific dirent inode or parent/child device behavior, including OverlayFS configurations used by container runners.
 - The first held-descriptor proof is the active content baseline. Later growth between descriptor and path checks is accepted only when that proved prefix remains unchanged; rewrite-and-grow, replacement, shrink, rollback, and same-size mutation after the baseline fail closed, while archives retain exact snapshots throughout consumption.
+- An active candidate with no metadata in its first immutable snapshot gets one bounded refreshed-snapshot parse after checkpointing. A first metadata record captured in the refreshed aligned snapshot is returned; an append high-water ahead of that verified snapshot, or a second aligned advance with no match, becomes an explicit coverage error instead of a silent miss.
 - `ELOOP` maps to the precise symlink coverage error, while every transient candidate descriptor closes before enumeration continues.
 
 ## Next Steps
@@ -30,9 +31,9 @@ superseded_by:
 
 ## Evidence
 
-- `python3 tests/test_remote_codex_probe.py`: 29 of 29 tests passed in 4.401 seconds.
-- Python 3.13.0 full suite, final public worktree: 987 of 987 tests passed in 108.809 seconds.
-- Python 3.14.2 full suite, final public worktree: 987 of 987 tests passed in 112.400 seconds.
+- `python3 tests/test_remote_codex_probe.py`: 31 of 31 tests passed in 4.191 seconds.
+- Python 3.13.0 full suite, final public worktree: 989 of 989 tests passed in 102.006 seconds.
+- Python 3.14.2 full suite, final public worktree: 989 of 989 tests passed in 101.850 seconds.
 - Ruff passed for both changed Python files; Python 3.13 and Python 3.14 byte compilation passed.
 - Isolated `quick_validate.py` validation passed for `codex-session-retrospective`; `git diff --check` and signed commit verification passed.
 - Private reproduction: `Joey-Tools/codex-private-workflows` run `29600214365`, job `87950238935`, failed with 44 failures and 18 errors rooted in `rollout identity changed during enumeration`.

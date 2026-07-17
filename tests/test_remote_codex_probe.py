@@ -1217,6 +1217,306 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                     self.assertNotIn("forged--session", output.getvalue())
                     self.assertGreater(rollout.stat().st_size, len(original))
 
+    def test_active_missing_meta_refreshes_once_or_reports_repeated_growth(
+        self,
+    ) -> None:
+        for scope in ("local", "embedded"):
+            for layout in ("sessions", "root"):
+                for scenario in ("late_meta", "repeated_growth"):
+                    with self.subTest(
+                        scope=scope,
+                        layout=layout,
+                        scenario=scenario,
+                    ), tempfile.TemporaryDirectory() as temp_dir:
+                        rollout_ref = (
+                            ROLLOUT_REF
+                            if layout == "sessions"
+                            else "rollout-2026-05-26T10-00-00-root.jsonl"
+                        )
+                        codex_root = Path(temp_dir) / ".codex"
+                        rollout = write_rollout(
+                            codex_root,
+                            rollout_ref=rollout_ref,
+                        )
+                        rollout.write_bytes(b"{}\n")
+                        late_meta = (
+                            json.dumps(
+                                session_meta_row("late-session"),
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        ).encode()
+                        scan_calls = 0
+                        append_calls = 0
+                        output = io.StringIO()
+
+                        if scope == "local":
+                            real_lines = MODULE._bounded_session_meta_lines
+
+                            def run_scan() -> object:
+                                return MODULE._scan_session_meta_records(
+                                    codex_root=codex_root,
+                                    dates=[dt.date(2026, 5, 26)],
+                                    limit=10,
+                                    host="local",
+                                )
+
+                        else:
+                            namespace = embedded_probe_namespace(
+                                {
+                                    "mode": "session-meta",
+                                    "dates": ["2026/05/26"],
+                                    "limit": 10,
+                                    "codex_root": str(codex_root),
+                                    "session_meta_scan_bytes": (
+                                        MODULE.MAX_SESSION_META_SCAN_BYTES
+                                    ),
+                                }
+                            )
+                            real_lines = namespace["bounded_session_meta_lines"]
+
+                            def run_scan() -> object:
+                                return namespace["iter_session_meta"]()
+
+                        def append_after_snapshot(
+                            handle: object,
+                            max_bytes: int,
+                        ):
+                            nonlocal scan_calls, append_calls
+                            scan_calls += 1
+                            current_scan = scan_calls
+                            yield from real_lines(handle, max_bytes)
+                            if current_scan == 1:
+                                data = (
+                                    late_meta
+                                    if scenario == "late_meta"
+                                    else b"{}\n"
+                                )
+                            elif (
+                                current_scan == 2
+                                and scenario == "repeated_growth"
+                            ):
+                                data = b"{}\n"
+                            else:
+                                return
+                            with rollout.open("ab") as rollout_handle:
+                                rollout_handle.write(data)
+                            append_calls += 1
+
+                        if scope == "local":
+                            patcher = mock.patch.object(
+                                MODULE,
+                                "_bounded_session_meta_lines",
+                                side_effect=append_after_snapshot,
+                            )
+                        else:
+                            patcher = mock.patch.dict(
+                                namespace,
+                                {
+                                    "bounded_session_meta_lines": (
+                                        append_after_snapshot
+                                    )
+                                },
+                            )
+
+                        with patcher, redirect_stdout(output):
+                            if scenario == "late_meta":
+                                scan = run_scan()
+                            elif scope == "local":
+                                with self.assertRaises(
+                                    MODULE.SessionMetaRolloutError
+                                ) as raised:
+                                    run_scan()
+                                error = raised.exception.error
+                            else:
+                                with self.assertRaises(SystemExit) as raised:
+                                    run_scan()
+                                self.assertEqual(raised.exception.code, 0)
+                                error = next(
+                                    json.loads(line)["error"]
+                                    for line in output.getvalue().splitlines()[1:-1]
+                                    if "error" in json.loads(line)
+                                )
+
+                        self.assertEqual(scan_calls, 2)
+                        if scenario == "late_meta":
+                            self.assertEqual(append_calls, 1)
+                            if scope == "local":
+                                session_ids = [
+                                    row["session_id"] for row in scan.rows
+                                ]
+                            else:
+                                session_ids = [
+                                    json.loads(line)["session_id"]
+                                    for line in output.getvalue().splitlines()[1:-1]
+                                ]
+                            self.assertEqual(session_ids, ["late-session"])
+                        else:
+                            self.assertEqual(append_calls, 2)
+                            self.assertEqual(
+                                error,
+                                "rollout identity changed after session-meta scan",
+                            )
+
+    def test_active_missing_meta_rejects_unaligned_checkpoint_high_water(
+        self,
+    ) -> None:
+        for scope in ("local", "embedded"):
+            for layout in ("sessions", "root"):
+                with self.subTest(
+                    scope=scope,
+                    layout=layout,
+                ), tempfile.TemporaryDirectory() as temp_dir:
+                    rollout_ref = (
+                        ROLLOUT_REF
+                        if layout == "sessions"
+                        else "rollout-2026-05-26T10-00-00-root.jsonl"
+                    )
+                    codex_root = Path(temp_dir) / ".codex"
+                    rollout = write_rollout(
+                        codex_root,
+                        rollout_ref=rollout_ref,
+                    )
+                    rollout.write_bytes(b"{}\n")
+                    late_meta = (
+                        json.dumps(
+                            session_meta_row("late-unaligned-session"),
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode()
+                    appended = False
+                    output = io.StringIO()
+
+                    if scope == "local":
+                        real_checkpoint = (
+                            MODULE._assert_append_only_rollout_checkpoint
+                        )
+
+                        def checkpoint_with_unaligned_high_water(
+                            fd: int,
+                            parent_fd: int,
+                            name: str,
+                            expected: object,
+                            prefix_proof: object,
+                            *,
+                            phase: str,
+                        ) -> object:
+                            nonlocal appended
+                            result = real_checkpoint(
+                                fd,
+                                parent_fd,
+                                name,
+                                expected,
+                                prefix_proof,
+                                phase=phase,
+                            )
+                            if phase == "after session-meta scan" and not appended:
+                                with rollout.open("ab") as handle:
+                                    handle.write(late_meta)
+                                appended = True
+                                return (
+                                    MODULE._rollout_identity_from_stat(
+                                        os.fstat(fd)
+                                    ),
+                                    *result[1:],
+                                )
+                            return result
+
+                        patcher = mock.patch.object(
+                            MODULE,
+                            "_assert_append_only_rollout_checkpoint",
+                            side_effect=checkpoint_with_unaligned_high_water,
+                        )
+
+                        def run_scan() -> object:
+                            return MODULE._scan_session_meta_records(
+                                codex_root=codex_root,
+                                dates=[dt.date(2026, 5, 26)],
+                                limit=10,
+                                host="local",
+                            )
+
+                    else:
+                        namespace = embedded_probe_namespace(
+                            {
+                                "mode": "session-meta",
+                                "dates": ["2026/05/26"],
+                                "limit": 10,
+                                "codex_root": str(codex_root),
+                                "session_meta_scan_bytes": (
+                                    MODULE.MAX_SESSION_META_SCAN_BYTES
+                                ),
+                            }
+                        )
+                        real_checkpoint = namespace[
+                            "assert_append_only_rollout_checkpoint"
+                        ]
+
+                        def checkpoint_with_unaligned_high_water(
+                            fd: int,
+                            parent_fd: int,
+                            name: str,
+                            expected: object,
+                            prefix_proof: object,
+                            phase: str,
+                        ) -> object:
+                            nonlocal appended
+                            result = real_checkpoint(
+                                fd,
+                                parent_fd,
+                                name,
+                                expected,
+                                prefix_proof,
+                                phase,
+                            )
+                            if phase == "after session-meta scan" and not appended:
+                                with rollout.open("ab") as handle:
+                                    handle.write(late_meta)
+                                appended = True
+                                return (
+                                    namespace["rollout_identity_from_stat"](
+                                        os.fstat(fd)
+                                    ),
+                                    *result[1:],
+                                )
+                            return result
+
+                        patcher = mock.patch.dict(
+                            namespace,
+                            {
+                                "assert_append_only_rollout_checkpoint": (
+                                    checkpoint_with_unaligned_high_water
+                                )
+                            },
+                        )
+
+                        def run_scan() -> object:
+                            return namespace["iter_session_meta"]()
+
+                    with patcher, redirect_stdout(output):
+                        if scope == "local":
+                            with self.assertRaises(
+                                MODULE.SessionMetaRolloutError
+                            ) as raised:
+                                run_scan()
+                            error = raised.exception.error
+                        else:
+                            with self.assertRaises(SystemExit) as raised:
+                                run_scan()
+                            self.assertEqual(raised.exception.code, 0)
+                            error = next(
+                                json.loads(line)["error"]
+                                for line in output.getvalue().splitlines()[1:-1]
+                                if "error" in json.loads(line)
+                            )
+
+                    self.assertTrue(appended)
+                    self.assertEqual(
+                        error,
+                        "rollout identity changed after session-meta scan",
+                    )
+
     def test_active_prefix_proof_candidate_limit_bounds_capture_io(self) -> None:
         for scope in ("local", "embedded"):
             for scenario in ("valid", "no_meta"):

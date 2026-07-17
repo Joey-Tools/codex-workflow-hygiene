@@ -1532,6 +1532,59 @@ def _session_meta_date_overlaps_window(
     return True
 
 
+def _parse_session_meta_snapshot(
+    scan_handle: Any,
+    *,
+    date_value: dt.date | None,
+    require_record_date_match: bool,
+    rollout_start: dt.datetime | None,
+    rollout_end: dt.datetime | None,
+) -> tuple[dt.date | None, str, str, dt.datetime | None] | None:
+    for line in _bounded_session_meta_lines(
+        scan_handle,
+        MAX_SESSION_META_SCAN_BYTES,
+    ):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "session_meta":
+            continue
+        timestamp = _session_meta_record_timestamp(obj)
+        if require_record_date_match:
+            if date_value is None or not _session_meta_record_matches_window(
+                obj,
+                date_value,
+                rollout_start,
+                rollout_end,
+            ):
+                continue
+        elif timestamp is None:
+            if date_value is None or not _session_meta_date_overlaps_window(
+                date_value,
+                rollout_start,
+                rollout_end,
+            ):
+                continue
+        else:
+            if rollout_start is not None and timestamp < rollout_start:
+                continue
+            if rollout_end is not None and timestamp >= rollout_end:
+                continue
+        payload = obj.get("payload", {})
+        session_id = str(payload.get("id", ""))
+        if not session_id:
+            return None
+        cwd = str(payload.get("cwd", ""))
+        return (
+            timestamp.date() if timestamp is not None else date_value,
+            session_id,
+            cwd,
+            timestamp,
+        )
+    return None
+
+
 def _session_meta_from_rollout(
     codex_root: pathlib.Path,
     rollout_relative_path: pathlib.PurePosixPath,
@@ -1594,57 +1647,66 @@ def _session_meta_from_rollout(
             else:
                 identity = _rollout_identity_from_stat(os.fstat(handle.fileno()))
                 scan_handle = handle
-            result: tuple[dt.date | None, str, str, dt.datetime | None] | None = None
-            for line in _bounded_session_meta_lines(
+            result = _parse_session_meta_snapshot(
                 scan_handle,
-                MAX_SESSION_META_SCAN_BYTES,
-            ):
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if obj.get("type") != "session_meta":
-                    continue
-                timestamp = _session_meta_record_timestamp(obj)
-                if require_record_date_match:
-                    if date_value is None or not _session_meta_record_matches_window(
-                        obj,
-                        date_value,
-                        rollout_start,
-                        rollout_end,
-                    ):
-                        continue
-                elif timestamp is None:
-                    if date_value is None or not _session_meta_date_overlaps_window(
-                        date_value,
-                        rollout_start,
-                        rollout_end,
-                    ):
-                        continue
-                else:
-                    if rollout_start is not None and timestamp < rollout_start:
-                        continue
-                    if rollout_end is not None and timestamp >= rollout_end:
-                        continue
-                payload = obj.get("payload", {})
-                session_id = str(payload.get("id", ""))
-                if not session_id:
-                    break
-                cwd = str(payload.get("cwd", ""))
-                result = (
-                    timestamp.date() if timestamp is not None else date_value,
-                    session_id,
-                    cwd,
-                    timestamp,
-                )
-                break
+                date_value=date_value,
+                require_record_date_match=require_record_date_match,
+                rollout_start=rollout_start,
+                rollout_end=rollout_end,
+            )
             if expected_identity is None:
                 handle.assert_identity(identity, phase="after session-meta scan")
             elif allow_append:
-                handle.assert_append_only_identity(
+                refreshed_identity = handle.assert_append_only_identity(
                     identity,
                     phase="after session-meta scan",
                 )
+                refreshed_snapshot_identity = handle.verified_snapshot_identity
+                if refreshed_snapshot_identity is None:
+                    raise ValueError(
+                        "rollout identity changed after session-meta scan"
+                    )
+                if (
+                    result is None
+                    and refreshed_snapshot_identity == snapshot_identity
+                    and refreshed_identity != refreshed_snapshot_identity
+                ):
+                    raise ValueError(
+                        "rollout identity changed after session-meta scan"
+                    )
+                if (
+                    result is None
+                    and refreshed_snapshot_identity != snapshot_identity
+                ):
+                    result = _parse_session_meta_snapshot(
+                        _session_meta_snapshot_reader(
+                            refreshed_snapshot_identity,
+                            handle.verified_snapshot,
+                        ),
+                        date_value=date_value,
+                        require_record_date_match=require_record_date_match,
+                        rollout_start=rollout_start,
+                        rollout_end=rollout_end,
+                    )
+                    final_identity = handle.assert_append_only_identity(
+                        refreshed_identity,
+                        phase="after refreshed session-meta scan",
+                    )
+                    final_snapshot_identity = handle.verified_snapshot_identity
+                    if final_snapshot_identity is None:
+                        raise ValueError(
+                            "rollout identity changed after session-meta scan"
+                        )
+                    if (
+                        result is None
+                        and (
+                            final_snapshot_identity != refreshed_snapshot_identity
+                            or final_identity != final_snapshot_identity
+                        )
+                    ):
+                        raise ValueError(
+                            "rollout identity changed after session-meta scan"
+                        )
             else:
                 handle.assert_identity(
                     expected_identity.snapshot,
@@ -2682,6 +2744,46 @@ def session_meta_date_overlaps_window(date_text):
     return True
 
 
+def parse_session_meta_snapshot(
+    scan_handle,
+    date_text,
+    require_record_date_match,
+):
+    for line in bounded_session_meta_lines(
+        scan_handle,
+        SESSION_META_SCAN_BYTES,
+    ):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "session_meta":
+            continue
+        timestamp = session_meta_record_timestamp(obj)
+        if require_record_date_match:
+            if date_text is None or not session_meta_record_matches_window(obj, date_text):
+                continue
+        elif timestamp is None:
+            if date_text is None or not session_meta_date_overlaps_window(date_text):
+                continue
+        else:
+            if ROLLOUT_START_TIME is not None and timestamp < ROLLOUT_START_TIME:
+                continue
+            if ROLLOUT_END_TIME is not None and timestamp >= ROLLOUT_END_TIME:
+                continue
+        payload = obj.get("payload", {{}})
+        session_id = str(payload.get("id", ""))
+        if not session_id:
+            return None
+        cwd = str(payload.get("cwd", ""))
+        if timestamp is None:
+            meta_date = date_text
+        else:
+            meta_date = timestamp.strftime("%Y/%m/%d")
+        return (meta_date, session_id, cwd, timestamp)
+    return None
+
+
 def emit_session_meta_item(item):
     serialized = json.dumps(item, separators=(",", ":"), sort_keys=True)
     if len(serialized.encode("utf-8")) > SESSION_META_SERIALIZED_ROW_BYTES:
@@ -2737,47 +2839,62 @@ def session_meta_from_rollout(
             else:
                 identity = rollout_identity_from_stat(os.fstat(handle.fileno()))
                 scan_handle = handle
-            result = None
-            for line in bounded_session_meta_lines(
+            result = parse_session_meta_snapshot(
                 scan_handle,
-                SESSION_META_SCAN_BYTES,
-            ):
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if obj.get("type") != "session_meta":
-                    continue
-                timestamp = session_meta_record_timestamp(obj)
-                if require_record_date_match:
-                    if date_text is None or not session_meta_record_matches_window(obj, date_text):
-                        continue
-                elif timestamp is None:
-                    if date_text is None or not session_meta_date_overlaps_window(date_text):
-                        continue
-                else:
-                    if ROLLOUT_START_TIME is not None and timestamp < ROLLOUT_START_TIME:
-                        continue
-                    if ROLLOUT_END_TIME is not None and timestamp >= ROLLOUT_END_TIME:
-                        continue
-                payload = obj.get("payload", {{}})
-                session_id = str(payload.get("id", ""))
-                if not session_id:
-                    break
-                cwd = str(payload.get("cwd", ""))
-                if timestamp is None:
-                    meta_date = date_text
-                else:
-                    meta_date = timestamp.strftime("%Y/%m/%d")
-                result = (meta_date, session_id, cwd, timestamp)
-                break
+                date_text,
+                require_record_date_match,
+            )
             if expected_identity is None:
                 handle.assert_identity(identity, "after session-meta scan")
             elif allow_append:
-                handle.assert_append_only_identity(
+                refreshed_identity = handle.assert_append_only_identity(
                     identity,
                     "after session-meta scan",
                 )
+                refreshed_snapshot_identity = handle.verified_snapshot_identity
+                if refreshed_snapshot_identity is None:
+                    raise ValueError(
+                        "rollout identity changed after session-meta scan"
+                    )
+                if (
+                    result is None
+                    and refreshed_snapshot_identity == snapshot_identity
+                    and refreshed_identity != refreshed_snapshot_identity
+                ):
+                    raise ValueError(
+                        "rollout identity changed after session-meta scan"
+                    )
+                if (
+                    result is None
+                    and refreshed_snapshot_identity != snapshot_identity
+                ):
+                    result = parse_session_meta_snapshot(
+                        session_meta_snapshot_reader(
+                            refreshed_snapshot_identity,
+                            handle.verified_snapshot,
+                        ),
+                        date_text,
+                        require_record_date_match,
+                    )
+                    final_identity = handle.assert_append_only_identity(
+                        refreshed_identity,
+                        "after refreshed session-meta scan",
+                    )
+                    final_snapshot_identity = handle.verified_snapshot_identity
+                    if final_snapshot_identity is None:
+                        raise ValueError(
+                            "rollout identity changed after session-meta scan"
+                        )
+                    if (
+                        result is None
+                        and (
+                            final_snapshot_identity != refreshed_snapshot_identity
+                            or final_identity != final_snapshot_identity
+                        )
+                    ):
+                        raise ValueError(
+                            "rollout identity changed after session-meta scan"
+                        )
             else:
                 handle.assert_identity(
                     expected_identity["snapshot"],
