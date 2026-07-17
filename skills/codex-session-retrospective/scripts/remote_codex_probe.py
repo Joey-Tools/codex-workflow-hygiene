@@ -384,9 +384,16 @@ class RolloutStableIdentity:
 
 
 @dataclasses.dataclass(frozen=True)
+class RolloutCandidateIdentity:
+    snapshot: RolloutIdentity
+    stable: RolloutStableIdentity
+
+
+@dataclasses.dataclass(frozen=True)
 class EnumeratedRolloutParent:
     fd: int
-    expected_identity: RolloutStableIdentity
+    expected_identity: RolloutCandidateIdentity
+    allow_same_inode_changes: bool
 
 
 class SessionMetaRolloutError(ValueError):
@@ -777,6 +784,16 @@ def _stable_rollout_identity_from_stat(
     )
 
 
+def _rollout_candidate_identity_from_stat(
+    stat_result: os.stat_result,
+) -> RolloutCandidateIdentity:
+    stable = _stable_rollout_identity_from_stat(stat_result)
+    return RolloutCandidateIdentity(
+        snapshot=_rollout_identity_from_stat(stat_result),
+        stable=stable,
+    )
+
+
 def _assert_rollout_identity(
     actual: RolloutIdentity,
     expected: RolloutIdentity,
@@ -801,7 +818,8 @@ def _open_pinned_regular_file_from_fd(
     parent_fd: int,
     name: str,
     *,
-    expected_identity: RolloutStableIdentity | None = None,
+    expected_identity: RolloutCandidateIdentity | None = None,
+    allow_same_inode_changes: bool = False,
 ) -> int:
     if name in ("", ".", "..") or "/" in name:
         raise ValueError("rollout path has an invalid file name")
@@ -815,11 +833,18 @@ def _open_pinned_regular_file_from_fd(
         raise ValueError("rollout path is a symlink")
     observed = _rollout_identity_from_stat(observed_stat)
     if expected_identity is not None:
-        _assert_stable_rollout_identity(
-            _stable_rollout_identity_from_stat(observed_stat),
-            expected_identity,
-            phase="after enumeration",
-        )
+        if allow_same_inode_changes:
+            _assert_stable_rollout_identity(
+                _stable_rollout_identity_from_stat(observed_stat),
+                expected_identity.stable,
+                phase="after enumeration",
+            )
+        else:
+            _assert_rollout_identity(
+                observed,
+                expected_identity.snapshot,
+                phase="after enumeration",
+            )
     try:
         fd = os.open(name, _regular_file_open_flags(), dir_fd=parent_fd)
     except FileNotFoundError as error:
@@ -829,10 +854,16 @@ def _open_pinned_regular_file_from_fd(
         opened = _rollout_identity_from_stat(opened_stat)
         if expected_identity is None:
             _assert_rollout_identity(opened, observed, phase="during open")
-        else:
+        elif allow_same_inode_changes:
             _assert_stable_rollout_identity(
                 _stable_rollout_identity_from_stat(opened_stat),
-                expected_identity,
+                expected_identity.stable,
+                phase="during open",
+            )
+        else:
+            _assert_rollout_identity(
+                opened,
+                expected_identity.snapshot,
                 phase="during open",
             )
         try:
@@ -842,10 +873,17 @@ def _open_pinned_regular_file_from_fd(
         if expected_identity is None:
             current = _rollout_identity_from_stat(current_stat)
             _assert_rollout_identity(current, opened, phase="during open")
-        else:
+        elif allow_same_inode_changes:
             _assert_stable_rollout_identity(
                 _stable_rollout_identity_from_stat(current_stat),
-                expected_identity,
+                expected_identity.stable,
+                phase="during open",
+            )
+        else:
+            current = _rollout_identity_from_stat(current_stat)
+            _assert_rollout_identity(
+                current,
+                expected_identity.snapshot,
                 phase="during open",
             )
         return fd
@@ -935,12 +973,14 @@ def _open_pinned_rollout_text_from_parent_fd(
     parent_fd: int,
     name: str,
     *,
-    expected_identity: RolloutStableIdentity | None = None,
+    expected_identity: RolloutCandidateIdentity | None = None,
+    allow_same_inode_changes: bool = False,
 ) -> _PinnedRolloutHandle:
     fd = _open_pinned_regular_file_from_fd(
         parent_fd,
         name,
         expected_identity=expected_identity,
+        allow_same_inode_changes=allow_same_inode_changes,
     )
     try:
         pinned_parent_fd = os.dup(parent_fd)
@@ -998,6 +1038,7 @@ def _open_local_rollout_text(
             codex_root.fd,
             rollout_relative_path.name,
             expected_identity=codex_root.expected_identity,
+            allow_same_inode_changes=codex_root.allow_same_inode_changes,
         )
     if isinstance(codex_root, int):
         return _open_pinned_rollout_text_from_parent_fd(
@@ -1189,6 +1230,12 @@ def _session_meta_is_flat_archived_undated(relative_path: pathlib.PurePosixPath)
     return relative_path.parts[:1] == ("archived_sessions",) and _session_meta_flat_undated_alias(relative_path) is not None
 
 
+def _session_meta_allows_same_inode_changes(
+    relative_path: pathlib.PurePosixPath,
+) -> bool:
+    return len(relative_path.parts) == 1 or relative_path.parts[0] == "sessions"
+
+
 def _session_meta_record_timestamp(row: dict[str, Any]) -> dt.datetime | None:
     timestamp = row.get("timestamp")
     if not isinstance(timestamp, str) or not timestamp.strip():
@@ -1236,15 +1283,22 @@ def _session_meta_from_rollout(
     rollout_relative_path: pathlib.PurePosixPath,
     *,
     parent_fd: int | None = None,
-    expected_identity: RolloutStableIdentity | None = None,
+    expected_identity: RolloutCandidateIdentity | None = None,
     date_value: dt.date | None = None,
     require_record_date_match: bool = False,
     rollout_start: dt.datetime | None = None,
     rollout_end: dt.datetime | None = None,
 ) -> tuple[dt.date | None, str, str, dt.datetime | None] | None:
+    allow_same_inode_changes = _session_meta_allows_same_inode_changes(
+        rollout_relative_path
+    )
     rollout_source: pathlib.Path | int | EnumeratedRolloutParent
     if parent_fd is not None and expected_identity is not None:
-        rollout_source = EnumeratedRolloutParent(parent_fd, expected_identity)
+        rollout_source = EnumeratedRolloutParent(
+            parent_fd,
+            expected_identity,
+            allow_same_inode_changes,
+        )
     else:
         rollout_source = parent_fd if parent_fd is not None else codex_root
     try:
@@ -1315,9 +1369,14 @@ def _session_meta_from_rollout(
                 break
             if expected_identity is None:
                 handle.assert_identity(identity, phase="after session-meta scan")
-            else:
+            elif allow_same_inode_changes:
                 handle.assert_stable_identity(
-                    expected_identity,
+                    expected_identity.stable,
+                    phase="after session-meta scan",
+                )
+            else:
+                handle.assert_identity(
+                    expected_identity.snapshot,
                     phase="after session-meta scan",
                 )
             return result
@@ -1745,6 +1804,14 @@ def stable_rollout_identity_from_stat(stat_result):
     }}
 
 
+def rollout_candidate_identity_from_stat(stat_result):
+    stable = stable_rollout_identity_from_stat(stat_result)
+    return {{
+        "snapshot": rollout_identity_from_stat(stat_result),
+        "stable": stable,
+    }}
+
+
 def assert_rollout_identity(actual, expected, phase):
     if actual != expected:
         raise ValueError("rollout identity changed " + phase)
@@ -1755,7 +1822,12 @@ def assert_stable_rollout_identity(actual, expected, phase):
         raise ValueError("rollout identity changed " + phase)
 
 
-def open_pinned_regular_file_from_fd(parent_fd, name, expected_identity=None):
+def open_pinned_regular_file_from_fd(
+    parent_fd,
+    name,
+    expected_identity=None,
+    allow_same_inode_changes=False,
+):
     if name in ("", ".", "..") or "/" in name:
         raise ValueError("rollout path has an invalid file name")
     try:
@@ -1768,11 +1840,18 @@ def open_pinned_regular_file_from_fd(parent_fd, name, expected_identity=None):
         raise ValueError("rollout path is a symlink")
     observed = rollout_identity_from_stat(observed_stat)
     if expected_identity is not None:
-        assert_stable_rollout_identity(
-            stable_rollout_identity_from_stat(observed_stat),
-            expected_identity,
-            "after enumeration",
-        )
+        if allow_same_inode_changes:
+            assert_stable_rollout_identity(
+                stable_rollout_identity_from_stat(observed_stat),
+                expected_identity["stable"],
+                "after enumeration",
+            )
+        else:
+            assert_rollout_identity(
+                observed,
+                expected_identity["snapshot"],
+                "after enumeration",
+            )
     try:
         fd = os.open(name, regular_file_open_flags(), dir_fd=parent_fd)
     except FileNotFoundError as error:
@@ -1782,10 +1861,16 @@ def open_pinned_regular_file_from_fd(parent_fd, name, expected_identity=None):
         opened = rollout_identity_from_stat(opened_stat)
         if expected_identity is None:
             assert_rollout_identity(opened, observed, "during open")
-        else:
+        elif allow_same_inode_changes:
             assert_stable_rollout_identity(
                 stable_rollout_identity_from_stat(opened_stat),
-                expected_identity,
+                expected_identity["stable"],
+                "during open",
+            )
+        else:
+            assert_rollout_identity(
+                opened,
+                expected_identity["snapshot"],
                 "during open",
             )
         try:
@@ -1795,10 +1880,17 @@ def open_pinned_regular_file_from_fd(parent_fd, name, expected_identity=None):
         if expected_identity is None:
             current = rollout_identity_from_stat(current_stat)
             assert_rollout_identity(current, opened, "during open")
-        else:
+        elif allow_same_inode_changes:
             assert_stable_rollout_identity(
                 stable_rollout_identity_from_stat(current_stat),
-                expected_identity,
+                expected_identity["stable"],
+                "during open",
+            )
+        else:
+            current = rollout_identity_from_stat(current_stat)
+            assert_rollout_identity(
+                current,
+                expected_identity["snapshot"],
                 "during open",
             )
         return fd
@@ -1879,11 +1971,17 @@ class PinnedRolloutHandle:
         assert_stable_rollout_identity(current, expected, phase)
 
 
-def open_pinned_rollout_text_from_parent_fd(parent_fd, name, expected_identity=None):
+def open_pinned_rollout_text_from_parent_fd(
+    parent_fd,
+    name,
+    expected_identity=None,
+    allow_same_inode_changes=False,
+):
     fd = open_pinned_regular_file_from_fd(
         parent_fd,
         name,
         expected_identity=expected_identity,
+        allow_same_inode_changes=allow_same_inode_changes,
     )
     try:
         pinned_parent_fd = os.dup(parent_fd)
@@ -1990,12 +2088,18 @@ def rollout_matches_bounds(path):
     return True
 
 
-def open_rollout_text(rel, parent_fd=None, expected_identity=None):
+def open_rollout_text(
+    rel,
+    parent_fd=None,
+    expected_identity=None,
+    allow_same_inode_changes=False,
+):
     if parent_fd is not None:
         return open_pinned_rollout_text_from_parent_fd(
             parent_fd,
             rel.name,
             expected_identity=expected_identity,
+            allow_same_inode_changes=allow_same_inode_changes,
         )
     return open_pinned_rollout_text(rel)
 
@@ -2059,6 +2163,10 @@ def session_meta_is_flat_archived_undated(rel):
     return rel.parts[:1] == ("archived_sessions",) and session_meta_flat_undated_alias(rel) is not None
 
 
+def session_meta_allows_same_inode_changes(rel):
+    return len(rel.parts) == 1 or rel.parts[0] == "sessions"
+
+
 def session_meta_record_timestamp(row):
     timestamp = row.get("timestamp")
     if not isinstance(timestamp, str) or not timestamp.strip():
@@ -2112,11 +2220,13 @@ def session_meta_from_rollout(
     date_text=None,
     require_record_date_match=False,
 ):
+    allow_same_inode_changes = session_meta_allows_same_inode_changes(rel)
     try:
         handle = open_rollout_text(
             rel,
             parent_fd=parent_fd,
             expected_identity=expected_identity,
+            allow_same_inode_changes=allow_same_inode_changes,
         )
     except FileNotFoundError:
         if expected_identity is not None:
@@ -2168,9 +2278,14 @@ def session_meta_from_rollout(
                 break
             if expected_identity is None:
                 handle.assert_identity(identity, "after session-meta scan")
-            else:
+            elif allow_same_inode_changes:
                 handle.assert_stable_identity(
-                    expected_identity,
+                    expected_identity["stable"],
+                    "after session-meta scan",
+                )
+            else:
+                handle.assert_identity(
+                    expected_identity["snapshot"],
                     "after session-meta scan",
                 )
             return result
@@ -2766,7 +2881,8 @@ def iter_session_meta():
         session_directory_unreadable()
 
     opened_directories = {{}}
-    directory_candidates = {{}}
+    directory_names = {{}}
+    directory_candidate_identities = {{}}
 
     def open_directory(rel_dir):
         key = rel_dir.as_posix()
@@ -2783,55 +2899,63 @@ def iter_session_meta():
 
     def close_directory(rel_dir):
         key = rel_dir.as_posix()
-        directory_candidates.pop(key, None)
+        directory_names.pop(key, None)
+        directory_candidate_identities.pop(key, None)
         directory_fd = opened_directories.pop(key, None)
         if directory_fd is not None:
             os.close(directory_fd)
 
-    def sorted_rollout_candidates(rel_dir):
+    def sorted_rollout_names(rel_dir):
         key = rel_dir.as_posix()
         directory_fd = open_directory(rel_dir)
         if directory_fd is None:
             return None, []
-        if key not in directory_candidates:
+        if key not in directory_names:
             try:
                 with os.scandir(directory_fd) as entries:
-                    candidates = []
-                    for entry in entries:
-                        if not RAW_ROLLOUT_BASENAME_RE.fullmatch(entry.name):
-                            continue
-                        rel = rel_dir / entry.name
-                        try:
-                            expected_identity = stable_rollout_identity_from_stat(
-                                entry.stat(follow_symlinks=False)
-                            )
-                        except FileNotFoundError:
-                            session_rollout_error(
-                                rel,
-                                "rollout identity changed during enumeration",
-                            )
-                        except OSError:
-                            session_rollout_error(rel, "rollout unreadable")
-                        except ValueError as error:
-                            session_rollout_error(rel, str(error))
-                        candidates.append((entry.name, expected_identity))
-                    directory_candidates[key] = sorted(
-                        candidates,
-                        key=lambda candidate: candidate[0],
+                    directory_names[key] = sorted(
+                        (
+                            entry.name
+                            for entry in entries
+                            if RAW_ROLLOUT_BASENAME_RE.fullmatch(entry.name)
+                        ),
                         reverse=True,
                     )
             except OSError:
                 session_directory_unreadable()
-        return directory_fd, directory_candidates[key]
+        return directory_fd, directory_names[key]
+
+    def candidate_identity(rel_dir, directory_fd, name):
+        key = rel_dir.as_posix()
+        cached = directory_candidate_identities.setdefault(key, {{}})
+        if name in cached:
+            return cached[name]
+        rel = rel_dir / name
+        try:
+            identity = rollout_candidate_identity_from_stat(
+                os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            )
+        except FileNotFoundError:
+            session_rollout_error(
+                rel,
+                "rollout identity changed during enumeration",
+            )
+        except OSError:
+            session_rollout_error(rel, "rollout unreadable")
+        except ValueError as error:
+            session_rollout_error(rel, str(error))
+        cached[name] = identity
+        return identity
 
     def add_directory_candidates(selected, rel_dir, predicate):
-        directory_fd, candidates = sorted_rollout_candidates(rel_dir)
+        directory_fd, names = sorted_rollout_names(rel_dir)
         if directory_fd is None:
             return
-        for name, expected_identity in candidates:
+        for name in names:
             rel = rel_dir / name
             if not predicate(rel):
                 continue
+            expected_identity = candidate_identity(rel_dir, directory_fd, name)
             key = session_meta_rollout_dedupe_key(rel)
             selected.setdefault(key, (rel, directory_fd, expected_identity))
 
@@ -2842,15 +2966,20 @@ def iter_session_meta():
     try:
         if ROLLOUT_FILENAME_MODE != "known":
             flat_archived_rel_dir = pathlib.PurePosixPath("archived_sessions")
-            flat_archived_fd, flat_archived_candidates = sorted_rollout_candidates(
+            flat_archived_fd, flat_archived_names = sorted_rollout_names(
                 flat_archived_rel_dir
             )
             date_set = set(DATE_STRINGS)
             if flat_archived_fd is not None:
-                for name, expected_identity in flat_archived_candidates:
+                for name in flat_archived_names:
                     if session_meta_rollout_filename_date(name) is not None:
                         continue
                     rel = flat_archived_rel_dir / name
+                    expected_identity = candidate_identity(
+                        flat_archived_rel_dir,
+                        flat_archived_fd,
+                        name,
+                    )
                     meta = session_meta_from_rollout(
                         flat_archived_fd,
                         rel,
@@ -3064,9 +3193,10 @@ def _scan_session_meta_records(
     rows: list[dict[str, str]] = []
     seen_rollout_paths: set[str] = set()
     opened_directories: dict[str, int] = {}
-    directory_candidates: dict[
+    directory_names: dict[str, list[str]] = {}
+    directory_candidate_identities: dict[
         str,
-        list[tuple[str, RolloutStableIdentity]],
+        dict[str, RolloutCandidateIdentity],
     ] = {}
 
     def open_directory(relative_dir: pathlib.PurePosixPath) -> int | None:
@@ -3084,70 +3214,86 @@ def _scan_session_meta_records(
 
     def close_directory(relative_dir: pathlib.PurePosixPath) -> None:
         key = relative_dir.as_posix()
-        directory_candidates.pop(key, None)
+        directory_names.pop(key, None)
+        directory_candidate_identities.pop(key, None)
         directory_fd = opened_directories.pop(key, None)
         if directory_fd is not None:
             os.close(directory_fd)
 
-    def sorted_rollout_candidates(
+    def sorted_rollout_names(
         relative_dir: pathlib.PurePosixPath,
-    ) -> tuple[int | None, list[tuple[str, RolloutStableIdentity]]]:
+    ) -> tuple[int | None, list[str]]:
         key = relative_dir.as_posix()
         directory_fd = open_directory(relative_dir)
         if directory_fd is None:
             return None, []
-        if key not in directory_candidates:
+        if key not in directory_names:
             try:
                 with os.scandir(directory_fd) as entries:
-                    candidates: list[tuple[str, RolloutStableIdentity]] = []
-                    for entry in entries:
-                        if not RAW_ROLLOUT_BASENAME_RE.fullmatch(entry.name):
-                            continue
-                        relative_path = relative_dir / entry.name
-                        try:
-                            expected_identity = _stable_rollout_identity_from_stat(
-                                entry.stat(follow_symlinks=False)
-                            )
-                        except FileNotFoundError as exc:
-                            raise SessionMetaRolloutError(
-                                "rollout identity changed during enumeration",
-                                rollout=relative_path.as_posix(),
-                            ) from exc
-                        except OSError as exc:
-                            raise SessionMetaRolloutError(
-                                "rollout unreadable",
-                                rollout=relative_path.as_posix(),
-                            ) from exc
-                        except ValueError as exc:
-                            raise SessionMetaRolloutError(
-                                str(exc),
-                                rollout=relative_path.as_posix(),
-                            ) from exc
-                        candidates.append((entry.name, expected_identity))
-                    directory_candidates[key] = sorted(
-                        candidates,
-                        key=lambda candidate: candidate[0],
+                    directory_names[key] = sorted(
+                        (
+                            entry.name
+                            for entry in entries
+                            if RAW_ROLLOUT_BASENAME_RE.fullmatch(entry.name)
+                        ),
                         reverse=True,
                     )
             except OSError as exc:
                 raise SessionMetaRolloutError("session directory unreadable") from exc
-        return directory_fd, directory_candidates[key]
+        return directory_fd, directory_names[key]
+
+    def candidate_identity(
+        relative_dir: pathlib.PurePosixPath,
+        directory_fd: int,
+        name: str,
+    ) -> RolloutCandidateIdentity:
+        key = relative_dir.as_posix()
+        cached = directory_candidate_identities.setdefault(key, {})
+        if name in cached:
+            return cached[name]
+        relative_path = relative_dir / name
+        try:
+            identity = _rollout_candidate_identity_from_stat(
+                os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            )
+        except FileNotFoundError as exc:
+            raise SessionMetaRolloutError(
+                "rollout identity changed during enumeration",
+                rollout=relative_path.as_posix(),
+            ) from exc
+        except OSError as exc:
+            raise SessionMetaRolloutError(
+                "rollout unreadable",
+                rollout=relative_path.as_posix(),
+            ) from exc
+        except ValueError as exc:
+            raise SessionMetaRolloutError(
+                str(exc),
+                rollout=relative_path.as_posix(),
+            ) from exc
+        cached[name] = identity
+        return identity
 
     def add_directory_candidates(
         selected: dict[
             str,
-            tuple[pathlib.PurePosixPath, int, RolloutStableIdentity],
+            tuple[pathlib.PurePosixPath, int, RolloutCandidateIdentity],
         ],
         relative_dir: pathlib.PurePosixPath,
         predicate: Any,
     ) -> None:
-        directory_fd, candidates = sorted_rollout_candidates(relative_dir)
+        directory_fd, names = sorted_rollout_names(relative_dir)
         if directory_fd is None:
             return
-        for name, expected_identity in candidates:
+        for name in names:
             relative_path = relative_dir / name
             if not predicate(relative_path):
                 continue
+            expected_identity = candidate_identity(
+                relative_dir,
+                directory_fd,
+                name,
+            )
             key = _session_meta_rollout_dedupe_key(relative_path)
             selected.setdefault(
                 key,
@@ -3158,19 +3304,24 @@ def _scan_session_meta_records(
         dt.date,
         dict[str, tuple[str, str, dt.datetime | None]],
     ] = {}
-    flat_archived_candidate_identities: dict[str, RolloutStableIdentity] = {}
+    flat_archived_candidate_identities: dict[str, RolloutCandidateIdentity] = {}
     try:
         if rollout_filename_mode != "known":
             flat_archived_relative_dir = pathlib.PurePosixPath("archived_sessions")
-            flat_archived_fd, flat_archived_candidates = sorted_rollout_candidates(
+            flat_archived_fd, flat_archived_names = sorted_rollout_names(
                 flat_archived_relative_dir
             )
             date_set = set(dates)
             if flat_archived_fd is not None:
-                for name, expected_identity in flat_archived_candidates:
+                for name in flat_archived_names:
                     if _session_meta_rollout_filename_date(name) is not None:
                         continue
                     rollout_relative_path = flat_archived_relative_dir / name
+                    expected_identity = candidate_identity(
+                        flat_archived_relative_dir,
+                        flat_archived_fd,
+                        name,
+                    )
                     meta = _session_meta_from_rollout(
                         codex_root,
                         rollout_relative_path,
@@ -3201,7 +3352,7 @@ def _scan_session_meta_records(
                 tuple[
                     pathlib.PurePosixPath,
                     int,
-                    RolloutStableIdentity,
+                    RolloutCandidateIdentity,
                 ],
             ] = {}
             for relative_dir in date_relative_dirs:
