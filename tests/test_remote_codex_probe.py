@@ -618,6 +618,136 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                     self.assertGreater(rollout.stat().st_size, original_size)
                     self.assertEqual(session_ids, ["trusted-session"])
 
+    def test_late_append_high_water_rejects_rollback_local_and_embedded(
+        self,
+    ) -> None:
+        for scope in ("local", "embedded"):
+            for layout in ("sessions", "root"):
+                with self.subTest(
+                    scope=scope,
+                    layout=layout,
+                ), tempfile.TemporaryDirectory() as temp_dir:
+                    rollout_ref = (
+                        ROLLOUT_REF
+                        if layout == "sessions"
+                        else "rollout-2026-05-26T10-00-00-root.jsonl"
+                    )
+                    codex_root = Path(temp_dir) / ".codex"
+                    rollout = write_rollout(codex_root, rollout_ref=rollout_ref)
+                    original_size = rollout.stat().st_size
+                    read_calls = 0
+                    appended = False
+                    rolled_back = False
+
+                    if scope == "local":
+                        real_read = MODULE._read_rollout_prefix_proof
+                        real_lines = MODULE._bounded_session_meta_lines
+
+                        def run_scan() -> object:
+                            return MODULE._scan_session_meta_records(
+                                codex_root=codex_root,
+                                dates=[dt.date(2026, 5, 26)],
+                                limit=10,
+                                host="local",
+                            )
+
+                    else:
+                        namespace = embedded_probe_namespace(
+                            {
+                                "mode": "session-meta",
+                                "dates": ["2026/05/26"],
+                                "limit": 10,
+                                "codex_root": str(codex_root),
+                                "session_meta_scan_bytes": (
+                                    MODULE.MAX_SESSION_META_SCAN_BYTES
+                                ),
+                            }
+                        )
+                        real_read = namespace["read_rollout_prefix_proof"]
+                        real_lines = namespace["bounded_session_meta_lines"]
+
+                        def run_scan() -> object:
+                            return namespace["iter_session_meta"]()
+
+                    def append_after_verified_read(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> object:
+                        nonlocal read_calls, appended
+                        result = real_read(*args, **kwargs)
+                        read_calls += 1
+                        if read_calls == 5:
+                            with rollout.open("ab") as handle:
+                                handle.write(b"{}\n" * 20)
+                            appended = True
+                        return result
+
+                    def rollback_after_snapshot_line(
+                        handle: object,
+                        max_bytes: int,
+                    ):
+                        nonlocal rolled_back
+                        for line in real_lines(handle, max_bytes):
+                            if not rolled_back:
+                                with rollout.open("r+b") as rollout_handle:
+                                    rollout_handle.truncate(original_size + 1)
+                                rolled_back = True
+                            yield line
+
+                    if scope == "local":
+                        read_patcher = mock.patch.object(
+                            MODULE,
+                            "_read_rollout_prefix_proof",
+                            side_effect=append_after_verified_read,
+                        )
+                        lines_patcher = mock.patch.object(
+                            MODULE,
+                            "_bounded_session_meta_lines",
+                            side_effect=rollback_after_snapshot_line,
+                        )
+                    else:
+                        read_patcher = mock.patch.dict(
+                            namespace,
+                            {
+                                "read_rollout_prefix_proof": (
+                                    append_after_verified_read
+                                )
+                            },
+                        )
+                        lines_patcher = mock.patch.dict(
+                            namespace,
+                            {
+                                "bounded_session_meta_lines": (
+                                    rollback_after_snapshot_line
+                                )
+                            },
+                        )
+
+                    output = io.StringIO()
+                    with read_patcher, lines_patcher, redirect_stdout(output):
+                        if scope == "local":
+                            with self.assertRaises(
+                                MODULE.SessionMetaRolloutError
+                            ) as raised:
+                                run_scan()
+                            error = raised.exception.error
+                        else:
+                            with self.assertRaises(SystemExit) as raised:
+                                run_scan()
+                            self.assertEqual(raised.exception.code, 0)
+                            error = json.loads(
+                                output.getvalue().splitlines()[1]
+                            )["error"]
+
+                    self.assertTrue(appended)
+                    self.assertTrue(rolled_back)
+                    self.assertEqual(read_calls, 5)
+                    self.assertEqual(rollout.stat().st_size, original_size + 1)
+                    self.assertIn(
+                        "rollout identity changed after session-meta scan",
+                        error,
+                    )
+
     def test_active_prefix_proof_capture_fails_closed_on_growth(self) -> None:
         for scope in ("local", "embedded"):
             for layout in ("sessions", "root"):

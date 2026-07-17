@@ -915,7 +915,7 @@ def _assert_append_only_rollout_checkpoint(
     prefix_proof: RolloutPrefixProof | None,
     *,
     phase: str,
-) -> tuple[RolloutIdentity, RolloutPrefixProof, bytes]:
+) -> tuple[RolloutIdentity, RolloutIdentity, RolloutPrefixProof, bytes]:
     if prefix_proof is None:
         raise ValueError(f"rollout identity changed {phase}")
     descriptor_identity = _rollout_identity_from_stat(os.fstat(fd))
@@ -973,7 +973,7 @@ def _assert_append_only_rollout_checkpoint(
         descriptor_final,
         phase=phase,
     )
-    return current, advanced_proof, verified_snapshot
+    return current_final, current, advanced_proof, verified_snapshot
 
 
 def _open_pinned_regular_file_from_fd(
@@ -982,7 +982,13 @@ def _open_pinned_regular_file_from_fd(
     *,
     expected_identity: RolloutCandidateIdentity | None = None,
     allow_append: bool = False,
-) -> tuple[int, RolloutIdentity, RolloutPrefixProof | None, bytes | None]:
+) -> tuple[
+    int,
+    RolloutIdentity,
+    RolloutIdentity | None,
+    RolloutPrefixProof | None,
+    bytes | None,
+]:
     if name in ("", ".", "..") or "/" in name:
         raise ValueError("rollout path has an invalid file name")
     try:
@@ -1017,7 +1023,7 @@ def _open_pinned_regular_file_from_fd(
         if expected_identity is None:
             _assert_rollout_identity(opened, observed, phase="during open")
         elif allow_append:
-            current, prefix_proof, verified_snapshot = (
+            current, snapshot_identity, prefix_proof, verified_snapshot = (
                 _assert_append_only_rollout_checkpoint(
                     fd,
                     parent_fd,
@@ -1027,7 +1033,7 @@ def _open_pinned_regular_file_from_fd(
                     phase="during open",
                 )
             )
-            return fd, current, prefix_proof, verified_snapshot
+            return fd, current, snapshot_identity, prefix_proof, verified_snapshot
         else:
             _assert_rollout_identity(
                 opened,
@@ -1053,7 +1059,7 @@ def _open_pinned_regular_file_from_fd(
                 expected_identity.snapshot,
                 phase="during open",
             )
-        return fd, current, None, None
+        return fd, current, None, None, None
     except Exception:
         os.close(fd)
         raise
@@ -1066,6 +1072,7 @@ class _PinnedRolloutHandle:
         parent_fd: int,
         name: str,
         open_identity: RolloutIdentity,
+        verified_snapshot_identity: RolloutIdentity | None,
         prefix_proof: RolloutPrefixProof | None,
         verified_snapshot: bytes | None,
     ) -> None:
@@ -1081,6 +1088,7 @@ class _PinnedRolloutHandle:
         self._parent_fd = parent_fd
         self._name = name
         self._open_identity = open_identity
+        self._verified_snapshot_identity = verified_snapshot_identity
         self._prefix_proof = prefix_proof
         self._verified_snapshot = verified_snapshot
 
@@ -1129,7 +1137,7 @@ class _PinnedRolloutHandle:
         *,
         phase: str,
     ) -> RolloutIdentity:
-        current, prefix_proof, verified_snapshot = (
+        current, snapshot_identity, prefix_proof, verified_snapshot = (
             _assert_append_only_rollout_checkpoint(
                 self.fileno(),
                 self._parent_fd,
@@ -1139,6 +1147,7 @@ class _PinnedRolloutHandle:
                 phase=phase,
             )
         )
+        self._verified_snapshot_identity = snapshot_identity
         self._prefix_proof = prefix_proof
         self._verified_snapshot = verified_snapshot
         return current
@@ -1151,6 +1160,10 @@ class _PinnedRolloutHandle:
     def verified_snapshot(self) -> bytes | None:
         return self._verified_snapshot
 
+    @property
+    def verified_snapshot_identity(self) -> RolloutIdentity | None:
+        return self._verified_snapshot_identity
+
 
 def _open_pinned_rollout_text_from_parent_fd(
     parent_fd: int,
@@ -1159,7 +1172,7 @@ def _open_pinned_rollout_text_from_parent_fd(
     expected_identity: RolloutCandidateIdentity | None = None,
     allow_append: bool = False,
 ) -> _PinnedRolloutHandle:
-    fd, open_identity, prefix_proof, verified_snapshot = (
+    fd, open_identity, snapshot_identity, prefix_proof, verified_snapshot = (
         _open_pinned_regular_file_from_fd(
             parent_fd,
             name,
@@ -1177,6 +1190,7 @@ def _open_pinned_rollout_text_from_parent_fd(
         pinned_parent_fd,
         name,
         open_identity,
+        snapshot_identity,
         prefix_proof,
         verified_snapshot,
     )
@@ -1540,8 +1554,11 @@ def _session_meta_from_rollout(
                     handle.open_identity,
                     phase="before session-meta scan",
                 )
+                snapshot_identity = handle.verified_snapshot_identity
+                if snapshot_identity is None:
+                    raise ValueError("rollout identity changed before session-meta scan")
                 scan_handle = _session_meta_snapshot_reader(
-                    identity,
+                    snapshot_identity,
                     handle.verified_snapshot,
                 )
             else:
@@ -2178,7 +2195,7 @@ def assert_append_only_rollout_checkpoint(
     except (FileNotFoundError, ValueError) as error:
         raise ValueError("rollout identity changed " + phase) from error
     assert_append_only_rollout_identity(current_final, descriptor_final, phase)
-    return current, advanced_proof, verified_snapshot
+    return current_final, current, advanced_proof, verified_snapshot
 
 
 def open_pinned_regular_file_from_fd(
@@ -2221,7 +2238,7 @@ def open_pinned_regular_file_from_fd(
         if expected_identity is None:
             assert_rollout_identity(opened, observed, "during open")
         elif allow_append:
-            current, prefix_proof, verified_snapshot = (
+            current, snapshot_identity, prefix_proof, verified_snapshot = (
                 assert_append_only_rollout_checkpoint(
                     fd,
                     parent_fd,
@@ -2231,7 +2248,7 @@ def open_pinned_regular_file_from_fd(
                     "during open",
                 )
             )
-            return fd, current, prefix_proof, verified_snapshot
+            return fd, current, snapshot_identity, prefix_proof, verified_snapshot
         else:
             assert_rollout_identity(
                 opened,
@@ -2257,7 +2274,7 @@ def open_pinned_regular_file_from_fd(
                 expected_identity["snapshot"],
                 "during open",
             )
-        return fd, current, None, None
+        return fd, current, None, None, None
     except Exception:
         os.close(fd)
         raise
@@ -2270,6 +2287,7 @@ class PinnedRolloutHandle:
         parent_fd,
         name,
         open_identity,
+        verified_snapshot_identity,
         prefix_proof,
         verified_snapshot,
     ):
@@ -2285,6 +2303,7 @@ class PinnedRolloutHandle:
         self.parent_fd = parent_fd
         self.name = name
         self.open_identity = open_identity
+        self.verified_snapshot_identity = verified_snapshot_identity
         self.prefix_proof = prefix_proof
         self.verified_snapshot = verified_snapshot
 
@@ -2328,7 +2347,7 @@ class PinnedRolloutHandle:
         assert_rollout_identity(current, expected, phase)
 
     def assert_append_only_identity(self, expected, phase):
-        current, prefix_proof, verified_snapshot = (
+        current, snapshot_identity, prefix_proof, verified_snapshot = (
             assert_append_only_rollout_checkpoint(
                 self.fileno(),
                 self.parent_fd,
@@ -2338,6 +2357,7 @@ class PinnedRolloutHandle:
                 phase,
             )
         )
+        self.verified_snapshot_identity = snapshot_identity
         self.prefix_proof = prefix_proof
         self.verified_snapshot = verified_snapshot
         return current
@@ -2349,7 +2369,7 @@ def open_pinned_rollout_text_from_parent_fd(
     expected_identity=None,
     allow_append=False,
 ):
-    fd, open_identity, prefix_proof, verified_snapshot = (
+    fd, open_identity, snapshot_identity, prefix_proof, verified_snapshot = (
         open_pinned_regular_file_from_fd(
             parent_fd,
             name,
@@ -2367,6 +2387,7 @@ def open_pinned_rollout_text_from_parent_fd(
         pinned_parent_fd,
         name,
         open_identity,
+        snapshot_identity,
         prefix_proof,
         verified_snapshot,
     )
@@ -2648,8 +2669,11 @@ def session_meta_from_rollout(
                     handle.open_identity,
                     "before session-meta scan",
                 )
+                snapshot_identity = handle.verified_snapshot_identity
+                if snapshot_identity is None:
+                    raise ValueError("rollout identity changed before session-meta scan")
                 scan_handle = session_meta_snapshot_reader(
-                    identity,
+                    snapshot_identity,
                     handle.verified_snapshot,
                 )
             else:
