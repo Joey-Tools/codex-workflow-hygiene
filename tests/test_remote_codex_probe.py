@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
+from typing import Any
 from unittest import mock
 
 
@@ -85,37 +86,47 @@ def embedded_probe_namespace(payload: dict[str, object]) -> dict[str, object]:
     return namespace
 
 
-def rollout_mutating_stat(
-    real_stat: Callable[..., os.stat_result],
+def entry_mutating_scandir(
+    real_scandir: Callable[..., Any],
     target_name: str,
     mutate: Callable[[], None],
     *,
     before_stat: bool = False,
-) -> Callable[..., os.stat_result]:
-    def mutating_stat(
-        path: object,
-        *,
-        dir_fd: int | None = None,
-        follow_symlinks: bool = True,
-    ) -> os.stat_result:
-        if path != target_name or dir_fd is None:
-            return real_stat(
-                path,
-                dir_fd=dir_fd,
-                follow_symlinks=follow_symlinks,
-            )
-        if before_stat:
-            mutate()
-        result = real_stat(
-            path,
-            dir_fd=dir_fd,
-            follow_symlinks=follow_symlinks,
-        )
-        if not before_stat:
-            mutate()
-        return result
+) -> Callable[..., Any]:
+    class EntryProxy:
+        def __init__(self, entry: Any) -> None:
+            self._entry = entry
+            self.name = entry.name
 
-    return mutating_stat
+        def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+            if before_stat:
+                mutate()
+            result = self._entry.stat(follow_symlinks=follow_symlinks)
+            if not before_stat:
+                mutate()
+            return result
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._entry, name)
+
+    class ScandirProxy:
+        def __init__(self, iterator: Any) -> None:
+            self._iterator = iterator
+
+        def __enter__(self) -> Any:
+            entries = self._iterator.__enter__()
+            return (
+                EntryProxy(entry) if entry.name == target_name else entry
+                for entry in entries
+            )
+
+        def __exit__(self, *args: object) -> object:
+            return self._iterator.__exit__(*args)
+
+    def mutating_scandir(path: object) -> Any:
+        return ScandirProxy(real_scandir(path))
+
+    return mutating_scandir
 
 
 class RemoteCodexProbeDescriptorTests(unittest.TestCase):
@@ -123,6 +134,7 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
         for scope in ("local", "embedded"):
             for mutation in (
                 "delete_before_stat",
+                "replace_before_stat",
                 "delete_after_stat",
                 "replace_after_stat",
             ):
@@ -174,18 +186,18 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         def run_scan() -> object:
                             return namespace["iter_session_meta"]()
 
-                    mutating_stat = rollout_mutating_stat(
-                        target_os.stat,
+                    mutating_scandir = entry_mutating_scandir(
+                        target_os.scandir,
                         rollout.name,
                         mutate,
-                        before_stat=mutation == "delete_before_stat",
+                        before_stat=mutation.endswith("before_stat"),
                     )
                     output = io.StringIO()
                     if scope == "local":
                         with mock.patch.object(
                             target_os,
-                            "stat",
-                            side_effect=mutating_stat,
+                            "scandir",
+                            side_effect=mutating_scandir,
                         ), self.assertRaises(
                             MODULE.SessionMetaRolloutError
                         ) as raised:
@@ -195,8 +207,8 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                     else:
                         with mock.patch.object(
                             target_os,
-                            "stat",
-                            side_effect=mutating_stat,
+                            "scandir",
+                            side_effect=mutating_scandir,
                         ), redirect_stdout(output), self.assertRaises(
                             SystemExit
                         ) as raised:
@@ -239,29 +251,22 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         outside.write_text("outside\n", encoding="utf-8")
                         abnormal.symlink_to(outside)
 
+                        stat_called = False
+
+                        def record_stat() -> None:
+                            nonlocal stat_called
+                            stat_called = True
+
                         output = io.StringIO()
                         if scope == "local":
-                            if in_scope:
-                                with self.assertRaisesRegex(
-                                    MODULE.SessionMetaRolloutError,
-                                    "symlink",
-                                ):
-                                    MODULE._scan_session_meta_records(
-                                        codex_root=codex_root,
-                                        dates=[dt.date(2026, 5, 26)],
-                                        limit=10,
-                                        host="local",
-                                    )
-                            else:
-                                scan = MODULE._scan_session_meta_records(
+                            target_os = MODULE.os
+
+                            def run_scan() -> object:
+                                return MODULE._scan_session_meta_records(
                                     codex_root=codex_root,
                                     dates=[dt.date(2026, 5, 26)],
                                     limit=10,
                                     host="local",
-                                )
-                                self.assertEqual(
-                                    [row["session_id"] for row in scan.rows],
-                                    ["trusted-session"],
                                 )
                         else:
                             namespace = embedded_probe_namespace(
@@ -273,19 +278,51 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                                     "session_meta_scan_bytes": MODULE.MAX_SESSION_META_SCAN_BYTES,
                                 }
                             )
-                            with redirect_stdout(output):
-                                if in_scope:
-                                    with self.assertRaises(SystemExit) as raised:
-                                        namespace["iter_session_meta"]()
-                                    self.assertEqual(raised.exception.code, 0)
-                                else:
-                                    namespace["iter_session_meta"]()
+                            target_os = namespace["os"]
+
+                            def run_scan() -> object:
+                                return namespace["iter_session_meta"]()
+
+                        mutating_scandir = entry_mutating_scandir(
+                            target_os.scandir,
+                            abnormal.name,
+                            record_stat,
+                        )
+                        with mock.patch.object(
+                            target_os,
+                            "scandir",
+                            side_effect=mutating_scandir,
+                        ), redirect_stdout(output):
+                            if in_scope and scope == "local":
+                                with self.assertRaisesRegex(
+                                    MODULE.SessionMetaRolloutError,
+                                    "symlink",
+                                ):
+                                    run_scan()
+                            elif in_scope:
+                                with self.assertRaises(SystemExit) as raised:
+                                    run_scan()
+                                self.assertEqual(raised.exception.code, 0)
+                            else:
+                                scan = run_scan()
+
+                        self.assertEqual(stat_called, in_scope)
+                        if scope == "local":
+                            if not in_scope:
+                                self.assertEqual(
+                                    [row["session_id"] for row in scan.rows],
+                                    ["trusted-session"],
+                                )
+                        else:
                             records = [
                                 json.loads(line)
                                 for line in output.getvalue().splitlines()[1:-1]
                             ]
                             if in_scope:
-                                self.assertEqual(records[0]["rollout"], abnormal.relative_to(codex_root).as_posix())
+                                self.assertEqual(
+                                    records[0]["rollout"],
+                                    abnormal.relative_to(codex_root).as_posix(),
+                                )
                                 self.assertIn("symlink", records[0]["error"])
                             else:
                                 self.assertEqual(
@@ -294,80 +331,379 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                                 )
                                 self.assertNotIn("outside", output.getvalue())
 
-    def test_session_meta_allows_same_inode_append_local_and_embedded(self) -> None:
+    def test_active_session_meta_enforces_append_only_policy(self) -> None:
         for scope in ("local", "embedded"):
             for layout in ("sessions", "root"):
-                with self.subTest(
-                    scope=scope,
-                    layout=layout,
-                ), tempfile.TemporaryDirectory() as temp_dir:
-                    rollout_ref = (
-                        ROLLOUT_REF
-                        if layout == "sessions"
-                        else "rollout-2026-05-26T10-00-00-root.jsonl"
-                    )
-                    codex_root = Path(temp_dir) / ".codex"
-                    rollout = write_rollout(codex_root, rollout_ref=rollout_ref)
-                    original_stat = rollout.stat()
-                    appended = False
-
-                    def append_after_identity_capture() -> None:
-                        nonlocal appended
-                        if appended:
-                            return
-                        appended = True
-                        with rollout.open("ab") as output:
-                            output.write(
-                                b'{"type":"event_msg","payload":{"type":"task_complete"}}\n'
+                for phase in ("before_open", "post_read"):
+                    for mutation in ("append", "truncate", "rewrite"):
+                        with self.subTest(
+                            scope=scope,
+                            layout=layout,
+                            phase=phase,
+                            mutation=mutation,
+                        ), tempfile.TemporaryDirectory() as temp_dir:
+                            rollout_ref = (
+                                ROLLOUT_REF
+                                if layout == "sessions"
+                                else "rollout-2026-05-26T10-00-00-root.jsonl"
                             )
+                            codex_root = Path(temp_dir) / ".codex"
+                            rollout = write_rollout(
+                                codex_root,
+                                rollout_ref=rollout_ref,
+                            )
+                            original_stat = rollout.stat()
+                            mutated = False
 
-                    if scope == "local":
-                        target_os = MODULE.os
-                    else:
-                        namespace = embedded_probe_namespace(
-                            {
-                                "mode": "session-meta",
-                                "dates": ["2026/05/26"],
-                                "limit": 10,
-                                "codex_root": str(codex_root),
-                                "session_meta_scan_bytes": MODULE.MAX_SESSION_META_SCAN_BYTES,
-                            }
+                            def mutate() -> None:
+                                nonlocal mutated
+                                if mutated:
+                                    return
+                                mutated = True
+                                if mutation == "append":
+                                    with rollout.open("ab") as handle:
+                                        handle.write(b"{}\n")
+                                elif mutation == "truncate":
+                                    with rollout.open("r+b") as handle:
+                                        handle.truncate(
+                                            max(1, original_stat.st_size // 2)
+                                        )
+                                else:
+                                    data = rollout.read_bytes()
+                                    with rollout.open("r+b") as handle:
+                                        handle.write(b" " + data[1:])
+                                    os.utime(
+                                        rollout,
+                                        ns=(
+                                            original_stat.st_atime_ns,
+                                            original_stat.st_mtime_ns
+                                            + 1_000_000_000,
+                                        ),
+                                    )
+
+                            if scope == "local":
+                                target_os = MODULE.os
+
+                                def run_scan() -> object:
+                                    return MODULE._scan_session_meta_records(
+                                        codex_root=codex_root,
+                                        dates=[dt.date(2026, 5, 26)],
+                                        limit=10,
+                                        host="local",
+                                    )
+                            else:
+                                namespace = embedded_probe_namespace(
+                                    {
+                                        "mode": "session-meta",
+                                        "dates": ["2026/05/26"],
+                                        "limit": 10,
+                                        "codex_root": str(codex_root),
+                                        "session_meta_scan_bytes": MODULE.MAX_SESSION_META_SCAN_BYTES,
+                                    }
+                                )
+                                target_os = namespace["os"]
+
+                                def run_scan() -> object:
+                                    return namespace["iter_session_meta"]()
+
+                            if phase == "before_open":
+                                patcher = mock.patch.object(
+                                    target_os,
+                                    "scandir",
+                                    side_effect=entry_mutating_scandir(
+                                        target_os.scandir,
+                                        rollout.name,
+                                        mutate,
+                                    ),
+                                )
+                            elif scope == "local":
+                                real_lines = MODULE._bounded_session_meta_lines
+
+                                def mutating_lines(handle: object, max_bytes: int):
+                                    for line in real_lines(handle, max_bytes):
+                                        mutate()
+                                        yield line
+
+                                patcher = mock.patch.object(
+                                    MODULE,
+                                    "_bounded_session_meta_lines",
+                                    side_effect=mutating_lines,
+                                )
+                            else:
+                                real_lines = namespace["bounded_session_meta_lines"]
+
+                                def mutating_lines(handle: object, max_bytes: int):
+                                    for line in real_lines(handle, max_bytes):
+                                        mutate()
+                                        yield line
+
+                                patcher = mock.patch.dict(
+                                    namespace,
+                                    {"bounded_session_meta_lines": mutating_lines},
+                                )
+
+                            output = io.StringIO()
+                            with patcher, redirect_stdout(output):
+                                if mutation == "append":
+                                    scan = run_scan()
+                                    if scope == "local":
+                                        session_ids = [
+                                            row["session_id"] for row in scan.rows
+                                        ]
+                                    else:
+                                        session_ids = [
+                                            json.loads(line)["session_id"]
+                                            for line in output.getvalue().splitlines()[
+                                                1:-1
+                                            ]
+                                        ]
+                                elif scope == "local":
+                                    with self.assertRaises(
+                                        MODULE.SessionMetaRolloutError
+                                    ) as raised:
+                                        run_scan()
+                                    error = raised.exception.error
+                                else:
+                                    with self.assertRaises(SystemExit) as raised:
+                                        run_scan()
+                                    self.assertEqual(raised.exception.code, 0)
+                                    error = json.loads(
+                                        output.getvalue().splitlines()[1]
+                                    )["error"]
+
+                            final_stat = rollout.stat()
+                            self.assertTrue(mutated)
+                            self.assertEqual(
+                                (final_stat.st_dev, final_stat.st_ino),
+                                (original_stat.st_dev, original_stat.st_ino),
+                            )
+                            if mutation == "append":
+                                self.assertGreater(
+                                    final_stat.st_size,
+                                    original_stat.st_size,
+                                )
+                                self.assertEqual(
+                                    session_ids,
+                                    ["trusted-session"],
+                                )
+                            else:
+                                self.assertIn("identity changed", error)
+
+    def test_append_only_policy_rejects_growth_followed_by_rollback(self) -> None:
+        def regular_stat(size: int, timestamp_ns: int) -> argparse.Namespace:
+            return argparse.Namespace(
+                st_mode=MODULE.stat.S_IFREG | 0o600,
+                st_size=size,
+                st_dev=11,
+                st_ino=22,
+                st_mtime_ns=timestamp_ns,
+                st_ctime_ns=timestamp_ns,
+            )
+
+        initial = regular_stat(100, 1)
+        grown = regular_stat(200, 2)
+        rolled_back = regular_stat(150, 3)
+
+        for scope in ("local", "embedded"):
+            with self.subTest(scope=scope, phase="during_open"):
+                if scope == "local":
+                    target_os = MODULE.os
+                    candidate = MODULE._rollout_candidate_identity_from_stat(initial)
+                    open_rollout = MODULE._open_pinned_regular_file_from_fd
+                else:
+                    namespace = embedded_probe_namespace(
+                        {
+                            "mode": "session-meta",
+                            "dates": [],
+                            "limit": 10,
+                            "codex_root": "/tmp/unused",
+                            "session_meta_scan_bytes": (
+                                MODULE.MAX_SESSION_META_SCAN_BYTES
+                            ),
+                        }
+                    )
+                    target_os = namespace["os"]
+                    candidate = namespace["rollout_candidate_identity_from_stat"](
+                        initial
+                    )
+                    open_rollout = namespace["open_pinned_regular_file_from_fd"]
+
+                with mock.patch.object(
+                    target_os,
+                    "stat",
+                    return_value=grown,
+                ), mock.patch.object(
+                    target_os,
+                    "open",
+                    return_value=91,
+                ), mock.patch.object(
+                    target_os,
+                    "fstat",
+                    return_value=rolled_back,
+                ), mock.patch.object(
+                    target_os,
+                    "close",
+                ) as close_fd, self.assertRaisesRegex(
+                    ValueError,
+                    "identity changed during open",
+                ):
+                    open_rollout(
+                        7,
+                        "rollout.jsonl",
+                        expected_identity=candidate,
+                        allow_append=True,
+                    )
+                close_fd.assert_called_once_with(91)
+
+            with self.subTest(scope=scope, phase="after_scan"):
+                if scope == "local":
+                    handle = MODULE._PinnedRolloutHandle.__new__(
+                        MODULE._PinnedRolloutHandle
+                    )
+                    handle._handle = mock.Mock()
+                    handle._handle.fileno.return_value = 92
+                    handle._parent_fd = 7
+                    handle._name = "rollout.jsonl"
+                    expected = MODULE._rollout_identity_from_stat(initial)
+
+                    def assert_append_only() -> None:
+                        handle.assert_append_only_identity(
+                            expected,
+                            phase="after session-meta scan",
                         )
-                        target_os = namespace["os"]
-                    mutating_stat = rollout_mutating_stat(
-                        target_os.stat,
-                        rollout.name,
-                        append_after_identity_capture,
-                    )
-                    output = io.StringIO()
-                    with mock.patch.object(
-                        target_os,
-                        "stat",
-                        side_effect=mutating_stat,
-                    ), redirect_stdout(output):
-                        if scope == "local":
-                            scan = MODULE._scan_session_meta_records(
-                                codex_root=codex_root,
-                                dates=[dt.date(2026, 5, 26)],
-                                limit=10,
-                                host="local",
-                            )
-                            session_ids = [row["session_id"] for row in scan.rows]
-                        else:
-                            namespace["iter_session_meta"]()
-                            session_ids = [
-                                json.loads(line)["session_id"]
-                                for line in output.getvalue().splitlines()[1:-1]
-                            ]
 
-                    final_stat = rollout.stat()
-                    self.assertTrue(appended)
-                    self.assertEqual(
-                        (final_stat.st_dev, final_stat.st_ino),
-                        (original_stat.st_dev, original_stat.st_ino),
+                else:
+                    handle_type = namespace["PinnedRolloutHandle"]
+                    handle = handle_type.__new__(handle_type)
+                    handle.handle = mock.Mock()
+                    handle.handle.fileno.return_value = 92
+                    handle.parent_fd = 7
+                    handle.name = "rollout.jsonl"
+                    expected = namespace["rollout_identity_from_stat"](initial)
+
+                    def assert_append_only() -> None:
+                        handle.assert_append_only_identity(
+                            expected,
+                            "after session-meta scan",
+                        )
+
+                with mock.patch.object(
+                    target_os,
+                    "fstat",
+                    return_value=grown,
+                ), mock.patch.object(
+                    target_os,
+                    "stat",
+                    return_value=rolled_back,
+                ), self.assertRaisesRegex(
+                    ValueError,
+                    "identity changed after session-meta scan",
+                ):
+                    assert_append_only()
+
+    def test_append_only_policy_preserves_open_to_scan_handoff(self) -> None:
+        for scope in ("local", "embedded"):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temp_dir:
+                codex_root = Path(temp_dir) / ".codex"
+                rollout = write_rollout(codex_root)
+                initial_stat = rollout.stat()
+                grew = False
+                rolled_back = False
+
+                def grow() -> None:
+                    nonlocal grew
+                    if grew:
+                        return
+                    grew = True
+                    with rollout.open("ab") as handle:
+                        handle.write(b"x" * 256)
+
+                def rollback() -> None:
+                    nonlocal rolled_back
+                    if rolled_back:
+                        return
+                    rolled_back = True
+                    with rollout.open("r+b") as handle:
+                        handle.truncate(initial_stat.st_size + 32)
+
+                output = io.StringIO()
+                if scope == "local":
+                    target_os = MODULE.os
+                    real_open = MODULE._open_pinned_rollout_text_from_parent_fd
+
+                    def open_then_rollback(*args: object, **kwargs: object) -> object:
+                        handle = real_open(*args, **kwargs)
+                        rollback()
+                        return handle
+
+                    open_patcher = mock.patch.object(
+                        MODULE,
+                        "_open_pinned_rollout_text_from_parent_fd",
+                        side_effect=open_then_rollback,
                     )
-                    self.assertGreater(final_stat.st_size, original_stat.st_size)
-                    self.assertEqual(session_ids, ["trusted-session"])
+
+                    def run_scan() -> object:
+                        return MODULE._scan_session_meta_records(
+                            codex_root=codex_root,
+                            dates=[dt.date(2026, 5, 26)],
+                            limit=10,
+                            host="local",
+                        )
+
+                else:
+                    namespace = embedded_probe_namespace(
+                        {
+                            "mode": "session-meta",
+                            "dates": ["2026/05/26"],
+                            "limit": 10,
+                            "codex_root": str(codex_root),
+                            "session_meta_scan_bytes": (
+                                MODULE.MAX_SESSION_META_SCAN_BYTES
+                            ),
+                        }
+                    )
+                    target_os = namespace["os"]
+                    real_open = namespace["open_pinned_rollout_text_from_parent_fd"]
+
+                    def open_then_rollback(*args: object, **kwargs: object) -> object:
+                        handle = real_open(*args, **kwargs)
+                        rollback()
+                        return handle
+
+                    open_patcher = mock.patch.dict(
+                        namespace,
+                        {"open_pinned_rollout_text_from_parent_fd": open_then_rollback},
+                    )
+
+                    def run_scan() -> object:
+                        return namespace["iter_session_meta"]()
+
+                with mock.patch.object(
+                    target_os,
+                    "scandir",
+                    side_effect=entry_mutating_scandir(
+                        target_os.scandir,
+                        rollout.name,
+                        grow,
+                    ),
+                ), open_patcher, redirect_stdout(output):
+                    if scope == "local":
+                        with self.assertRaises(
+                            MODULE.SessionMetaRolloutError
+                        ) as raised:
+                            run_scan()
+                        error = raised.exception.error
+                    else:
+                        with self.assertRaises(SystemExit) as raised:
+                            run_scan()
+                        self.assertEqual(raised.exception.code, 0)
+                        error = json.loads(output.getvalue().splitlines()[1])["error"]
+
+                final_stat = rollout.stat()
+                self.assertTrue(grew)
+                self.assertTrue(rolled_back)
+                self.assertGreater(final_stat.st_size, initial_stat.st_size)
+                self.assertIn("identity changed before session-meta scan", error)
 
     def test_archived_session_meta_rejects_same_inode_mutations(self) -> None:
         layouts = {
@@ -454,9 +790,9 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         if phase == "before_open":
                             patcher = mock.patch.object(
                                 target_os,
-                                "stat",
-                                side_effect=rollout_mutating_stat(
-                                    target_os.stat,
+                                "scandir",
+                                side_effect=entry_mutating_scandir(
+                                    target_os.scandir,
                                     rollout.name,
                                     mutate,
                                 ),
