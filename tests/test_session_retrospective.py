@@ -2867,6 +2867,99 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(scan_meta.get("source_sha256"), expected_sha256)
         self.assertNotIn("source_sha256=", scan_meta["text"])
 
+    def test_remote_probe_hashing_reader_rejects_lossy_text_stream(self) -> None:
+        raw_bytes = b"a\r\nb\r\n\xff"
+        with io.TextIOWrapper(
+            io.BytesIO(raw_bytes),
+            encoding="utf-8",
+            errors="replace",
+            newline=None,
+        ) as handle:
+            reader = REMOTE_PROBE._HashingReader(handle)
+            with self.assertRaisesRegex(TypeError, "requires binary input"):
+                reader.read()
+
+    def test_remote_probe_local_rollout_summary_hashes_exact_raw_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-raw-bytes.jsonl"
+            rollout = root / rollout_ref
+            first_line = json.dumps(
+                message("user", "Review the deployment.", "2026-05-01T10:00:00Z")
+            ).encode("utf-8")
+            first_line = first_line.replace(b"deployment", b"deploy\xffment")
+            payload = first_line + b"\r\n" + json.dumps(
+                message("assistant", "Acknowledged.", "2026-05-01T10:01:00Z")
+            ).encode("utf-8") + b"\r\n"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_bytes(payload)
+            stdout = io.StringIO()
+
+            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
+                sys, "stdout", stdout
+            ):
+                result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=10,
+                        tail_records=0,
+                        max_text_chars=80,
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(payload.count(b"\r\n"), 2)
+        self.assertIn(b"\xff", payload)
+        rows = [json.loads(line) for line in stdout.getvalue().splitlines() if line.startswith("{")]
+        scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+        self.assertFalse(scan_meta["scan_truncated"])
+        self.assertEqual(scan_meta["source_bytes"], len(payload))
+        self.assertEqual(scan_meta["source_sha256"], hashlib.sha256(payload).hexdigest())
+
+    def test_remote_probe_embedded_rollout_summary_hashes_exact_raw_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-raw-bytes.jsonl"
+            rollout = root / rollout_ref
+            first_line = json.dumps(
+                message("user", "Review the deployment.", "2026-05-01T10:00:00Z")
+            ).encode("utf-8")
+            first_line = first_line.replace(b"deployment", b"deploy\xffment")
+            payload = first_line + b"\r\n" + json.dumps(
+                message("assistant", "Acknowledged.", "2026-05-01T10:01:00Z")
+            ).encode("utf-8") + b"\r\n"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_bytes(payload)
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": rollout_ref,
+                    "summary_limit": 10,
+                    "summary_scan_bytes": 4096,
+                    "summary_tail_records": 0,
+                    "summary_max_text_chars": 80,
+                    "summary_keywords": [],
+                }
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+        scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+        self.assertFalse(scan_meta["scan_truncated"])
+        self.assertEqual(scan_meta["source_bytes"], len(payload))
+        self.assertEqual(scan_meta["source_sha256"], hashlib.sha256(payload).hexdigest())
+
     def test_remote_probe_local_rollout_summary_scans_full_rollout_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
