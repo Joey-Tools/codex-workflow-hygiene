@@ -800,7 +800,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         for error in errors:
             with self.subTest(error=type(error).__name__), mock.patch.object(
                 REMOTE_PROBE,
-                "_resolve_safe_codex_root",
+                "_inspect_safe_codex_root",
                 side_effect=error,
             ), self.assertRaisesRegex(
                 REMOTE_PROBE.SessionMetaRolloutError,

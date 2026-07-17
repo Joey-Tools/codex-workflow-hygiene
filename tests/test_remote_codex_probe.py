@@ -824,45 +824,30 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         "pread",
                         side_effect=tracking_pread,
                     ), redirect_stdout(output):
-                        if scope == "local" and scenario == "no_meta":
-                            with self.assertRaises(
-                                MODULE.SessionMetaRolloutError
-                            ) as raised:
-                                run_scan()
-                            error = raised.exception.error
-                            error_rollout = raised.exception.rollout
-                        elif scope == "embedded" and scenario == "no_meta":
-                            with self.assertRaises(SystemExit) as raised:
-                                run_scan()
-                            self.assertEqual(raised.exception.code, 0)
-                            record = json.loads(output.getvalue().splitlines()[1])
-                            error = record["error"]
-                            error_rollout = record.get("rollout")
-                        else:
-                            scan = run_scan()
+                        scan = run_scan()
 
-                    if scenario == "valid":
-                        if scope == "local":
-                            self.assertTrue(scan.truncated)
+                    if scope == "local":
+                        self.assertTrue(scan.truncated)
+                        if scenario == "valid":
                             self.assertEqual(len(scan.rows), 1)
                         else:
-                            records = [
-                                json.loads(line)
-                                for line in output.getvalue().splitlines()[1:-1]
-                            ]
-                            self.assertEqual(records[-1]["kind"], "truncation")
-                            self.assertEqual(
-                                records[-1]["reason"],
-                                MODULE.SESSION_META_LIMIT_TRUNCATED_REASON,
-                            )
+                            self.assertEqual(scan.rows, [])
                     else:
+                        records = [
+                            json.loads(line)
+                            for line in output.getvalue().splitlines()[1:-1]
+                        ]
+                        self.assertEqual(records[-1]["kind"], "truncation")
                         self.assertEqual(
-                            error,
-                            MODULE.SESSION_META_PREFIX_PROOF_COVERAGE_ERROR,
+                            records[-1]["reason"],
+                            MODULE.SESSION_META_LIMIT_TRUNCATED_REASON,
                         )
-                        self.assertIsNone(error_rollout)
+                        if scenario == "valid":
+                            self.assertEqual(records[0]["session_id"], "trusted-session")
+                        else:
+                            self.assertEqual(len(records), 1)
+                    if scenario == "no_meta":
                         for rollout_ref in rollout_refs:
-                            self.assertNotIn(rollout_ref, error)
                             self.assertNotIn(rollout_ref, output.getvalue())
 
                     self.assertEqual(len(capture_names), 2)
@@ -875,6 +860,103 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                     )
                     self.assertLessEqual(len(pread_requests), 14)
                     self.assertLessEqual(sum(pread_bytes), 14 * candidate_size)
+
+    def test_mixed_valid_and_no_meta_candidates_auto_split_local_and_embedded(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_root = Path(temp_dir) / ".codex"
+            newest_ref = (
+                "sessions/2026/05/26/"
+                "rollout-2026-05-26T10-45-00-newest.jsonl"
+            )
+            no_meta_ref = (
+                "sessions/2026/05/26/"
+                "rollout-2026-05-26T10-30-00-no-meta.jsonl"
+            )
+            oldest_ref = (
+                "sessions/2026/05/26/"
+                "rollout-2026-05-26T10-15-00-oldest.jsonl"
+            )
+            write_rollout(
+                codex_root,
+                rollout_ref=newest_ref,
+                session_id="newest-session",
+                timestamp="2026-05-26T10:45:00Z",
+            )
+            no_meta = codex_root / no_meta_ref
+            no_meta.parent.mkdir(parents=True, exist_ok=True)
+            no_meta.write_text("{}\n", encoding="utf-8")
+            write_rollout(
+                codex_root,
+                rollout_ref=oldest_ref,
+                session_id="oldest-session",
+                timestamp="2026-05-26T10:15:00Z",
+            )
+
+            for scope in ("local", "embedded"):
+                with self.subTest(scope=scope):
+                    alias = "local" if scope == "local" else "embedded-test"
+
+                    def run_embedded(
+                        _alias: str,
+                        payload: dict[str, object],
+                        *,
+                        max_stdout_bytes: int,
+                    ) -> subprocess.CompletedProcess[str]:
+                        self.assertGreater(max_stdout_bytes, 0)
+                        return subprocess.run(
+                            [sys.executable, "-"],
+                            input=MODULE._remote_python_script(payload),
+                            text=True,
+                            capture_output=True,
+                            check=False,
+                        )
+
+                    host_patch = mock.patch.dict(
+                        MODULE.HOSTS,
+                        {
+                            alias: {
+                                "kind": scope,
+                                "codex_root": str(codex_root),
+                                "ssh_target": "unused",
+                            }
+                        },
+                    )
+                    local_root_patch = mock.patch.object(
+                        MODULE,
+                        "_local_codex_root",
+                        return_value=codex_root,
+                    )
+                    runner_patch = mock.patch.object(
+                        MODULE,
+                        "_run_remote_python_bounded",
+                        side_effect=run_embedded,
+                    )
+                    with host_patch, local_root_patch, runner_patch:
+                        initial = MODULE._scan_host_session_meta(
+                            alias,
+                            dates=[dt.date(2026, 5, 26)],
+                            limit=1,
+                            rollout_start=None,
+                            rollout_end=None,
+                        )
+                        split = MODULE._scan_host_session_meta_with_auto_split(
+                            alias,
+                            dates=[dt.date(2026, 5, 26)],
+                            limit=1,
+                        )
+
+                    self.assertTrue(initial.truncated)
+                    self.assertEqual(
+                        [row["session_id"] for row in initial.rows],
+                        ["newest-session"],
+                    )
+                    self.assertFalse(split.truncated)
+                    self.assertEqual(
+                        {row["session_id"] for row in split.rows},
+                        {"newest-session", "oldest-session"},
+                    )
 
     def test_append_only_policy_rejects_growth_followed_by_rollback(self) -> None:
         def regular_stat(size: int, timestamp_ns: int) -> argparse.Namespace:
@@ -1390,44 +1472,61 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                 ):
                     namespace["validate_relative_path_parts"](invalid)
 
-    def test_root_swap_between_lstat_and_resolve_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            base = Path(temp_dir)
-            codex_root = base / ".codex"
-            external_root = base / "external-codex"
-            write_rollout(codex_root)
-            write_rollout(external_root, session_id="external-sentinel")
-            moved_root = base / ".codex-pinned"
-            real_resolve = MODULE.pathlib.Path.resolve
-            swapped = False
+    def test_root_swap_to_original_directory_symlink_fails_closed(self) -> None:
+        for scope in ("local", "embedded"):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temp_dir:
+                base = Path(temp_dir)
+                codex_root = base / ".codex"
+                moved_root = base / ".codex-pinned"
+                write_rollout(codex_root)
+                if scope == "local":
+                    target_os = MODULE.os
 
-            def swap_before_resolve(path: Path, *args: object, **kwargs: object) -> Path:
-                nonlocal swapped
-                if path == codex_root and not swapped:
-                    os.replace(codex_root, moved_root)
-                    os.replace(external_root, codex_root)
-                    swapped = True
-                return real_resolve(path, *args, **kwargs)
+                    def open_root() -> int:
+                        return MODULE._open_pinned_codex_root(codex_root)
 
-            with mock.patch.object(
-                MODULE.pathlib.Path,
-                "resolve",
-                swap_before_resolve,
-            ), self.assertRaisesRegex(
-                ValueError,
-                "Codex root changed during resolution",
-            ):
-                MODULE._read_local_rollout_bytes(
-                    codex_root,
-                    PurePosixPath(ROLLOUT_REF),
-                    max_bytes=MODULE.MAX_FETCH_ROLLOUT_BYTES,
-                )
+                else:
+                    namespace = embedded_probe_namespace(
+                        {
+                            "mode": "session-meta",
+                            "dates": ["2026/05/26"],
+                            "limit": 10,
+                            "codex_root": str(codex_root),
+                            "session_meta_scan_bytes": (
+                                MODULE.MAX_SESSION_META_SCAN_BYTES
+                            ),
+                        }
+                    )
+                    target_os = namespace["os"]
 
-            self.assertTrue(swapped)
-            self.assertNotIn(
-                b"external-sentinel",
-                (moved_root / ROLLOUT_REF).read_bytes(),
-            )
+                    def open_root() -> int:
+                        return namespace["open_pinned_codex_root"]()
+
+                real_open = target_os.open
+                swapped = False
+
+                def swap_before_open(
+                    path: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal swapped
+                    if str(path) == str(codex_root) and dir_fd is None and not swapped:
+                        os.replace(codex_root, moved_root)
+                        codex_root.symlink_to(moved_root, target_is_directory=True)
+                        swapped = True
+                    return real_open(path, flags, mode, dir_fd=dir_fd)
+
+                with mock.patch.object(
+                    target_os,
+                    "open",
+                    side_effect=swap_before_open,
+                ), self.assertRaises((OSError, ValueError)):
+                    open_root()
+
+                self.assertTrue(swapped)
 
     def test_root_swap_between_stat_and_open_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1436,7 +1535,7 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
             external_root = base / "external-codex"
             write_rollout(codex_root)
             write_rollout(external_root, session_id="external-sentinel")
-            resolved_root = codex_root.resolve()
+            expanded_root = codex_root.expanduser()
             moved_root = base / ".codex-pinned"
             real_open = MODULE.os.open
             swapped = False
@@ -1449,7 +1548,7 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                 dir_fd: int | None = None,
             ) -> int:
                 nonlocal swapped
-                if str(path) == str(resolved_root) and dir_fd is None and not swapped:
+                if str(path) == str(expanded_root) and dir_fd is None and not swapped:
                     os.replace(codex_root, moved_root)
                     os.replace(external_root, codex_root)
                     swapped = True

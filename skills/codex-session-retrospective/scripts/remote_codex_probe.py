@@ -333,9 +333,6 @@ SUMMARY_SENSITIVE_SIGNAL_RE = re.compile(SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT, 
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
 SESSION_META_LIMIT_TRUNCATED_REASON = "session_meta_limit_truncated"
-SESSION_META_PREFIX_PROOF_COVERAGE_ERROR = (
-    "session-meta active rollout coverage exceeded prefix proof candidate limit"
-)
 SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR = "session-meta output row too large"
 REMOTE_FETCH_ROLLOUT_BEGIN = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_BEGIN__"
 REMOTE_FETCH_ROLLOUT_END = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_END__"
@@ -695,7 +692,7 @@ def _validate_relative_path_parts(
     return parts
 
 
-def _resolve_safe_codex_root(
+def _inspect_safe_codex_root(
     codex_root: pathlib.Path,
 ) -> tuple[pathlib.Path, os.stat_result]:
     expanded_root = codex_root.expanduser()
@@ -704,22 +701,13 @@ def _resolve_safe_codex_root(
         raise ValueError("Codex root is a symlink")
     if not stat.S_ISDIR(root_entry.st_mode):
         raise ValueError("Codex root is not a directory")
-    try:
-        resolved_root = expanded_root.resolve(strict=True)
-        observed = os.stat(resolved_root, follow_symlinks=False)
-    except (FileNotFoundError, RuntimeError) as error:
-        raise ValueError("Codex root changed after initial inspection") from error
-    if not stat.S_ISDIR(observed.st_mode):
-        raise ValueError("Codex root is not a directory")
-    if (observed.st_dev, observed.st_ino) != (root_entry.st_dev, root_entry.st_ino):
-        raise ValueError("Codex root changed during resolution")
-    return resolved_root, observed
+    return expanded_root, root_entry
 
 
 def _open_pinned_codex_root(codex_root: pathlib.Path) -> int:
-    resolved_root, observed = _resolve_safe_codex_root(codex_root)
+    expanded_root, observed = _inspect_safe_codex_root(codex_root)
     try:
-        fd = os.open(str(resolved_root), _directory_open_flags())
+        fd = os.open(str(expanded_root), _directory_open_flags())
     except FileNotFoundError as error:
         raise ValueError("Codex root changed after initial inspection") from error
     try:
@@ -1916,7 +1904,6 @@ REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF = {REMOTE_GENERATED_SUMMARY_SOURC
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
 SESSION_META_END = {REMOTE_SESSION_META_END!r}
 SESSION_META_LIMIT_TRUNCATED_REASON = {SESSION_META_LIMIT_TRUNCATED_REASON!r}
-SESSION_META_PREFIX_PROOF_COVERAGE_ERROR = {SESSION_META_PREFIX_PROOF_COVERAGE_ERROR!r}
 SESSION_META_FLAT_UNDATED_ALIAS_PREFIX = {SESSION_META_FLAT_UNDATED_ALIAS_PREFIX!r}
 FETCH_ROLLOUT_BEGIN = {REMOTE_FETCH_ROLLOUT_BEGIN!r}
 FETCH_ROLLOUT_END = {REMOTE_FETCH_ROLLOUT_END!r}
@@ -1966,23 +1953,14 @@ def open_pinned_codex_root():
     if not stat.S_ISDIR(root_entry.st_mode):
         raise ValueError("Codex root is not a directory")
     try:
-        resolved_root = ROOT.resolve(strict=True)
-        observed = os.stat(resolved_root, follow_symlinks=False)
-    except (FileNotFoundError, RuntimeError) as error:
-        raise ValueError("Codex root changed after initial inspection") from error
-    if not stat.S_ISDIR(observed.st_mode):
-        raise ValueError("Codex root is not a directory")
-    if (observed.st_dev, observed.st_ino) != (root_entry.st_dev, root_entry.st_ino):
-        raise ValueError("Codex root changed during resolution")
-    try:
-        fd = os.open(str(resolved_root), directory_open_flags())
+        fd = os.open(str(ROOT), directory_open_flags())
     except FileNotFoundError as error:
         raise ValueError("Codex root changed after initial inspection") from error
     try:
         opened = os.fstat(fd)
         if not stat.S_ISDIR(opened.st_mode):
             raise ValueError("Codex root is not a directory")
-        if (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino):
+        if (opened.st_dev, opened.st_ino) != (root_entry.st_dev, root_entry.st_ino):
             raise ValueError("Codex root changed during open")
         return fd
     except Exception:
@@ -3307,11 +3285,6 @@ def iter_session_meta():
         print(SESSION_META_END)
         raise SystemExit(0)
 
-    def session_coverage_error():
-        emit_session_meta_item({{"kind": "error", "error": SESSION_META_PREFIX_PROOF_COVERAGE_ERROR}})
-        print(SESSION_META_END)
-        raise SystemExit(0)
-
     try:
         root_fd = open_pinned_codex_root()
     except FileNotFoundError:
@@ -3348,7 +3321,7 @@ def iter_session_meta():
         if not session_meta_allows_append(rel):
             return identity
         if prefix_proof_candidate_captures >= prefix_proof_candidate_limit:
-            session_coverage_error()
+            return None
         prefix_proof_candidate_captures += 1
         try:
             prefix_proof = capture_rollout_prefix_proof_from_parent_fd(
@@ -3516,6 +3489,10 @@ def iter_session_meta():
                         rel,
                         expected_identity,
                     )
+                    if consumed_identity is None:
+                        emit_session_meta_item({{"kind": "truncation", "reason": SESSION_META_LIMIT_TRUNCATED_REASON, "date": date_text, "limit": LIMIT}})
+                        print(SESSION_META_END)
+                        return
                     meta = session_meta_from_rollout(
                         parent_fd,
                         rel,
@@ -3679,14 +3656,12 @@ def _scan_session_meta_records(
         parent_fd: int,
         relative_path: pathlib.PurePosixPath,
         identity: RolloutCandidateIdentity,
-    ) -> RolloutCandidateIdentity:
+    ) -> RolloutCandidateIdentity | None:
         nonlocal prefix_proof_candidate_captures
         if not _session_meta_allows_append(relative_path):
             return identity
         if prefix_proof_candidate_captures >= prefix_proof_candidate_limit:
-            raise SessionMetaRolloutError(
-                SESSION_META_PREFIX_PROOF_COVERAGE_ERROR
-            )
+            return None
         prefix_proof_candidate_captures += 1
         try:
             prefix_proof = _capture_rollout_prefix_proof_from_parent_fd(
@@ -3924,6 +3899,8 @@ def _scan_session_meta_records(
                         rollout_relative_path,
                         expected_identity,
                     )
+                    if consumed_identity is None:
+                        return SessionMetaScan(rows=rows, truncated=True)
                     meta = _session_meta_from_rollout(
                         codex_root,
                         rollout_relative_path,
