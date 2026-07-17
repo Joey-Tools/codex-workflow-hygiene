@@ -105,7 +105,7 @@ def bounded_jsonl(handle):
             return
         line_no += 1
         if len(raw_line) > max_record_bytes:
-            while raw_line and not raw_line.endswith((b'\n', b'\r')):
+            while raw_line and not raw_line.endswith(b'\n'):
                 raw_line = handle.readline(max_record_bytes + 1)
             continue
         yield line_no, raw_line
