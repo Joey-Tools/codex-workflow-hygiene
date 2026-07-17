@@ -287,6 +287,7 @@ Do not use `jq 'select(tostring | contains("needle"))'` as a shortcut on rollout
 
 ```bash
 python3 - "$ROLLOUT" "$NEEDLE" <<'PY'
+from collections import deque
 from pathlib import Path
 import json
 import sys
@@ -294,28 +295,38 @@ import sys
 path = Path(sys.argv[1]).expanduser()
 needle = sys.argv[2]
 printed = 0
+max_record_bytes = 1024 * 1024
+before_chars = 180
+after_chars = 220
+max_metadata_chars = 80
 
-def collect_text(value, parts):
+
+def bounded_jsonl(handle):
+    line_no = 0
+    while True:
+        raw_line = handle.readline(max_record_bytes + 1)
+        if not raw_line:
+            return
+        line_no += 1
+        if len(raw_line) > max_record_bytes:
+            while raw_line and not raw_line.endswith(b'\n'):
+                raw_line = handle.readline(max_record_bytes + 1)
+            continue
+        yield line_no, raw_line
+
+
+def iter_text(value):
     if isinstance(value, str):
-        parts.append(value)
+        yield value
     elif isinstance(value, dict):
         for item in value.values():
-            collect_text(item, parts)
+            yield from iter_text(item)
     elif isinstance(value, list):
         for item in value:
-            collect_text(item, parts)
+            yield from iter_text(item)
 
-def hit_window(text, needle):
-    idx = text.find(needle)
-    if idx < 0:
-        return ''
-    start = max(0, idx - 180)
-    end = min(len(text), idx + len(needle) + 220)
-    prefix = '...' if start else ''
-    suffix = '...' if end < len(text) else ''
-    return prefix + text[start:end] + suffix
 
-def add_top_level_fields(obj, parts):
+def iter_top_level_fields(obj):
     for key in (
         'id',
         'session_id',
@@ -348,40 +359,159 @@ def add_top_level_fields(obj, parts):
         value = obj.get(key)
         if value is None or value == '' or value == [] or value == {}:
             continue
-        parts.append(key)
-        collect_text(value, parts)
+        yield key
+        yield from iter_text(value)
 
-for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
-    obj = json.loads(line)
-    payload = obj.get('payload') or {}
-    item_type = payload.get('type')
-    record_kind = item_type or obj.get('type') or 'history'
-    text_parts = [str(item_type or '')]
+
+def bounded_output_field(value, fallback):
+    if not isinstance(value, str):
+        return fallback
+    fragments = []
+    length = 0
+    pending_space = False
+    truncated = False
+    for character in value:
+        if character.isspace():
+            pending_space = bool(fragments)
+            continue
+        encoded = json.dumps(character, ensure_ascii=True)[1:-1]
+        candidates = (' ', encoded) if pending_space else (encoded,)
+        for fragment in candidates:
+            if length + len(fragment) > max_metadata_chars:
+                truncated = True
+                break
+            fragments.append(fragment)
+            length += len(fragment)
+        if truncated:
+            break
+        pending_space = False
+    if not fragments:
+        return fallback
+    if truncated:
+        while fragments and length + 3 > max_metadata_chars:
+            length -= len(fragments.pop())
+        fragments.append('...')
+    return ''.join(fragments)
+
+
+def first_string_value(*values):
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def iter_record_text(obj, payload, item_type):
+    yield item_type or ''
     if item_type == 'message':
-        collect_text(payload.get('content') or [], text_parts)
+        yield from iter_text(payload.get('content') or [])
     elif item_type == 'function_call':
-        text_parts.append(str(payload.get('name') or ''))
-        text_parts.append(str(payload.get('arguments') or ''))
+        yield from iter_text(payload.get('name') or '')
+        yield from iter_text(payload.get('arguments') or '')
     elif item_type == 'function_call_output':
-        collect_text(payload.get('output') or payload.get('content') or payload.get('result') or '', text_parts)
+        yield from iter_text(payload.get('output') or payload.get('content') or payload.get('result') or '')
     elif item_type == 'user_message':
-        collect_text(payload.get('message') or payload.get('text') or payload.get('content') or '', text_parts)
+        yield from iter_text(payload.get('message') or payload.get('text') or payload.get('content') or '')
     elif item_type == 'task_complete':
-        collect_text(payload.get('last_agent_message') or payload.get('message') or payload.get('text') or '', text_parts)
+        yield from iter_text(payload.get('last_agent_message') or payload.get('message') or payload.get('text') or '')
     elif not item_type:
-        add_top_level_fields(obj, text_parts)
-        add_top_level_fields(payload, text_parts)
+        yield from iter_top_level_fields(obj)
+        yield from iter_top_level_fields(payload)
     else:
-        add_top_level_fields(payload, text_parts)
-    text = ' '.join(' '.join(text_parts).split())
-    if needle not in text:
-        continue
-    print(f'{path}:{line_no}:{obj.get("timestamp") or obj.get("ts")}:{record_kind}:{hit_window(text, needle)}')
-    printed += 1
-    if printed >= 20:
-        break
+        yield from iter_top_level_fields(payload)
+
+
+def normalized_characters(parts):
+    emitted = False
+    pending_space = False
+    for part in parts:
+        if emitted:
+            pending_space = True
+        for character in part:
+            if character.isspace():
+                if emitted:
+                    pending_space = True
+                continue
+            if pending_space:
+                yield ' '
+                pending_space = False
+            yield character
+            emitted = True
+
+
+def prefix_table(pattern):
+    table = [0] * len(pattern)
+    matched = 0
+    for index in range(1, len(pattern)):
+        while matched and pattern[matched] != pattern[index]:
+            matched = table[matched - 1]
+        if pattern[matched] == pattern[index]:
+            matched += 1
+            table[index] = matched
+    return table
+
+
+def hit_window(parts, raw_needle):
+    normalized_needle = ' '.join(raw_needle.split())
+    if not normalized_needle:
+        return ''
+    table = prefix_table(normalized_needle)
+    matched = 0
+    consumed = 0
+    before = deque(maxlen=before_chars + len(normalized_needle))
+    prefix = None
+    after = []
+    for character in normalized_characters(parts):
+        if prefix is not None:
+            if len(after) >= after_chars:
+                return prefix + ''.join(after) + '...'
+            after.append(character)
+            continue
+        before.append(character)
+        consumed += 1
+        while matched and normalized_needle[matched] != character:
+            matched = table[matched - 1]
+        if normalized_needle[matched] == character:
+            matched += 1
+        if matched == len(normalized_needle):
+            prefix = ('...' if consumed > len(before) else '') + ''.join(before)
+    if prefix is None:
+        return None
+    return prefix + ''.join(after)
+
+
+with path.open('rb') as handle:
+    records = bounded_jsonl(handle)
+    for line_no, raw_line in records:
+        try:
+            obj = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        payload = obj.get('payload') or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        item_type_value = payload.get('type')
+        item_type = item_type_value if isinstance(item_type_value, str) else None
+        safe_item_type = bounded_output_field(item_type, '')
+        record_kind = safe_item_type or bounded_output_field(obj.get('type'), 'history')
+        timestamp_value = first_string_value(obj.get('timestamp'), obj.get('ts'))
+        timestamp = bounded_output_field(timestamp_value, '')
+        snippet = hit_window(
+            iter_record_text(obj, payload, item_type),
+            needle,
+        )
+        if snippet is None:
+            continue
+        print(f'{path}:{line_no}:{timestamp}:{record_kind}:{snippet}')
+        printed += 1
+        if printed >= 20:
+            break
 PY
 ```
+
+The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
 
 For JSONL schema checks, inspect one record or aggregate unique keys once. Do not run `jq -R 'fromjson | keys' file.jsonl`, because it prints the same key list for every line and can produce massive output on retained artifacts such as `turn_flags.jsonl`.
 

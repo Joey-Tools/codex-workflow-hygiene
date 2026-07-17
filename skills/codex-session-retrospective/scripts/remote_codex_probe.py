@@ -2188,7 +2188,15 @@ def iter_session_meta():
 
     def sorted_rollout_paths(directory):
         try:
-            return sorted(directory.glob("rollout-*.jsonl"), reverse=True)
+            with os.scandir(directory) as entries:
+                paths = [
+                    pathlib.Path(entry.path)
+                    for entry in entries
+                    if entry.name.startswith("rollout-") and entry.name.endswith(".jsonl")
+                ]
+            return sorted(paths, reverse=True)
+        except FileNotFoundError:
+            return []
         except OSError:
             session_directory_unreadable()
 
@@ -2399,7 +2407,16 @@ def _scan_session_meta_records(
 
     def sorted_rollout_paths(directory: pathlib.Path) -> list[pathlib.Path]:
         try:
-            return sorted(directory.glob("rollout-*.jsonl"), reverse=True)
+            with os.scandir(directory) as entries:
+                paths = [
+                    pathlib.Path(entry.path)
+                    for entry in entries
+                    if entry.name.startswith("rollout-")
+                    and entry.name.endswith(".jsonl")
+                ]
+            return sorted(paths, reverse=True)
+        except FileNotFoundError:
+            return []
         except OSError as exc:
             raise SessionMetaRolloutError("session directory unreadable") from exc
 
