@@ -14,23 +14,53 @@ CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
 python3 - "$SESSION_ID" "$CODEX_ROOT" <<'PY'
 from pathlib import Path
 import json
+import re
 import sys
 
 session_id = sys.argv[1]
 codex_root = Path(sys.argv[2]).expanduser()
+max_record_bytes = 1024 * 1024
+uuid_shaped = re.fullmatch(
+    r'[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}',
+    session_id,
+) is not None
+
+
+def bounded_jsonl(handle):
+    line_no = 0
+    while True:
+        raw_line = handle.readline(max_record_bytes + 1)
+        if not raw_line:
+            return
+        line_no += 1
+        if len(raw_line) > max_record_bytes:
+            while raw_line and not raw_line.endswith(b'\n'):
+                raw_line = handle.readline(max_record_bytes + 1)
+            continue
+        yield line_no, raw_line
+
+
+def matches_session(value):
+    if not isinstance(value, str):
+        return False
+    if uuid_shaped:
+        return value.lower() == session_id.lower()
+    return value == session_id
+
+
 for path in (codex_root / 'session_index.jsonl', codex_root / 'history.jsonl'):
     if not path.is_file():
         continue
     try:
-        with path.open(encoding='utf-8', errors='replace') as handle:
-            for line_no, line in enumerate(handle, 1):
-                if session_id not in line:
-                    continue
+        with path.open('rb') as handle:
+            for line_no, raw_line in bounded_jsonl(handle):
                 try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
+                    row = json.loads(raw_line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
                 if not isinstance(row, dict):
+                    continue
+                if not any(matches_session(row.get(key)) for key in ('id', 'session_id')):
                     continue
                 selected = {key: row.get(key) for key in ('id', 'session_id', 'thread_name', 'updated_at', 'ts', 'cwd')}
                 text = ' '.join(str(row.get('text') or '').split())[:300]
@@ -82,7 +112,7 @@ Search both existing roots because an exact session can move from the active dat
 
 The recipe keeps `find` output NUL-delimited until Python applies a literal basename substring match and validates every selected path, then rejects non-printable path components before printing any rollout match. It matches complete UUID-shaped session IDs case-insensitively, consistent with lifecycle normalization, while preserving exact characters and case for opaque IDs, including glob metacharacters.
 
-Treat `session_index.jsonl` and `history.jsonl` as optional hints: a missing, unreadable, or malformed index record must not prevent the rollout-root search, and warnings must never include the raw line.
+Treat `session_index.jsonl` and `history.jsonl` as optional hints: a missing, unreadable, malformed, or oversized index record must not prevent the rollout-root search, and warnings must never include the raw line. The binary reader limits each candidate record to `max_record_bytes` and drains an oversized physical line through LF in fixed-size chunks; a bare CR never exposes its tail as a separate JSON record.
 
 Recent prior turn or "read your rollout":
 

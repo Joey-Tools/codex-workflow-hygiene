@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import errno
 import importlib.util
 import hashlib
 import io
@@ -790,6 +791,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
 
         self.assertEqual(rows, [])
+
+    def test_remote_probe_session_meta_unreadable_codex_root_fails_closed(self) -> None:
+        errors = (
+            PermissionError("blocked Codex root"),
+            OSError(errno.EIO, "Codex root I/O error"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__), mock.patch.object(
+                REMOTE_PROBE,
+                "_resolve_safe_codex_root",
+                side_effect=error,
+            ), self.assertRaisesRegex(
+                REMOTE_PROBE.SessionMetaRolloutError,
+                "session directory unreadable",
+            ) as raised:
+                REMOTE_PROBE._iter_session_meta_records(
+                    codex_root=Path("/unreadable-codex-root"),
+                    dates=[dt.date(2026, 5, 1)],
+                    limit=10,
+                    host="local",
+                )
+            self.assertIs(raised.exception.__cause__, error)
 
     def test_remote_probe_session_meta_reports_unreadable_local_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -2390,8 +2390,10 @@ def _scan_session_meta_records(
 ) -> SessionMetaScan:
     try:
         resolved_root = _resolve_safe_codex_root(codex_root)
-    except OSError:
+    except FileNotFoundError:
         return SessionMetaScan(rows=[], truncated=False)
+    except OSError as exc:
+        raise SessionMetaRolloutError("session directory unreadable") from exc
     rows: list[dict[str, str]] = []
     seen_rollout_paths: set[str] = set()
 
