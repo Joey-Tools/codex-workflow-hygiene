@@ -401,8 +401,8 @@ def first_string_value(*values):
     return None
 
 
-def iter_record_text(obj, payload, item_type, safe_item_type):
-    yield safe_item_type
+def iter_record_text(obj, payload, item_type):
+    yield item_type or ''
     if item_type == 'message':
         yield from iter_text(payload.get('content') or [])
     elif item_type == 'function_call':
@@ -499,7 +499,7 @@ with path.open('rb') as handle:
         timestamp_value = first_string_value(obj.get('timestamp'), obj.get('ts'))
         timestamp = bounded_output_field(timestamp_value, '')
         snippet = hit_window(
-            iter_record_text(obj, payload, item_type, safe_item_type),
+            iter_record_text(obj, payload, item_type),
             needle,
         )
         if snippet is None:
@@ -511,7 +511,7 @@ with path.open('rb') as handle:
 PY
 ```
 
-The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the selected nested strings incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
+The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
 
 For JSONL schema checks, inspect one record or aggregate unique keys once. Do not run `jq -R 'fromjson | keys' file.jsonl`, because it prints the same key list for every line and can produce massive output on retained artifacts such as `turn_flags.jsonl`.
 

@@ -140,9 +140,10 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("yield from iter_text(item)", keyword_recipe)
         self.assertIn("snippet = hit_window(", keyword_recipe)
         self.assertIn(
-            "iter_record_text(obj, payload, item_type, safe_item_type)",
+            "iter_record_text(obj, payload, item_type)",
             keyword_recipe,
         )
+        self.assertIn("yield item_type or ''", keyword_recipe)
         self.assertIn("def bounded_output_field(value, fallback):", keyword_recipe)
         self.assertIn(
             "item_type_value if isinstance(item_type_value, str) else None",
@@ -161,6 +162,10 @@ class SkillStructureTests(unittest.TestCase):
         self.assertNotIn("' '.join(' '.join(", keyword_recipe)
         self.assertNotIn("collect_text(", keyword_recipe)
         self.assertNotIn("str(item_type", keyword_recipe)
+        self.assertNotIn(
+            "iter_record_text(obj, payload, item_type, safe_item_type)",
+            keyword_recipe,
+        )
 
     def test_session_mining_avoids_whole_codex_home_searches(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -754,6 +759,50 @@ class SkillStructureTests(unittest.TestCase):
         self.assertNotIn("Q" * 256, result.stdout)
         self.assertNotIn("P" * 256, result.stdout)
         self.assertNotIn("Z" * 256, result.stdout)
+
+    def test_session_mining_exact_probe_matches_full_item_type_before_output_projection(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
+        start = workflow.index(marker) + len(marker)
+        code = workflow[start : workflow.index("\nPY\n" + (chr(96) * 3), start)]
+        needle = "尾部类型针"
+        item_type = "分类\n" + ("x" * 400) + needle
+        timestamp = "2026-07-17T00:00:00Z"
+        row = {
+            "type": "response_item",
+            "timestamp": timestamp,
+            "payload": {"type": item_type},
+        }
+        raw_record = (json_dumps(row) + "\n").encode("utf-8")
+        self.assertLessEqual(len(raw_record), 1024 * 1024)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout-full-item-type.jsonl"
+            rollout.write_bytes(raw_record)
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(rollout), needle],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertLess(len(result.stdout.encode("utf-8")), 1000)
+        line = result.stdout.rstrip("\n")
+        output_prefix = f"{rollout}:1:{timestamp}:"
+        self.assertTrue(line.startswith(output_prefix))
+        record_kind, snippet = line[len(output_prefix) :].split(":", 1)
+        self.assertEqual(len(record_kind), 80)
+        self.assertTrue(record_kind.endswith("..."))
+        self.assertIn("\\u5206\\u7c7b", record_kind)
+        self.assertNotIn("分类", result.stdout)
+        self.assertNotIn(needle, record_kind)
+        self.assertIn(needle, snippet)
 
     def test_session_mining_failure_probe_handles_event_message_fields(self) -> None:
         root = Path(__file__).resolve().parents[1]
