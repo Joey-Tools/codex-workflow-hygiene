@@ -15,13 +15,13 @@ superseded_by:
 ## Summary
 
 - Replaced session-metadata identity checks that compared cached `DirEntry.inode()` data with fresh stat data and assumed a final entry shared its parent directory's device number.
-- Treated `scandir` as name-only discovery, then bound every in-scope candidate through its pinned parent using a no-follow, nonblocking descriptor open, authoritative `fstat`, and two fresh descriptor-relative no-follow stats.
+- Treated `scandir` as name-only discovery and delayed all candidate opens until actual consumption. Exact archive candidates bind authoritative `fstat` to two fresh descriptor-relative no-follow stats; active candidates establish a prefix proof before the first path stat and stabilize it through the append-only checkpoint on the same held descriptor.
 - Preserved fail-closed replacement, disappearance, symlink, FIFO, append-proof, proof-budget, and exact archive semantics in both local and embedded probes.
 
 ## Current State
 
 - Enumeration no longer depends on filesystem-specific dirent inode or parent/child device behavior, including OverlayFS configurations used by container runners.
-- Replacement before the first fresh stat or between the two fresh stats is rejected against the already-open descriptor snapshot.
+- The first held-descriptor proof is the active content baseline. Later growth between descriptor and path checks is accepted only when that proved prefix remains unchanged; rewrite-and-grow, replacement, shrink, rollback, and same-size mutation after the baseline fail closed, while archives retain exact snapshots throughout consumption.
 - `ELOOP` maps to the precise symlink coverage error, while every transient candidate descriptor closes before enumeration continues.
 
 ## Next Steps
@@ -30,9 +30,9 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -m unittest tests.test_remote_codex_probe`: 27 of 27 tests passed.
-- Python 3.13.0 full suite: 985 of 985 tests passed in 78.923 seconds.
-- Python 3.14.3 full suite: 985 of 985 tests passed in 86.136 seconds.
+- `python3 tests/test_remote_codex_probe.py`: 29 of 29 tests passed in 4.401 seconds.
+- Python 3.13.0 full suite, final public worktree: 987 of 987 tests passed in 108.809 seconds.
+- Python 3.14.2 full suite, final public worktree: 987 of 987 tests passed in 112.400 seconds.
 - Ruff passed for both changed Python files; Python 3.13 and Python 3.14 byte compilation passed.
 - Isolated `quick_validate.py` validation passed for `codex-session-retrospective`; `git diff --check` and signed commit verification passed.
 - Private reproduction: `Joey-Tools/codex-private-workflows` run `29600214365`, job `87950238935`, failed with 44 failures and 18 errors rooted in `rollout identity changed during enumeration`.
