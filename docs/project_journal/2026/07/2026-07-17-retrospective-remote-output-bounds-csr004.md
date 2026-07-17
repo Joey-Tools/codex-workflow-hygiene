@@ -41,4 +41,4 @@ superseded_by:
 - `python3 -m py_compile` passed for the changed Python source and test files.
 - Ruff passed for the changed source and for the test file with its pre-existing `F541` finding excluded.
 - The installed skill validator, project-journal validator, and `git diff --check` passed.
-- Independent read-only diff reviews reported no findings. Helper-backed fixed-range reviews found a local/embedded limit-order mismatch and a missing real parent-capture boundary test; both are now covered by dedicated regressions. A final fixed-range rerun is required before merge.
+- Independent read-only diff reviews reported no findings. Helper-backed fixed-range reviews found a local/embedded limit-order mismatch and a missing real parent-capture boundary test; both are now covered by dedicated regressions. The final whole-range helper-backed rerun reported no findings.
