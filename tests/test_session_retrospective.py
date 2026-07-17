@@ -851,28 +851,97 @@ class SessionRetrospectiveTests(unittest.TestCase):
             date_dir = root / "sessions" / "2026" / "05" / "01"
             date_dir.mkdir(parents=True)
             resolved_date_dir = date_dir.resolve()
-            real_glob = Path.glob
+            real_scandir = os.scandir
+            errors = (
+                PermissionError("blocked /home/hoteng/.codex/sessions/2026/05/01"),
+                OSError(errno.EIO, "I/O error /home/hoteng/.codex/sessions/2026/05/01"),
+            )
 
-            def glob_or_raise(self: Path, pattern: str):
-                if self == resolved_date_dir:
-                    raise PermissionError("blocked /home/hoteng/.codex/sessions/2026/05/01")
-                return real_glob(self, pattern)
+            for error in errors:
+                with self.subTest(error=type(error).__name__):
 
-            stderr = io.StringIO()
-            stdout = io.StringIO()
-            with mock.patch.object(REMOTE_PROBE, "_local_codex_root", return_value=root), mock.patch.object(
-                Path, "glob", glob_or_raise
-            ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(sys, "stdout", stdout):
-                result = REMOTE_PROBE.cmd_session_meta(
-                    types.SimpleNamespace(host=["local"], date=["2026/05/01"], from_date=None, to_date=None, limit=10)
+                    def scandir_or_raise(path: object):
+                        if Path(path) == resolved_date_dir:
+                            raise error
+                        return real_scandir(path)
+
+                    stderr = io.StringIO()
+                    stdout = io.StringIO()
+                    with mock.patch.object(
+                        REMOTE_PROBE, "_local_codex_root", return_value=root
+                    ), mock.patch.object(
+                        REMOTE_PROBE.os, "scandir", scandir_or_raise
+                    ), mock.patch.object(
+                        sys, "stderr", stderr
+                    ), mock.patch.object(
+                        sys, "stdout", stdout
+                    ):
+                        result = REMOTE_PROBE.cmd_session_meta(
+                            types.SimpleNamespace(
+                                host=["local"],
+                                date=["2026/05/01"],
+                                from_date=None,
+                                to_date=None,
+                                limit=10,
+                            )
+                        )
+
+                    self.assertEqual(result, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("host=local", stderr.getvalue())
+                    self.assertIn("error=session directory unreadable", stderr.getvalue())
+                    self.assertNotIn("/home/hoteng/.codex", stderr.getvalue())
+                    self.assertNotIn("blocked", stderr.getvalue())
+                    self.assertNotIn("I/O error", stderr.getvalue())
+
+    def test_remote_probe_embedded_session_meta_frames_directory_enumeration_errors(
+        self,
+    ) -> None:
+        errors = (
+            PermissionError("blocked /home/hoteng/.codex/sessions/2026/05/01"),
+            OSError(errno.EIO, "I/O error /home/hoteng/.codex/sessions/2026/05/01"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / ".codex"
+                date_dir = root / "sessions" / "2026" / "05" / "01"
+                date_dir.mkdir(parents=True)
+                resolved_date_dir = date_dir.resolve()
+                namespace = embedded_probe_namespace(
+                    {
+                        "mode": "session-meta",
+                        "codex_root": str(root),
+                        "dates": ["2026/05/01"],
+                        "limit": 10,
+                        "session_meta_scan_bytes": 1024 * 1024,
+                    }
                 )
+                real_scandir = os.scandir
 
-        self.assertEqual(result, 1)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("host=local", stderr.getvalue())
-        self.assertIn("error=session directory unreadable", stderr.getvalue())
-        self.assertNotIn("/home/hoteng/.codex", stderr.getvalue())
-        self.assertNotIn("blocked", stderr.getvalue())
+                def scandir_or_raise(path: object):
+                    if Path(path) == resolved_date_dir:
+                        raise error
+                    return real_scandir(path)
+
+                stdout = io.StringIO()
+                with mock.patch.object(
+                    namespace["os"], "scandir", scandir_or_raise
+                ), mock.patch.object(sys, "stdout", stdout), self.assertRaises(
+                    SystemExit
+                ) as raised:
+                    namespace["iter_session_meta"]()
+
+                output = stdout.getvalue()
+                self.assertEqual(raised.exception.code, 0)
+                self.assertIn(REMOTE_PROBE.REMOTE_SESSION_META_BEGIN, output)
+                self.assertIn(
+                    '{"error":"session directory unreadable","kind":"error"}',
+                    output,
+                )
+                self.assertIn(REMOTE_PROBE.REMOTE_SESSION_META_END, output)
+                self.assertNotIn("/home/hoteng/.codex", output)
+                self.assertNotIn("blocked", output)
+                self.assertNotIn("I/O error", output)
 
     def test_remote_probe_session_meta_reports_unreadable_remote_rollout_without_remote_path(self) -> None:
         marker = json.dumps(

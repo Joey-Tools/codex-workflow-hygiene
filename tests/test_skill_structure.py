@@ -102,6 +102,11 @@ class SkillStructureTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
+        recipe_start = workflow.index(marker) + len(marker)
+        keyword_recipe = workflow[
+            recipe_start : workflow.index("\nPY\n" + (chr(96) * 3), recipe_start)
+        ]
         self.assertIn("select(tostring | contains", skill)
         self.assertIn("function_call_output", skill)
         self.assertIn("filter by record type and field first", skill)
@@ -110,7 +115,7 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("function_call_output", workflow)
         self.assertIn("def hit_window", workflow)
         self.assertIn("hit_window(text, needle)", workflow)
-        self.assertIn("def add_top_level_fields", workflow)
+        self.assertIn("def iter_top_level_fields", workflow)
         self.assertIn("thread_name", workflow)
         self.assertIn("session_id", workflow)
         self.assertIn("current_date", workflow)
@@ -118,7 +123,7 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("model_provider", workflow)
         self.assertIn("'output'", workflow)
         self.assertIn("'arguments'", workflow)
-        self.assertIn("add_top_level_fields(payload, text_parts)", workflow)
+        self.assertIn("yield from iter_top_level_fields(payload)", workflow)
         self.assertIn("elif isinstance(value, dict)", workflow)
         self.assertIn("for item in value.values()", workflow)
         self.assertIn("elif item_type == 'user_message'", workflow)
@@ -128,6 +133,16 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("record_kind = item_type or obj.get('type') or 'history'", workflow)
         self.assertNotIn("text = json.dumps(payload", workflow)
         self.assertNotIn("snippet = ' '.join(text.split())[:", workflow)
+        self.assertIn("path.open('rb')", keyword_recipe)
+        self.assertIn("handle.readline(max_record_bytes + 1)", keyword_recipe)
+        self.assertIn("while raw_line and not raw_line.endswith(b'\\n'):", keyword_recipe)
+        self.assertIn("def iter_text(value):", keyword_recipe)
+        self.assertIn("def normalized_characters(parts):", keyword_recipe)
+        self.assertIn("yield from iter_text(item)", keyword_recipe)
+        self.assertIn("snippet = hit_window(iter_record_text(", keyword_recipe)
+        self.assertNotIn("text_parts", keyword_recipe)
+        self.assertNotIn("' '.join(' '.join(", keyword_recipe)
+        self.assertNotIn("collect_text(", keyword_recipe)
 
     def test_session_mining_avoids_whole_codex_home_searches(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -559,6 +574,110 @@ class SkillStructureTests(unittest.TestCase):
             text=True,
         )
         self.assertIn(":turn_context:", metadata_result.stdout)
+
+    def test_session_mining_exact_probe_matches_late_nested_signal_without_full_projection(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
+        start = workflow.index(marker) + len(marker)
+        code = workflow[start : workflow.index("\nPY\n" + (chr(96) * 3), start)]
+        row = {
+            "type": "response_item",
+            "timestamp": "2026-07-17T00:00:00Z",
+            "payload": {
+                "type": "function_call_output",
+                "output": {
+                    "nested": [
+                        {"before": ("x" * 900_000) + "late\n"},
+                        {
+                            "after": "\tneedle",
+                            "tail": "bounded-cross-boundary-tail",
+                        },
+                    ]
+                },
+            },
+        }
+        raw_record = (json_dumps(row) + "\n").encode("utf-8")
+        self.assertLessEqual(len(raw_record), 1024 * 1024)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout-large-accepted.jsonl"
+            rollout.write_bytes(raw_record)
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(rollout), "late needle"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertIn(f"{rollout}:1:", result.stdout)
+        self.assertIn("late needle", result.stdout)
+        self.assertIn("bounded-cross-boundary-tail", result.stdout)
+        self.assertLess(len(result.stdout), 1200)
+        self.assertNotIn("x" * 512, result.stdout)
+
+    def test_session_mining_exact_probe_drains_bare_cr_oversized_decoy_through_lf(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
+        start = workflow.index(marker) + len(marker)
+        code = workflow[start : workflow.index("\nPY\n" + (chr(96) * 3), start)]
+        decoy_marker = "bare-cr-decoy-marker"
+        normal_marker = "post-oversized-normal-marker"
+        decoy = {
+            "type": "response_item",
+            "timestamp": "2026-07-17T00:00:00Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": f"bounded needle {decoy_marker}",
+                    }
+                ],
+            },
+        }
+        normal = {
+            "type": "response_item",
+            "timestamp": "2026-07-17T00:01:00Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": f"bounded needle {normal_marker}",
+                    }
+                ],
+            },
+        }
+        payload = b"x" * (1024 * 1024) + b"\r"
+        payload += (json_dumps(decoy) + "\n" + json_dumps(normal) + "\n").encode(
+            "utf-8"
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout-oversized-decoy.jsonl"
+            rollout.write_bytes(payload)
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(rollout), "bounded needle"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertIn(f"{rollout}:2:", result.stdout)
+        self.assertIn(normal_marker, result.stdout)
+        self.assertNotIn(decoy_marker, result.stdout)
 
     def test_session_mining_failure_probe_handles_event_message_fields(self) -> None:
         root = Path(__file__).resolve().parents[1]
