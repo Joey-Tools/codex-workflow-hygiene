@@ -2652,6 +2652,8 @@ def _scan_session_meta_records(
                 _meta_date, session_id, cwd, _timestamp = meta
             if not session_id:
                 continue
+            if limit and len(rows) >= limit:
+                return SessionMetaScan(rows=rows, truncated=True)
             try:
                 item = _validated_session_meta_output_item(
                     date=date_value.strftime(DATE_FORMAT),
@@ -2662,8 +2664,6 @@ def _scan_session_meta_records(
             except ValueError as exc:
                 raise SessionMetaRolloutError(str(exc), rollout=rollout_relative_key) from exc
             rows.append({"host": host, **item})
-            if limit and len(rows) > limit:
-                return SessionMetaScan(rows=rows[:limit], truncated=True)
     return SessionMetaScan(rows=rows, truncated=False)
 
 

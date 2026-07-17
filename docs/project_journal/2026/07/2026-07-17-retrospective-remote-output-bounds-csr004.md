@@ -34,9 +34,10 @@ superseded_by:
 - `skills/codex-session-retrospective/SKILL.md`
 - `tests/test_session_retrospective.py`
 - Focused output and raw-read boundary selection: 7 tests passed.
-- `python3 -B -m unittest tests.test_session_retrospective`: 867 tests passed in 162.535 seconds.
+- Post-review limit-order selection: 2 tests passed, covering the new local/embedded truncation parity regression and the existing row boundary.
+- `python3 -B -m unittest tests.test_session_retrospective`: 868 tests passed in 331.053 seconds after the review fix.
 - `python3 -B -m unittest discover -s tests -p 'test_*.py'`: 956 tests passed in 314.646 seconds.
 - `python3 -m py_compile` passed for the changed Python source and test files.
 - Ruff passed for the changed source and for the test file with its pre-existing `F541` finding excluded.
 - The installed skill validator, project-journal validator, and `git diff --check` passed.
-- A final read-only diff review reported no findings.
+- An independent read-only diff review reported no findings. The helper-backed fixed-range review found a local/embedded limit-order mismatch; the implementation now gives limit truncation precedence over validating the excluded extra row, with a dedicated regression. A final fixed-range rerun is required before merge.

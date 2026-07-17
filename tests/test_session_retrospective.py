@@ -2824,6 +2824,90 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 )
                 self.assertNotIn("x" * 1024, result.stdout)
 
+    def test_remote_probe_session_meta_limit_truncation_precedes_oversized_extra_row_local_and_embedded(self) -> None:
+        accepted_ref = "sessions/2026/05/01/rollout-2026-05-01T11-00-00-limit.jsonl"
+        oversized_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-limit.jsonl"
+        oversized_item = {
+            "date": "2026/05/01",
+            "session_id": "oversized-extra",
+            "cwd": "",
+            "rollout": oversized_ref,
+        }
+        base_size = len(json.dumps(oversized_item, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        oversized_cwd = "x" * (REMOTE_PROBE.MAX_REMOTE_SESSION_META_SERIALIZED_ROW_BYTES - base_size + 1)
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            write_jsonl(
+                root / accepted_ref,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T11:00:00Z",
+                        "payload": {"id": "accepted", "cwd": "/repo"},
+                    }
+                ],
+            )
+            write_jsonl(
+                root / oversized_ref,
+                [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"id": "oversized-extra", "cwd": oversized_cwd},
+                    }
+                ],
+            )
+
+            local_scan = REMOTE_PROBE._scan_session_meta_records(
+                codex_root=root,
+                dates=[dt.date(2026, 5, 1)],
+                limit=1,
+                host="local",
+            )
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "session-meta",
+                    "codex_root": str(root),
+                    "dates": ["2026/05/01"],
+                    "limit": 1,
+                    "session_meta_scan_bytes": REMOTE_PROBE.MAX_SESSION_META_SCAN_BYTES,
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertTrue(local_scan.truncated)
+        self.assertEqual([row["session_id"] for row in local_scan.rows], ["accepted"])
+        self.assertEqual(embedded.returncode, 0, embedded.stderr)
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                embedded.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_SESSION_META_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_SESSION_META_END,
+                host="embedded",
+                command="session-meta",
+            )
+        ]
+        self.assertEqual(embedded_rows[0]["session_id"], "accepted")
+        self.assertEqual(
+            embedded_rows[1],
+            {
+                "date": "2026/05/01",
+                "kind": "truncation",
+                "limit": 1,
+                "reason": REMOTE_PROBE.SESSION_META_LIMIT_TRUNCATED_REASON,
+            },
+        )
+        self.assertNotIn("oversized-extra", embedded.stdout)
+        self.assertNotIn("x" * 1024, embedded.stdout)
+
     def test_remote_probe_embedded_rollout_summary_serialized_record_boundary(self) -> None:
         rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-summary-row-budget.jsonl"
         timestamp = "2026-05-01T10:00:00Z"
