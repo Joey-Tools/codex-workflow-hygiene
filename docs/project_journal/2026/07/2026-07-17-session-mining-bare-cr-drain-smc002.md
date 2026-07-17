@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-17
 updated: 2026-07-17
 branch: codex/daily-skill-friction-20260717-codex-workflow-hygiene-session-mining-bare-cr-drain
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/47
 supersedes: []
 superseded_by:
 ---
@@ -28,6 +28,7 @@ superseded_by:
 
 ## Evidence
 
+- https://github.com/Joey-Tools/codex-workflow-hygiene/pull/47
 - `tests.test_skill_structure.SkillStructureTests.test_session_mining_recent_turn_recipe_reads_both_indexes`
 - `python3 -m unittest discover -s tests -p 'test_*.py'` (938 passed, 1 skipped)
 - `quick_validate.py skills/codex-session-mining`
