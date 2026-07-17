@@ -276,7 +276,11 @@ class SkillStructureTests(unittest.TestCase):
         recipe = extract_bash_block_after(workflow, "Exact session ID:")
         self.assertIn("if not path.is_file():", recipe)
         self.assertIn("except OSError:", recipe)
-        self.assertIn("except json.JSONDecodeError:", recipe)
+        self.assertIn("path.open('rb')", recipe)
+        self.assertIn("handle.readline(max_record_bytes + 1)", recipe)
+        self.assertIn("while raw_line and not raw_line.endswith(b'\\n'):", recipe)
+        self.assertIn("except (UnicodeDecodeError, json.JSONDecodeError):", recipe)
+        self.assertIn("matches_session(row.get(key))", recipe)
         self.assertIn("warning: unable to read optional index", recipe)
         self.assertNotIn("ensure_ascii=False", workflow)
         self.assertGreaterEqual(workflow.count("ensure_ascii=True"), 3)
@@ -311,17 +315,42 @@ class SkillStructureTests(unittest.TestCase):
             self.assertEqual({Path(line) for line in missing.stdout.splitlines()}, expected)
 
             session_index = codex_home / "session_index.jsonl"
-            session_index.write_text(
-                f"not-json-{session_id}\n"
+            bare_cr_tail_marker = "bare-cr-tail-index-marker"
+            post_oversized_marker = "post-oversized-index-marker"
+            decoy_marker = "session-id-text-decoy"
+            session_index_payload = f"not-json-{session_id}\n".encode("utf-8")
+            session_index_payload += b"x" * (1024 * 1024) + b"\r"
+            session_index_payload += (
+                json_dumps(
+                    {
+                        "session_id": session_id,
+                        "text": bare_cr_tail_marker,
+                    }
+                )
+                + "\n"
+                + json_dumps(
+                    {
+                        "session_id": session_id,
+                        "text": post_oversized_marker,
+                    }
+                )
+                + "\n"
+                + json_dumps(
+                    {
+                        "session_id": "different-session",
+                        "text": f"{decoy_marker} mentions {session_id}",
+                    }
+                )
+                + "\n"
                 + json.dumps(
                     {
                         "session_id": session_id,
                         "text": "matching \ud800 index row",
                     }
                 )
-                + "\n",
-                encoding="utf-8",
-            )
+                + "\n"
+            ).encode("utf-8")
+            session_index.write_bytes(session_index_payload)
             (codex_home / "history.jsonl").write_text(
                 f"also-not-json-{session_id}\n",
                 encoding="utf-8",
@@ -337,7 +366,9 @@ class SkillStructureTests(unittest.TestCase):
             self.assertEqual(malformed.returncode, 0, malformed.stderr)
             self.assertIn(str(active), malformed.stdout)
             self.assertIn(str(archived), malformed.stdout)
-            self.assertIn(f"{session_index}:2:", malformed.stdout)
+            self.assertIn(post_oversized_marker, malformed.stdout)
+            self.assertNotIn(bare_cr_tail_marker, malformed.stdout)
+            self.assertNotIn(decoy_marker, malformed.stdout)
             self.assertIn("\\ud800", malformed.stdout)
             self.assertNotIn("not-json", malformed.stdout)
 
