@@ -3646,9 +3646,16 @@ def summarize_rollout():
             if not isinstance(obj, dict):
                 json_error_count += 1
                 continue
-            timestamp = str(obj.get("timestamp", ""))
+            timestamp_value = obj.get("timestamp")
+            if "timestamp" in obj and not isinstance(timestamp_value, str):
+                json_error_count += 1
+                continue
+            timestamp = timestamp_value if isinstance(timestamp_value, str) else ""
             record = None
-            record_type = str(obj.get("type", ""))
+            record_type = obj.get("type")
+            if not isinstance(record_type, str):
+                json_error_count += 1
+                continue
             payload = obj.get("payload")
             if record_type in ("session_meta", "response_item", "event_msg") and not isinstance(payload, dict):
                 json_error_count += 1
@@ -3658,12 +3665,17 @@ def summarize_rollout():
                 if not isinstance(session_id_value, str) or not session_id_value:
                     json_error_count += 1
                     continue
+                cwd_value = payload.get("cwd")
+                if "cwd" in payload and not isinstance(cwd_value, str):
+                    json_error_count += 1
+                    continue
+                cwd_present = isinstance(cwd_value, str) and bool(cwd_value)
                 if session_meta_record is None:
                     record = summary_record(
                         "session_meta",
                         "session_id=" + session_id_value
                         + " cwd_present="
-                        + str(bool(payload.get("cwd", ""))).lower(),
+                        + str(cwd_present).lower(),
                         line_no=line_no,
                         timestamp=timestamp,
                         session_id=session_id_value,
@@ -3672,7 +3684,10 @@ def summarize_rollout():
                     session_meta_record = record
                 continue
             elif record_type == "response_item":
-                payload_type = str(payload.get("type", ""))
+                payload_type = payload.get("type")
+                if not isinstance(payload_type, str):
+                    json_error_count += 1
+                    continue
                 if payload_type == "message":
                     if not message_payload_is_valid(payload):
                         json_error_count += 1
@@ -3692,7 +3707,10 @@ def summarize_rollout():
                             last_user_record = record
                 elif payload_type == "function_call_output":
                     output = payload.get("output")
-                    if isinstance(output, str) and output.strip():
+                    if not isinstance(output, str):
+                        json_error_count += 1
+                        continue
+                    if output.strip():
                         record = summary_record(
                             "function_call_output",
                             output,
@@ -3701,10 +3719,16 @@ def summarize_rollout():
                             search_keywords=keywords,
                         )
             elif record_type == "event_msg":
-                payload_type = str(payload.get("type", ""))
+                payload_type = payload.get("type")
+                if not isinstance(payload_type, str):
+                    json_error_count += 1
+                    continue
                 if payload_type == "task_complete":
                     text = payload.get("last_agent_message")
-                    if text:
+                    if not isinstance(text, str):
+                        json_error_count += 1
+                        continue
+                    if text.strip():
                         record = summary_record(
                             "task_complete",
                             text,
@@ -5525,9 +5549,16 @@ def _summarize_rollout_records_with_meta(
         if not isinstance(obj, dict):
             json_error_count += 1
             continue
-        timestamp = str(obj.get("timestamp", ""))
+        timestamp_value = obj.get("timestamp")
+        if "timestamp" in obj and not isinstance(timestamp_value, str):
+            json_error_count += 1
+            continue
+        timestamp = timestamp_value if isinstance(timestamp_value, str) else ""
         record: dict[str, Any] | None = None
-        record_type = str(obj.get("type", ""))
+        record_type = obj.get("type")
+        if not isinstance(record_type, str):
+            json_error_count += 1
+            continue
         payload = obj.get("payload")
         if record_type in ("session_meta", "response_item", "event_msg") and not isinstance(payload, dict):
             json_error_count += 1
@@ -5538,10 +5569,15 @@ def _summarize_rollout_records_with_meta(
             if not isinstance(session_id_value, str) or not session_id_value:
                 json_error_count += 1
                 continue
+            cwd_value = payload.get("cwd")
+            if "cwd" in payload and not isinstance(cwd_value, str):
+                json_error_count += 1
+                continue
+            cwd_present = isinstance(cwd_value, str) and bool(cwd_value)
             if session_meta_record is None:
                 session_meta_record = _build_summary_record(
                     kind="session_meta",
-                    text=f"session_id={session_id_value} cwd_present={str(bool(payload.get('cwd', ''))).lower()}",
+                    text=f"session_id={session_id_value} cwd_present={str(cwd_present).lower()}",
                     line_no=line_no,
                     timestamp=timestamp,
                     max_text_chars=max_text_chars,
@@ -5551,7 +5587,10 @@ def _summarize_rollout_records_with_meta(
             continue
 
         if record_type == "response_item":
-            payload_type = str(payload.get("type", ""))
+            payload_type = payload.get("type")
+            if not isinstance(payload_type, str):
+                json_error_count += 1
+                continue
             if payload_type == "message":
                 if not _message_payload_is_valid(payload):
                     json_error_count += 1
@@ -5572,7 +5611,10 @@ def _summarize_rollout_records_with_meta(
                         last_user_record = record
             elif payload_type == "function_call_output":
                 output = payload.get("output")
-                if isinstance(output, str) and output.strip():
+                if not isinstance(output, str):
+                    json_error_count += 1
+                    continue
+                if output.strip():
                     record = _build_summary_record(
                         kind="function_call_output",
                         text=output,
@@ -5582,13 +5624,19 @@ def _summarize_rollout_records_with_meta(
                         search_keywords=search_keywords,
                     )
         elif record_type == "event_msg":
-            payload_type = str(payload.get("type", ""))
+            payload_type = payload.get("type")
+            if not isinstance(payload_type, str):
+                json_error_count += 1
+                continue
             if payload_type == "task_complete":
                 text = payload.get("last_agent_message")
-                if text:
+                if not isinstance(text, str):
+                    json_error_count += 1
+                    continue
+                if text.strip():
                     record = _build_summary_record(
                         kind="task_complete",
-                        text=str(text),
+                        text=text,
                         line_no=line_no,
                         timestamp=timestamp,
                         max_text_chars=max_text_chars,
