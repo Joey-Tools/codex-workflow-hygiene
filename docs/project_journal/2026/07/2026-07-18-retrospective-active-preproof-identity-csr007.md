@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-18
 updated: 2026-07-18
 branch: codex/daily-skill-friction-20260718-codex-workflow-hygiene-active-preproof-grow-rewrite
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/54
 supersedes: [20260717-csr006]
 superseded_by:
 ---
@@ -26,11 +26,11 @@ superseded_by:
 
 ## Next Steps
 
-- Add the PR URL before final delivery.
+- Complete review and merge gates for PR #54.
 
 ## Evidence
 
-- PR: pending.
+- PR: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/54
 - `python3 tests/test_remote_codex_probe.py`: 33 of 33 tests passed in 4.644 seconds, including local and embedded append-grow and same-inode rewrite-grow during the first proof read.
 - Ruff 0.13.2 passed on both changed Python files with `--no-cache` because the canonical worktree is read-only to tool caches.
 - `codex_skill_validate.py skills/codex-session-retrospective`: valid through the isolated `uv` validator path.
