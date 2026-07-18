@@ -4162,7 +4162,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     [],
                 )
 
-    def test_remote_probe_bounded_text_lines_local_and_embedded_honor_nonzero_start_offset(
+    def test_remote_probe_bounded_text_lines_local_and_embedded_reject_nonzero_start_offset(
         self,
     ) -> None:
         class RecordingBytesIO(io.BytesIO):
@@ -4180,37 +4180,39 @@ class SessionRetrospectiveTests(unittest.TestCase):
             ).encode("utf-8")
             + b"\n"
         )
-        final_line = json.dumps(
+        next_line = json.dumps(
             message(
                 "user",
-                "You missed the final nonzero-offset record.",
+                "You missed the nonzero-offset record.",
                 "2026-05-01T10:01:00Z",
             )
         )
-        final_bytes = final_line.encode("utf-8")
+        next_bytes = next_line.encode("utf-8")
+        payload = prefix + next_bytes + b"\n"
+        named_offsets = {
+            1: "first-byte",
+            len(prefix): "lf-boundary",
+            len(prefix) + len(next_bytes) // 2: "mid-record-json-suffix",
+            len(payload): "snapshot-eof",
+        }
 
         for implementation, reader in bounded_text_line_readers():
-            with self.subTest(implementation=implementation, boundary="true-eof"):
-                payload = prefix + final_bytes
-                handle = RecordingBytesIO(payload)
-                handle.seek(len(prefix))
+            for start_offset in range(1, len(payload) + 1):
+                with self.subTest(
+                    implementation=implementation,
+                    boundary=named_offsets.get(start_offset, "other-nonzero"),
+                    start_offset=start_offset,
+                ):
+                    handle = RecordingBytesIO(payload)
+                    handle.seek(start_offset)
 
-                self.assertEqual(
-                    list(reader(handle, 0, len(payload))),
-                    [final_line],
-                )
-                self.assertEqual(handle.read_sizes, [len(final_bytes)])
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "rollout summary reader must start at byte 0",
+                    ):
+                        list(reader(handle, len(next_bytes), len(payload)))
 
-            with self.subTest(implementation=implementation, boundary="scan-cap"):
-                payload = prefix + final_bytes + b"\n"
-                handle = RecordingBytesIO(payload)
-                handle.seek(len(prefix))
-
-                self.assertEqual(
-                    list(reader(handle, len(final_bytes), len(payload))),
-                    [],
-                )
-                self.assertEqual(handle.read_sizes, [len(final_bytes)])
+                    self.assertEqual(handle.read_sizes, [])
 
     def test_remote_probe_bounded_text_lines_local_and_embedded_reject_invalid_start_offset(
         self,
@@ -30248,15 +30250,13 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn('os.fdopen(fd, "rb")', script)
         self.assertIn('raw_bytes.find(b"\\n", offset)', script)
         self.assertIn("start_offset = handle.tell()", script)
+        self.assertIn("if start_offset != 0:", script)
+        self.assertIn("rollout summary reader must start at byte 0", script)
         self.assertIn(
-            "remaining_source_bytes = source_size - start_offset",
+            "scan_limit = min(max_scan_bytes, source_size) if max_scan_bytes else source_size",
             script,
         )
-        self.assertIn(
-            "min(max_scan_bytes, remaining_source_bytes)",
-            script,
-        )
-        self.assertIn("if start_offset + scanned == source_size:", script)
+        self.assertIn("if scanned == source_size:", script)
         self.assertIn("SUMMARY_LINE_BYTES", script)
         self.assertNotIn("(2,)", script)
         self.assertNotIn("(16,)", script)

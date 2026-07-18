@@ -3467,16 +3467,13 @@ def bounded_text_lines(handle, max_scan_bytes, source_size):
         or start_offset > source_size
     ):
         raise ValueError("rollout summary reader offset is invalid")
+    if start_offset != 0:
+        raise ValueError("rollout summary reader must start at byte 0")
     scanned = 0
     buffer = bytearray()
     dropping_oversized_line = False
     chunk_bytes = 64 * 1024
-    remaining_source_bytes = source_size - start_offset
-    scan_limit = (
-        min(max_scan_bytes, remaining_source_bytes)
-        if max_scan_bytes
-        else remaining_source_bytes
-    )
+    scan_limit = min(max_scan_bytes, source_size) if max_scan_bytes else source_size
 
     while scanned < scan_limit:
         read_size = min(chunk_bytes, scan_limit - scanned)
@@ -3510,7 +3507,7 @@ def bounded_text_lines(handle, max_scan_bytes, source_size):
                     buffer.clear()
             offset = part_end
 
-    if start_offset + scanned == source_size:
+    if scanned == source_size:
         if dropping_oversized_line:
             yield "\\n"
         elif buffer:
@@ -5298,16 +5295,13 @@ def _bounded_text_lines(
         or start_offset > source_size
     ):
         raise ValueError("rollout summary reader offset is invalid")
+    if start_offset != 0:
+        raise ValueError("rollout summary reader must start at byte 0")
     scanned = 0
     buffer = bytearray()
     dropping_oversized_line = False
     chunk_bytes = 64 * 1024
-    remaining_source_bytes = source_size - start_offset
-    scan_limit = (
-        min(max_scan_bytes, remaining_source_bytes)
-        if max_scan_bytes
-        else remaining_source_bytes
-    )
+    scan_limit = min(max_scan_bytes, source_size) if max_scan_bytes else source_size
 
     while scanned < scan_limit:
         read_size = min(chunk_bytes, scan_limit - scanned)
@@ -5341,7 +5335,7 @@ def _bounded_text_lines(
                     buffer.clear()
             offset = part_end
 
-    if start_offset + scanned == source_size:
+    if scanned == source_size:
         if dropping_oversized_line:
             yield "\n"
         elif buffer:
