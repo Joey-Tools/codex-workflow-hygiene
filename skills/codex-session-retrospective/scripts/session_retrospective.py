@@ -21,7 +21,7 @@ import sys
 import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 WRAPPER_PREFIXES = (
@@ -1236,20 +1236,49 @@ def iter_jsonl_strict_bytes(data: bytes, label: str) -> Iterable[tuple[int, dict
         yield line_no, record
 
 
+def message_content_is_valid(payload: dict[str, Any]) -> bool:
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if not isinstance(part, dict):
+            return False
+        part_type = part.get("type")
+        if not isinstance(part_type, str):
+            return False
+        if part_type not in ("input_text", "output_text", "text"):
+            continue
+        if not isinstance(part.get("text"), str):
+            return False
+    return True
+
+
+def response_message_payload_is_valid(payload: dict[str, Any]) -> bool:
+    if payload.get("type") != "message":
+        return False
+    role = payload.get("role")
+    if role != "user" and role != "assistant":
+        return False
+    return message_content_is_valid(payload)
+
+
 def text_from_message_payload(payload: dict[str, Any]) -> str:
-    texts: list[str] = []
-    for part in payload.get("content") or []:
-        if isinstance(part, dict) and part.get("type") in {"input_text", "output_text", "text"}:
-            texts.append(str(part.get("text") or ""))
+    if not message_content_is_valid(payload):
+        return ""
+    texts = [
+        part["text"]
+        for part in payload["content"]
+        if part["type"] in ("input_text", "output_text", "text")
+    ]
     return "\n".join(texts).strip()
 
 
 def event_user_message_text(payload: dict[str, Any]) -> str:
-    message = payload.get("message")
-    if isinstance(message, str):
-        return message.strip()
-    if isinstance(message, dict):
-        if message.get("role") == "user":
+    if "message" in payload:
+        message = payload.get("message")
+        if isinstance(message, str):
+            return message.strip()
+        if isinstance(message, dict) and message.get("role") == "user":
             return text_from_message_payload(message)
         return ""
     text = payload.get("text")
@@ -1259,7 +1288,7 @@ def event_user_message_text(payload: dict[str, Any]) -> str:
 
 
 def user_text_from_payload(payload: dict[str, Any]) -> str:
-    if payload.get("type") == "message" and payload.get("role") == "user":
+    if response_message_payload_is_valid(payload) and payload.get("role") == "user":
         return text_from_message_payload(payload)
     if payload.get("type") == "user_message":
         return event_user_message_text(payload)
@@ -1267,18 +1296,37 @@ def user_text_from_payload(payload: dict[str, Any]) -> str:
 
 
 def assistant_text_from_payload(payload: dict[str, Any]) -> str:
-    if payload.get("type") == "message" and payload.get("role") == "assistant":
+    if response_message_payload_is_valid(payload) and payload.get("role") == "assistant":
         return text_from_message_payload(payload)
     if payload.get("type") == "task_complete":
-        return str(payload.get("last_agent_message") or "").strip()
+        message = payload.get("last_agent_message")
+        return message.strip() if isinstance(message, str) else ""
     return ""
 
 
 def tool_output_payload_text(record: dict[str, Any], payload: dict[str, Any]) -> str:
-    record_type = str(record.get("type") or "")
-    payload_type = str(payload.get("type") or "")
-    if record_type == "function_call_output" or payload_type == "function_call_output":
-        return str(payload.get("output") or payload.get("text") or "").strip()
+    record_type = record.get("type")
+    payload_type = payload.get("type")
+    if not isinstance(record_type, str):
+        return ""
+    if "type" in payload and not isinstance(payload_type, str):
+        return ""
+    if record_type == "response_item":
+        if payload_type != "function_call_output":
+            return ""
+        output = payload.get("output")
+        return output.strip() if isinstance(output, str) else ""
+    if record_type != "function_call_output":
+        return ""
+    if "output" in payload:
+        output = payload.get("output")
+        if not isinstance(output, str):
+            return ""
+        if output:
+            return output.strip()
+    if "text" in payload:
+        text = payload.get("text")
+        return text.strip() if isinstance(text, str) else ""
     return ""
 
 
@@ -1307,11 +1355,46 @@ def record_timestamp_with_origin(record: dict[str, Any], path: Path) -> tuple[st
 
 
 def record_text(record: dict[str, Any]) -> str:
-    payload = record.get("payload") or {}
-    if isinstance(payload, dict) and payload.get("type") in {"message", "user_message"}:
-        if payload.get("type") == "user_message":
+    record_type = record.get("type")
+    if not isinstance(record_type, str) or record_type not in (
+        "response_item",
+        "event_msg",
+        "function_call_output",
+    ):
+        return ""
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    payload_type = payload.get("type")
+    if "type" in payload and not isinstance(payload_type, str):
+        return ""
+
+    if record_type == "response_item":
+        if payload_type == "message":
+            if not response_message_payload_is_valid(payload):
+                return ""
+            return text_from_message_payload(payload)
+        if payload_type == "function_call_output":
+            return tool_output_payload_text(record, payload)
+        if payload_type in ("user_message", "task_complete", "function_call"):
+            return ""
+    elif record_type == "event_msg":
+        if payload_type == "user_message":
             return event_user_message_text(payload)
-        return text_from_message_payload(payload)
+        if payload_type == "task_complete":
+            return assistant_text_from_payload(payload)
+        if payload_type in (
+            "message",
+            "function_call_output",
+            "token_count",
+            "thread/start",
+        ):
+            return ""
+    else:
+        tool_text = tool_output_payload_text(record, payload)
+        if tool_text or "output" in payload or "text" in payload:
+            return tool_text
+
     try:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
     except TypeError:
@@ -5673,9 +5756,6 @@ def extract_rollout(
 
     for line_no, record in iter_jsonl(path):
         payload = record.get("payload") or {}
-        if isinstance(payload, dict):
-            cwd = payload.get("cwd") or cwd
-            model = payload.get("model") or payload.get("model_id") or model
         timestamp, timestamp_is_fallback = record_timestamp_with_origin(record, path)
         parsed_timestamp = parse_time(timestamp)
         timestamp, parsed_timestamp = effective_record_time(
@@ -5686,11 +5766,42 @@ def extract_rollout(
         if parsed_timestamp and end and parsed_timestamp >= end:
             continue
 
+        record_type = record.get("type")
+        payload_type = payload.get("type") if isinstance(payload, dict) else None
+        if (
+            isinstance(record_type, str)
+            and isinstance(payload, dict)
+            and (
+                record_type in ("session_meta", "turn_context")
+                or (record_type == "response_item" and response_message_payload_is_valid(payload))
+            )
+        ):
+            payload_cwd = payload.get("cwd")
+            if isinstance(payload_cwd, str) and payload_cwd:
+                cwd = payload_cwd
+            for model_key in ("model", "model_id"):
+                payload_model = payload.get(model_key)
+                if isinstance(payload_model, str) and payload_model:
+                    model = payload_model
+                    break
+
         if isinstance(payload, dict):
-            user_text = user_text_from_payload(payload)
-            assistant_text = assistant_text_from_payload(payload)
+            user_text = ""
+            assistant_text = ""
+            tool_text = ""
+            if record_type == "function_call_output":
+                tool_text = tool_output_payload_text(record, payload)
+            elif isinstance(record_type, str) and isinstance(payload_type, str):
+                if record_type == "response_item" and response_message_payload_is_valid(payload):
+                    user_text = user_text_from_payload(payload)
+                    assistant_text = assistant_text_from_payload(payload)
+                elif record_type == "event_msg" and payload_type == "user_message":
+                    user_text = user_text_from_payload(payload)
+                elif record_type == "event_msg" and payload_type == "task_complete":
+                    assistant_text = assistant_text_from_payload(payload)
+                elif record_type == "response_item" and payload_type == "function_call_output":
+                    tool_text = tool_output_payload_text(record, payload)
             prompt_text = meaningful_prompt_text(user_text) if user_text else ""
-            tool_text = tool_output_payload_text(record, payload)
             if user_text and not meaningful_user_text(user_text):
                 # Runtime wrappers do not start a user turn. Keep still-active prompts,
                 # but detach once the prior turn already has terminal evidence.
