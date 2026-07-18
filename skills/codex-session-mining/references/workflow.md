@@ -480,6 +480,15 @@ def hit_window(parts, raw_needle):
     return prefix + ''.join(after)
 
 
+def escaped_output_text(value):
+    return ''.join(
+        character
+        if character.isprintable()
+        else json.dumps(character, ensure_ascii=True)[1:-1]
+        for character in value
+    )
+
+
 with path.open('rb') as handle:
     records = bounded_jsonl(handle)
     for line_no, raw_line in records:
@@ -504,14 +513,15 @@ with path.open('rb') as handle:
         )
         if snippet is None:
             continue
-        print(f'{path}:{line_no}:{timestamp}:{record_kind}:{snippet}')
+        safe_snippet = escaped_output_text(snippet)
+        print(f'{path}:{line_no}:{timestamp}:{record_kind}:{safe_snippet}')
         printed += 1
         if printed >= 20:
             break
 PY
 ```
 
-The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
+The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. After raw matching and window selection, the snippet JSON-escapes only non-printable characters so terminal control sequences cannot reach stdout while printable Unicode remains unchanged. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
 
 For JSONL schema checks, inspect one record or aggregate unique keys once. Do not run `jq -R 'fromjson | keys' file.jsonl`, because it prints the same key list for every line and can produce massive output on retained artifacts such as `turn_flags.jsonl`.
 
