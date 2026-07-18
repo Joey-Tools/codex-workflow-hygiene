@@ -3303,7 +3303,7 @@ def message_payload_is_valid(payload):
     role = payload.get("role")
     return (
         isinstance(role, str)
-        and role in ("assistant", "user")
+        and role in ("assistant", "developer", "system", "user")
         and message_content_is_valid(payload.get("content"))
     )
 
@@ -5200,7 +5200,7 @@ def _message_payload_is_valid(payload: dict[str, Any]) -> bool:
     role = payload.get("role")
     return (
         isinstance(role, str)
-        and role in ("assistant", "user")
+        and role in ("assistant", "developer", "system", "user")
         and _message_content_is_valid(payload.get("content"))
     )
 

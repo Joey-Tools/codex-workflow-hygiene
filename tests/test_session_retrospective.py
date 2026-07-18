@@ -4339,7 +4339,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 "timestamp": "2026-05-01T10:00:02Z",
                 "payload": {
                     "type": "message",
-                    "role": "system",
+                    "role": "tool",
                     "content": [{"type": "output_text", "text": "Unknown role evidence."}],
                 },
             },
@@ -4408,6 +4408,175 @@ class SessionRetrospectiveTests(unittest.TestCase):
             self.assertNotIn("coverage_proof", scan_meta)
             self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
             self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
+
+    def test_remote_probe_rollout_summary_validates_non_evidence_response_roles_local_and_embedded(
+        self,
+    ) -> None:
+        def summarize_pair(
+            root: Path,
+            rollout_ref: str,
+            rollout_rows: list[dict],
+        ) -> tuple[list[dict], list[dict]]:
+            rollout = root / rollout_ref
+            write_jsonl(rollout, rollout_rows)
+            local_stdout = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE, "_local_codex_root", return_value=root
+            ), mock.patch.object(sys, "stdout", local_stdout):
+                local_result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=10,
+                        tail_records=8,
+                        max_text_chars=120,
+                    )
+                )
+
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": rollout_ref,
+                    "summary_limit": 10,
+                    "summary_scan_bytes": rollout.stat().st_size,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 120,
+                    "summary_keywords": [],
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(local_result, 0)
+            self.assertEqual(embedded.returncode, 0, embedded.stderr)
+            local_rows = [
+                json.loads(line) for line in local_stdout.getvalue().splitlines()
+            ]
+            embedded_rows = [
+                json.loads(line)
+                for line in REMOTE_PROBE._extract_framed_lines(
+                    embedded.stdout,
+                    begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                    end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                    host="embedded",
+                    command="rollout-summary",
+                )
+            ]
+            return local_rows, embedded_rows
+
+        later_evidence = [
+            message("user", "You missed the later valid evidence.", "2026-05-01T10:01:00Z"),
+            message("assistant", "Ordinary later valid completion.", "2026-05-01T10:02:00Z"),
+        ]
+        valid_non_evidence_rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {"type": "input_text", "text": "Developer policy is not evidence."}
+                    ],
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {"type": "output_text", "text": "System policy is not evidence."}
+                    ],
+                },
+            },
+            *later_evidence,
+        ]
+        malformed_non_evidence_rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": None,
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "output_text"}],
+                },
+            },
+            *later_evidence,
+        ]
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            valid_results = summarize_pair(
+                root,
+                "sessions/2026/05/01/rollout-2026-05-01T10-00-00-valid-non-evidence-roles.jsonl",
+                valid_non_evidence_rows,
+            )
+            malformed_results = summarize_pair(
+                root,
+                "sessions/2026/05/01/rollout-2026-05-01T10-00-00-malformed-non-evidence-roles.jsonl",
+                malformed_non_evidence_rows,
+            )
+
+        for rows in valid_results:
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(scan_meta["json_error_count"], 0)
+            self.assertEqual(scan_meta["summary_record_count"], len(later_evidence))
+            self.assertEqual(
+                scan_meta["source_identity_proof"],
+                MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+            )
+            self.assertEqual(
+                scan_meta["coverage_proof"],
+                MODULE.REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
+            )
+            self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
+            self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
+            self.assertEqual(
+                {
+                    (row.get("kind"), row.get("line"))
+                    for row in rows
+                    if row.get("kind") in {"user_message", "assistant_message"}
+                },
+                {("user_message", 3), ("assistant_message", 4)},
+            )
+            serialized = json.dumps(rows, sort_keys=True)
+            self.assertNotIn("developer policy", serialized.lower())
+            self.assertNotIn("system policy", serialized.lower())
+
+        for rows in malformed_results:
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(scan_meta["json_error_count"], 2)
+            self.assertEqual(scan_meta["summary_record_count"], len(later_evidence))
+            self.assertNotIn("source_identity_proof", scan_meta)
+            self.assertNotIn("coverage_proof", scan_meta)
+            self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
+            self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
+            self.assertEqual(
+                {
+                    (row.get("kind"), row.get("line"))
+                    for row in rows
+                    if row.get("kind") in {"user_message", "assistant_message"}
+                },
+                {("user_message", 3), ("assistant_message", 4)},
+            )
 
     def test_remote_probe_rollout_summary_rejects_non_string_record_types_local_and_embedded(
         self,
