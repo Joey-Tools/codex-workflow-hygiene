@@ -3462,6 +3462,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
             with self.assertRaisesRegex(TypeError, "requires binary input"):
                 reader.read()
 
+    def test_remote_probe_hashing_readers_forward_tell(self) -> None:
+        namespace = embedded_probe_namespace(
+            {
+                "mode": "rollout-summary",
+                "codex_root": ".",
+            }
+        )
+        payload = b"prefix\nsuffix"
+
+        for implementation, reader_type in (
+            ("local", REMOTE_PROBE._HashingReader),
+            ("embedded", namespace["HashingReader"]),
+        ):
+            with self.subTest(implementation=implementation):
+                handle = io.BytesIO(payload)
+                handle.seek(len(b"prefix\n"))
+                reader = reader_type(handle)
+
+                self.assertEqual(reader.tell(), len(b"prefix\n"))
+                self.assertEqual(reader.read(2), b"su")
+                self.assertEqual(reader.tell(), len(b"prefix\nsu"))
+
     def test_remote_probe_local_rollout_summary_hashes_exact_raw_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -4139,6 +4161,85 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     list(reader(io.BytesIO(payload), scan_cap, len(payload))),
                     [],
                 )
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_honor_nonzero_start_offset(
+        self,
+    ) -> None:
+        class RecordingBytesIO(io.BytesIO):
+            def __init__(self, payload: bytes) -> None:
+                super().__init__(payload)
+                self.read_sizes: list[int] = []
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_sizes.append(size)
+                return super().read(size)
+
+        prefix = (
+            json.dumps(
+                message("assistant", "Earlier record.", "2026-05-01T10:00:00Z")
+            ).encode("utf-8")
+            + b"\n"
+        )
+        final_line = json.dumps(
+            message(
+                "user",
+                "You missed the final nonzero-offset record.",
+                "2026-05-01T10:01:00Z",
+            )
+        )
+        final_bytes = final_line.encode("utf-8")
+
+        for implementation, reader in bounded_text_line_readers():
+            with self.subTest(implementation=implementation, boundary="true-eof"):
+                payload = prefix + final_bytes
+                handle = RecordingBytesIO(payload)
+                handle.seek(len(prefix))
+
+                self.assertEqual(
+                    list(reader(handle, 0, len(payload))),
+                    [final_line],
+                )
+                self.assertEqual(handle.read_sizes, [len(final_bytes)])
+
+            with self.subTest(implementation=implementation, boundary="scan-cap"):
+                payload = prefix + final_bytes + b"\n"
+                handle = RecordingBytesIO(payload)
+                handle.seek(len(prefix))
+
+                self.assertEqual(
+                    list(reader(handle, len(final_bytes), len(payload))),
+                    [],
+                )
+                self.assertEqual(handle.read_sizes, [len(final_bytes)])
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_reject_invalid_start_offset(
+        self,
+    ) -> None:
+        class ReaderWithoutTell:
+            def read(self, _size: int = -1) -> bytes:
+                return b""
+
+        class ReaderWithTell(ReaderWithoutTell):
+            def __init__(self, offset: object) -> None:
+                self.offset = offset
+
+            def tell(self) -> object:
+                return self.offset
+
+        source_size = 4
+        cases = (
+            ("unavailable", ReaderWithoutTell(), "offset is unavailable"),
+            ("boolean", ReaderWithTell(False), "offset is invalid"),
+            ("non-integer", ReaderWithTell(0.0), "offset is invalid"),
+            ("negative", ReaderWithTell(-1), "offset is invalid"),
+            ("past-snapshot", ReaderWithTell(source_size + 1), "offset is invalid"),
+        )
+
+        for implementation, reader in bounded_text_line_readers():
+            for case, handle, message_pattern in cases:
+                with self.subTest(implementation=implementation, case=case):
+                    with self.assertRaisesRegex(ValueError, message_pattern):
+                        list(reader(handle, source_size, source_size))
 
     def test_remote_probe_bounded_text_lines_local_and_embedded_preserve_crlf(
         self,
@@ -30146,12 +30247,17 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("Codex root is a symlink", script)
         self.assertIn('os.fdopen(fd, "rb")', script)
         self.assertIn('raw_bytes.find(b"\\n", offset)', script)
+        self.assertIn("start_offset = handle.tell()", script)
         self.assertIn(
-            "scan_limit = min(max_scan_bytes, source_size) if max_scan_bytes else source_size",
+            "remaining_source_bytes = source_size - start_offset",
             script,
         )
-        self.assertIn("if scanned == source_size:", script)
-        self.assertIn('SUMMARY_LINE_BYTES', script)
+        self.assertIn(
+            "min(max_scan_bytes, remaining_source_bytes)",
+            script,
+        )
+        self.assertIn("if start_offset + scanned == source_size:", script)
+        self.assertIn("SUMMARY_LINE_BYTES", script)
         self.assertNotIn("(2,)", script)
         self.assertNotIn("(16,)", script)
 
