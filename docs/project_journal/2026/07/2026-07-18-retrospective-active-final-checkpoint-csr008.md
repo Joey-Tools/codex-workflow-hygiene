@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-18
 updated: 2026-07-18
 branch: codex/daily-skill-friction-20260718-codex-workflow-hygiene-active-final-checkpoint-proof
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/55
 supersedes: [20260718-csr007]
 superseded_by:
 ---
@@ -26,10 +26,12 @@ superseded_by:
 
 ## Next Steps
 
-- Monitor active-session retry rates for unexpectedly frequent final-checkpoint growth; keep the single re-proof boundary fail closed rather than adding a stabilization loop.
+- Complete review and merge gates for PR #55.
+- After merge, monitor active-session retry rates for unexpectedly frequent final-checkpoint growth; keep the single re-proof boundary fail closed rather than adding a stabilization loop.
 
 ## Evidence
 
+- PR: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/55
 - `python3 tests/test_remote_codex_probe.py`: 36 of 36 tests passed in 4.846 seconds.
 - Local and embedded regressions force a truthy existing `session_meta` to rewrite-and-grow after the post-parse checkpoint's former final proof, verify the one extra proof rejects it, and confirm a stable retry returns the rewritten session id.
 - The same four local/embedded and sessions/root subcases fail against the isolated `d78f50f` base snapshot because no coverage error is raised, proving the regression exercises the repaired silent-return window.
