@@ -1311,10 +1311,12 @@ def tool_output_payload_text(record: dict[str, Any], payload: dict[str, Any]) ->
         return ""
     if "type" in payload and not isinstance(payload_type, str):
         return ""
-    if not (
-        record_type == "function_call_output"
-        or (record_type == "response_item" and payload_type == "function_call_output")
-    ):
+    if record_type == "response_item":
+        if payload_type != "function_call_output":
+            return ""
+        output = payload.get("output")
+        return output.strip() if isinstance(output, str) else ""
+    if record_type != "function_call_output":
         return ""
     if "output" in payload:
         output = payload.get("output")

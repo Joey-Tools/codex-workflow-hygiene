@@ -7171,6 +7171,150 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
         self.assertIn("action_categories=verification", turns[0].assistant_action_summary)
 
+    def test_tool_output_payload_text_scopes_text_fallback_to_legacy_outer(self) -> None:
+        legacy_record = {"type": "function_call_output"}
+        exact_record = {"type": "response_item"}
+
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                legacy_record,
+                {"text": " Legacy text fallback. "},
+            ),
+            "Legacy text fallback.",
+        )
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                legacy_record,
+                {"output": "", "text": " Empty output fallback. "},
+            ),
+            "Empty output fallback.",
+        )
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                legacy_record,
+                {"output": "   ", "text": "Whitespace output must keep precedence."},
+            ),
+            "",
+        )
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                legacy_record,
+                {"output": ["invalid"], "text": "Invalid output must not fall back."},
+            ),
+            "",
+        )
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                legacy_record,
+                {"output": " Preferred output. ", "text": "Ignored text."},
+            ),
+            "Preferred output.",
+        )
+
+        for payload in (
+            {
+                "type": "function_call_output",
+                "text": "Missing output must not fall back.",
+            },
+            {
+                "type": "function_call_output",
+                "output": ["invalid"],
+                "text": "Invalid output must not fall back.",
+            },
+            {
+                "type": "function_call_output",
+                "output": "",
+                "text": "Empty output must not fall back.",
+            },
+            {
+                "type": "function_call_output",
+                "output": "   ",
+                "text": "Whitespace output must not fall back.",
+            },
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(MODULE.tool_output_payload_text(exact_record, payload), "")
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                exact_record,
+                {
+                    "type": "function_call_output",
+                    "output": " Exact output. ",
+                    "text": "Ignored exact text.",
+                },
+            ),
+            "Exact output.",
+        )
+
+    def test_extract_rollout_exact_tool_output_without_output_does_not_detach_later_assistant(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-exact-tool.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the helper.", "2026-05-22T10:01:00Z"),
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:02:00Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "text": "Process exited with code 1; permission denied.",
+                        },
+                    },
+                    message(
+                        "user",
+                        "# AGENTS.md instructions\nRepository policy only.",
+                        "2026-05-22T10:03:00Z",
+                    ),
+                    message(
+                        "assistant",
+                        "Implemented the helper and ran tests.",
+                        "2026-05-22T10:04:00Z",
+                    ),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].issue_flags, [])
+        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+        self.assertIn("action_categories=implementation,verification", turns[0].assistant_action_summary)
+
+    def test_extract_rollout_legacy_tool_output_text_fallback_still_drives_flags(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-legacy-tool.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please diagnose the command.", "2026-05-22T10:01:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:02:00Z",
+                        "payload": {
+                            "text": "Process exited with code 1; permission denied.",
+                        },
+                    },
+                    message(
+                        "assistant",
+                        "Diagnosed the failure.",
+                        "2026-05-22T10:03:00Z",
+                    ),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("failed_command", turns[0].issue_flags)
+        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+
     def test_extract_rollout_rejects_invalid_response_message_schema_before_later_valid_turn(
         self,
     ) -> None:
