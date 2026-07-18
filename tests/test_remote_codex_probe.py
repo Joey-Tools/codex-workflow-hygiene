@@ -2284,7 +2284,7 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         "rollout identity changed after session-meta scan",
                     )
 
-    def test_active_prefix_proof_candidate_limit_bounds_capture_io(self) -> None:
+    def test_active_prefix_proof_safety_limit_bounds_capture_io(self) -> None:
         for scope in ("local", "embedded"):
             for scenario in ("valid", "no_meta"):
                 with self.subTest(
@@ -2319,6 +2319,11 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         real_capture = (
                             MODULE._capture_active_rollout_candidate_identity_from_parent_fd
                         )
+                        candidate_limit_patcher = mock.patch.object(
+                            MODULE,
+                            "MAX_SESSION_META_CANDIDATE_LIMIT",
+                            2,
+                        )
 
                         def run_scan() -> object:
                             return MODULE._scan_session_meta_records(
@@ -2344,6 +2349,10 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         real_capture = namespace[
                             "capture_active_rollout_candidate_identity_from_parent_fd"
                         ]
+                        candidate_limit_patcher = mock.patch.dict(
+                            namespace,
+                            {"SESSION_META_CANDIDATE_LIMIT": 2},
+                        )
 
                         def run_scan() -> object:
                             return namespace["iter_session_meta"]()
@@ -2384,7 +2393,7 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         )
 
                     output = io.StringIO()
-                    with capture_patcher, mock.patch.object(
+                    with candidate_limit_patcher, capture_patcher, mock.patch.object(
                         target_os,
                         "pread",
                         side_effect=tracking_pread,
@@ -2405,8 +2414,16 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         self.assertEqual(records[-1]["kind"], "truncation")
                         self.assertEqual(
                             records[-1]["reason"],
-                            MODULE.SESSION_META_LIMIT_TRUNCATED_REASON,
+                            (
+                                MODULE.SESSION_META_LIMIT_TRUNCATED_REASON
+                                if scenario == "valid"
+                                else MODULE.SESSION_META_CANDIDATE_LIMIT_TRUNCATED_REASON
+                            ),
                         )
+                        if scenario == "valid":
+                            self.assertEqual(records[-1]["limit"], 1)
+                        else:
+                            self.assertEqual(records[-1]["candidate_limit"], 2)
                         if scenario == "valid":
                             self.assertEqual(records[0]["session_id"], "trusted-session")
                         else:
