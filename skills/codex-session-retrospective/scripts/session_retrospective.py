@@ -1990,7 +1990,11 @@ def build_local_rollout_summary(
                 source_bytes = len(scan_data)
                 source_sha256 = source_scan_sha256
             records, summary_meta = remote_probe._summarize_rollout_records_with_meta(
-                lines=remote_probe._bounded_text_lines(io.BytesIO(scan_data), LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES),
+                lines=remote_probe._bounded_text_lines(
+                    io.BytesIO(scan_data),
+                    LOCAL_ROLLOUT_SUMMARY_SCAN_BYTES,
+                    len(scan_data),
+                ),
                 keywords=[],
                 limit=LOCAL_ROLLOUT_SUMMARY_LIMIT,
                 tail_records=LOCAL_ROLLOUT_SUMMARY_TAIL_RECORDS,

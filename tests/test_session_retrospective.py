@@ -298,6 +298,20 @@ def embedded_probe_namespace(payload: dict[str, object]) -> dict[str, object]:
     return namespace
 
 
+def bounded_text_line_readers(summary_line_bytes: int | None = None):
+    payload: dict[str, object] = {
+        "mode": "rollout-summary",
+        "codex_root": ".",
+    }
+    if summary_line_bytes is not None:
+        payload["summary_line_bytes"] = summary_line_bytes
+    namespace = embedded_probe_namespace(payload)
+    return (
+        ("local", REMOTE_PROBE._bounded_text_lines),
+        ("embedded", namespace["bounded_text_lines"]),
+    )
+
+
 class SessionRetrospectiveTests(unittest.TestCase):
     def setUp(self) -> None:
         self._key_tmp = tempfile.TemporaryDirectory()
@@ -3148,8 +3162,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 )
                 real_lines = namespace["bounded_text_lines"]
 
-                def lines_then_mutate(handle: object, max_scan_bytes: int):
-                    yield from real_lines(handle, max_scan_bytes)
+                def lines_then_mutate(
+                    handle: object, max_scan_bytes: int, source_size: int
+                ):
+                    yield from real_lines(handle, max_scan_bytes, source_size)
                     if mutation == "append":
                         with rollout.open("ab") as output:
                             output.write(b"{}\n")
@@ -3445,6 +3461,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
             reader = REMOTE_PROBE._HashingReader(handle)
             with self.assertRaisesRegex(TypeError, "requires binary input"):
                 reader.read()
+
+    def test_remote_probe_hashing_readers_forward_tell(self) -> None:
+        namespace = embedded_probe_namespace(
+            {
+                "mode": "rollout-summary",
+                "codex_root": ".",
+            }
+        )
+        payload = b"prefix\nsuffix"
+
+        for implementation, reader_type in (
+            ("local", REMOTE_PROBE._HashingReader),
+            ("embedded", namespace["HashingReader"]),
+        ):
+            with self.subTest(implementation=implementation):
+                handle = io.BytesIO(payload)
+                handle.seek(len(b"prefix\n"))
+                reader = reader_type(handle)
+
+                self.assertEqual(reader.tell(), len(b"prefix\n"))
+                self.assertEqual(reader.read(2), b"su")
+                self.assertEqual(reader.tell(), len(b"prefix\nsu"))
 
     def test_remote_probe_local_rollout_summary_hashes_exact_raw_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3962,51 +4000,295 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("context-loss", records[0]["text"])
 
     def test_remote_probe_rollout_summary_uses_bounded_input_scan(self) -> None:
-        first = json.dumps(message("user", "First bounded signal.", "2026-05-01T10:00:00Z")) + "\n"
-        second = json.dumps(message("user", "You missed the late unbounded signal.", "2026-05-01T10:01:00Z")) + "\n"
+        first = (
+            json.dumps(message("user", "First bounded signal.", "2026-05-01T10:00:00Z"))
+            + "\n"
+        )
+        second = (
+            json.dumps(
+                message(
+                    "user",
+                    "You missed the late unbounded signal.",
+                    "2026-05-01T10:01:00Z",
+                )
+            )
+            + "\n"
+        )
 
         records = REMOTE_PROBE._summarize_rollout_records(
-            lines=REMOTE_PROBE._bounded_text_lines(io.BytesIO((first + second).encode("utf-8")), len(first.encode("utf-8"))),
+            lines=REMOTE_PROBE._bounded_text_lines(
+                io.BytesIO((first + second).encode("utf-8")),
+                len(first.encode("utf-8")),
+                len((first + second).encode("utf-8")),
+            ),
             keywords=["missed"],
             limit=10,
             tail_records=0,
             max_text_chars=80,
         )
 
-        self.assertEqual([record["text"] for record in records], ["user message present"])
+        self.assertEqual(
+            [record["text"] for record in records], ["user message present"]
+        )
 
     def test_remote_probe_bounded_text_lines_counts_multibyte_bytes(self) -> None:
-        first = json.dumps(message("user", "多字节任务 needle", "2026-05-01T10:00:00Z"), ensure_ascii=False) + "\n"
-        second = json.dumps(message("user", "Second bounded signal.", "2026-05-01T10:01:00Z")) + "\n"
+        first = (
+            json.dumps(
+                message("user", "多字节任务 needle", "2026-05-01T10:00:00Z"),
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        second = (
+            json.dumps(
+                message("user", "Second bounded signal.", "2026-05-01T10:01:00Z")
+            )
+            + "\n"
+        )
         payload = (first + second).encode("utf-8")
 
         self.assertEqual(
-            list(REMOTE_PROBE._bounded_text_lines(io.BytesIO(payload), len(first))),
-            [payload[: len(first)].decode("utf-8", "replace")],
+            list(
+                REMOTE_PROBE._bounded_text_lines(
+                    io.BytesIO(payload), len(first), len(payload)
+                )
+            ),
+            [],
         )
         self.assertEqual(
-            list(REMOTE_PROBE._bounded_text_lines(io.BytesIO(payload), len(first.encode("utf-8")))),
+            list(
+                REMOTE_PROBE._bounded_text_lines(
+                    io.BytesIO(payload),
+                    len(first.encode("utf-8")),
+                    len(payload),
+                )
+            ),
             [first],
         )
 
-    def test_remote_probe_bounded_text_lines_flushes_cap_equal_final_line_without_newline(self) -> None:
-        line = json.dumps(message("user", "You missed the final no-newline record.", "2026-05-01T10:00:00Z"))
+    def test_remote_probe_bounded_text_lines_local_and_embedded_keep_true_eof_without_lf(
+        self,
+    ) -> None:
+        line = json.dumps(
+            message(
+                "user",
+                "You missed the final no-newline record.",
+                "2026-05-01T10:00:00Z",
+            )
+        )
         payload = line.encode("utf-8")
 
-        self.assertEqual(list(REMOTE_PROBE._bounded_text_lines(io.BytesIO(payload), len(payload))), [line])
+        for implementation, reader in bounded_text_line_readers():
+            with self.subTest(implementation=implementation):
+                self.assertEqual(
+                    list(reader(io.BytesIO(payload), len(payload) + 64, len(payload))),
+                    [line],
+                )
 
-    def test_remote_probe_bounded_text_lines_skips_oversized_single_line(self) -> None:
+    def test_remote_probe_bounded_text_lines_local_and_embedded_only_lf_ends_records(
+        self,
+    ) -> None:
+        first = json.dumps(message("user", "First record.", "2026-05-01T10:00:00Z"))
+        second = json.dumps(
+            message("assistant", "Second record.", "2026-05-01T10:01:00Z")
+        )
+        payload = (first + "\r" + second + "\n").encode("utf-8")
+
+        for implementation, reader in bounded_text_line_readers():
+            with self.subTest(implementation=implementation):
+                lines = list(reader(io.BytesIO(payload), len(payload), len(payload)))
+                records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
+                    lines=lines,
+                    keywords=[],
+                    limit=10,
+                    tail_records=0,
+                    max_text_chars=80,
+                )
+
+                self.assertEqual(lines, [payload.decode("utf-8")])
+                self.assertEqual(records, [])
+                self.assertEqual(meta["json_error_count"], 1)
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_drain_oversized_bare_cr_until_lf(
+        self,
+    ) -> None:
+        line_limit = 1024
         oversized = json.dumps(
             {
                 "type": "response_item",
                 "timestamp": "2026-05-01T10:00:00Z",
-                "payload": {"type": "function_call_output", "output": "x" * 2000},
+                "payload": {
+                    "type": "function_call_output",
+                    "output": "x" * (64 * 1024),
+                },
             }
-        ) + "\n"
-        following = json.dumps(message("user", "You missed the bounded follow-up.", "2026-05-01T10:01:00Z")) + "\n"
+        )
+        bare_cr_suffix = json.dumps(
+            message("user", "Bare CR suffix must stay drained.", "2026-05-01T10:01:00Z")
+        )
+        following = json.dumps(
+            message("user", "You missed the bounded follow-up.", "2026-05-01T10:02:00Z")
+        )
+        payload = (oversized + "\r" + bare_cr_suffix + "\n" + following + "\n").encode(
+            "utf-8"
+        )
+
+        with mock.patch.object(
+            REMOTE_PROBE, "MAX_ROLLOUT_SUMMARY_LINE_BYTES", line_limit
+        ):
+            for implementation, reader in bounded_text_line_readers(line_limit):
+                with self.subTest(implementation=implementation):
+                    self.assertEqual(
+                        list(reader(io.BytesIO(payload), len(payload), len(payload))),
+                        ["\n", following + "\n"],
+                    )
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_drop_truncated_json_prefix(
+        self,
+    ) -> None:
+        first = json.dumps(
+            message("user", "You missed the capped suffix.", "2026-05-01T10:00:00Z")
+        )
+        second = json.dumps(
+            message("assistant", "Second record.", "2026-05-01T10:01:00Z")
+        )
+        payload = (first + "\n" + second + "\n").encode("utf-8")
+        scan_cap = len(first.encode("utf-8"))
+
+        for implementation, reader in bounded_text_line_readers():
+            with self.subTest(implementation=implementation):
+                self.assertEqual(
+                    list(reader(io.BytesIO(payload), scan_cap, len(payload))),
+                    [],
+                )
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_reject_nonzero_start_offset(
+        self,
+    ) -> None:
+        class RecordingBytesIO(io.BytesIO):
+            def __init__(self, payload: bytes) -> None:
+                super().__init__(payload)
+                self.read_sizes: list[int] = []
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_sizes.append(size)
+                return super().read(size)
+
+        prefix = (
+            json.dumps(
+                message("assistant", "Earlier record.", "2026-05-01T10:00:00Z")
+            ).encode("utf-8")
+            + b"\n"
+        )
+        next_line = json.dumps(
+            message(
+                "user",
+                "You missed the nonzero-offset record.",
+                "2026-05-01T10:01:00Z",
+            )
+        )
+        next_bytes = next_line.encode("utf-8")
+        payload = prefix + next_bytes + b"\n"
+        named_offsets = {
+            1: "first-byte",
+            len(prefix): "lf-boundary",
+            len(prefix) + len(next_bytes) // 2: "mid-record-json-suffix",
+            len(payload): "snapshot-eof",
+        }
+
+        for implementation, reader in bounded_text_line_readers():
+            for start_offset in range(1, len(payload) + 1):
+                with self.subTest(
+                    implementation=implementation,
+                    boundary=named_offsets.get(start_offset, "other-nonzero"),
+                    start_offset=start_offset,
+                ):
+                    handle = RecordingBytesIO(payload)
+                    handle.seek(start_offset)
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "rollout summary reader must start at byte 0",
+                    ):
+                        list(reader(handle, len(next_bytes), len(payload)))
+
+                    self.assertEqual(handle.read_sizes, [])
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_reject_invalid_start_offset(
+        self,
+    ) -> None:
+        class ReaderWithoutTell:
+            def read(self, _size: int = -1) -> bytes:
+                return b""
+
+        class ReaderWithTell(ReaderWithoutTell):
+            def __init__(self, offset: object) -> None:
+                self.offset = offset
+
+            def tell(self) -> object:
+                return self.offset
+
+        source_size = 4
+        cases = (
+            ("unavailable", ReaderWithoutTell(), "offset is unavailable"),
+            ("boolean", ReaderWithTell(False), "offset is invalid"),
+            ("non-integer", ReaderWithTell(0.0), "offset is invalid"),
+            ("negative", ReaderWithTell(-1), "offset is invalid"),
+            ("past-snapshot", ReaderWithTell(source_size + 1), "offset is invalid"),
+        )
+
+        for implementation, reader in bounded_text_line_readers():
+            for case, handle, message_pattern in cases:
+                with self.subTest(implementation=implementation, case=case):
+                    with self.assertRaisesRegex(ValueError, message_pattern):
+                        list(reader(handle, source_size, source_size))
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_preserve_crlf(
+        self,
+    ) -> None:
+        first = json.dumps(
+            message("user", "First CRLF record.", "2026-05-01T10:00:00Z")
+        )
+        second = json.dumps(
+            message("assistant", "Second CRLF record.", "2026-05-01T10:01:00Z")
+        )
+        payload = (first + "\r\n" + second + "\r\n").encode("utf-8")
+
+        for implementation, reader in bounded_text_line_readers():
+            with self.subTest(implementation=implementation):
+                lines = list(reader(io.BytesIO(payload), len(payload), len(payload)))
+
+                self.assertEqual(lines, [first + "\r\n", second + "\r\n"])
+                self.assertEqual(
+                    [json.loads(line) for line in lines],
+                    [json.loads(first), json.loads(second)],
+                )
+
+    def test_remote_probe_bounded_text_lines_skips_oversized_single_line(self) -> None:
+        oversized = (
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-05-01T10:00:00Z",
+                    "payload": {"type": "function_call_output", "output": "x" * 2000},
+                }
+            )
+            + "\n"
+        )
+        following = (
+            json.dumps(
+                message(
+                    "user", "You missed the bounded follow-up.", "2026-05-01T10:01:00Z"
+                )
+            )
+            + "\n"
+        )
+        payload = (oversized + following).encode("utf-8")
 
         with mock.patch.object(REMOTE_PROBE, "MAX_ROLLOUT_SUMMARY_LINE_BYTES", 1024):
-            lines = list(REMOTE_PROBE._bounded_text_lines(io.BytesIO((oversized + following).encode("utf-8")), 0))
+            lines = list(
+                REMOTE_PROBE._bounded_text_lines(io.BytesIO(payload), 0, len(payload))
+            )
         records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
             lines=lines,
             keywords=[],
@@ -29966,9 +30248,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("ROOT.lstat()", script)
         self.assertIn("Codex root is a symlink", script)
         self.assertIn('os.fdopen(fd, "rb")', script)
-        self.assertIn('raw_bytes.splitlines(keepends=True)', script)
-        self.assertIn("if max_scan_bytes and scanned >= max_scan_bytes:\n            if dropping_oversized_line:", script)
-        self.assertIn('SUMMARY_LINE_BYTES', script)
+        self.assertIn('raw_bytes.find(b"\\n", offset)', script)
+        self.assertIn("start_offset = handle.tell()", script)
+        self.assertIn("if start_offset != 0:", script)
+        self.assertIn("rollout summary reader must start at byte 0", script)
+        self.assertIn(
+            "scan_limit = min(max_scan_bytes, source_size) if max_scan_bytes else source_size",
+            script,
+        )
+        self.assertIn("if scanned == source_size:", script)
+        self.assertIn("SUMMARY_LINE_BYTES", script)
         self.assertNotIn("(2,)", script)
         self.assertNotIn("(16,)", script)
 
