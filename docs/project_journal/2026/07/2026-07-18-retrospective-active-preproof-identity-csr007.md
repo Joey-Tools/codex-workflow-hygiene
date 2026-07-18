@@ -7,7 +7,7 @@ updated: 2026-07-18
 branch: codex/daily-skill-friction-20260718-codex-workflow-hygiene-active-preproof-grow-rewrite
 pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/54
 supersedes: [20260717-csr006]
-superseded_by:
+superseded_by: 20260718-csr008
 ---
 
 # Retrospective Active Pre-Proof Identity
