@@ -282,6 +282,11 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("isinstance(value, bool)", code)
         self.assertIn("math.isfinite(value)", code)
         self.assertIn("json.dumps(value, allow_nan=False)", code)
+        self.assertIn("per_source_match_cap = 20", code)
+        self.assertIn("global_match_limit = 20", code)
+        self.assertIn("'kind': 'scan_meta'", code)
+        self.assertIn("global_output_truncated", code)
+        self.assertNotIn("raise SystemExit", code)
         self.assertNotIn("needle.search(line)", code)
         self.assertNotIn("errors='replace'", code)
 
@@ -367,8 +372,11 @@ class SkillStructureTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = [json.loads(line) for line in result.stdout.splitlines()]
-        self.assertLessEqual(len(rows), 20)
-        rows_by_id = {row["id"]: row for row in rows}
+        self.assertLessEqual(len(rows), 21)
+        self.assertEqual(rows[-1]["kind"], "scan_meta")
+        match_rows = rows[:-1]
+        self.assertLessEqual(len(match_rows), 20)
+        rows_by_id = {row["id"]: row for row in match_rows}
         self.assertEqual(
             set(rows_by_id),
             {
@@ -387,13 +395,158 @@ class SkillStructureTests(unittest.TestCase):
             oversized_timestamp_hit,
         ):
             self.assertEqual(rows_by_id[invalid_timestamp_id]["timestamp"], "")
-        self.assertTrue(any(row["path"].endswith("history.jsonl") for row in rows))
-        self.assertTrue(any(row["path"].endswith("session_index.jsonl") for row in rows))
+        self.assertTrue(
+            any(row["path"].endswith("history.jsonl") for row in match_rows)
+        )
+        self.assertTrue(
+            any(row["path"].endswith("session_index.jsonl") for row in match_rows)
+        )
+        scan_meta = rows[-1]
+        self.assertEqual(scan_meta["match_rows_emitted"], 5)
+        self.assertFalse(scan_meta["global_output_truncated"])
+        self.assertEqual(
+            scan_meta["sources"],
+            {
+                "history": {
+                    "available": True,
+                    "emitted": 4,
+                    "match_cap": 20,
+                    "retained": 4,
+                    "truncated": False,
+                },
+                "session_index": {
+                    "available": True,
+                    "emitted": 1,
+                    "match_cap": 20,
+                    "retained": 1,
+                    "truncated": False,
+                },
+            },
+        )
         self.assertNotIn(bare_cr_decoy, result.stdout)
         self.assertNotIn(oversized_decoy, result.stdout)
         self.assertNotIn(deep_decoy, result.stdout)
         self.assertNotIn("review-malformed", result.stdout)
         self.assertNotIn("review-invalid-utf8", result.stdout)
+
+    def test_session_mining_broad_keyword_recipe_fairly_caps_multiple_sources(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        code = extract_python_block_after(workflow, "Broad keyword searches across")
+
+        def run_recipe(
+            history_records: list[dict[str, object]] | None,
+            index_records: list[dict[str, object]] | None,
+        ) -> list[dict[str, object]]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                codex_home = Path(temp_dir) / ".codex"
+                codex_home.mkdir()
+                if history_records is not None:
+                    (codex_home / "history.jsonl").write_text(
+                        "".join(f"{json_dumps(record)}\n" for record in history_records),
+                        encoding="utf-8",
+                    )
+                if index_records is not None:
+                    (codex_home / "session_index.jsonl").write_text(
+                        "".join(f"{json_dumps(record)}\n" for record in index_records),
+                        encoding="utf-8",
+                    )
+                result = subprocess.run(
+                    [sys.executable, "-c", code],
+                    env=dict(os.environ, CODEX_HOME=str(codex_home)),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return [json.loads(line) for line in result.stdout.splitlines()]
+
+        history_records = [
+            {
+                "session_id": f"history-fair-{index:02d}",
+                "text": f"review history match {index:02d}",
+                "ts": f"2026-07-18T00:{index:02d}:00Z",
+            }
+            for index in range(21)
+        ]
+        index_records = [
+            {
+                "id": "index-fair-00",
+                "thread_name": "review session index match",
+                "updated_at": "2026-07-18T01:00:00Z",
+            }
+        ]
+        rows = run_recipe(history_records, index_records)
+
+        self.assertEqual(len(rows), 21)
+        match_rows = rows[:-1]
+        scan_meta = rows[-1]
+        self.assertEqual(scan_meta["kind"], "scan_meta")
+        self.assertEqual(len(match_rows), 20)
+        self.assertEqual(match_rows[0]["id"], "history-fair-00")
+        self.assertEqual(match_rows[1]["id"], "index-fair-00")
+        self.assertEqual(
+            {row["id"] for row in match_rows},
+            {"index-fair-00"}
+            | {f"history-fair-{index:02d}" for index in range(19)},
+        )
+        self.assertEqual(scan_meta["match_rows_emitted"], 20)
+        self.assertTrue(scan_meta["global_output_truncated"])
+        self.assertEqual(
+            scan_meta["sources"],
+            {
+                "history": {
+                    "available": True,
+                    "emitted": 19,
+                    "match_cap": 20,
+                    "retained": 20,
+                    "truncated": True,
+                },
+                "session_index": {
+                    "available": True,
+                    "emitted": 1,
+                    "match_cap": 20,
+                    "retained": 1,
+                    "truncated": False,
+                },
+            },
+        )
+        self.assertLessEqual(
+            len(json.dumps(scan_meta, ensure_ascii=True).encode("utf-8")), 1024
+        )
+
+        no_match_rows = run_recipe(
+            [{"session_id": "no-match", "text": "unrelated", "ts": 0}],
+            None,
+        )
+        self.assertEqual(len(no_match_rows), 1)
+        no_match_meta = no_match_rows[0]
+        self.assertEqual(no_match_meta["kind"], "scan_meta")
+        self.assertEqual(no_match_meta["match_rows_emitted"], 0)
+        self.assertFalse(no_match_meta["global_output_truncated"])
+        self.assertEqual(
+            no_match_meta["sources"],
+            {
+                "history": {
+                    "available": True,
+                    "emitted": 0,
+                    "match_cap": 20,
+                    "retained": 0,
+                    "truncated": False,
+                },
+                "session_index": {
+                    "available": False,
+                    "emitted": 0,
+                    "match_cap": 20,
+                    "retained": 0,
+                    "truncated": False,
+                },
+            },
+        )
 
     def test_session_mining_avoids_whole_record_tostring_searches(self) -> None:
         root = Path(__file__).resolve().parents[1]

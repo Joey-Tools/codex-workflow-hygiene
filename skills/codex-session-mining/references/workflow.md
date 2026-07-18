@@ -245,13 +245,14 @@ import re
 
 codex_root = Path(os.environ.get('CODEX_HOME', '~/.codex')).expanduser()
 sources = (
-    (codex_root / 'history.jsonl', 'session_id', 'ts', 'text'),
-    (codex_root / 'session_index.jsonl', 'id', 'updated_at', 'thread_name'),
+    ('history', codex_root / 'history.jsonl', 'session_id', 'ts', 'text'),
+    ('session_index', codex_root / 'session_index.jsonl', 'id', 'updated_at', 'thread_name'),
 )
 needle = re.compile(r'review|codex thread|pull/84', re.I)
 max_record_bytes = 1024 * 1024
 drain_chunk_bytes = 64 * 1024
-printed = 0
+per_source_match_cap = 20
+global_match_limit = 20
 
 def bounded_field(value, limit):
     if not isinstance(value, str):
@@ -268,10 +269,19 @@ def bounded_timestamp(value, limit):
     encoded = json.dumps(value, allow_nan=False)
     return value if len(encoded) <= limit else ''
 
-for path, id_key, timestamp_key, text_key in sources:
+source_results = []
+for source_name, path, id_key, timestamp_key, text_key in sources:
+    matches = []
+    source_truncated = False
     try:
         handle = path.open('rb')
     except FileNotFoundError:
+        source_results.append({
+            'available': False,
+            'matches': matches,
+            'name': source_name,
+            'truncated': source_truncated,
+        })
         continue
     with handle:
         line_no = 0
@@ -293,6 +303,9 @@ for path, id_key, timestamp_key, text_key in sources:
             text = row.get(text_key)
             if not isinstance(text, str) or not needle.search(text):
                 continue
+            if len(matches) >= per_source_match_cap:
+                source_truncated = True
+                break
             projection = {
                 'id': bounded_field(row.get(id_key), 200),
                 'line': line_no,
@@ -300,14 +313,60 @@ for path, id_key, timestamp_key, text_key in sources:
                 'text': bounded_field(text, 300),
                 'timestamp': bounded_timestamp(row.get(timestamp_key), 200),
             }
-            print(json.dumps(projection, ensure_ascii=True, sort_keys=True))
-            printed += 1
-            if printed >= 20:
-                raise SystemExit
+            matches.append(projection)
+    source_results.append({
+        'available': True,
+        'matches': matches,
+        'name': source_name,
+        'truncated': source_truncated,
+    })
+
+emitted_counts = [0] * len(source_results)
+match_rows_emitted = 0
+for match_index in range(per_source_match_cap):
+    for source_index, result in enumerate(source_results):
+        matches = result['matches']
+        if match_index >= len(matches):
+            continue
+        if match_rows_emitted >= global_match_limit:
+            break
+        print(json.dumps(matches[match_index], ensure_ascii=True, sort_keys=True))
+        emitted_counts[source_index] += 1
+        match_rows_emitted += 1
+    if match_rows_emitted >= global_match_limit:
+        break
+
+source_meta = {}
+global_output_truncated = False
+for source_index, result in enumerate(source_results):
+    retained = len(result['matches'])
+    emitted = emitted_counts[source_index]
+    truncated = result['truncated']
+    source_meta[result['name']] = {
+        'available': result['available'],
+        'emitted': emitted,
+        'match_cap': per_source_match_cap,
+        'retained': retained,
+        'truncated': truncated,
+    }
+    if truncated or emitted < retained:
+        global_output_truncated = True
+
+print(json.dumps({
+    'global_match_limit': global_match_limit,
+    'global_output_truncated': global_output_truncated,
+    'kind': 'scan_meta',
+    'match_rows_emitted': match_rows_emitted,
+    'sources': source_meta,
+}, ensure_ascii=True, sort_keys=True))
 PY
 ```
 
-This index recipe reads binary physical records up to 1 MiB, drains any oversized record through LF in fixed 64 KiB reads, and treats a bare CR as record data. It strictly decodes UTF-8 and JSON, ignores malformed or non-object records, searches only the public text field for each index schema, and emits at most 20 bounded JSON projections. String fields are normalized and length-limited before the outer JSON encoder escapes controls; timestamps additionally preserve bounded JSON integers and finite floats while rejecting booleans, non-finite floats, and oversized numeric projections. Use the later bounded rollout probe for `sessions/**/rollout-*.jsonl` and `archived_sessions/**/rollout-*.jsonl`, whose nested record shapes require their own selectors.
+This index recipe reads binary physical records up to 1 MiB, drains any oversized record through LF in fixed 64 KiB reads, and treats a bare CR as record data. It strictly decodes UTF-8 and JSON, ignores malformed or non-object records, and searches only the public text field for each index schema. String fields are normalized and length-limited before the outer JSON encoder escapes controls; timestamps additionally preserve bounded JSON integers and finite floats while rejecting booleans, non-finite floats, and oversized numeric projections.
+
+Each source is scanned independently in the fixed order shown above. The recipe retains its first 20 matches in physical-record order, detects a 21st match as source truncation, and then proceeds to the next source. It emits retained matches round-robin in source order, capped at 20 match rows total, so a busy earlier source cannot starve a later one. One fixed-shape `scan_meta` record is always emitted last, making the complete output at most 21 JSON lines. For each source, metadata reports whether the file was available, the 20-match collection cap, retained and emitted counts, and whether a 21st source match was detected. `global_output_truncated` is true when any source detected that extra match or any retained match could not fit in the global output cap. A missing source reports `available: false`; an available source with no matches reports zero retained and emitted rows without truncation.
+
+Use the later bounded rollout probe for `sessions/**/rollout-*.jsonl` and `archived_sessions/**/rollout-*.jsonl`, whose nested record shapes require their own selectors.
 
 ## 2. Extract Only The Relevant Parts
 
