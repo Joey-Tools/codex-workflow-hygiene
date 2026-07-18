@@ -1713,6 +1713,13 @@ def _session_meta_date_overlaps_window(
     return True
 
 
+def _decode_session_meta_line(raw_bytes: bytes) -> str:
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("session-meta record is not valid UTF-8") from error
+
+
 def _parse_session_meta_snapshot(
     scan_handle: Any,
     *,
@@ -1727,7 +1734,9 @@ def _parse_session_meta_snapshot(
     ):
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(obj, dict):
             continue
         if obj.get("type") != "session_meta":
             continue
@@ -1753,6 +1762,8 @@ def _parse_session_meta_snapshot(
             if rollout_end is not None and timestamp >= rollout_end:
                 continue
         payload = obj.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
         session_id = str(payload.get("id", ""))
         if not session_id:
             return None
@@ -3081,6 +3092,13 @@ def session_meta_date_overlaps_window(date_text):
     return True
 
 
+def decode_session_meta_line(raw_bytes):
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("session-meta record is not valid UTF-8") from error
+
+
 def parse_session_meta_snapshot(
     scan_handle,
     date_text,
@@ -3092,7 +3110,9 @@ def parse_session_meta_snapshot(
     ):
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(obj, dict):
             continue
         if obj.get("type") != "session_meta":
             continue
@@ -3109,6 +3129,8 @@ def parse_session_meta_snapshot(
             if ROLLOUT_END_TIME is not None and timestamp >= ROLLOUT_END_TIME:
                 continue
         payload = obj.get("payload", {{}})
+        if not isinstance(payload, dict):
+            continue
         session_id = str(payload.get("id", ""))
         if not session_id:
             return None
@@ -3424,7 +3446,7 @@ def bounded_session_meta_lines(handle, max_scan_bytes):
         chunk = os.read(file_descriptor, read_size) if file_descriptor is not None else handle.read(read_size)
         if not chunk:
             if buffer:
-                yield bytes(buffer).decode("utf-8", "replace")
+                yield decode_session_meta_line(bytes(buffer))
             return
         raw_bytes = chunk.encode("utf-8", "surrogatepass") if isinstance(chunk, str) else bytes(chunk)
         if len(raw_bytes) > read_size:
@@ -3452,13 +3474,20 @@ def bounded_session_meta_lines(handle, max_scan_bytes):
             line = bytes(buffer[:line_size])
             del buffer[:line_size]
             buffer_offset = absolute_line_end
-            yield line.decode("utf-8", "replace")
+            yield decode_session_meta_line(line)
         if scanned == max_scan_bytes:
             if cap_has_unread_bytes:
                 raise ValueError("session metadata scan truncated at " + str(max_scan_bytes) + " bytes")
             if buffer:
-                yield bytes(buffer).decode("utf-8", "replace")
+                yield decode_session_meta_line(bytes(buffer))
             return
+
+
+def decode_summary_line(raw_bytes):
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return "\\n"
 
 
 def bounded_text_lines(handle, max_scan_bytes, source_size):
@@ -3509,7 +3538,7 @@ def bounded_text_lines(handle, max_scan_bytes, source_size):
             else:
                 buffer.extend(part)
                 if line_end >= 0:
-                    yield bytes(buffer).decode("utf-8", "replace")
+                    yield decode_summary_line(bytes(buffer))
                     buffer.clear()
             offset = part_end
 
@@ -3517,7 +3546,7 @@ def bounded_text_lines(handle, max_scan_bytes, source_size):
         if dropping_oversized_line:
             yield "\\n"
         elif buffer:
-            yield bytes(buffer).decode("utf-8", "replace")
+            yield decode_summary_line(bytes(buffer))
 
 
 def summarize_rollout():
@@ -3581,14 +3610,20 @@ def summarize_rollout():
         ):
             try:
                 obj = json.loads(line)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
+                json_error_count += 1
+                continue
+            if not isinstance(obj, dict):
                 json_error_count += 1
                 continue
             timestamp = str(obj.get("timestamp", ""))
             record = None
             record_type = str(obj.get("type", ""))
+            payload = obj.get("payload")
+            if record_type in ("session_meta", "response_item", "event_msg") and not isinstance(payload, dict):
+                json_error_count += 1
+                continue
             if record_type == "session_meta" and session_meta_record is None:
-                payload = obj.get("payload", {{}})
                 record = summary_record(
                     "session_meta",
                     "session_id=" + str(payload.get("id", ""))
@@ -3601,9 +3636,11 @@ def summarize_rollout():
                 )
                 session_meta_record = record
             elif record_type == "response_item":
-                payload = obj.get("payload", {{}})
                 payload_type = str(payload.get("type", ""))
                 if payload_type == "message":
+                    if not isinstance(payload.get("content"), list):
+                        json_error_count += 1
+                        continue
                     kind, text = message_summary_from_payload(payload)
                     if text:
                         record = summary_record(
@@ -3628,7 +3665,6 @@ def summarize_rollout():
                             search_keywords=keywords,
                         )
             elif record_type == "event_msg":
-                payload = obj.get("payload", {{}})
                 payload_type = str(payload.get("type", ""))
                 if payload_type == "task_complete":
                     text = payload.get("last_agent_message")
@@ -3642,6 +3678,10 @@ def summarize_rollout():
                         )
                         last_task_complete_record = record
                 elif payload_type == "user_message":
+                    message = payload.get("message")
+                    if isinstance(message, dict) and not isinstance(message.get("content"), list):
+                        json_error_count += 1
+                        continue
                     text = event_user_message_text(payload)
                     if text:
                         record = summary_record(
@@ -4533,7 +4573,7 @@ def _sort_session_meta_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
 def _json_line_to_dict(line: str, *, host: str) -> dict[str, Any]:
     try:
         value = json.loads(line)
-    except json.JSONDecodeError as exc:
+    except (ValueError, RecursionError) as exc:
         raise ValueError(
             f"remote helper returned a non-JSON line for host {host}: {line!r}"
         ) from exc
@@ -5248,7 +5288,7 @@ def _bounded_session_meta_lines(handle: Any, max_scan_bytes: int) -> Iterable[st
         chunk = os.read(file_descriptor, read_size) if file_descriptor is not None else handle.read(read_size)
         if not chunk:
             if buffer:
-                yield bytes(buffer).decode("utf-8", "replace")
+                yield _decode_session_meta_line(bytes(buffer))
             return
         raw_bytes = (
             chunk.encode("utf-8", "surrogatepass")
@@ -5280,13 +5320,20 @@ def _bounded_session_meta_lines(handle: Any, max_scan_bytes: int) -> Iterable[st
             line = bytes(buffer[:line_size])
             del buffer[:line_size]
             buffer_offset = absolute_line_end
-            yield line.decode("utf-8", "replace")
+            yield _decode_session_meta_line(line)
         if scanned == max_scan_bytes:
             if cap_has_unread_bytes:
                 raise ValueError(f"session metadata scan truncated at {max_scan_bytes} bytes")
             if buffer:
-                yield bytes(buffer).decode("utf-8", "replace")
+                yield _decode_session_meta_line(bytes(buffer))
             return
+
+
+def _decode_summary_line(raw_bytes: bytes) -> str:
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return "\n"
 
 
 def _bounded_text_lines(
@@ -5341,7 +5388,7 @@ def _bounded_text_lines(
             else:
                 buffer.extend(part)
                 if line_end >= 0:
-                    yield bytes(buffer).decode("utf-8", "replace")
+                    yield _decode_summary_line(bytes(buffer))
                     buffer.clear()
             offset = part_end
 
@@ -5349,7 +5396,7 @@ def _bounded_text_lines(
         if dropping_oversized_line:
             yield "\n"
         elif buffer:
-            yield bytes(buffer).decode("utf-8", "replace")
+            yield _decode_summary_line(bytes(buffer))
 
 
 def _summarize_rollout_records(
@@ -5396,15 +5443,21 @@ def _summarize_rollout_records_with_meta(
     for line_no, line in enumerate(lines, 1):
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            json_error_count += 1
+            continue
+        if not isinstance(obj, dict):
             json_error_count += 1
             continue
         timestamp = str(obj.get("timestamp", ""))
         record: dict[str, Any] | None = None
         record_type = str(obj.get("type", ""))
+        payload = obj.get("payload")
+        if record_type in ("session_meta", "response_item", "event_msg") and not isinstance(payload, dict):
+            json_error_count += 1
+            continue
 
         if record_type == "session_meta" and session_meta_record is None:
-            payload = obj.get("payload", {})
             session_meta_record = _build_summary_record(
                 kind="session_meta",
                 text=f"session_id={payload.get('id', '')} cwd_present={str(bool(payload.get('cwd', ''))).lower()}",
@@ -5417,9 +5470,11 @@ def _summarize_rollout_records_with_meta(
             continue
 
         if record_type == "response_item":
-            payload = obj.get("payload", {})
             payload_type = str(payload.get("type", ""))
             if payload_type == "message":
+                if not isinstance(payload.get("content"), list):
+                    json_error_count += 1
+                    continue
                 kind, text = _message_summary(payload)
                 if text:
                     record = _build_summary_record(
@@ -5446,7 +5501,6 @@ def _summarize_rollout_records_with_meta(
                         search_keywords=search_keywords,
                     )
         elif record_type == "event_msg":
-            payload = obj.get("payload", {})
             payload_type = str(payload.get("type", ""))
             if payload_type == "task_complete":
                 text = payload.get("last_agent_message")
@@ -5461,6 +5515,10 @@ def _summarize_rollout_records_with_meta(
                     )
                     last_task_complete_record = record
             elif payload_type == "user_message":
+                message = payload.get("message")
+                if isinstance(message, dict) and not isinstance(message.get("content"), list):
+                    json_error_count += 1
+                    continue
                 text = _event_user_message_text(payload)
                 if text:
                     record = _build_summary_record(

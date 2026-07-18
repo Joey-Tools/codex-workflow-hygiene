@@ -239,24 +239,75 @@ Broad keyword searches across `history.jsonl`, `session_index.jsonl`, `sessions/
 python3 - <<'PY'
 from pathlib import Path
 import json
+import math
+import os
 import re
 
-paths = [Path('~/.codex/history.jsonl').expanduser()]
+codex_root = Path(os.environ.get('CODEX_HOME', '~/.codex')).expanduser()
+sources = (
+    (codex_root / 'history.jsonl', 'session_id', 'ts', 'text'),
+    (codex_root / 'session_index.jsonl', 'id', 'updated_at', 'thread_name'),
+)
 needle = re.compile(r'review|codex thread|pull/84', re.I)
+max_record_bytes = 1024 * 1024
+drain_chunk_bytes = 64 * 1024
 printed = 0
 
-for path in paths:
-    for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
-        if not needle.search(line):
-            continue
-        row = json.loads(line)
-        text = ' '.join(str(row.get('text') or '').split())[:300]
-        print(f'{path}:{line_no}:{row.get("session_id")}:{row.get("ts")}:{text}')
-        printed += 1
-        if printed >= 20:
-            raise SystemExit
+def bounded_field(value, limit):
+    if not isinstance(value, str):
+        return ''
+    return ' '.join(value.split())[:limit]
+
+def bounded_timestamp(value, limit):
+    if isinstance(value, str):
+        return bounded_field(value, limit)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ''
+    if isinstance(value, float) and not math.isfinite(value):
+        return ''
+    encoded = json.dumps(value, allow_nan=False)
+    return value if len(encoded) <= limit else ''
+
+for path, id_key, timestamp_key, text_key in sources:
+    try:
+        handle = path.open('rb')
+    except FileNotFoundError:
+        continue
+    with handle:
+        line_no = 0
+        while True:
+            raw_line = handle.readline(max_record_bytes + 1)
+            if not raw_line:
+                break
+            line_no += 1
+            if len(raw_line) > max_record_bytes:
+                while raw_line and not raw_line.endswith(b'\n'):
+                    raw_line = handle.readline(drain_chunk_bytes)
+                continue
+            try:
+                row = json.loads(raw_line.decode('utf-8'))
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(row, dict):
+                continue
+            text = row.get(text_key)
+            if not isinstance(text, str) or not needle.search(text):
+                continue
+            projection = {
+                'id': bounded_field(row.get(id_key), 200),
+                'line': line_no,
+                'path': str(path),
+                'text': bounded_field(text, 300),
+                'timestamp': bounded_timestamp(row.get(timestamp_key), 200),
+            }
+            print(json.dumps(projection, ensure_ascii=True, sort_keys=True))
+            printed += 1
+            if printed >= 20:
+                raise SystemExit
 PY
 ```
+
+This index recipe reads binary physical records up to 1 MiB, drains any oversized record through LF in fixed 64 KiB reads, and treats a bare CR as record data. It strictly decodes UTF-8 and JSON, ignores malformed or non-object records, searches only the public text field for each index schema, and emits at most 20 bounded JSON projections. String fields are normalized and length-limited before the outer JSON encoder escapes controls; timestamps additionally preserve bounded JSON integers and finite floats while rejecting booleans, non-finite floats, and oversized numeric projections. Use the later bounded rollout probe for `sessions/**/rollout-*.jsonl` and `archived_sessions/**/rollout-*.jsonl`, whose nested record shapes require their own selectors.
 
 ## 2. Extract Only The Relevant Parts
 
@@ -535,13 +586,25 @@ path = Path(sys.argv[1])
 line_count = 0
 keys = set()
 first = None
+max_record_bytes = 1024 * 1024
+drain_chunk_bytes = 64 * 1024
 
-with path.open(encoding='utf-8', errors='replace') as handle:
-    for line in handle:
+with path.open('rb') as handle:
+    while True:
+        raw_line = handle.readline(max_record_bytes + 1)
+        if not raw_line:
+            break
         line_count += 1
-        if not line.strip():
+        if len(raw_line) > max_record_bytes:
+            while raw_line and not raw_line.endswith(b'\n'):
+                raw_line = handle.readline(drain_chunk_bytes)
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(raw_line.decode('utf-8'))
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(row, dict):
+            continue
         if first is None:
             first = row
         keys.update(row.keys())
@@ -554,6 +617,8 @@ print(json.dumps({
 }, ensure_ascii=True, sort_keys=True))
 PY
 ```
+
+The schema recipe applies the same 1 MiB binary physical-record cap and fixed-size LF drain. Invalid UTF-8, malformed JSON, non-object top-level values, and oversized records still count as physical input records but do not contribute schema keys.
 
 Show user and assistant messages for one rollout, while skipping the wrapper noise that otherwise makes every session look like it mentioned every listed skill:
 

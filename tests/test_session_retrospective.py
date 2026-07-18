@@ -3892,6 +3892,137 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(meta["json_error_count"], 1)
         self.assertFalse(meta["record_limit_reached"])
 
+    def test_remote_probe_rollout_summary_counts_schema_errors_local_and_embedded(
+        self,
+    ) -> None:
+        malformed_shapes: list[object] = [
+            None,
+            [],
+            "scalar",
+            {"type": "session_meta", "payload": None},
+            {"type": "response_item", "payload": []},
+            {"type": "event_msg", "payload": "scalar"},
+            {
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": None},
+            },
+            {
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": "scalar"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": None},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": "scalar"},
+                },
+            },
+        ]
+        pathological_records = (
+            b"9" * 5000 + b"\n",
+            b"[" * 1100 + b"null" + b"]" * 1100 + b"\n",
+        )
+        valid_rows = [
+            message("user", "You missed the schema-safe follow-up.", "2026-05-01T10:00:00Z"),
+            message("assistant", "Ordinary schema-safe completion.", "2026-05-01T10:01:00Z"),
+        ]
+        invalid_utf8_fields = ("timestamp", "id", "cwd")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-schema-errors.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True)
+            payload = b"".join(
+                json.dumps(row).encode("utf-8") + b"\n" for row in malformed_shapes
+            )
+            payload += b"".join(pathological_records)
+            for field in invalid_utf8_fields:
+                row = {
+                    "type": "session_meta",
+                    "timestamp": "2026-05-01T10:00:00Z",
+                    "payload": {"id": "valid-session", "cwd": "/valid/repo"},
+                }
+                if field == "timestamp":
+                    row[field] = "invalid-byte-marker"
+                else:
+                    row["payload"][field] = "invalid-byte-marker"
+                encoded = json.dumps(row, separators=(",", ":")).encode("utf-8")
+                payload += encoded.replace(b"invalid-byte-marker", b"invalid-\xff-byte") + b"\n"
+            payload += b"".join(
+                json.dumps(row).encode("utf-8") + b"\n" for row in valid_rows
+            )
+            rollout.write_bytes(payload)
+            local_stdout = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE, "_local_codex_root", return_value=root
+            ), mock.patch.object(sys, "stdout", local_stdout):
+                local_result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=10,
+                        tail_records=8,
+                        max_text_chars=120,
+                    )
+                )
+
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": rollout_ref,
+                    "summary_limit": 10,
+                    "summary_scan_bytes": rollout.stat().st_size,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 120,
+                    "summary_keywords": [],
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(local_result, 0)
+        self.assertEqual(embedded.returncode, 0, embedded.stderr)
+        local_rows = [json.loads(line) for line in local_stdout.getvalue().splitlines()]
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                embedded.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                host="embedded",
+                command="rollout-summary",
+            )
+        ]
+        for rows in (local_rows, embedded_rows):
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(
+                scan_meta["json_error_count"],
+                len(malformed_shapes)
+                + len(pathological_records)
+                + len(invalid_utf8_fields),
+            )
+            self.assertNotIn("source_identity_proof", scan_meta)
+            self.assertNotIn("coverage_proof", scan_meta)
+            self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
+            self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
+            self.assertTrue(any(row.get("text") == "you missed" for row in rows))
+        self.assertNotIn("\ufffd", local_stdout.getvalue())
+        self.assertNotIn("\ufffd", embedded.stdout)
+
     def test_remote_probe_cmd_rollout_summary_emits_record_limit_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -4569,6 +4700,124 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
         ]
         self.assertEqual([row["session_id"] for row in embedded_rows], ["no-lf-eof"])
+
+    def test_remote_probe_session_meta_skips_non_object_records_local_and_embedded(
+        self,
+    ) -> None:
+        valid = {
+            "type": "session_meta",
+            "timestamp": "2026-05-01T10:00:00Z",
+            "payload": {"id": "schema-safe-session", "cwd": "/schema-safe/repo"},
+        }
+        rows: list[object] = [
+            None,
+            [],
+            "scalar",
+            {"type": "session_meta", "payload": None},
+            {"type": "session_meta", "payload": []},
+            {"type": "session_meta", "payload": "scalar"},
+            valid,
+        ]
+        payload = b"9" * 5000 + b"\n"
+        payload += b"[" * 1100 + b"null" + b"]" * 1100 + b"\n"
+        payload += ("\n".join(json.dumps(row) for row in rows) + "\n").encode("utf-8")
+
+        local = REMOTE_PROBE._parse_session_meta_snapshot(
+            io.BytesIO(payload),
+            date_value=dt.date(2026, 5, 1),
+            require_record_date_match=False,
+            rollout_start=None,
+            rollout_end=None,
+        )
+        namespace = embedded_probe_namespace(
+            {
+                "mode": "session-meta",
+                "codex_root": ".",
+                "session_meta_scan_bytes": len(payload) + 1,
+            }
+        )
+        embedded = namespace["parse_session_meta_snapshot"](
+            io.BytesIO(payload),
+            "2026/05/01",
+            False,
+        )
+
+        self.assertIsNotNone(local)
+        self.assertIsNotNone(embedded)
+        assert local is not None
+        assert embedded is not None
+        self.assertEqual(local[:3], (dt.date(2026, 5, 1), "schema-safe-session", "/schema-safe/repo"))
+        self.assertEqual(embedded[:3], ("2026/05/01", "schema-safe-session", "/schema-safe/repo"))
+
+    def test_remote_probe_session_meta_rejects_invalid_utf8_local_and_embedded(
+        self,
+    ) -> None:
+        for field in ("timestamp", "id", "cwd"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / ".codex"
+                rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-invalid-utf8.jsonl"
+                rollout = root / rollout_ref
+                rollout.parent.mkdir(parents=True)
+                row = {
+                    "type": "session_meta",
+                    "timestamp": "2026-05-01T10:00:00Z",
+                    "payload": {"id": "valid-session", "cwd": "/valid/repo"},
+                }
+                if field == "timestamp":
+                    row[field] = "invalid-byte-marker"
+                else:
+                    row["payload"][field] = "invalid-byte-marker"
+                payload = json.dumps(row, separators=(",", ":")).encode("utf-8")
+                rollout.write_bytes(payload.replace(b"invalid-byte-marker", b"invalid-\xff-byte") + b"\n")
+
+                with self.assertRaises(REMOTE_PROBE.SessionMetaRolloutError) as raised:
+                    REMOTE_PROBE._scan_session_meta_records(
+                        codex_root=root,
+                        dates=[dt.date(2026, 5, 1)],
+                        limit=10,
+                        host="local",
+                    )
+
+                script = REMOTE_PROBE._remote_python_script(
+                    {
+                        "mode": "session-meta",
+                        "codex_root": str(root),
+                        "dates": ["2026/05/01"],
+                        "limit": 10,
+                        "session_meta_scan_bytes": REMOTE_PROBE.MAX_SESSION_META_SCAN_BYTES,
+                    }
+                )
+                embedded = subprocess.run(
+                    [sys.executable, "-"],
+                    input=script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            self.assertEqual(raised.exception.error, "session-meta record is not valid UTF-8")
+            self.assertEqual(embedded.returncode, 0, embedded.stderr)
+            embedded_rows = [
+                json.loads(line)
+                for line in REMOTE_PROBE._extract_framed_lines(
+                    embedded.stdout,
+                    begin_marker=REMOTE_PROBE.REMOTE_SESSION_META_BEGIN,
+                    end_marker=REMOTE_PROBE.REMOTE_SESSION_META_END,
+                    host="embedded",
+                    command="session-meta",
+                )
+            ]
+            self.assertEqual(
+                embedded_rows,
+                [
+                    {
+                        "error": "session-meta record is not valid UTF-8",
+                        "kind": "error",
+                        "rollout": rollout_ref,
+                    }
+                ],
+            )
+            self.assertNotIn("\ufffd", embedded.stdout)
 
     def test_remote_probe_session_meta_rejects_trailing_bytes_at_exact_cap_local_and_embedded(self) -> None:
         session_id = "exact-cap-must-not-escape"

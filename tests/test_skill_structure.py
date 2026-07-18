@@ -98,6 +98,194 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("jq -R 'fromjson | keys'", skill)
         self.assertIn("aggregate unique keys once", workflow)
 
+    def test_session_mining_schema_recipe_bounds_and_validates_physical_records(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        code = extract_python_block_after(
+            workflow,
+            "For JSONL schema checks",
+            marker='```bash\npython3 - "$JSONL_PATH" <<\'PY\'\n',
+        )
+
+        self.assertIn("path.open('rb')", code)
+        self.assertIn("handle.readline(max_record_bytes + 1)", code)
+        self.assertIn("handle.readline(drain_chunk_bytes)", code)
+        self.assertIn("raw_line.decode('utf-8')", code)
+        self.assertIn("except (ValueError, RecursionError):", code)
+        self.assertIn("if not isinstance(row, dict):", code)
+        self.assertNotIn("errors='replace'", code)
+
+        oversized_decoy = "oversized-schema-decoy"
+        valid_first = {"first-safe-key": 1, "shared-safe-key": 2}
+        valid_later = {"later-safe-key": 3, "shared-safe-key": 4}
+        payload = b'{"malformed-schema-decoy":\n'
+        payload += b'["non-object-schema-decoy"]\n'
+        payload += b'{"invalid-utf8-schema-decoy-\xff":1}\n'
+        payload += b"9" * 5000 + b"\n"
+        payload += b"[" * 1100 + b'"deep-schema-decoy"' + b"]" * 1100 + b"\n"
+        payload += b"x" * (1024 * 1024) + b"\r"
+        payload += (json_dumps({oversized_decoy: 1}) + "\n").encode("utf-8")
+        payload += (json_dumps(valid_first) + "\n").encode("utf-8")
+        payload += (json_dumps(valid_later) + "\n").encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jsonl = Path(temp_dir) / "schema.jsonl"
+            jsonl.write_bytes(payload)
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(jsonl)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["line_count"], 8)
+        self.assertEqual(summary["first_record_keys"], sorted(valid_first))
+        self.assertEqual(
+            summary["unique_keys"],
+            sorted(set(valid_first) | set(valid_later)),
+        )
+        self.assertNotIn(oversized_decoy, result.stdout)
+        self.assertNotIn("schema-decoy", result.stdout)
+
+    def test_session_mining_broad_keyword_recipe_uses_bounded_public_index_schemas(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        code = extract_python_block_after(workflow, "Broad keyword searches across")
+
+        self.assertIn("history.jsonl", code)
+        self.assertIn("session_index.jsonl", code)
+        self.assertIn("'session_id', 'ts', 'text'", code)
+        self.assertIn("'id', 'updated_at', 'thread_name'", code)
+        self.assertIn("path.open('rb')", code)
+        self.assertIn("handle.readline(max_record_bytes + 1)", code)
+        self.assertIn("handle.readline(drain_chunk_bytes)", code)
+        self.assertIn("raw_line.decode('utf-8')", code)
+        self.assertIn("except (ValueError, RecursionError):", code)
+        self.assertIn("if not isinstance(row, dict):", code)
+        self.assertIn("isinstance(value, bool)", code)
+        self.assertIn("math.isfinite(value)", code)
+        self.assertIn("json.dumps(value, allow_nan=False)", code)
+        self.assertNotIn("needle.search(line)", code)
+        self.assertNotIn("errors='replace'", code)
+
+        history_hit = "history-valid-review-hit"
+        index_hit = "index-valid-review-hit"
+        bare_cr_decoy = "bare-cr-review-decoy"
+        oversized_decoy = "oversized-review-decoy"
+        deep_decoy = "deep-review-decoy"
+        history_timestamp = 1784304000123
+        bool_timestamp_hit = "history-bool-timestamp-hit"
+        nonfinite_timestamp_hit = "history-nonfinite-timestamp-hit"
+        oversized_timestamp_hit = "history-oversized-timestamp-hit"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            codex_home.mkdir()
+            history_payload = b'not-json-review-malformed\n'
+            history_payload += b'"review-non-object"\n'
+            history_payload += b'{"text":"review-invalid-utf8-\xff"}\n'
+            history_payload += b"9" * 5000 + b"\n"
+            history_payload += b"[" * 1100 + f'"review {deep_decoy}"'.encode("utf-8") + b"]" * 1100 + b"\n"
+            history_payload += b"x" * (1024 * 1024) + b"\r"
+            history_payload += (
+                json_dumps(
+                    {
+                        "session_id": oversized_decoy,
+                        "ts": "2026-07-18T00:00:00Z",
+                        "text": f"review {bare_cr_decoy}",
+                    }
+                )
+                + "\n"
+                + json_dumps(
+                    {
+                        "session_id": history_hit,
+                        "ts": history_timestamp,
+                        "text": "review valid history evidence",
+                    }
+                )
+                + "\n"
+                + json_dumps(
+                    {
+                        "session_id": bool_timestamp_hit,
+                        "ts": True,
+                        "text": "review boolean timestamp evidence",
+                    }
+                )
+                + "\n"
+                + json_dumps(
+                    {
+                        "session_id": nonfinite_timestamp_hit,
+                        "ts": float("nan"),
+                        "text": "review non-finite timestamp evidence",
+                    }
+                )
+                + "\n"
+                + json_dumps(
+                    {
+                        "session_id": oversized_timestamp_hit,
+                        "ts": 10**200,
+                        "text": "review oversized timestamp evidence",
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+            (codex_home / "history.jsonl").write_bytes(history_payload)
+            (codex_home / "session_index.jsonl").write_text(
+                json_dumps(
+                    {
+                        "id": index_hit,
+                        "updated_at": "2026-07-18T00:02:00Z",
+                        "thread_name": "review valid session index evidence",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                env=dict(os.environ, CODEX_HOME=str(codex_home)),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertLessEqual(len(rows), 20)
+        rows_by_id = {row["id"]: row for row in rows}
+        self.assertEqual(
+            set(rows_by_id),
+            {
+                history_hit,
+                bool_timestamp_hit,
+                nonfinite_timestamp_hit,
+                oversized_timestamp_hit,
+                index_hit,
+            },
+        )
+        self.assertEqual(rows_by_id[history_hit]["timestamp"], history_timestamp)
+        self.assertEqual(rows_by_id[index_hit]["timestamp"], "2026-07-18T00:02:00Z")
+        for invalid_timestamp_id in (
+            bool_timestamp_hit,
+            nonfinite_timestamp_hit,
+            oversized_timestamp_hit,
+        ):
+            self.assertEqual(rows_by_id[invalid_timestamp_id]["timestamp"], "")
+        self.assertTrue(any(row["path"].endswith("history.jsonl") for row in rows))
+        self.assertTrue(any(row["path"].endswith("session_index.jsonl") for row in rows))
+        self.assertNotIn(bare_cr_decoy, result.stdout)
+        self.assertNotIn(oversized_decoy, result.stdout)
+        self.assertNotIn(deep_decoy, result.stdout)
+        self.assertNotIn("review-malformed", result.stdout)
+        self.assertNotIn("review-invalid-utf8", result.stdout)
+
     def test_session_mining_avoids_whole_record_tostring_searches(self) -> None:
         root = Path(__file__).resolve().parents[1]
         skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
