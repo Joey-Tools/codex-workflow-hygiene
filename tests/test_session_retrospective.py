@@ -598,6 +598,162 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(scan_meta["json_error_count"], 1)
         self.assertNotIn("coverage_proof", scan_meta)
 
+    def test_remote_probe_rollout_summary_counts_invalid_event_message_container_local_and_embedded(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-invalid-event-message.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"type": "user_message"},
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:01Z",
+                        "payload": {"type": "user_message", "message": None},
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:02Z",
+                        "payload": {"type": "user_message", "message": []},
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:03Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "Ordinary nested assistant.",
+                                    }
+                                ],
+                            },
+                            "text": "permission denied tempting assistant fallback",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:04Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": "Ordinary nested missing role.",
+                                    }
+                                ],
+                            },
+                            "text": "permission denied tempting missing-role fallback",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:05Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": "You forgot the valid explicit string evidence.",
+                            "text": "permission denied tempting string fallback",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:06Z",
+                        "payload": {
+                            "type": "user_message",
+                            "text": "You forgot the valid legacy fallback evidence.",
+                        },
+                    },
+                    message(
+                        "user",
+                        "You missed the valid evidence after the malformed event.",
+                        "2026-05-01T10:01:00Z",
+                    ),
+                    message(
+                        "assistant",
+                        "Ordinary completion after the malformed event.",
+                        "2026-05-01T10:02:00Z",
+                    ),
+                ],
+            )
+            local_stdout = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE, "_local_codex_root", return_value=root
+            ), mock.patch.object(sys, "stdout", local_stdout):
+                local_result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=40,
+                        tail_records=8,
+                        max_text_chars=400,
+                    )
+                )
+
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "rollout": rollout_ref,
+                    "codex_root": str(root),
+                    "summary_keywords": [],
+                    "summary_limit": 40,
+                    "summary_scan_bytes": REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 400,
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(local_result, 0)
+        self.assertEqual(embedded.returncode, 0, embedded.stderr)
+        local_rows = [json.loads(line) for line in local_stdout.getvalue().splitlines()]
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                embedded.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                host="embedded",
+                command="rollout-summary",
+            )
+        ]
+        for rows in (local_rows, embedded_rows):
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(scan_meta["json_error_count"], 5)
+            self.assertEqual(scan_meta["summary_record_count"], 4)
+            self.assertNotIn("coverage_proof", scan_meta)
+            user_message_rows = [
+                row
+                for row in rows
+                if row.get("kind") == "user_message"
+            ]
+            self.assertEqual(
+                {row.get("line") for row in user_message_rows},
+                {6, 7, 8},
+            )
+            self.assertTrue(
+                all(row.get("text") == "you missed" for row in user_message_rows)
+            )
+            self.assertTrue(
+                any(row.get("kind") == "assistant_message" for row in rows)
+            )
+            self.assertNotIn("approval", json.dumps(rows, sort_keys=True))
+
     def test_remote_probe_rollout_summary_records_source_identity_with_tail_limited_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -3902,6 +4058,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
             {"type": "session_meta", "payload": None},
             {"type": "response_item", "payload": []},
             {"type": "event_msg", "payload": "scalar"},
+            {"type": "session_meta", "payload": {}},
+            {"type": "session_meta", "payload": {"id": ""}},
+            {"type": "session_meta", "payload": {"id": None}},
+            {"type": "session_meta", "payload": {"id": 7}},
             {
                 "type": "response_item",
                 "payload": {"type": "message", "role": "user", "content": None},
@@ -3909,6 +4069,26 @@ class SessionRetrospectiveTests(unittest.TestCase):
             {
                 "type": "response_item",
                 "payload": {"type": "message", "role": "user", "content": "scalar"},
+            },
+            {
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [None]},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text"}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": 7}],
+                },
             },
             {
                 "type": "event_msg",
@@ -3924,11 +4104,64 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     "message": {"role": "user", "content": "scalar"},
                 },
             },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": [None]},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text"}],
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": None}],
+                    },
+                },
+            },
+        ]
+        valid_ignored_shapes = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "unsupported"}],
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "unsupported"}],
+                    },
+                    "text": "permission denied unsupported dict fallback",
+                },
+            },
         ]
         pathological_records = (
             b"9" * 5000 + b"\n",
             b"[" * 1100 + b"null" + b"]" * 1100 + b"\n",
         )
+        valid_session_meta = {
+            "type": "session_meta",
+            "timestamp": "2026-05-01T09:59:00Z",
+            "payload": {"id": "schema-safe-session", "cwd": "/schema-safe/repo"},
+        }
         valid_rows = [
             message("user", "You missed the schema-safe follow-up.", "2026-05-01T10:00:00Z"),
             message("assistant", "Ordinary schema-safe completion.", "2026-05-01T10:01:00Z"),
@@ -3955,6 +4188,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     row["payload"][field] = "invalid-byte-marker"
                 encoded = json.dumps(row, separators=(",", ":")).encode("utf-8")
                 payload += encoded.replace(b"invalid-byte-marker", b"invalid-\xff-byte") + b"\n"
+            payload += b"".join(
+                json.dumps(row).encode("utf-8") + b"\n"
+                for row in [*valid_ignored_shapes, valid_session_meta]
+            )
             payload += b"".join(
                 json.dumps(row).encode("utf-8") + b"\n" for row in valid_rows
             )
@@ -4017,9 +4254,17 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
             self.assertNotIn("source_identity_proof", scan_meta)
             self.assertNotIn("coverage_proof", scan_meta)
+            self.assertTrue(
+                any(
+                    row.get("kind") == "session_meta"
+                    and row.get("session_id") == "schema-safe-session"
+                    for row in rows
+                )
+            )
             self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
             self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
             self.assertTrue(any(row.get("text") == "you missed" for row in rows))
+            self.assertNotIn("approval", json.dumps(rows, sort_keys=True))
         self.assertNotIn("\ufffd", local_stdout.getvalue())
         self.assertNotIn("\ufffd", embedded.stdout)
 
@@ -4748,6 +4993,125 @@ class SessionRetrospectiveTests(unittest.TestCase):
         assert embedded is not None
         self.assertEqual(local[:3], (dt.date(2026, 5, 1), "schema-safe-session", "/schema-safe/repo"))
         self.assertEqual(embedded[:3], ("2026/05/01", "schema-safe-session", "/schema-safe/repo"))
+
+    def test_remote_probe_session_meta_skips_invalid_ids_local_and_embedded(
+        self,
+    ) -> None:
+        valid = {
+            "type": "session_meta",
+            "timestamp": "2026-05-01T10:01:00Z",
+            "payload": {"id": "later-valid-session", "cwd": "/later-valid/repo"},
+        }
+        invalid_payloads: list[tuple[str, dict[str, object]]] = [
+            ("missing", {"cwd": "/invalid/missing"}),
+            ("empty", {"id": "", "cwd": "/invalid/empty"}),
+            ("null", {"id": None, "cwd": "/invalid/null"}),
+            ("numeric", {"id": 7, "cwd": "/invalid/numeric"}),
+        ]
+        namespace = embedded_probe_namespace(
+            {
+                "mode": "session-meta",
+                "codex_root": ".",
+                "session_meta_scan_bytes": 1024 * 1024,
+            }
+        )
+
+        for label, invalid_payload in invalid_payloads:
+            with self.subTest(label=label):
+                invalid = {
+                    "type": "session_meta",
+                    "timestamp": "2026-05-01T10:00:00Z",
+                    "payload": invalid_payload,
+                }
+                payload = (
+                    json.dumps(invalid, separators=(",", ":"))
+                    + "\n"
+                    + json.dumps(valid, separators=(",", ":"))
+                    + "\n"
+                ).encode("utf-8")
+
+                local = REMOTE_PROBE._parse_session_meta_snapshot(
+                    io.BytesIO(payload),
+                    date_value=dt.date(2026, 5, 1),
+                    require_record_date_match=False,
+                    rollout_start=None,
+                    rollout_end=None,
+                )
+                embedded = namespace["parse_session_meta_snapshot"](
+                    io.BytesIO(payload),
+                    "2026/05/01",
+                    False,
+                )
+
+                self.assertIsNotNone(local)
+                self.assertIsNotNone(embedded)
+                assert local is not None
+                assert embedded is not None
+                self.assertEqual(
+                    local[:3],
+                    (
+                        dt.date(2026, 5, 1),
+                        "later-valid-session",
+                        "/later-valid/repo",
+                    ),
+                )
+                self.assertEqual(
+                    embedded[:3],
+                    ("2026/05/01", "later-valid-session", "/later-valid/repo"),
+                )
+
+    def test_remote_probe_session_meta_skips_overflowing_timestamp_local_and_embedded(
+        self,
+    ) -> None:
+        invalid = {
+            "type": "session_meta",
+            "timestamp": "0001-01-01T00:00:00+23:59",
+            "payload": {"id": "overflowing-timestamp", "cwd": "/invalid/repo"},
+        }
+        valid = {
+            "type": "session_meta",
+            "timestamp": "2026-05-01T10:00:00Z",
+            "payload": {"id": "later-valid-timestamp", "cwd": "/valid/repo"},
+        }
+        payload = (
+            json.dumps(invalid, separators=(",", ":"))
+            + "\n"
+            + json.dumps(valid, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+
+        local = REMOTE_PROBE._parse_session_meta_snapshot(
+            io.BytesIO(payload),
+            date_value=dt.date(2026, 5, 1),
+            require_record_date_match=True,
+            rollout_start=None,
+            rollout_end=None,
+        )
+        namespace = embedded_probe_namespace(
+            {
+                "mode": "session-meta",
+                "codex_root": ".",
+                "session_meta_scan_bytes": len(payload) + 1,
+            }
+        )
+        embedded = namespace["parse_session_meta_snapshot"](
+            io.BytesIO(payload),
+            "2026/05/01",
+            True,
+        )
+
+        self.assertIsNotNone(local)
+        self.assertIsNotNone(embedded)
+        assert local is not None
+        assert embedded is not None
+        self.assertEqual(
+            local[:3],
+            (dt.date(2026, 5, 1), "later-valid-timestamp", "/valid/repo"),
+        )
+        self.assertEqual(
+            embedded[:3],
+            ("2026/05/01", "later-valid-timestamp", "/valid/repo"),
+        )
 
     def test_remote_probe_session_meta_rejects_invalid_utf8_local_and_embedded(
         self,
