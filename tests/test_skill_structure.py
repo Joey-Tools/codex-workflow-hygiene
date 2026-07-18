@@ -760,6 +760,55 @@ class SkillStructureTests(unittest.TestCase):
         self.assertNotIn("P" * 256, result.stdout)
         self.assertNotIn("Z" * 256, result.stdout)
 
+    def test_session_mining_exact_probe_escapes_selected_content_controls(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
+        start = workflow.index(marker) + len(marker)
+        code = workflow[start : workflow.index("\nPY\n" + (chr(96) * 3), start)]
+        needle = "match-csi=\x1b[31m literal Unicode 保留"
+        selected_content = (
+            "prefix nul=\x00 esc=\x1b "
+            "osc=\x1b]0;unsafe-title\x07 bel=\x07 "
+            f"{needle} tail=\x1b[0m"
+        )
+        row = {
+            "type": "response_item",
+            "timestamp": "2026-07-18T00:00:00Z",
+            "payload": {
+                "type": "function_call_output",
+                "output": selected_content,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout-control-output.jsonl"
+            rollout.write_text(json_dumps(row) + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(rollout), needle],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        output_bytes = result.stdout.encode("utf-8")
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertLess(len(output_bytes), 1000)
+        self.assertIn("nul=\\u0000", result.stdout)
+        self.assertIn("esc=\\u001b", result.stdout)
+        self.assertIn("osc=\\u001b]0;unsafe-title\\u0007", result.stdout)
+        self.assertIn("bel=\\u0007", result.stdout)
+        self.assertIn("match-csi=\\u001b[31m", result.stdout)
+        self.assertIn("tail=\\u001b[0m", result.stdout)
+        self.assertIn("literal Unicode 保留", result.stdout)
+        self.assertNotIn("\\u4fdd\\u7559", result.stdout)
+        for control_byte in (b"\x00", b"\x07", b"\x1b"):
+            self.assertNotIn(control_byte, output_bytes)
+
     def test_session_mining_exact_probe_matches_full_item_type_before_output_projection(
         self,
     ) -> None:
