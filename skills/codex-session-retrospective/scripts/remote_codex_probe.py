@@ -1020,7 +1020,7 @@ def _capture_active_rollout_candidate_identity_from_parent_fd(
             parent_fd,
             name,
             inventory_identity,
-            allow_append=True,
+            allow_append=False,
             phase="after enumeration",
         )
     )
@@ -1040,13 +1040,29 @@ def _capture_active_rollout_candidate_identity_from_parent_fd(
         _assert_rollout_inventory_identity(
             initial_inventory_identity,
             observed_inventory_identity,
-            allow_append=True,
+            allow_append=False,
             phase=phase,
         )
         initial = _rollout_candidate_identity_from_stat(initial_stat)
         initial_proof, _snapshot = _read_rollout_prefix_proof(
             fd,
             min(initial.snapshot.size, MAX_SESSION_META_SCAN_BYTES),
+            phase=phase,
+        )
+        descriptor_after_proof = _rollout_inventory_identity_from_stat(
+            os.fstat(fd)
+        )
+        _assert_rollout_inventory_identity(
+            descriptor_after_proof,
+            inventory_identity,
+            allow_append=False,
+            phase=phase,
+        )
+        _validated_rollout_inventory_identity_from_parent_fd(
+            parent_fd,
+            name,
+            inventory_identity,
+            allow_append=False,
             phase=phase,
         )
         current, _snapshot_identity, proof, _verified_snapshot = (
@@ -2470,7 +2486,7 @@ def capture_active_rollout_candidate_identity_from_parent_fd(
             parent_fd,
             name,
             inventory_identity,
-            True,
+            False,
             "after enumeration",
         )
     )
@@ -2490,7 +2506,7 @@ def capture_active_rollout_candidate_identity_from_parent_fd(
         assert_rollout_inventory_identity(
             initial_inventory_identity,
             observed_inventory_identity,
-            True,
+            False,
             phase,
         )
         initial = rollout_candidate_identity_from_stat(initial_stat)
@@ -2498,6 +2514,20 @@ def capture_active_rollout_candidate_identity_from_parent_fd(
             fd,
             min(initial["snapshot"]["size"], SESSION_META_PREFIX_PROOF_BYTES),
             phase=phase,
+        )
+        descriptor_after_proof = rollout_inventory_identity_from_stat(os.fstat(fd))
+        assert_rollout_inventory_identity(
+            descriptor_after_proof,
+            inventory_identity,
+            False,
+            phase,
+        )
+        validated_rollout_inventory_identity_from_parent_fd(
+            parent_fd,
+            name,
+            inventory_identity,
+            False,
+            phase,
         )
         current, _snapshot_identity, proof, _verified_snapshot = (
             assert_append_only_rollout_checkpoint(

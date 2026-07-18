@@ -471,84 +471,135 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         ["trusted-session"],
                     )
 
-    def test_active_append_between_inventory_and_consumption_is_accepted(self) -> None:
+    def test_active_growth_between_inventory_and_consumption_is_retryable_gap(
+        self,
+    ) -> None:
         for scope in ("local", "embedded"):
-            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temp_dir:
-                codex_root = Path(temp_dir) / ".codex"
-                rollout = write_rollout(codex_root)
-                original_size = rollout.stat().st_size
-                appended = False
-                output = io.StringIO()
+            for mutation in ("append_grow", "rewrite_grow"):
+                with self.subTest(
+                    scope=scope,
+                    mutation=mutation,
+                ), tempfile.TemporaryDirectory() as temp_dir:
+                    codex_root = Path(temp_dir) / ".codex"
+                    rollout = write_rollout(codex_root)
+                    original = rollout.read_bytes()
+                    original_stat = rollout.stat()
+                    mutated = False
+                    output = io.StringIO()
 
-                if scope == "local":
-                    real_capture = (
-                        MODULE._capture_active_rollout_candidate_identity_from_parent_fd
-                    )
-
-                    def run_scan() -> object:
-                        return MODULE._scan_session_meta_records(
-                            codex_root=codex_root,
-                            dates=[dt.date(2026, 5, 26)],
-                            limit=10,
-                            host="local",
+                    if scope == "local":
+                        real_capture = (
+                            MODULE._capture_active_rollout_candidate_identity_from_parent_fd
                         )
 
-                else:
-                    namespace = embedded_probe_namespace(
-                        {
-                            "mode": "session-meta",
-                            "dates": ["2026/05/26"],
-                            "limit": 10,
-                            "codex_root": str(codex_root),
-                            "session_meta_scan_bytes": (
-                                MODULE.MAX_SESSION_META_SCAN_BYTES
-                            ),
-                        }
-                    )
-                    real_capture = namespace[
-                        "capture_active_rollout_candidate_identity_from_parent_fd"
-                    ]
-
-                    def run_scan() -> object:
-                        return namespace["iter_session_meta"]()
-
-                def append_before_capture(*args: object, **kwargs: object) -> object:
-                    nonlocal appended
-                    if not appended:
-                        with rollout.open("ab") as handle:
-                            handle.write(b"{}\n")
-                        appended = True
-                    return real_capture(*args, **kwargs)
-
-                if scope == "local":
-                    patcher = mock.patch.object(
-                        MODULE,
-                        "_capture_active_rollout_candidate_identity_from_parent_fd",
-                        side_effect=append_before_capture,
-                    )
-                else:
-                    patcher = mock.patch.dict(
-                        namespace,
-                        {
-                            "capture_active_rollout_candidate_identity_from_parent_fd": (
-                                append_before_capture
+                        def run_scan() -> object:
+                            return MODULE._scan_session_meta_records(
+                                codex_root=codex_root,
+                                dates=[dt.date(2026, 5, 26)],
+                                limit=10,
+                                host="local",
                             )
-                        },
+
+                    else:
+                        namespace = embedded_probe_namespace(
+                            {
+                                "mode": "session-meta",
+                                "dates": ["2026/05/26"],
+                                "limit": 10,
+                                "codex_root": str(codex_root),
+                                "session_meta_scan_bytes": (
+                                    MODULE.MAX_SESSION_META_SCAN_BYTES
+                                ),
+                            }
+                        )
+                        real_capture = namespace[
+                            "capture_active_rollout_candidate_identity_from_parent_fd"
+                        ]
+
+                        def run_scan() -> object:
+                            return namespace["iter_session_meta"]()
+
+                    def grow_before_capture(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> object:
+                        nonlocal mutated
+                        if not mutated:
+                            if mutation == "append_grow":
+                                with rollout.open("ab") as handle:
+                                    handle.write(b"{}\n")
+                            else:
+                                rewritten = original.replace(
+                                    b"trusted-session",
+                                    b"rewritten-session",
+                                    1,
+                                ) + b"{}\n"
+                                with rollout.open("r+b") as handle:
+                                    handle.write(rewritten)
+                                    handle.truncate()
+                            mutated = True
+                        return real_capture(*args, **kwargs)
+
+                    if scope == "local":
+                        patcher = mock.patch.object(
+                            MODULE,
+                            "_capture_active_rollout_candidate_identity_from_parent_fd",
+                            side_effect=grow_before_capture,
+                        )
+                    else:
+                        patcher = mock.patch.dict(
+                            namespace,
+                            {
+                                "capture_active_rollout_candidate_identity_from_parent_fd": (
+                                    grow_before_capture
+                                )
+                            },
+                        )
+
+                    with patcher, redirect_stdout(output):
+                        if scope == "local":
+                            with self.assertRaises(
+                                MODULE.SessionMetaRolloutError
+                            ) as raised:
+                                run_scan()
+                            error = raised.exception.error
+                        else:
+                            with self.assertRaises(SystemExit) as raised:
+                                run_scan()
+                            self.assertEqual(raised.exception.code, 0)
+                            error = json.loads(
+                                output.getvalue().splitlines()[1]
+                            )["error"]
+
+                    retry_output = io.StringIO()
+                    with redirect_stdout(retry_output):
+                        retry_scan = run_scan()
+                    if scope == "local":
+                        retry_session_ids = [
+                            row["session_id"] for row in retry_scan.rows
+                        ]
+                    else:
+                        retry_session_ids = [
+                            json.loads(line)["session_id"]
+                            for line in retry_output.getvalue().splitlines()[1:-1]
+                        ]
+
+                    final_stat = rollout.stat()
+                    self.assertTrue(mutated)
+                    self.assertEqual(
+                        (final_stat.st_dev, final_stat.st_ino),
+                        (original_stat.st_dev, original_stat.st_ino),
                     )
-
-                with patcher, redirect_stdout(output):
-                    scan = run_scan()
-
-                if scope == "local":
-                    session_ids = [row["session_id"] for row in scan.rows]
-                else:
-                    session_ids = [
-                        json.loads(line)["session_id"]
-                        for line in output.getvalue().splitlines()[1:-1]
-                    ]
-                self.assertTrue(appended)
-                self.assertGreater(rollout.stat().st_size, original_size)
-                self.assertEqual(session_ids, ["trusted-session"])
+                    self.assertGreater(final_stat.st_size, original_stat.st_size)
+                    self.assertIn("identity changed after enumeration", error)
+                    self.assertEqual(
+                        retry_session_ids,
+                        [
+                            "trusted-session"
+                            if mutation == "append_grow"
+                            else "rewritten-session"
+                        ],
+                    )
 
     def test_active_replacement_between_inventory_and_consumption_is_rejected(
         self,
@@ -734,9 +785,9 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                 self.assertIn("identity changed after enumeration", error)
                 self.assertNotIn("replacement-session", output.getvalue())
 
-    def test_active_capture_stage_growth_requires_unchanged_prefix(self) -> None:
+    def test_active_post_proof_exact_recheck_rejects_growth(self) -> None:
         for scope in ("local", "embedded"):
-            for mutation in ("append", "rewrite_grow"):
+            for mutation in ("append_grow", "rewrite_grow"):
                 with self.subTest(
                     scope=scope,
                     mutation=mutation,
@@ -752,12 +803,18 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         if mutated:
                             return
                         mutated = True
-                        if mutation == "append":
+                        if mutation == "append_grow":
                             with rollout.open("ab") as handle:
                                 handle.write(b"{}\n")
                         else:
+                            rewritten = original.replace(
+                                b"trusted-session",
+                                b"rewritten-session",
+                                1,
+                            ) + b"{}\n"
                             with rollout.open("r+b") as handle:
-                                handle.write(b" " + original[1:] + b"{}\n")
+                                handle.write(rewritten)
+                                handle.truncate()
 
                     if scope == "local":
                         target_os = MODULE.os
@@ -798,9 +855,7 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         "stat",
                         side_effect=mutating_stat,
                     ), redirect_stdout(output):
-                        if mutation == "append":
-                            scan = run_scan()
-                        elif scope == "local":
+                        if scope == "local":
                             with self.assertRaises(
                                 MODULE.SessionMetaRolloutError
                             ) as raised:
@@ -814,18 +869,29 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                                 output.getvalue().splitlines()[1]
                             )["error"]
 
-                    self.assertTrue(mutated)
-                    if mutation == "append":
-                        if scope == "local":
-                            session_ids = [row["session_id"] for row in scan.rows]
-                        else:
-                            session_ids = [
-                                json.loads(line)["session_id"]
-                                for line in output.getvalue().splitlines()[1:-1]
-                            ]
-                        self.assertEqual(session_ids, ["trusted-session"])
+                    retry_output = io.StringIO()
+                    with redirect_stdout(retry_output):
+                        retry_scan = run_scan()
+                    if scope == "local":
+                        retry_session_ids = [
+                            row["session_id"] for row in retry_scan.rows
+                        ]
                     else:
-                        self.assertIn("identity changed", error)
+                        retry_session_ids = [
+                            json.loads(line)["session_id"]
+                            for line in retry_output.getvalue().splitlines()[1:-1]
+                        ]
+
+                    self.assertTrue(mutated)
+                    self.assertIn("identity changed", error)
+                    self.assertEqual(
+                        retry_session_ids,
+                        [
+                            "trusted-session"
+                            if mutation == "append_grow"
+                            else "rewritten-session"
+                        ],
+                    )
 
     def test_active_session_meta_enforces_append_only_policy(self) -> None:
         for scope in ("local", "embedded"):
@@ -1244,90 +1310,134 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         error,
                     )
 
-    def test_active_prefix_proof_capture_accepts_append_growth(self) -> None:
+    def test_active_prefix_proof_capture_rejects_pre_anchor_growth(self) -> None:
         for scope in ("local", "embedded"):
             for layout in ("sessions", "root"):
-                with self.subTest(
-                    scope=scope,
-                    layout=layout,
-                ), tempfile.TemporaryDirectory() as temp_dir:
-                    rollout_ref = (
-                        ROLLOUT_REF
-                        if layout == "sessions"
-                        else "rollout-2026-05-26T10-00-00-root.jsonl"
-                    )
-                    codex_root = Path(temp_dir) / ".codex"
-                    rollout = write_rollout(codex_root, rollout_ref=rollout_ref)
-                    original_stat = rollout.stat()
-                    mutated = False
-
-                    if scope == "local":
-                        target_os = MODULE.os
-
-                        def run_scan() -> object:
-                            return MODULE._scan_session_meta_records(
-                                codex_root=codex_root,
-                                dates=[dt.date(2026, 5, 26)],
-                                limit=10,
-                                host="local",
-                            )
-
-                    else:
-                        namespace = embedded_probe_namespace(
-                            {
-                                "mode": "session-meta",
-                                "dates": ["2026/05/26"],
-                                "limit": 10,
-                                "codex_root": str(codex_root),
-                                "session_meta_scan_bytes": (
-                                    MODULE.MAX_SESSION_META_SCAN_BYTES
-                                ),
-                            }
+                for mutation in ("append_grow", "rewrite_grow"):
+                    with self.subTest(
+                        scope=scope,
+                        layout=layout,
+                        mutation=mutation,
+                    ), tempfile.TemporaryDirectory() as temp_dir:
+                        rollout_ref = (
+                            ROLLOUT_REF
+                            if layout == "sessions"
+                            else "rollout-2026-05-26T10-00-00-root.jsonl"
                         )
-                        target_os = namespace["os"]
+                        codex_root = Path(temp_dir) / ".codex"
+                        rollout = write_rollout(
+                            codex_root,
+                            rollout_ref=rollout_ref,
+                        )
+                        original = rollout.read_bytes()
+                        original_stat = rollout.stat()
+                        mutated = False
 
-                        def run_scan() -> object:
-                            return namespace["iter_session_meta"]()
+                        if scope == "local":
+                            target_os = MODULE.os
 
-                    real_pread = target_os.pread
+                            def run_scan() -> object:
+                                return MODULE._scan_session_meta_records(
+                                    codex_root=codex_root,
+                                    dates=[dt.date(2026, 5, 26)],
+                                    limit=10,
+                                    host="local",
+                                )
 
-                    def grow_during_pread(
-                        fd: int,
-                        length: int,
-                        offset: int,
-                    ) -> bytes:
-                        nonlocal mutated
-                        data = real_pread(fd, length, offset)
-                        if not mutated:
-                            mutated = True
-                            with rollout.open("ab") as handle:
-                                handle.write(b"{}\n")
-                        return data
+                        else:
+                            namespace = embedded_probe_namespace(
+                                {
+                                    "mode": "session-meta",
+                                    "dates": ["2026/05/26"],
+                                    "limit": 10,
+                                    "codex_root": str(codex_root),
+                                    "session_meta_scan_bytes": (
+                                        MODULE.MAX_SESSION_META_SCAN_BYTES
+                                    ),
+                                }
+                            )
+                            target_os = namespace["os"]
 
-                    output = io.StringIO()
-                    with mock.patch.object(
-                        target_os,
-                        "pread",
-                        side_effect=grow_during_pread,
-                    ), redirect_stdout(output):
-                        scan = run_scan()
+                            def run_scan() -> object:
+                                return namespace["iter_session_meta"]()
 
-                    if scope == "local":
-                        session_ids = [row["session_id"] for row in scan.rows]
-                    else:
-                        session_ids = [
-                            json.loads(line)["session_id"]
-                            for line in output.getvalue().splitlines()[1:-1]
-                        ]
+                        real_pread = target_os.pread
 
-                    final_stat = rollout.stat()
-                    self.assertTrue(mutated)
-                    self.assertEqual(
-                        (final_stat.st_dev, final_stat.st_ino),
-                        (original_stat.st_dev, original_stat.st_ino),
-                    )
-                    self.assertGreater(final_stat.st_size, original_stat.st_size)
-                    self.assertEqual(session_ids, ["trusted-session"])
+                        def grow_during_pread(
+                            fd: int,
+                            length: int,
+                            offset: int,
+                        ) -> bytes:
+                            nonlocal mutated
+                            data = real_pread(fd, length, offset)
+                            if not mutated:
+                                if mutation == "append_grow":
+                                    with rollout.open("ab") as handle:
+                                        handle.write(b"{}\n")
+                                else:
+                                    rewritten = original.replace(
+                                        b"trusted-session",
+                                        b"rewritten-session",
+                                        1,
+                                    ) + b"{}\n"
+                                    with rollout.open("r+b") as handle:
+                                        handle.write(rewritten)
+                                        handle.truncate()
+                                mutated = True
+                            return data
+
+                        output = io.StringIO()
+                        with mock.patch.object(
+                            target_os,
+                            "pread",
+                            side_effect=grow_during_pread,
+                        ), redirect_stdout(output):
+                            if scope == "local":
+                                with self.assertRaises(
+                                    MODULE.SessionMetaRolloutError
+                                ) as raised:
+                                    run_scan()
+                                error = raised.exception.error
+                            else:
+                                with self.assertRaises(SystemExit) as raised:
+                                    run_scan()
+                                self.assertEqual(raised.exception.code, 0)
+                                error = json.loads(
+                                    output.getvalue().splitlines()[1]
+                                )["error"]
+
+                        retry_output = io.StringIO()
+                        with redirect_stdout(retry_output):
+                            retry_scan = run_scan()
+                        if scope == "local":
+                            retry_session_ids = [
+                                row["session_id"] for row in retry_scan.rows
+                            ]
+                        else:
+                            retry_session_ids = [
+                                json.loads(line)["session_id"]
+                                for line in retry_output.getvalue().splitlines()[1:-1]
+                            ]
+
+                        final_stat = rollout.stat()
+                        self.assertTrue(mutated)
+                        self.assertEqual(
+                            (final_stat.st_dev, final_stat.st_ino),
+                            (original_stat.st_dev, original_stat.st_ino),
+                        )
+                        self.assertGreater(
+                            final_stat.st_size,
+                            original_stat.st_size,
+                        )
+                        self.assertIn("identity changed", error)
+                        self.assertEqual(
+                            retry_session_ids,
+                            [
+                                "trusted-session"
+                                if mutation == "append_grow"
+                                else "rewritten-session"
+                            ],
+                        )
 
     def test_active_session_meta_parses_only_verified_snapshot(self) -> None:
         for scope in ("local", "embedded"):
