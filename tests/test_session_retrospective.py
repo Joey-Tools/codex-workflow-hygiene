@@ -4313,6 +4313,102 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("\ufffd", local_stdout.getvalue())
         self.assertNotIn("\ufffd", embedded.stdout)
 
+    def test_remote_probe_rollout_summary_rejects_invalid_response_roles_local_and_embedded(
+        self,
+    ) -> None:
+        invalid_role_rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "content": [{"type": "input_text", "text": "Missing role evidence."}],
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": ["user"],
+                    "content": [{"type": "input_text", "text": "Non-string role evidence."}],
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "output_text", "text": "Unknown role evidence."}],
+                },
+            },
+        ]
+        valid_rows = [
+            message("user", "You missed the later valid evidence.", "2026-05-01T10:01:00Z"),
+            message("assistant", "Ordinary later valid completion.", "2026-05-01T10:02:00Z"),
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-invalid-roles.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [*invalid_role_rows, *valid_rows])
+            local_stdout = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE, "_local_codex_root", return_value=root
+            ), mock.patch.object(sys, "stdout", local_stdout):
+                local_result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=10,
+                        tail_records=8,
+                        max_text_chars=120,
+                    )
+                )
+
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": rollout_ref,
+                    "summary_limit": 10,
+                    "summary_scan_bytes": rollout.stat().st_size,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 120,
+                    "summary_keywords": [],
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(local_result, 0)
+        self.assertEqual(embedded.returncode, 0, embedded.stderr)
+        local_rows = [json.loads(line) for line in local_stdout.getvalue().splitlines()]
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                embedded.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                host="embedded",
+                command="rollout-summary",
+            )
+        ]
+        for rows in (local_rows, embedded_rows):
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(scan_meta["json_error_count"], len(invalid_role_rows))
+            self.assertNotIn("source_identity_proof", scan_meta)
+            self.assertNotIn("coverage_proof", scan_meta)
+            self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
+            self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
+
     def test_remote_probe_cmd_rollout_summary_emits_record_limit_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"

@@ -3299,6 +3299,15 @@ def message_content_is_valid(content):
     return True
 
 
+def message_payload_is_valid(payload):
+    role = payload.get("role")
+    return (
+        isinstance(role, str)
+        and role in ("assistant", "user")
+        and message_content_is_valid(payload.get("content"))
+    )
+
+
 def message_summary_from_payload(payload):
     role = str(payload.get("role", ""))
     if role not in ("assistant", "user"):
@@ -3665,8 +3674,7 @@ def summarize_rollout():
             elif record_type == "response_item":
                 payload_type = str(payload.get("type", ""))
                 if payload_type == "message":
-                    content = payload.get("content")
-                    if not message_content_is_valid(content):
+                    if not message_payload_is_valid(payload):
                         json_error_count += 1
                         continue
                     kind, text = message_summary_from_payload(payload)
@@ -5164,6 +5172,15 @@ def _message_content_is_valid(content: Any) -> bool:
     return True
 
 
+def _message_payload_is_valid(payload: dict[str, Any]) -> bool:
+    role = payload.get("role")
+    return (
+        isinstance(role, str)
+        and role in ("assistant", "user")
+        and _message_content_is_valid(payload.get("content"))
+    )
+
+
 def _message_summary(payload: dict[str, Any]) -> tuple[str, str]:
     role = str(payload.get("role", ""))
     if role not in {"assistant", "user"}:
@@ -5536,8 +5553,7 @@ def _summarize_rollout_records_with_meta(
         if record_type == "response_item":
             payload_type = str(payload.get("type", ""))
             if payload_type == "message":
-                content = payload.get("content")
-                if not _message_content_is_valid(content):
+                if not _message_payload_is_valid(payload):
                     json_error_count += 1
                     continue
                 kind, text = _message_summary(payload)
