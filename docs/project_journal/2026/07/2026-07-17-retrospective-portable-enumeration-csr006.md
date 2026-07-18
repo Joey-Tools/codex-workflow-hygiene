@@ -24,7 +24,7 @@ superseded_by:
 - Scoped inventory snapshots can represent symlinks and non-regular entries without opening them, so replacement or disappearance before first consumption is rejected while precise symlink/FIFO classification remains consumption-time behavior.
 - The first held-descriptor proof is the active content baseline. Later growth between descriptor and path checks is accepted only when that proved prefix remains unchanged; rewrite-and-grow, replacement, shrink, rollback, and same-size mutation after the baseline fail closed, while archives retain exact snapshots throughout consumption.
 - An active candidate with no metadata in its first immutable snapshot gets one bounded refreshed-snapshot parse after checkpointing. A first metadata record captured in the refreshed aligned snapshot is returned; an append high-water ahead of that verified snapshot, or a second aligned advance with no match, becomes an explicit coverage error instead of a silent miss.
-- `ELOOP` maps to the precise symlink coverage error, while every transient candidate descriptor closes before enumeration continues.
+- A no-follow `ELOOP` is reported as a rollout-identity change, while every transient candidate descriptor closes before enumeration continues.
 
 ## Next Steps
 
