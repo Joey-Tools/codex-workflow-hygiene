@@ -584,10 +584,18 @@ import sys
 
 path = Path(sys.argv[1])
 line_count = 0
-keys = set()
-first = None
+unique_keys = set()
+unique_key_utf8_bytes = 0
+unique_keys_truncated = False
+unique_keys_truncation_reason = None
+first_record_seen = False
+first_record_keys = []
+first_record_key_utf8_bytes = 0
+first_record_keys_truncated = False
 max_record_bytes = 1024 * 1024
 drain_chunk_bytes = 64 * 1024
+max_unique_keys = 256
+max_unique_key_utf8_bytes = 32 * 1024
 
 with path.open('rb') as handle:
     while True:
@@ -605,20 +613,68 @@ with path.open('rb') as handle:
             continue
         if not isinstance(row, dict):
             continue
-        if first is None:
-            first = row
-        keys.update(row.keys())
+        if not first_record_seen:
+            first_record_seen = True
+            for key in row:
+                try:
+                    key_utf8_bytes = len(key.encode('utf-8'))
+                except UnicodeEncodeError:
+                    first_record_keys_truncated = True
+                    break
+                if (
+                    len(first_record_keys) >= max_unique_keys
+                    or first_record_key_utf8_bytes + key_utf8_bytes
+                    > max_unique_key_utf8_bytes
+                ):
+                    first_record_keys_truncated = True
+                    break
+                first_record_keys.append(key)
+                first_record_key_utf8_bytes += key_utf8_bytes
+        if unique_keys_truncated:
+            continue
+        for key in row:
+            if key in unique_keys:
+                continue
+            try:
+                key_utf8_bytes = len(key.encode('utf-8'))
+            except UnicodeEncodeError:
+                unique_keys_truncated = True
+                unique_keys_truncation_reason = 'non_utf8_key'
+                break
+            if len(unique_keys) >= max_unique_keys:
+                unique_keys_truncated = True
+                unique_keys_truncation_reason = 'count'
+                break
+            if unique_key_utf8_bytes + key_utf8_bytes > max_unique_key_utf8_bytes:
+                unique_keys_truncated = True
+                unique_keys_truncation_reason = 'utf8_bytes'
+                break
+            unique_keys.add(key)
+            unique_key_utf8_bytes += key_utf8_bytes
 
 print(json.dumps({
     'path': str(path),
     'line_count': line_count,
-    'first_record_keys': sorted(first.keys()) if isinstance(first, dict) else [],
-    'unique_keys': sorted(keys),
+    'first_record_key_count': len(first_record_keys),
+    'first_record_key_utf8_bytes': first_record_key_utf8_bytes,
+    'first_record_keys': sorted(first_record_keys),
+    'first_record_keys_truncated': first_record_keys_truncated,
+    'max_unique_keys': max_unique_keys,
+    'max_unique_key_utf8_bytes': max_unique_key_utf8_bytes,
+    'unique_key_count': len(unique_keys),
+    'unique_key_utf8_bytes': unique_key_utf8_bytes,
+    'unique_keys': sorted(unique_keys),
+    'unique_keys_truncated': unique_keys_truncated,
+    'unique_keys_truncation_reason': unique_keys_truncation_reason,
 }, ensure_ascii=True, sort_keys=True))
 PY
 ```
 
 The schema recipe applies the same 1 MiB binary physical-record cap and fixed-size LF drain. Invalid UTF-8, malformed JSON, non-object top-level values, and oversized records still count as physical input records but do not contribute schema keys.
+
+Schema keys use a deterministic bounded-prefix contract. New keys are considered in physical-record order and then in decoded JSON object order. Duplicate keys do not consume budget. A key is accepted when doing so keeps both the unique-key count at or below 256 and the cumulative size of decoded keys under strict UTF-8 encoding at or below 32 KiB. The first new key that would exceed either boundary is omitted, `unique_keys_truncated` becomes true, `unique_keys_truncation_reason` records `count` or `utf8_bytes`, and no later new keys are accepted. If both limits would be exceeded by the same key, `count` wins because that boundary is checked first. A decoded key that cannot be encoded as strict UTF-8 instead records `non_utf8_key` and stops the prefix at that key. The reported count and byte total describe the retained prefix exactly; sorting happens only after that prefix is bounded. The first valid object remains the source of `first_record_keys`, whose projection uses the same count, byte, and strict-encoding boundaries and reports its own truncation marker.
+
+Beyond a fixed number of per-record parsing objects derived from physical records capped at 1 MiB, the recipe retains at most 256 global keys totaling at most 32 KiB under strict UTF-8 encoding and the equivalently bounded first-record key projection. Its key-list output has the same count and strict-encoding byte bounds before JSON escaping, whose expansion is itself bounded by a constant factor.
 
 Show user and assistant messages for one rollout, while skipping the wrapper noise that otherwise makes every session look like it mentioned every listed skill:
 

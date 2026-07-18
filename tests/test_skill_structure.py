@@ -115,6 +115,13 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("raw_line.decode('utf-8')", code)
         self.assertIn("except (ValueError, RecursionError):", code)
         self.assertIn("if not isinstance(row, dict):", code)
+        self.assertIn("max_unique_keys = 256", code)
+        self.assertIn("max_unique_key_utf8_bytes = 32 * 1024", code)
+        self.assertIn("unique_keys_truncation_reason = 'count'", code)
+        self.assertIn("unique_keys_truncation_reason = 'utf8_bytes'", code)
+        self.assertIn("unique_keys_truncation_reason = 'non_utf8_key'", code)
+        self.assertNotIn("keys.update(", code)
+        self.assertNotIn("sorted(keys)", code)
         self.assertNotIn("errors='replace'", code)
 
         oversized_decoy = "oversized-schema-decoy"
@@ -144,12 +151,114 @@ class SkillStructureTests(unittest.TestCase):
         summary = json.loads(result.stdout)
         self.assertEqual(summary["line_count"], 8)
         self.assertEqual(summary["first_record_keys"], sorted(valid_first))
+        self.assertEqual(summary["first_record_key_count"], len(valid_first))
+        self.assertEqual(
+            summary["first_record_key_utf8_bytes"],
+            sum(len(key.encode("utf-8")) for key in valid_first),
+        )
+        self.assertFalse(summary["first_record_keys_truncated"])
         self.assertEqual(
             summary["unique_keys"],
             sorted(set(valid_first) | set(valid_later)),
         )
+        self.assertEqual(summary["unique_key_count"], 3)
+        self.assertEqual(
+            summary["unique_key_utf8_bytes"],
+            sum(
+                len(key.encode("utf-8"))
+                for key in set(valid_first) | set(valid_later)
+            ),
+        )
+        self.assertFalse(summary["unique_keys_truncated"])
+        self.assertIsNone(summary["unique_keys_truncation_reason"])
         self.assertNotIn(oversized_decoy, result.stdout)
         self.assertNotIn("schema-decoy", result.stdout)
+
+    def test_session_mining_schema_recipe_bounds_global_unique_key_state(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        code = extract_python_block_after(
+            workflow,
+            "For JSONL schema checks",
+            marker='```bash\npython3 - "$JSONL_PATH" <<\'PY\'\n',
+        )
+
+        def run_recipe(records: list[dict[str, int]]) -> tuple[dict[str, object], int]:
+            payload = "".join(
+                f"{json.dumps(record, ensure_ascii=True, sort_keys=True)}\n"
+                for record in records
+            ).encode("utf-8")
+            with tempfile.TemporaryDirectory() as temp_dir:
+                jsonl = Path(temp_dir) / "schema.jsonl"
+                jsonl.write_bytes(payload)
+                result = subprocess.run(
+                    [sys.executable, "-c", code, str(jsonl)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout), len(result.stdout.encode("utf-8"))
+
+        count_keys = [f"count-key-{index:03d}" for index in range(257)]
+        count_summary, count_output_bytes = run_recipe(
+            [
+                {key: index for index, key in enumerate(count_keys)},
+                {"ignored-after-count-truncation": 1},
+            ]
+        )
+        self.assertEqual(count_summary["line_count"], 2)
+        self.assertEqual(count_summary["max_unique_keys"], 256)
+        self.assertEqual(count_summary["max_unique_key_utf8_bytes"], 32 * 1024)
+        self.assertEqual(count_summary["unique_key_count"], 256)
+        self.assertEqual(
+            count_summary["unique_key_utf8_bytes"],
+            sum(len(key.encode("utf-8")) for key in count_keys[:256]),
+        )
+        self.assertEqual(count_summary["unique_keys"], sorted(count_keys[:256]))
+        self.assertTrue(count_summary["unique_keys_truncated"])
+        self.assertEqual(count_summary["unique_keys_truncation_reason"], "count")
+        self.assertEqual(count_summary["first_record_key_count"], 256)
+        self.assertEqual(count_summary["first_record_keys"], sorted(count_keys[:256]))
+        self.assertTrue(count_summary["first_record_keys_truncated"])
+
+        byte_keys = ["first", "x" * 16380, "y" * 16383, "z"]
+        byte_summary, byte_output_bytes = run_recipe(
+            [
+                {key: index for index, key in enumerate(byte_keys)},
+                {"ignored-after-byte-truncation": 1},
+            ]
+        )
+        self.assertEqual(byte_summary["line_count"], 2)
+        self.assertEqual(byte_summary["unique_key_count"], 3)
+        self.assertEqual(byte_summary["unique_key_utf8_bytes"], 32 * 1024)
+        self.assertEqual(byte_summary["unique_keys"], sorted(byte_keys[:3]))
+        self.assertTrue(byte_summary["unique_keys_truncated"])
+        self.assertEqual(byte_summary["unique_keys_truncation_reason"], "utf8_bytes")
+        self.assertEqual(byte_summary["first_record_key_utf8_bytes"], 32 * 1024)
+        self.assertEqual(byte_summary["first_record_keys"], sorted(byte_keys[:3]))
+        self.assertTrue(byte_summary["first_record_keys_truncated"])
+
+        invalid_key_summary, invalid_key_output_bytes = run_recipe(
+            [{"\ud800": 1}, {"ignored-after-invalid-key": 1}]
+        )
+        self.assertEqual(invalid_key_summary["line_count"], 2)
+        self.assertEqual(invalid_key_summary["unique_key_count"], 0)
+        self.assertEqual(invalid_key_summary["unique_key_utf8_bytes"], 0)
+        self.assertEqual(invalid_key_summary["unique_keys"], [])
+        self.assertTrue(invalid_key_summary["unique_keys_truncated"])
+        self.assertEqual(
+            invalid_key_summary["unique_keys_truncation_reason"], "non_utf8_key"
+        )
+        self.assertEqual(invalid_key_summary["first_record_key_count"], 0)
+        self.assertTrue(invalid_key_summary["first_record_keys_truncated"])
+
+        max_output_bytes = 2 * 6 * (32 * 1024) + 2 * 4 * 256 + 8192
+        self.assertLessEqual(count_output_bytes, max_output_bytes)
+        self.assertLessEqual(byte_output_bytes, max_output_bytes)
+        self.assertLessEqual(invalid_key_output_bytes, max_output_bytes)
 
     def test_session_mining_broad_keyword_recipe_uses_bounded_public_index_schemas(
         self,
