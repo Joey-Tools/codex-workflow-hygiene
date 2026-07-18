@@ -7,7 +7,7 @@ updated: 2026-07-18
 branch: codex/daily-skill-friction-20260717-codex-workflow-hygiene-portable-scandir-identity
 pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/53
 supersedes: []
-superseded_by:
+superseded_by: 20260718-csr007
 ---
 
 # Retrospective Portable Enumeration
