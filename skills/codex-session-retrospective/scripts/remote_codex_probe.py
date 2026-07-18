@@ -27,6 +27,7 @@ from typing import Any, BinaryIO
 
 DATE_FORMAT = "%Y/%m/%d"
 MAX_SESSION_META_LIMIT = 500
+MAX_SESSION_META_CANDIDATE_LIMIT = MAX_SESSION_META_LIMIT + 1
 MAX_SESSION_META_DATE_COUNT = 31
 MAX_FETCH_ROLLOUT_BYTES = 16 * 1024 * 1024
 MAX_REMOTE_SESSION_META_SERIALIZED_ROW_BYTES = 64 * 1024
@@ -334,6 +335,9 @@ SUMMARY_SENSITIVE_SIGNAL_RE = re.compile(SUMMARY_SENSITIVE_SIGNAL_PATTERN_TEXT, 
 REMOTE_SESSION_META_BEGIN = "__REMOTE_CODEX_PROBE_SESSION_META_BEGIN__"
 REMOTE_SESSION_META_END = "__REMOTE_CODEX_PROBE_SESSION_META_END__"
 SESSION_META_LIMIT_TRUNCATED_REASON = "session_meta_limit_truncated"
+SESSION_META_CANDIDATE_LIMIT_TRUNCATED_REASON = (
+    "session_meta_candidate_limit_truncated"
+)
 SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR = "session-meta output row too large"
 REMOTE_FETCH_ROLLOUT_BEGIN = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_BEGIN__"
 REMOTE_FETCH_ROLLOUT_END = "__REMOTE_CODEX_PROBE_FETCH_ROLLOUT_END__"
@@ -2120,6 +2124,7 @@ MAX_FETCH_ROLLOUT_BYTES = int(CONFIG.get("max_fetch_rollout_bytes", 0))
 SESSION_META_SCAN_BYTES = int(CONFIG.get("session_meta_scan_bytes", 0))
 SESSION_META_READ_CHUNK_BYTES = {SESSION_META_READ_CHUNK_BYTES}
 SESSION_META_PREFIX_PROOF_BYTES = {MAX_SESSION_META_SCAN_BYTES}
+SESSION_META_CANDIDATE_LIMIT = {MAX_SESSION_META_CANDIDATE_LIMIT}
 SESSION_META_SERIALIZED_ROW_BYTES = {MAX_REMOTE_SESSION_META_SERIALIZED_ROW_BYTES}
 SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR = {SESSION_META_OUTPUT_ROW_TOO_LARGE_ERROR!r}
 SUMMARY_LIMIT = int(CONFIG.get("summary_limit", 0))
@@ -2191,6 +2196,7 @@ REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF = {REMOTE_GENERATED_SUMMARY_SOURC
 SESSION_META_BEGIN = {REMOTE_SESSION_META_BEGIN!r}
 SESSION_META_END = {REMOTE_SESSION_META_END!r}
 SESSION_META_LIMIT_TRUNCATED_REASON = {SESSION_META_LIMIT_TRUNCATED_REASON!r}
+SESSION_META_CANDIDATE_LIMIT_TRUNCATED_REASON = {SESSION_META_CANDIDATE_LIMIT_TRUNCATED_REASON!r}
 SESSION_META_FLAT_UNDATED_ALIAS_PREFIX = {SESSION_META_FLAT_UNDATED_ALIAS_PREFIX!r}
 FETCH_ROLLOUT_BEGIN = {REMOTE_FETCH_ROLLOUT_BEGIN!r}
 FETCH_ROLLOUT_END = {REMOTE_FETCH_ROLLOUT_END!r}
@@ -3837,7 +3843,7 @@ def iter_session_meta():
         session_directory_unreadable()
 
     opened_directories = {{}}
-    prefix_proof_candidate_limit = LIMIT + 1
+    prefix_proof_candidate_limit = SESSION_META_CANDIDATE_LIMIT
     prefix_proof_candidate_captures = 0
 
     def open_directory(rel_dir):
@@ -4023,7 +4029,7 @@ def iter_session_meta():
                         inventory_identity,
                     )
                     if consumed_identity is None:
-                        emit_session_meta_item({{"kind": "truncation", "reason": SESSION_META_LIMIT_TRUNCATED_REASON, "date": date_text, "limit": LIMIT}})
+                        emit_session_meta_item({{"kind": "truncation", "reason": SESSION_META_CANDIDATE_LIMIT_TRUNCATED_REASON, "date": date_text, "candidate_limit": SESSION_META_CANDIDATE_LIMIT}})
                         print(SESSION_META_END)
                         return
                     meta = session_meta_from_rollout(
@@ -4163,7 +4169,7 @@ def _scan_session_meta_records(
     rows: list[dict[str, str]] = []
     seen_rollout_paths: set[str] = set()
     opened_directories: dict[str, int] = {}
-    prefix_proof_candidate_limit = limit + 1
+    prefix_proof_candidate_limit = MAX_SESSION_META_CANDIDATE_LIMIT
     prefix_proof_candidate_captures = 0
 
     def open_directory(relative_dir: pathlib.PurePosixPath) -> int | None:
@@ -4684,7 +4690,11 @@ def _session_meta_row_from_item(item: dict[str, Any], *, host: str) -> dict[str,
 def _is_session_meta_truncation_item(item: dict[str, Any]) -> bool:
     return (
         item.get("kind") == "truncation"
-        and item.get("reason") == SESSION_META_LIMIT_TRUNCATED_REASON
+        and item.get("reason")
+        in {
+            SESSION_META_LIMIT_TRUNCATED_REASON,
+            SESSION_META_CANDIDATE_LIMIT_TRUNCATED_REASON,
+        }
     )
 
 
