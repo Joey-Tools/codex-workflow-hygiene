@@ -3291,7 +3291,10 @@ def message_content_is_valid(content):
     for item in content:
         if not isinstance(item, dict):
             return False
-        if item.get("type") in ("input_text", "output_text", "text") and not isinstance(item.get("text"), str):
+        item_type = item.get("type")
+        if not isinstance(item_type, str):
+            return False
+        if item_type in ("input_text", "output_text", "text") and not isinstance(item.get("text"), str):
             return False
     return True
 
@@ -3304,7 +3307,10 @@ def message_summary_from_payload(payload):
     for item in payload.get("content", []):
         if not isinstance(item, dict):
             continue
-        if item.get("type") not in ("input_text", "output_text", "text"):
+        item_type = item.get("type")
+        if not isinstance(item_type, str):
+            continue
+        if item_type not in ("input_text", "output_text", "text"):
             continue
         text = item.get("text")
         if isinstance(text, str) and text:
@@ -5148,7 +5154,10 @@ def _message_content_is_valid(content: Any) -> bool:
     for item in content:
         if not isinstance(item, dict):
             return False
-        if item.get("type") in {"input_text", "output_text", "text"} and not isinstance(
+        item_type = item.get("type")
+        if not isinstance(item_type, str):
+            return False
+        if item_type in ("input_text", "output_text", "text") and not isinstance(
             item.get("text"), str
         ):
             return False
@@ -5163,7 +5172,10 @@ def _message_summary(payload: dict[str, Any]) -> tuple[str, str]:
     for item in payload.get("content", []):
         if not isinstance(item, dict):
             continue
-        if item.get("type") not in {"input_text", "output_text", "text"}:
+        item_type = item.get("type")
+        if not isinstance(item_type, str):
+            continue
+        if item_type not in ("input_text", "output_text", "text"):
             continue
         text = item.get("text")
         if isinstance(text, str) and text:

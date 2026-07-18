@@ -21,7 +21,7 @@ import sys
 import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 WRAPPER_PREFIXES = (
@@ -1237,10 +1237,22 @@ def iter_jsonl_strict_bytes(data: bytes, label: str) -> Iterable[tuple[int, dict
 
 
 def text_from_message_payload(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return ""
     texts: list[str] = []
-    for part in payload.get("content") or []:
-        if isinstance(part, dict) and part.get("type") in {"input_text", "output_text", "text"}:
-            texts.append(str(part.get("text") or ""))
+    for part in content:
+        if not isinstance(part, dict):
+            return ""
+        part_type = part.get("type")
+        if not isinstance(part_type, str):
+            return ""
+        if part_type not in ("input_text", "output_text", "text"):
+            continue
+        text = part.get("text")
+        if not isinstance(text, str):
+            return ""
+        texts.append(text)
     return "\n".join(texts).strip()
 
 
@@ -1308,10 +1320,12 @@ def record_timestamp_with_origin(record: dict[str, Any], path: Path) -> tuple[st
 
 def record_text(record: dict[str, Any]) -> str:
     payload = record.get("payload") or {}
-    if isinstance(payload, dict) and payload.get("type") in {"message", "user_message"}:
-        if payload.get("type") == "user_message":
-            return event_user_message_text(payload)
-        return text_from_message_payload(payload)
+    if isinstance(payload, dict):
+        payload_type = payload.get("type")
+        if isinstance(payload_type, str) and payload_type in ("message", "user_message"):
+            if payload_type == "user_message":
+                return event_user_message_text(payload)
+            return text_from_message_payload(payload)
     try:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
     except TypeError:

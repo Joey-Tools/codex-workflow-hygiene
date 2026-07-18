@@ -4091,6 +4091,30 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 },
             },
             {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": []}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": {}}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{}],
+                },
+            },
+            {
                 "type": "event_msg",
                 "payload": {
                     "type": "user_message",
@@ -4129,6 +4153,27 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         "role": "user",
                         "content": [{"type": "input_text", "text": None}],
                     },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": [{"type": []}]},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": [{"type": {}}]},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": [{}]},
                 },
             },
         ]
@@ -6340,13 +6385,90 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("category=review", turns[0].redacted_user_prompt_summary)
         self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
 
-    def test_extract_rollout_reads_structured_event_msg_user_messages(self) -> None:
+    def test_extract_rollout_skips_malformed_messages_before_structured_event_evidence(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-structured.jsonl"
+            valid_user_text = "You forgot the verification step and assumed success."
             write_jsonl(
                 rollout,
                 [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:00Z",
+                        "payload": {"type": []},
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:01Z",
+                        "payload": {"type": {}},
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:02Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": 7,
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:03Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [None],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:04Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": []}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:05Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": {}}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:06Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": ["You forgot malformed list evidence."],
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:07Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": {"status": "malformed object evidence"},
+                                }
+                            ],
+                        },
+                    },
                     {
                         "type": "event_msg",
                         "timestamp": "2026-05-22T10:01:00Z",
@@ -6357,21 +6479,29 @@ class SessionRetrospectiveTests(unittest.TestCase):
                                 "content": [
                                     {
                                         "type": "input_text",
-                                        "text": "You forgot the verification step and assumed success.",
+                                        "text": valid_user_text,
                                     }
                                 ],
                             },
                         },
-                    }
+                    },
+                    message(
+                        "assistant",
+                        "Validated the later assistant evidence.",
+                        "2026-05-22T10:02:00Z",
+                    ),
                 ],
             )
 
             turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
 
         self.assertEqual(len(turns), 1)
+        self.assertIn(f"prompt_chars={len(valid_user_text)}", turns[0].redacted_user_prompt_summary)
         self.assertIn("user_correction", turns[0].issue_flags)
         self.assertIn("context_loss", turns[0].issue_flags)
         self.assertNotIn("role", turns[0].redacted_user_prompt_summary)
+        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+        self.assertIn("action_categories=verification", turns[0].assistant_action_summary)
 
     def test_extract_rollout_deduplicates_near_duplicate_user_message_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
