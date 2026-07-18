@@ -5733,6 +5733,19 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     message("user", "# AGENTS.md instructions\nsecret wrapper", "2026-05-22T10:00:00Z"),
                     message("user", "Please fix this using https://internal.example/case and token sk-proj-abcdefghijklmnop123456.", "2026-05-22T10:01:00Z"),
                     {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:10Z",
+                        "payload": {"detail": "continued without asking"},
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:20Z",
+                        "payload": {
+                            "type": "custom_notice",
+                            "detail": "could not run compatibility check",
+                        },
+                    },
+                    {
                         "type": "function_call_output",
                         "timestamp": "2026-05-22T10:02:00Z",
                         "payload": {"output": "Process exited with code 1\npermission denied"},
@@ -5752,6 +5765,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("failed_command", turns[0].issue_flags)
         self.assertIn("approval_auth_friction", turns[0].issue_flags)
         self.assertIn("safety_privacy_flag", turns[0].issue_flags)
+        self.assertIn("under_asking", turns[0].issue_flags)
+        self.assertIn("verification_gap", turns[0].issue_flags)
 
     def test_local_rollout_internal_hostname_is_redacted_and_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -6385,16 +6400,88 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("category=review", turns[0].redacted_user_prompt_summary)
         self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
 
-    def test_extract_rollout_skips_malformed_messages_before_structured_event_evidence(
+    def test_extract_rollout_rejects_malformed_evidence_and_preserves_later_records(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-structured.jsonl"
             valid_user_text = "You forgot the verification step and assumed success."
+            valid_cwd = "/valid/context/repo"
             write_jsonl(
                 rollout,
                 [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-22T09:59:50Z",
+                        "payload": {
+                            "id": "valid-context-session",
+                            "cwd": valid_cwd,
+                            "model": "openai/gpt-5.4",
+                        },
+                    },
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-23T00:00:00Z",
+                        "payload": {
+                            "id": "future-context-session",
+                            "cwd": "/future/context/repo",
+                            "model": "openai/gpt-5.5",
+                        },
+                    },
+                    {
+                        "type": "turn_context",
+                        "timestamp": "2026-05-22T09:59:51Z",
+                        "payload": {"cwd": ["/invalid/context"]},
+                    },
+                    {
+                        "type": "turn_context",
+                        "timestamp": "2026-05-22T09:59:52Z",
+                        "payload": {"model": {"name": "invalid-model"}},
+                    },
+                    {
+                        "type": "turn_context",
+                        "timestamp": "2026-05-22T09:59:53Z",
+                        "payload": {"model_id": 7},
+                    },
+                    {
+                        "type": ["response_item"],
+                        "timestamp": "2026-05-22T09:59:54Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "You missed forged non-string outer evidence.",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-22T09:59:55Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "You forgot forged wrong-outer evidence.",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T09:59:56Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": "You missed forged wrong-pair evidence.",
+                            "cwd": "/wrong/pair/repo",
+                            "model": "openai/gpt-5.5",
+                        },
+                    },
                     {
                         "type": "response_item",
                         "timestamp": "2026-05-22T10:00:00Z",
@@ -6471,9 +6558,38 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     },
                     {
                         "type": "event_msg",
+                        "timestamp": "2026-05-22T10:00:08Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": None,
+                            "text": "You missed the tempting explicit-null fallback.",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:00:09Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": [],
+                            "text": "You forgot the tempting explicit-list fallback.",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:00:10Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": 7,
+                            "text": "You missed the tempting explicit-scalar fallback.",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
                         "timestamp": "2026-05-22T10:01:00Z",
                         "payload": {
                             "type": "user_message",
+                            "cwd": "/wrong/outer/repo",
+                            "model": "openai/gpt-5.5",
                             "message": {
                                 "role": "user",
                                 "content": [
@@ -6486,6 +6602,113 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         },
                     },
                     message(
+                        "user",
+                        "# AGENTS.md instructions\nRepository policy only.",
+                        "2026-05-22T10:01:05Z",
+                    ),
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:10Z",
+                        "payload": {
+                            "type": "task_complete",
+                            "last_agent_message": [
+                                "The command failed with permission denied."
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:11Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": ["Process exited with code 1"],
+                            "text": "permission denied tempting fallback",
+                        },
+                    },
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:01:12Z",
+                        "payload": {
+                            "output": {"error": "permission denied"},
+                            "text": "Process exited with code 1 tempting fallback",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:13Z",
+                        "payload": "permission denied without asking",
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:14Z",
+                        "payload": "permission denied without asking",
+                    },
+                    {
+                        "type": ["function_call_output"],
+                        "timestamp": "2026-05-22T10:01:15Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": "permission denied without asking",
+                        },
+                    },
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-22T10:01:16Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Failed with permission denied.",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:17Z",
+                        "payload": {
+                            "type": "function_call",
+                            "arguments": "permission denied without asking",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:18Z",
+                        "payload": {
+                            "type": "token_count",
+                            "detail": "permission denied without asking",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:19Z",
+                        "payload": {
+                            "type": "thread/start",
+                            "message": "permission denied without asking",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:30Z",
+                        "payload": {
+                            "type": {
+                                "error": "permission denied",
+                                "prompt": "without asking",
+                            }
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:40Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": "Verification not run.",
+                            "text": "permission denied must not override output",
+                        },
+                    },
+                    message(
                         "assistant",
                         "Validated the later assistant evidence.",
                         "2026-05-22T10:02:00Z",
@@ -6493,15 +6716,107 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 ],
             )
 
-            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                None,
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+            )
 
         self.assertEqual(len(turns), 1)
         self.assertIn(f"prompt_chars={len(valid_user_text)}", turns[0].redacted_user_prompt_summary)
-        self.assertIn("user_correction", turns[0].issue_flags)
-        self.assertIn("context_loss", turns[0].issue_flags)
+        self.assertEqual(
+            set(turns[0].issue_flags),
+            {"context_loss", "user_correction", "verification_gap"},
+        )
+        self.assertEqual(turns[0].cwd, MODULE.path_ref(valid_cwd))
+        self.assertEqual(turns[0].model, "gpt-5.4")
+        self.assertEqual(turns[0].model_era, "gpt-5.4")
         self.assertNotIn("role", turns[0].redacted_user_prompt_summary)
         self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
         self.assertIn("action_categories=verification", turns[0].assistant_action_summary)
+
+    def test_extract_rollout_rejects_invalid_response_message_schema_before_later_valid_turn(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-schema.jsonl"
+            valid_cwd = "/valid/schema/repo"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:00Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "future_metadata",
+                                    "text": {"ignored": "unknown string item types remain schema-valid"},
+                                }
+                            ],
+                            "cwd": valid_cwd,
+                            "model": "openai/gpt-5.4",
+                        },
+                    },
+                    message("user", "Please implement the alpha helper.", "2026-05-22T10:01:00Z"),
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:10Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "system",
+                            "content": [{"type": "output_text", "text": "Permission denied without asking."}],
+                            "cwd": "/invalid/role/repo",
+                            "model": "openai/gpt-5.5",
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:20Z",
+                        "payload": {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "Verification not run."}],
+                            "cwd": "/missing/role/repo",
+                            "model": "openai/gpt-5.5",
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:30Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": ["Process exited with code 1"],
+                                }
+                            ],
+                            "cwd": "/malformed/content/repo",
+                            "model": "openai/gpt-5.5",
+                        },
+                    },
+                    message("assistant", "Implemented the alpha helper.", "2026-05-22T10:02:00Z"),
+                    message("user", "Please implement the beta helper.", "2026-05-22T10:03:00Z"),
+                    message("assistant", "Implemented the beta helper.", "2026-05-22T10:04:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].issue_flags, [])
+        self.assertEqual(turns[1].issue_flags, [])
+        for turn in turns:
+            self.assertEqual(turn.cwd, MODULE.path_ref(valid_cwd))
+            self.assertEqual(turn.model, "gpt-5.4")
+            self.assertEqual(turn.model_era, "gpt-5.4")
+        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+        self.assertIn("assistant_messages=1", turns[1].assistant_action_summary)
 
     def test_extract_rollout_deduplicates_near_duplicate_user_message_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -6709,16 +7024,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-secret.jsonl"
+            cwd = "/Users/hoteng/Program/GitHub/customer-secret/repo"
             write_jsonl(
                 rollout,
-                [
-                    message_with_cwd(
-                        "user",
-                        "Please implement the helper.",
-                        "2026-05-22T10:01:00Z",
-                        "/Users/hoteng/Program/GitHub/customer-secret/repo",
-                    ),
-                ],
+                [message_with_cwd("user", "Please implement the helper.", "2026-05-22T10:01:00Z", cwd)],
             )
 
             turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
@@ -6734,6 +7043,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-undated.jsonl"
+            cwd = "/Users/hoteng/Program/GitHub/customer-secret/repo"
             write_jsonl(
                 rollout,
                 [
@@ -6741,8 +7051,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         "user",
                         "Please fix this permission denied failure.",
                         "2026-05-22T10:01:00Z",
-                        "/Users/hoteng/Program/GitHub/customer-secret/repo",
-                    ),
+                        cwd,
+                    )
                 ],
             )
 
