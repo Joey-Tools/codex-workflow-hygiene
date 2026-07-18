@@ -1153,6 +1153,30 @@ def _assert_append_only_rollout_checkpoint(
         descriptor_final,
         phase=phase,
     )
+    if current_final != current_after:
+        _reverified_proof, verified_snapshot = _read_rollout_prefix_proof(
+            fd,
+            advanced_proof.length,
+            expected_prefix=advanced_proof,
+            phase=phase,
+        )
+        descriptor_reverified = _rollout_identity_from_stat(os.fstat(fd))
+        _assert_rollout_identity(
+            descriptor_reverified,
+            current_final,
+            phase=phase,
+        )
+        try:
+            current_reverified = _rollout_identity_from_stat(
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            )
+        except (FileNotFoundError, ValueError) as error:
+            raise ValueError(f"rollout identity changed {phase}") from error
+        _assert_rollout_identity(
+            current_reverified,
+            current_final,
+            phase=phase,
+        )
     return current_final, current, advanced_proof, verified_snapshot
 
 
@@ -2600,6 +2624,22 @@ def assert_append_only_rollout_checkpoint(
     except (FileNotFoundError, ValueError) as error:
         raise ValueError("rollout identity changed " + phase) from error
     assert_append_only_rollout_identity(current_final, descriptor_final, phase)
+    if current_final != current_after:
+        _reverified_proof, verified_snapshot = read_rollout_prefix_proof(
+            fd,
+            advanced_proof["length"],
+            expected_prefix=advanced_proof,
+            phase=phase,
+        )
+        descriptor_reverified = rollout_identity_from_stat(os.fstat(fd))
+        assert_rollout_identity(descriptor_reverified, current_final, phase)
+        try:
+            current_reverified = rollout_identity_from_stat(
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            )
+        except (FileNotFoundError, ValueError) as error:
+            raise ValueError("rollout identity changed " + phase) from error
+        assert_rollout_identity(current_reverified, current_final, phase)
     return current_final, current, advanced_proof, verified_snapshot
 
 

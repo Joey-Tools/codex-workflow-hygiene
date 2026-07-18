@@ -1104,7 +1104,7 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                     codex_root = Path(temp_dir) / ".codex"
                     rollout = write_rollout(codex_root, rollout_ref=rollout_ref)
                     original_size = rollout.stat().st_size
-                    read_calls = 0
+                    during_open_reads = 0
                     mutated = False
 
                     if scope == "local":
@@ -1139,10 +1139,12 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         *args: object,
                         **kwargs: object,
                     ) -> object:
-                        nonlocal read_calls, mutated
+                        nonlocal during_open_reads, mutated
                         result = real_read(*args, **kwargs)
-                        read_calls += 1
-                        if read_calls == 5:
+                        if kwargs.get("phase") != "during open":
+                            return result
+                        during_open_reads += 1
+                        if during_open_reads == 2:
                             with rollout.open("ab") as handle:
                                 handle.write(b"{}\n")
                             mutated = True
@@ -1176,9 +1178,450 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                             for line in output.getvalue().splitlines()[1:-1]
                         ]
                     self.assertTrue(mutated)
-                    self.assertGreaterEqual(read_calls, 7)
+                    self.assertEqual(during_open_reads, 3)
                     self.assertGreater(rollout.stat().st_size, original_size)
                     self.assertEqual(session_ids, ["trusted-session"])
+
+    def test_active_rewrite_grow_after_post_parse_final_proof_fails_closed(
+        self,
+    ) -> None:
+        for scope in ("local", "embedded"):
+            for layout in ("sessions", "root"):
+                with self.subTest(
+                    scope=scope,
+                    layout=layout,
+                ), tempfile.TemporaryDirectory() as temp_dir:
+                    rollout_ref = (
+                        ROLLOUT_REF
+                        if layout == "sessions"
+                        else "rollout-2026-05-26T10-00-00-root.jsonl"
+                    )
+                    codex_root = Path(temp_dir) / ".codex"
+                    rollout = write_rollout(codex_root, rollout_ref=rollout_ref)
+                    original = rollout.read_bytes()
+                    original_stat = rollout.stat()
+                    rewritten = original.replace(
+                        b"trusted-session",
+                        b"rewritten-session",
+                        1,
+                    ) + b"{}\n"
+                    after_scan_attempts = 0
+                    after_scan_successes = 0
+                    mutated = False
+
+                    if scope == "local":
+                        real_read = MODULE._read_rollout_prefix_proof
+
+                        def run_scan() -> object:
+                            return MODULE._scan_session_meta_records(
+                                codex_root=codex_root,
+                                dates=[dt.date(2026, 5, 26)],
+                                limit=10,
+                                host="local",
+                            )
+
+                    else:
+                        namespace = embedded_probe_namespace(
+                            {
+                                "mode": "session-meta",
+                                "dates": ["2026/05/26"],
+                                "limit": 10,
+                                "codex_root": str(codex_root),
+                                "session_meta_scan_bytes": (
+                                    MODULE.MAX_SESSION_META_SCAN_BYTES
+                                ),
+                            }
+                        )
+                        real_read = namespace["read_rollout_prefix_proof"]
+
+                        def run_scan() -> object:
+                            return namespace["iter_session_meta"]()
+
+                    def rewrite_after_final_proof(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> object:
+                        nonlocal after_scan_attempts
+                        nonlocal after_scan_successes, mutated
+                        after_scan = kwargs.get("phase") == "after session-meta scan"
+                        if after_scan:
+                            after_scan_attempts += 1
+                        result = real_read(*args, **kwargs)
+                        if after_scan:
+                            after_scan_successes += 1
+                        if after_scan and after_scan_successes == 2 and not mutated:
+                            with rollout.open("r+b") as handle:
+                                handle.write(rewritten)
+                                handle.truncate()
+                            mutated = True
+                        return result
+
+                    if scope == "local":
+                        patcher = mock.patch.object(
+                            MODULE,
+                            "_read_rollout_prefix_proof",
+                            side_effect=rewrite_after_final_proof,
+                        )
+                    else:
+                        patcher = mock.patch.dict(
+                            namespace,
+                            {
+                                "read_rollout_prefix_proof": (
+                                    rewrite_after_final_proof
+                                )
+                            },
+                        )
+
+                    output = io.StringIO()
+                    retry_output = io.StringIO()
+                    with patcher:
+                        with redirect_stdout(output):
+                            if scope == "local":
+                                with self.assertRaises(
+                                    MODULE.SessionMetaRolloutError
+                                ) as raised:
+                                    run_scan()
+                                error = raised.exception.error
+                            else:
+                                with self.assertRaises(SystemExit) as raised:
+                                    run_scan()
+                                self.assertEqual(raised.exception.code, 0)
+                                error = json.loads(
+                                    output.getvalue().splitlines()[1]
+                                )["error"]
+                        first_run_attempts = after_scan_attempts
+                        first_run_successes = after_scan_successes
+                        after_scan_attempts = 0
+                        after_scan_successes = 0
+                        with redirect_stdout(retry_output):
+                            retry_scan = run_scan()
+
+                    if scope == "local":
+                        retry_session_ids = [
+                            row["session_id"] for row in retry_scan.rows
+                        ]
+                    else:
+                        retry_session_ids = [
+                            json.loads(line)["session_id"]
+                            for line in retry_output.getvalue().splitlines()[1:-1]
+                        ]
+
+                    final_stat = rollout.stat()
+                    self.assertTrue(mutated)
+                    self.assertEqual(first_run_attempts, 3)
+                    self.assertEqual(first_run_successes, 2)
+                    self.assertEqual(after_scan_attempts, 2)
+                    self.assertEqual(after_scan_successes, 2)
+                    self.assertEqual(
+                        (final_stat.st_dev, final_stat.st_ino),
+                        (original_stat.st_dev, original_stat.st_ino),
+                    )
+                    self.assertGreater(final_stat.st_size, original_stat.st_size)
+                    self.assertIn("identity changed", error)
+                    self.assertEqual(retry_session_ids, ["rewritten-session"])
+
+    def test_active_growth_after_extra_post_parse_proof_fails_stability_check(
+        self,
+    ) -> None:
+        for scope in ("local", "embedded"):
+            for layout in ("sessions", "root"):
+                with self.subTest(
+                    scope=scope,
+                    layout=layout,
+                ), tempfile.TemporaryDirectory() as temp_dir:
+                    rollout_ref = (
+                        ROLLOUT_REF
+                        if layout == "sessions"
+                        else "rollout-2026-05-26T10-00-00-root.jsonl"
+                    )
+                    codex_root = Path(temp_dir) / ".codex"
+                    rollout = write_rollout(codex_root, rollout_ref=rollout_ref)
+                    original_stat = rollout.stat()
+                    after_scan_attempts = 0
+                    after_scan_successes = 0
+                    growth_events = 0
+
+                    if scope == "local":
+                        real_read = MODULE._read_rollout_prefix_proof
+
+                        def run_scan() -> object:
+                            return MODULE._scan_session_meta_records(
+                                codex_root=codex_root,
+                                dates=[dt.date(2026, 5, 26)],
+                                limit=10,
+                                host="local",
+                            )
+
+                    else:
+                        namespace = embedded_probe_namespace(
+                            {
+                                "mode": "session-meta",
+                                "dates": ["2026/05/26"],
+                                "limit": 10,
+                                "codex_root": str(codex_root),
+                                "session_meta_scan_bytes": (
+                                    MODULE.MAX_SESSION_META_SCAN_BYTES
+                                ),
+                            }
+                        )
+                        real_read = namespace["read_rollout_prefix_proof"]
+
+                        def run_scan() -> object:
+                            return namespace["iter_session_meta"]()
+
+                    def grow_after_post_parse_proofs(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> object:
+                        nonlocal after_scan_attempts
+                        nonlocal after_scan_successes, growth_events
+                        after_scan = kwargs.get("phase") == "after session-meta scan"
+                        if after_scan:
+                            after_scan_attempts += 1
+                        result = real_read(*args, **kwargs)
+                        if after_scan:
+                            after_scan_successes += 1
+                        if (
+                            after_scan
+                            and after_scan_successes in (2, 3)
+                            and growth_events < 2
+                        ):
+                            with rollout.open("ab") as handle:
+                                handle.write(b"{}\n")
+                            growth_events += 1
+                        return result
+
+                    if scope == "local":
+                        patcher = mock.patch.object(
+                            MODULE,
+                            "_read_rollout_prefix_proof",
+                            side_effect=grow_after_post_parse_proofs,
+                        )
+                    else:
+                        patcher = mock.patch.dict(
+                            namespace,
+                            {
+                                "read_rollout_prefix_proof": (
+                                    grow_after_post_parse_proofs
+                                )
+                            },
+                        )
+
+                    output = io.StringIO()
+                    retry_output = io.StringIO()
+                    with patcher:
+                        with redirect_stdout(output):
+                            if scope == "local":
+                                with self.assertRaises(
+                                    MODULE.SessionMetaRolloutError
+                                ) as raised:
+                                    run_scan()
+                                error = raised.exception.error
+                            else:
+                                with self.assertRaises(SystemExit) as raised:
+                                    run_scan()
+                                self.assertEqual(raised.exception.code, 0)
+                                error = json.loads(
+                                    output.getvalue().splitlines()[1]
+                                )["error"]
+                        first_run_attempts = after_scan_attempts
+                        first_run_successes = after_scan_successes
+                        after_scan_attempts = 0
+                        after_scan_successes = 0
+                        with redirect_stdout(retry_output):
+                            retry_scan = run_scan()
+
+                    if scope == "local":
+                        retry_session_ids = [
+                            row["session_id"] for row in retry_scan.rows
+                        ]
+                    else:
+                        retry_session_ids = [
+                            json.loads(line)["session_id"]
+                            for line in retry_output.getvalue().splitlines()[1:-1]
+                        ]
+
+                    final_stat = rollout.stat()
+                    self.assertEqual(growth_events, 2)
+                    self.assertEqual(first_run_attempts, 3)
+                    self.assertEqual(first_run_successes, 3)
+                    self.assertEqual(after_scan_attempts, 2)
+                    self.assertEqual(after_scan_successes, 2)
+                    self.assertEqual(
+                        (final_stat.st_dev, final_stat.st_ino),
+                        (original_stat.st_dev, original_stat.st_ino),
+                    )
+                    self.assertEqual(final_stat.st_size, original_stat.st_size + 6)
+                    self.assertIn("identity changed", error)
+                    self.assertEqual(retry_session_ids, ["trusted-session"])
+
+    def test_active_growth_between_post_reproof_descriptor_and_path_fails(
+        self,
+    ) -> None:
+        for scope in ("local", "embedded"):
+            for layout in ("sessions", "root"):
+                with self.subTest(
+                    scope=scope,
+                    layout=layout,
+                ), tempfile.TemporaryDirectory() as temp_dir:
+                    rollout_ref = (
+                        ROLLOUT_REF
+                        if layout == "sessions"
+                        else "rollout-2026-05-26T10-00-00-root.jsonl"
+                    )
+                    codex_root = Path(temp_dir) / ".codex"
+                    rollout = write_rollout(codex_root, rollout_ref=rollout_ref)
+                    original_stat = rollout.stat()
+                    after_scan_attempts = 0
+                    after_scan_successes = 0
+                    safe_append_done = False
+                    descriptor_gap_growth_done = False
+                    armed_reproof_fd: int | None = None
+
+                    if scope == "local":
+                        target_os = MODULE.os
+                        real_read = MODULE._read_rollout_prefix_proof
+
+                        def run_scan() -> object:
+                            return MODULE._scan_session_meta_records(
+                                codex_root=codex_root,
+                                dates=[dt.date(2026, 5, 26)],
+                                limit=10,
+                                host="local",
+                            )
+
+                    else:
+                        namespace = embedded_probe_namespace(
+                            {
+                                "mode": "session-meta",
+                                "dates": ["2026/05/26"],
+                                "limit": 10,
+                                "codex_root": str(codex_root),
+                                "session_meta_scan_bytes": (
+                                    MODULE.MAX_SESSION_META_SCAN_BYTES
+                                ),
+                            }
+                        )
+                        target_os = namespace["os"]
+                        real_read = namespace["read_rollout_prefix_proof"]
+
+                        def run_scan() -> object:
+                            return namespace["iter_session_meta"]()
+
+                    real_fstat = target_os.fstat
+
+                    def append_and_arm_after_post_parse_proofs(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> object:
+                        nonlocal after_scan_attempts, after_scan_successes
+                        nonlocal safe_append_done, armed_reproof_fd
+                        after_scan = kwargs.get("phase") == "after session-meta scan"
+                        if after_scan:
+                            after_scan_attempts += 1
+                        result = real_read(*args, **kwargs)
+                        if after_scan:
+                            after_scan_successes += 1
+                        if (
+                            after_scan
+                            and after_scan_successes == 2
+                            and not safe_append_done
+                        ):
+                            with rollout.open("ab") as handle:
+                                handle.write(b"{}\n")
+                            safe_append_done = True
+                        elif (
+                            after_scan
+                            and after_scan_successes == 3
+                            and safe_append_done
+                            and not descriptor_gap_growth_done
+                        ):
+                            armed_reproof_fd = int(args[0])
+                        return result
+
+                    def grow_after_reproof_fstat(fd: int) -> os.stat_result:
+                        nonlocal armed_reproof_fd, descriptor_gap_growth_done
+                        result = real_fstat(fd)
+                        if (
+                            armed_reproof_fd == fd
+                            and not descriptor_gap_growth_done
+                        ):
+                            with rollout.open("ab") as handle:
+                                handle.write(b"{}\n")
+                            descriptor_gap_growth_done = True
+                            armed_reproof_fd = None
+                        return result
+
+                    if scope == "local":
+                        proof_patcher = mock.patch.object(
+                            MODULE,
+                            "_read_rollout_prefix_proof",
+                            side_effect=append_and_arm_after_post_parse_proofs,
+                        )
+                    else:
+                        proof_patcher = mock.patch.dict(
+                            namespace,
+                            {
+                                "read_rollout_prefix_proof": (
+                                    append_and_arm_after_post_parse_proofs
+                                )
+                            },
+                        )
+                    fstat_patcher = mock.patch.object(
+                        target_os,
+                        "fstat",
+                        side_effect=grow_after_reproof_fstat,
+                    )
+
+                    output = io.StringIO()
+                    retry_output = io.StringIO()
+                    with proof_patcher, fstat_patcher:
+                        with redirect_stdout(output):
+                            if scope == "local":
+                                with self.assertRaises(
+                                    MODULE.SessionMetaRolloutError
+                                ) as raised:
+                                    run_scan()
+                                error = raised.exception.error
+                            else:
+                                with self.assertRaises(SystemExit) as raised:
+                                    run_scan()
+                                self.assertEqual(raised.exception.code, 0)
+                                error = json.loads(
+                                    output.getvalue().splitlines()[1]
+                                )["error"]
+                        first_run_attempts = after_scan_attempts
+                        first_run_successes = after_scan_successes
+                        after_scan_attempts = 0
+                        after_scan_successes = 0
+                        with redirect_stdout(retry_output):
+                            retry_scan = run_scan()
+
+                    if scope == "local":
+                        retry_session_ids = [
+                            row["session_id"] for row in retry_scan.rows
+                        ]
+                    else:
+                        retry_session_ids = [
+                            json.loads(line)["session_id"]
+                            for line in retry_output.getvalue().splitlines()[1:-1]
+                        ]
+
+                    final_stat = rollout.stat()
+                    self.assertTrue(safe_append_done)
+                    self.assertTrue(descriptor_gap_growth_done)
+                    self.assertIsNone(armed_reproof_fd)
+                    self.assertEqual(first_run_attempts, 3)
+                    self.assertEqual(first_run_successes, 3)
+                    self.assertEqual(after_scan_attempts, 2)
+                    self.assertEqual(after_scan_successes, 2)
+                    self.assertEqual(
+                        (final_stat.st_dev, final_stat.st_ino),
+                        (original_stat.st_dev, original_stat.st_ino),
+                    )
+                    self.assertEqual(final_stat.st_size, original_stat.st_size + 6)
+                    self.assertIn("identity changed", error)
+                    self.assertEqual(retry_session_ids, ["trusted-session"])
 
     def test_late_append_high_water_rejects_rollback_local_and_embedded(
         self,
@@ -1197,7 +1640,7 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                     codex_root = Path(temp_dir) / ".codex"
                     rollout = write_rollout(codex_root, rollout_ref=rollout_ref)
                     original_size = rollout.stat().st_size
-                    read_calls = 0
+                    during_open_reads = 0
                     appended = False
                     rolled_back = False
 
@@ -1235,10 +1678,12 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
                         *args: object,
                         **kwargs: object,
                     ) -> object:
-                        nonlocal read_calls, appended
+                        nonlocal during_open_reads, appended
                         result = real_read(*args, **kwargs)
-                        read_calls += 1
-                        if read_calls == 5:
+                        if kwargs.get("phase") != "during open":
+                            return result
+                        during_open_reads += 1
+                        if during_open_reads == 2:
                             with rollout.open("ab") as handle:
                                 handle.write(b"{}\n" * 20)
                             appended = True
@@ -1303,7 +1748,7 @@ class RemoteCodexProbeDescriptorTests(unittest.TestCase):
 
                     self.assertTrue(appended)
                     self.assertTrue(rolled_back)
-                    self.assertEqual(read_calls, 7)
+                    self.assertEqual(during_open_reads, 3)
                     self.assertEqual(rollout.stat().st_size, original_size + 1)
                     self.assertIn(
                         "rollout identity changed after session-meta scan",
