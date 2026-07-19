@@ -387,6 +387,39 @@ time.sleep(30)
         self.assertEqual(len(started), 1)
         self.assertIsNotNone(started[0].poll())
 
+    def test_signal_during_handler_restore_cannot_escape_as_traceback(
+        self,
+    ) -> None:
+        supervisor = load_supervisor_module()
+        original_restore = supervisor.restore_signal_handlers
+        restore_calls = 0
+
+        def signal_then_restore(previous: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            handler = signal.getsignal(signal.SIGTERM)
+            if not callable(handler):
+                raise AssertionError("managed signal handler is not callable")
+            handler(signal.SIGTERM, None)
+            original_restore(previous)
+
+        with mock.patch.object(
+            supervisor,
+            "restore_signal_handlers",
+            side_effect=signal_then_restore,
+        ):
+            returncode = supervisor.main(
+                [
+                    "--timeout-seconds",
+                    "2",
+                    "--",
+                    "/usr/bin/true",
+                ]
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(restore_calls, 1)
+
     def test_setsid_descendant_is_not_chased(self) -> None:
         escaped = """
 import os

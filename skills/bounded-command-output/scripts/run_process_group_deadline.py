@@ -65,6 +65,9 @@ class SignalGate:
         self._armed = True
         self._raise_pending_once()
 
+    def close(self) -> None:
+        self._armed = False
+
 
 def finite_positive(value: str) -> float:
     try:
@@ -219,6 +222,21 @@ def restore_signal_handlers(previous: dict[int, signal.Handlers]) -> None:
         signal.signal(signum, handler)
 
 
+def close_gate_and_restore_signal_handlers(
+    gate: SignalGate,
+    previous: dict[int, signal.Handlers],
+) -> None:
+    previous_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK,
+        MANAGED_SIGNALS,
+    )
+    try:
+        gate.close()
+        restore_signal_handlers(previous)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
 def print_error(message: str) -> None:
     print(f"run_process_group_deadline: {message}", file=sys.stderr)
 
@@ -309,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
                 print_error("forwarded signal; process-group cleanup unverified")
             return min(255, 128 + event.signum)
     finally:
-        restore_signal_handlers(previous_handlers)
+        close_gate_and_restore_signal_handlers(gate, previous_handlers)
 
 
 if __name__ == "__main__":
