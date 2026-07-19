@@ -43,18 +43,31 @@ class SkillStructureTests(unittest.TestCase):
         skill_root = root / "skills/bounded-command-output"
         skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
         patterns = (skill_root / "references/command-patterns.md").read_text(encoding="utf-8")
+        supervisor = skill_root / "scripts/run_process_group_deadline.py"
         interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
 
         for trigger in (
             "broad searches or inventories",
             "large Jenkins, GitHub Actions, artifact, manual, diff, or review-range reads",
+            "broad database aggregates or filesystem walks with uncertain runtime",
             "broad or noisy process diagnostics",
             "verbose xcodebuild or other tests and builds",
             "spinner-heavy container builds",
         ):
             self.assertIn(trigger, skill)
         self.assertIn("Apply alongside the domain skill", skill)
-        self.assertIn("controls command shape and output handling only", skill)
+        self.assertIn(
+            "controls command shape, execution deadlines, and output handling only",
+            skill,
+        )
+        self.assertIn("Small output does not imply bounded runtime", skill)
+        self.assertIn("expected result is one line", skill)
+        self.assertIn("known to be both small and fast", skill)
+        self.assertIn("task-specific deadlines", skill)
+        self.assertIn("native Windows", skill)
+        self.assertIn("WSL follows the POSIX path", skill)
+        self.assertIn("do not claim process-group or descendant cleanup", skill)
+        self.assertIn("expected output is a single value", skill)
         self.assertIn("display backstops, not as execution-time bounds", skill)
         self.assertIn("finite wall-clock deadline", skill)
         self.assertIn("explicitly capped candidate-filename sample", skill)
@@ -69,6 +82,7 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("## Searches And Inventories", patterns)
         self.assertIn("## Logs, Artifacts, And Manuals", patterns)
         self.assertIn("## Process And System Diagnostics", patterns)
+        self.assertIn("## Database And Filesystem Scans", patterns)
         self.assertIn("## Builds, Tests, And Polling", patterns)
         self.assertIn("total counter plus an explicit `N`-path sampler", patterns)
         self.assertIn("total count plus an explicit `N`-filename sample", patterns)
@@ -86,7 +100,48 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("terminate the producer with a bounded grace period", patterns)
         self.assertIn("tail -c 8192 <task-log>", patterns)
         self.assertIn("tr '\\r' '\\n'", patterns)
+        self.assertIn("SQLite `.timeout` controls how long the client waits for a busy lock", patterns)
+        self.assertIn("it is not a query-execution deadline", patterns)
+        self.assertIn("Broad macOS `du` walks", patterns)
+        self.assertIn("A PTY and repeated polling", patterns)
+        self.assertIn("report every timed-out branch as unknown or incomplete", patterns)
+        self.assertIn("macOS does not ship GNU `timeout`", patterns)
+        self.assertIn("Do not use an in-process Perl `alarm` plus `exec`", patterns)
+        self.assertIn("exit status `142` cannot distinguish", patterns)
+        self.assertIn("even a single SQLite or `du` producer", patterns)
+        self.assertIn("Choose a task-specific deadline before launch", patterns)
+        self.assertIn("illustrative rather than defaults", patterns)
+        self.assertIn("separate supervisor owns the monotonic deadline", patterns)
+        self.assertIn(
+            "Launching descendants does not by itself require stronger containment",
+            patterns,
+        )
+        self.assertIn("adds no persistent launcher", patterns)
+        self.assertIn("native Windows (non-WSL)", patterns)
+        self.assertIn("returns `125` before installing signal handlers", patterns)
+        self.assertIn("one absolute monotonic deadline", patterns)
+        self.assertIn("checks the deadline before each new exit observation", patterns)
+        self.assertIn("reports `READY`, and waits for the parent's `GO`", patterns)
+        self.assertIn("later managed signals cannot interrupt it", patterns)
+        self.assertIn("unblocks managed `INT`, `TERM`, and `HUP`", patterns)
+        self.assertIn("Diagnostics are best effort", patterns)
+        self.assertIn("a closed or broken sink, or a full pipe", patterns)
+        self.assertIn("shared open-file description", patterns)
+        self.assertIn("Python 3.10 baseline", patterns)
+        self.assertIn("standalone single-threaded POSIX CLI", patterns)
+        self.assertIn("require neither root, a container", patterns)
+        self.assertIn("an uninterruptible kernel call cannot be preempted", patterns)
+        self.assertIn("capped at one year solely", patterns)
+        self.assertIn("retained-output byte ceilings remain a separate caller responsibility", patterns)
+        self.assertIn("keep an outer pipe reader waiting for EOF", patterns)
+        self.assertIn("or prove group quiescence", patterns)
+        self.assertIn("not a real-time scheduler", patterns)
+        self.assertNotIn("If a tool launches descendants", patterns)
+        self.assertNotIn("terminates and reaps the entire unit", patterns)
+        self.assertTrue(supervisor.is_file())
+        self.assertTrue(os.access(supervisor, os.X_OK))
         self.assertIn("$bounded-command-output", interface)
+        self.assertIn("time-bounded, pollable, and compact", interface)
         self.assertIn("allow_implicit_invocation: true", interface)
         self.assertNotIn("TODO", skill)
 

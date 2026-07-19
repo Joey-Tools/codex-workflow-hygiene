@@ -1,25 +1,27 @@
 ---
 name: bounded-command-output
-description: Keep potentially high-output commands scoped, pollable, and compact while another skill owns the substantive task. Use for broad searches or inventories; large Jenkins, GitHub Actions, artifact, manual, diff, or review-range reads; broad or noisy process diagnostics; verbose xcodebuild or other tests and builds; spinner-heavy container builds; and repeated polling. Apply alongside the domain skill and skip exact commands known to be small.
+description: Keep potentially high-output or long-running commands scoped, time-bounded, pollable, and compact while another skill owns the substantive task. Use for broad searches or inventories; large Jenkins, GitHub Actions, artifact, manual, diff, or review-range reads; broad database aggregates or filesystem walks with uncertain runtime; broad or noisy process diagnostics; verbose xcodebuild or other tests and builds; spinner-heavy container builds; and repeated polling. Apply alongside the domain skill and skip only exact commands known to be both small and fast.
 ---
 
 # Bounded Command Output
 
 ## Overview
 
-Shape commands so the producer, retained artifact, polling path, and visible evidence all have deliberate bounds.
-This skill controls command shape and output handling only. It does not own diagnosis, implementation delivery, or review decisions.
+Shape commands so the producer, runtime, retained artifact, polling path, and visible evidence all have deliberate bounds.
+This skill controls command shape, execution deadlines, and output handling only. It does not own diagnosis, implementation delivery, or review decisions.
 
 ## Workflow
 
-1. Decide whether the command needs an output budget.
-- Use this skill when input scope is broad, output size is unknown, lines may be huge, progress redraws use carriage returns, or a long-running command will be polled.
-- Skip it for an exact command whose output is known to be small.
+1. Decide whether the command needs an output or runtime budget.
+- Use this skill when input scope is broad, output size or runtime is unknown, lines may be huge, progress redraws use carriage returns, or a long-running command will be polled.
+- Small output does not imply bounded runtime. Apply the database and filesystem deadline patterns to broad SQLite aggregates, `du` walks, and similar scans even when the expected result is one line.
+- Skip it only for an exact command known to be both small and fast.
 
-2. Bound the producer before running it.
+2. Bound the producer scope and runtime before running it.
 - Narrow directories, files, time windows, predicates, identifiers, or changed paths.
 - Exclude dependency trees, generated output, archives, and lockfiles unless they are the target.
 - Start with counts, metadata, an explicitly capped candidate-filename sample, or status summaries before printing matching lines or full records.
+- Choose task-specific deadlines rather than treating illustrative durations as default thresholds. Route database and filesystem scans to the matching reference patterns before launch.
 
 3. Choose the output sink deliberately.
 - Let compact commands return directly.
@@ -48,13 +50,15 @@ This skill controls command shape and output handling only. It does not own diag
 
 ## Guardrails
 
+- Use the process-group deadline wrapper only on POSIX runtimes. On native Windows or any runtime where `os.name != "posix"`, skip this protection and do not claim process-group or descendant cleanup. WSL follows the POSIX path only when its Python runtime exposes the required POSIX APIs.
 - Do not run an unbounded producer and assume a small display cap made the work bounded.
 - Do not call a redirected log bounded unless its time and retained-byte ceilings are enforced while the producer runs.
 - Do not treat per-file match limits such as `rg --max-count` as a total-output cap across many files.
 - Do not print a whole long line when a filename, count, bounded match, length, or structured snippet would answer the question.
 - Do not redirect a small interactive command when doing so would hide a prompt or other required interaction.
+- Do not skip runtime bounding solely because the expected output is a single value or a few lines.
 - Use direct commands when possible. Use a shell only when redirection, a pipeline, or another real shell feature is required.
 
 ## References
 
-- Use [references/command-patterns.md](references/command-patterns.md) for concrete search, inventory, log, process, build, and polling patterns.
+- Use [references/command-patterns.md](references/command-patterns.md) for concrete search, inventory, database, filesystem, log, process, build, deadline, and polling patterns.
