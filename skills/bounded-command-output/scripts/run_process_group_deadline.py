@@ -44,18 +44,26 @@ class GroupSignalOutcome(enum.Enum):
 class SignalGate:
     def __init__(self) -> None:
         self._armed = False
+        self._interrupt_raised = False
         self._pending: int | None = None
 
     def handle(self, signum: int, _frame: object) -> None:
         if self._pending is None:
             self._pending = signum
-        if self._armed:
+        self._raise_pending_once()
+
+    def _raise_pending_once(self) -> None:
+        if (
+            self._armed
+            and not self._interrupt_raised
+            and self._pending is not None
+        ):
+            self._interrupt_raised = True
             raise ForwardedSignal(self._pending)
 
     def arm(self) -> None:
         self._armed = True
-        if self._pending is not None:
-            raise ForwardedSignal(self._pending)
+        self._raise_pending_once()
 
 
 def finite_positive(value: str) -> float:
@@ -262,26 +270,27 @@ def main(argv: list[str] | None = None) -> int:
 
             process_group_id = process.pid
             gate.arm()
-            return normalized_exit_code(
-                process.wait(timeout=args.timeout_seconds)
-            )
-        except subprocess.TimeoutExpired:
-            ignore_managed_signals()
             try:
-                cleanup_unverified = stop_process_group(
-                    process,
-                    process_group_id=process_group_id,
-                    initial_signal=signal.SIGTERM,
-                    grace_seconds=args.grace_seconds,
+                return normalized_exit_code(
+                    process.wait(timeout=args.timeout_seconds)
                 )
-            except SupervisorError as exc:
-                print_error(str(exc))
-                return SUPERVISOR_ERROR_EXIT
-            message = "deadline exceeded; result incomplete"
-            if cleanup_unverified:
-                message += "; post-TERM group cleanup unverified"
-            print_error(message)
-            return TIMEOUT_EXIT
+            except subprocess.TimeoutExpired:
+                ignore_managed_signals()
+                try:
+                    cleanup_unverified = stop_process_group(
+                        process,
+                        process_group_id=process_group_id,
+                        initial_signal=signal.SIGTERM,
+                        grace_seconds=args.grace_seconds,
+                    )
+                except SupervisorError as exc:
+                    print_error(str(exc))
+                    return SUPERVISOR_ERROR_EXIT
+                message = "deadline exceeded; result incomplete"
+                if cleanup_unverified:
+                    message += "; post-TERM group cleanup unverified"
+                print_error(message)
+                return TIMEOUT_EXIT
         except ForwardedSignal as event:
             ignore_managed_signals()
             if process is None:

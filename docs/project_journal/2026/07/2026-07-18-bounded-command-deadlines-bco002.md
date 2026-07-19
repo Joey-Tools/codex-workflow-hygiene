@@ -27,6 +27,7 @@ superseded_by:
 - macOS single-process scans have a system-Perl direct-`exec` deadline pattern that preserves ordinary exit statuses and maps `SIGALRM` to an explicit incomplete result.
 - A POSIX/Python 3.11 same-session process-group wrapper adds TERM/grace/KILL handling for ordinary child processes without requiring root or a container.
 - Cancellation handlers are installed before process creation; signals received during the startup handoff are forwarded once the new group is available.
+- The first managed signal owns the cleanup transition; later managed signals cannot unwind and bypass the in-progress group stop.
 - The wrapper preserves the original session, does not allocate a PTY, waits only for its direct child, and intentionally does not chase escaped descendants or prove group quiescence.
 - macOS may return `EPERM` during immediate process-group handoff or after the leader exits; the wrapper falls back to signaling a still-live direct child and reports group cleanup as unverified while preserving the timeout or forwarded-signal result.
 - Background descendants that intentionally survive a normal leader exit must close or redirect inherited stdout/stderr, or an outer pipe reader can continue waiting for EOF.

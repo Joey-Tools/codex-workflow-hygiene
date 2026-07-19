@@ -18,7 +18,8 @@ SCRIPT = (
     REPO_ROOT
     / "skills/bounded-command-output/scripts/run_process_group_deadline.py"
 )
-POSIX_PROCESS_GROUPS = os.name == "posix" and sys.version_info >= (3, 11)
+POSIX = os.name == "posix"
+SAME_SESSION_PROCESS_GROUPS = POSIX and sys.version_info >= (3, 11)
 
 
 def run_supervisor(
@@ -55,7 +56,68 @@ def load_supervisor_module() -> object:
     return module
 
 
-@unittest.skipUnless(POSIX_PROCESS_GROUPS, "requires POSIX and Python 3.11+")
+@unittest.skipUnless(POSIX, "requires POSIX")
+class PosixNewSessionDeadlineTests(unittest.TestCase):
+    def test_new_session_mode_is_explicit(self) -> None:
+        probe = (
+            "import json, os; "
+            "print(json.dumps({'pid': os.getpid(), 'pgid': os.getpgrp(), "
+            "'sid': os.getsid(0)}))"
+        )
+        result = run_supervisor(
+            "--timeout-seconds",
+            "2",
+            "--new-session",
+            "--",
+            sys.executable,
+            "-c",
+            probe,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        identity = json.loads(result.stdout)
+        self.assertEqual(identity["pgid"], identity["pid"])
+        self.assertEqual(identity["sid"], identity["pid"])
+        self.assertNotEqual(identity["sid"], os.getsid(0))
+
+    def test_cli_and_spawn_failures_are_distinct(self) -> None:
+        invalid = run_supervisor(
+            "--timeout-seconds",
+            "inf",
+            "--new-session",
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        )
+        self.assertEqual(invalid.returncode, 2)
+
+        missing = run_supervisor(
+            "--timeout-seconds",
+            "1",
+            "--new-session",
+            "--",
+            "/definitely/missing/bounded-command",
+        )
+        self.assertEqual(missing.returncode, 127)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            nonexecutable = Path(temp_dir) / "not-executable"
+            nonexecutable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            nonexecutable.chmod(0o600)
+            denied = run_supervisor(
+                "--timeout-seconds",
+                "1",
+                "--new-session",
+                "--",
+                str(nonexecutable),
+            )
+            self.assertEqual(denied.returncode, 126)
+
+
+@unittest.skipUnless(
+    SAME_SESSION_PROCESS_GROUPS,
+    "requires POSIX and Python 3.11+",
+)
 class ProcessGroupDeadlineTests(unittest.TestCase):
     def test_preserves_normal_exit_status(self) -> None:
         for exit_code in (0, 42):
@@ -89,27 +151,6 @@ class ProcessGroupDeadlineTests(unittest.TestCase):
         self.assertEqual(identity["pgid"], identity["pid"])
         self.assertEqual(identity["sid"], os.getsid(0))
         self.assertEqual(identity["euid"], os.geteuid())
-
-    def test_new_session_mode_is_explicit(self) -> None:
-        probe = (
-            "import json, os; "
-            "print(json.dumps({'pid': os.getpid(), 'pgid': os.getpgrp(), "
-            "'sid': os.getsid(0)}))"
-        )
-        result = run_supervisor(
-            "--timeout-seconds",
-            "2",
-            "--new-session",
-            "--",
-            sys.executable,
-            "-c",
-            probe,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        identity = json.loads(result.stdout)
-        self.assertEqual(identity["pgid"], identity["pid"])
-        self.assertEqual(identity["sid"], identity["pid"])
-        self.assertNotEqual(identity["sid"], os.getsid(0))
 
     def test_timeout_signals_group_then_waits_full_grace(self) -> None:
         grandchild = """
@@ -286,6 +327,66 @@ time.sleep(30)
             ["forwarded signal; process-group cleanup unverified"],
         )
 
+    def test_second_signal_during_timeout_transition_cannot_escape_cleanup(
+        self,
+    ) -> None:
+        supervisor = load_supervisor_module()
+        original_popen = subprocess.Popen
+        original_ignore = supervisor.ignore_managed_signals
+        started: list[subprocess.Popen[bytes]] = []
+        ignore_calls = 0
+
+        def record_spawn(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            process = original_popen(*args, **kwargs)
+            started.append(process)
+            return process
+
+        def cleanup_started() -> None:
+            for process in started:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+
+        self.addCleanup(cleanup_started)
+
+        def interrupt_then_ignore() -> None:
+            nonlocal ignore_calls
+            ignore_calls += 1
+            handler = signal.getsignal(signal.SIGTERM)
+            if not callable(handler):
+                raise AssertionError("managed signal handler is not callable")
+            signum = signal.SIGTERM if ignore_calls == 1 else signal.SIGINT
+            handler(signum, None)
+            original_ignore()
+
+        with (
+            mock.patch.object(supervisor.subprocess, "Popen", record_spawn),
+            mock.patch.object(
+                supervisor,
+                "ignore_managed_signals",
+                side_effect=interrupt_then_ignore,
+            ),
+        ):
+            returncode = supervisor.main(
+                [
+                    "--timeout-seconds",
+                    "0.05",
+                    "--grace-seconds",
+                    "0",
+                    "--",
+                    "/bin/sleep",
+                    "30",
+                ]
+            )
+
+        self.assertEqual(returncode, 143)
+        self.assertEqual(ignore_calls, 2)
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll())
+
     def test_setsid_descendant_is_not_chased(self) -> None:
         escaped = """
 import os
@@ -342,15 +443,28 @@ import time
 from pathlib import Path
 
 marker = Path(sys.argv[1])
-time.sleep(0.4)
-marker.write_text("finished", encoding="utf-8")
+ready = Path(sys.argv[2])
+release = Path(sys.argv[3])
+ready.write_text("ready", encoding="utf-8")
+deadline = time.monotonic() + 5
+while not release.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+if release.exists():
+    marker.write_text("finished", encoding="utf-8")
 """
         leader = """
 import subprocess
 import sys
 
 subprocess.Popen(
-    [sys.executable, "-c", sys.argv[2], sys.argv[1]],
+    [
+        sys.executable,
+        "-c",
+        sys.argv[4],
+        sys.argv[1],
+        sys.argv[2],
+        sys.argv[3],
+    ],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
@@ -358,48 +472,25 @@ subprocess.Popen(
 """
         with tempfile.TemporaryDirectory() as temp_dir:
             marker = Path(temp_dir) / "background-finished"
-            result = run_supervisor(
-                "--timeout-seconds",
-                "2",
-                "--",
-                sys.executable,
-                "-c",
-                leader,
-                str(marker),
-                background,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(marker.exists())
+            ready = Path(temp_dir) / "background-ready"
+            release = Path(temp_dir) / "background-release"
+            try:
+                result = run_supervisor(
+                    "--timeout-seconds",
+                    "2",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    leader,
+                    str(marker),
+                    str(ready),
+                    str(release),
+                    background,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                wait_for_file(ready)
+                self.assertFalse(marker.exists())
+            finally:
+                release.write_text("release", encoding="utf-8")
             wait_for_file(marker, timeout=2)
             self.assertEqual(marker.read_text(encoding="utf-8"), "finished")
-
-    def test_cli_and_spawn_failures_are_distinct(self) -> None:
-        invalid = run_supervisor(
-            "--timeout-seconds",
-            "inf",
-            "--",
-            sys.executable,
-            "-c",
-            "pass",
-        )
-        self.assertEqual(invalid.returncode, 2)
-
-        missing = run_supervisor(
-            "--timeout-seconds",
-            "1",
-            "--",
-            "/definitely/missing/bounded-command",
-        )
-        self.assertEqual(missing.returncode, 127)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            nonexecutable = Path(temp_dir) / "not-executable"
-            nonexecutable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            nonexecutable.chmod(0o600)
-            denied = run_supervisor(
-                "--timeout-seconds",
-                "1",
-                "--",
-                str(nonexecutable),
-            )
-            self.assertEqual(denied.returncode, 126)
