@@ -25,7 +25,7 @@ superseded_by:
 - Timed-out filesystem branches remain explicitly unknown or incomplete.
 - Numeric deadlines are illustrative rather than default thresholds; long-running scans are not friction by duration alone.
 - The main skill now triggers on uncertain runtime as well as uncertain output and routes one-line SQLite aggregates or similar scans to the deadline reference instead of skipping them as small output.
-- macOS single-process scans have a system-Perl direct-`exec` deadline pattern that preserves ordinary exit statuses and maps `SIGALRM` to an explicit incomplete result.
+- The earlier system-Perl `alarm`/`exec` pattern is explicitly rejected as a general hard deadline because a target can alter `SIGALRM` and ordinary `exit(142)` is ambiguous; POSIX single-process scans now use the same external process-group supervisor as descendant-producing commands.
 - A POSIX/Python 3.10 process-group wrapper adds TERM/grace/KILL handling for ordinary child processes without requiring root, a container, tree scanning, or a persistent launcher process.
 - Native Windows and other non-POSIX runtimes explicitly skip this process-group safeguard and must not claim equivalent cleanup; accidental invocation returns `125` before installing signal handlers or starting the command, while WSL follows the POSIX capability path.
 - One absolute monotonic deadline starts before pipe creation and `fork`; a masked `READY`/`GO` barrier prevents user code from running until the parent has recorded the child PID and process-group handoff.

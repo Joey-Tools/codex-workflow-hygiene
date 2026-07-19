@@ -51,22 +51,9 @@ Keep the full retained artifact under a task-scoped directory such as `.codex-tm
 - SQLite `.timeout` controls how long the client waits for a busy lock; it is not a query-execution deadline. On a large or actively written database, start with metadata, `sqlite_sequence`, schema/index inspection, or a narrow indexed range. Put any broad aggregate behind an outer hard wall-clock deadline, and treat a terminated query as incomplete rather than as an empty result.
 - Broad macOS `du` walks under `$HOME`, `/System/Volumes/Data`, Containers, or FileProvider-backed trees require a hard deadline before launch. A PTY and repeated polling make the walk interruptible but do not bound its runtime. Split the scan into explicit top-level directories or narrower branches, and report every timed-out branch as unknown or incomplete instead of inferring a total from the surviving branches.
 
-macOS does not ship GNU `timeout`, but its system Perl can put a direct single-process producer under a real deadline without a shell-inside-a-shell wrapper. Choose a task-specific deadline before launch; the numeric value below is illustrative rather than a default or threshold. This SQLite probe preserves ordinary exit statuses, turns `SIGALRM` into an explicit incomplete result, and terminates the producer itself:
+macOS does not ship GNU `timeout`. Do not use an in-process Perl `alarm` plus `exec` as a general hard deadline: the target inherits and can ignore, block, replace, or cancel `SIGALRM`, and exit status `142` cannot distinguish a normal `exit(142)` from signal termination. Choose a task-specific deadline before launch; numeric examples are illustrative rather than defaults or slow-command thresholds.
 
-```bash
-/usr/bin/perl -e 'alarm shift; exec @ARGV or die qq(exec failed: $!\n)' \
-  60 /usr/bin/sqlite3 /exact/path/database.sqlite 'SELECT count(*) FROM events;'
-status=$?
-if (( status == 142 )); then
-  printf '%s\n' 'deadline exceeded; result incomplete' >&2
-  exit 124
-fi
-exit "$status"
-```
-
-Use the same prefix with `/usr/bin/du -xhd 1 /exact/path` for a bounded filesystem walk. This direct-`exec` pattern is sufficient when terminating the exec'd producer ends all task-owned work. Launching descendants does not by itself require containing and terminating the whole process unit.
-
-When ordinary same-user child processes should receive the timeout signal too, use the lightweight process-group wrapper without adding a container:
+On POSIX, put even a single SQLite or `du` producer behind the lightweight external process-group wrapper. The separate supervisor owns the monotonic deadline and preserves the target's ordinary exit status without adding a container:
 
 Use this wrapper only when Python reports `os.name == "posix"` and the required POSIX process APIs are available. On native Windows (non-WSL) or any other non-POSIX runtime, skip this protection: do not invoke the wrapper and do not claim process-group or descendant cleanup. WSL uses its Linux/POSIX runtime and remains eligible when those APIs are present. The other scope, output, and evidence guardrails still apply; a native-Windows supervisor would be a separate, explicitly validated mechanism rather than an implicit substitute. If this script is invoked accidentally on a non-POSIX host, it returns `125` before installing signal handlers or starting the command.
 
@@ -74,8 +61,10 @@ Use this wrapper only when Python reports `os.name == "posix"` and the required 
 python3 <loaded-skill-dir>/scripts/run_process_group_deadline.py \
   --timeout-seconds <task-specific-seconds> \
   --grace-seconds 1 \
-  -- /usr/bin/du -xhd 1 /exact/path
+  -- /usr/bin/sqlite3 /exact/path/database.sqlite 'SELECT count(*) FROM events;'
 ```
+
+Use the same wrapper with `/usr/bin/du -xhd 1 /exact/path` for a bounded filesystem walk. Launching descendants does not by itself require stronger containment; the wrapper's documented process-group boundary is sufficient when ordinary same-user descendants should receive the timeout signals too.
 
 The wrapper runs direct argv without an implicit shell, inherits only standard input, output, and error, and adds no persistent launcher between itself and the command. It takes one absolute monotonic deadline before creating the control pipes and forking. The child establishes its process group or session, reports `READY`, and waits for the parent's `GO` before it can execute user code. Before `READY`, timeout or cancellation safely targets only the known child PID; after `GO`, setup, `exec`, and command runtime all consume the same deadline budget and cleanup targets the known PGID. Direct-child waiting uses capped exponential backoff and settles at no more than about 25 nonblocking `waitpid` observations per second for a long-running command. The wrapper checks the deadline before each new exit observation; a direct-child status returned by an observation begun before the deadline wins that boundary race, while no new observation starts once the deadline is reached. The supervisor parent unblocks managed `INT`, `TERM`, and `HUP` signals while it owns cleanup, even if its launcher blocked them; the target child receives the launcher's original signal mask, and the parent restores that mask during teardown. The first timeout or managed signal owns one cleanup transition, so later managed signals cannot interrupt it. On timeout the wrapper sends `TERM`, waits the complete selected grace period without reaping the group leader, sends best-effort `KILL`, and then waits only for its direct child. Diagnostics are best effort and temporarily make standard error nonblocking for one short write: a closed or broken sink, or a full pipe, cannot replace or indefinitely delay the command, timeout, or forwarded-signal status. Because that flag belongs to the shared open-file description, an uncatchable child death in the short toggle window can leave inherited standard error nonblocking; eliminating that edge requires a dedicated diagnostic channel outside this lightweight contract. A normal child exit is returned unchanged; a deadline returns `124`, and an externally received `INT`, `TERM`, or `HUP` is forwarded before the wrapper returns the conventional `128 + signal` status.
 

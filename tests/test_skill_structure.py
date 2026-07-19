@@ -106,15 +106,14 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("A PTY and repeated polling", patterns)
         self.assertIn("report every timed-out branch as unknown or incomplete", patterns)
         self.assertIn("macOS does not ship GNU `timeout`", patterns)
-        self.assertIn("/usr/bin/perl -e 'alarm shift; exec @ARGV", patterns)
-        self.assertIn("status == 142", patterns)
-        self.assertIn("deadline exceeded; result incomplete", patterns)
+        self.assertIn("Do not use an in-process Perl `alarm` plus `exec`", patterns)
+        self.assertIn("exit status `142` cannot distinguish", patterns)
+        self.assertIn("even a single SQLite or `du` producer", patterns)
         self.assertIn("Choose a task-specific deadline before launch", patterns)
-        self.assertIn("illustrative rather than a default or threshold", patterns)
-        self.assertIn("terminating the exec'd producer ends all task-owned work", patterns)
+        self.assertIn("illustrative rather than defaults", patterns)
+        self.assertIn("separate supervisor owns the monotonic deadline", patterns)
         self.assertIn(
-            "Launching descendants does not by itself require containing and "
-            "terminating the whole process unit",
+            "Launching descendants does not by itself require stronger containment",
             patterns,
         )
         self.assertIn("adds no persistent launcher", patterns)
