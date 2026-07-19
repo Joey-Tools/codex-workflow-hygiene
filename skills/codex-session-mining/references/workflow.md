@@ -239,24 +239,134 @@ Broad keyword searches across `history.jsonl`, `session_index.jsonl`, `sessions/
 python3 - <<'PY'
 from pathlib import Path
 import json
+import math
+import os
 import re
 
-paths = [Path('~/.codex/history.jsonl').expanduser()]
+codex_root = Path(os.environ.get('CODEX_HOME', '~/.codex')).expanduser()
+sources = (
+    ('history', codex_root / 'history.jsonl', 'session_id', 'ts', 'text'),
+    ('session_index', codex_root / 'session_index.jsonl', 'id', 'updated_at', 'thread_name'),
+)
 needle = re.compile(r'review|codex thread|pull/84', re.I)
-printed = 0
+max_record_bytes = 1024 * 1024
+drain_chunk_bytes = 64 * 1024
+per_source_match_cap = 20
+global_match_limit = 20
 
-for path in paths:
-    for line_no, line in enumerate(path.open(encoding='utf-8', errors='replace'), 1):
-        if not needle.search(line):
+def bounded_field(value, limit):
+    if not isinstance(value, str):
+        return ''
+    return ' '.join(value.split())[:limit]
+
+def bounded_timestamp(value, limit):
+    if isinstance(value, str):
+        return bounded_field(value, limit)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ''
+    if isinstance(value, float) and not math.isfinite(value):
+        return ''
+    encoded = json.dumps(value, allow_nan=False)
+    return value if len(encoded) <= limit else ''
+
+source_results = []
+for source_name, path, id_key, timestamp_key, text_key in sources:
+    matches = []
+    source_truncated = False
+    try:
+        handle = path.open('rb')
+    except FileNotFoundError:
+        source_results.append({
+            'available': False,
+            'matches': matches,
+            'name': source_name,
+            'truncated': source_truncated,
+        })
+        continue
+    with handle:
+        line_no = 0
+        while True:
+            raw_line = handle.readline(max_record_bytes + 1)
+            if not raw_line:
+                break
+            line_no += 1
+            if len(raw_line) > max_record_bytes:
+                while raw_line and not raw_line.endswith(b'\n'):
+                    raw_line = handle.readline(drain_chunk_bytes)
+                continue
+            try:
+                row = json.loads(raw_line.decode('utf-8'))
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(row, dict):
+                continue
+            text = row.get(text_key)
+            if not isinstance(text, str) or not needle.search(text):
+                continue
+            if len(matches) >= per_source_match_cap:
+                source_truncated = True
+                break
+            projection = {
+                'id': bounded_field(row.get(id_key), 200),
+                'line': line_no,
+                'path': str(path),
+                'text': bounded_field(text, 300),
+                'timestamp': bounded_timestamp(row.get(timestamp_key), 200),
+            }
+            matches.append(projection)
+    source_results.append({
+        'available': True,
+        'matches': matches,
+        'name': source_name,
+        'truncated': source_truncated,
+    })
+
+emitted_counts = [0] * len(source_results)
+match_rows_emitted = 0
+for match_index in range(per_source_match_cap):
+    for source_index, result in enumerate(source_results):
+        matches = result['matches']
+        if match_index >= len(matches):
             continue
-        row = json.loads(line)
-        text = ' '.join(str(row.get('text') or '').split())[:300]
-        print(f'{path}:{line_no}:{row.get("session_id")}:{row.get("ts")}:{text}')
-        printed += 1
-        if printed >= 20:
-            raise SystemExit
+        if match_rows_emitted >= global_match_limit:
+            break
+        print(json.dumps(matches[match_index], ensure_ascii=True, sort_keys=True))
+        emitted_counts[source_index] += 1
+        match_rows_emitted += 1
+    if match_rows_emitted >= global_match_limit:
+        break
+
+source_meta = {}
+global_output_truncated = False
+for source_index, result in enumerate(source_results):
+    retained = len(result['matches'])
+    emitted = emitted_counts[source_index]
+    truncated = result['truncated']
+    source_meta[result['name']] = {
+        'available': result['available'],
+        'emitted': emitted,
+        'match_cap': per_source_match_cap,
+        'retained': retained,
+        'truncated': truncated,
+    }
+    if truncated or emitted < retained:
+        global_output_truncated = True
+
+print(json.dumps({
+    'global_match_limit': global_match_limit,
+    'global_output_truncated': global_output_truncated,
+    'kind': 'scan_meta',
+    'match_rows_emitted': match_rows_emitted,
+    'sources': source_meta,
+}, ensure_ascii=True, sort_keys=True))
 PY
 ```
+
+This index recipe reads binary physical records up to 1 MiB, drains any oversized record through LF in fixed 64 KiB reads, and treats a bare CR as record data. It strictly decodes UTF-8 and JSON, ignores malformed or non-object records, and searches only the public text field for each index schema. String fields are normalized and length-limited before the outer JSON encoder escapes controls; timestamps additionally preserve bounded JSON integers and finite floats while rejecting booleans, non-finite floats, and oversized numeric projections.
+
+Each source is scanned independently in the fixed order shown above. The recipe retains its first 20 matches in physical-record order, detects a 21st match as source truncation, and then proceeds to the next source. It emits retained matches round-robin in source order, capped at 20 match rows total, so a busy earlier source cannot starve a later one. One fixed-shape `scan_meta` record is always emitted last, making the complete output at most 21 JSON lines. For each source, metadata reports whether the file was available, the 20-match collection cap, retained and emitted counts, and whether a 21st source match was detected. `global_output_truncated` is true when any source detected that extra match or any retained match could not fit in the global output cap. A missing source reports `available: false`; an available source with no matches reports zero retained and emitted rows without truncation.
+
+Use the later bounded rollout probe for `sessions/**/rollout-*.jsonl` and `archived_sessions/**/rollout-*.jsonl`, whose nested record shapes require their own selectors.
 
 ## 2. Extract Only The Relevant Parts
 
@@ -480,6 +590,15 @@ def hit_window(parts, raw_needle):
     return prefix + ''.join(after)
 
 
+def escaped_output_text(value):
+    return ''.join(
+        character
+        if character.isprintable()
+        else json.dumps(character, ensure_ascii=True)[1:-1]
+        for character in value
+    )
+
+
 with path.open('rb') as handle:
     records = bounded_jsonl(handle)
     for line_no, raw_line in records:
@@ -504,14 +623,15 @@ with path.open('rb') as handle:
         )
         if snippet is None:
             continue
-        print(f'{path}:{line_no}:{timestamp}:{record_kind}:{snippet}')
+        safe_snippet = escaped_output_text(snippet)
+        print(f'{path}:{line_no}:{timestamp}:{record_kind}:{safe_snippet}')
         printed += 1
         if printed >= 20:
             break
 PY
 ```
 
-The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
+The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. After raw matching and window selection, the snippet JSON-escapes only non-printable characters so terminal control sequences cannot reach stdout while printable Unicode remains unchanged. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
 
 For JSONL schema checks, inspect one record or aggregate unique keys once. Do not run `jq -R 'fromjson | keys' file.jsonl`, because it prints the same key list for every line and can produce massive output on retained artifacts such as `turn_flags.jsonl`.
 
@@ -523,27 +643,97 @@ import sys
 
 path = Path(sys.argv[1])
 line_count = 0
-keys = set()
-first = None
+unique_keys = set()
+unique_key_utf8_bytes = 0
+unique_keys_truncated = False
+unique_keys_truncation_reason = None
+first_record_seen = False
+first_record_keys = []
+first_record_key_utf8_bytes = 0
+first_record_keys_truncated = False
+max_record_bytes = 1024 * 1024
+drain_chunk_bytes = 64 * 1024
+max_unique_keys = 256
+max_unique_key_utf8_bytes = 32 * 1024
 
-with path.open(encoding='utf-8', errors='replace') as handle:
-    for line in handle:
+with path.open('rb') as handle:
+    while True:
+        raw_line = handle.readline(max_record_bytes + 1)
+        if not raw_line:
+            break
         line_count += 1
-        if not line.strip():
+        if len(raw_line) > max_record_bytes:
+            while raw_line and not raw_line.endswith(b'\n'):
+                raw_line = handle.readline(drain_chunk_bytes)
             continue
-        row = json.loads(line)
-        if first is None:
-            first = row
-        keys.update(row.keys())
+        try:
+            row = json.loads(raw_line.decode('utf-8'))
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        if not first_record_seen:
+            first_record_seen = True
+            for key in row:
+                try:
+                    key_utf8_bytes = len(key.encode('utf-8'))
+                except UnicodeEncodeError:
+                    first_record_keys_truncated = True
+                    break
+                if (
+                    len(first_record_keys) >= max_unique_keys
+                    or first_record_key_utf8_bytes + key_utf8_bytes
+                    > max_unique_key_utf8_bytes
+                ):
+                    first_record_keys_truncated = True
+                    break
+                first_record_keys.append(key)
+                first_record_key_utf8_bytes += key_utf8_bytes
+        if unique_keys_truncated:
+            continue
+        for key in row:
+            if key in unique_keys:
+                continue
+            try:
+                key_utf8_bytes = len(key.encode('utf-8'))
+            except UnicodeEncodeError:
+                unique_keys_truncated = True
+                unique_keys_truncation_reason = 'non_utf8_key'
+                break
+            if len(unique_keys) >= max_unique_keys:
+                unique_keys_truncated = True
+                unique_keys_truncation_reason = 'count'
+                break
+            if unique_key_utf8_bytes + key_utf8_bytes > max_unique_key_utf8_bytes:
+                unique_keys_truncated = True
+                unique_keys_truncation_reason = 'utf8_bytes'
+                break
+            unique_keys.add(key)
+            unique_key_utf8_bytes += key_utf8_bytes
 
 print(json.dumps({
     'path': str(path),
     'line_count': line_count,
-    'first_record_keys': sorted(first.keys()) if isinstance(first, dict) else [],
-    'unique_keys': sorted(keys),
+    'first_record_key_count': len(first_record_keys),
+    'first_record_key_utf8_bytes': first_record_key_utf8_bytes,
+    'first_record_keys': sorted(first_record_keys),
+    'first_record_keys_truncated': first_record_keys_truncated,
+    'max_unique_keys': max_unique_keys,
+    'max_unique_key_utf8_bytes': max_unique_key_utf8_bytes,
+    'unique_key_count': len(unique_keys),
+    'unique_key_utf8_bytes': unique_key_utf8_bytes,
+    'unique_keys': sorted(unique_keys),
+    'unique_keys_truncated': unique_keys_truncated,
+    'unique_keys_truncation_reason': unique_keys_truncation_reason,
 }, ensure_ascii=True, sort_keys=True))
 PY
 ```
+
+The schema recipe applies the same 1 MiB binary physical-record cap and fixed-size LF drain. Invalid UTF-8, malformed JSON, non-object top-level values, and oversized records still count as physical input records but do not contribute schema keys.
+
+Schema keys use a deterministic bounded-prefix contract. New keys are considered in physical-record order and then in decoded JSON object order. Duplicate keys do not consume budget. A key is accepted when doing so keeps both the unique-key count at or below 256 and the cumulative size of decoded keys under strict UTF-8 encoding at or below 32 KiB. The first new key that would exceed either boundary is omitted, `unique_keys_truncated` becomes true, `unique_keys_truncation_reason` records `count` or `utf8_bytes`, and no later new keys are accepted. If both limits would be exceeded by the same key, `count` wins because that boundary is checked first. A decoded key that cannot be encoded as strict UTF-8 instead records `non_utf8_key` and stops the prefix at that key. The reported count and byte total describe the retained prefix exactly; sorting happens only after that prefix is bounded. The first valid object remains the source of `first_record_keys`, whose projection uses the same count, byte, and strict-encoding boundaries and reports its own truncation marker.
+
+Beyond a fixed number of per-record parsing objects derived from physical records capped at 1 MiB, the recipe retains at most 256 global keys totaling at most 32 KiB under strict UTF-8 encoding and the equivalently bounded first-record key projection. Its key-list output has the same count and strict-encoding byte bounds before JSON escaping, whose expansion is itself bounded by a constant factor.
 
 Show user and assistant messages for one rollout, while skipping the wrapper noise that otherwise makes every session look like it mentioned every listed skill:
 

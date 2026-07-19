@@ -298,6 +298,20 @@ def embedded_probe_namespace(payload: dict[str, object]) -> dict[str, object]:
     return namespace
 
 
+def bounded_text_line_readers(summary_line_bytes: int | None = None):
+    payload: dict[str, object] = {
+        "mode": "rollout-summary",
+        "codex_root": ".",
+    }
+    if summary_line_bytes is not None:
+        payload["summary_line_bytes"] = summary_line_bytes
+    namespace = embedded_probe_namespace(payload)
+    return (
+        ("local", REMOTE_PROBE._bounded_text_lines),
+        ("embedded", namespace["bounded_text_lines"]),
+    )
+
+
 class SessionRetrospectiveTests(unittest.TestCase):
     def setUp(self) -> None:
         self._key_tmp = tempfile.TemporaryDirectory()
@@ -583,6 +597,162 @@ class SessionRetrospectiveTests(unittest.TestCase):
 
         self.assertEqual(scan_meta["json_error_count"], 1)
         self.assertNotIn("coverage_proof", scan_meta)
+
+    def test_remote_probe_rollout_summary_counts_invalid_event_message_container_local_and_embedded(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-invalid-event-message.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:00Z",
+                        "payload": {"type": "user_message"},
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:01Z",
+                        "payload": {"type": "user_message", "message": None},
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:02Z",
+                        "payload": {"type": "user_message", "message": []},
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:03Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "Ordinary nested assistant.",
+                                    }
+                                ],
+                            },
+                            "text": "permission denied tempting assistant fallback",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:04Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": "Ordinary nested missing role.",
+                                    }
+                                ],
+                            },
+                            "text": "permission denied tempting missing-role fallback",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:05Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": "You forgot the valid explicit string evidence.",
+                            "text": "permission denied tempting string fallback",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-01T10:00:06Z",
+                        "payload": {
+                            "type": "user_message",
+                            "text": "You forgot the valid legacy fallback evidence.",
+                        },
+                    },
+                    message(
+                        "user",
+                        "You missed the valid evidence after the malformed event.",
+                        "2026-05-01T10:01:00Z",
+                    ),
+                    message(
+                        "assistant",
+                        "Ordinary completion after the malformed event.",
+                        "2026-05-01T10:02:00Z",
+                    ),
+                ],
+            )
+            local_stdout = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE, "_local_codex_root", return_value=root
+            ), mock.patch.object(sys, "stdout", local_stdout):
+                local_result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=40,
+                        tail_records=8,
+                        max_text_chars=400,
+                    )
+                )
+
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "rollout": rollout_ref,
+                    "codex_root": str(root),
+                    "summary_keywords": [],
+                    "summary_limit": 40,
+                    "summary_scan_bytes": REMOTE_PROBE.MAX_ROLLOUT_SUMMARY_SCAN_BYTES,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 400,
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(local_result, 0)
+        self.assertEqual(embedded.returncode, 0, embedded.stderr)
+        local_rows = [json.loads(line) for line in local_stdout.getvalue().splitlines()]
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                embedded.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                host="embedded",
+                command="rollout-summary",
+            )
+        ]
+        for rows in (local_rows, embedded_rows):
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(scan_meta["json_error_count"], 5)
+            self.assertEqual(scan_meta["summary_record_count"], 4)
+            self.assertNotIn("coverage_proof", scan_meta)
+            user_message_rows = [
+                row
+                for row in rows
+                if row.get("kind") == "user_message"
+            ]
+            self.assertEqual(
+                {row.get("line") for row in user_message_rows},
+                {6, 7, 8},
+            )
+            self.assertTrue(
+                all(row.get("text") == "you missed" for row in user_message_rows)
+            )
+            self.assertTrue(
+                any(row.get("kind") == "assistant_message" for row in rows)
+            )
+            self.assertNotIn("approval", json.dumps(rows, sort_keys=True))
 
     def test_remote_probe_rollout_summary_records_source_identity_with_tail_limited_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1495,6 +1665,88 @@ class SessionRetrospectiveTests(unittest.TestCase):
             },
         )
 
+    def test_remote_probe_session_meta_skipped_active_files_do_not_consume_row_limit_local_and_embedded(
+        self,
+    ) -> None:
+        for include_valid in (False, True):
+            with self.subTest(include_valid=include_valid), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / ".codex"
+                session_dir = root / "sessions" / "2026" / "05" / "01"
+                for hour in (13, 12, 11):
+                    write_jsonl(
+                        session_dir
+                        / f"rollout-2026-05-01T{hour:02d}-00-00-no-meta.jsonl",
+                        [
+                            {
+                                "type": "response_item",
+                                "timestamp": f"2026-05-01T{hour:02d}:00:00Z",
+                                "payload": {"type": "message", "role": "user"},
+                            }
+                        ],
+                    )
+                if include_valid:
+                    write_jsonl(
+                        session_dir
+                        / "rollout-2026-05-01T10-00-00-usable.jsonl",
+                        [
+                            {
+                                "type": "session_meta",
+                                "timestamp": "2026-05-01T10:00:00Z",
+                                "payload": {
+                                    "id": "usable-session",
+                                    "cwd": "/redacted/repo",
+                                },
+                            }
+                        ],
+                    )
+
+                local_scan = REMOTE_PROBE._scan_session_meta_records(
+                    codex_root=root,
+                    dates=[dt.date(2026, 5, 1)],
+                    limit=1,
+                    host="local",
+                )
+                script = REMOTE_PROBE._remote_python_script(
+                    {
+                        "mode": "session-meta",
+                        "codex_root": str(root),
+                        "dates": ["2026/05/01"],
+                        "limit": 1,
+                        "session_meta_scan_bytes": (
+                            REMOTE_PROBE.MAX_SESSION_META_SCAN_BYTES
+                        ),
+                    }
+                )
+                embedded = subprocess.run(
+                    [sys.executable, "-"],
+                    input=script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            expected_session_ids = ["usable-session"] if include_valid else []
+            self.assertFalse(local_scan.truncated)
+            self.assertEqual(
+                [row["session_id"] for row in local_scan.rows],
+                expected_session_ids,
+            )
+            self.assertEqual(embedded.returncode, 0, embedded.stderr)
+            embedded_rows = [
+                json.loads(line)
+                for line in REMOTE_PROBE._extract_framed_lines(
+                    embedded.stdout,
+                    begin_marker=REMOTE_PROBE.REMOTE_SESSION_META_BEGIN,
+                    end_marker=REMOTE_PROBE.REMOTE_SESSION_META_END,
+                    host="embedded",
+                    command="session-meta",
+                )
+            ]
+            self.assertEqual(
+                [row["session_id"] for row in embedded_rows],
+                expected_session_ids,
+            )
+
     def test_remote_probe_session_meta_sorts_selected_duplicate_before_limit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -2087,24 +2339,40 @@ class SessionRetrospectiveTests(unittest.TestCase):
         row = json.dumps(
             {"date": "2026/05/01", "session_id": "session-1", "cwd": "/redacted/repo", "rollout": "sessions/2026/05/01/rollout-1.jsonl"}
         )
-        marker = json.dumps({"kind": "truncation", "reason": REMOTE_PROBE.SESSION_META_LIMIT_TRUNCATED_REASON, "date": "2026/05/01", "limit": 1})
-        remote_output = f"{REMOTE_PROBE.REMOTE_SESSION_META_BEGIN}\n{row}\n{marker}\n{REMOTE_PROBE.REMOTE_SESSION_META_END}\n"
-        stderr = io.StringIO()
-        stdout = io.StringIO()
+        truncation_markers = (
+            {
+                "kind": "truncation",
+                "reason": REMOTE_PROBE.SESSION_META_LIMIT_TRUNCATED_REASON,
+                "date": "2026/05/01",
+                "limit": 1,
+            },
+            {
+                "kind": "truncation",
+                "reason": REMOTE_PROBE.SESSION_META_CANDIDATE_LIMIT_TRUNCATED_REASON,
+                "date": "2026/05/01",
+                "candidate_limit": REMOTE_PROBE.MAX_SESSION_META_CANDIDATE_LIMIT,
+            },
+        )
+        for marker_item in truncation_markers:
+            with self.subTest(reason=marker_item["reason"]):
+                marker = json.dumps(marker_item)
+                remote_output = f"{REMOTE_PROBE.REMOTE_SESSION_META_BEGIN}\n{row}\n{marker}\n{REMOTE_PROBE.REMOTE_SESSION_META_END}\n"
+                stderr = io.StringIO()
+                stdout = io.StringIO()
 
-        with mock.patch.object(
-            REMOTE_PROBE,
-            "_run_remote_python_bounded",
-            return_value=subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout=remote_output, stderr=""),
-        ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(sys, "stdout", stdout):
-            result = REMOTE_PROBE.cmd_session_meta(
-                types.SimpleNamespace(host=["miku-bot-dev"], date=["2026/05/01"], from_date=None, to_date=None, limit=1)
-            )
+                with mock.patch.object(
+                    REMOTE_PROBE,
+                    "_run_remote_python_bounded",
+                    return_value=subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout=remote_output, stderr=""),
+                ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(sys, "stdout", stdout):
+                    result = REMOTE_PROBE.cmd_session_meta(
+                        types.SimpleNamespace(host=["miku-bot-dev"], date=["2026/05/01"], from_date=None, to_date=None, limit=1)
+                    )
 
-        self.assertEqual(result, 1)
-        self.assertIn("host=miku-bot-dev", stderr.getvalue())
-        self.assertIn("session-meta result exceeded --limit=1", stderr.getvalue())
-        self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(result, 1)
+                self.assertIn("host=miku-bot-dev", stderr.getvalue())
+                self.assertIn("session-meta result exceeded --limit=1", stderr.getvalue())
+                self.assertEqual(stdout.getvalue(), "")
 
     def test_remote_probe_session_meta_rejects_global_limit_truncation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3148,8 +3416,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
                 )
                 real_lines = namespace["bounded_text_lines"]
 
-                def lines_then_mutate(handle: object, max_scan_bytes: int):
-                    yield from real_lines(handle, max_scan_bytes)
+                def lines_then_mutate(
+                    handle: object, max_scan_bytes: int, source_size: int
+                ):
+                    yield from real_lines(handle, max_scan_bytes, source_size)
                     if mutation == "append":
                         with rollout.open("ab") as output:
                             output.write(b"{}\n")
@@ -3445,6 +3715,28 @@ class SessionRetrospectiveTests(unittest.TestCase):
             reader = REMOTE_PROBE._HashingReader(handle)
             with self.assertRaisesRegex(TypeError, "requires binary input"):
                 reader.read()
+
+    def test_remote_probe_hashing_readers_forward_tell(self) -> None:
+        namespace = embedded_probe_namespace(
+            {
+                "mode": "rollout-summary",
+                "codex_root": ".",
+            }
+        )
+        payload = b"prefix\nsuffix"
+
+        for implementation, reader_type in (
+            ("local", REMOTE_PROBE._HashingReader),
+            ("embedded", namespace["HashingReader"]),
+        ):
+            with self.subTest(implementation=implementation):
+                handle = io.BytesIO(payload)
+                handle.seek(len(b"prefix\n"))
+                reader = reader_type(handle)
+
+                self.assertEqual(reader.tell(), len(b"prefix\n"))
+                self.assertEqual(reader.read(2), b"su")
+                self.assertEqual(reader.tell(), len(b"prefix\nsu"))
 
     def test_remote_probe_local_rollout_summary_hashes_exact_raw_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3756,6 +4048,875 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertEqual(meta["json_error_count"], 1)
         self.assertFalse(meta["record_limit_reached"])
 
+    def test_remote_probe_rollout_summary_counts_schema_errors_local_and_embedded(
+        self,
+    ) -> None:
+        malformed_shapes: list[object] = [
+            None,
+            [],
+            "scalar",
+            {"type": "session_meta", "payload": None},
+            {"type": "response_item", "payload": []},
+            {"type": "event_msg", "payload": "scalar"},
+            {"type": "session_meta", "payload": {}},
+            {"type": "session_meta", "payload": {"id": ""}},
+            {"type": "session_meta", "payload": {"id": None}},
+            {"type": "session_meta", "payload": {"id": 7}},
+            {
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": None},
+            },
+            {
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": "scalar"},
+            },
+            {
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [None]},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text"}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": 7}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": []}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": {}}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{}],
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": None},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": "scalar"},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": [None]},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text"}],
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": None}],
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": [{"type": []}]},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": [{"type": {}}]},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {"role": "user", "content": [{}]},
+                },
+            },
+        ]
+        valid_ignored_shapes = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "unsupported"}],
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "unsupported"}],
+                    },
+                    "text": "permission denied unsupported dict fallback",
+                },
+            },
+        ]
+        pathological_records = (
+            b"9" * 5000 + b"\n",
+            b"[" * 1100 + b"null" + b"]" * 1100 + b"\n",
+        )
+        valid_session_meta = {
+            "type": "session_meta",
+            "timestamp": "2026-05-01T09:59:00Z",
+            "payload": {"id": "schema-safe-session", "cwd": "/schema-safe/repo"},
+        }
+        valid_rows = [
+            message("user", "You missed the schema-safe follow-up.", "2026-05-01T10:00:00Z"),
+            message("assistant", "Ordinary schema-safe completion.", "2026-05-01T10:01:00Z"),
+        ]
+        invalid_utf8_fields = ("timestamp", "id", "cwd")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-schema-errors.jsonl"
+            rollout = root / rollout_ref
+            rollout.parent.mkdir(parents=True)
+            payload = b"".join(
+                json.dumps(row).encode("utf-8") + b"\n" for row in malformed_shapes
+            )
+            payload += b"".join(pathological_records)
+            for field in invalid_utf8_fields:
+                row = {
+                    "type": "session_meta",
+                    "timestamp": "2026-05-01T10:00:00Z",
+                    "payload": {"id": "valid-session", "cwd": "/valid/repo"},
+                }
+                if field == "timestamp":
+                    row[field] = "invalid-byte-marker"
+                else:
+                    row["payload"][field] = "invalid-byte-marker"
+                encoded = json.dumps(row, separators=(",", ":")).encode("utf-8")
+                payload += encoded.replace(b"invalid-byte-marker", b"invalid-\xff-byte") + b"\n"
+            payload += b"".join(
+                json.dumps(row).encode("utf-8") + b"\n"
+                for row in [*valid_ignored_shapes, valid_session_meta]
+            )
+            payload += b"".join(
+                json.dumps(row).encode("utf-8") + b"\n" for row in valid_rows
+            )
+            rollout.write_bytes(payload)
+            local_stdout = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE, "_local_codex_root", return_value=root
+            ), mock.patch.object(sys, "stdout", local_stdout):
+                local_result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=10,
+                        tail_records=8,
+                        max_text_chars=120,
+                    )
+                )
+
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": rollout_ref,
+                    "summary_limit": 10,
+                    "summary_scan_bytes": rollout.stat().st_size,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 120,
+                    "summary_keywords": [],
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(local_result, 0)
+        self.assertEqual(embedded.returncode, 0, embedded.stderr)
+        local_rows = [json.loads(line) for line in local_stdout.getvalue().splitlines()]
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                embedded.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                host="embedded",
+                command="rollout-summary",
+            )
+        ]
+        for rows in (local_rows, embedded_rows):
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(
+                scan_meta["json_error_count"],
+                len(malformed_shapes)
+                + len(pathological_records)
+                + len(invalid_utf8_fields),
+            )
+            self.assertNotIn("source_identity_proof", scan_meta)
+            self.assertNotIn("coverage_proof", scan_meta)
+            self.assertTrue(
+                any(
+                    row.get("kind") == "session_meta"
+                    and row.get("session_id") == "schema-safe-session"
+                    for row in rows
+                )
+            )
+            self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
+            self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
+            self.assertTrue(any(row.get("text") == "you missed" for row in rows))
+            self.assertNotIn("approval", json.dumps(rows, sort_keys=True))
+        self.assertNotIn("\ufffd", local_stdout.getvalue())
+        self.assertNotIn("\ufffd", embedded.stdout)
+
+    def test_remote_probe_rollout_summary_rejects_invalid_response_roles_local_and_embedded(
+        self,
+    ) -> None:
+        invalid_role_rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "content": [{"type": "input_text", "text": "Missing role evidence."}],
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": ["user"],
+                    "content": [{"type": "input_text", "text": "Non-string role evidence."}],
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "tool",
+                    "content": [{"type": "output_text", "text": "Unknown role evidence."}],
+                },
+            },
+        ]
+        valid_rows = [
+            message("user", "You missed the later valid evidence.", "2026-05-01T10:01:00Z"),
+            message("assistant", "Ordinary later valid completion.", "2026-05-01T10:02:00Z"),
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-invalid-roles.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [*invalid_role_rows, *valid_rows])
+            local_stdout = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE, "_local_codex_root", return_value=root
+            ), mock.patch.object(sys, "stdout", local_stdout):
+                local_result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=10,
+                        tail_records=8,
+                        max_text_chars=120,
+                    )
+                )
+
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": rollout_ref,
+                    "summary_limit": 10,
+                    "summary_scan_bytes": rollout.stat().st_size,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 120,
+                    "summary_keywords": [],
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(local_result, 0)
+        self.assertEqual(embedded.returncode, 0, embedded.stderr)
+        local_rows = [json.loads(line) for line in local_stdout.getvalue().splitlines()]
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                embedded.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                host="embedded",
+                command="rollout-summary",
+            )
+        ]
+        for rows in (local_rows, embedded_rows):
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(scan_meta["json_error_count"], len(invalid_role_rows))
+            self.assertNotIn("source_identity_proof", scan_meta)
+            self.assertNotIn("coverage_proof", scan_meta)
+            self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
+            self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
+
+    def test_remote_probe_rollout_summary_validates_non_evidence_response_roles_local_and_embedded(
+        self,
+    ) -> None:
+        def summarize_pair(
+            root: Path,
+            rollout_ref: str,
+            rollout_rows: list[dict],
+        ) -> tuple[list[dict], list[dict]]:
+            rollout = root / rollout_ref
+            write_jsonl(rollout, rollout_rows)
+            local_stdout = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE, "_local_codex_root", return_value=root
+            ), mock.patch.object(sys, "stdout", local_stdout):
+                local_result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=10,
+                        tail_records=8,
+                        max_text_chars=120,
+                    )
+                )
+
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": rollout_ref,
+                    "summary_limit": 10,
+                    "summary_scan_bytes": rollout.stat().st_size,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 120,
+                    "summary_keywords": [],
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(local_result, 0)
+            self.assertEqual(embedded.returncode, 0, embedded.stderr)
+            local_rows = [
+                json.loads(line) for line in local_stdout.getvalue().splitlines()
+            ]
+            embedded_rows = [
+                json.loads(line)
+                for line in REMOTE_PROBE._extract_framed_lines(
+                    embedded.stdout,
+                    begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                    end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                    host="embedded",
+                    command="rollout-summary",
+                )
+            ]
+            return local_rows, embedded_rows
+
+        later_evidence = [
+            message("user", "You missed the later valid evidence.", "2026-05-01T10:01:00Z"),
+            message("assistant", "Ordinary later valid completion.", "2026-05-01T10:02:00Z"),
+        ]
+        valid_non_evidence_rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {"type": "input_text", "text": "Developer policy is not evidence."}
+                    ],
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {"type": "output_text", "text": "System policy is not evidence."}
+                    ],
+                },
+            },
+            *later_evidence,
+        ]
+        malformed_non_evidence_rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": None,
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-05-01T10:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "output_text"}],
+                },
+            },
+            *later_evidence,
+        ]
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            valid_results = summarize_pair(
+                root,
+                "sessions/2026/05/01/rollout-2026-05-01T10-00-00-valid-non-evidence-roles.jsonl",
+                valid_non_evidence_rows,
+            )
+            malformed_results = summarize_pair(
+                root,
+                "sessions/2026/05/01/rollout-2026-05-01T10-00-00-malformed-non-evidence-roles.jsonl",
+                malformed_non_evidence_rows,
+            )
+
+        for rows in valid_results:
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(scan_meta["json_error_count"], 0)
+            self.assertEqual(scan_meta["summary_record_count"], len(later_evidence))
+            self.assertEqual(
+                scan_meta["source_identity_proof"],
+                MODULE.REMOTE_GENERATED_SUMMARY_SOURCE_IDENTITY_PROOF,
+            )
+            self.assertEqual(
+                scan_meta["coverage_proof"],
+                MODULE.REMOTE_GENERATED_SUMMARY_COVERAGE_PROOF,
+            )
+            self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
+            self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
+            self.assertEqual(
+                {
+                    (row.get("kind"), row.get("line"))
+                    for row in rows
+                    if row.get("kind") in {"user_message", "assistant_message"}
+                },
+                {("user_message", 3), ("assistant_message", 4)},
+            )
+            serialized = json.dumps(rows, sort_keys=True)
+            self.assertNotIn("developer policy", serialized.lower())
+            self.assertNotIn("system policy", serialized.lower())
+
+        for rows in malformed_results:
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(scan_meta["json_error_count"], 2)
+            self.assertEqual(scan_meta["summary_record_count"], len(later_evidence))
+            self.assertNotIn("source_identity_proof", scan_meta)
+            self.assertNotIn("coverage_proof", scan_meta)
+            self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
+            self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
+            self.assertEqual(
+                {
+                    (row.get("kind"), row.get("line"))
+                    for row in rows
+                    if row.get("kind") in {"user_message", "assistant_message"}
+                },
+                {("user_message", 3), ("assistant_message", 4)},
+            )
+
+    def test_remote_probe_rollout_summary_rejects_non_string_record_types_local_and_embedded(
+        self,
+    ) -> None:
+        content = [{"type": "input_text", "text": "Invalid type evidence."}]
+        invalid_type_rows = [
+            {
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": content,
+                }
+            },
+            *[
+                {
+                    "type": invalid_outer_type,
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": content,
+                    },
+                }
+                for invalid_outer_type in ([], {}, 7)
+            ],
+            {"type": "response_item", "payload": {"content": content}},
+            *[
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": invalid_inner_type,
+                        "role": "user",
+                        "content": content,
+                    },
+                }
+                for invalid_inner_type in ([], {}, 7)
+            ],
+            {"type": "event_msg", "payload": {"message": "Missing inner type evidence."}},
+            *[
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": invalid_inner_type,
+                        "message": "Invalid inner type evidence.",
+                    },
+                }
+                for invalid_inner_type in ([], {}, 7)
+            ],
+        ]
+        compatible_ignored_rows = [
+            {
+                "type": "function_call_output",
+                "payload": {"output": "Legacy outer without inner type."},
+            },
+            {
+                "type": "custom_outer",
+                "payload": {"type": "custom_inner", "detail": "Unknown string outer."},
+            },
+            {
+                "type": "response_item",
+                "payload": {"type": "custom_response", "detail": "Unknown string response inner."},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "custom_event", "detail": "Unknown string event inner."},
+            },
+        ]
+        valid_session_meta = {
+            "type": "session_meta",
+            "timestamp": "2026-05-01T09:59:00Z",
+            "payload": {"id": "strict-type-session", "cwd": "/strict/type/repo"},
+        }
+        valid_rows = [
+            message("user", "You missed the later strict-type evidence.", "2026-05-01T10:01:00Z"),
+            message("assistant", "Ordinary later strict-type completion.", "2026-05-01T10:02:00Z"),
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-invalid-types.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(
+                rollout,
+                [
+                    *invalid_type_rows,
+                    *compatible_ignored_rows,
+                    valid_session_meta,
+                    *valid_rows,
+                ],
+            )
+            local_stdout = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE, "_local_codex_root", return_value=root
+            ), mock.patch.object(sys, "stdout", local_stdout):
+                local_result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=10,
+                        tail_records=8,
+                        max_text_chars=120,
+                    )
+                )
+
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": rollout_ref,
+                    "summary_limit": 10,
+                    "summary_scan_bytes": rollout.stat().st_size,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 120,
+                    "summary_keywords": [],
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(local_result, 0)
+        self.assertEqual(embedded.returncode, 0, embedded.stderr)
+        local_rows = [json.loads(line) for line in local_stdout.getvalue().splitlines()]
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                embedded.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                host="embedded",
+                command="rollout-summary",
+            )
+        ]
+        for rows in (local_rows, embedded_rows):
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(scan_meta["json_error_count"], len(invalid_type_rows))
+            self.assertEqual(scan_meta["summary_record_count"], len(valid_rows))
+            self.assertNotIn("source_identity_proof", scan_meta)
+            self.assertNotIn("coverage_proof", scan_meta)
+            self.assertTrue(
+                any(
+                    row.get("kind") == "session_meta"
+                    and row.get("session_id") == "strict-type-session"
+                    for row in rows
+                )
+            )
+            self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
+            self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
+
+    def test_remote_probe_rollout_summary_validates_scalar_fields_local_and_embedded(
+        self,
+    ) -> None:
+        invalid_scalar_values = (None, False, [], {}, 7)
+        invalid_rows = [
+            *[
+                {
+                    "type": "custom_outer",
+                    "timestamp": invalid_timestamp,
+                }
+                for invalid_timestamp in invalid_scalar_values
+            ],
+            *[
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": f"invalid-cwd-{index}",
+                        "cwd": invalid_cwd,
+                    },
+                }
+                for index, invalid_cwd in enumerate(invalid_scalar_values)
+            ],
+            {
+                "type": "response_item",
+                "payload": {"type": "function_call_output"},
+            },
+            *[
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "output": invalid_output,
+                    },
+                }
+                for invalid_output in invalid_scalar_values
+            ],
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete"},
+            },
+            *[
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "last_agent_message": invalid_message,
+                    },
+                }
+                for invalid_message in invalid_scalar_values
+            ],
+        ]
+        compatible_rows = [
+            {
+                "type": "session_meta",
+                "payload": {"id": "missing-cwd-session"},
+            },
+            {
+                "type": "session_meta",
+                "timestamp": "",
+                "payload": {"id": "empty-cwd-session", "cwd": ""},
+            },
+            {
+                "type": "session_meta",
+                "payload": {"id": "string-cwd-session", "cwd": "/valid/repo"},
+            },
+            {
+                "type": "response_item",
+                "payload": {"type": "function_call_output", "output": ""},
+            },
+            {
+                "type": "response_item",
+                "payload": {"type": "function_call_output", "output": "   "},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": ""},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": "   "},
+            },
+            {
+                "type": "function_call_output",
+                "payload": {"output": ["Legacy outer remains ignored."]},
+            },
+            {
+                "type": "custom_outer",
+                "payload": {"type": "custom_inner"},
+            },
+            {
+                "type": "response_item",
+                "payload": {"type": "custom_response"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "custom_event"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "You missed the valid event message.",
+                    "text": "permission denied sibling fallback",
+                },
+            },
+        ]
+        valid_rows = [
+            message("user", "You missed the later scalar evidence.", "2026-05-01T10:01:00Z"),
+            message("assistant", "Ordinary later scalar completion.", "2026-05-01T10:02:00Z"),
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-invalid-scalars.jsonl"
+            rollout = root / rollout_ref
+            write_jsonl(rollout, [*invalid_rows, *compatible_rows, *valid_rows])
+            local_stdout = io.StringIO()
+            with mock.patch.object(
+                REMOTE_PROBE, "_local_codex_root", return_value=root
+            ), mock.patch.object(sys, "stdout", local_stdout):
+                local_result = REMOTE_PROBE.cmd_rollout_summary(
+                    types.SimpleNamespace(
+                        host="local",
+                        rollout=rollout_ref,
+                        keyword=[],
+                        limit=10,
+                        tail_records=8,
+                        max_text_chars=120,
+                    )
+                )
+
+            script = REMOTE_PROBE._remote_python_script(
+                {
+                    "mode": "rollout-summary",
+                    "codex_root": str(root),
+                    "rollout": rollout_ref,
+                    "summary_limit": 10,
+                    "summary_scan_bytes": rollout.stat().st_size,
+                    "summary_tail_records": 8,
+                    "summary_max_text_chars": 120,
+                    "summary_keywords": [],
+                }
+            )
+            embedded = subprocess.run(
+                [sys.executable, "-"],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(local_result, 0)
+        self.assertEqual(embedded.returncode, 0, embedded.stderr)
+        local_rows = [json.loads(line) for line in local_stdout.getvalue().splitlines()]
+        embedded_rows = [
+            json.loads(line)
+            for line in REMOTE_PROBE._extract_framed_lines(
+                embedded.stdout,
+                begin_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_BEGIN,
+                end_marker=REMOTE_PROBE.REMOTE_ROLLOUT_SUMMARY_END,
+                host="embedded",
+                command="rollout-summary",
+            )
+        ]
+        for rows in (local_rows, embedded_rows):
+            scan_meta = next(row for row in rows if row.get("kind") == "scan_meta")
+            self.assertEqual(scan_meta["json_error_count"], len(invalid_rows))
+            self.assertEqual(scan_meta["summary_record_count"], len(valid_rows) + 1)
+            self.assertNotIn("source_identity_proof", scan_meta)
+            self.assertNotIn("coverage_proof", scan_meta)
+            session_meta = next(row for row in rows if row.get("kind") == "session_meta")
+            self.assertEqual(session_meta["session_id"], "missing-cwd-session")
+            self.assertEqual(session_meta["timestamp"], "")
+            self.assertTrue(any(row.get("kind") == "user_message" for row in rows))
+            self.assertTrue(any(row.get("kind") == "assistant_message" for row in rows))
+            self.assertTrue(
+                any(
+                    row.get("kind") == "user_message" and row.get("timestamp") == ""
+                    for row in rows
+                )
+            )
+            self.assertFalse(
+                any(
+                    row.get("kind") in ("function_call_output", "task_complete")
+                    for row in rows
+                )
+            )
+            self.assertNotIn("permission denied", json.dumps(rows, sort_keys=True))
+
     def test_remote_probe_cmd_rollout_summary_emits_record_limit_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
@@ -3962,51 +5123,295 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertNotIn("context-loss", records[0]["text"])
 
     def test_remote_probe_rollout_summary_uses_bounded_input_scan(self) -> None:
-        first = json.dumps(message("user", "First bounded signal.", "2026-05-01T10:00:00Z")) + "\n"
-        second = json.dumps(message("user", "You missed the late unbounded signal.", "2026-05-01T10:01:00Z")) + "\n"
+        first = (
+            json.dumps(message("user", "First bounded signal.", "2026-05-01T10:00:00Z"))
+            + "\n"
+        )
+        second = (
+            json.dumps(
+                message(
+                    "user",
+                    "You missed the late unbounded signal.",
+                    "2026-05-01T10:01:00Z",
+                )
+            )
+            + "\n"
+        )
 
         records = REMOTE_PROBE._summarize_rollout_records(
-            lines=REMOTE_PROBE._bounded_text_lines(io.BytesIO((first + second).encode("utf-8")), len(first.encode("utf-8"))),
+            lines=REMOTE_PROBE._bounded_text_lines(
+                io.BytesIO((first + second).encode("utf-8")),
+                len(first.encode("utf-8")),
+                len((first + second).encode("utf-8")),
+            ),
             keywords=["missed"],
             limit=10,
             tail_records=0,
             max_text_chars=80,
         )
 
-        self.assertEqual([record["text"] for record in records], ["user message present"])
+        self.assertEqual(
+            [record["text"] for record in records], ["user message present"]
+        )
 
     def test_remote_probe_bounded_text_lines_counts_multibyte_bytes(self) -> None:
-        first = json.dumps(message("user", "多字节任务 needle", "2026-05-01T10:00:00Z"), ensure_ascii=False) + "\n"
-        second = json.dumps(message("user", "Second bounded signal.", "2026-05-01T10:01:00Z")) + "\n"
+        first = (
+            json.dumps(
+                message("user", "多字节任务 needle", "2026-05-01T10:00:00Z"),
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        second = (
+            json.dumps(
+                message("user", "Second bounded signal.", "2026-05-01T10:01:00Z")
+            )
+            + "\n"
+        )
         payload = (first + second).encode("utf-8")
 
         self.assertEqual(
-            list(REMOTE_PROBE._bounded_text_lines(io.BytesIO(payload), len(first))),
-            [payload[: len(first)].decode("utf-8", "replace")],
+            list(
+                REMOTE_PROBE._bounded_text_lines(
+                    io.BytesIO(payload), len(first), len(payload)
+                )
+            ),
+            [],
         )
         self.assertEqual(
-            list(REMOTE_PROBE._bounded_text_lines(io.BytesIO(payload), len(first.encode("utf-8")))),
+            list(
+                REMOTE_PROBE._bounded_text_lines(
+                    io.BytesIO(payload),
+                    len(first.encode("utf-8")),
+                    len(payload),
+                )
+            ),
             [first],
         )
 
-    def test_remote_probe_bounded_text_lines_flushes_cap_equal_final_line_without_newline(self) -> None:
-        line = json.dumps(message("user", "You missed the final no-newline record.", "2026-05-01T10:00:00Z"))
+    def test_remote_probe_bounded_text_lines_local_and_embedded_keep_true_eof_without_lf(
+        self,
+    ) -> None:
+        line = json.dumps(
+            message(
+                "user",
+                "You missed the final no-newline record.",
+                "2026-05-01T10:00:00Z",
+            )
+        )
         payload = line.encode("utf-8")
 
-        self.assertEqual(list(REMOTE_PROBE._bounded_text_lines(io.BytesIO(payload), len(payload))), [line])
+        for implementation, reader in bounded_text_line_readers():
+            with self.subTest(implementation=implementation):
+                self.assertEqual(
+                    list(reader(io.BytesIO(payload), len(payload) + 64, len(payload))),
+                    [line],
+                )
 
-    def test_remote_probe_bounded_text_lines_skips_oversized_single_line(self) -> None:
+    def test_remote_probe_bounded_text_lines_local_and_embedded_only_lf_ends_records(
+        self,
+    ) -> None:
+        first = json.dumps(message("user", "First record.", "2026-05-01T10:00:00Z"))
+        second = json.dumps(
+            message("assistant", "Second record.", "2026-05-01T10:01:00Z")
+        )
+        payload = (first + "\r" + second + "\n").encode("utf-8")
+
+        for implementation, reader in bounded_text_line_readers():
+            with self.subTest(implementation=implementation):
+                lines = list(reader(io.BytesIO(payload), len(payload), len(payload)))
+                records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
+                    lines=lines,
+                    keywords=[],
+                    limit=10,
+                    tail_records=0,
+                    max_text_chars=80,
+                )
+
+                self.assertEqual(lines, [payload.decode("utf-8")])
+                self.assertEqual(records, [])
+                self.assertEqual(meta["json_error_count"], 1)
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_drain_oversized_bare_cr_until_lf(
+        self,
+    ) -> None:
+        line_limit = 1024
         oversized = json.dumps(
             {
                 "type": "response_item",
                 "timestamp": "2026-05-01T10:00:00Z",
-                "payload": {"type": "function_call_output", "output": "x" * 2000},
+                "payload": {
+                    "type": "function_call_output",
+                    "output": "x" * (64 * 1024),
+                },
             }
-        ) + "\n"
-        following = json.dumps(message("user", "You missed the bounded follow-up.", "2026-05-01T10:01:00Z")) + "\n"
+        )
+        bare_cr_suffix = json.dumps(
+            message("user", "Bare CR suffix must stay drained.", "2026-05-01T10:01:00Z")
+        )
+        following = json.dumps(
+            message("user", "You missed the bounded follow-up.", "2026-05-01T10:02:00Z")
+        )
+        payload = (oversized + "\r" + bare_cr_suffix + "\n" + following + "\n").encode(
+            "utf-8"
+        )
+
+        with mock.patch.object(
+            REMOTE_PROBE, "MAX_ROLLOUT_SUMMARY_LINE_BYTES", line_limit
+        ):
+            for implementation, reader in bounded_text_line_readers(line_limit):
+                with self.subTest(implementation=implementation):
+                    self.assertEqual(
+                        list(reader(io.BytesIO(payload), len(payload), len(payload))),
+                        ["\n", following + "\n"],
+                    )
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_drop_truncated_json_prefix(
+        self,
+    ) -> None:
+        first = json.dumps(
+            message("user", "You missed the capped suffix.", "2026-05-01T10:00:00Z")
+        )
+        second = json.dumps(
+            message("assistant", "Second record.", "2026-05-01T10:01:00Z")
+        )
+        payload = (first + "\n" + second + "\n").encode("utf-8")
+        scan_cap = len(first.encode("utf-8"))
+
+        for implementation, reader in bounded_text_line_readers():
+            with self.subTest(implementation=implementation):
+                self.assertEqual(
+                    list(reader(io.BytesIO(payload), scan_cap, len(payload))),
+                    [],
+                )
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_reject_nonzero_start_offset(
+        self,
+    ) -> None:
+        class RecordingBytesIO(io.BytesIO):
+            def __init__(self, payload: bytes) -> None:
+                super().__init__(payload)
+                self.read_sizes: list[int] = []
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_sizes.append(size)
+                return super().read(size)
+
+        prefix = (
+            json.dumps(
+                message("assistant", "Earlier record.", "2026-05-01T10:00:00Z")
+            ).encode("utf-8")
+            + b"\n"
+        )
+        next_line = json.dumps(
+            message(
+                "user",
+                "You missed the nonzero-offset record.",
+                "2026-05-01T10:01:00Z",
+            )
+        )
+        next_bytes = next_line.encode("utf-8")
+        payload = prefix + next_bytes + b"\n"
+        named_offsets = {
+            1: "first-byte",
+            len(prefix): "lf-boundary",
+            len(prefix) + len(next_bytes) // 2: "mid-record-json-suffix",
+            len(payload): "snapshot-eof",
+        }
+
+        for implementation, reader in bounded_text_line_readers():
+            for start_offset in range(1, len(payload) + 1):
+                with self.subTest(
+                    implementation=implementation,
+                    boundary=named_offsets.get(start_offset, "other-nonzero"),
+                    start_offset=start_offset,
+                ):
+                    handle = RecordingBytesIO(payload)
+                    handle.seek(start_offset)
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "rollout summary reader must start at byte 0",
+                    ):
+                        list(reader(handle, len(next_bytes), len(payload)))
+
+                    self.assertEqual(handle.read_sizes, [])
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_reject_invalid_start_offset(
+        self,
+    ) -> None:
+        class ReaderWithoutTell:
+            def read(self, _size: int = -1) -> bytes:
+                return b""
+
+        class ReaderWithTell(ReaderWithoutTell):
+            def __init__(self, offset: object) -> None:
+                self.offset = offset
+
+            def tell(self) -> object:
+                return self.offset
+
+        source_size = 4
+        cases = (
+            ("unavailable", ReaderWithoutTell(), "offset is unavailable"),
+            ("boolean", ReaderWithTell(False), "offset is invalid"),
+            ("non-integer", ReaderWithTell(0.0), "offset is invalid"),
+            ("negative", ReaderWithTell(-1), "offset is invalid"),
+            ("past-snapshot", ReaderWithTell(source_size + 1), "offset is invalid"),
+        )
+
+        for implementation, reader in bounded_text_line_readers():
+            for case, handle, message_pattern in cases:
+                with self.subTest(implementation=implementation, case=case):
+                    with self.assertRaisesRegex(ValueError, message_pattern):
+                        list(reader(handle, source_size, source_size))
+
+    def test_remote_probe_bounded_text_lines_local_and_embedded_preserve_crlf(
+        self,
+    ) -> None:
+        first = json.dumps(
+            message("user", "First CRLF record.", "2026-05-01T10:00:00Z")
+        )
+        second = json.dumps(
+            message("assistant", "Second CRLF record.", "2026-05-01T10:01:00Z")
+        )
+        payload = (first + "\r\n" + second + "\r\n").encode("utf-8")
+
+        for implementation, reader in bounded_text_line_readers():
+            with self.subTest(implementation=implementation):
+                lines = list(reader(io.BytesIO(payload), len(payload), len(payload)))
+
+                self.assertEqual(lines, [first + "\r\n", second + "\r\n"])
+                self.assertEqual(
+                    [json.loads(line) for line in lines],
+                    [json.loads(first), json.loads(second)],
+                )
+
+    def test_remote_probe_bounded_text_lines_skips_oversized_single_line(self) -> None:
+        oversized = (
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-05-01T10:00:00Z",
+                    "payload": {"type": "function_call_output", "output": "x" * 2000},
+                }
+            )
+            + "\n"
+        )
+        following = (
+            json.dumps(
+                message(
+                    "user", "You missed the bounded follow-up.", "2026-05-01T10:01:00Z"
+                )
+            )
+            + "\n"
+        )
+        payload = (oversized + following).encode("utf-8")
 
         with mock.patch.object(REMOTE_PROBE, "MAX_ROLLOUT_SUMMARY_LINE_BYTES", 1024):
-            lines = list(REMOTE_PROBE._bounded_text_lines(io.BytesIO((oversized + following).encode("utf-8")), 0))
+            lines = list(
+                REMOTE_PROBE._bounded_text_lines(io.BytesIO(payload), 0, len(payload))
+            )
         records, meta = REMOTE_PROBE._summarize_rollout_records_with_meta(
             lines=lines,
             keywords=[],
@@ -4189,6 +5594,243 @@ class SessionRetrospectiveTests(unittest.TestCase):
             )
         ]
         self.assertEqual([row["session_id"] for row in embedded_rows], ["no-lf-eof"])
+
+    def test_remote_probe_session_meta_skips_non_object_records_local_and_embedded(
+        self,
+    ) -> None:
+        valid = {
+            "type": "session_meta",
+            "timestamp": "2026-05-01T10:00:00Z",
+            "payload": {"id": "schema-safe-session", "cwd": "/schema-safe/repo"},
+        }
+        rows: list[object] = [
+            None,
+            [],
+            "scalar",
+            {"type": "session_meta", "payload": None},
+            {"type": "session_meta", "payload": []},
+            {"type": "session_meta", "payload": "scalar"},
+            valid,
+        ]
+        payload = b"9" * 5000 + b"\n"
+        payload += b"[" * 1100 + b"null" + b"]" * 1100 + b"\n"
+        payload += ("\n".join(json.dumps(row) for row in rows) + "\n").encode("utf-8")
+
+        local = REMOTE_PROBE._parse_session_meta_snapshot(
+            io.BytesIO(payload),
+            date_value=dt.date(2026, 5, 1),
+            require_record_date_match=False,
+            rollout_start=None,
+            rollout_end=None,
+        )
+        namespace = embedded_probe_namespace(
+            {
+                "mode": "session-meta",
+                "codex_root": ".",
+                "session_meta_scan_bytes": len(payload) + 1,
+            }
+        )
+        embedded = namespace["parse_session_meta_snapshot"](
+            io.BytesIO(payload),
+            "2026/05/01",
+            False,
+        )
+
+        self.assertIsNotNone(local)
+        self.assertIsNotNone(embedded)
+        assert local is not None
+        assert embedded is not None
+        self.assertEqual(local[:3], (dt.date(2026, 5, 1), "schema-safe-session", "/schema-safe/repo"))
+        self.assertEqual(embedded[:3], ("2026/05/01", "schema-safe-session", "/schema-safe/repo"))
+
+    def test_remote_probe_session_meta_skips_invalid_ids_local_and_embedded(
+        self,
+    ) -> None:
+        valid = {
+            "type": "session_meta",
+            "timestamp": "2026-05-01T10:01:00Z",
+            "payload": {"id": "later-valid-session", "cwd": "/later-valid/repo"},
+        }
+        invalid_payloads: list[tuple[str, dict[str, object]]] = [
+            ("missing", {"cwd": "/invalid/missing"}),
+            ("empty", {"id": "", "cwd": "/invalid/empty"}),
+            ("null", {"id": None, "cwd": "/invalid/null"}),
+            ("numeric", {"id": 7, "cwd": "/invalid/numeric"}),
+        ]
+        namespace = embedded_probe_namespace(
+            {
+                "mode": "session-meta",
+                "codex_root": ".",
+                "session_meta_scan_bytes": 1024 * 1024,
+            }
+        )
+
+        for label, invalid_payload in invalid_payloads:
+            with self.subTest(label=label):
+                invalid = {
+                    "type": "session_meta",
+                    "timestamp": "2026-05-01T10:00:00Z",
+                    "payload": invalid_payload,
+                }
+                payload = (
+                    json.dumps(invalid, separators=(",", ":"))
+                    + "\n"
+                    + json.dumps(valid, separators=(",", ":"))
+                    + "\n"
+                ).encode("utf-8")
+
+                local = REMOTE_PROBE._parse_session_meta_snapshot(
+                    io.BytesIO(payload),
+                    date_value=dt.date(2026, 5, 1),
+                    require_record_date_match=False,
+                    rollout_start=None,
+                    rollout_end=None,
+                )
+                embedded = namespace["parse_session_meta_snapshot"](
+                    io.BytesIO(payload),
+                    "2026/05/01",
+                    False,
+                )
+
+                self.assertIsNotNone(local)
+                self.assertIsNotNone(embedded)
+                assert local is not None
+                assert embedded is not None
+                self.assertEqual(
+                    local[:3],
+                    (
+                        dt.date(2026, 5, 1),
+                        "later-valid-session",
+                        "/later-valid/repo",
+                    ),
+                )
+                self.assertEqual(
+                    embedded[:3],
+                    ("2026/05/01", "later-valid-session", "/later-valid/repo"),
+                )
+
+    def test_remote_probe_session_meta_skips_overflowing_timestamp_local_and_embedded(
+        self,
+    ) -> None:
+        invalid = {
+            "type": "session_meta",
+            "timestamp": "0001-01-01T00:00:00+23:59",
+            "payload": {"id": "overflowing-timestamp", "cwd": "/invalid/repo"},
+        }
+        valid = {
+            "type": "session_meta",
+            "timestamp": "2026-05-01T10:00:00Z",
+            "payload": {"id": "later-valid-timestamp", "cwd": "/valid/repo"},
+        }
+        payload = (
+            json.dumps(invalid, separators=(",", ":"))
+            + "\n"
+            + json.dumps(valid, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+
+        local = REMOTE_PROBE._parse_session_meta_snapshot(
+            io.BytesIO(payload),
+            date_value=dt.date(2026, 5, 1),
+            require_record_date_match=True,
+            rollout_start=None,
+            rollout_end=None,
+        )
+        namespace = embedded_probe_namespace(
+            {
+                "mode": "session-meta",
+                "codex_root": ".",
+                "session_meta_scan_bytes": len(payload) + 1,
+            }
+        )
+        embedded = namespace["parse_session_meta_snapshot"](
+            io.BytesIO(payload),
+            "2026/05/01",
+            True,
+        )
+
+        self.assertIsNotNone(local)
+        self.assertIsNotNone(embedded)
+        assert local is not None
+        assert embedded is not None
+        self.assertEqual(
+            local[:3],
+            (dt.date(2026, 5, 1), "later-valid-timestamp", "/valid/repo"),
+        )
+        self.assertEqual(
+            embedded[:3],
+            ("2026/05/01", "later-valid-timestamp", "/valid/repo"),
+        )
+
+    def test_remote_probe_session_meta_rejects_invalid_utf8_local_and_embedded(
+        self,
+    ) -> None:
+        for field in ("timestamp", "id", "cwd"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / ".codex"
+                rollout_ref = "sessions/2026/05/01/rollout-2026-05-01T10-00-00-invalid-utf8.jsonl"
+                rollout = root / rollout_ref
+                rollout.parent.mkdir(parents=True)
+                row = {
+                    "type": "session_meta",
+                    "timestamp": "2026-05-01T10:00:00Z",
+                    "payload": {"id": "valid-session", "cwd": "/valid/repo"},
+                }
+                if field == "timestamp":
+                    row[field] = "invalid-byte-marker"
+                else:
+                    row["payload"][field] = "invalid-byte-marker"
+                payload = json.dumps(row, separators=(",", ":")).encode("utf-8")
+                rollout.write_bytes(payload.replace(b"invalid-byte-marker", b"invalid-\xff-byte") + b"\n")
+
+                with self.assertRaises(REMOTE_PROBE.SessionMetaRolloutError) as raised:
+                    REMOTE_PROBE._scan_session_meta_records(
+                        codex_root=root,
+                        dates=[dt.date(2026, 5, 1)],
+                        limit=10,
+                        host="local",
+                    )
+
+                script = REMOTE_PROBE._remote_python_script(
+                    {
+                        "mode": "session-meta",
+                        "codex_root": str(root),
+                        "dates": ["2026/05/01"],
+                        "limit": 10,
+                        "session_meta_scan_bytes": REMOTE_PROBE.MAX_SESSION_META_SCAN_BYTES,
+                    }
+                )
+                embedded = subprocess.run(
+                    [sys.executable, "-"],
+                    input=script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            self.assertEqual(raised.exception.error, "session-meta record is not valid UTF-8")
+            self.assertEqual(embedded.returncode, 0, embedded.stderr)
+            embedded_rows = [
+                json.loads(line)
+                for line in REMOTE_PROBE._extract_framed_lines(
+                    embedded.stdout,
+                    begin_marker=REMOTE_PROBE.REMOTE_SESSION_META_BEGIN,
+                    end_marker=REMOTE_PROBE.REMOTE_SESSION_META_END,
+                    host="embedded",
+                    command="session-meta",
+                )
+            ]
+            self.assertEqual(
+                embedded_rows,
+                [
+                    {
+                        "error": "session-meta record is not valid UTF-8",
+                        "kind": "error",
+                        "rollout": rollout_ref,
+                    }
+                ],
+            )
+            self.assertNotIn("\ufffd", embedded.stdout)
 
     def test_remote_probe_session_meta_rejects_trailing_bytes_at_exact_cap_local_and_embedded(self) -> None:
         session_id = "exact-cap-must-not-escape"
@@ -4695,6 +6337,19 @@ class SessionRetrospectiveTests(unittest.TestCase):
                     message("user", "# AGENTS.md instructions\nsecret wrapper", "2026-05-22T10:00:00Z"),
                     message("user", "Please fix this using https://internal.example/case and token sk-proj-abcdefghijklmnop123456.", "2026-05-22T10:01:00Z"),
                     {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:10Z",
+                        "payload": {"detail": "continued without asking"},
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:20Z",
+                        "payload": {
+                            "type": "custom_notice",
+                            "detail": "could not run compatibility check",
+                        },
+                    },
+                    {
                         "type": "function_call_output",
                         "timestamp": "2026-05-22T10:02:00Z",
                         "payload": {"output": "Process exited with code 1\npermission denied"},
@@ -4714,6 +6369,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("failed_command", turns[0].issue_flags)
         self.assertIn("approval_auth_friction", turns[0].issue_flags)
         self.assertIn("safety_privacy_flag", turns[0].issue_flags)
+        self.assertIn("under_asking", turns[0].issue_flags)
+        self.assertIn("verification_gap", turns[0].issue_flags)
 
     def test_local_rollout_internal_hostname_is_redacted_and_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -5347,38 +7004,567 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("category=review", turns[0].redacted_user_prompt_summary)
         self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
 
-    def test_extract_rollout_reads_structured_event_msg_user_messages(self) -> None:
+    def test_extract_rollout_rejects_malformed_evidence_and_preserves_later_records(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-structured.jsonl"
+            valid_user_text = "You forgot the verification step and assumed success."
+            valid_cwd = "/valid/context/repo"
             write_jsonl(
                 rollout,
                 [
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-22T09:59:50Z",
+                        "payload": {
+                            "id": "valid-context-session",
+                            "cwd": valid_cwd,
+                            "model": "openai/gpt-5.4",
+                        },
+                    },
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-23T00:00:00Z",
+                        "payload": {
+                            "id": "future-context-session",
+                            "cwd": "/future/context/repo",
+                            "model": "openai/gpt-5.5",
+                        },
+                    },
+                    {
+                        "type": "turn_context",
+                        "timestamp": "2026-05-22T09:59:51Z",
+                        "payload": {"cwd": ["/invalid/context"]},
+                    },
+                    {
+                        "type": "turn_context",
+                        "timestamp": "2026-05-22T09:59:52Z",
+                        "payload": {"model": {"name": "invalid-model"}},
+                    },
+                    {
+                        "type": "turn_context",
+                        "timestamp": "2026-05-22T09:59:53Z",
+                        "payload": {"model_id": 7},
+                    },
+                    {
+                        "type": ["response_item"],
+                        "timestamp": "2026-05-22T09:59:54Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "You missed forged non-string outer evidence.",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-22T09:59:55Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "You forgot forged wrong-outer evidence.",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T09:59:56Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": "You missed forged wrong-pair evidence.",
+                            "cwd": "/wrong/pair/repo",
+                            "model": "openai/gpt-5.5",
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:00Z",
+                        "payload": {"type": []},
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:01Z",
+                        "payload": {"type": {}},
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:02Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": 7,
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:03Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [None],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:04Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": []}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:05Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": {}}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:06Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": ["You forgot malformed list evidence."],
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:07Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": {"status": "malformed object evidence"},
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:00:08Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": None,
+                            "text": "You missed the tempting explicit-null fallback.",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:00:09Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": [],
+                            "text": "You forgot the tempting explicit-list fallback.",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:00:10Z",
+                        "payload": {
+                            "type": "user_message",
+                            "message": 7,
+                            "text": "You missed the tempting explicit-scalar fallback.",
+                        },
+                    },
                     {
                         "type": "event_msg",
                         "timestamp": "2026-05-22T10:01:00Z",
                         "payload": {
                             "type": "user_message",
+                            "cwd": "/wrong/outer/repo",
+                            "model": "openai/gpt-5.5",
                             "message": {
                                 "role": "user",
                                 "content": [
                                     {
                                         "type": "input_text",
-                                        "text": "You forgot the verification step and assumed success.",
+                                        "text": valid_user_text,
                                     }
                                 ],
                             },
                         },
-                    }
+                    },
+                    message(
+                        "user",
+                        "# AGENTS.md instructions\nRepository policy only.",
+                        "2026-05-22T10:01:05Z",
+                    ),
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:10Z",
+                        "payload": {
+                            "type": "task_complete",
+                            "last_agent_message": [
+                                "The command failed with permission denied."
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:11Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": ["Process exited with code 1"],
+                            "text": "permission denied tempting fallback",
+                        },
+                    },
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:01:12Z",
+                        "payload": {
+                            "output": {"error": "permission denied"},
+                            "text": "Process exited with code 1 tempting fallback",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:13Z",
+                        "payload": "permission denied without asking",
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:14Z",
+                        "payload": "permission denied without asking",
+                    },
+                    {
+                        "type": ["function_call_output"],
+                        "timestamp": "2026-05-22T10:01:15Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": "permission denied without asking",
+                        },
+                    },
+                    {
+                        "type": "session_meta",
+                        "timestamp": "2026-05-22T10:01:16Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Failed with permission denied.",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:17Z",
+                        "payload": {
+                            "type": "function_call",
+                            "arguments": "permission denied without asking",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:18Z",
+                        "payload": {
+                            "type": "token_count",
+                            "detail": "permission denied without asking",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:19Z",
+                        "payload": {
+                            "type": "thread/start",
+                            "message": "permission denied without asking",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-05-22T10:01:30Z",
+                        "payload": {
+                            "type": {
+                                "error": "permission denied",
+                                "prompt": "without asking",
+                            }
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:40Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": "Verification not run.",
+                            "text": "permission denied must not override output",
+                        },
+                    },
+                    message(
+                        "assistant",
+                        "Validated the later assistant evidence.",
+                        "2026-05-22T10:02:00Z",
+                    ),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(
+                MODULE.Source("local", root),
+                rollout,
+                None,
+                MODULE.parse_time("2026-05-23T00:00:00Z"),
+            )
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn(f"prompt_chars={len(valid_user_text)}", turns[0].redacted_user_prompt_summary)
+        self.assertEqual(
+            set(turns[0].issue_flags),
+            {"context_loss", "user_correction", "verification_gap"},
+        )
+        self.assertEqual(turns[0].cwd, MODULE.path_ref(valid_cwd))
+        self.assertEqual(turns[0].model, "gpt-5.4")
+        self.assertEqual(turns[0].model_era, "gpt-5.4")
+        self.assertNotIn("role", turns[0].redacted_user_prompt_summary)
+        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+        self.assertIn("action_categories=verification", turns[0].assistant_action_summary)
+
+    def test_tool_output_payload_text_scopes_text_fallback_to_legacy_outer(self) -> None:
+        legacy_record = {"type": "function_call_output"}
+        exact_record = {"type": "response_item"}
+
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                legacy_record,
+                {"text": " Legacy text fallback. "},
+            ),
+            "Legacy text fallback.",
+        )
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                legacy_record,
+                {"output": "", "text": " Empty output fallback. "},
+            ),
+            "Empty output fallback.",
+        )
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                legacy_record,
+                {"output": "   ", "text": "Whitespace output must keep precedence."},
+            ),
+            "",
+        )
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                legacy_record,
+                {"output": ["invalid"], "text": "Invalid output must not fall back."},
+            ),
+            "",
+        )
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                legacy_record,
+                {"output": " Preferred output. ", "text": "Ignored text."},
+            ),
+            "Preferred output.",
+        )
+
+        for payload in (
+            {
+                "type": "function_call_output",
+                "text": "Missing output must not fall back.",
+            },
+            {
+                "type": "function_call_output",
+                "output": ["invalid"],
+                "text": "Invalid output must not fall back.",
+            },
+            {
+                "type": "function_call_output",
+                "output": "",
+                "text": "Empty output must not fall back.",
+            },
+            {
+                "type": "function_call_output",
+                "output": "   ",
+                "text": "Whitespace output must not fall back.",
+            },
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(MODULE.tool_output_payload_text(exact_record, payload), "")
+        self.assertEqual(
+            MODULE.tool_output_payload_text(
+                exact_record,
+                {
+                    "type": "function_call_output",
+                    "output": " Exact output. ",
+                    "text": "Ignored exact text.",
+                },
+            ),
+            "Exact output.",
+        )
+
+    def test_extract_rollout_exact_tool_output_without_output_does_not_detach_later_assistant(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-exact-tool.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please implement the helper.", "2026-05-22T10:01:00Z"),
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:02:00Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "text": "Process exited with code 1; permission denied.",
+                        },
+                    },
+                    message(
+                        "user",
+                        "# AGENTS.md instructions\nRepository policy only.",
+                        "2026-05-22T10:03:00Z",
+                    ),
+                    message(
+                        "assistant",
+                        "Implemented the helper and ran tests.",
+                        "2026-05-22T10:04:00Z",
+                    ),
                 ],
             )
 
             turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
 
         self.assertEqual(len(turns), 1)
-        self.assertIn("user_correction", turns[0].issue_flags)
-        self.assertIn("context_loss", turns[0].issue_flags)
-        self.assertNotIn("role", turns[0].redacted_user_prompt_summary)
+        self.assertEqual(turns[0].issue_flags, [])
+        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+        self.assertIn("action_categories=implementation,verification", turns[0].assistant_action_summary)
+
+    def test_extract_rollout_legacy_tool_output_text_fallback_still_drives_flags(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-legacy-tool.jsonl"
+            write_jsonl(
+                rollout,
+                [
+                    message("user", "Please diagnose the command.", "2026-05-22T10:01:00Z"),
+                    {
+                        "type": "function_call_output",
+                        "timestamp": "2026-05-22T10:02:00Z",
+                        "payload": {
+                            "text": "Process exited with code 1; permission denied.",
+                        },
+                    },
+                    message(
+                        "assistant",
+                        "Diagnosed the failure.",
+                        "2026-05-22T10:03:00Z",
+                    ),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 1)
+        self.assertIn("failed_command", turns[0].issue_flags)
+        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+
+    def test_extract_rollout_rejects_invalid_response_message_schema_before_later_valid_turn(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / ".codex"
+            rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-schema.jsonl"
+            valid_cwd = "/valid/schema/repo"
+            write_jsonl(
+                rollout,
+                [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:00:00Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "future_metadata",
+                                    "text": {"ignored": "unknown string item types remain schema-valid"},
+                                }
+                            ],
+                            "cwd": valid_cwd,
+                            "model": "openai/gpt-5.4",
+                        },
+                    },
+                    message("user", "Please implement the alpha helper.", "2026-05-22T10:01:00Z"),
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:10Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "system",
+                            "content": [{"type": "output_text", "text": "Permission denied without asking."}],
+                            "cwd": "/invalid/role/repo",
+                            "model": "openai/gpt-5.5",
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:20Z",
+                        "payload": {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "Verification not run."}],
+                            "cwd": "/missing/role/repo",
+                            "model": "openai/gpt-5.5",
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-05-22T10:01:30Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": ["Process exited with code 1"],
+                                }
+                            ],
+                            "cwd": "/malformed/content/repo",
+                            "model": "openai/gpt-5.5",
+                        },
+                    },
+                    message("assistant", "Implemented the alpha helper.", "2026-05-22T10:02:00Z"),
+                    message("user", "Please implement the beta helper.", "2026-05-22T10:03:00Z"),
+                    message("assistant", "Implemented the beta helper.", "2026-05-22T10:04:00Z"),
+                ],
+            )
+
+            turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
+
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].issue_flags, [])
+        self.assertEqual(turns[1].issue_flags, [])
+        for turn in turns:
+            self.assertEqual(turn.cwd, MODULE.path_ref(valid_cwd))
+            self.assertEqual(turn.model, "gpt-5.4")
+            self.assertEqual(turn.model_era, "gpt-5.4")
+        self.assertIn("assistant_messages=1", turns[0].assistant_action_summary)
+        self.assertIn("assistant_messages=1", turns[1].assistant_action_summary)
 
     def test_extract_rollout_deduplicates_near_duplicate_user_message_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -5586,16 +7772,10 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-2026-05-22T10-00-00-secret.jsonl"
+            cwd = "/Users/hoteng/Program/GitHub/customer-secret/repo"
             write_jsonl(
                 rollout,
-                [
-                    message_with_cwd(
-                        "user",
-                        "Please implement the helper.",
-                        "2026-05-22T10:01:00Z",
-                        "/Users/hoteng/Program/GitHub/customer-secret/repo",
-                    ),
-                ],
+                [message_with_cwd("user", "Please implement the helper.", "2026-05-22T10:01:00Z", cwd)],
             )
 
             turns = MODULE.extract_rollout(MODULE.Source("local", root), rollout, None, None)
@@ -5611,6 +7791,7 @@ class SessionRetrospectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / ".codex"
             rollout = root / "sessions" / "2026" / "05" / "22" / "rollout-undated.jsonl"
+            cwd = "/Users/hoteng/Program/GitHub/customer-secret/repo"
             write_jsonl(
                 rollout,
                 [
@@ -5618,8 +7799,8 @@ class SessionRetrospectiveTests(unittest.TestCase):
                         "user",
                         "Please fix this permission denied failure.",
                         "2026-05-22T10:01:00Z",
-                        "/Users/hoteng/Program/GitHub/customer-secret/repo",
-                    ),
+                        cwd,
+                    )
                 ],
             )
 
@@ -29966,9 +32147,16 @@ class SessionRetrospectiveTests(unittest.TestCase):
         self.assertIn("ROOT.lstat()", script)
         self.assertIn("Codex root is a symlink", script)
         self.assertIn('os.fdopen(fd, "rb")', script)
-        self.assertIn('raw_bytes.splitlines(keepends=True)', script)
-        self.assertIn("if max_scan_bytes and scanned >= max_scan_bytes:\n            if dropping_oversized_line:", script)
-        self.assertIn('SUMMARY_LINE_BYTES', script)
+        self.assertIn('raw_bytes.find(b"\\n", offset)', script)
+        self.assertIn("start_offset = handle.tell()", script)
+        self.assertIn("if start_offset != 0:", script)
+        self.assertIn("rollout summary reader must start at byte 0", script)
+        self.assertIn(
+            "scan_limit = min(max_scan_bytes, source_size) if max_scan_bytes else source_size",
+            script,
+        )
+        self.assertIn("if scanned == source_size:", script)
+        self.assertIn("SUMMARY_LINE_BYTES", script)
         self.assertNotIn("(2,)", script)
         self.assertNotIn("(16,)", script)
 

@@ -109,6 +109,456 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("jq -R 'fromjson | keys'", skill)
         self.assertIn("aggregate unique keys once", workflow)
 
+    def test_session_mining_schema_recipe_bounds_and_validates_physical_records(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        code = extract_python_block_after(
+            workflow,
+            "For JSONL schema checks",
+            marker='```bash\npython3 - "$JSONL_PATH" <<\'PY\'\n',
+        )
+
+        self.assertIn("path.open('rb')", code)
+        self.assertIn("handle.readline(max_record_bytes + 1)", code)
+        self.assertIn("handle.readline(drain_chunk_bytes)", code)
+        self.assertIn("raw_line.decode('utf-8')", code)
+        self.assertIn("except (ValueError, RecursionError):", code)
+        self.assertIn("if not isinstance(row, dict):", code)
+        self.assertIn("max_unique_keys = 256", code)
+        self.assertIn("max_unique_key_utf8_bytes = 32 * 1024", code)
+        self.assertIn("unique_keys_truncation_reason = 'count'", code)
+        self.assertIn("unique_keys_truncation_reason = 'utf8_bytes'", code)
+        self.assertIn("unique_keys_truncation_reason = 'non_utf8_key'", code)
+        self.assertNotIn("keys.update(", code)
+        self.assertNotIn("sorted(keys)", code)
+        self.assertNotIn("errors='replace'", code)
+
+        oversized_decoy = "oversized-schema-decoy"
+        valid_first = {"first-safe-key": 1, "shared-safe-key": 2}
+        valid_later = {"later-safe-key": 3, "shared-safe-key": 4}
+        payload = b'{"malformed-schema-decoy":\n'
+        payload += b'["non-object-schema-decoy"]\n'
+        payload += b'{"invalid-utf8-schema-decoy-\xff":1}\n'
+        payload += b"9" * 5000 + b"\n"
+        payload += b"[" * 1100 + b'"deep-schema-decoy"' + b"]" * 1100 + b"\n"
+        payload += b"x" * (1024 * 1024) + b"\r"
+        payload += (json_dumps({oversized_decoy: 1}) + "\n").encode("utf-8")
+        payload += (json_dumps(valid_first) + "\n").encode("utf-8")
+        payload += (json_dumps(valid_later) + "\n").encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jsonl = Path(temp_dir) / "schema.jsonl"
+            jsonl.write_bytes(payload)
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(jsonl)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["line_count"], 8)
+        self.assertEqual(summary["first_record_keys"], sorted(valid_first))
+        self.assertEqual(summary["first_record_key_count"], len(valid_first))
+        self.assertEqual(
+            summary["first_record_key_utf8_bytes"],
+            sum(len(key.encode("utf-8")) for key in valid_first),
+        )
+        self.assertFalse(summary["first_record_keys_truncated"])
+        self.assertEqual(
+            summary["unique_keys"],
+            sorted(set(valid_first) | set(valid_later)),
+        )
+        self.assertEqual(summary["unique_key_count"], 3)
+        self.assertEqual(
+            summary["unique_key_utf8_bytes"],
+            sum(
+                len(key.encode("utf-8"))
+                for key in set(valid_first) | set(valid_later)
+            ),
+        )
+        self.assertFalse(summary["unique_keys_truncated"])
+        self.assertIsNone(summary["unique_keys_truncation_reason"])
+        self.assertNotIn(oversized_decoy, result.stdout)
+        self.assertNotIn("schema-decoy", result.stdout)
+
+    def test_session_mining_schema_recipe_bounds_global_unique_key_state(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        code = extract_python_block_after(
+            workflow,
+            "For JSONL schema checks",
+            marker='```bash\npython3 - "$JSONL_PATH" <<\'PY\'\n',
+        )
+
+        def run_recipe(records: list[dict[str, int]]) -> tuple[dict[str, object], int]:
+            payload = "".join(
+                f"{json.dumps(record, ensure_ascii=True, sort_keys=True)}\n"
+                for record in records
+            ).encode("utf-8")
+            with tempfile.TemporaryDirectory() as temp_dir:
+                jsonl = Path(temp_dir) / "schema.jsonl"
+                jsonl.write_bytes(payload)
+                result = subprocess.run(
+                    [sys.executable, "-c", code, str(jsonl)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout), len(result.stdout.encode("utf-8"))
+
+        count_keys = [f"count-key-{index:03d}" for index in range(257)]
+        count_summary, count_output_bytes = run_recipe(
+            [
+                {key: index for index, key in enumerate(count_keys)},
+                {"ignored-after-count-truncation": 1},
+            ]
+        )
+        self.assertEqual(count_summary["line_count"], 2)
+        self.assertEqual(count_summary["max_unique_keys"], 256)
+        self.assertEqual(count_summary["max_unique_key_utf8_bytes"], 32 * 1024)
+        self.assertEqual(count_summary["unique_key_count"], 256)
+        self.assertEqual(
+            count_summary["unique_key_utf8_bytes"],
+            sum(len(key.encode("utf-8")) for key in count_keys[:256]),
+        )
+        self.assertEqual(count_summary["unique_keys"], sorted(count_keys[:256]))
+        self.assertTrue(count_summary["unique_keys_truncated"])
+        self.assertEqual(count_summary["unique_keys_truncation_reason"], "count")
+        self.assertEqual(count_summary["first_record_key_count"], 256)
+        self.assertEqual(count_summary["first_record_keys"], sorted(count_keys[:256]))
+        self.assertTrue(count_summary["first_record_keys_truncated"])
+
+        byte_keys = ["first", "x" * 16380, "y" * 16383, "z"]
+        byte_summary, byte_output_bytes = run_recipe(
+            [
+                {key: index for index, key in enumerate(byte_keys)},
+                {"ignored-after-byte-truncation": 1},
+            ]
+        )
+        self.assertEqual(byte_summary["line_count"], 2)
+        self.assertEqual(byte_summary["unique_key_count"], 3)
+        self.assertEqual(byte_summary["unique_key_utf8_bytes"], 32 * 1024)
+        self.assertEqual(byte_summary["unique_keys"], sorted(byte_keys[:3]))
+        self.assertTrue(byte_summary["unique_keys_truncated"])
+        self.assertEqual(byte_summary["unique_keys_truncation_reason"], "utf8_bytes")
+        self.assertEqual(byte_summary["first_record_key_utf8_bytes"], 32 * 1024)
+        self.assertEqual(byte_summary["first_record_keys"], sorted(byte_keys[:3]))
+        self.assertTrue(byte_summary["first_record_keys_truncated"])
+
+        invalid_key_summary, invalid_key_output_bytes = run_recipe(
+            [{"\ud800": 1}, {"ignored-after-invalid-key": 1}]
+        )
+        self.assertEqual(invalid_key_summary["line_count"], 2)
+        self.assertEqual(invalid_key_summary["unique_key_count"], 0)
+        self.assertEqual(invalid_key_summary["unique_key_utf8_bytes"], 0)
+        self.assertEqual(invalid_key_summary["unique_keys"], [])
+        self.assertTrue(invalid_key_summary["unique_keys_truncated"])
+        self.assertEqual(
+            invalid_key_summary["unique_keys_truncation_reason"], "non_utf8_key"
+        )
+        self.assertEqual(invalid_key_summary["first_record_key_count"], 0)
+        self.assertTrue(invalid_key_summary["first_record_keys_truncated"])
+
+        max_output_bytes = 2 * 6 * (32 * 1024) + 2 * 4 * 256 + 8192
+        self.assertLessEqual(count_output_bytes, max_output_bytes)
+        self.assertLessEqual(byte_output_bytes, max_output_bytes)
+        self.assertLessEqual(invalid_key_output_bytes, max_output_bytes)
+
+    def test_session_mining_broad_keyword_recipe_uses_bounded_public_index_schemas(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        code = extract_python_block_after(workflow, "Broad keyword searches across")
+
+        self.assertIn("history.jsonl", code)
+        self.assertIn("session_index.jsonl", code)
+        self.assertIn("'session_id', 'ts', 'text'", code)
+        self.assertIn("'id', 'updated_at', 'thread_name'", code)
+        self.assertIn("path.open('rb')", code)
+        self.assertIn("handle.readline(max_record_bytes + 1)", code)
+        self.assertIn("handle.readline(drain_chunk_bytes)", code)
+        self.assertIn("raw_line.decode('utf-8')", code)
+        self.assertIn("except (ValueError, RecursionError):", code)
+        self.assertIn("if not isinstance(row, dict):", code)
+        self.assertIn("isinstance(value, bool)", code)
+        self.assertIn("math.isfinite(value)", code)
+        self.assertIn("json.dumps(value, allow_nan=False)", code)
+        self.assertIn("per_source_match_cap = 20", code)
+        self.assertIn("global_match_limit = 20", code)
+        self.assertIn("'kind': 'scan_meta'", code)
+        self.assertIn("global_output_truncated", code)
+        self.assertNotIn("raise SystemExit", code)
+        self.assertNotIn("needle.search(line)", code)
+        self.assertNotIn("errors='replace'", code)
+
+        history_hit = "history-valid-review-hit"
+        index_hit = "index-valid-review-hit"
+        bare_cr_decoy = "bare-cr-review-decoy"
+        oversized_decoy = "oversized-review-decoy"
+        deep_decoy = "deep-review-decoy"
+        history_timestamp = 1784304000123
+        bool_timestamp_hit = "history-bool-timestamp-hit"
+        nonfinite_timestamp_hit = "history-nonfinite-timestamp-hit"
+        oversized_timestamp_hit = "history-oversized-timestamp-hit"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            codex_home.mkdir()
+            history_payload = b'not-json-review-malformed\n'
+            history_payload += b'"review-non-object"\n'
+            history_payload += b'{"text":"review-invalid-utf8-\xff"}\n'
+            history_payload += b"9" * 5000 + b"\n"
+            history_payload += b"[" * 1100 + f'"review {deep_decoy}"'.encode("utf-8") + b"]" * 1100 + b"\n"
+            history_payload += b"x" * (1024 * 1024) + b"\r"
+            history_payload += (
+                json_dumps(
+                    {
+                        "session_id": oversized_decoy,
+                        "ts": "2026-07-18T00:00:00Z",
+                        "text": f"review {bare_cr_decoy}",
+                    }
+                )
+                + "\n"
+                + json_dumps(
+                    {
+                        "session_id": history_hit,
+                        "ts": history_timestamp,
+                        "text": "review valid history evidence",
+                    }
+                )
+                + "\n"
+                + json_dumps(
+                    {
+                        "session_id": bool_timestamp_hit,
+                        "ts": True,
+                        "text": "review boolean timestamp evidence",
+                    }
+                )
+                + "\n"
+                + json_dumps(
+                    {
+                        "session_id": nonfinite_timestamp_hit,
+                        "ts": float("nan"),
+                        "text": "review non-finite timestamp evidence",
+                    }
+                )
+                + "\n"
+                + json_dumps(
+                    {
+                        "session_id": oversized_timestamp_hit,
+                        "ts": 10**200,
+                        "text": "review oversized timestamp evidence",
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+            (codex_home / "history.jsonl").write_bytes(history_payload)
+            (codex_home / "session_index.jsonl").write_text(
+                json_dumps(
+                    {
+                        "id": index_hit,
+                        "updated_at": "2026-07-18T00:02:00Z",
+                        "thread_name": "review valid session index evidence",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                env=dict(os.environ, CODEX_HOME=str(codex_home)),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertLessEqual(len(rows), 21)
+        self.assertEqual(rows[-1]["kind"], "scan_meta")
+        match_rows = rows[:-1]
+        self.assertLessEqual(len(match_rows), 20)
+        rows_by_id = {row["id"]: row for row in match_rows}
+        self.assertEqual(
+            set(rows_by_id),
+            {
+                history_hit,
+                bool_timestamp_hit,
+                nonfinite_timestamp_hit,
+                oversized_timestamp_hit,
+                index_hit,
+            },
+        )
+        self.assertEqual(rows_by_id[history_hit]["timestamp"], history_timestamp)
+        self.assertEqual(rows_by_id[index_hit]["timestamp"], "2026-07-18T00:02:00Z")
+        for invalid_timestamp_id in (
+            bool_timestamp_hit,
+            nonfinite_timestamp_hit,
+            oversized_timestamp_hit,
+        ):
+            self.assertEqual(rows_by_id[invalid_timestamp_id]["timestamp"], "")
+        self.assertTrue(
+            any(row["path"].endswith("history.jsonl") for row in match_rows)
+        )
+        self.assertTrue(
+            any(row["path"].endswith("session_index.jsonl") for row in match_rows)
+        )
+        scan_meta = rows[-1]
+        self.assertEqual(scan_meta["match_rows_emitted"], 5)
+        self.assertFalse(scan_meta["global_output_truncated"])
+        self.assertEqual(
+            scan_meta["sources"],
+            {
+                "history": {
+                    "available": True,
+                    "emitted": 4,
+                    "match_cap": 20,
+                    "retained": 4,
+                    "truncated": False,
+                },
+                "session_index": {
+                    "available": True,
+                    "emitted": 1,
+                    "match_cap": 20,
+                    "retained": 1,
+                    "truncated": False,
+                },
+            },
+        )
+        self.assertNotIn(bare_cr_decoy, result.stdout)
+        self.assertNotIn(oversized_decoy, result.stdout)
+        self.assertNotIn(deep_decoy, result.stdout)
+        self.assertNotIn("review-malformed", result.stdout)
+        self.assertNotIn("review-invalid-utf8", result.stdout)
+
+    def test_session_mining_broad_keyword_recipe_fairly_caps_multiple_sources(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        code = extract_python_block_after(workflow, "Broad keyword searches across")
+
+        def run_recipe(
+            history_records: list[dict[str, object]] | None,
+            index_records: list[dict[str, object]] | None,
+        ) -> list[dict[str, object]]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                codex_home = Path(temp_dir) / ".codex"
+                codex_home.mkdir()
+                if history_records is not None:
+                    (codex_home / "history.jsonl").write_text(
+                        "".join(f"{json_dumps(record)}\n" for record in history_records),
+                        encoding="utf-8",
+                    )
+                if index_records is not None:
+                    (codex_home / "session_index.jsonl").write_text(
+                        "".join(f"{json_dumps(record)}\n" for record in index_records),
+                        encoding="utf-8",
+                    )
+                result = subprocess.run(
+                    [sys.executable, "-c", code],
+                    env=dict(os.environ, CODEX_HOME=str(codex_home)),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return [json.loads(line) for line in result.stdout.splitlines()]
+
+        history_records = [
+            {
+                "session_id": f"history-fair-{index:02d}",
+                "text": f"review history match {index:02d}",
+                "ts": f"2026-07-18T00:{index:02d}:00Z",
+            }
+            for index in range(21)
+        ]
+        index_records = [
+            {
+                "id": "index-fair-00",
+                "thread_name": "review session index match",
+                "updated_at": "2026-07-18T01:00:00Z",
+            }
+        ]
+        rows = run_recipe(history_records, index_records)
+
+        self.assertEqual(len(rows), 21)
+        match_rows = rows[:-1]
+        scan_meta = rows[-1]
+        self.assertEqual(scan_meta["kind"], "scan_meta")
+        self.assertEqual(len(match_rows), 20)
+        self.assertEqual(match_rows[0]["id"], "history-fair-00")
+        self.assertEqual(match_rows[1]["id"], "index-fair-00")
+        self.assertEqual(
+            {row["id"] for row in match_rows},
+            {"index-fair-00"}
+            | {f"history-fair-{index:02d}" for index in range(19)},
+        )
+        self.assertEqual(scan_meta["match_rows_emitted"], 20)
+        self.assertTrue(scan_meta["global_output_truncated"])
+        self.assertEqual(
+            scan_meta["sources"],
+            {
+                "history": {
+                    "available": True,
+                    "emitted": 19,
+                    "match_cap": 20,
+                    "retained": 20,
+                    "truncated": True,
+                },
+                "session_index": {
+                    "available": True,
+                    "emitted": 1,
+                    "match_cap": 20,
+                    "retained": 1,
+                    "truncated": False,
+                },
+            },
+        )
+        self.assertLessEqual(
+            len(json.dumps(scan_meta, ensure_ascii=True).encode("utf-8")), 1024
+        )
+
+        no_match_rows = run_recipe(
+            [{"session_id": "no-match", "text": "unrelated", "ts": 0}],
+            None,
+        )
+        self.assertEqual(len(no_match_rows), 1)
+        no_match_meta = no_match_rows[0]
+        self.assertEqual(no_match_meta["kind"], "scan_meta")
+        self.assertEqual(no_match_meta["match_rows_emitted"], 0)
+        self.assertFalse(no_match_meta["global_output_truncated"])
+        self.assertEqual(
+            no_match_meta["sources"],
+            {
+                "history": {
+                    "available": True,
+                    "emitted": 0,
+                    "match_cap": 20,
+                    "retained": 0,
+                    "truncated": False,
+                },
+                "session_index": {
+                    "available": False,
+                    "emitted": 0,
+                    "match_cap": 20,
+                    "retained": 0,
+                    "truncated": False,
+                },
+            },
+        )
+
     def test_session_mining_avoids_whole_record_tostring_searches(self) -> None:
         root = Path(__file__).resolve().parents[1]
         skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
@@ -770,6 +1220,55 @@ class SkillStructureTests(unittest.TestCase):
         self.assertNotIn("Q" * 256, result.stdout)
         self.assertNotIn("P" * 256, result.stdout)
         self.assertNotIn("Z" * 256, result.stdout)
+
+    def test_session_mining_exact_probe_escapes_selected_content_controls(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
+            encoding="utf-8"
+        )
+        marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
+        start = workflow.index(marker) + len(marker)
+        code = workflow[start : workflow.index("\nPY\n" + (chr(96) * 3), start)]
+        needle = "match-csi=\x1b[31m literal Unicode 保留"
+        selected_content = (
+            "prefix nul=\x00 esc=\x1b "
+            "osc=\x1b]0;unsafe-title\x07 bel=\x07 "
+            f"{needle} tail=\x1b[0m"
+        )
+        row = {
+            "type": "response_item",
+            "timestamp": "2026-07-18T00:00:00Z",
+            "payload": {
+                "type": "function_call_output",
+                "output": selected_content,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout-control-output.jsonl"
+            rollout.write_text(json_dumps(row) + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(rollout), needle],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        output_bytes = result.stdout.encode("utf-8")
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertLess(len(output_bytes), 1000)
+        self.assertIn("nul=\\u0000", result.stdout)
+        self.assertIn("esc=\\u001b", result.stdout)
+        self.assertIn("osc=\\u001b]0;unsafe-title\\u0007", result.stdout)
+        self.assertIn("bel=\\u0007", result.stdout)
+        self.assertIn("match-csi=\\u001b[31m", result.stdout)
+        self.assertIn("tail=\\u001b[0m", result.stdout)
+        self.assertIn("literal Unicode 保留", result.stdout)
+        self.assertNotIn("\\u4fdd\\u7559", result.stdout)
+        for control_byte in (b"\x00", b"\x07", b"\x1b"):
+            self.assertNotIn(control_byte, output_bytes)
 
     def test_session_mining_exact_probe_matches_full_item_type_before_output_projection(
         self,
