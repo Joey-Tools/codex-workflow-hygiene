@@ -284,6 +284,88 @@ class ProcessGroupDeadlineTests(unittest.TestCase):
         self.assertEqual(identity["sid"], os.getsid(0))
         self.assertEqual(identity["euid"], os.geteuid())
 
+    def test_spawn_refuses_fork_after_fd_enumeration_exhausts_deadline(
+        self,
+    ) -> None:
+        supervisor = load_supervisor_module()
+        expired = False
+
+        def monotonic() -> float:
+            return 10.0 if expired else 9.0
+
+        def exhaust_deadline() -> list[int]:
+            nonlocal expired
+            expired = True
+            return []
+
+        with (
+            mock.patch.object(
+                supervisor.signal,
+                "pthread_sigmask",
+                return_value=set(),
+            ) as pthread_sigmask,
+            mock.patch.object(
+                supervisor.os,
+                "pipe",
+                side_effect=((101, 102), (103, 104)),
+            ),
+            mock.patch.object(supervisor.os, "set_inheritable"),
+            mock.patch.object(supervisor.os, "set_blocking"),
+            mock.patch.object(
+                supervisor,
+                "inherited_file_descriptors",
+                side_effect=exhaust_deadline,
+            ),
+            mock.patch.object(supervisor.time, "monotonic", side_effect=monotonic),
+            mock.patch.object(supervisor, "close_fd") as close_fd,
+            mock.patch.object(supervisor.os, "fork") as fork,
+        ):
+            with self.assertRaises(supervisor.ChildWaitTimeout):
+                supervisor.spawn_process(
+                    ["/usr/bin/true"],
+                    new_session=False,
+                    inherited_sigchld_handler=signal.SIG_DFL,
+                    deadline=10.0,
+                )
+
+        fork.assert_not_called()
+        self.assertEqual(
+            [call.args[0] for call in close_fd.call_args_list],
+            [101, 102, 103, 104],
+        )
+        self.assertEqual(pthread_sigmask.call_count, 2)
+
+    def test_deadline_before_child_creation_is_a_timeout(self) -> None:
+        supervisor = load_supervisor_module()
+        diagnostics: list[str] = []
+
+        with (
+            mock.patch.object(
+                supervisor,
+                "spawn_process",
+                side_effect=supervisor.ChildWaitTimeout,
+            ),
+            mock.patch.object(
+                supervisor,
+                "print_error",
+                side_effect=diagnostics.append,
+            ),
+        ):
+            returncode = supervisor.main(
+                [
+                    "--timeout-seconds",
+                    "1",
+                    "--",
+                    "/usr/bin/true",
+                ]
+            )
+
+        self.assertEqual(returncode, 124)
+        self.assertEqual(
+            diagnostics,
+            ["deadline exceeded before child creation; result incomplete"],
+        )
+
     def test_deadline_stops_child_blocked_before_group_handoff(self) -> None:
         supervisor = load_supervisor_module()
 

@@ -53,6 +53,11 @@ class ChildWaitTimeout(Exception):
     pass
 
 
+def require_time_remaining(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise ChildWaitTimeout
+
+
 class ChildProcess:
     def __init__(self, pid: int) -> None:
         self.pid = pid
@@ -501,6 +506,7 @@ def spawn_process(
     *,
     new_session: bool,
     inherited_sigchld_handler: signal.Handlers,
+    deadline: float,
 ) -> tuple[ChildProcess, int, int, set[signal.Signals]]:
     inherited_signal_mask = signal.pthread_sigmask(
         signal.SIG_BLOCK,
@@ -508,14 +514,18 @@ def spawn_process(
     )
     opened_file_descriptors: list[int] = []
     try:
+        require_time_remaining(deadline)
         readiness_read_fd, readiness_write_fd = os.pipe()
         opened_file_descriptors.extend((readiness_read_fd, readiness_write_fd))
+        require_time_remaining(deadline)
         start_read_fd, start_write_fd = os.pipe()
         opened_file_descriptors.extend((start_read_fd, start_write_fd))
         for file_descriptor in opened_file_descriptors:
             os.set_inheritable(file_descriptor, False)
         os.set_blocking(readiness_read_fd, False)
+        require_time_remaining(deadline)
         inherited_file_descriptors_to_close = inherited_file_descriptors()
+        require_time_remaining(deadline)
         pid = os.fork()
     except BaseException:
         for file_descriptor in opened_file_descriptors:
@@ -695,7 +705,11 @@ def main(argv: list[str] | None = None) -> int:
                     command,
                     new_session=args.new_session,
                     inherited_sigchld_handler=previous_sigchld_handler,
+                    deadline=deadline,
                 )
+            except ChildWaitTimeout:
+                gate.arm()
+                raise
             except (OSError, SupervisorError) as exc:
                 gate.arm()
                 print_error(f"cannot launch command: {exc}")
@@ -730,8 +744,10 @@ def main(argv: list[str] | None = None) -> int:
             gate.close()
             ignore_managed_signals()
             if process is None:
-                print_error("deadline exceeded before child creation completed")
-                return SUPERVISOR_ERROR_EXIT
+                print_error(
+                    "deadline exceeded before child creation; result incomplete"
+                )
+                return TIMEOUT_EXIT
             try:
                 cleanup_unverified = stop_process_group(
                     process,

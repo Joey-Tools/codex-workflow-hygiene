@@ -24,9 +24,11 @@ superseded_by:
 - Broad macOS `du` walks require a hard deadline before launch; PTY polling alone is not a runtime bound.
 - Timed-out filesystem branches remain explicitly unknown or incomplete.
 - Numeric deadlines are illustrative rather than default thresholds; long-running scans are not friction by duration alone.
+- The main skill now triggers on uncertain runtime as well as uncertain output and routes one-line SQLite aggregates or similar scans to the deadline reference instead of skipping them as small output.
 - macOS single-process scans have a system-Perl direct-`exec` deadline pattern that preserves ordinary exit statuses and maps `SIGALRM` to an explicit incomplete result.
 - A POSIX/Python 3.10 process-group wrapper adds TERM/grace/KILL handling for ordinary child processes without requiring root, a container, tree scanning, or a persistent launcher process.
 - One absolute monotonic deadline starts before pipe creation and `fork`; a masked `READY`/`GO` barrier prevents user code from running until the parent has recorded the child PID and process-group handoff.
+- Startup checks the same absolute deadline after pipe setup and descriptor enumeration and immediately before `fork`, closing opened descriptors instead of starting a child once the budget is known to be exhausted.
 - The wrapper checks the deadline before each new exit observation; a status returned by an observation begun before the deadline wins that boundary race, and no new observation starts once the deadline is reached.
 - Before `READY`, timeout or cancellation signals only the direct child; after `GO`, blocked `exec` and runtime work are stopped through the group, with a final direct `SIGKILL` for a still-pinned leader that moved groups.
 - The first managed signal owns the cleanup transition; later managed signals cannot unwind and bypass the in-progress group stop.
@@ -47,6 +49,7 @@ superseded_by:
 
 ## Evidence
 
+- `skills/bounded-command-output/SKILL.md`
 - `skills/bounded-command-output/references/command-patterns.md`
 - `skills/bounded-command-output/scripts/run_process_group_deadline.py`
 - `tests/test_bounded_process_group_deadline.py`

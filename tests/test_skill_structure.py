@@ -49,13 +49,22 @@ class SkillStructureTests(unittest.TestCase):
         for trigger in (
             "broad searches or inventories",
             "large Jenkins, GitHub Actions, artifact, manual, diff, or review-range reads",
+            "broad database aggregates or filesystem walks with uncertain runtime",
             "broad or noisy process diagnostics",
             "verbose xcodebuild or other tests and builds",
             "spinner-heavy container builds",
         ):
             self.assertIn(trigger, skill)
         self.assertIn("Apply alongside the domain skill", skill)
-        self.assertIn("controls command shape and output handling only", skill)
+        self.assertIn(
+            "controls command shape, execution deadlines, and output handling only",
+            skill,
+        )
+        self.assertIn("Small output does not imply bounded runtime", skill)
+        self.assertIn("expected result is one line", skill)
+        self.assertIn("known to be both small and fast", skill)
+        self.assertIn("task-specific deadlines", skill)
+        self.assertIn("expected output is a single value", skill)
         self.assertIn("display backstops, not as execution-time bounds", skill)
         self.assertIn("finite wall-clock deadline", skill)
         self.assertIn("explicitly capped candidate-filename sample", skill)
@@ -124,6 +133,7 @@ class SkillStructureTests(unittest.TestCase):
         self.assertTrue(supervisor.is_file())
         self.assertTrue(os.access(supervisor, os.X_OK))
         self.assertIn("$bounded-command-output", interface)
+        self.assertIn("time-bounded, pollable, and compact", interface)
         self.assertIn("allow_implicit_invocation: true", interface)
         self.assertNotIn("TODO", skill)
 
