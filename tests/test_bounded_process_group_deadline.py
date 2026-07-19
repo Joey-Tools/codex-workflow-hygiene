@@ -57,6 +57,23 @@ def load_supervisor_module() -> object:
     return module
 
 
+def create_full_blocking_pipe() -> tuple[int, int]:
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_blocking(write_fd, False)
+        while True:
+            try:
+                os.write(write_fd, b"x" * 4096)
+            except BlockingIOError:
+                break
+        os.set_blocking(write_fd, True)
+    except BaseException:
+        os.close(write_fd)
+        os.close(read_fd)
+        raise
+    return read_fd, write_fd
+
+
 class PlatformRejectionTests(unittest.TestCase):
     def test_non_posix_rejection_precedes_supervision(self) -> None:
         supervisor = load_supervisor_module()
@@ -324,6 +341,61 @@ raise SystemExit(
                 process.wait(timeout=2)
 
         self.assertEqual(returncode, 124)
+
+    def test_full_stderr_pipe_does_not_delay_timeout_status(self) -> None:
+        read_fd, write_fd = create_full_blocking_pipe()
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--timeout-seconds",
+                    "0.2",
+                    "--grace-seconds",
+                    "0",
+                    "--",
+                    "/bin/sleep",
+                    "30",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=write_fd,
+            )
+            returncode = process.wait(timeout=5)
+            self.assertEqual(returncode, 124)
+            self.assertTrue(os.get_blocking(write_fd))
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            os.close(write_fd)
+            os.close(read_fd)
+
+    def test_exec_error_does_not_block_on_full_stderr_pipe(self) -> None:
+        read_fd, write_fd = create_full_blocking_pipe()
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--timeout-seconds",
+                    "2",
+                    "--",
+                    "/definitely/missing/deadline-target",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=write_fd,
+            )
+            returncode = process.wait(timeout=5)
+            self.assertEqual(returncode, 127)
+            self.assertTrue(os.get_blocking(write_fd))
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            os.close(write_fd)
+            os.close(read_fd)
 
     def test_same_session_mode_creates_a_new_process_group(self) -> None:
         probe = (

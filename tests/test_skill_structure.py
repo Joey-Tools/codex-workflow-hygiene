@@ -126,6 +126,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("later managed signals cannot interrupt it", patterns)
         self.assertIn("unblocks managed `INT`, `TERM`, and `HUP`", patterns)
         self.assertIn("Diagnostics are best effort", patterns)
+        self.assertIn("a closed or broken sink, or a full pipe", patterns)
+        self.assertIn("shared open-file description", patterns)
         self.assertIn("Python 3.10 baseline", patterns)
         self.assertIn("standalone single-threaded POSIX CLI", patterns)
         self.assertIn("require neither root, a container", patterns)

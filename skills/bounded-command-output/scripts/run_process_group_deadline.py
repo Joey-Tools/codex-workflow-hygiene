@@ -355,6 +355,44 @@ def stop_process_group(
     return cleanup_unverified
 
 
+def write_best_effort_diagnostic(
+    diagnostic: bytes,
+    *,
+    restore_sigpipe: bool,
+) -> None:
+    previous_sigpipe: signal.Handlers | None = None
+    if hasattr(signal, "SIGPIPE"):
+        try:
+            if restore_sigpipe:
+                previous_sigpipe = signal.getsignal(signal.SIGPIPE)
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        except (OSError, ValueError):
+            return
+    restore_blocking = False
+    try:
+        try:
+            restore_blocking = os.get_blocking(2)
+            if restore_blocking:
+                os.set_blocking(2, False)
+        except (AttributeError, OSError):
+            return
+        try:
+            os.write(2, diagnostic)
+        except OSError:
+            pass
+    finally:
+        if restore_blocking:
+            try:
+                os.set_blocking(2, True)
+            except (AttributeError, OSError):
+                pass
+        if previous_sigpipe is not None:
+            try:
+                signal.signal(signal.SIGPIPE, previous_sigpipe)
+            except (OSError, ValueError):
+                pass
+
+
 def child_error(message: str, returncode: int, *file_descriptors: int) -> None:
     for file_descriptor in file_descriptors:
         try:
@@ -365,16 +403,10 @@ def child_error(message: str, returncode: int, *file_descriptors: int) -> None:
         "utf-8",
         errors="replace",
     )
-    if hasattr(signal, "SIGPIPE"):
-        try:
-            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-        except (OSError, ValueError):
-            pass
     try:
-        os.write(2, diagnostic)
-    except OSError:
-        pass
-    os._exit(returncode)
+        write_best_effort_diagnostic(diagnostic, restore_sigpipe=False)
+    finally:
+        os._exit(returncode)
 
 
 def close_fd(file_descriptor: int) -> None:
@@ -639,31 +671,7 @@ def print_error(message: str) -> None:
     diagnostic = (
         f"run_process_group_deadline: {message[:1024]}\n"
     ).encode("utf-8", errors="replace")
-    previous_sigpipe: signal.Handlers | None = None
-    if hasattr(signal, "SIGPIPE"):
-        try:
-            previous_sigpipe = signal.getsignal(signal.SIGPIPE)
-            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-        except (OSError, ValueError):
-            previous_sigpipe = None
-    try:
-        offset = 0
-        while offset < len(diagnostic):
-            try:
-                written = os.write(2, diagnostic[offset:])
-                if written <= 0:
-                    break
-                offset += written
-            except InterruptedError:
-                continue
-            except OSError:
-                break
-    finally:
-        if previous_sigpipe is not None:
-            try:
-                signal.signal(signal.SIGPIPE, previous_sigpipe)
-            except (OSError, ValueError):
-                pass
+    write_best_effort_diagnostic(diagnostic, restore_sigpipe=True)
 
 
 def main(argv: list[str] | None = None) -> int:

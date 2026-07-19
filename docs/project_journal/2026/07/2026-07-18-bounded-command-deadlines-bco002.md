@@ -34,7 +34,8 @@ superseded_by:
 - Before `READY`, timeout or cancellation signals only the direct child; after `GO`, blocked `exec` and runtime work are stopped through the group, with a final direct `SIGKILL` for a still-pinned leader that moved groups.
 - The first managed signal owns the cleanup transition; later managed signals cannot unwind and bypass the in-progress group stop.
 - The supervisor parent unblocks managed `INT`, `TERM`, and `HUP` signals during supervision even when the launcher blocked them; the target child and final parent teardown retain the launcher's original mask.
-- Diagnostic writes temporarily ignore `SIGPIPE` and treat closed or broken stderr as best effort so they cannot replace the selected child, timeout, or forwarded-signal status.
+- Diagnostic writes temporarily ignore `SIGPIPE`, make stderr nonblocking for one short best-effort write, and drop output to a closed or broken sink or a full pipe so diagnostics cannot replace or indefinitely delay the selected child, timeout, or forwarded-signal status.
+- The nonblocking flag is shared across forked descriptors; an uncatchable child death in the short diagnostic-write window can leave inherited stderr nonblocking, and eliminating that edge would require a dedicated diagnostic channel outside the lightweight design.
 - Handler restoration temporarily masks managed signals on the current thread so teardown cannot leak a `ForwardedSignal` traceback.
 - An outer signal boundary covers the pre-mask teardown window, while non-POSIX rejection happens before handler setup.
 - Timeout and grace inputs are capped at one year for representability rather than as workflow defaults or duration thresholds; malformed executable formats map to exit `126`.
