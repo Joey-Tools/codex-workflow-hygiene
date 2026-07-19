@@ -226,7 +226,13 @@ def close_gate_and_restore_signal_handlers(
     gate: SignalGate,
     previous: dict[int, signal.Handlers],
 ) -> None:
-    previous_mask = signal.pthread_sigmask(
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if pthread_sigmask is None:
+        gate.close()
+        restore_signal_handlers(previous)
+        return
+
+    previous_mask = pthread_sigmask(
         signal.SIG_BLOCK,
         MANAGED_SIGNALS,
     )
@@ -234,7 +240,7 @@ def close_gate_and_restore_signal_handlers(
         gate.close()
         restore_signal_handlers(previous)
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def print_error(message: str) -> None:
@@ -272,62 +278,68 @@ def main(argv: list[str] | None = None) -> int:
     try:
         try:
             try:
-                process = subprocess.Popen(command, **popen_options)
-            except FileNotFoundError:
-                gate.arm()
-                print_error(f"command not found: {command[0]}")
-                return COMMAND_NOT_FOUND_EXIT
-            except PermissionError:
-                gate.arm()
-                print_error(f"command is not executable: {command[0]}")
-                return CANNOT_EXECUTE_EXIT
-            except OSError as exc:
-                gate.arm()
-                print_error(f"cannot start command: {exc}")
-                return SUPERVISOR_ERROR_EXIT
+                try:
+                    process = subprocess.Popen(command, **popen_options)
+                except FileNotFoundError:
+                    gate.arm()
+                    print_error(f"command not found: {command[0]}")
+                    return COMMAND_NOT_FOUND_EXIT
+                except PermissionError:
+                    gate.arm()
+                    print_error(f"command is not executable: {command[0]}")
+                    return CANNOT_EXECUTE_EXIT
+                except OSError as exc:
+                    gate.arm()
+                    print_error(f"cannot start command: {exc}")
+                    return SUPERVISOR_ERROR_EXIT
 
-            process_group_id = process.pid
-            gate.arm()
-            try:
-                return normalized_exit_code(
-                    process.wait(timeout=args.timeout_seconds)
-                )
-            except subprocess.TimeoutExpired:
+                process_group_id = process.pid
+                gate.arm()
+                try:
+                    return normalized_exit_code(
+                        process.wait(timeout=args.timeout_seconds)
+                    )
+                except subprocess.TimeoutExpired:
+                    ignore_managed_signals()
+                    try:
+                        cleanup_unverified = stop_process_group(
+                            process,
+                            process_group_id=process_group_id,
+                            initial_signal=signal.SIGTERM,
+                            grace_seconds=args.grace_seconds,
+                        )
+                    except SupervisorError as exc:
+                        print_error(str(exc))
+                        return SUPERVISOR_ERROR_EXIT
+                    message = "deadline exceeded; result incomplete"
+                    if cleanup_unverified:
+                        message += "; post-TERM group cleanup unverified"
+                    print_error(message)
+                    return TIMEOUT_EXIT
+            except ForwardedSignal as event:
                 ignore_managed_signals()
+                if process is None:
+                    return min(255, 128 + event.signum)
                 try:
                     cleanup_unverified = stop_process_group(
                         process,
-                        process_group_id=process_group_id,
-                        initial_signal=signal.SIGTERM,
+                        process_group_id=process.pid,
+                        initial_signal=event.signum,
                         grace_seconds=args.grace_seconds,
                     )
                 except SupervisorError as exc:
                     print_error(str(exc))
                     return SUPERVISOR_ERROR_EXIT
-                message = "deadline exceeded; result incomplete"
                 if cleanup_unverified:
-                    message += "; post-TERM group cleanup unverified"
-                print_error(message)
-                return TIMEOUT_EXIT
-        except ForwardedSignal as event:
-            ignore_managed_signals()
-            if process is None:
+                    print_error("forwarded signal; process-group cleanup unverified")
                 return min(255, 128 + event.signum)
-            try:
-                cleanup_unverified = stop_process_group(
-                    process,
-                    process_group_id=process.pid,
-                    initial_signal=event.signum,
-                    grace_seconds=args.grace_seconds,
-                )
-            except SupervisorError as exc:
-                print_error(str(exc))
-                return SUPERVISOR_ERROR_EXIT
-            if cleanup_unverified:
-                print_error("forwarded signal; process-group cleanup unverified")
-            return min(255, 128 + event.signum)
-    finally:
-        close_gate_and_restore_signal_handlers(gate, previous_handlers)
+        finally:
+            close_gate_and_restore_signal_handlers(gate, previous_handlers)
+    except ForwardedSignal as event:
+        ignore_managed_signals()
+        gate.close()
+        restore_signal_handlers(previous_handlers)
+        return min(255, 128 + event.signum)
 
 
 if __name__ == "__main__":

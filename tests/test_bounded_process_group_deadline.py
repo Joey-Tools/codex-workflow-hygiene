@@ -56,6 +56,38 @@ def load_supervisor_module() -> object:
     return module
 
 
+class PlatformRejectionTests(unittest.TestCase):
+    def test_non_posix_rejection_precedes_signal_teardown(self) -> None:
+        supervisor = load_supervisor_module()
+        diagnostics: list[str] = []
+
+        with (
+            mock.patch.object(supervisor.os, "name", "nt"),
+            mock.patch.object(
+                supervisor.signal,
+                "pthread_sigmask",
+                side_effect=AssertionError("signal teardown should not run"),
+                create=True,
+            ),
+            mock.patch.object(
+                supervisor,
+                "print_error",
+                side_effect=diagnostics.append,
+            ),
+        ):
+            returncode = supervisor.main(
+                [
+                    "--timeout-seconds",
+                    "1",
+                    "--",
+                    "/usr/bin/true",
+                ]
+            )
+
+        self.assertEqual(returncode, 125)
+        self.assertEqual(diagnostics, ["POSIX process groups are required"])
+
+
 @unittest.skipUnless(POSIX, "requires POSIX")
 class PosixNewSessionDeadlineTests(unittest.TestCase):
     def test_new_session_mode_is_explicit(self) -> None:
@@ -419,6 +451,40 @@ time.sleep(30)
 
         self.assertEqual(returncode, 0)
         self.assertEqual(restore_calls, 1)
+
+    def test_signal_before_teardown_mask_is_caught_by_outer_boundary(
+        self,
+    ) -> None:
+        supervisor = load_supervisor_module()
+        original_sigmask = supervisor.signal.pthread_sigmask
+        mask_calls = 0
+
+        def signal_then_mask(how: int, mask: object) -> object:
+            nonlocal mask_calls
+            mask_calls += 1
+            if mask_calls == 1:
+                handler = signal.getsignal(signal.SIGTERM)
+                if not callable(handler):
+                    raise AssertionError("managed signal handler is not callable")
+                handler(signal.SIGTERM, None)
+            return original_sigmask(how, mask)
+
+        with mock.patch.object(
+            supervisor.signal,
+            "pthread_sigmask",
+            side_effect=signal_then_mask,
+        ):
+            returncode = supervisor.main(
+                [
+                    "--timeout-seconds",
+                    "2",
+                    "--",
+                    "/usr/bin/true",
+                ]
+            )
+
+        self.assertEqual(returncode, 143)
+        self.assertEqual(mask_calls, 1)
 
     def test_setsid_descendant_is_not_chased(self) -> None:
         escaped = """
