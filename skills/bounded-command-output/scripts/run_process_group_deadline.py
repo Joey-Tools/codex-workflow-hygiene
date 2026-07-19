@@ -61,20 +61,27 @@ class ChildProcess:
     def poll(self) -> int | None:
         if self.returncode is not None:
             return self.returncode
-        while True:
-            try:
-                waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
-                break
-            except InterruptedError:
-                continue
-            except ChildProcessError as exc:
-                raise SupervisorError(
-                    f"cannot reap direct child {self.pid}: {exc}"
-                ) from exc
-        if waited_pid == 0:
-            return None
-        self.returncode = os.waitstatus_to_exitcode(status)
-        return self.returncode
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            MANAGED_SIGNALS,
+        )
+        try:
+            while True:
+                try:
+                    waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+                    break
+                except InterruptedError:
+                    continue
+                except ChildProcessError as exc:
+                    raise SupervisorError(
+                        f"cannot reap direct child {self.pid}: {exc}"
+                    ) from exc
+            if waited_pid == 0:
+                return None
+            self.returncode = os.waitstatus_to_exitcode(status)
+            return self.returncode
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
     def wait(self, timeout: float | None = None) -> int:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -83,6 +90,10 @@ class ChildProcess:
     def wait_until(self, deadline: float | None) -> int:
         sleep_seconds = WAIT_POLL_INITIAL_SECONDS
         while True:
+            if self.returncode is not None:
+                return self.returncode
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ChildWaitTimeout
             returncode = self.poll()
             if returncode is not None:
                 return returncode
@@ -667,94 +678,107 @@ def main(argv: list[str] | None = None) -> int:
     start_fd: int | None = None
     group_handoff_complete = False
     deadline = time.monotonic() + args.timeout_seconds
-    try:
+
+    def run_command() -> int:
+        nonlocal process
+        nonlocal readiness_fd
+        nonlocal start_fd
+        nonlocal group_handoff_complete
         try:
             try:
-                try:
-                    (
-                        process,
-                        readiness_fd,
-                        start_fd,
-                        inherited_signal_mask,
-                    ) = spawn_process(
-                        command,
-                        new_session=args.new_session,
-                        inherited_sigchld_handler=previous_sigchld_handler,
-                    )
-                except (OSError, SupervisorError) as exc:
-                    gate.arm()
-                    print_error(f"cannot launch command: {exc}")
-                    return SUPERVISOR_ERROR_EXIT
-
-                try:
-                    gate.arm()
-                finally:
-                    signal.pthread_sigmask(
-                        signal.SIG_SETMASK,
-                        inherited_signal_mask,
-                    )
-                group_handoff_complete = wait_for_group_handoff(
+                (
                     process,
                     readiness_fd,
-                    deadline=deadline,
+                    start_fd,
+                    inherited_signal_mask,
+                ) = spawn_process(
+                    command,
+                    new_session=args.new_session,
+                    inherited_sigchld_handler=previous_sigchld_handler,
                 )
+            except (OSError, SupervisorError) as exc:
+                gate.arm()
+                print_error(f"cannot launch command: {exc}")
+                return SUPERVISOR_ERROR_EXIT
+
+            try:
+                gate.arm()
+            finally:
+                signal.pthread_sigmask(
+                    signal.SIG_SETMASK,
+                    inherited_signal_mask,
+                )
+            group_handoff_complete = wait_for_group_handoff(
+                process,
+                readiness_fd,
+                deadline=deadline,
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ChildWaitTimeout
+            if group_handoff_complete:
+                try:
+                    release_child_for_exec(start_fd)
+                finally:
+                    close_fd(start_fd)
+                    start_fd = None
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise ChildWaitTimeout
-                if group_handoff_complete:
-                    try:
-                        release_child_for_exec(start_fd)
-                    finally:
-                        close_fd(start_fd)
-                        start_fd = None
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise ChildWaitTimeout
-                return normalized_exit_code(process.wait_until(deadline))
-            except ChildWaitTimeout:
-                gate.close()
-                ignore_managed_signals()
-                if process is None:
-                    print_error("deadline exceeded before child creation completed")
-                    return SUPERVISOR_ERROR_EXIT
+            return normalized_exit_code(process.wait_until(deadline))
+        except ChildWaitTimeout:
+            gate.close()
+            ignore_managed_signals()
+            if process is None:
+                print_error("deadline exceeded before child creation completed")
+                return SUPERVISOR_ERROR_EXIT
+            try:
+                cleanup_unverified = stop_process_group(
+                    process,
+                    process_group_id=process.pid,
+                    initial_signal=signal.SIGTERM,
+                    grace_seconds=args.grace_seconds,
+                    group_handoff_complete=group_handoff_complete,
+                )
+            except SupervisorError as exc:
+                print_error(str(exc))
+                return SUPERVISOR_ERROR_EXIT
+            message = "deadline exceeded; result incomplete"
+            if cleanup_unverified:
+                message += "; post-TERM group cleanup unverified"
+            print_error(message)
+            return TIMEOUT_EXIT
+        except SupervisorError as exc:
+            gate.close()
+            ignore_managed_signals()
+            if process is not None:
                 try:
-                    cleanup_unverified = stop_process_group(
+                    stop_process_group(
                         process,
                         process_group_id=process.pid,
                         initial_signal=signal.SIGTERM,
-                        grace_seconds=args.grace_seconds,
+                        grace_seconds=0,
                         group_handoff_complete=group_handoff_complete,
                     )
-                except SupervisorError as exc:
-                    print_error(str(exc))
+                except SupervisorError as cleanup_exc:
+                    print_error(f"{exc}; cleanup failed: {cleanup_exc}")
                     return SUPERVISOR_ERROR_EXIT
-                message = "deadline exceeded; result incomplete"
-                if cleanup_unverified:
-                    message += "; post-TERM group cleanup unverified"
-                print_error(message)
-                return TIMEOUT_EXIT
-            except SupervisorError as exc:
-                gate.close()
-                ignore_managed_signals()
-                if process is not None:
-                    try:
-                        stop_process_group(
-                            process,
-                            process_group_id=process.pid,
-                            initial_signal=signal.SIGTERM,
-                            grace_seconds=0,
-                            group_handoff_complete=group_handoff_complete,
-                        )
-                    except SupervisorError as cleanup_exc:
-                        print_error(f"{exc}; cleanup failed: {cleanup_exc}")
-                        return SUPERVISOR_ERROR_EXIT
-                print_error(str(exc))
-                return SUPERVISOR_ERROR_EXIT
-            except ForwardedSignal as event:
-                gate.close()
-                ignore_managed_signals()
-                if process is None:
-                    return min(255, 128 + event.signum)
+            print_error(str(exc))
+            return SUPERVISOR_ERROR_EXIT
+        finally:
+            if readiness_fd is not None:
+                close_fd(readiness_fd)
+            if start_fd is not None:
+                close_fd(start_fd)
+
+    try:
+        try:
+            result = run_command()
+            close_gate_and_restore_signal_handlers(gate, previous_handlers)
+        except ForwardedSignal as event:
+            gate.close()
+            ignore_managed_signals()
+            if process is not None:
                 try:
                     cleanup_unverified = stop_process_group(
                         process,
@@ -765,24 +789,19 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 except SupervisorError as exc:
                     print_error(str(exc))
-                    return SUPERVISOR_ERROR_EXIT
-                if cleanup_unverified:
-                    print_error("forwarded signal; process-group cleanup unverified")
-                return min(255, 128 + event.signum)
-        finally:
-            if readiness_fd is not None:
-                close_fd(readiness_fd)
-            if start_fd is not None:
-                close_fd(start_fd)
-            try:
-                close_gate_and_restore_signal_handlers(gate, previous_handlers)
-            finally:
-                signal.signal(signal.SIGCHLD, previous_sigchld_handler)
-    except ForwardedSignal as event:
-        gate.close()
-        ignore_managed_signals()
-        restore_signal_handlers(previous_handlers)
-        return min(255, 128 + event.signum)
+                    result = SUPERVISOR_ERROR_EXIT
+                else:
+                    if cleanup_unverified:
+                        print_error(
+                            "forwarded signal; process-group cleanup unverified"
+                        )
+                    result = min(255, 128 + event.signum)
+            else:
+                result = min(255, 128 + event.signum)
+            close_gate_and_restore_signal_handlers(gate, previous_handlers)
+        return result
+    finally:
+        signal.signal(signal.SIGCHLD, previous_sigchld_handler)
 
 
 if __name__ == "__main__":

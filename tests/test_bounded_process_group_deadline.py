@@ -453,6 +453,62 @@ class ProcessGroupDeadlineTests(unittest.TestCase):
         killpg.assert_not_called()
         kill_process.assert_not_called()
 
+    def test_deadline_wins_before_a_new_exit_observation(self) -> None:
+        supervisor = load_supervisor_module()
+        process = supervisor.ChildProcess(999_997)
+
+        with (
+            mock.patch.object(supervisor.time, "monotonic", return_value=10.0),
+            mock.patch.object(process, "poll") as poll,
+        ):
+            with self.assertRaises(supervisor.ChildWaitTimeout):
+                process.wait_until(10.0)
+
+        poll.assert_not_called()
+
+    def test_exit_observation_started_before_deadline_wins(self) -> None:
+        supervisor = load_supervisor_module()
+        process = supervisor.ChildProcess(999_996)
+
+        with (
+            mock.patch.object(supervisor.time, "monotonic", return_value=9.9),
+            mock.patch.object(process, "poll", return_value=0) as poll,
+        ):
+            self.assertEqual(process.wait_until(10.0), 0)
+
+        poll.assert_called_once_with()
+
+    def test_waitpid_status_is_cached_before_signals_are_unmasked(self) -> None:
+        supervisor = load_supervisor_module()
+        process = supervisor.ChildProcess(999_995)
+        mask_calls = 0
+
+        def mask_then_interrupt(how: int, _signals: object) -> set[object]:
+            nonlocal mask_calls
+            mask_calls += 1
+            if how == signal.SIG_SETMASK:
+                self.assertEqual(process.returncode, 0)
+                raise supervisor.ForwardedSignal(signal.SIGTERM)
+            return set()
+
+        with (
+            mock.patch.object(
+                supervisor.os,
+                "waitpid",
+                return_value=(process.pid, 0),
+            ),
+            mock.patch.object(
+                supervisor.signal,
+                "pthread_sigmask",
+                side_effect=mask_then_interrupt,
+            ),
+        ):
+            with self.assertRaises(supervisor.ForwardedSignal):
+                process.poll()
+
+        self.assertEqual(mask_calls, 2)
+        self.assertEqual(process.returncode, 0)
+
     def test_final_group_kill_also_targets_a_pinned_escaped_leader(self) -> None:
         supervisor = load_supervisor_module()
         process = supervisor.ChildProcess(999_998)
@@ -814,6 +870,82 @@ raise SystemExit(9)
         self.assertEqual(len(started), 1)
         self.assertIsNotNone(started[0].poll())
 
+    def test_signal_interrupting_timeout_gate_close_still_cleans_child(
+        self,
+    ) -> None:
+        supervisor = load_supervisor_module()
+        original_spawn = supervisor.spawn_process
+        original_close = supervisor.SignalGate.close
+        original_stop = supervisor.stop_process_group
+        started: list[object] = []
+        close_calls = 0
+
+        def record_spawn(
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[object, int, int, object]:
+            spawned = original_spawn(*args, **kwargs)
+            started.append(spawned[0])
+            return spawned
+
+        def cleanup_started() -> None:
+            for process in started:
+                if process.poll() is None:
+                    process.send_signal(signal.SIGKILL)
+                    process.wait(timeout=2)
+
+        self.addCleanup(cleanup_started)
+
+        def interrupt_first_close(gate: object) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 1:
+                handler = signal.getsignal(signal.SIGTERM)
+                if not callable(handler):
+                    raise AssertionError("managed signal handler is not callable")
+                handler(signal.SIGTERM, None)
+            original_close(gate)
+
+        def assert_sigchld_then_stop(*args: object, **kwargs: object) -> bool:
+            self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_DFL)
+            return original_stop(*args, **kwargs)
+
+        previous_sigchld = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        try:
+            with (
+                mock.patch.object(supervisor, "spawn_process", record_spawn),
+                mock.patch.object(
+                    supervisor.SignalGate,
+                    "close",
+                    autospec=True,
+                    side_effect=interrupt_first_close,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "stop_process_group",
+                    side_effect=assert_sigchld_then_stop,
+                ),
+            ):
+                returncode = supervisor.main(
+                    [
+                        "--timeout-seconds",
+                        "0.05",
+                        "--grace-seconds",
+                        "0",
+                        "--",
+                        "/bin/sleep",
+                        "30",
+                    ]
+                )
+            self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_IGN)
+        finally:
+            signal.signal(signal.SIGCHLD, previous_sigchld)
+
+        self.assertEqual(returncode, 143)
+        self.assertGreaterEqual(close_calls, 3)
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll())
+
     def test_signal_during_handler_restore_cannot_escape_as_traceback(
         self,
     ) -> None:
@@ -857,10 +989,11 @@ raise SystemExit(9)
         def signal_then_close(gate: object, previous: object) -> None:
             nonlocal close_calls
             close_calls += 1
-            handler = signal.getsignal(signal.SIGTERM)
-            if not callable(handler):
-                raise AssertionError("managed signal handler is not callable")
-            handler(signal.SIGTERM, None)
+            if close_calls == 1:
+                handler = signal.getsignal(signal.SIGTERM)
+                if not callable(handler):
+                    raise AssertionError("managed signal handler is not callable")
+                handler(signal.SIGTERM, None)
             original_close(gate, previous)
 
         with mock.patch.object(
@@ -878,7 +1011,7 @@ raise SystemExit(9)
             )
 
         self.assertEqual(returncode, 143)
-        self.assertEqual(close_calls, 1)
+        self.assertEqual(close_calls, 2)
 
     def test_setsid_descendant_is_not_chased(self) -> None:
         escaped = """
