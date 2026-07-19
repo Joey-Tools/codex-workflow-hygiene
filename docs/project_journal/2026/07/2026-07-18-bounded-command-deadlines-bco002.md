@@ -3,8 +3,8 @@ id: 20260718-bco002
 title: Bounded Database And Filesystem Scans
 status: completed
 created: 2026-07-18
-updated: 2026-07-18
-branch: codex/daily-skill-friction-20260718-codex-workflow-hygiene-bound-sqlite-du
+updated: 2026-07-19
+branch: codex/bounded-process-group-supervisor-20260719
 pr:
 supersedes: []
 superseded_by:
@@ -14,7 +14,7 @@ superseded_by:
 
 ## Summary
 
-- Added concrete hard-deadline guidance for SQLite aggregates and broad macOS filesystem walks after both command shapes caused repeated manual interruption.
+- Added task-selected deadline guidance for SQLite aggregates and broad macOS filesystem walks, plus a lightweight process-group wrapper for ordinary child processes.
 
 ## Current State
 
@@ -23,14 +23,22 @@ superseded_by:
 - Broad aggregates require an outer hard wall-clock deadline and produce incomplete evidence when terminated.
 - Broad macOS `du` walks require a hard deadline before launch; PTY polling alone is not a runtime bound.
 - Timed-out filesystem branches remain explicitly unknown or incomplete.
+- Numeric deadlines are illustrative rather than default thresholds; long-running scans are not friction by duration alone.
 - macOS single-process scans have a system-Perl direct-`exec` deadline pattern that preserves ordinary exit statuses and maps `SIGALRM` to an explicit incomplete result.
-- Producers that detach descendants still require task-scoped supervision or OS containment for the whole process unit.
+- A POSIX/Python 3.11 same-session process-group wrapper adds TERM/grace/KILL handling for ordinary child processes without requiring root or a container.
+- The wrapper preserves the original session, does not allocate a PTY, waits only for its direct child, and intentionally does not chase escaped descendants or prove group quiescence.
+- macOS may return `EPERM` when the wrapper re-signals a group whose leader exited during grace; this remains timeout `124` with an explicit unverified-cleanup diagnostic after the direct child is confirmed exited.
+- Background descendants that intentionally survive a normal leader exit must close or redirect inherited stdout/stderr, or an outer pipe reader can continue waiting for EOF.
+- Python 3.10 can use the explicit `--new-session` mode when losing the controlling terminal is acceptable.
+- Output-byte enforcement remains separate from the deadline wrapper.
 
 ## Next Steps
 
-- Monitor whether these concrete patterns prevent manual interruption in future database and disk-usage investigations.
+- Monitor whether the lightweight wrapper covers ordinary non-interactive builds and scans without introducing unacceptable TTY or Python-version constraints.
 
 ## Evidence
 
 - `skills/bounded-command-output/references/command-patterns.md`
+- `skills/bounded-command-output/scripts/run_process_group_deadline.py`
+- `tests/test_bounded_process_group_deadline.py`
 - `tests/test_skill_structure.py`

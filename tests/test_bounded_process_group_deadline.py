@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = (
+    REPO_ROOT
+    / "skills/bounded-command-output/scripts/run_process_group_deadline.py"
+)
+POSIX_PROCESS_GROUPS = os.name == "posix" and sys.version_info >= (3, 11)
+
+
+def run_supervisor(
+    *arguments: str,
+    timeout: float = 8.0,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *arguments],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def wait_for_file(path: Path, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {path}")
+
+
+@unittest.skipUnless(POSIX_PROCESS_GROUPS, "requires POSIX and Python 3.11+")
+class ProcessGroupDeadlineTests(unittest.TestCase):
+    def test_preserves_normal_exit_status(self) -> None:
+        for exit_code in (0, 42):
+            with self.subTest(exit_code=exit_code):
+                result = run_supervisor(
+                    "--timeout-seconds",
+                    "2",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    f"raise SystemExit({exit_code})",
+                )
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+
+    def test_same_session_mode_creates_a_new_process_group(self) -> None:
+        probe = (
+            "import json, os; "
+            "print(json.dumps({'pid': os.getpid(), 'pgid': os.getpgrp(), "
+            "'sid': os.getsid(0), 'euid': os.geteuid()}))"
+        )
+        result = run_supervisor(
+            "--timeout-seconds",
+            "2",
+            "--",
+            sys.executable,
+            "-c",
+            probe,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        identity = json.loads(result.stdout)
+        self.assertEqual(identity["pgid"], identity["pid"])
+        self.assertEqual(identity["sid"], os.getsid(0))
+        self.assertEqual(identity["euid"], os.geteuid())
+
+    def test_new_session_mode_is_explicit(self) -> None:
+        probe = (
+            "import json, os; "
+            "print(json.dumps({'pid': os.getpid(), 'pgid': os.getpgrp(), "
+            "'sid': os.getsid(0)}))"
+        )
+        result = run_supervisor(
+            "--timeout-seconds",
+            "2",
+            "--new-session",
+            "--",
+            sys.executable,
+            "-c",
+            probe,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        identity = json.loads(result.stdout)
+        self.assertEqual(identity["pgid"], identity["pid"])
+        self.assertEqual(identity["sid"], identity["pid"])
+        self.assertNotEqual(identity["sid"], os.getsid(0))
+
+    def test_timeout_signals_group_then_waits_full_grace(self) -> None:
+        grandchild = """
+import signal
+import sys
+import time
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+
+def record_term(_signum, _frame):
+    marker.write_text("term", encoding="utf-8")
+
+signal.signal(signal.SIGTERM, record_term)
+ready.write_text("ready", encoding="utf-8")
+time.sleep(30)
+"""
+        leader = """
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+source = sys.argv[3]
+subprocess.Popen([sys.executable, "-c", source, str(marker), str(ready)])
+deadline = time.monotonic() + 2
+while not ready.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(30)
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker = Path(temp_dir) / "term-marker"
+            ready = Path(temp_dir) / "ready"
+            started = time.monotonic()
+            result = run_supervisor(
+                "--timeout-seconds",
+                "0.3",
+                "--grace-seconds",
+                "0.2",
+                "--",
+                sys.executable,
+                "-c",
+                leader,
+                str(marker),
+                str(ready),
+                grandchild,
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(result.returncode, 124, result.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "term")
+            self.assertGreaterEqual(elapsed, 0.45)
+            self.assertLess(elapsed, 2.0)
+            self.assertIn("result incomplete", result.stderr)
+
+    def test_cooperative_single_process_timeout_is_still_a_timeout(self) -> None:
+        started = time.monotonic()
+        result = run_supervisor(
+            "--timeout-seconds",
+            "0.2",
+            "--grace-seconds",
+            "0.1",
+            "--",
+            "/bin/sleep",
+            "30",
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertGreaterEqual(elapsed, 0.25)
+        self.assertLess(elapsed, 2.0)
+        self.assertIn("result incomplete", result.stderr)
+
+    def test_external_sigterm_is_forwarded_to_the_group(self) -> None:
+        child = """
+import signal
+import sys
+import time
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+
+def record_term(_signum, _frame):
+    marker.write_text("term", encoding="utf-8")
+
+signal.signal(signal.SIGTERM, record_term)
+ready.write_text("ready", encoding="utf-8")
+time.sleep(30)
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker = Path(temp_dir) / "term-marker"
+            ready = Path(temp_dir) / "ready"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--timeout-seconds",
+                    "10",
+                    "--grace-seconds",
+                    "0.1",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    child,
+                    str(marker),
+                    str(ready),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.addCleanup(process.kill)
+            wait_for_file(ready)
+            process.send_signal(signal.SIGTERM)
+            _stdout, stderr = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 143, stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "term")
+
+    def test_setsid_descendant_is_not_chased(self) -> None:
+        escaped = """
+import os
+import sys
+import time
+from pathlib import Path
+
+ready = Path(sys.argv[1])
+survived = Path(sys.argv[2])
+os.setsid()
+ready.write_text(str(os.getpid()), encoding="utf-8")
+time.sleep(0.7)
+survived.write_text("survived", encoding="utf-8")
+"""
+        leader = """
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ready = Path(sys.argv[1])
+survived = Path(sys.argv[2])
+source = sys.argv[3]
+subprocess.Popen([sys.executable, "-c", source, str(ready), str(survived)])
+deadline = time.monotonic() + 2
+while not ready.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+time.sleep(30)
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ready = Path(temp_dir) / "escaped-ready"
+            survived = Path(temp_dir) / "escaped-survived"
+            result = run_supervisor(
+                "--timeout-seconds",
+                "0.3",
+                "--grace-seconds",
+                "0.1",
+                "--",
+                sys.executable,
+                "-c",
+                leader,
+                str(ready),
+                str(survived),
+                escaped,
+            )
+            self.assertEqual(result.returncode, 124, result.stderr)
+            wait_for_file(survived, timeout=2)
+            self.assertEqual(survived.read_text(encoding="utf-8"), "survived")
+
+    def test_normal_leader_exit_does_not_clean_up_background_child(self) -> None:
+        background = """
+import sys
+import time
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+time.sleep(0.4)
+marker.write_text("finished", encoding="utf-8")
+"""
+        leader = """
+import subprocess
+import sys
+
+subprocess.Popen(
+    [sys.executable, "-c", sys.argv[2], sys.argv[1]],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker = Path(temp_dir) / "background-finished"
+            result = run_supervisor(
+                "--timeout-seconds",
+                "2",
+                "--",
+                sys.executable,
+                "-c",
+                leader,
+                str(marker),
+                background,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(marker.exists())
+            wait_for_file(marker, timeout=2)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "finished")
+
+    def test_cli_and_spawn_failures_are_distinct(self) -> None:
+        invalid = run_supervisor(
+            "--timeout-seconds",
+            "inf",
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        )
+        self.assertEqual(invalid.returncode, 2)
+
+        missing = run_supervisor(
+            "--timeout-seconds",
+            "1",
+            "--",
+            "/definitely/missing/bounded-command",
+        )
+        self.assertEqual(missing.returncode, 127)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            nonexecutable = Path(temp_dir) / "not-executable"
+            nonexecutable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            nonexecutable.chmod(0o600)
+            denied = run_supervisor(
+                "--timeout-seconds",
+                "1",
+                "--",
+                str(nonexecutable),
+            )
+            self.assertEqual(denied.returncode, 126)

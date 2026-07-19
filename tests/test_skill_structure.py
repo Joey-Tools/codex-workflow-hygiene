@@ -43,6 +43,7 @@ class SkillStructureTests(unittest.TestCase):
         skill_root = root / "skills/bounded-command-output"
         skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
         patterns = (skill_root / "references/command-patterns.md").read_text(encoding="utf-8")
+        supervisor = skill_root / "scripts/run_process_group_deadline.py"
         interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
 
         for trigger in (
@@ -96,7 +97,22 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("/usr/bin/perl -e 'alarm shift; exec @ARGV", patterns)
         self.assertIn("status == 142", patterns)
         self.assertIn("deadline exceeded; result incomplete", patterns)
-        self.assertIn("terminates and reaps the entire unit", patterns)
+        self.assertIn("Choose a task-specific deadline before launch", patterns)
+        self.assertIn("illustrative rather than a default or threshold", patterns)
+        self.assertIn("terminating the exec'd producer ends all task-owned work", patterns)
+        self.assertIn(
+            "Launching descendants does not by itself require containing and "
+            "terminating the whole process unit",
+            patterns,
+        )
+        self.assertIn("subprocess.Popen(process_group=0)", patterns)
+        self.assertIn("retained-output byte ceilings remain a separate caller responsibility", patterns)
+        self.assertIn("keep an outer pipe reader waiting for EOF", patterns)
+        self.assertIn("do not prove group quiescence", patterns)
+        self.assertNotIn("If a tool launches descendants", patterns)
+        self.assertNotIn("terminates and reaps the entire unit", patterns)
+        self.assertTrue(supervisor.is_file())
+        self.assertTrue(os.access(supervisor, os.X_OK))
         self.assertIn("$bounded-command-output", interface)
         self.assertIn("allow_implicit_invocation: true", interface)
         self.assertNotIn("TODO", skill)

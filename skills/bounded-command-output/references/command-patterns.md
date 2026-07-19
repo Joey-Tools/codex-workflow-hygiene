@@ -51,7 +51,7 @@ Keep the full retained artifact under a task-scoped directory such as `.codex-tm
 - SQLite `.timeout` controls how long the client waits for a busy lock; it is not a query-execution deadline. On a large or actively written database, start with metadata, `sqlite_sequence`, schema/index inspection, or a narrow indexed range. Put any broad aggregate behind an outer hard wall-clock deadline, and treat a terminated query as incomplete rather than as an empty result.
 - Broad macOS `du` walks under `$HOME`, `/System/Volumes/Data`, Containers, or FileProvider-backed trees require a hard deadline before launch. A PTY and repeated polling make the walk interruptible but do not bound its runtime. Split the scan into explicit top-level directories or narrower branches, and report every timed-out branch as unknown or incomplete instead of inferring a total from the surviving branches.
 
-macOS does not ship GNU `timeout`, but its system Perl can put a direct single-process producer under a real deadline without a shell-inside-a-shell wrapper. For example, this 60-second SQLite probe preserves ordinary exit statuses, turns `SIGALRM` into an explicit incomplete result, and terminates the producer itself:
+macOS does not ship GNU `timeout`, but its system Perl can put a direct single-process producer under a real deadline without a shell-inside-a-shell wrapper. Choose a task-specific deadline before launch; the numeric value below is illustrative rather than a default or threshold. This SQLite probe preserves ordinary exit statuses, turns `SIGALRM` into an explicit incomplete result, and terminates the producer itself:
 
 ```bash
 /usr/bin/perl -e 'alarm shift; exec @ARGV or die qq(exec failed: $!\n)' \
@@ -64,7 +64,20 @@ fi
 exit "$status"
 ```
 
-Use the same prefix with `/usr/bin/du -xhd 1 /exact/path` for a bounded filesystem walk. This direct-`exec` pattern is for producers such as `sqlite3` and `du` that do not detach a process tree. If a tool launches descendants, use a task-scoped supervisor or OS containment that terminates and reaps the entire unit instead.
+Use the same prefix with `/usr/bin/du -xhd 1 /exact/path` for a bounded filesystem walk. This direct-`exec` pattern is sufficient when terminating the exec'd producer ends all task-owned work. Launching descendants does not by itself require containing and terminating the whole process unit.
+
+When ordinary same-user child processes should receive the timeout signal too, use the lightweight process-group wrapper without adding a container:
+
+```bash
+python3 <loaded-skill-dir>/scripts/run_process_group_deadline.py \
+  --timeout-seconds <task-specific-seconds> \
+  --grace-seconds 1 \
+  -- /usr/bin/du -xhd 1 /exact/path
+```
+
+The wrapper runs direct argv without an implicit shell, inherits standard I/O, and normally adds only one process plus process-group setup. On timeout it sends `TERM` to the process group, waits the complete grace period without reaping the leader so the PGID cannot be reused, sends best-effort `KILL`, and waits only for its direct child. A normal child exit is returned unchanged; a deadline returns `124`, and an externally received `INT`, `TERM`, or `HUP` is forwarded to the group before the wrapper returns the conventional `128 + signal` status.
+
+The default same-session mode requires POSIX plus Python 3.11 or newer because it uses `subprocess.Popen(process_group=0)`. It preserves the session and controlling terminal, but the new group is not automatically the terminal's foreground group; use it for non-interactive commands or redirected input. `--new-session` works on the repository's Python 3.10 baseline via `start_new_session=True`, but explicitly removes the controlling terminal. Both modes assume signalable same-effective-UID processes, do not chase descendants that call `setsid()` or `setpgid()` to escape, do not clean up background descendants after a normal leader exit, and do not prove group quiescence. A surviving descendant that inherits stdout or stderr can keep an outer pipe reader waiting for EOF even after the direct child exits; redirect or close those descriptors when background survival is intentional. On macOS, re-signaling a group after its leader exits may return `EPERM`; after confirming the direct child exited, the wrapper preserves the timeout result and reports that post-signal cleanup was unverified. The wrapper enforces time only; retained-output byte ceilings remain a separate caller responsibility. Use stronger supervision or OS containment only when task-owned work can outlive these accepted boundaries and must be stopped.
 
 ## Builds, Tests, And Polling
 
