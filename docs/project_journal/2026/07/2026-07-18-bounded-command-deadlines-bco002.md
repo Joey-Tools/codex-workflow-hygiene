@@ -25,16 +25,19 @@ superseded_by:
 - Timed-out filesystem branches remain explicitly unknown or incomplete.
 - Numeric deadlines are illustrative rather than default thresholds; long-running scans are not friction by duration alone.
 - macOS single-process scans have a system-Perl direct-`exec` deadline pattern that preserves ordinary exit statuses and maps `SIGALRM` to an explicit incomplete result.
-- A POSIX/Python 3.11 same-session process-group wrapper adds TERM/grace/KILL handling for ordinary child processes without requiring root or a container.
-- Cancellation handlers are installed before process creation; signals received during the startup handoff are forwarded once the new group is available.
+- A POSIX/Python 3.10 process-group wrapper adds TERM/grace/KILL handling for ordinary child processes without requiring root, a container, tree scanning, or a persistent launcher process.
+- One absolute monotonic deadline starts before pipe creation and `fork`; a masked `READY`/`GO` barrier prevents user code from running until the parent has recorded the child PID and process-group handoff.
+- Before `READY`, timeout or cancellation signals only the direct child; after `GO`, blocked `exec` and runtime work are stopped through the group, with a final direct `SIGKILL` for a still-pinned leader that moved groups.
 - The first managed signal owns the cleanup transition; later managed signals cannot unwind and bypass the in-progress group stop.
 - Handler restoration temporarily masks managed signals on the current thread so teardown cannot leak a `ForwardedSignal` traceback.
 - An outer signal boundary covers the pre-mask teardown window, while non-POSIX rejection happens before handler setup.
 - Timeout and grace inputs are capped at one year for representability rather than as workflow defaults or duration thresholds; malformed executable formats map to exit `126`.
+- The child restores default `SIGPIPE`-family behavior, the parent temporarily normalizes and restores `SIGCHLD`, and inherited descriptors above standard I/O are closed from a single-threaded `/dev/fd` or `/proc/self/fd` snapshot.
 - The wrapper preserves the original session, does not allocate a PTY, waits only for its direct child, and intentionally does not chase escaped descendants or prove group quiescence.
-- macOS may return `EPERM` during immediate process-group handoff or after the leader exits; the wrapper falls back to signaling a still-live direct child and reports group cleanup as unverified while preserving the timeout or forwarded-signal result.
+- macOS may return `EPERM` or report a missing group after `GO` or after the leader exits; the wrapper falls back to signaling a still-live direct child and reports group cleanup as unverified while preserving the timeout or forwarded-signal result.
 - Background descendants that intentionally survive a normal leader exit must close or redirect inherited stdout/stderr, or an outer pipe reader can continue waiting for EOF.
-- Python 3.10 can use the explicit `--new-session` mode when losing the controlling terminal is acceptable.
+- Both same-session `setpgid()` and explicit `--new-session` `setsid()` modes support Python 3.10. The helper must be a standalone single-threaded CLI with open standard descriptors, `pthread_sigmask`, and a process-FD view; synchronous uninterruptible kernel calls, `SIGSTOP`, `SIGKILL`, and host suspend remain outside enforceable wall-clock bounds.
+- Local interleaved benchmarks observed roughly 34–42 ms added median latency for `/usr/bin/true`; a 10-second supervised sleep consumed 0.03 seconds user and 0.02 seconds system CPU with capped wait polling.
 - Output-byte enforcement remains separate from the deadline wrapper.
 
 ## Next Steps
