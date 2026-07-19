@@ -284,6 +284,69 @@ class ProcessGroupDeadlineTests(unittest.TestCase):
         self.assertEqual(identity["sid"], os.getsid(0))
         self.assertEqual(identity["euid"], os.geteuid())
 
+    def test_parent_unblocks_inherited_managed_signal_while_supervising(
+        self,
+    ) -> None:
+        launcher = """
+import os
+import signal
+import sys
+
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+target = (
+    "import os, sys, time; "
+    "open(sys.argv[1], 'w', encoding='utf-8').write(str(os.getpid())); "
+    "time.sleep(30)"
+)
+os.execv(
+    sys.executable,
+    [
+        sys.executable,
+        sys.argv[1],
+        "--timeout-seconds",
+        "2",
+        "--grace-seconds",
+        "0",
+        "--",
+        sys.executable,
+        "-c",
+        target,
+        sys.argv[2],
+    ],
+)
+"""
+        child_pid: int | None = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ready = Path(temp_dir) / "ready"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    launcher,
+                    str(SCRIPT),
+                    str(ready),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                wait_for_file(ready)
+                child_pid = int(ready.read_text(encoding="utf-8"))
+                process.send_signal(signal.SIGTERM)
+                _stdout, stderr = process.communicate(timeout=5)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=2)
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+        self.assertEqual(process.returncode, 143, stderr)
+
     def test_spawn_refuses_fork_after_fd_enumeration_exhausts_deadline(
         self,
     ) -> None:
@@ -325,6 +388,8 @@ class ProcessGroupDeadlineTests(unittest.TestCase):
                     ["/usr/bin/true"],
                     new_session=False,
                     inherited_sigchld_handler=signal.SIG_DFL,
+                    inherited_signal_mask=set(),
+                    parent_signal_mask=set(),
                     deadline=10.0,
                 )
 
@@ -333,7 +398,7 @@ class ProcessGroupDeadlineTests(unittest.TestCase):
             [call.args[0] for call in close_fd.call_args_list],
             [101, 102, 103, 104],
         )
-        self.assertEqual(pthread_sigmask.call_count, 2)
+        self.assertEqual(pthread_sigmask.call_count, 1)
 
     def test_deadline_before_child_creation_is_a_timeout(self) -> None:
         supervisor = load_supervisor_module()
@@ -858,7 +923,7 @@ raise SystemExit(9)
         def spawn_then_cancel(
             *args: object,
             **kwargs: object,
-        ) -> tuple[object, int, int, object]:
+        ) -> tuple[object, int, int]:
             spawned = original_spawn(*args, **kwargs)
             started.append(spawned[0])
             handler = signal.getsignal(signal.SIGTERM)
@@ -904,7 +969,7 @@ raise SystemExit(9)
         def record_spawn(
             *args: object,
             **kwargs: object,
-        ) -> tuple[object, int, int, object]:
+        ) -> tuple[object, int, int]:
             spawned = original_spawn(*args, **kwargs)
             started.append(spawned[0])
             return spawned
@@ -965,7 +1030,7 @@ raise SystemExit(9)
         def record_spawn(
             *args: object,
             **kwargs: object,
-        ) -> tuple[object, int, int, object]:
+        ) -> tuple[object, int, int]:
             spawned = original_spawn(*args, **kwargs)
             started.append(spawned[0])
             return spawned
@@ -1068,7 +1133,11 @@ raise SystemExit(9)
         original_close = supervisor.close_gate_and_restore_signal_handlers
         close_calls = 0
 
-        def signal_then_close(gate: object, previous: object) -> None:
+        def signal_then_close(
+            gate: object,
+            previous: object,
+            final_signal_mask: object,
+        ) -> None:
             nonlocal close_calls
             close_calls += 1
             if close_calls == 1:
@@ -1076,7 +1145,7 @@ raise SystemExit(9)
                 if not callable(handler):
                     raise AssertionError("managed signal handler is not callable")
                 handler(signal.SIGTERM, None)
-            original_close(gate, previous)
+            original_close(gate, previous, final_signal_mask)
 
         with mock.patch.object(
             supervisor,

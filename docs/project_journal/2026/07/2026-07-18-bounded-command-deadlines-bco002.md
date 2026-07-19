@@ -32,6 +32,7 @@ superseded_by:
 - The wrapper checks the deadline before each new exit observation; a status returned by an observation begun before the deadline wins that boundary race, and no new observation starts once the deadline is reached.
 - Before `READY`, timeout or cancellation signals only the direct child; after `GO`, blocked `exec` and runtime work are stopped through the group, with a final direct `SIGKILL` for a still-pinned leader that moved groups.
 - The first managed signal owns the cleanup transition; later managed signals cannot unwind and bypass the in-progress group stop.
+- The supervisor parent unblocks managed `INT`, `TERM`, and `HUP` signals during supervision even when the launcher blocked them; the target child and final parent teardown retain the launcher's original mask.
 - Handler restoration temporarily masks managed signals on the current thread so teardown cannot leak a `ForwardedSignal` traceback.
 - An outer signal boundary covers the pre-mask teardown window, while non-POSIX rejection happens before handler setup.
 - Timeout and grace inputs are capped at one year for representability rather than as workflow defaults or duration thresholds; malformed executable formats map to exit `126`.

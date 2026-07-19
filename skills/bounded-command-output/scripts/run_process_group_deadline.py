@@ -506,12 +506,10 @@ def spawn_process(
     *,
     new_session: bool,
     inherited_sigchld_handler: signal.Handlers,
+    inherited_signal_mask: set[signal.Signals],
+    parent_signal_mask: set[signal.Signals],
     deadline: float,
-) -> tuple[ChildProcess, int, int, set[signal.Signals]]:
-    inherited_signal_mask = signal.pthread_sigmask(
-        signal.SIG_BLOCK,
-        MANAGED_SIGNALS,
-    )
+) -> tuple[ChildProcess, int, int]:
     opened_file_descriptors: list[int] = []
     try:
         require_time_remaining(deadline)
@@ -530,7 +528,7 @@ def spawn_process(
     except BaseException:
         for file_descriptor in opened_file_descriptors:
             close_fd(file_descriptor)
-        signal.pthread_sigmask(signal.SIG_SETMASK, inherited_signal_mask)
+        signal.pthread_sigmask(signal.SIG_SETMASK, parent_signal_mask)
         raise
     if pid == 0:
         close_fd(readiness_read_fd)
@@ -557,12 +555,7 @@ def spawn_process(
         os._exit(SUPERVISOR_ERROR_EXIT)
     close_fd(readiness_write_fd)
     close_fd(start_read_fd)
-    return (
-        ChildProcess(pid),
-        readiness_read_fd,
-        start_write_fd,
-        inherited_signal_mask,
-    )
+    return ChildProcess(pid), readiness_read_fd, start_write_fd
 
 
 def wait_for_group_handoff(
@@ -623,6 +616,7 @@ def restore_signal_handlers(previous: dict[int, signal.Handlers]) -> None:
 def close_gate_and_restore_signal_handlers(
     gate: SignalGate,
     previous: dict[int, signal.Handlers],
+    final_signal_mask: set[signal.Signals],
 ) -> None:
     pthread_sigmask = getattr(signal, "pthread_sigmask", None)
     if pthread_sigmask is None:
@@ -630,7 +624,7 @@ def close_gate_and_restore_signal_handlers(
         restore_signal_handlers(previous)
         return
 
-    previous_mask = pthread_sigmask(
+    pthread_sigmask(
         signal.SIG_BLOCK,
         MANAGED_SIGNALS,
     )
@@ -638,7 +632,7 @@ def close_gate_and_restore_signal_handlers(
         gate.close()
         restore_signal_handlers(previous)
     finally:
-        pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        pthread_sigmask(signal.SIG_SETMASK, final_signal_mask)
 
 
 def print_error(message: str) -> None:
@@ -681,6 +675,13 @@ def main(argv: list[str] | None = None) -> int:
     if previous_sigchld_handler is None:
         previous_sigchld_handler = signal.SIG_DFL
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    inherited_signal_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK,
+        MANAGED_SIGNALS,
+    )
+    supervisor_signal_mask = set(inherited_signal_mask).difference(
+        MANAGED_SIGNALS
+    )
     gate = SignalGate()
     previous_handlers = install_signal_handlers(gate)
     process: ChildProcess | None = None
@@ -700,11 +701,12 @@ def main(argv: list[str] | None = None) -> int:
                     process,
                     readiness_fd,
                     start_fd,
-                    inherited_signal_mask,
                 ) = spawn_process(
                     command,
                     new_session=args.new_session,
                     inherited_sigchld_handler=previous_sigchld_handler,
+                    inherited_signal_mask=inherited_signal_mask,
+                    parent_signal_mask=supervisor_signal_mask,
                     deadline=deadline,
                 )
             except ChildWaitTimeout:
@@ -720,7 +722,7 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 signal.pthread_sigmask(
                     signal.SIG_SETMASK,
-                    inherited_signal_mask,
+                    supervisor_signal_mask,
                 )
             group_handoff_complete = wait_for_group_handoff(
                 process,
@@ -790,7 +792,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         try:
             result = run_command()
-            close_gate_and_restore_signal_handlers(gate, previous_handlers)
+            close_gate_and_restore_signal_handlers(
+                gate,
+                previous_handlers,
+                inherited_signal_mask,
+            )
         except ForwardedSignal as event:
             gate.close()
             ignore_managed_signals()
@@ -814,10 +820,20 @@ def main(argv: list[str] | None = None) -> int:
                     result = min(255, 128 + event.signum)
             else:
                 result = min(255, 128 + event.signum)
-            close_gate_and_restore_signal_handlers(gate, previous_handlers)
+            close_gate_and_restore_signal_handlers(
+                gate,
+                previous_handlers,
+                inherited_signal_mask,
+            )
         return result
     finally:
-        signal.signal(signal.SIGCHLD, previous_sigchld_handler)
+        try:
+            signal.signal(signal.SIGCHLD, previous_sigchld_handler)
+        finally:
+            signal.pthread_sigmask(
+                signal.SIG_SETMASK,
+                inherited_signal_mask,
+            )
 
 
 if __name__ == "__main__":
