@@ -120,6 +120,7 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("reports `READY`, and waits for the parent's `GO`", patterns)
         self.assertIn("later managed signals cannot interrupt it", patterns)
         self.assertIn("unblocks managed `INT`, `TERM`, and `HUP`", patterns)
+        self.assertIn("Diagnostics are best effort", patterns)
         self.assertIn("Python 3.10 baseline", patterns)
         self.assertIn("standalone single-threaded POSIX CLI", patterns)
         self.assertIn("require neither root, a container", patterns)

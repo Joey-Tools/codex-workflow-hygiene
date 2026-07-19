@@ -264,6 +264,49 @@ class ProcessGroupDeadlineTests(unittest.TestCase):
         self.assertEqual(result.stdout, "out\n")
         self.assertEqual(result.stderr, "err\n")
 
+    def test_closed_stderr_pipe_does_not_replace_timeout_status(self) -> None:
+        launcher = """
+import importlib.util
+import signal
+import sys
+
+spec = importlib.util.spec_from_file_location("deadline_supervisor", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit(99)
+supervisor = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(supervisor)
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+raise SystemExit(
+    supervisor.main(
+        [
+            "--timeout-seconds",
+            "0.1",
+            "--grace-seconds",
+            "0",
+            "--",
+            "/bin/sleep",
+            "30",
+        ]
+    )
+)
+"""
+        process = subprocess.Popen(
+            [sys.executable, "-c", launcher, str(SCRIPT)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if process.stderr is None:
+            self.fail("stderr pipe was not created")
+        process.stderr.close()
+        try:
+            returncode = process.wait(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+
+        self.assertEqual(returncode, 124)
+
     def test_same_session_mode_creates_a_new_process_group(self) -> None:
         probe = (
             "import json, os; "

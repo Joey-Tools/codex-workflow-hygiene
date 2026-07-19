@@ -636,7 +636,34 @@ def close_gate_and_restore_signal_handlers(
 
 
 def print_error(message: str) -> None:
-    print(f"run_process_group_deadline: {message}", file=sys.stderr)
+    diagnostic = (
+        f"run_process_group_deadline: {message[:1024]}\n"
+    ).encode("utf-8", errors="replace")
+    previous_sigpipe: signal.Handlers | None = None
+    if hasattr(signal, "SIGPIPE"):
+        try:
+            previous_sigpipe = signal.getsignal(signal.SIGPIPE)
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        except (OSError, ValueError):
+            previous_sigpipe = None
+    try:
+        offset = 0
+        while offset < len(diagnostic):
+            try:
+                written = os.write(2, diagnostic[offset:])
+                if written <= 0:
+                    break
+                offset += written
+            except InterruptedError:
+                continue
+            except OSError:
+                break
+    finally:
+        if previous_sigpipe is not None:
+            try:
+                signal.signal(signal.SIGPIPE, previous_sigpipe)
+            except (OSError, ValueError):
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:
