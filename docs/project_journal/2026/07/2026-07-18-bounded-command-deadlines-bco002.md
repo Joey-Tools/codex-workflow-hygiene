@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-18
 updated: 2026-07-19
 branch: codex/bounded-process-group-supervisor-20260719
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/60
 supersedes: []
 superseded_by:
 ---
