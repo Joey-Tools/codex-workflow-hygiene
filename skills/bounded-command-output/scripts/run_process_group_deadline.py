@@ -36,8 +36,26 @@ class SupervisorError(Exception):
 
 class GroupSignalOutcome(enum.Enum):
     SENT = "sent"
+    DIRECT_CHILD_ONLY = "direct-child-only"
     MISSING = "missing"
     LEADER_EXITED_PERMISSION = "leader-exited-permission"
+
+
+class SignalGate:
+    def __init__(self) -> None:
+        self._armed = False
+        self._pending: int | None = None
+
+    def handle(self, signum: int, _frame: object) -> None:
+        if self._pending is None:
+            self._pending = signum
+        if self._armed:
+            raise ForwardedSignal(self._pending)
+
+    def arm(self) -> None:
+        self._armed = True
+        if self._pending is not None:
+            raise ForwardedSignal(self._pending)
 
 
 def finite_positive(value: str) -> float:
@@ -111,12 +129,19 @@ def signal_process_group(
         os.killpg(process_group_id, signum)
     except ProcessLookupError:
         return GroupSignalOutcome.MISSING
-    except PermissionError as exc:
+    except PermissionError:
         if leader.poll() is not None:
             return GroupSignalOutcome.LEADER_EXITED_PERMISSION
-        raise SupervisorError(
-            f"cannot signal process group {process_group_id}: {exc}"
-        ) from exc
+        try:
+            leader.send_signal(signum)
+        except ProcessLookupError:
+            return GroupSignalOutcome.LEADER_EXITED_PERMISSION
+        except OSError as leader_exc:
+            raise SupervisorError(
+                f"cannot signal process group {process_group_id} or its leader: "
+                f"{leader_exc}"
+            ) from leader_exc
+        return GroupSignalOutcome.DIRECT_CHILD_ONLY
     except OSError as exc:
         raise SupervisorError(
             f"cannot signal process group {process_group_id}: {exc}"
@@ -136,20 +161,26 @@ def stop_process_group(
         initial_signal,
         leader=process,
     )
-    cleanup_unverified = (
-        initial_outcome is GroupSignalOutcome.LEADER_EXITED_PERMISSION
-    )
-    if initial_outcome is GroupSignalOutcome.SENT and grace_seconds:
+    signal_delivered = initial_outcome in {
+        GroupSignalOutcome.SENT,
+        GroupSignalOutcome.DIRECT_CHILD_ONLY,
+    }
+    cleanup_unverified = initial_outcome in {
+        GroupSignalOutcome.DIRECT_CHILD_ONLY,
+        GroupSignalOutcome.LEADER_EXITED_PERMISSION,
+    }
+    if signal_delivered and grace_seconds:
         time.sleep(grace_seconds)
-    if initial_outcome is GroupSignalOutcome.SENT:
+    if signal_delivered:
         kill_outcome = signal_process_group(
             process_group_id,
             signal.SIGKILL,
             leader=process,
         )
-        cleanup_unverified = cleanup_unverified or (
-            kill_outcome is GroupSignalOutcome.LEADER_EXITED_PERMISSION
-        )
+        cleanup_unverified = cleanup_unverified or kill_outcome in {
+            GroupSignalOutcome.DIRECT_CHILD_ONLY,
+            GroupSignalOutcome.LEADER_EXITED_PERMISSION,
+        }
     try:
         process.wait(timeout=KILL_REAP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as exc:
@@ -159,15 +190,14 @@ def stop_process_group(
     return cleanup_unverified
 
 
-def install_signal_handlers() -> dict[int, signal.Handlers]:
+def install_signal_handlers(
+    gate: SignalGate,
+) -> dict[int, signal.Handlers]:
     previous: dict[int, signal.Handlers] = {}
-
-    def forward(signum: int, _frame: object) -> None:
-        raise ForwardedSignal(signum)
 
     for signum in MANAGED_SIGNALS:
         previous[signum] = signal.getsignal(signum)
-        signal.signal(signum, forward)
+        signal.signal(signum, gate.handle)
     return previous
 
 
@@ -210,22 +240,28 @@ def main(argv: list[str] | None = None) -> int:
     else:
         popen_options = {"process_group": 0}
 
-    try:
-        process = subprocess.Popen(command, **popen_options)
-    except FileNotFoundError:
-        print_error(f"command not found: {command[0]}")
-        return COMMAND_NOT_FOUND_EXIT
-    except PermissionError:
-        print_error(f"command is not executable: {command[0]}")
-        return CANNOT_EXECUTE_EXIT
-    except OSError as exc:
-        print_error(f"cannot start command: {exc}")
-        return SUPERVISOR_ERROR_EXIT
-
-    process_group_id = process.pid
-    previous_handlers = install_signal_handlers()
+    gate = SignalGate()
+    previous_handlers = install_signal_handlers(gate)
+    process: subprocess.Popen[bytes] | None = None
     try:
         try:
+            try:
+                process = subprocess.Popen(command, **popen_options)
+            except FileNotFoundError:
+                gate.arm()
+                print_error(f"command not found: {command[0]}")
+                return COMMAND_NOT_FOUND_EXIT
+            except PermissionError:
+                gate.arm()
+                print_error(f"command is not executable: {command[0]}")
+                return CANNOT_EXECUTE_EXIT
+            except OSError as exc:
+                gate.arm()
+                print_error(f"cannot start command: {exc}")
+                return SUPERVISOR_ERROR_EXIT
+
+            process_group_id = process.pid
+            gate.arm()
             return normalized_exit_code(
                 process.wait(timeout=args.timeout_seconds)
             )
@@ -248,10 +284,12 @@ def main(argv: list[str] | None = None) -> int:
             return TIMEOUT_EXIT
         except ForwardedSignal as event:
             ignore_managed_signals()
+            if process is None:
+                return min(255, 128 + event.signum)
             try:
                 cleanup_unverified = stop_process_group(
                     process,
-                    process_group_id=process_group_id,
+                    process_group_id=process.pid,
                     initial_signal=event.signum,
                     grace_seconds=args.grace_seconds,
                 )

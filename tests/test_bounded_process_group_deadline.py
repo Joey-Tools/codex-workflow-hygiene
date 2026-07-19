@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +41,18 @@ def wait_for_file(path: Path, timeout: float = 3.0) -> None:
             return
         time.sleep(0.01)
     raise AssertionError(f"timed out waiting for {path}")
+
+
+def load_supervisor_module() -> object:
+    spec = importlib.util.spec_from_file_location(
+        "bounded_process_group_deadline_under_test",
+        SCRIPT,
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"cannot load {SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @unittest.skipUnless(POSIX_PROCESS_GROUPS, "requires POSIX and Python 3.11+")
@@ -218,6 +232,60 @@ time.sleep(30)
             self.assertEqual(process.returncode, 143, stderr)
             self.assertEqual(marker.read_text(encoding="utf-8"), "term")
 
+    def test_signal_during_spawn_is_forwarded_after_process_handoff(self) -> None:
+        supervisor = load_supervisor_module()
+        original_popen = subprocess.Popen
+        started: list[subprocess.Popen[bytes]] = []
+        diagnostics: list[str] = []
+
+        def spawn_then_cancel(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            process = original_popen(*args, **kwargs)
+            started.append(process)
+            handler = signal.getsignal(signal.SIGTERM)
+            if not callable(handler):
+                process.kill()
+                process.wait(timeout=2)
+                raise AssertionError("SIGTERM handler was not installed before Popen")
+            handler(signal.SIGTERM, None)
+            return process
+
+        permission_error = PermissionError(1, "simulated process-group handoff")
+        with (
+            mock.patch.object(supervisor.subprocess, "Popen", spawn_then_cancel),
+            mock.patch.object(
+                supervisor.os,
+                "killpg",
+                side_effect=permission_error,
+            ),
+            mock.patch.object(
+                supervisor,
+                "print_error",
+                side_effect=diagnostics.append,
+            ),
+        ):
+            returncode = supervisor.main(
+                [
+                    "--timeout-seconds",
+                    "10",
+                    "--grace-seconds",
+                    "0",
+                    "--",
+                    "/bin/sleep",
+                    "30",
+                ]
+            )
+
+        self.assertEqual(returncode, 143)
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll())
+        self.assertEqual(
+            diagnostics,
+            ["forwarded signal; process-group cleanup unverified"],
+        )
+
     def test_setsid_descendant_is_not_chased(self) -> None:
         escaped = """
 import os
@@ -229,7 +297,7 @@ ready = Path(sys.argv[1])
 survived = Path(sys.argv[2])
 os.setsid()
 ready.write_text(str(os.getpid()), encoding="utf-8")
-time.sleep(0.7)
+time.sleep(2.0)
 survived.write_text("survived", encoding="utf-8")
 """
         leader = """
@@ -252,7 +320,7 @@ time.sleep(30)
             survived = Path(temp_dir) / "escaped-survived"
             result = run_supervisor(
                 "--timeout-seconds",
-                "0.3",
+                "1.0",
                 "--grace-seconds",
                 "0.1",
                 "--",
@@ -264,7 +332,7 @@ time.sleep(30)
                 escaped,
             )
             self.assertEqual(result.returncode, 124, result.stderr)
-            wait_for_file(survived, timeout=2)
+            wait_for_file(survived, timeout=3)
             self.assertEqual(survived.read_text(encoding="utf-8"), "survived")
 
     def test_normal_leader_exit_does_not_clean_up_background_child(self) -> None:

@@ -106,6 +106,7 @@ class SkillStructureTests(unittest.TestCase):
             patterns,
         )
         self.assertIn("subprocess.Popen(process_group=0)", patterns)
+        self.assertIn("installs cancellation handlers before `Popen`", patterns)
         self.assertIn("retained-output byte ceilings remain a separate caller responsibility", patterns)
         self.assertIn("keep an outer pipe reader waiting for EOF", patterns)
         self.assertIn("do not prove group quiescence", patterns)
