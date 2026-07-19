@@ -68,6 +68,8 @@ Use the same prefix with `/usr/bin/du -xhd 1 /exact/path` for a bounded filesyst
 
 When ordinary same-user child processes should receive the timeout signal too, use the lightweight process-group wrapper without adding a container:
 
+Use this wrapper only when Python reports `os.name == "posix"` and the required POSIX process APIs are available. On native Windows (non-WSL) or any other non-POSIX runtime, skip this protection: do not invoke the wrapper and do not claim process-group or descendant cleanup. WSL uses its Linux/POSIX runtime and remains eligible when those APIs are present. The other scope, output, and evidence guardrails still apply; a native-Windows supervisor would be a separate, explicitly validated mechanism rather than an implicit substitute. If this script is invoked accidentally on a non-POSIX host, it returns `125` before installing signal handlers or starting the command.
+
 ```bash
 python3 <loaded-skill-dir>/scripts/run_process_group_deadline.py \
   --timeout-seconds <task-specific-seconds> \

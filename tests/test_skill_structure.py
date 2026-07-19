@@ -64,6 +64,9 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("expected result is one line", skill)
         self.assertIn("known to be both small and fast", skill)
         self.assertIn("task-specific deadlines", skill)
+        self.assertIn("native Windows", skill)
+        self.assertIn("WSL follows the POSIX path", skill)
+        self.assertIn("do not claim process-group or descendant cleanup", skill)
         self.assertIn("expected output is a single value", skill)
         self.assertIn("display backstops, not as execution-time bounds", skill)
         self.assertIn("finite wall-clock deadline", skill)
@@ -115,6 +118,8 @@ class SkillStructureTests(unittest.TestCase):
             patterns,
         )
         self.assertIn("adds no persistent launcher", patterns)
+        self.assertIn("native Windows (non-WSL)", patterns)
+        self.assertIn("returns `125` before installing signal handlers", patterns)
         self.assertIn("one absolute monotonic deadline", patterns)
         self.assertIn("checks the deadline before each new exit observation", patterns)
         self.assertIn("reports `READY`, and waits for the parent's `GO`", patterns)

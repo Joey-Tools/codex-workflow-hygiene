@@ -58,12 +58,22 @@ def load_supervisor_module() -> object:
 
 
 class PlatformRejectionTests(unittest.TestCase):
-    def test_non_posix_rejection_precedes_signal_teardown(self) -> None:
+    def test_non_posix_rejection_precedes_supervision(self) -> None:
         supervisor = load_supervisor_module()
         diagnostics: list[str] = []
 
         with (
             mock.patch.object(supervisor.os, "name", "nt"),
+            mock.patch.object(
+                supervisor,
+                "spawn_process",
+                side_effect=AssertionError("target command should not start"),
+            ) as spawn_process,
+            mock.patch.object(
+                supervisor,
+                "install_signal_handlers",
+                side_effect=AssertionError("signal handlers should not install"),
+            ) as install_signal_handlers,
             mock.patch.object(
                 supervisor.signal,
                 "pthread_sigmask",
@@ -86,7 +96,15 @@ class PlatformRejectionTests(unittest.TestCase):
             )
 
         self.assertEqual(returncode, 125)
-        self.assertEqual(diagnostics, ["POSIX process groups are required"])
+        self.assertEqual(
+            diagnostics,
+            [
+                "process-group deadlines are unsupported on non-POSIX hosts; "
+                "command was not started"
+            ],
+        )
+        spawn_process.assert_not_called()
+        install_signal_handlers.assert_not_called()
 
 
 @unittest.skipUnless(POSIX, "requires POSIX")

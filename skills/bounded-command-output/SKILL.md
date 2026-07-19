@@ -50,6 +50,7 @@ This skill controls command shape, execution deadlines, and output handling only
 
 ## Guardrails
 
+- Use the process-group deadline wrapper only on POSIX runtimes. On native Windows or any runtime where `os.name != "posix"`, skip this protection and do not claim process-group or descendant cleanup. WSL follows the POSIX path only when its Python runtime exposes the required POSIX APIs.
 - Do not run an unbounded producer and assume a small display cap made the work bounded.
 - Do not call a redirected log bounded unless its time and retained-byte ceilings are enforced while the producer runs.
 - Do not treat per-file match limits such as `rg --max-count` as a total-output cap across many files.

@@ -27,6 +27,7 @@ superseded_by:
 - The main skill now triggers on uncertain runtime as well as uncertain output and routes one-line SQLite aggregates or similar scans to the deadline reference instead of skipping them as small output.
 - macOS single-process scans have a system-Perl direct-`exec` deadline pattern that preserves ordinary exit statuses and maps `SIGALRM` to an explicit incomplete result.
 - A POSIX/Python 3.10 process-group wrapper adds TERM/grace/KILL handling for ordinary child processes without requiring root, a container, tree scanning, or a persistent launcher process.
+- Native Windows and other non-POSIX runtimes explicitly skip this process-group safeguard and must not claim equivalent cleanup; accidental invocation returns `125` before installing signal handlers or starting the command, while WSL follows the POSIX capability path.
 - One absolute monotonic deadline starts before pipe creation and `fork`; a masked `READY`/`GO` barrier prevents user code from running until the parent has recorded the child PID and process-group handoff.
 - Startup checks the same absolute deadline after pipe setup and descriptor enumeration and immediately before `fork`, closing opened descriptors instead of starting a child once the budget is known to be exhausted.
 - The wrapper checks the deadline before each new exit observation; a status returned by an observation begun before the deadline wins that boundary race, and no new observation starts once the deadline is reached.

@@ -676,7 +676,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("a command is required after --")
 
     if os.name != "posix":
-        print_error("POSIX process groups are required")
+        print_error(
+            "process-group deadlines are unsupported on non-POSIX hosts; "
+            "command was not started"
+        )
         return SUPERVISOR_ERROR_EXIT
     required_posix_functions = ("fork", "killpg", "setpgid", "setsid", "waitpid")
     if any(not hasattr(os, name) for name in required_posix_functions):
