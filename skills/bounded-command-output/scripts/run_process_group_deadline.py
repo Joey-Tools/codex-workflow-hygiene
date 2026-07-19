@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import enum
+import errno
 import math
 import os
 import signal
@@ -17,6 +18,7 @@ SUPERVISOR_ERROR_EXIT = 125
 CANNOT_EXECUTE_EXIT = 126
 COMMAND_NOT_FOUND_EXIT = 127
 KILL_REAP_TIMEOUT_SECONDS = 5.0
+MAX_DURATION_SECONDS = 365 * 24 * 60 * 60
 MANAGED_SIGNALS = tuple(
     getattr(signal, name)
     for name in ("SIGINT", "SIGTERM", "SIGHUP")
@@ -74,8 +76,14 @@ def finite_positive(value: str) -> float:
         parsed = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be a number") from exc
-    if not math.isfinite(parsed) or parsed <= 0:
-        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    if (
+        not math.isfinite(parsed)
+        or parsed <= 0
+        or parsed > MAX_DURATION_SECONDS
+    ):
+        raise argparse.ArgumentTypeError(
+            f"must be greater than zero and at most {MAX_DURATION_SECONDS}"
+        )
     return parsed
 
 
@@ -84,8 +92,14 @@ def finite_nonnegative(value: str) -> float:
         parsed = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be a number") from exc
-    if not math.isfinite(parsed) or parsed < 0:
-        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    if (
+        not math.isfinite(parsed)
+        or parsed < 0
+        or parsed > MAX_DURATION_SECONDS
+    ):
+        raise argparse.ArgumentTypeError(
+            f"must be nonnegative and at most {MAX_DURATION_SECONDS}"
+        )
     return parsed
 
 
@@ -290,6 +304,9 @@ def main(argv: list[str] | None = None) -> int:
                     return CANNOT_EXECUTE_EXIT
                 except OSError as exc:
                     gate.arm()
+                    if exc.errno == errno.ENOEXEC:
+                        print_error(f"command has an invalid executable format: {command[0]}")
+                        return CANNOT_EXECUTE_EXIT
                     print_error(f"cannot start command: {exc}")
                     return SUPERVISOR_ERROR_EXIT
 

@@ -110,6 +110,7 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("later managed signals cannot interrupt that cleanup", patterns)
         self.assertIn("POSIX signal mask", patterns)
         self.assertIn("Non-POSIX runtimes are rejected before signal handlers", patterns)
+        self.assertIn("capped at one year solely", patterns)
         self.assertIn("retained-output byte ceilings remain a separate caller responsibility", patterns)
         self.assertIn("keep an outer pipe reader waiting for EOF", patterns)
         self.assertIn("do not prove group quiescence", patterns)

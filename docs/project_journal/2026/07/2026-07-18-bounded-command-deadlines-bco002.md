@@ -30,6 +30,7 @@ superseded_by:
 - The first managed signal owns the cleanup transition; later managed signals cannot unwind and bypass the in-progress group stop.
 - Handler restoration temporarily masks managed signals on the current thread so teardown cannot leak a `ForwardedSignal` traceback.
 - An outer signal boundary covers the pre-mask teardown window, while non-POSIX rejection happens before handler setup.
+- Timeout and grace inputs are capped at one year for representability rather than as workflow defaults or duration thresholds; malformed executable formats map to exit `126`.
 - The wrapper preserves the original session, does not allocate a PTY, waits only for its direct child, and intentionally does not chase escaped descendants or prove group quiescence.
 - macOS may return `EPERM` during immediate process-group handoff or after the leader exits; the wrapper falls back to signaling a still-live direct child and reports group cleanup as unverified while preserving the timeout or forwarded-signal result.
 - Background descendants that intentionally survive a normal leader exit must close or redirect inherited stdout/stderr, or an outer pipe reader can continue waiting for EOF.

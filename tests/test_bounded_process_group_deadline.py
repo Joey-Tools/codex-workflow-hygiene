@@ -112,16 +112,27 @@ class PosixNewSessionDeadlineTests(unittest.TestCase):
         self.assertNotEqual(identity["sid"], os.getsid(0))
 
     def test_cli_and_spawn_failures_are_distinct(self) -> None:
-        invalid = run_supervisor(
-            "--timeout-seconds",
-            "inf",
-            "--new-session",
-            "--",
-            sys.executable,
-            "-c",
-            "pass",
+        invalid_durations = (
+            ("--timeout-seconds", "inf"),
+            ("--timeout-seconds", "1e308"),
+            (
+                "--timeout-seconds",
+                "1",
+                "--grace-seconds",
+                "1e308",
+            ),
         )
-        self.assertEqual(invalid.returncode, 2)
+        for duration_args in invalid_durations:
+            with self.subTest(duration_args=duration_args):
+                invalid = run_supervisor(
+                    *duration_args,
+                    "--new-session",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "pass",
+                )
+                self.assertEqual(invalid.returncode, 2)
 
         missing = run_supervisor(
             "--timeout-seconds",
@@ -144,6 +155,18 @@ class PosixNewSessionDeadlineTests(unittest.TestCase):
                 str(nonexecutable),
             )
             self.assertEqual(denied.returncode, 126)
+
+            invalid_format = Path(temp_dir) / "invalid-format"
+            invalid_format.write_text("not an executable format\n", encoding="utf-8")
+            invalid_format.chmod(0o700)
+            malformed = run_supervisor(
+                "--timeout-seconds",
+                "1",
+                "--new-session",
+                "--",
+                str(invalid_format),
+            )
+            self.assertEqual(malformed.returncode, 126)
 
 
 @unittest.skipUnless(
