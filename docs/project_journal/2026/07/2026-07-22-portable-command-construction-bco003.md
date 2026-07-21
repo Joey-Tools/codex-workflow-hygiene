@@ -34,3 +34,4 @@ superseded_by:
 - `python3 -m unittest tests.test_skill_structure`: 27 tests passed.
 - `python3 -m unittest discover -s tests -q`: 1,058 tests passed with process-local commit signing disabled for temporary fixture merge commits.
 - `quick_validate.py skills/bounded-command-output`: valid.
+- The initial fresh-context Codex review found two stale `/usr/bin` examples; both examples and their contract tests were corrected before the final gate.

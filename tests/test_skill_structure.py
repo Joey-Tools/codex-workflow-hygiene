@@ -99,6 +99,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("Preserve the pipeline producer's status", patterns)
         self.assertIn("Parallel launch does not create an output budget", patterns)
         self.assertIn("one aggregate visible-output and retained-byte ceiling", patterns)
+        self.assertNotIn("/usr/bin/sqlite3", patterns)
+        self.assertNotIn("/usr/bin/du", patterns)
         self.assertIn("Do not print the complete inventory", patterns)
         self.assertIn("/usr/local/bin/container build", patterns)
         self.assertIn("maximum byte count across the entire retained-log set", patterns)
