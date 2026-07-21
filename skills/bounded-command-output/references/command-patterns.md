@@ -24,7 +24,13 @@ Common generated-tree excludes include:
 !**/vendor/**
 ```
 
+Treat executable locations and data arguments as separate concerns. For portable tools such as `rg`, use the command name through direct argv when the selected runtime trusts `PATH`; do not assume `/usr/bin/rg`, a Homebrew prefix, or another host-specific installation path. If a caller truly needs an exact executable path, resolve it once with a narrow preflight, validate that result, and reuse it instead of guessing successive prefixes.
+
+When a pipeline requires a shell, pass dynamic paths, patterns, URLs, and other values as positional arguments to the shell entrypoint, or write a task-scoped script whose argv parser owns them. Quoting a value inside a host-language template does not make it safe across the next shell parse: nested interpolation can erase an argument, split whitespace, expand metacharacters, or change the search root while the outer wrapper still exits successfully. Preserve the pipeline producer's status so a missing executable or malformed argument cannot masquerade as an empty result.
+
 An inventory command is not bounded merely because each item is short. Consume it with a streaming counter/sampler that retains at most `N` items and emits only the total plus those items; preserve the producer's exit status with the shell's pipeline-status mechanism. Do not print the complete inventory before counting or sampling it.
+
+Parallel launch does not create an output budget. Before using `Promise.all`, background jobs, or another fan-out mechanism, select one aggregate visible-output and retained-byte ceiling. Make every child cap fit within that total, or route each producer to its own enforced bounded sink and emit only a compact aggregate. A display cap applied independently to every child can still multiply into a truncated combined result.
 
 For embedded payloads, minified bundles, or other very long lines, prefer counts, stream `rg -l` through the total-counter/`N`-filename sampler, or use bounded `rg -o` or structured length/snippet extraction. `rg --max-count` limits matches per file, so it does not replace a bounded candidate file set.
 

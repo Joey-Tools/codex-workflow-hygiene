@@ -21,10 +21,13 @@ This skill controls command shape, execution deadlines, and output handling only
 - Narrow directories, files, time windows, predicates, identifiers, or changed paths.
 - Exclude dependency trees, generated output, archives, and lockfiles unless they are the target.
 - Start with counts, metadata, an explicitly capped candidate-filename sample, or status summaries before printing matching lines or full records.
+- Invoke portable tools by command name when the selected runtime trusts `PATH`. Do not guess `/usr/bin` or a package-manager prefix; when an exact executable path is required, resolve and validate it once before launch.
+- When a shell is unavoidable for a pipeline or redirection, keep dynamic paths, patterns, URLs, and other values out of nested host-language and shell quoting. Pass them as positional arguments to the shell entrypoint or move the logic into a task-scoped script.
 - Choose task-specific deadlines rather than treating illustrative durations as default thresholds. Route database and filesystem scans to the matching reference patterns before launch.
 
 3. Choose the output sink deliberately.
 - Let compact commands return directly.
+- Give a parallel batch one aggregate output and retained-byte budget. Per-command caps must fit inside that total, or each producer must write to a separately enforced bounded sink before a compact aggregate is emitted.
 - When full output may be large or useful for later inspection, redirect stdout and stderr to a task-scoped file before starting the command.
 - Before launch, set a finite wall-clock deadline and an enforced ceiling across all retained artifacts. Use a hard quota or bounded sink, rotation with fixed aggregate-byte and segment-count caps that removes or reuses old segments before writing more, or a supervisor that terminates the producer at the byte ceiling. The deadline must terminate the producer; byte enforcement must either keep the retained set below its fixed ceiling or terminate the producer.
 - A task-scoped path and byte-count polling do not by themselves bound disk growth.
