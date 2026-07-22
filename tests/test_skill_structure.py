@@ -762,6 +762,9 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_corpus_recipe_uses_structured_helper(self) -> None:
         root = Path(__file__).resolve().parents[1]
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(
+            encoding="utf-8"
+        )
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
             encoding="utf-8"
         )
@@ -774,6 +777,27 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn('CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"', recipe)
         self.assertIn('python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py"', recipe)
         self.assertIn('--sample-limit 20', recipe)
+        self.assertIn("full-root cost, not a requested-window cost", skill)
+        self.assertIn("previous successful runtime", skill)
+        self.assertIn("classify the result as incomplete", skill)
+        self.assertIn("different fresh nonexistent output directory", skill)
+        self.assertIn("producer and descendants are proven quiescent", skill)
+        self.assertIn("recorded directory object identity", skill)
+        self.assertIn("target is missing at revalidation", skill)
+        self.assertIn("leave any present path untouched", skill)
+        self.assertIn("quiet stdout is expected", workflow)
+        self.assertIn("supplies no reusable checkpoint", workflow)
+        self.assertIn("device/inode or platform-equivalent identity", workflow)
+        self.assertIn("immediate pre-removal revalidation", workflow)
+        self.assertIn("child-entry churn inside the same directory", workflow)
+        self.assertIn("classify that result separately as missing", workflow)
+        self.assertIn("do not recreate it or delete anything at that pathname", workflow)
+        self.assertIn("do not claim this run verified cleanup", workflow)
+        self.assertIn("baseline identity is unavailable", workflow)
+        self.assertIn("revalidation is unreadable", workflow)
+        self.assertIn("current identity mismatches", workflow)
+        self.assertIn("leave any present path untouched", workflow)
+        self.assertIn("Never interpret missing output as an empty corpus", workflow)
 
     def test_session_mining_exact_session_recipe_propagates_find_failure(self) -> None:
         root = Path(__file__).resolve().parents[1]
