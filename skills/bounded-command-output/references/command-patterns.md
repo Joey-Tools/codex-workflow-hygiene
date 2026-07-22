@@ -24,7 +24,13 @@ Common generated-tree excludes include:
 !**/vendor/**
 ```
 
+Treat executable locations and data arguments as separate concerns. For portable tools such as `rg`, use the command name through direct argv when the selected runtime trusts `PATH`; do not assume `/usr/bin/rg`, a Homebrew prefix, or another host-specific installation path. If a caller truly needs an exact executable path, resolve it once with a narrow preflight, validate that result, and reuse it instead of guessing successive prefixes.
+
+When a pipeline requires a shell, pass dynamic paths, patterns, URLs, and other values as positional arguments to the shell entrypoint, or write a task-scoped script whose argv parser owns them. Quoting a value inside a host-language template does not make it safe across the next shell parse: nested interpolation can erase an argument, split whitespace, expand metacharacters, or change the search root while the outer wrapper still exits successfully. Preserve the pipeline producer's status so a missing executable or malformed argument cannot masquerade as an empty result.
+
 An inventory command is not bounded merely because each item is short. Consume it with a streaming counter/sampler that retains at most `N` items and emits only the total plus those items; preserve the producer's exit status with the shell's pipeline-status mechanism. Do not print the complete inventory before counting or sampling it.
+
+Parallel launch does not create an output budget. Before using `Promise.all`, background jobs, or another fan-out mechanism, select one aggregate visible-output and retained-byte ceiling. Make every child cap fit within that total, or route each producer to its own enforced bounded sink and emit only a compact aggregate. A display cap applied independently to every child can still multiply into a truncated combined result.
 
 For embedded payloads, minified bundles, or other very long lines, prefer counts, stream `rg -l` through the total-counter/`N`-filename sampler, or use bounded `rg -o` or structured length/snippet extraction. `rg --max-count` limits matches per file, so it does not replace a bounded candidate file set.
 
@@ -61,10 +67,10 @@ Use this wrapper only when Python reports `os.name == "posix"` and the required 
 python3 <loaded-skill-dir>/scripts/run_process_group_deadline.py \
   --timeout-seconds <task-specific-seconds> \
   --grace-seconds 1 \
-  -- /usr/bin/sqlite3 /exact/path/database.sqlite 'SELECT count(*) FROM events;'
+  -- sqlite3 /exact/path/database.sqlite 'SELECT count(*) FROM events;'
 ```
 
-Use the same wrapper with `/usr/bin/du -xhd 1 /exact/path` for a bounded filesystem walk. Launching descendants does not by itself require stronger containment; the wrapper's documented process-group boundary is sufficient when ordinary same-user descendants should receive the timeout signals too.
+Use the same wrapper with `du -xhd 1 /exact/path` for a bounded filesystem walk. Launching descendants does not by itself require stronger containment; the wrapper's documented process-group boundary is sufficient when ordinary same-user descendants should receive the timeout signals too.
 
 The wrapper runs direct argv without an implicit shell, inherits only standard input, output, and error, and adds no persistent launcher between itself and the command. It takes one absolute monotonic deadline before creating the control pipes and forking. The child establishes its process group or session, reports `READY`, and waits for the parent's `GO` before it can execute user code. Before `READY`, timeout or cancellation safely targets only the known child PID; after `GO`, setup, `exec`, and command runtime all consume the same deadline budget and cleanup targets the known PGID. Direct-child waiting uses capped exponential backoff and settles at no more than about 25 nonblocking `waitpid` observations per second for a long-running command. The wrapper checks the deadline before each new exit observation; a direct-child status returned by an observation begun before the deadline wins that boundary race, while no new observation starts once the deadline is reached. The supervisor parent unblocks managed `INT`, `TERM`, and `HUP` signals while it owns cleanup, even if its launcher blocked them; the target child receives the launcher's original signal mask, and the parent restores that mask during teardown. The first timeout or managed signal owns one cleanup transition, so later managed signals cannot interrupt it. On timeout the wrapper sends `TERM`, waits the complete selected grace period without reaping the group leader, sends best-effort `KILL`, and then waits only for its direct child. Diagnostics are best effort and temporarily make standard error nonblocking for one short write: a closed or broken sink, or a full pipe, cannot replace or indefinitely delay the command, timeout, or forwarded-signal status. Because that flag belongs to the shared open-file description, an uncatchable child death in the short toggle window can leave inherited standard error nonblocking; eliminating that edge requires a dedicated diagnostic channel outside this lightweight contract. A normal child exit is returned unchanged; a deadline returns `124`, and an externally received `INT`, `TERM`, or `HUP` is forwarded before the wrapper returns the conventional `128 + signal` status.
 
