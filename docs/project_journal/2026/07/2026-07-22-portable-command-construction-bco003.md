@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-22
 updated: 2026-07-22
 branch: codex/daily-skill-friction-20260722-codex-workflow-hygiene-portable-rg-command-guardrail
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/61
 supersedes: []
 superseded_by:
 ---
@@ -35,3 +35,4 @@ superseded_by:
 - `python3 -m unittest discover -s tests -q`: 1,058 tests passed with process-local commit signing disabled for temporary fixture merge commits.
 - `quick_validate.py skills/bounded-command-output`: valid.
 - The initial fresh-context Codex review found two stale `/usr/bin` examples; both examples and their contract tests were corrected before the final gate.
+- PR: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/61
