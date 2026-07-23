@@ -21,7 +21,7 @@ superseded_by:
 - Corpus-helper deadlines are sized from full-root cost and previous successful runtime rather than the requested timestamp-window width.
 - Quiet stdout is treated as expected while a healthy full-root scan is still running.
 - Timed-out or interrupted scans are classified as incomplete; the old producer and its descendants must be proven quiescent before a fresh nonexistent output directory is used for any retry.
-- Failed output directories are removed only after producer quiescence and directory-object identity revalidation; child-entry churn within the same directory is not treated as replacement. A missing target is not recreated or claimed as verified cleanup, while unavailable baseline identity, unreadable revalidation, identity mismatch, or unproven quiescence leaves any present path untouched for handoff.
+- Failed output cleanup is optional. Producer quiescence and directory-object identity revalidation remain necessary evidence, but a pathname `stat` followed by recursive deletion is not treated as race-safe; removal additionally requires a trusted descriptor-relative primitive that binds the verified parent and target identities throughout cleanup, or platform containment that prevents replacement. Otherwise the path is retained for handoff.
 
 ## Next Steps
 
@@ -33,6 +33,7 @@ superseded_by:
 - The 2026-07-23 Daily Skill Friction audit reproduced the short-deadline failure at 300 seconds before the same fixed window completed under a 900-second deadline.
 - A fresh-context internal review identified unsafe pathname-only cleanup after interruption; the fix now protects directory object identity and keeps quiescence, unreadable state, missing identity, and replacement outcomes distinct.
 - PR single review identified retry-before-quiescence resource contention; the fix now blocks every retry until the original producer and its descendants are proven quiescent.
+- PR single rereview identified the remaining check-to-delete replacement window; the fix now distinguishes diagnostic identity revalidation from an identity-bound deletion guarantee and retains the path when only pathname recursion is available.
 - `python3 -m unittest tests.test_skill_structure tests.test_session_corpus`: 83 tests passed.
 - Full `python3 -m unittest discover -s tests`: 1,058 tests passed with commit signing disabled only for temporary Git fixture commits.
 - `uv run --isolated --with pyyaml ... quick_validate.py skills/codex-session-mining`: passed.
