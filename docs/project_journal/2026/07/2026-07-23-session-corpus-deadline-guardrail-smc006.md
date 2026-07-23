@@ -34,6 +34,7 @@ superseded_by:
 - A fresh-context internal review identified unsafe pathname-only cleanup after interruption; the fix now protects directory object identity and keeps quiescence, unreadable state, missing identity, and replacement outcomes distinct.
 - PR single review identified retry-before-quiescence resource contention; the fix now blocks every retry until the original producer and its descendants are proven quiescent.
 - PR single rereview identified the remaining check-to-delete replacement window; the fix now distinguishes diagnostic identity revalidation from an identity-bound deletion guarantee and retains the path when only pathname recursion is available.
+- Final whole-range fresh-context rereview through `5d4d2e8dfa4bfb27821e20b672a380092edfed28` returned `No findings`; exact-secret admission for that range was clean with complete temporary cleanup.
 - `python3 -m unittest tests.test_skill_structure tests.test_session_corpus`: 83 tests passed.
 - Full `python3 -m unittest discover -s tests`: 1,058 tests passed with commit signing disabled only for temporary Git fixture commits.
 - `uv run --isolated --with pyyaml ... quick_validate.py skills/codex-session-mining`: passed.
