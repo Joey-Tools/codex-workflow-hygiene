@@ -20,7 +20,7 @@ superseded_by:
 
 - Corpus-helper deadlines are sized from full-root cost and previous successful runtime rather than the requested timestamp-window width.
 - Quiet stdout is treated as expected while a healthy full-root scan is still running.
-- Timed-out or interrupted scans are classified as incomplete and rerun only with a fresh nonexistent output directory; missing or partial output cannot be reported as an empty or complete corpus.
+- Timed-out or interrupted scans are classified as incomplete; the old producer and its descendants must be proven quiescent before a fresh nonexistent output directory is used for any retry.
 - Failed output directories are removed only after producer quiescence and directory-object identity revalidation; child-entry churn within the same directory is not treated as replacement. A missing target is not recreated or claimed as verified cleanup, while unavailable baseline identity, unreadable revalidation, identity mismatch, or unproven quiescence leaves any present path untouched for handoff.
 
 ## Next Steps
@@ -32,6 +32,7 @@ superseded_by:
 - Session `019f8616-6fbd-7e13-9057-1d703c78fc88` required a user-triggered retry after a healthy 53 GiB cross-root scan was interrupted at roughly three minutes; the fresh rerun completed after several more minutes.
 - The 2026-07-23 Daily Skill Friction audit reproduced the short-deadline failure at 300 seconds before the same fixed window completed under a 900-second deadline.
 - A fresh-context internal review identified unsafe pathname-only cleanup after interruption; the fix now protects directory object identity and keeps quiescence, unreadable state, missing identity, and replacement outcomes distinct.
+- PR single review identified retry-before-quiescence resource contention; the fix now blocks every retry until the original producer and its descendants are proven quiescent.
 - `python3 -m unittest tests.test_skill_structure tests.test_session_corpus`: 83 tests passed.
 - Full `python3 -m unittest discover -s tests`: 1,058 tests passed with commit signing disabled only for temporary Git fixture commits.
 - `uv run --isolated --with pyyaml ... quick_validate.py skills/codex-session-mining`: passed.

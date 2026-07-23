@@ -780,13 +780,25 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("full-root cost, not a requested-window cost", skill)
         self.assertIn("previous successful runtime", skill)
         self.assertIn("classify the result as incomplete", skill)
+        self.assertIn("Before any retry", skill)
+        self.assertIn("without starting another full-root scan", skill)
+        self.assertLess(
+            skill.index("Before any retry"),
+            skill.index("After quiescence is proved, retry"),
+        )
         self.assertIn("different fresh nonexistent output directory", skill)
-        self.assertIn("producer and descendants are proven quiescent", skill)
+        self.assertIn("original producer and its descendants are quiescent", skill)
         self.assertIn("recorded directory object identity", skill)
         self.assertIn("target is missing at revalidation", skill)
         self.assertIn("leave any present path untouched", skill)
         self.assertIn("quiet stdout is expected", workflow)
         self.assertIn("supplies no reusable checkpoint", workflow)
+        self.assertIn("Before any retry", workflow)
+        self.assertIn("do not start another full-root scan", workflow)
+        self.assertLess(
+            workflow.index("Before any retry"),
+            workflow.index("After quiescence is proved, retry"),
+        )
         self.assertIn("device/inode or platform-equivalent identity", workflow)
         self.assertIn("immediate pre-removal revalidation", workflow)
         self.assertIn("child-entry churn inside the same directory", workflow)
