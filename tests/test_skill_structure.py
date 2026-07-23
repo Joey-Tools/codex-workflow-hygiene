@@ -762,6 +762,9 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_corpus_recipe_uses_structured_helper(self) -> None:
         root = Path(__file__).resolve().parents[1]
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(
+            encoding="utf-8"
+        )
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
             encoding="utf-8"
         )
@@ -774,6 +777,44 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn('CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"', recipe)
         self.assertIn('python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py"', recipe)
         self.assertIn('--sample-limit 20', recipe)
+        self.assertIn("full-root cost, not a requested-window cost", skill)
+        self.assertIn("previous successful runtime", skill)
+        self.assertIn("classify the result as incomplete", skill)
+        self.assertIn("Before any retry", skill)
+        self.assertIn("without starting another full-root scan", skill)
+        self.assertLess(
+            skill.index("Before any retry"),
+            skill.index("After quiescence is proved, retry"),
+        )
+        self.assertIn("different fresh nonexistent output directory", skill)
+        self.assertIn("original producer and its descendants are quiescent", skill)
+        self.assertIn("binds the verified parent and target directory identities", skill)
+        self.assertIn("target is missing at revalidation", skill)
+        self.assertIn("leave any present path untouched", skill)
+        self.assertIn("quiet stdout is expected", workflow)
+        self.assertIn("supplies no reusable checkpoint", workflow)
+        self.assertIn("Before any retry", workflow)
+        self.assertIn("do not start another full-root scan", workflow)
+        self.assertLess(
+            workflow.index("Before any retry"),
+            workflow.index("After quiescence is proved, retry"),
+        )
+        self.assertIn("device/inode or platform-equivalent identity", workflow)
+        self.assertIn("immediate pre-removal revalidation", workflow)
+        self.assertIn("child-entry churn inside the same directory", workflow)
+        self.assertIn("Cleanup of the failed-run path is optional", workflow)
+        self.assertIn("does not close the check-to-delete replacement window", workflow)
+        self.assertIn("trusted descriptor-relative cleanup primitive", workflow)
+        self.assertIn("binds both the verified parent directory and target directory identities", workflow)
+        self.assertIn("If only pathname-based recursive deletion is available", workflow)
+        self.assertIn("classify that result separately as missing", workflow)
+        self.assertIn("do not recreate it or delete anything at that pathname", workflow)
+        self.assertIn("do not claim this run verified cleanup", workflow)
+        self.assertIn("baseline identity is unavailable", workflow)
+        self.assertIn("revalidation is unreadable", workflow)
+        self.assertIn("current identity mismatches", workflow)
+        self.assertIn("leave any present path untouched", workflow)
+        self.assertIn("Never interpret missing output as an empty corpus", workflow)
 
     def test_session_mining_exact_session_recipe_propagates_find_failure(self) -> None:
         root = Path(__file__).resolve().parents[1]
