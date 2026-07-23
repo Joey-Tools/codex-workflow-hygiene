@@ -1,6 +1,6 @@
 ---
 name: codex-rules-hygiene
-description: Audit or apply cleanup to the user's `~/.codex/rules/default.rules` by separating stable command families from wrapper drift, helper gaps, and disposable approval-log literals. Use audit mode for read-only inspection after rules growth or recurring one-off approvals; use apply mode when cleanup is authorized or an audit has proved an exact change that the active task authorizes.
+description: Audit or apply cleanup to the user's `~/.codex/rules/default.rules` by separating stable command families from wrapper drift, helper gaps, and disposable approval-log literals. Default to read-only audit after rules growth or recurring one-off approvals; enter apply mode only when cleanup is authorized or an audit has proved an exact change that the active task authorizes.
 ---
 
 # Codex Rules Hygiene
@@ -16,9 +16,9 @@ Always choose an explicit mode before inspecting or changing host state.
 
 - Use for inspect, audit, report, or recommendation requests.
 - Choose a light audit for one known recent growth burst; choose a full audit for whole-file, stale-gap, periodic, or cold-start requests.
-- Keep the run read-only: do not create a backup, rewrite `default.rules`, refresh the clean baseline, or update a journal.
+- Keep the run read-only: leave `default.rules`, baselines, safety snapshots, and journals unchanged.
 - Resolve the best existing comparison anchor, classify the delta, and report an exact proposed change.
-- If no clean baseline or older backup exists, inspect the current file as a cold-start inventory and report the bootstrap apply steps without creating any files.
+- If no clean baseline or older backup exists, inspect the current file as a cold-start inventory and report the bootstrap apply plan while leaving host state unchanged.
 - An audit-only request never becomes writable merely because it found drift.
 
 ### Apply Mode

@@ -2,18 +2,17 @@
 
 ## Mode Contract
 
-- `audit` is read-only. It may resolve existing anchors, diff, classify, and propose an exact apply plan, but it never creates a backup, rewrites rules, refreshes a baseline, or updates a journal.
-- `apply` is writable only when cleanup is requested or an audit has proved an exact change that the active task authorizes. It revalidates the audited inputs before writing.
-- If apply has no approved content change, report a no-op and create nothing.
+- `audit` is read-only. It may resolve existing anchors, diff, classify, and propose an exact apply plan, but it leaves every host file unchanged.
+- Apply-mode authorization and transaction rules begin at the Apply Checklist below.
 
 ## Default Rhythm
 
 - Prefer a light audit after one burst of work when `~/.codex/rules/default.rules` clearly gained shell-shaped literals.
-- Prefer a fuller audit about once a week, or when roughly `8-12` new rules have accumulated since the last clean-baseline refresh or other successful full audit.
+- Prefer a fuller audit about once a week, or when roughly `8-12` new rules have accumulated since the clean baseline was last established or another successful full audit.
 - If the file grows again immediately after a cleanup, treat that as a workflow-design signal rather than as proof that the deleted literal was actually durable.
 - Treat `~/.codex/rules/default.rules.clean-baseline` as the canonical clean anchor after a successful full cleanup.
 - If that clean-baseline file does not exist yet, treat the latest timestamped backup as the temporary comparison fallback rather than pretending a clean anchor exists.
-- If neither anchor exists yet, enter a cold-start bootstrap: create one safety backup, do not diff against that freshly created backup, and treat the current file as the initial inventory to clean.
+- If neither anchor exists yet, treat the current file as a cold-start read-only inventory; host-state mutation belongs exclusively to apply mode.
 
 ## Light Audit Checklist
 
@@ -30,7 +29,7 @@
    - repo-local skill/helper when the drift is tied to one repo's scripts or policy
    - personal skill/helper when the drift is host-level and cross-repo
    - [$codex-skill-authoring](../../codex-skill-authoring/SKILL.md) when the owner or instruction layer is unclear
-7. Emit an exact apply plan or a read-only no-change result. Do not back up, rewrite, refresh the baseline, or journal from audit mode.
+7. Emit an exact apply plan or a read-only no-change result. Keep every host file unchanged.
 
 ## Full Audit Checklist
 
@@ -38,19 +37,20 @@
 2. Group additions by workflow family rather than by literal string.
 3. Propose the narrowest stable prefix that still covers each recurring workflow.
 4. Identify obsolete literals already replaced by helpers or skills.
-5. State whether the proposed full cleanup would be eligible to refresh `default.rules.clean-baseline`.
-6. List any durable observation that would require a journal or focused-note update if adopted.
+5. State whether the proposed full cleanup would qualify the resulting file as the next `default.rules.clean-baseline`.
+6. List any durable observation that apply mode would record in a journal or focused note if adopted.
 7. Remain read-only until apply mode is authorized.
 
 ## Apply Checklist
 
-1. Re-read `default.rules` and the selected comparison anchor; stop if either differs from the audited inputs. Identify the existing policy validator, and stop before backup or rewrite if no trustworthy validation gate can be named and run.
-2. If no content change remains, report a no-op and create nothing.
-3. Create one timestamped safety backup before rewriting.
-4. Rewrite only the reviewed entries and run the identified validator against the resulting policy.
-5. Refresh `default.rules.clean-baseline` only after a successful full cleanup with no intentionally retained drift debt.
-6. Write the necessary adopted-journal or focused-note update only for a durable decision actually applied or a successful full-cleanup baseline refresh. Use an existing owning-repo journal when already adopted; otherwise use a nearby focused note rather than bootstrapping a tracker.
-7. Never treat the new safety backup as the comparison anchor for the same apply.
+1. Enter apply mode only when cleanup is requested or an audit has proved an exact change that the active task authorizes.
+2. Re-read `default.rules` and the selected comparison anchor; stop if either differs from the audited inputs. Identify the existing policy validator, and stop before backup or rewrite if no trustworthy validation gate can be named and run.
+3. If no content change remains, report a no-op and create nothing.
+4. Create one timestamped safety backup before rewriting.
+5. Rewrite only the reviewed entries and run the identified validator against the resulting policy.
+6. Refresh `default.rules.clean-baseline` only after a successful full cleanup with no intentionally retained drift debt.
+7. Write the necessary adopted-journal or focused-note update only for a durable decision actually applied or a successful full-cleanup baseline refresh. Use an existing owning-repo journal when already adopted; otherwise use a nearby focused note rather than bootstrapping a tracker.
+8. Never treat the new safety backup as the comparison anchor for the same apply.
 
 ## Cold-Start Bootstrap
 

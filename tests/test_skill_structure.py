@@ -153,6 +153,8 @@ class SkillStructureTests(unittest.TestCase):
 
         audit = skill.split("### Audit Mode", 1)[1].split("### Apply Mode", 1)[0]
         apply_mode = skill.split("### Apply Mode", 1)[1].split("## Audit Workflow", 1)[0]
+        skill_before_apply = skill.split("### Apply Mode", 1)[0]
+        cadence_before_apply = cadence.split("## Apply Checklist", 1)[0]
         transaction = skill.split("## Apply Transaction", 1)[1].split(
             "## Ownership And Guardrails", 1
         )[0]
@@ -160,7 +162,7 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("Keep the run read-only", audit)
         self.assertIn("Choose a light audit", audit)
         self.assertIn("choose a full audit", audit)
-        self.assertIn("do not create a backup", audit)
+        self.assertIn("leave `default.rules`, baselines, safety snapshots, and journals unchanged", audit)
         self.assertIn("An audit-only request never becomes writable", audit)
         self.assertIn("cleanup/apply", apply_mode)
         self.assertIn("active task already authorizes applying it", apply_mode)
@@ -186,6 +188,15 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("`audit` is read-only", cadence)
         self.assertIn("## Apply Checklist", cadence)
         self.assertIn("Remain read-only until apply mode is authorized", cadence)
+        write_instruction = (
+            r"(?im)^\s*(?:[-*]|\d+\.).*"
+            r"\b(?:back up|create|delete|remove|rewrite|refresh|update|write)\b"
+        )
+        self.assertNotRegex(skill_before_apply, write_instruction)
+        self.assertNotRegex(cadence_before_apply, write_instruction)
+        self.assertIn("Audit Codex rules without changing files", interface)
+        self.assertIn("run a read-only audit", interface)
+        self.assertNotIn("audit or apply", interface.lower())
         self.assertIn("Use $codex-rules-hygiene", interface)
 
     def test_session_mining_exposes_locate_and_corpus_paths(self) -> None:
@@ -217,8 +228,14 @@ class SkillStructureTests(unittest.TestCase):
         skill_root = root / "skills/codex-skill-authoring"
         skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
         interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
+        frontmatter = skill.split("---", 2)[1]
 
         self.assertLess(len(skill.splitlines()), 80)
+        self.assertIn("Create or update Codex skills", frontmatter)
+        self.assertIn(
+            "Use alongside `$skill-creator` whenever a task creates or updates a Codex skill",
+            frontmatter,
+        )
         self.assertIn("Load `$skill-creator` first", skill)
         self.assertIn("This skill is a thin overlay", skill)
         self.assertIn("`$skill-creator` owns", skill)
@@ -230,7 +247,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn(".system/skill-creator/scripts/quick_validate.py", skill)
         self.assertIn("Do not duplicate system scaffolding", skill)
         self.assertFalse((skill_root / "references/description-patterns.md").exists())
-        self.assertIn("Use $codex-skill-authoring with $skill-creator", interface)
+        self.assertIn("Use $skill-creator for general authoring and scaffolding", interface)
+        self.assertIn("use $codex-skill-authoring to place, layer, and validate", interface)
         self.assertNotIn("concise concise", interface)
 
     def test_session_mining_avoids_per_record_jsonl_key_dumps(self) -> None:

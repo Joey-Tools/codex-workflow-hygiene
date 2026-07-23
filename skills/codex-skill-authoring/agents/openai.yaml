@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Skill Authoring"
-  short_description: "Apply placement and validation conventions."
-  default_prompt: "Use $codex-skill-authoring with $skill-creator to place, layer, and validate this skill."
+  short_description: "Apply the user's skill conventions."
+  default_prompt: "Use $skill-creator for general authoring and scaffolding, and use $codex-skill-authoring to place, layer, and validate this skill."

@@ -1,6 +1,6 @@
 ---
 name: codex-skill-authoring
-description: Apply canonical placement, instruction-layering, validation-wrapper, and approval-friendly argv conventions on top of the system `$skill-creator`. Use when choosing personal versus repo-local skill placement, deciding whether guidance belongs in `AGENTS.md`, `SKILL.md`, or `references/`, validating one or more skills through the local wrapper, or removing shell shapes that cause repeated approvals.
+description: Create or update Codex skills for the user's workflows by applying canonical placement, instruction-layering, validation-wrapper, and approval-friendly argv conventions on top of the system `$skill-creator`. Use alongside `$skill-creator` whenever a task creates or updates a Codex skill, especially when choosing personal versus repo-local placement, deciding whether guidance belongs in `AGENTS.md`, `SKILL.md`, or `references/`, or validating skills through the local wrapper.
 ---
 
 # Codex Skill Authoring
