@@ -1,63 +1,63 @@
 ---
 name: codex-skill-authoring
-description: Create or update Codex skills for the user's workflows. Use when turning repeated work into a repo or personal skill, tightening a skill's frontmatter description, deciding whether guidance belongs in AGENTS.md, SKILL.md, or references, or capturing post-mortem lessons without bloating prompts.
+description: Apply canonical placement, instruction-layering, validation-wrapper, and approval-friendly argv conventions on top of the system `$skill-creator`. Use when choosing personal versus repo-local skill placement, deciding whether guidance belongs in `AGENTS.md`, `SKILL.md`, or `references/`, validating one or more skills through the local wrapper, or removing shell shapes that cause repeated approvals.
 ---
 
 # Codex Skill Authoring
 
 ## Overview
 
-Create skills that trigger reliably and stay small.
-Keep `AGENTS.md` as the short policy/index layer, keep `SKILL.md` procedural, and move detailed notes, examples, and post-mortems into `references/`.
+Load `$skill-creator` first.
+This skill is a thin overlay for local canonical placement and execution conventions; it does not replace the system skill's general authoring workflow.
 
-## Place The Skill Correctly
+## Keep The Ownership Boundary
 
-- Put cross-repo habits, local environment practices, and reusable authoring conventions in `~/.codex/skills`.
-- When the workflow is driven by host-level state such as `~/.codex/rules`, `~/.cursor/cli-config.json`, downloaded local archives, or Codex session/history mining, default to a personal skill even if the investigation started from a repository checkout.
-- Put repo-specific workflows, internal paths, repo-only scripts, and design notes in the repository's `.agents/skills/<skill-name>/` directory.
-- Keep it repo-local only when the normal runtime really depends on repo-owned scripts, fixtures, or policy. Do not mirror a host-level workflow into a repo skill just because that repo happened to be open when the friction was discovered.
-- Do not create a personal skill that hard-codes one repository's paths, secrets, or policies.
+`$skill-creator` owns:
 
-## Follow This Workflow
+- concrete usage examples, naming, and frontmatter design
+- `init_skill.py` scaffolding and standard `agents/openai.yaml` generation
+- general resource selection, `quick_validate.py` validation, and forward-testing
 
-1. Start from two or three concrete user phrasings that should trigger the skill.
-2. Write the frontmatter `description` before writing the body.
-3. Keep `SKILL.md` focused on workflow, decisions, and resource loading rules.
-4. Move long notes, pitfalls, and examples into `references/`.
-5. Add a script only when the work is repetitive or fragile enough to justify deterministic automation.
-6. Validate the finished skill before installing or committing it.
+This overlay owns:
 
-## Apply User-Specific Rules
+- personal versus repo-local placement
+- `AGENTS.md` / `SKILL.md` / `references/` layering
+- the local multi-skill validator wrapper and fallback order
+- direct, approval-friendly argv examples and task-scoped temporary artifacts
 
-- Keep `AGENTS.md` terse. Store only distilled reminders there and link to the skill or reference file instead of duplicating detailed guidance.
-- When a new skill is repo-local and the repo tracks `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md`, update those files in the same task.
-- If the same workflow keeps reappearing across repositories, prefer a personal skill plus a short `AGENTS.md` pointer over repeating the full procedure in every repo.
-- Name important variants in the description when they affect triggering. Do not accidentally narrow a skill to Windows-only if it should also cover macOS or other supported variants.
-- Rewrite the description until another Codex instance could decide to load the skill from the frontmatter alone.
-- When a skill or reference suggests repeated escalated commands, prefer examples that call the real executable directly so approval prefix rules can match stable argv forms; avoid `bash -lc` / `/bin/zsh -lc` examples unless shell syntax is essential to the workflow.
-- When a skill or reference creates temporary artifacts, prefer task-scoped directories plus explicit cleanup guidance over fixed `/tmp/foo` paths that silently accumulate across sessions.
+Do not duplicate system scaffolding or mirror the system validator into this skill.
 
-## Use These Creation Defaults
+## Choose Placement
 
-- Prefer `python3 "$HOME/.codex/skills/.system/skill-creator/scripts/init_skill.py" <skill-name> --path ~/.codex/skills` for personal skills, or `python3 "$HOME/.codex/skills/.system/skill-creator/scripts/init_skill.py" <skill-name> --path .agents/skills` for repo-local skills.
-- Prefer `"$HOME/.codex/skills/codex-skill-authoring/scripts/codex_skill_validate.py" ...` to validate one or more skills through the local wrapper. The wrapper calls the installed OpenAI validator at `$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py`; do not edit or mirror OpenAI's validator for user-specific workflow changes.
-- If the wrapper is unavailable, fall back to `uv run --isolated --with pyyaml python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" ...` for direct single-skill validation.
-- Fall back to `python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" ...` only when the needed dependency is already available locally or when `uv` is not the right tool for the environment.
-- Use the Python entrypoint directly if the helper wrapper exists but is not executable in the current environment.
+- Put cross-repo habits, host-level state workflows, and reusable local conventions in `~/.codex/skills`.
+- Default workflows rooted in `~/.codex`, rules, session history, local archives, or other host state to personal skills.
+- Put repository-specific procedures, paths, scripts, fixtures, and policy in `.agents/skills/<skill-name>/`.
+- Keep a skill repo-local only when its normal runtime depends on repo-owned material.
+- Do not hard-code one repository's paths, secrets, or policy into a personal skill.
 
-## Check The Description
+## Layer Instructions
 
-- State the main job first.
-- Include two to four concrete triggers or contexts.
-- Mention relevant platforms or variants when they materially change invocation.
-- Keep body-only details out of the frontmatter.
-- Read `references/description-patterns.md` when naming or description scope is the hard part.
+- Keep `AGENTS.md` short: stable policy, reminders, and pointers only.
+- Keep `SKILL.md` procedural: decisions, workflow, and resource-loading rules.
+- Put detailed recipes, examples, schemas, pitfalls, and post-mortems in `references/`.
+- Avoid duplicating the same rule across layers.
 
-## Validate And Iterate
+## Preserve Approval-Friendly Commands
 
-- Run quick validation before installation or commit. For many skills, use `"$HOME/.codex/skills/codex-skill-authoring/scripts/codex_skill_validate.py" --report .codex-tmp/skill-validation/report.json <skill> [...]` so stdout stays compact and complete results go to a task-scoped file.
-- Smoke-test any newly added script with at least one real invocation.
-- If `quick_validate.py` cannot run directly because local dependencies such as `PyYAML` are missing, first retry via `uv run --isolated --with pyyaml ...`.
-- If the `uv` path is unavailable, inappropriate, or still fails, fall back to explicit checks: parse `agents/openai.yaml`, verify `SKILL.md` frontmatter/body structure, and confirm referenced resources exist.
-- If the intended update depends on an external reference that is unreadable in the current environment, stop and ask for a local copy or excerpt instead of shipping a placeholder-only update.
-- After real usage, update the skill with the exact friction that appeared instead of adding generic prose.
+- Prefer the real executable with direct argv so stable approval prefixes can match.
+- Use `bash -lc` or `/bin/zsh -lc` only when shell syntax is essential.
+- Pass dynamic values as direct arguments; use a task-scoped script for non-trivial multi-line logic.
+- Put temporary artifacts in task-scoped directories and state their cleanup or handoff.
+
+## Validate Through The Overlay
+
+After following `$skill-creator`:
+
+1. Prefer `"$HOME/.codex/skills/codex-skill-authoring/scripts/codex_skill_validate.py" --report <task-scoped-report.json> <skill> [...]`.
+2. The wrapper must delegate to the installed `$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py`; do not edit or mirror that validator here.
+3. If the wrapper exists but is not executable, invoke its Python entrypoint directly.
+4. If the wrapper is unavailable, use `uv run --isolated --with pyyaml python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" <skill>`.
+5. Use direct `python3 .../quick_validate.py` only when its dependencies are already available or `uv` is inappropriate.
+6. Smoke-test every newly added helper script with a real invocation.
+
+Treat this wrapper as the canonical local entrypoint, not as a replacement for the system skill's validation contract.

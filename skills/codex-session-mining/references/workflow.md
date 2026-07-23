@@ -1,8 +1,8 @@
 # Codex Session Mining Recipes
 
-Use these recipes when the task is to recover prior work, map a session ID to a rollout file, or audit repeated workflow friction from the user's local Codex history.
+Choose `locate` for one exact session/thread or recent turn. Choose `corpus` for active-plus-archived, date-window, replay-prefix, repeated-friction, or full current-host analysis.
 
-## 1. Find The Canonical Rollout File
+## Locate Path: Find The Canonical Rollout File
 
 Exact session ID:
 
@@ -197,6 +197,8 @@ The heap retains at most `per_source_limit` bounded projections per source. The 
 
 Do not run keyword `rg -n ... ~/.codex` or `rg -n ... "$CODEX_HOME"` to recover a recent command, password hint, or rollout memory. The whole tree includes retained transcript output plus installed skills, overlays, caches, and package payloads; a single match can print irrelevant or enormous records. Use the recent index rows above, a known session ID, or a bounded date directory to select rollout files first.
 
+## Corpus Path: Build The Current-Host Union
+
 Bounded date range and current-host corpus inventory:
 
 ```bash
@@ -224,7 +226,7 @@ A timeout, cancellation, or interrupted producer is an incomplete scan and suppl
 
 Cleanup of the failed-run path is optional. The protected property is that output directory's object identity. The device/inode or platform-equivalent identity recorded when the directory first appeared, compared with an immediate pre-removal revalidation, detects a replacement that happened before that check; child-entry churn inside the same directory is not an identity mismatch. That comparison does not close the check-to-delete replacement window: a one-shot pathname revalidation followed by recursive deletion can still remove a different directory substituted by another same-UID process. Permit removal only through a trusted descriptor-relative cleanup primitive that binds both the verified parent directory and target directory identities throughout the operation, or under platform containment that prevents replacement. If only pathname-based recursive deletion is available, leave any present path untouched and retain the recorded identity for handoff rather than claiming safe cleanup. If the target is missing at revalidation, classify that result separately as missing: do not recreate it or delete anything at that pathname, retain the recorded path and identity as unresolved handoff evidence, and do not claim this run verified cleanup. If quiescence becomes uncertain, the baseline identity is unavailable, revalidation is unreadable, or the current identity mismatches, likewise leave any present path untouched. Never interpret missing output as an empty corpus, reuse a partial directory, or claim the requested window was fully scanned.
 
-The helper reports `active candidate count`, `archived candidate count`, `union candidate count`, matching parsed counts, `active accepted count`, `archived accepted count`, `union accepted count`, cross-root duplicate groups among accepted candidate groups, collapsed duplicate rollouts, and replayed-prefix records. It requires a fresh nonexistent output directory, lexically normalizes dot segments before traversal, rejects untrusted symlink ancestors, and creates the complete candidate and accepted path lists, `manifest.json`, `corpus-paths.txt`, and `corpus.jsonl` there without following or replacing existing artifact paths. Inventory snapshots and revalidates every traversed directory plus each entry identity and file type; both read passes reopen candidate files from the root directory descriptor with no-follow components and reject replacement or truncation. Non-printable rollout path components fail closed before line-delimited path artifacts or terminal samples are emitted. The first pass pins the complete-record prefix observed when it opens each same-inode rollout, deferring only an unterminated invalid final fragment from an active rollout; the second pass consumes only that verified unchanged prefix, so normal append-only growth remains safe. It prints only the counts plus a bounded union sample. Each `corpus.jsonl` entry retains a distinct suffix, the inferred `owner_id`, all observed `lifecycle_ids`, its in-window `accepted_record_count`, and compact `accepted_line_ranges`; use those locators plus narrowly selected nearby context when reconstructing the real task. For a multi-ID rollout, the filename UUID is accepted as owner only when every identity alias in its first lifecycle record agrees; later foreign IDs are retained as embedded provenance. Owner-later or otherwise ambiguous histories cannot prefix-bridge sessions, although byte-identical copies with the same complete lifecycle-ID set are still safely collapsed. Timestamp-less empty files stay visible in candidate/parsed counts but are not accepted as zero-record tasks. Committed invalid JSON, any invalid archived tail, unsafe path shapes, and inventory or read failures stop the scan instead of silently shrinking the corpus. Groups with no record or fallback timestamp inside the requested window stay in candidate/parsed counts but do not enter the fingerprint-loading pass.
+The helper reports `active candidate count`, `archived candidate count`, `union candidate count`, matching parsed counts, `active accepted count`, `archived accepted count`, `union accepted count`, cross-root duplicate groups among accepted candidate groups, collapsed duplicate rollouts, and replayed-prefix records. It requires a fresh nonexistent output directory, lexically normalizes dot segments before traversal, rejects untrusted symlink ancestors, and creates the complete candidate and accepted path lists, `manifest.json`, `corpus-paths.txt`, and `corpus.jsonl` there without following or replacing existing artifact paths. Inventory snapshots and revalidates every traversed directory plus each entry identity and file type; both read passes reopen candidate files from the root directory descriptor with no-follow components and reject replacement or truncation. Non-printable rollout path components fail closed before line-delimited path artifacts or terminal samples are emitted. The first pass pins the complete-record prefix observed when it opens each same-inode rollout, deferring only an unterminated invalid final fragment from an active rollout; the second pass consumes only that verified unchanged prefix, so normal append-only growth remains safe. It prints only the counts plus a bounded union sample. Each serialized JSONL record, including its line ending, is capped at 16 MiB in both read passes; an oversized-record error is a bounded-input safety stop, not permission to substitute an unbounded whole-line reader. Treat any inventory-change error as a failed snapshot rather than an empty or partial corpus. Each `corpus.jsonl` entry retains a distinct suffix, the inferred `owner_id`, all observed `lifecycle_ids`, its in-window `accepted_record_count`, and compact `accepted_line_ranges`; use those locators plus narrowly selected nearby context when reconstructing the real task. For a multi-ID rollout, the filename UUID is accepted as owner only when every identity alias in its first lifecycle record agrees; later foreign IDs are retained as embedded provenance. Owner-later or otherwise ambiguous histories cannot prefix-bridge sessions, although byte-identical copies with the same complete lifecycle-ID set are still safely collapsed. Timestamp-less empty files stay visible in candidate/parsed counts but are not accepted as zero-record tasks. Committed invalid JSON, any invalid archived tail, unsafe path shapes, and inventory or read failures stop the scan instead of silently shrinking the corpus. Groups with no record or fallback timestamp inside the requested window stay in candidate/parsed counts but do not enter the fingerprint-loading pass.
 
 ### Current-Host Union And Deduplication
 
@@ -374,7 +376,7 @@ Each source is scanned independently in the fixed order shown above. The recipe 
 
 Use the later bounded rollout probe for `sessions/**/rollout-*.jsonl` and `archived_sessions/**/rollout-*.jsonl`, whose nested record shapes require their own selectors.
 
-## 2. Extract Only The Relevant Parts
+## Shared Extraction
 
 Before printing details from a large rollout, count record shapes and then filter:
 
@@ -1000,7 +1002,7 @@ for path in paths:
 PY
 ```
 
-## 3. Audit Repeated Skill Friction
+## Corpus Classification: Audit Repeated Skill Friction
 
 - First inventory both existing current-host transcript roots and list the sessions in scope. Report active, archived, union, and accepted-after-deduplication counts separately.
 - Detect resumed or forked replay before counting new activity:
@@ -1018,6 +1020,6 @@ PY
   - the same bounded workflow appeared multiple times without a reusable skill
 - When a problem shows up only once, prefer leaving a note instead of immediately creating a new skill.
 
-## 4. Escalate To Remote Coverage Only When Needed
+## Remote Composition
 
-If the user is asking for a work summary, activity audit, or session recovery that may include remote hosts, use an environment-specific remote evidence workflow before concluding that the local `~/.codex` tree is complete.
+If a work summary, activity audit, or session recovery may include remote hosts, load `$remote-host-context` before concluding that the local `~/.codex` tree is complete. That skill owns the current host list, reachability/authentication preflight, canonical host paths, and bounded remote materialization. Do not copy those details here. Once it materializes exact rollout evidence locally, return to this skill for extraction, replay handling, and classification while preserving host provenance.

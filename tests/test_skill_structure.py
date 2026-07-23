@@ -46,43 +46,29 @@ class SkillStructureTests(unittest.TestCase):
         supervisor = skill_root / "scripts/run_process_group_deadline.py"
         interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
 
-        for trigger in (
-            "broad searches or inventories",
-            "large Jenkins, GitHub Actions, artifact, manual, diff, or review-range reads",
-            "broad database aggregates or filesystem walks with uncertain runtime",
-            "broad or noisy process diagnostics",
-            "verbose xcodebuild or other tests and builds",
-            "spinner-heavy container builds",
-        ):
-            self.assertIn(trigger, skill)
-        self.assertIn("Apply alongside the domain skill", skill)
+        self.assertIn("genuinely broad, noisy, or long-running", skill)
+        self.assertIn("Do not use for routine exact commands", skill)
+        self.assertIn("at least one property is real", skill)
+        self.assertIn("Do not trigger merely because every command could theoretically hang", skill)
+        self.assertIn("Small visible output can still qualify", skill)
+        self.assertIn("## Keep Three Budgets Separate", skill)
+        self.assertIn("Bound the producer", skill)
+        self.assertIn("Bound runtime", skill)
+        self.assertIn("Bound retained bytes", skill)
+        self.assertIn("task-specific finite wall-clock deadline", skill)
+        self.assertIn("scripts/run_process_group_deadline.py", skill)
+        self.assertIn("process-group cleanup", skill)
+        self.assertIn("does not prove quiescence", skill)
+        self.assertIn("On non-POSIX runtimes", skill)
+        self.assertIn("one enforced aggregate byte ceiling", skill)
+        self.assertIn("all per-command caps fit inside that aggregate ceiling", skill)
+        self.assertIn("producer volume, runtime, retained bytes, and visible output", skill)
+        self.assertIn("Start interruptible long-running work in a pollable PTY shape", skill)
+        self.assertIn("Apply this skill alongside the task's domain skill", skill)
+        self.assertIn("genuinely broad, noisy, or long-running command", patterns)
         self.assertIn(
-            "controls command shape, execution deadlines, and output handling only",
-            skill,
+            "producer scope, runtime, retained bytes, and visible output", patterns
         )
-        self.assertIn("Small output does not imply bounded runtime", skill)
-        self.assertIn("expected result is one line", skill)
-        self.assertIn("known to be both small and fast", skill)
-        self.assertIn("task-specific deadlines", skill)
-        self.assertIn("Do not guess `/usr/bin` or a package-manager prefix", skill)
-        self.assertIn("nested host-language and shell quoting", skill)
-        self.assertIn("Pass them as positional arguments", skill)
-        self.assertIn("one aggregate output and retained-byte budget", skill)
-        self.assertIn("native Windows", skill)
-        self.assertIn("WSL follows the POSIX path", skill)
-        self.assertIn("do not claim process-group or descendant cleanup", skill)
-        self.assertIn("expected output is a single value", skill)
-        self.assertIn("display backstops, not as execution-time bounds", skill)
-        self.assertIn("finite wall-clock deadline", skill)
-        self.assertIn("explicitly capped candidate-filename sample", skill)
-        self.assertIn("bounded filename samples", skill)
-        self.assertIn("enforced ceiling across all retained artifacts", skill)
-        self.assertIn("fixed aggregate-byte and segment-count caps", skill)
-        self.assertIn("removes or reuses old segments", skill)
-        self.assertIn("keep the retained set below its fixed ceiling or terminate the producer", skill)
-        self.assertIn("do not by themselves bound disk growth", skill)
-        self.assertIn("pollable TTY or PTY shape", skill)
-        self.assertIn("plain-pipe session after stdin closes", skill)
         self.assertIn("## Searches And Inventories", patterns)
         self.assertIn("## Logs, Artifacts, And Manuals", patterns)
         self.assertIn("## Process And System Diagnostics", patterns)
@@ -152,16 +138,109 @@ class SkillStructureTests(unittest.TestCase):
         self.assertTrue(supervisor.is_file())
         self.assertTrue(os.access(supervisor, os.X_OK))
         self.assertIn("$bounded-command-output", interface)
-        self.assertIn("time-bounded, pollable, and compact", interface)
+        self.assertIn("broad, noisy, or long-running", interface)
         self.assertIn("allow_implicit_invocation: true", interface)
         self.assertNotIn("TODO", skill)
+
+    def test_rules_hygiene_separates_audit_and_apply(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill_root = root / "skills/codex-rules-hygiene"
+        skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        cadence = (skill_root / "references/audit-cadence.md").read_text(
+            encoding="utf-8"
+        )
+        interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
+
+        audit = skill.split("### Audit Mode", 1)[1].split("### Apply Mode", 1)[0]
+        apply_mode = skill.split("### Apply Mode", 1)[1].split("## Audit Workflow", 1)[0]
+        transaction = skill.split("## Apply Transaction", 1)[1].split(
+            "## Ownership And Guardrails", 1
+        )[0]
+
+        self.assertIn("Keep the run read-only", audit)
+        self.assertIn("Choose a light audit", audit)
+        self.assertIn("choose a full audit", audit)
+        self.assertIn("do not create a backup", audit)
+        self.assertIn("An audit-only request never becomes writable", audit)
+        self.assertIn("cleanup/apply", apply_mode)
+        self.assertIn("active task already authorizes applying it", apply_mode)
+        self.assertIn("report a no-op and create nothing", apply_mode)
+        for phrase in (
+            "timestamped safety backup",
+            "Rewrite only the reviewed rule set",
+            "Run the identified policy validator",
+            "refresh `default.rules.clean-baseline`",
+            "necessary adopted-journal",
+        ):
+            self.assertIn(phrase, transaction)
+        self.assertIn("stop before backup or rewrite", transaction)
+        self.assertIn("instead of bootstrapping a tracker", transaction)
+        self.assertLess(
+            transaction.index("timestamped safety backup"),
+            transaction.index("Rewrite only the reviewed rule set"),
+        )
+        self.assertLess(
+            transaction.index("Rewrite only the reviewed rule set"),
+            transaction.index("Run the identified policy validator"),
+        )
+        self.assertIn("`audit` is read-only", cadence)
+        self.assertIn("## Apply Checklist", cadence)
+        self.assertIn("Remain read-only until apply mode is authorized", cadence)
+        self.assertIn("Use $codex-rules-hygiene", interface)
+
+    def test_session_mining_exposes_locate_and_corpus_paths(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill_root = root / "skills/codex-session-mining"
+        skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        workflow = (skill_root / "references/workflow.md").read_text(encoding="utf-8")
+        interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
+
+        locate = skill.split("### Locate", 1)[1].split("### Corpus", 1)[0]
+        corpus = skill.split("### Corpus", 1)[1].split("## Compose Remote Coverage", 1)[0]
+        self.assertIn("exact session ID, thread ID, recent prior turn", locate)
+        self.assertIn("Do not invoke `scripts/build_session_corpus.py`", locate)
+        self.assertIn("scripts/build_session_corpus.py", corpus)
+        self.assertIn("active and archived roots", corpus)
+        self.assertIn("replay prefixes", corpus)
+        self.assertIn("$remote-host-context", skill)
+        self.assertIn("Do not copy its host list or SSH recipes", skill)
+        self.assertNotIn("--host", skill)
+        self.assertNotIn("remote_codex_probe.py", skill)
+        self.assertIn("## Locate Path: Find The Canonical Rollout File", workflow)
+        self.assertIn("## Corpus Path: Build The Current-Host Union", workflow)
+        self.assertIn("## Shared Extraction", workflow)
+        self.assertIn("## Remote Composition", workflow)
+        self.assertIn("choose a locate or corpus path", interface)
+
+    def test_skill_authoring_is_a_thin_skill_creator_overlay(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill_root = root / "skills/codex-skill-authoring"
+        skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
+
+        self.assertLess(len(skill.splitlines()), 80)
+        self.assertIn("Load `$skill-creator` first", skill)
+        self.assertIn("This skill is a thin overlay", skill)
+        self.assertIn("`$skill-creator` owns", skill)
+        self.assertIn("`init_skill.py` scaffolding", skill)
+        self.assertIn("personal versus repo-local placement", skill)
+        self.assertIn("`AGENTS.md` / `SKILL.md` / `references/` layering", skill)
+        self.assertIn("approval-friendly argv", skill)
+        self.assertIn("scripts/codex_skill_validate.py", skill)
+        self.assertIn(".system/skill-creator/scripts/quick_validate.py", skill)
+        self.assertIn("Do not duplicate system scaffolding", skill)
+        self.assertFalse((skill_root / "references/description-patterns.md").exists())
+        self.assertIn("Use $codex-skill-authoring with $skill-creator", interface)
+        self.assertNotIn("concise concise", interface)
 
     def test_session_mining_avoids_per_record_jsonl_key_dumps(self) -> None:
         root = Path(__file__).resolve().parents[1]
         skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
-        self.assertIn("do not run a per-line key dump", skill)
-        self.assertIn("jq -R 'fromjson | keys'", skill)
+        self.assertIn("Count record shapes or lines before details", skill)
+        self.assertIn("Do not dump full JSONL records or whole per-record inventories", skill)
+        self.assertIn("inspect one record or aggregate unique keys once", workflow)
+        self.assertIn("jq -R 'fromjson | keys'", workflow)
         self.assertIn("aggregate unique keys once", workflow)
 
     def test_session_mining_schema_recipe_bounds_and_validates_physical_records(self) -> None:
@@ -623,9 +702,8 @@ class SkillStructureTests(unittest.TestCase):
         keyword_recipe = workflow[
             recipe_start : workflow.index("\nPY\n" + (chr(96) * 3), recipe_start)
         ]
-        self.assertIn("select(tostring | contains", skill)
-        self.assertIn("function_call_output", skill)
-        self.assertIn("filter by record type and field first", skill)
+        self.assertIn("parse only the fields and nearby records needed", skill)
+        self.assertIn("tool outputs only when failures or approval friction matter", skill)
         self.assertIn("Do not use `jq 'select(tostring | contains", workflow)
         self.assertIn("filter on record shape and specific fields", workflow)
         self.assertIn("function_call_output", workflow)
@@ -688,8 +766,7 @@ class SkillStructureTests(unittest.TestCase):
         skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
         self.assertIn("read your rollout", skill)
-        self.assertIn("Do not start with keyword `rg -n` over all of `$CODEX_HOME` / `~/.codex`", skill)
-        self.assertIn("Do not point raw `rg -n` at the whole `$CODEX_HOME` / `~/.codex` tree", skill)
+        self.assertIn("never point raw `rg` at all of `$CODEX_HOME` / `~/.codex`", skill)
         self.assertIn('Recent prior turn or "read your rollout":', workflow)
         self.assertIn("Do not run keyword `rg -n ... ~/.codex`", workflow)
         self.assertIn("installed skills, overlays, caches, and package payloads", workflow)
@@ -699,7 +776,7 @@ class SkillStructureTests(unittest.TestCase):
         skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
 
-        self.assertIn("copied and restamped earlier history", skill)
+        self.assertIn("copied/restamped history", skill)
         self.assertIn("A strict record-timestamp filter is not sufficient", skill)
         self.assertIn("latest genuine resume boundary", skill)
         self.assertIn("Detect resumed or forked replay", workflow)
@@ -713,12 +790,10 @@ class SkillStructureTests(unittest.TestCase):
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
         corpus_helper = root / "skills/codex-session-mining/scripts/build_session_corpus.py"
 
-        self.assertIn("inventory both `~/.codex/sessions/` and `~/.codex/archived_sessions/`", skill)
-        self.assertIn("build one union corpus", skill)
-        self.assertIn("flat or date-nested archive layouts", skill)
-        self.assertIn("inventory every rollout under both existing active and archived roots first", skill)
-        self.assertIn("A rollout in either root may have an old dated path or filename", skill)
-        self.assertIn("group candidates by lifecycle session ID", skill)
+        self.assertIn("active-plus-archived", skill)
+        self.assertIn("Inventory both existing active and archived roots", skill)
+        self.assertIn("an old path can contain a genuine later continuation", skill)
+        self.assertIn("Group candidates by lifecycle identity", skill)
         self.assertIn("Do not deduplicate by basename alone", skill)
         self.assertIn('for root in "$CODEX_ROOT/sessions" "$CODEX_ROOT/archived_sessions"', workflow)
         self.assertIn("current-host corpus inventory", workflow)
@@ -777,20 +852,14 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn('CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"', recipe)
         self.assertIn('python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py"', recipe)
         self.assertIn('--sample-limit 20', recipe)
-        self.assertIn("full-root cost, not a requested-window cost", skill)
-        self.assertIn("previous successful runtime", skill)
-        self.assertIn("classify the result as incomplete", skill)
-        self.assertIn("Before any retry", skill)
-        self.assertIn("without starting another full-root scan", skill)
-        self.assertLess(
-            skill.index("Before any retry"),
-            skill.index("After quiescence is proved, retry"),
-        )
-        self.assertIn("different fresh nonexistent output directory", skill)
-        self.assertIn("original producer and its descendants are quiescent", skill)
-        self.assertIn("binds the verified parent and target directory identities", skill)
-        self.assertIn("target is missing at revalidation", skill)
-        self.assertIn("leave any present path untouched", skill)
+        self.assertIn("full-root scan, not as a requested-window scan", skill)
+        self.assertIn("previous runtime and current corpus scale", skill)
+        self.assertIn("incomplete/failed snapshot", skill)
+        self.assertIn("Before retrying", skill)
+        self.assertIn("original producer and descendants are quiescent", skill)
+        self.assertIn("different fresh output directory", skill)
+        self.assertIn("identity-bound cleanup contract", skill)
+        self.assertIn("leave a failed-run path untouched", skill)
         self.assertIn("quiet stdout is expected", workflow)
         self.assertIn("supplies no reusable checkpoint", workflow)
         self.assertIn("Before any retry", workflow)

@@ -1,5 +1,11 @@
 # Rules Audit Cadence
 
+## Mode Contract
+
+- `audit` is read-only. It may resolve existing anchors, diff, classify, and propose an exact apply plan, but it never creates a backup, rewrites rules, refreshes a baseline, or updates a journal.
+- `apply` is writable only when cleanup is requested or an audit has proved an exact change that the active task authorizes. It revalidates the audited inputs before writing.
+- If apply has no approved content change, report a no-op and create nothing.
+
 ## Default Rhythm
 
 - Prefer a light audit after one burst of work when `~/.codex/rules/default.rules` clearly gained shell-shaped literals.
@@ -12,39 +18,57 @@
 ## Light Audit Checklist
 
 1. Resolve the comparison baseline: prefer `~/.codex/rules/default.rules.clean-baseline`, otherwise fall back to the latest timestamped backup; if neither anchor exists yet, stop the light audit here and switch to the cold-start bootstrap below.
-2. Back up the current rules file before deleting or rewriting anything.
-3. Inspect only the added lines.
-4. Label each new line:
+2. Inspect only the added lines.
+3. Label each new line:
    - `stable prefix`
    - `wrapper drift`
    - `helper gap`
    - `approval log`
-5. Remove obvious approval-log literals.
-6. If one workflow family drifted because of `env ...` or shell wrappers, note that family for helper or invocation cleanup.
-7. If a `helper gap` appears, decide the owner before ending the audit:
+4. Propose removal of obvious approval-log literals without changing the file.
+5. If one workflow family drifted because of `env ...` or shell wrappers, name that family and its helper or invocation owner.
+6. If a `helper gap` appears, decide the owner before ending the audit:
    - repo-local skill/helper when the drift is tied to one repo's scripts or policy
    - personal skill/helper when the drift is host-level and cross-repo
    - [$codex-skill-authoring](../../codex-skill-authoring/SKILL.md) when the owner or instruction layer is unclear
+7. Emit an exact apply plan or a read-only no-change result. Do not back up, rewrite, refresh the baseline, or journal from audit mode.
 
 ## Full Audit Checklist
 
-1. Back up the current rules file.
-2. Diff against `~/.codex/rules/default.rules.clean-baseline` when it exists; otherwise use the previous timestamped backup as a first-pass fallback. If neither anchor exists yet, switch to the cold-start bootstrap instead of pretending a comparison baseline exists.
-3. Group additions by workflow family rather than by literal string.
-4. Collapse retained rules back to the narrowest stable prefix that still covers the recurring workflow.
-5. Delete obsolete literals that were replaced by helpers or skills.
-6. Refresh `~/.codex/rules/default.rules.clean-baseline` from the rewritten `default.rules` only after the cleanup result is good enough to serve as the next clean anchor.
-7. Record any durable observation in project journals or a focused note, including when the clean-baseline file was last refreshed.
+1. Diff against `~/.codex/rules/default.rules.clean-baseline` when it exists; otherwise use the previous timestamped backup as a first-pass fallback. If neither anchor exists yet, switch to the cold-start bootstrap instead of pretending a comparison baseline exists.
+2. Group additions by workflow family rather than by literal string.
+3. Propose the narrowest stable prefix that still covers each recurring workflow.
+4. Identify obsolete literals already replaced by helpers or skills.
+5. State whether the proposed full cleanup would be eligible to refresh `default.rules.clean-baseline`.
+6. List any durable observation that would require a journal or focused-note update if adopted.
+7. Remain read-only until apply mode is authorized.
+
+## Apply Checklist
+
+1. Re-read `default.rules` and the selected comparison anchor; stop if either differs from the audited inputs. Identify the existing policy validator, and stop before backup or rewrite if no trustworthy validation gate can be named and run.
+2. If no content change remains, report a no-op and create nothing.
+3. Create one timestamped safety backup before rewriting.
+4. Rewrite only the reviewed entries and run the identified validator against the resulting policy.
+5. Refresh `default.rules.clean-baseline` only after a successful full cleanup with no intentionally retained drift debt.
+6. Write the necessary adopted-journal or focused-note update only for a durable decision actually applied or a successful full-cleanup baseline refresh. Use an existing owning-repo journal when already adopted; otherwise use a nearby focused note rather than bootstrapping a tracker.
+7. Never treat the new safety backup as the comparison anchor for the same apply.
 
 ## Cold-Start Bootstrap
 
 Use this branch only when a machine has neither `~/.codex/rules/default.rules.clean-baseline` nor any older `default.rules.bak-*` snapshot.
 
-1. Create one timestamped backup of the current rules file for safety.
-2. Do not diff against that freshly created backup.
-3. Treat the current `default.rules` as the bootstrap inventory and classify the file directly.
-4. Run a full cleanup pass from that inventory.
-5. Only after that full cleanup succeeds, refresh `~/.codex/rules/default.rules.clean-baseline`.
+In audit mode:
+
+1. Treat the current `default.rules` as the bootstrap inventory and classify it directly.
+2. Produce an exact full-cleanup plan.
+3. Do not create the safety backup or clean baseline.
+
+In apply mode:
+
+1. Revalidate the audited bootstrap inventory.
+2. Create one timestamped safety backup.
+3. Do not diff against that freshly created backup.
+4. Apply and validate the reviewed full cleanup.
+5. Only after that full cleanup succeeds, create `~/.codex/rules/default.rules.clean-baseline`.
 
 ## Classification Heuristics
 

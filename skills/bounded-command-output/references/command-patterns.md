@@ -1,6 +1,7 @@
 # Bounded Command Patterns
 
-Use these patterns after the main skill decides that a command needs an output budget. Adapt paths, predicates, and limits to the task instead of copying placeholders literally.
+Use these patterns only after the main skill's trigger gate identifies a genuinely broad, noisy, or long-running command. Adapt paths, predicates, and limits to the task instead of copying placeholders literally.
+Keep producer scope, runtime, retained bytes, and visible output as separate budgets throughout every recipe.
 
 ## Searches And Inventories
 

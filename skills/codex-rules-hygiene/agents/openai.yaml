@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Rules Hygiene"
+  short_description: "Audit or apply cleanup to Codex rules."
+  default_prompt: "Use $codex-rules-hygiene to audit or apply an authorized cleanup to my Codex rules."
