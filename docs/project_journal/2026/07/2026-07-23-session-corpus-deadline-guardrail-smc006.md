@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-23
 updated: 2026-07-23
 branch: codex/daily-skill-friction-20260723-codex-workflow-hygiene-session-corpus-deadline-guardrail
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/62
 supersedes: []
 superseded_by:
 ---
