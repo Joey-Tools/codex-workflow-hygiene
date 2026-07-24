@@ -306,6 +306,52 @@ class RulesApplyTransactionTests(unittest.TestCase):
             *namespace.validator_command,
         ]
 
+    def configure_isolated_case(self, root: Path) -> None:
+        self.root = root
+        self.codex_home = root / "codex-home"
+        self.rules_dir = self.codex_home / "rules"
+        self.rules_dir.mkdir(parents=True)
+        self.rules = self.rules_dir / "default.rules"
+        self.rules.write_bytes(OLD_RULES)
+        self.rules.chmod(0o640)
+        self.candidate = root / "candidate.rules"
+        self.candidate.write_bytes(NEW_RULES)
+        self.receipt = root / "task" / "recovery.json"
+        self.receipt.parent.mkdir(mode=0o700)
+        self.backup_name = "default.rules.bak-20260724-120000"
+        self.backup = self.rules_dir / self.backup_name
+        self.validator = root / "validator.py"
+
+    def inject_final_apply_evidence_drift(
+        self,
+        drift: str,
+    ) -> tuple[str, str]:
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        result = TRANSACTION.recovery_terminal_result_path(terminal)
+        if drift == "identity":
+            bound = self.receipt.with_name("recovery.bound.json")
+            os.rename(self.receipt, bound)
+            replacement = self.receipt.with_name("recovery.replacement.json")
+            replacement.write_bytes(bound.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, self.receipt)
+            return "receipt_changed", "object_identity"
+        if drift == "content":
+            result.write_bytes(result.read_bytes() + b" ")
+            return "recovery_terminal_result_changed", "content"
+        if drift == "access":
+            terminal.chmod(0o640)
+            return "recovery_terminal_changed", "access_policy"
+        if drift == "link":
+            os.link(self.receipt, self.receipt.with_name("recovery.link.json"))
+            return "receipt_changed", "object_policy"
+        if drift == "parent":
+            moved_parent = self.root / "task.bound"
+            os.rename(self.receipt.parent, moved_parent)
+            self.receipt.parent.mkdir(mode=0o700)
+            return "receipt_parent_changed", "object_identity"
+        raise AssertionError(f"unknown final evidence drift: {drift}")
+
     def recover_argv(self) -> list[str]:
         return [
             "recover",
@@ -1740,16 +1786,17 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 "atomic_rename_exchange",
                 side_effect=hardlink_receipt_then_exchange,
             ),
+            redirect_stdout(stdout := io.StringIO()),
             redirect_stderr(io.StringIO()),
         ):
-            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
+            exit_code = TRANSACTION.main(self.apply_argv())
 
+        payload = json.loads(stdout.getvalue())
         self.assertEqual(exit_code, 30)
         self.assertEqual(payload["status"], "recovery_required")
-        self.assertEqual(
-            payload["post_replace_failure"]["status"],
-            "receipt_changed",
-        )
+        self.assertEqual(payload["operation_status"], "replacement_started")
+        self.assertEqual(payload["reason"], "receipt_changed")
+        self.assertIn("object_policy", payload["mismatched_properties"])
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
 
     def test_evidence_is_revalidated_immediately_before_exchange(self) -> None:
@@ -3913,6 +3960,182 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.backup.read_bytes(), NEW_RULES)
         self.assertTrue(self.receipt.is_file())
         self.assert_no_private_stage()
+
+    def test_rollback_finalizer_propagates_persistent_evidence_drift(
+        self,
+    ) -> None:
+        for drift in ("identity", "content", "access", "link", "parent"):
+            with (
+                self.subTest(drift=drift),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-rollback-finalizer-{drift}."
+                ) as temp_dir,
+            ):
+                self.configure_isolated_case(Path(temp_dir))
+                self.write_validator(
+                    """\
+                    from pathlib import Path
+                    import sys
+
+                    if Path(sys.argv[1]).name == "default.rules":
+                        raise SystemExit(9)
+                    """
+                )
+                real_record_terminal = TRANSACTION.record_recovery_terminal
+                drift_status: str | None = None
+                drift_property: str | None = None
+
+                def record_then_drift(
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    nonlocal drift_status, drift_property
+                    result = real_record_terminal(*args, **kwargs)
+                    drift_status, drift_property = (
+                        self.inject_final_apply_evidence_drift(drift)
+                    )
+                    return result
+
+                stdout = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "record_recovery_terminal",
+                        side_effect=record_then_drift,
+                    ),
+                    redirect_stdout(stdout),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    code = TRANSACTION.main(self.apply_argv())
+
+                assert drift_status is not None
+                assert drift_property is not None
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(code, 30)
+                self.assertEqual(payload["status"], "recovery_required")
+                self.assertEqual(
+                    payload["operation_status"],
+                    "post_replace_failed_rolled_back",
+                )
+                self.assertEqual(payload["reason"], drift_status)
+                self.assertIn(
+                    drift_property,
+                    payload["mismatched_properties"],
+                )
+                self.assertEqual(
+                    Path(payload["recovery_locators"]["receipt"]).resolve(),
+                    self.receipt.resolve(),
+                )
+                self.assertEqual(
+                    Path(payload["recovery_locators"]["backup"]).resolve(),
+                    self.backup.resolve(),
+                )
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_signal_rollback_keeps_signal_primary_on_final_evidence_drift(
+        self,
+    ) -> None:
+        for drift in ("identity", "content", "access", "link", "parent"):
+            with (
+                self.subTest(drift=drift),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-signal-finalizer-{drift}."
+                ) as temp_dir,
+            ):
+                self.configure_isolated_case(Path(temp_dir))
+                self.write_validator("raise SystemExit(0)\n")
+                forwarded = TRANSACTION.ForwardedValidatorSignal(signal.SIGTERM)
+                real_record_terminal = TRANSACTION.record_recovery_terminal
+                drift_status: str | None = None
+                drift_property: str | None = None
+
+                def record_then_drift(
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    nonlocal drift_status, drift_property
+                    result = real_record_terminal(*args, **kwargs)
+                    drift_status, drift_property = (
+                        self.inject_final_apply_evidence_drift(drift)
+                    )
+                    return result
+
+                stdout = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "run_validator",
+                        side_effect=[
+                            TRANSACTION.ValidatorResult(0, "", ""),
+                            forwarded,
+                        ],
+                    ) as run_validator,
+                    mock.patch.object(
+                        TRANSACTION,
+                        "record_recovery_terminal",
+                        side_effect=record_then_drift,
+                    ),
+                    redirect_stdout(stdout),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    code = TRANSACTION.main(self.apply_argv())
+
+                assert drift_status is not None
+                assert drift_property is not None
+                self.assertEqual(run_validator.call_count, 2)
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(code, 128 + signal.SIGTERM)
+                self.assertEqual(payload["status"], "interrupted")
+                self.assertEqual(payload["signal"], signal.SIGTERM)
+                recovery = payload["post_replace_recovery"]
+                self.assertEqual(recovery["status"], "recovery_required")
+                self.assertEqual(
+                    recovery["operation_status"],
+                    "post_replace_failed_rolled_back",
+                )
+                self.assertEqual(
+                    recovery["final_evidence_failure"]["status"],
+                    drift_status,
+                )
+                self.assertIn(
+                    drift_property,
+                    recovery["final_evidence_failure"]["mismatched_properties"],
+                )
+                finalization = payload["lock_finalization_failures"]
+                self.assertEqual(len(finalization), 1)
+                self.assertEqual(
+                    finalization[0]["descriptor"],
+                    "before-release",
+                )
+                self.assertEqual(
+                    finalization[0]["status"],
+                    "recovery_required",
+                )
+                self.assertEqual(
+                    finalization[0]["details"]["reason"],
+                    drift_status,
+                )
+                self.assertIn(
+                    drift_property,
+                    finalization[0]["details"]["mismatched_properties"],
+                )
+                self.assertEqual(
+                    Path(
+                        finalization[0]["details"]["recovery_locators"]["receipt"]
+                    ).resolve(),
+                    self.receipt.resolve(),
+                )
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertEqual(self.backup.read_bytes(), NEW_RULES)
 
     def test_post_replace_validator_raw_failure_preserves_cleanup_evidence(
         self,

@@ -436,6 +436,11 @@ def structured_operation_failure(
     if isinstance(error, OSError) and error.errno is not None:
         failure["errno"] = error.errno
         failure["errno_name"] = errno.errorcode.get(error.errno, "UNKNOWN")
+    if isinstance(error, TransactionError):
+        failure["status"] = error.status
+        failure["exit_code"] = error.exit_code
+        if error.details:
+            failure["details"] = dict(error.details)
     if release_uncertain:
         failure["release_uncertain"] = True
     return failure
@@ -7394,6 +7399,24 @@ def _apply_transaction_inner(
         )
         raise post_replace_signal.with_traceback(post_replace_signal_traceback)
 
+    def bind_post_replace_final_evidence_failure(
+        error: TransactionError,
+    ) -> None:
+        if post_replace_signal is None:
+            return
+        recovery = post_replace_signal.recovery_details.get("post_replace_recovery")
+        if not isinstance(recovery, dict):
+            return
+        operation_status = recovery.get("status")
+        recovery["status"] = "recovery_required"
+        if isinstance(operation_status, str):
+            recovery["operation_status"] = operation_status
+        recovery["final_evidence_failure"] = {
+            "status": error.status,
+            "message": str(error),
+            **error.details,
+        }
+
     def finalize_apply_state() -> None:
         nonlocal finalized, retain_stage
         if finalized:
@@ -7462,14 +7485,30 @@ def _apply_transaction_inner(
                     "cleanup_refusals": cleanup_refusals,
                 },
             )
-        if evidence_error is not None and pending_success_status is not None:
+        if evidence_error is not None and (
+            pending_success_status is not None
+            or replacement_started
+            or post_replace_signal is not None
+        ):
+            operation_status = pending_success_status
+            if operation_status is None:
+                operation_status = (
+                    "post_replace_failed_rolled_back"
+                    if evidence is not None and evidence.restored
+                    else "replacement_started"
+                )
+            bind_post_replace_final_evidence_failure(evidence_error)
             raise TransactionError(
                 "recovery_required",
                 "bound transaction evidence changed before lock release",
                 exit_code=EXIT_POST_REPLACE_FAILED,
                 details={
+                    "operation_status": operation_status,
                     "reason": evidence_error.status,
                     "message": str(evidence_error),
+                    "receipt_path": str(receipt),
+                    "backup_path": str(backup),
+                    "recovery_locators": apply_recovery_locators(),
                     **evidence_error.details,
                 },
             ) from evidence_error

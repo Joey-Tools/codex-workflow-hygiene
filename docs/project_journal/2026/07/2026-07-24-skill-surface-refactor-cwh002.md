@@ -83,6 +83,10 @@ superseded_by:
 - Routed a managed signal from the post-replacement validator through the
   normal rollback/recovery state machine while retaining the signal-derived
   exit code and `interrupted` as the primary outcome.
+- Propagated persistent evidence drift discovered during lock finalization
+  after any replacement, including a verified ordinary or managed-signal
+  rollback, instead of reporting a certain rollback after receipt, terminal,
+  result, link, access, or parent evidence became uncertain.
 - Promoted deferred schema-v4 possible-prior-state evidence whenever a
   reserved terminal does not accompany exact `Q`, including state-none loss
   of a `P` candidate or `R` backup.
@@ -216,6 +220,12 @@ superseded_by:
   operator recovery before it is re-raised. Its JSON result keeps the signal
   primary and includes exact receipt, backup, terminal, prepared, and staged
   recovery locators plus the nested rollback/recovery outcome.
+- Final lock-held evidence drift after replacement is always
+  `recovery_required`. Ordinary rollback reports its prior
+  `post_replace_failed_rolled_back` state as `operation_status`; a managed
+  signal remains the primary `interrupted` result while its nested recovery
+  and structured `lock_finalization_failures` record the same property
+  mismatch and exact recovery locators.
 - An apparent apply or no-change result cannot remain successful after final
   evidence or rules-parent close uncertainty. It reports
   `final_evidence_descriptor_close_failed`, retains the original
@@ -288,8 +298,15 @@ superseded_by:
   the schema-v4 cases prove `recovery_required` with mutation journal and
   locators. Existing later-live-state and untrusted-inode cases now assert the
   same conservative possible-prior-state contract.
-- Full repository suite covered all 1,255 tests. The sandboxed run passed
-  1,251 and failed only four unrelated temporary merge-commit fixtures because
+- Rules transaction tests: 195 passed on Python 3.13. The two newest methods
+  exercise ten post-terminal drift subcases: identity, content, access policy,
+  link policy, and parent identity after both ordinary rollback and
+  managed-signal rollback. Six targeted scenarios passed on Python 3.9.6
+  across the compatibility reruns, including both new methods, hardlink
+  finalization, ordinary and managed-signal rollback, and secondary evidence
+  attachment without `add_note`.
+- Full repository suite covered all 1,257 tests. The sandboxed run passed
+  1,253 and failed only four unrelated temporary merge-commit fixtures because
   sandbox GPG could not reach `~/.gnupg/keyboxd`; those exact four tests passed
   in the approved narrow GPG-capable rerun.
 - Ruff check and Ruff format-check passed for both changed Python files.
