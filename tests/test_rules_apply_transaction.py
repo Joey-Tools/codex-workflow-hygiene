@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +16,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -166,6 +169,104 @@ class RulesApplyTransactionTests(unittest.TestCase):
             subprocess.run({command!r} + [str(path)], check=True)
             """
 
+    def add_test_xattr(self, path: Path) -> None:
+        if hasattr(os, "setxattr"):
+            try:
+                os.setxattr(path, b"user.codex_review", b"value")
+            except OSError as error:
+                self.skipTest(f"user xattrs unsupported by test filesystem: {error}")
+            return
+        xattr = shutil.which("xattr")
+        if xattr is None:
+            self.skipTest("xattr injection unavailable")
+        result = subprocess.run(
+            [xattr, "-w", "user.codex-review", "value", str(path)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            self.skipTest(
+                "xattr injection unsupported by test filesystem: "
+                + result.stderr.decode("utf-8", "replace")
+            )
+
+    def add_test_acl(self, path: Path) -> None:
+        username = pwd.getpwuid(os.geteuid()).pw_name
+        if sys.platform == "darwin":
+            command = ["/bin/chmod", "+a", f"user:{username} allow read"]
+        else:
+            setfacl = shutil.which("setfacl")
+            if setfacl is None:
+                self.skipTest("ACL injection tool unavailable")
+            command = [setfacl, "-m", f"u:{username}:r--"]
+        result = subprocess.run(
+            [*command, str(path)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            self.skipTest(
+                "ACL injection unsupported by test filesystem: "
+                + result.stderr.decode("utf-8", "replace")
+            )
+
+    def apply_namespace(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            expected_sha256=hashlib.sha256(OLD_RULES).hexdigest(),
+            candidate=str(self.candidate),
+            receipt=str(self.receipt),
+            backup_name=self.backup_name,
+            validator_timeout_seconds=5.0,
+            lock_timeout_seconds=2.0,
+            validator_command=[
+                sys.executable,
+                str(self.validator),
+                "{rules}",
+            ],
+        )
+
+    def create_apply_evidence(
+        self,
+    ) -> tuple[object, object]:
+        stage = TRANSACTION.PrivateStage(self.rules_dir)
+        receipt_parent = TRANSACTION.bind_directory(
+            self.receipt.parent,
+            label="receipt",
+            require_owner_private=True,
+        )
+        terminal = TRANSACTION.reserve_recovery_terminal(
+            TRANSACTION.recovery_terminal_path(self.receipt),
+            transaction_id="0" * 32,
+            parent=receipt_parent,
+        )
+        backup_stage, backup_expected = stage.create("backup", OLD_RULES)
+        _live_payload, live = TRANSACTION.read_stable(
+            self.rules,
+            label="live_rules",
+        )
+        backup_expected = stage.set_policy(
+            backup_stage,
+            backup_expected,
+            live,
+        )
+        backup = stage.publish_backup(backup_stage, self.backup)
+        receipt = TRANSACTION.write_receipt(
+            self.receipt,
+            {"schema_version": 2, "transaction_id": "0" * 32},
+            receipt_parent,
+        )
+        evidence = TRANSACTION.ApplyEvidenceBindings(
+            stage=stage,
+            receipt_parent=receipt_parent,
+            recovery_terminal=terminal,
+            backup=backup,
+            receipt=receipt,
+        )
+        evidence.validate()
+        return stage, evidence
+
     def run_apply(
         self,
         *,
@@ -290,6 +391,15 @@ class RulesApplyTransactionTests(unittest.TestCase):
         )
         self.assertEqual(receipt["installed"]["object_policy"], {"nlink": 1})
         self.assertEqual(receipt["backup"]["object_policy"], {"nlink": 1})
+        self.assertEqual(
+            receipt["recovery_terminal"]["object_policy"],
+            {"nlink": 1},
+        )
+        terminal = json.loads(
+            Path(receipt["recovery_terminal_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(terminal["state"], "reserved")
+        self.assertEqual(terminal["transaction_id"], receipt["transaction_id"])
 
     def test_candidate_changed_by_validator_is_rejected_before_lock(self) -> None:
         self.write_validator(
@@ -437,6 +547,235 @@ class RulesApplyTransactionTests(unittest.TestCase):
         finally:
             stage.cleanup()
 
+    def test_bound_backup_replacement_is_detected(self) -> None:
+        stage, evidence = self.create_apply_evidence()
+        moved_backup = self.rules_dir / "backup.bound"
+        os.rename(self.backup, moved_backup)
+        self.backup.write_bytes(LATER_RULES)
+        self.backup.chmod(0o640)
+        try:
+            with self.assertRaises(TRANSACTION.TransactionError) as raised:
+                evidence.validate()
+
+            self.assertEqual(raised.exception.status, "backup_changed")
+            self.assertIn(
+                "object_identity",
+                raised.exception.details["mismatched_properties"],
+            )
+        finally:
+            evidence.close()
+            stage.cleanup()
+
+    def test_bound_receipt_hardlink_is_detected(self) -> None:
+        stage, evidence = self.create_apply_evidence()
+        os.link(self.receipt, self.receipt.with_name("receipt.alias"))
+        try:
+            with self.assertRaises(TRANSACTION.TransactionError) as raised:
+                evidence.validate()
+
+            self.assertEqual(raised.exception.status, "receipt_changed")
+            self.assertEqual(
+                raised.exception.details["mismatched_properties"],
+                ["object_policy"],
+            )
+        finally:
+            evidence.close()
+            stage.cleanup()
+
+    def test_bound_backup_xattr_is_detected(self) -> None:
+        stage, evidence = self.create_apply_evidence()
+        self.add_test_xattr(self.backup)
+        try:
+            with self.assertRaises(TRANSACTION.TransactionError) as raised:
+                evidence.validate()
+
+            self.assertEqual(
+                raised.exception.status,
+                "unsupported_extended_attributes",
+            )
+        finally:
+            evidence.close()
+            stage.cleanup()
+
+    def test_bound_receipt_acl_is_detected(self) -> None:
+        stage, evidence = self.create_apply_evidence()
+        self.add_test_acl(self.receipt)
+        try:
+            with self.assertRaises(TRANSACTION.TransactionError) as raised:
+                evidence.validate()
+
+            self.assertEqual(
+                raised.exception.status,
+                "unsupported_access_control_list",
+            )
+        finally:
+            evidence.close()
+            stage.cleanup()
+
+    def test_bound_receipt_file_flags_are_detected(self) -> None:
+        stage, evidence = self.create_apply_evidence()
+        real_flags = TRANSACTION._bound_file_flags
+
+        def inject_receipt_flags(fd: int, *, label: str) -> int:
+            if label == "receipt":
+                return 0x10
+            return real_flags(fd, label=label)
+
+        try:
+            with (
+                mock.patch.object(
+                    TRANSACTION,
+                    "_bound_file_flags",
+                    side_effect=inject_receipt_flags,
+                ),
+                self.assertRaises(TRANSACTION.TransactionError) as raised,
+            ):
+                evidence.validate()
+
+            self.assertEqual(raised.exception.status, "unsupported_file_flags")
+            self.assertEqual(raised.exception.details["st_flags"], 0x10)
+        finally:
+            evidence.close()
+            stage.cleanup()
+
+    def test_bound_receipt_parent_replacement_is_detected(self) -> None:
+        stage, evidence = self.create_apply_evidence()
+        moved_parent = self.root / "task.bound"
+        os.rename(self.receipt.parent, moved_parent)
+        self.receipt.parent.mkdir(mode=0o700)
+        try:
+            with self.assertRaises(TRANSACTION.TransactionError) as raised:
+                evidence.validate()
+
+            self.assertEqual(
+                raised.exception.status,
+                "receipt_parent_changed",
+            )
+        finally:
+            evidence.close()
+            stage.cleanup()
+
+    def test_bound_receipt_parent_xattr_is_detected(self) -> None:
+        stage, evidence = self.create_apply_evidence()
+        self.add_test_xattr(self.receipt.parent)
+        try:
+            with self.assertRaises(TRANSACTION.TransactionError) as raised:
+                evidence.validate()
+
+            self.assertEqual(
+                raised.exception.status,
+                "unsupported_extended_attributes",
+            )
+        finally:
+            evidence.close()
+            stage.cleanup()
+
+    def test_receipt_read_rejects_hardlink_and_metadata(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+
+        alias = self.receipt.with_name("receipt.alias")
+        os.link(self.receipt, alias)
+        recovered = self.run_recover()
+        self.assertEqual(recovered.returncode, 50, recovered.stderr)
+        self.assertEqual(json.loads(recovered.stdout)["status"], "receipt_invalid")
+
+        alias.unlink()
+        self.add_test_xattr(self.receipt)
+        recovered = self.run_recover()
+        self.assertEqual(recovered.returncode, 50, recovered.stderr)
+        self.assertEqual(
+            json.loads(recovered.stdout)["status"],
+            "unsupported_extended_attributes",
+        )
+
+    def test_receipt_hardlink_inside_exchange_never_reports_success(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_exchange = TRANSACTION.atomic_rename_exchange
+        injected = False
+
+        def hardlink_receipt_then_exchange(
+            source_directory_fd: int,
+            source_name: str,
+            destination_directory_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal injected
+            if not injected:
+                injected = True
+                os.link(self.receipt, self.receipt.with_name("receipt.alias"))
+            real_exchange(
+                source_directory_fd,
+                source_name,
+                destination_directory_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_exchange",
+                side_effect=hardlink_receipt_then_exchange,
+            ),
+            redirect_stderr(io.StringIO()),
+        ):
+            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(exit_code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(
+            payload["post_replace_failure"]["status"],
+            "receipt_changed",
+        )
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+
+    def test_evidence_is_revalidated_immediately_before_exchange(self) -> None:
+        stage, evidence = self.create_apply_evidence()
+        candidate, candidate_expected = stage.create("candidate", NEW_RULES)
+        _live_payload, live = TRANSACTION.read_stable(
+            self.rules,
+            label="live_rules",
+        )
+        candidate_expected = stage.set_policy(
+            candidate,
+            candidate_expected,
+            live,
+        )
+
+        def mutate_then_revalidate() -> None:
+            os.link(self.receipt, self.receipt.with_name("receipt.alias"))
+            evidence.validate()
+
+        try:
+            with (
+                mock.patch.object(
+                    TRANSACTION,
+                    "atomic_rename_exchange",
+                ) as atomic_exchange,
+                self.assertRaises(TRANSACTION.TransactionError) as raised,
+            ):
+                stage.move_to(
+                    candidate,
+                    self.rules,
+                    live,
+                    pre_exchange_revalidate=mutate_then_revalidate,
+                )
+
+            self.assertEqual(raised.exception.status, "receipt_changed")
+            atomic_exchange.assert_not_called()
+            self.assertEqual(
+                candidate_expected.sha256, hashlib.sha256(NEW_RULES).hexdigest()
+            )
+            self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        finally:
+            evidence.close()
+            stage.cleanup()
+
     def test_validator_output_ceiling_terminates_the_process_group(self) -> None:
         self.write_validator(
             f"""\
@@ -542,6 +881,63 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertTrue(pid_path.is_file())
         self.assertEqual(stopped_path.read_text(encoding="ascii"), "stopped")
 
+    def test_validator_detects_descendant_with_all_stdio_closed(self) -> None:
+        ready_path = self.root / "validator-devnull-descendant.ready"
+        stopped_path = self.root / "validator-devnull-descendant.stopped"
+        child_script = self.root / "validator-devnull-descendant.py"
+        child_script.write_text(
+            textwrap.dedent(
+                f"""\
+                from pathlib import Path
+                import signal
+                import time
+
+                def stop(_signum, _frame):
+                    Path({str(stopped_path)!r}).write_text(
+                        "stopped",
+                        encoding="ascii",
+                    )
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, stop)
+                Path({str(ready_path)!r}).write_text("ready", encoding="ascii")
+                while True:
+                    time.sleep(1)
+                """
+            ),
+            encoding="utf-8",
+        )
+        self.write_validator(
+            f"""\
+            from pathlib import Path
+            import subprocess
+            import sys
+            import time
+
+            subprocess.Popen(
+                [sys.executable, {str(child_script)!r}],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            deadline = time.monotonic() + 1
+            while not Path({str(ready_path)!r}).exists():
+                if time.monotonic() >= deadline:
+                    raise SystemExit(8)
+                time.sleep(0.01)
+            """
+        )
+
+        result = TRANSACTION.run_validator(
+            [sys.executable, str(self.validator), "{rules}"],
+            self.candidate,
+            timeout_seconds=2,
+        )
+
+        self.assertFalse(result.valid)
+        self.assertTrue(result.descendants_terminated)
+        self.assertEqual(stopped_path.read_text(encoding="ascii"), "stopped")
+
     def test_validator_rejects_nonfinite_timeouts(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         for value in (float("nan"), float("inf"), float("-inf")):
@@ -599,6 +995,122 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.rules.read_bytes(), LATER_RULES)
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.receipt.exists())
+
+    def test_no_change_waits_for_shared_writer_and_rechecks_digest(self) -> None:
+        self.candidate.write_bytes(OLD_RULES)
+        self.write_validator("raise SystemExit(0)\n")
+        ready = self.root / "writer.ready"
+        writer = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent(
+                    """\
+                    import fcntl
+                    import os
+                    from pathlib import Path
+                    import sys
+                    import time
+
+                    lock = Path(sys.argv[1])
+                    live = Path(sys.argv[2])
+                    ready = Path(sys.argv[3])
+                    fd = os.open(
+                        lock,
+                        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
+                        0o600,
+                    )
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX)
+                        ready.write_text("ready", encoding="ascii")
+                        time.sleep(0.3)
+                        replacement = live.with_name(".compliant-writer")
+                        replacement.write_bytes(
+                            b'prefix_rule(pattern=["gh", "pr", "view"], decision="allow")\\n'
+                        )
+                        replacement.chmod(0o640)
+                        os.replace(replacement, live)
+                    finally:
+                        os.close(fd)
+                    """
+                ),
+                str(self.rules_dir / ".default.rules.apply.lock"),
+                str(self.rules),
+                str(ready),
+            ],
+            env=self.helper_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 2
+            while not ready.exists():
+                if writer.poll() is not None:
+                    self.fail(writer.stderr.read())
+                if time.monotonic() >= deadline:
+                    self.fail("compliant writer did not acquire the shared lock")
+                time.sleep(0.01)
+
+            result = self.run_apply()
+            writer_stdout, writer_stderr = writer.communicate(timeout=5)
+        finally:
+            if writer.poll() is None:
+                writer.kill()
+                writer.wait(timeout=5)
+
+        self.assertEqual(writer.returncode, 0, writer_stderr)
+        self.assertEqual(writer_stdout, "")
+        self.assertEqual(result.returncode, 20, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "expected_digest_mismatch")
+        self.assertEqual(self.rules.read_bytes(), LATER_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+
+    def test_no_change_succeeds_only_after_locked_metadata_admission(self) -> None:
+        self.candidate.write_bytes(OLD_RULES)
+        self.write_validator("raise SystemExit(0)\n")
+
+        result = self.run_apply()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "no_change_after_lock")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(TRANSACTION.recovery_terminal_path(self.receipt).exists())
+        self.assertTrue((self.rules_dir / ".default.rules.apply.lock").is_file())
+
+    def test_no_change_rejects_live_metadata_anomaly_after_lock(self) -> None:
+        self.candidate.write_bytes(OLD_RULES)
+        self.write_validator("raise SystemExit(0)\n")
+        self.add_test_xattr(self.rules)
+
+        result = self.run_apply()
+
+        self.assertEqual(result.returncode, 50, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "unsupported_extended_attributes")
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+
+    def test_stale_recovery_terminal_blocks_before_backup(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        terminal.write_text("stale\n", encoding="utf-8")
+        terminal.chmod(0o600)
+
+        result = self.run_apply()
+
+        self.assertEqual(result.returncode, 20, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "recovery_terminal_exists")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(terminal.read_text(encoding="utf-8"), "stale\n")
 
     def test_hardlinked_live_rules_are_rejected_before_backup(self) -> None:
         live_alias = self.rules_dir / "default.rules.alias"
@@ -827,6 +1339,26 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertTrue(terminal.is_file())
         self.assertEqual(stat.S_IMODE(terminal.stat().st_mode), 0o600)
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+
+    def test_recover_refuses_replaced_terminal_reservation(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        terminal = Path(receipt["recovery_terminal_path"])
+        reservation = terminal.read_bytes()
+        terminal.rename(terminal.with_name("recovery.bound"))
+        terminal.write_bytes(reservation)
+        terminal.chmod(0o600)
+
+        recovered = self.run_recover()
+
+        self.assertEqual(recovered.returncode, 40, recovered.stderr)
+        payload = json.loads(recovered.stdout)
+        self.assertEqual(payload["status"], "recovery_refused")
+        self.assertEqual(payload["reason"], "recovery_terminal_binding_changed")
+        self.assertEqual(payload["mismatched_properties"], ["object_identity"])
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
 
     def test_recover_accepts_legacy_v1_receipt_without_link_policy(self) -> None:
         self.write_validator("raise SystemExit(0)\n")

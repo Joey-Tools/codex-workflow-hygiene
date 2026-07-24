@@ -24,6 +24,13 @@ superseded_by:
   and pre/post-mutation validation.
 - Added descriptor-backed file-flag, xattr, and ACL admission plus a bounded
   validator process-group supervisor.
+- Kept backup, receipt, recovery-terminal, and parent-directory descriptors
+  bound through exchange and installed verification, with repeated protected
+  property, metadata, and directory-entry admission.
+- Reserved and identity-bound the recovery-terminal leaf before backup
+  publication, and made stale terminal evidence a pre-mutation conflict.
+- Removed the unlocked no-change fast path; apparent no-change now validates
+  under the shared writer lock and returns only `no_change_after_lock`.
 - Bound idempotent recovery to exact original or persisted recovery-terminal
   identity, and revalidated recovery copies after locator binding.
 - Reduced the Joey authoring overlay to placement and validation policy while
@@ -44,9 +51,14 @@ superseded_by:
   overwrite a later legitimate live state and reports retained recovery
   evidence instead; schema-v2 receipts add link policy while schema-v1
   recovery remains supported.
-- Validator execution now rejects nonfinite deadlines, caps aggregate captured
-  output, and terminates/drains its process group on timeout, overflow, or
-  surviving descendants.
+- Schema-v2 receipts now also bind the reserved recovery-terminal identity.
+  Backup, receipt, terminal, rules parent, and receipt parent remain open and
+  are revalidated immediately before exchange and throughout installed
+  verification.
+- Validator execution rejects nonfinite deadlines, caps aggregate captured
+  output, and independently enumerates live same-PGID members on Darwin and
+  Linux before accepting completion, including descendants whose standard
+  streams all point to `/dev/null`.
 - A recovery copy is verified only after rereading the held origin and copy
   descriptors and rechecking content, access/link policy, metadata admission,
   and directory-entry binding. Recovery refuses same-content replacement
@@ -58,27 +70,24 @@ superseded_by:
 
 ## Next Steps
 
-- Run a fresh whole-range review of the signed checkpoint and address only
-  findings bound to the current head.
-- Update PR #63 after final validation and review evidence are clean.
+- Run the parent-owned fresh whole-range review against the next signed
+  checkpoint.
+- Update PR #63 only after that review evidence is clean.
 
 ## Evidence
 
-- Rules transaction tests: 39 passed on Python 3.13 and system Python 3.9.6,
-  including source/destination unlink, parent replacement, validator/set-policy
-  hardlink, immediate pre-mutation revalidation, post-mutation link drift,
-  `EEXIST` plus source unlink, read-only-live, schema-v1 recovery, xattr/ACL
-  injection, recovery-copy content/link/access races, terminal-identity
-  idempotence, and validator overflow/timeout/descendant cases.
-- The focused rules plus structure run passed 40 tests on both Python versions.
-- Full repository suite covered 1,101 tests. After the one changed structure
-  assertion was corrected and rerun, only the same 4 sandbox-only GPG
+- Rules transaction tests: 55 passed on Python 3.13. New cases cover closed
+  validator stdio, compliant concurrent writers, locked no-change metadata
+  admission, stale/replaced terminal reservations, and backup/receipt/parent
+  replacement, hardlink, file-flag, xattr, and ACL races.
+- The focused rules, structure, and validator-wrapper run passed 97 tests.
+- Full repository suite covered 1,117 tests. Only the same 4 sandbox-only GPG
   merge-fixture errors remained; their exact keybox-enabled rerun passed 4 of
-  4.
-- Ruff check passed for all changed Python files. The helper and transaction
-  tests pass Ruff format; the repository's pre-existing structure-test format
-  drift remains and was not mechanically expanded.
+  4 outside the sandbox.
+- Ruff check and Ruff format-check passed for both changed Python files.
 - `codex-rules-hygiene` passed the official skill validator through an
-  isolated `uv` PyYAML environment after the direct local Python lacked
-  `PyYAML`.
-- `git diff --check` passed, and generated Python caches were removed.
+  isolated `uv` PyYAML environment after the direct installed wrapper reported
+  that local Python lacked `PyYAML`.
+- `git diff --check` passed after the last source update; five generated
+  `__pycache__` directories were removed and the bounded cache rescan was
+  empty.
