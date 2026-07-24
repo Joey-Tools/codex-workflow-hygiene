@@ -25,7 +25,7 @@ python3 <loaded-skill-dir>/scripts/locate_session.py \
 
 The helper emits one bounded schema-v2 JSON document. It scans optional
 `session_index.jsonl` and `history.jsonl` records with a physical-record byte
-cap. Exact-ID mode also inventories filenames under both rollout roots. Each
+cap. UUID-shaped exact-ID mode also inventories both rollout roots; opaque IDs remain index-only. Each
 source reports `checked`, `unavailable`, or `partial`, total and retained
 matches/errors, and deterministic truncation fields. `--limit` is enforced
 during collection; it is not a final slice of an unbounded list. Index matches
@@ -54,8 +54,8 @@ escape, or failed revalidation is `partial`.
   `checked` as `stable-captured-prefix-with-later-append`; the appended records
   were not searched. Truncation, prefix mutation, rotation, replacement, or
   unreadable validation is `partial`.
-- Normalize timezone-aware ISO timestamps to UTC for newest-match ordering.
-  Invalid or year-crossing values are missing, never process-level failures.
+- Normalize timezone-aware ISO and numeric Unix timestamps to UTC for ordering.
+  Invalid or out-of-range values are missing, never process-level failures.
 - Open every component from the filesystem root through `codex_home` and each
   rollout root with descriptor-relative no-follow directory opens. Enumerate
   from held directory descriptors and never traverse symlinks.

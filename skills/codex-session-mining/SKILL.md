@@ -15,8 +15,8 @@ orientation.
 
 1. Query `session_index.jsonl` and `history.jsonl` through
    `scripts/locate_session.py`.
-2. For an exact session ID, also inspect rollout filenames under both existing
-   `sessions/` and `archived_sessions/` roots.
+2. For an exact UUID-shaped session ID, also inspect rollout filenames under
+   both roots; keep opaque exact IDs index-only.
 3. Require every `checked` source to retain its descriptor-bound identity,
    access policy, stable index prefix, or rollout entry inventory through final
    revalidation.

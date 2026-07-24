@@ -299,6 +299,59 @@ class SessionLocatorTests(unittest.TestCase):
         self.assertEqual([match["line"] for match in source["matches"]], [5, 4, 2])
         self.assertTrue(source["matches_truncated"])
 
+    def test_numeric_timestamps_respect_representable_utc_range(self) -> None:
+        self.assertEqual(
+            LOCATE._normalize_index_timestamp(-62_135_596_800),
+            -62_135_596_800_000_000,
+        )
+        self.assertEqual(
+            LOCATE._normalize_index_timestamp(253_402_300_799),
+            253_402_300_799_000_000,
+        )
+        for value in (
+            -62_135_596_801,
+            253_402_300_800,
+            -62_135_596_801.0,
+            253_402_300_800.0,
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(LOCATE._normalize_index_timestamp(value))
+
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            rows = [
+                {
+                    "id": "out-of-range-future",
+                    "thread_name": "review helper",
+                    "ts": 10**31,
+                },
+                {
+                    "id": "real-newest",
+                    "thread_name": "review helper",
+                    "ts": 2_000_000_000,
+                },
+                {
+                    "id": "out-of-range-past",
+                    "thread_name": "review helper",
+                    "ts": -(10**31),
+                },
+            ]
+            (codex_home / "session_index.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            source = self.scan_index(codex_home, limit=1)
+
+        self.assertEqual(source["status"], "checked")
+        self.assertEqual(source["malformed_records"], 0)
+        self.assertEqual(source["match_count"], 3)
+        self.assertEqual(
+            [match["id"] for match in source["matches"]],
+            ["real-newest"],
+        )
+
     def test_index_byte_cap_is_schema_v2_partial_without_reading_sparse_body(
         self,
     ) -> None:
@@ -468,6 +521,33 @@ class SessionLocatorTests(unittest.TestCase):
                 "opaque-id",
             )
         )
+
+    def test_opaque_session_id_skips_rollout_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            (codex_home / "session_index.jsonl").write_text(
+                json.dumps({"id": "opaque-id", "thread_name": "Opaque thread"}) + "\n",
+                encoding="utf-8",
+            )
+            (codex_home / "history.jsonl").write_text("", encoding="utf-8")
+            (codex_home / "sessions").write_text("not a directory", encoding="utf-8")
+            (codex_home / "archived_sessions").write_text(
+                "not a directory",
+                encoding="utf-8",
+            )
+
+            completed, payload = self.run_locator(
+                codex_home,
+                "--session-id",
+                "opaque-id",
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(payload["status"], "checked")
+        self.assertEqual(payload["total_matches"], 1)
+        self.assertEqual(len(payload["sources"]), 2)
+        self.assertTrue(all(source["kind"] == "index" for source in payload["sources"]))
 
     def test_malformed_and_oversized_index_records_make_coverage_partial(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

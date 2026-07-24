@@ -49,10 +49,13 @@ superseded_by:
   stop cannot claim stable-prefix coverage.
 - Index JSON parsing rejects integers beyond 32 digits and non-standard
   constants as malformed records while continuing at the next physical record.
-  UTC normalization overflow at the supported year boundaries is treated as a
-  missing timestamp rather than escaping the schema-v2 response.
+  Numeric and ISO timestamps outside the representable UTC year range are
+  treated as missing timestamps, so sentinel-scale numeric values cannot evict
+  genuine newest index matches.
 - Rollout filename lookup accepts only the exact terminal lifecycle UUID, not
   UUID substrings, adjacent characters, or a non-terminal occurrence.
+- Opaque exact session IDs remain eligible for both indexes but skip rollout
+  traversal because the bounded filename grammar can only represent UUIDs.
 - Rollout traversal stops with `partial` coverage at depth 32 or before its
   aggregate ancestor state exceeds 250,000 component references or 16 MiB of
   component bytes. These limits bound both retained path state and repeated
@@ -72,13 +75,15 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -m unittest tests.test_skill_structure`: 29 tests passed,
+- `python3 -m unittest tests.test_skill_structure`: 31 tests passed,
   including append, prefix mutation, truncation, rotation, broken symlink,
   unreadable source/revalidation, directory replacement/escape, inventory
   drift, access-policy drift, newest-match retention, exact terminal UUID
-  matching, depth/component budgets, index byte/record caps, oversized JSON
-  integers, UTC year-boundary overflow, and 25-error retention-cap cases.
-- Full `python3 -m unittest discover -s tests -q`: 1,060 tests ran; only four
+  matching, opaque-ID rollout skipping, depth/component budgets, index
+  byte/record caps, oversized JSON integers, UTC numeric/ISO boundary handling,
+  and 25-error retention-cap cases.
+- Full buffered `python3 -m unittest discover -s tests -q -b`: 1,062 tests ran;
+  only four
   unrelated sandboxed temporary-Git merge-signing fixtures failed because
   keyboxd was inaccessible.
 - The exact four signing fixtures were rerun outside the sandbox and all passed.

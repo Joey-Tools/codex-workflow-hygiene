@@ -42,6 +42,25 @@ ROLLOUT_FILENAME_PATTERN = re.compile(
 UTC_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
+def _datetime_to_epoch_microseconds(value: datetime) -> int:
+    delta = value - UTC_EPOCH
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+UTC_MIN_MICROSECONDS = _datetime_to_epoch_microseconds(
+    datetime.min.replace(tzinfo=timezone.utc)
+)
+UTC_MAX_MICROSECONDS = _datetime_to_epoch_microseconds(
+    datetime.max.replace(tzinfo=timezone.utc)
+)
+
+
+def _valid_utc_microseconds(value: int) -> int | None:
+    if not UTC_MIN_MICROSECONDS <= value <= UTC_MAX_MICROSECONDS:
+        return None
+    return value
+
+
 class CoveragePartial(RuntimeError):
     """A source could not prove the protected lookup coverage."""
 
@@ -128,12 +147,12 @@ def _normalize_index_timestamp(value: object) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value * 1_000_000
+        return _valid_utc_microseconds(value * 1_000_000)
     if isinstance(value, float):
         scaled = value * 1_000_000
         if not math.isfinite(scaled):
             return None
-        return int(scaled)
+        return _valid_utc_microseconds(int(scaled))
     if not isinstance(value, str):
         return None
 
@@ -149,10 +168,10 @@ def _normalize_index_timestamp(value: object) -> int | None:
     if parsed.tzinfo is None:
         return None
     try:
-        delta = parsed.astimezone(timezone.utc) - UTC_EPOCH
+        normalized = parsed.astimezone(timezone.utc)
     except (OverflowError, ValueError):
         return None
-    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+    return _valid_utc_microseconds(_datetime_to_epoch_microseconds(normalized))
 
 
 def _index_match_sort_key(
@@ -1191,7 +1210,10 @@ def main() -> int:
             limit=args.limit,
         ),
     ]
-    if args.session_id is not None:
+    if (
+        args.session_id is not None
+        and UUID_PATTERN.fullmatch(args.session_id) is not None
+    ):
         sources.extend(
             _scan_rollout_root(
                 codex_home,
