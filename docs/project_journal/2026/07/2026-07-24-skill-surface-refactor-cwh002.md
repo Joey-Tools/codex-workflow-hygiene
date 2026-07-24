@@ -51,6 +51,13 @@ superseded_by:
   deterministic structured failures, preserving the existing terminal result.
 - Separated lock-close uncertainty from body, before-release, and final
   revalidation errors so the earlier safety failure remains authoritative.
+- Made missing schema-v1 historical link counts enforce current single-link
+  policy instead of disabling it for live, backup, recovery, and terminal
+  objects.
+- Added a zero-write namespace preflight that rejects receipt-derived paths
+  overlapping the fixed stage by leaf, ancestry, or canonical alias.
+- Extended structured best-effort descriptor cleanup and primary-outcome
+  precedence to every remaining bind, read, rollback, and stage helper.
 - Removed the unlocked no-change fast path; apparent no-change now validates
   under the shared writer lock and returns only `no_change_after_lock`.
 - Bound idempotent recovery to exact original or persisted recovery-terminal
@@ -99,6 +106,16 @@ superseded_by:
 - Result, reservation, receipt, prepared evidence, and every held parent close
   in a deterministic best-effort-all pass. EIO/EINTR on one descriptor cannot
   skip later closes or replace an existing apply/recovery terminal status.
+- Legacy schema-v1 receipts treat absent historical `nlink` as unknown history,
+  while every current regular transaction object still has to prove
+  `st_nlink == 1`; hardlinks before exchange, during exchange, after restore,
+  or before `already_original` fail closed.
+- Apply and recovery reject receipt, terminal/result, prepared, and lock
+  namespaces that are the fixed stage itself, its ancestor/descendant, or a
+  canonical/symlink alias before any new persistent transaction write.
+- Bind/read/rollback helpers now use the same deterministic best-effort close
+  primitive as terminal evidence; structured close faults attach to the
+  established property, tamper, or rollback result.
 - Recovery reads the immutable terminal result and exact live/backup roles
   under the lock before strict terminal validation; an `O/M` v4 primary state
   gets a bounded stage/prepared probe to prove exact `Q` or retain possible
@@ -127,7 +144,7 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 137 passed on Python 3.13. New cases cover fixed
+- Rules transaction tests: 152 passed on Python 3.13. New cases cover fixed
   stage zero-artifact failures, parse-to-lock receipt races, delegated-v3
   post-mutation receipt and parent changes, every terminal publication crash
   point, successful retry, terminal truncation prohibition, terminal/primary
@@ -136,8 +153,10 @@ superseded_by:
   cover schema-v3 `P` and schema-v4 `C` terminal replacement, exact `Q`
   refusal, combined final-revalidation/lock-close failure, close-only release
   uncertainty, persistent evidence lifetime, deterministic multi-close
-  EIO/EINTR, and primary-result preservation for recovered/required/refused.
-- Full repository suite covered 1,199 tests. Only the same 4 sandbox-only GPG
+  EIO/EINTR, primary-result preservation for recovered/required/refused,
+  schema-v1 current hardlink boundaries, receipt/stage namespace overlap, and
+  bind/read/rollback multi-close precedence.
+- Full repository suite covered 1,214 tests. Only the same 4 sandbox-only GPG
   merge-fixture errors remained; their exact keybox-enabled rerun passed 4 of
   4 outside the sandbox.
 - Ruff check and Ruff format-check passed for both changed Python files.

@@ -496,6 +496,48 @@ def descriptor_cleanup_error(
     )
 
 
+def finalize_descriptor_cleanup(
+    descriptors: list[tuple[str, int]],
+    *,
+    primary_error: BaseException | None = None,
+    payload: dict[str, object] | None = None,
+    status: str = "descriptor_cleanup_failed",
+    message: str = "descriptor cleanup could not be completed",
+) -> list[dict[str, object]]:
+    """Close every descriptor without displacing an established outcome."""
+
+    failures = close_descriptors_best_effort(descriptors)
+    if not failures:
+        return []
+    if primary_error is not None:
+        attach_failures_to_exception(
+            primary_error,
+            "cleanup_failures",
+            failures,
+        )
+    elif payload is not None:
+        attach_cleanup_failures_to_payload(payload, failures)
+    else:
+        raise descriptor_cleanup_error(
+            failures,
+            status=status,
+            message=message,
+        )
+    return failures
+
+
+def current_nlink_mismatches(expected: Snapshot, actual_nlink: int | None) -> bool:
+    """Enforce current link policy even when a legacy receipt omitted it.
+
+    Schema-v1 omitted historical ``nlink`` evidence. That omission cannot
+    authorize a currently hard-linked transaction object, so every current
+    regular-file observation still has to prove one link.
+    """
+
+    required_nlink = 1 if expected.nlink is None else expected.nlink
+    return actual_nlink != required_nlink
+
+
 def property_mismatches(expected: Snapshot, actual: Snapshot) -> list[str]:
     mismatches: list[str] = []
     if (expected.device, expected.inode) != (actual.device, actual.inode):
@@ -511,7 +553,7 @@ def property_mismatches(expected: Snapshot, actual: Snapshot) -> list[str]:
         actual.gid,
     ):
         mismatches.append("access_policy")
-    if expected.nlink is not None and expected.nlink != actual.nlink:
+    if current_nlink_mismatches(expected, actual.nlink):
         mismatches.append("object_policy")
     return mismatches
 
@@ -525,7 +567,7 @@ def content_access_and_object_policy_match(
         and hmac.compare_digest(expected.sha256, actual.sha256)
         and (expected.mode, expected.uid, expected.gid)
         == (actual.mode, actual.uid, actual.gid)
-        and (expected.nlink is None or expected.nlink == actual.nlink)
+        and not current_nlink_mismatches(expected, actual.nlink)
     )
 
 
@@ -542,7 +584,7 @@ def identity_access_and_object_policy_mismatches(
         actual.gid,
     ):
         mismatches.append("access_policy")
-    if expected.nlink is not None and expected.nlink != actual.nlink:
+    if current_nlink_mismatches(expected, actual.nlink):
         mismatches.append("object_policy")
     return mismatches
 
@@ -562,7 +604,7 @@ def stat_property_mismatches(
         actual.st_gid,
     ):
         mismatches.append("access_policy")
-    if expected.nlink is not None and expected.nlink != actual.st_nlink:
+    if current_nlink_mismatches(expected, actual.st_nlink):
         mismatches.append("object_policy")
     return mismatches
 
@@ -804,6 +846,56 @@ def resolved_leaf(raw_path: str, *, label: str) -> Path:
     return parent / path.name
 
 
+def canonical_namespace_path(path: Path, *, label: str) -> Path:
+    try:
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise TransactionError(
+            "path_invalid",
+            f"cannot resolve {label} for transaction namespace admission: {error}",
+        ) from error
+
+
+def path_namespaces_overlap(left: Path, right: Path) -> bool:
+    return left == right or left in right.parents or right in left.parents
+
+
+def reject_fixed_stage_namespace_overlap(
+    rules_parent: Path,
+    paths: list[tuple[str, Path]],
+) -> None:
+    """Reject lexical and canonical overlap with the fixed stage namespace."""
+
+    fixed_stage = rules_parent / PRIVATE_STAGE_NAME
+    stage_forms = (
+        fixed_stage,
+        canonical_namespace_path(fixed_stage, label="fixed_stage"),
+    )
+    for label, path in paths:
+        path_forms = (
+            path,
+            canonical_namespace_path(path, label=label),
+        )
+        if any(
+            path_namespaces_overlap(path_form, stage_form)
+            for path_form in path_forms
+            for stage_form in stage_forms
+        ):
+            raise TransactionError(
+                "path_invalid",
+                (
+                    f"{label} overlaps the fixed transaction-stage namespace "
+                    "by leaf, ancestor, descendant, or canonical alias"
+                ),
+                details={
+                    "path": str(path),
+                    "canonical_path": str(path_forms[1]),
+                    "fixed_stage": str(fixed_stage),
+                    "canonical_fixed_stage": str(stage_forms[1]),
+                },
+            )
+
+
 def read_fd(fd: int, *, label: str, max_bytes: int) -> bytes:
     os.lseek(fd, 0, os.SEEK_SET)
     chunks: list[bytes] = []
@@ -906,6 +998,8 @@ def read_stable(
             f"{label}_unreadable",
             f"cannot open {label}: {error}",
         ) from error
+    primary_error: BaseException | None = None
+    outcome: tuple[bytes, Snapshot] | None = None
     try:
         payload, snapshot = read_bound_fd(
             fd,
@@ -941,9 +1035,16 @@ def read_stable(
             )
         if require_modeled_metadata:
             reject_unmodeled_metadata_fd(fd, label=label)
-        return payload, snapshot
+        outcome = (payload, snapshot)
+        return outcome
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        os.close(fd)
+        finalize_descriptor_cleanup(
+            [(label, fd)],
+            primary_error=primary_error,
+        )
 
 
 def revalidate_candidate_source(
@@ -1350,8 +1451,11 @@ def bind_directory(
         )
         validate_bound_directory(binding)
         return binding
-    except BaseException:
-        os.close(fd)
+    except BaseException as error:
+        finalize_descriptor_cleanup(
+            [(f"{label}_parent", fd)],
+            primary_error=error,
+        )
         raise
 
 
@@ -1452,8 +1556,11 @@ def bind_regular_file(
             max_bytes=max_bytes,
         )
         return binding
-    except BaseException:
-        os.close(fd)
+    except BaseException as error:
+        finalize_descriptor_cleanup(
+            [(label, fd)],
+            primary_error=error,
+        )
         raise
 
 
@@ -1470,15 +1577,24 @@ def read_bound_regular_child(
         label=label,
         max_bytes=max_bytes,
     )
+    primary_error: BaseException | None = None
+    outcome: tuple[bytes, Snapshot] | None = None
     try:
-        return validate_bound_regular_file(
+        outcome = validate_bound_regular_file(
             binding,
             parent,
             label=label,
             max_bytes=max_bytes,
         )
+        return outcome
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        os.close(binding.fd)
+        finalize_descriptor_cleanup(
+            [(label, binding.fd)],
+            primary_error=primary_error,
+        )
 
 
 def write_exclusive(
@@ -1496,7 +1612,7 @@ def write_exclusive(
         uid=uid,
         gid=gid,
     )
-    os.close(fd)
+    finalize_descriptor_cleanup([("exclusive_write", fd)])
     return snapshot
 
 
@@ -1630,12 +1746,22 @@ def _write_exclusive_bound(
                 "cleanup_policy": "no_false_retention_claim",
                 "inspection_error": str(inspection_error),
             }
-        os.close(fd)
+        cleanup_failures = close_descriptors_best_effort([("exclusive_write", fd)])
         if isinstance(error, TransactionError):
             error.details.setdefault("retained_created_object", retained)
+            attach_failures_to_exception(
+                error,
+                "cleanup_failures",
+                cleanup_failures,
+            )
             raise
         if isinstance(error, Exception):
             retained_status = retained.get("retention_status")
+            details: dict[str, object] = {
+                "retained_created_object": retained,
+            }
+            if cleanup_failures:
+                details["cleanup_failures"] = cleanup_failures
             raise TransactionError(
                 "write_failed",
                 (
@@ -1647,8 +1773,13 @@ def _write_exclusive_bound(
                         f"be proved: {error}"
                     )
                 ),
-                details={"retained_created_object": retained},
+                details=details,
             ) from error
+        attach_failures_to_exception(
+            error,
+            "cleanup_failures",
+            cleanup_failures,
+        )
         raise
 
 
@@ -1725,8 +1856,11 @@ class PrivateStage:
                 label="rules",
             )
             validate_bound_directory(self.rules_parent_binding)
-        except BaseException:
-            os.close(self.rules_parent_fd)
+        except BaseException as error:
+            finalize_descriptor_cleanup(
+                [("rules_parent", self.rules_parent_fd)],
+                primary_error=error,
+            )
             raise
         self.stage_name = PRIVATE_STAGE_NAME
         if not recovery_mode:
@@ -1735,13 +1869,20 @@ class PrivateStage:
             except FileExistsError:
                 pass
             except OSError as error:
-                os.close(self.rules_parent_fd)
-                raise TransactionError(
+                transaction_error = TransactionError(
                     "private_stage_unavailable",
                     f"cannot create the private staging directory: {error}",
-                ) from error
-            except BaseException:
-                os.close(self.rules_parent_fd)
+                )
+                finalize_descriptor_cleanup(
+                    [("rules_parent", self.rules_parent_fd)],
+                    primary_error=transaction_error,
+                )
+                raise transaction_error from error
+            except BaseException as error:
+                finalize_descriptor_cleanup(
+                    [("rules_parent", self.rules_parent_fd)],
+                    primary_error=error,
+                )
                 raise
         self.path = rules_parent / self.stage_name
         try:
@@ -1826,9 +1967,17 @@ class PrivateStage:
                 )
             except OSError:
                 pass
-            if hasattr(self, "stage_fd"):
-                os.close(self.stage_fd)
-            os.close(self.rules_parent_fd)
+            finalize_descriptor_cleanup(
+                [
+                    *(
+                        [("private_stage", self.stage_fd)]
+                        if hasattr(self, "stage_fd")
+                        else []
+                    ),
+                    ("rules_parent", self.rules_parent_fd),
+                ],
+                primary_error=error,
+            )
             if isinstance(error, TransactionError):
                 error.details.setdefault("retained_stage", stage_identity_details)
             raise
@@ -1869,12 +2018,20 @@ class PrivateStage:
                         exit_code=EXIT_RECOVERY_REFUSED,
                         details={"mismatched_properties": mismatches},
                     )
-            except BaseException:
-                if "binding" in locals():
-                    os.close(binding.fd)
+            except BaseException as error:
                 self.closed = True
-                os.close(self.stage_fd)
-                os.close(self.rules_parent_fd)
+                finalize_descriptor_cleanup(
+                    [
+                        *(
+                            [("staged_backup", binding.fd)]
+                            if "binding" in locals()
+                            else []
+                        ),
+                        ("private_stage", self.stage_fd),
+                        ("rules_parent", self.rules_parent_fd),
+                    ],
+                    primary_error=error,
+                )
                 raise
             binding.snapshot = actual
             self.files[recovery_candidate] = binding
@@ -2122,8 +2279,11 @@ class PrivateStage:
                 label="live_rules",
             )
             reject_unmodeled_metadata_fd(fd, label="live_rules")
-        except BaseException:
-            os.close(fd)
+        except BaseException as error:
+            finalize_descriptor_cleanup(
+                [("live_rules", fd)],
+                primary_error=error,
+            )
             raise
         self.known_parent_names.add(target.name)
         return BoundFile(
@@ -2394,15 +2554,19 @@ class PrivateStage:
             ):
                 self.mutation_uncertain = False
                 self.extra_fds.remove(target_binding.fd)
-                os.close(target_binding.fd)
-                raise TransactionError(
+                transaction_error = TransactionError(
                     "atomic_exchange_failed",
                     f"atomic exchange failed without changing either side: {atomic_error}",
                     details={
                         "source_observation": initial_source,
                         "destination_observation": initial_destination,
                     },
-                ) from atomic_error
+                )
+                finalize_descriptor_cleanup(
+                    [("live_rules", target_binding.fd)],
+                    primary_error=transaction_error,
+                )
+                raise transaction_error from atomic_error
             raise self._uncertain_mutation(
                 operation="exchange",
                 source=source,
@@ -2702,41 +2866,32 @@ class PrivateStage:
                 return locator
         return None
 
-    def _close_bindings(self) -> None:
-        seen: set[int] = set()
-        close_errors: list[BaseException] = []
+    def _close_bindings(self) -> list[dict[str, object]]:
+        descriptors = [
+            *(
+                (f"stage_file:{binding.name}", binding.fd)
+                for binding in self.files.values()
+            ),
+            *((f"stage_extra:{index}", fd) for index, fd in enumerate(self.extra_fds)),
+        ]
         try:
-            for fd in (
-                *(binding.fd for binding in self.files.values()),
-                *self.extra_fds,
-            ):
-                if fd in seen:
-                    continue
-                seen.add(fd)
-                try:
-                    os.close(fd)
-                except BaseException as error:
-                    close_errors.append(error)
+            return close_descriptors_best_effort(descriptors)
         finally:
             self.files.clear()
             self.extra_fds.clear()
-        if close_errors:
-            raise close_errors[0]
 
-    def _close_all_descriptors(self) -> None:
-        close_errors: list[BaseException] = []
-        try:
-            self._close_bindings()
-        except BaseException as error:
-            close_errors.append(error)
+    def _close_all_descriptors(self) -> list[dict[str, object]]:
+        failures = self._close_bindings()
         self.closed = True
-        for fd in (self.stage_fd, self.rules_parent_fd):
-            try:
-                os.close(fd)
-            except BaseException as error:
-                close_errors.append(error)
-        if close_errors:
-            raise close_errors[0]
+        failures.extend(
+            close_descriptors_best_effort(
+                [
+                    ("private_stage", self.stage_fd),
+                    ("rules_parent", self.rules_parent_fd),
+                ]
+            )
+        )
+        return failures
 
     def _cleanup_fixed_stage(self) -> list[dict[str, object]]:
         """Close an empty persistent stage without pathname deletion.
@@ -2749,6 +2904,7 @@ class PrivateStage:
         """
 
         warnings: list[dict[str, object]] = []
+        primary_error: BaseException | None = None
         try:
             self._validate_rules_parent()
             self._validate_stage_root()
@@ -2789,8 +2945,24 @@ class PrivateStage:
             )
             if isinstance(error, TransactionError) and error.details:
                 warnings[-1]["details"] = error.details
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            self._close_all_descriptors()
+            failures = self._close_all_descriptors()
+            if primary_error is not None:
+                attach_failures_to_exception(
+                    primary_error,
+                    "cleanup_failures",
+                    failures,
+                )
+            elif failures:
+                warnings.append(
+                    {
+                        "status": "descriptor_cleanup_failed",
+                        "cleanup_failures": failures,
+                    }
+                )
         return warnings
 
     def cleanup(self, *, retain: bool = True) -> list[dict[str, object]]:
@@ -2800,6 +2972,7 @@ class PrivateStage:
             return self._cleanup_fixed_stage()
         warnings: list[dict[str, object]] = []
         inspected_fds: set[int] = set()
+        primary_error: BaseException | None = None
         try:
             root_locator = self._locator_for_snapshot(self.stage_snapshot)
             for binding in self.files.values():
@@ -2909,9 +3082,25 @@ class PrivateStage:
                     "cleanup_policy": "retained_no_compare_then_delete",
                 }
             )
-            return warnings
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            self._close_all_descriptors()
+            failures = self._close_all_descriptors()
+            if primary_error is not None:
+                attach_failures_to_exception(
+                    primary_error,
+                    "cleanup_failures",
+                    failures,
+                )
+            elif failures:
+                warnings.append(
+                    {
+                        "status": "descriptor_cleanup_failed",
+                        "cleanup_failures": failures,
+                    }
+                )
+        return warnings
 
 
 def validate_existing_fixed_stage_is_empty(
@@ -2931,19 +3120,33 @@ def validate_existing_fixed_stage_is_empty(
             follow_symlinks=False,
         )
     except FileNotFoundError:
-        validate_bound_directory(rules_parent_binding)
-        os.close(rules_parent_binding.fd)
+        primary_error: BaseException | None = None
+        try:
+            validate_bound_directory(rules_parent_binding)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            finalize_descriptor_cleanup(
+                [("rules_parent", rules_parent_binding.fd)],
+                primary_error=primary_error,
+            )
         return
     except OSError as error:
-        os.close(rules_parent_binding.fd)
-        raise TransactionError(
+        transaction_error = TransactionError(
             "recovery_required",
             f"cannot inspect existing fixed transaction stage: {error}",
             exit_code=EXIT_POST_REPLACE_FAILED,
             details={"stage_status": "private_stage_unreadable"},
-        ) from error
+        )
+        finalize_descriptor_cleanup(
+            [("rules_parent", rules_parent_binding.fd)],
+            primary_error=transaction_error,
+        )
+        raise transaction_error from error
 
     stage: PrivateStage | None = None
+    primary_error = None
     try:
         stage = PrivateStage(
             rules_parent,
@@ -2957,7 +3160,7 @@ def validate_existing_fixed_stage_is_empty(
             else "private_stage_unreadable"
         )
         error_details = error.details if isinstance(error, TransactionError) else {}
-        raise TransactionError(
+        transaction_error = TransactionError(
             "recovery_required",
             "existing fixed transaction stage requires recovery before no-change",
             exit_code=EXIT_POST_REPLACE_FAILED,
@@ -2966,9 +3169,18 @@ def validate_existing_fixed_stage_is_empty(
                 "stage_message": str(error),
                 **error_details,
             },
-        ) from error
+        )
+        primary_error = transaction_error
+        raise transaction_error from error
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        os.close(rules_parent_binding.fd)
+        finalize_descriptor_cleanup(
+            [("rules_parent", rules_parent_binding.fd)],
+            primary_error=primary_error,
+        )
+    assert stage is not None
     warnings = stage.cleanup(retain=False)
     if warnings:
         raise TransactionError(
@@ -3995,10 +4207,17 @@ class AnonymousValidatorInput:
                 f"validator descriptor path is unavailable: {error}",
                 exit_code=EXIT_VALIDATION_FAILED,
             ) from error
+        path_error: BaseException | None = None
         try:
             path_actual = os.fstat(path_fd)
+        except BaseException as error:
+            path_error = error
+            raise
         finally:
-            os.close(path_fd)
+            finalize_descriptor_cleanup(
+                [("validator_input_path", path_fd)],
+                primary_error=path_error,
+            )
         mismatches.extend(
             mismatch
             for mismatch in stat_property_mismatches(
@@ -4048,10 +4267,17 @@ class AnonymousValidatorInput:
                 f"validator descriptor path is unavailable: {error}",
                 exit_code=EXIT_VALIDATION_FAILED,
             ) from error
+        final_path_error: BaseException | None = None
         try:
             final_path_actual = os.fstat(final_path_fd)
+        except BaseException as error:
+            final_path_error = error
+            raise
         finally:
-            os.close(final_path_fd)
+            finalize_descriptor_cleanup(
+                [("validator_input_final_path", final_path_fd)],
+                primary_error=final_path_error,
+            )
         final_mismatches.extend(
             mismatch
             for mismatch in stat_property_mismatches(
@@ -4307,26 +4533,47 @@ def run_validator(
 def fsync_file_and_parent(path: Path) -> None:
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
+    primary_error: BaseException | None = None
     try:
         os.fsync(fd)
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        os.close(fd)
+        finalize_descriptor_cleanup(
+            [("fsync_file", fd)],
+            primary_error=primary_error,
+        )
     parent_fd = os.open(
         path.parent,
         os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
     )
+    primary_error = None
     try:
         os.fsync(parent_fd)
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        os.close(parent_fd)
+        finalize_descriptor_cleanup(
+            [("fsync_parent", parent_fd)],
+            primary_error=primary_error,
+        )
 
 
 def fsync_directory(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0))
+    primary_error: BaseException | None = None
     try:
         os.fsync(fd)
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        os.close(fd)
+        finalize_descriptor_cleanup(
+            [("fsync_directory", fd)],
+            primary_error=primary_error,
+        )
 
 
 def require_owner_private_directory(path: Path, *, label: str) -> None:
@@ -4335,7 +4582,7 @@ def require_owner_private_directory(path: Path, *, label: str) -> None:
         label=label,
         require_owner_private=True,
     )
-    os.close(binding.fd)
+    finalize_descriptor_cleanup([(f"{label}_parent", binding.fd)])
 
 
 def prepared_candidate_path(receipt: Path) -> Path:
@@ -4400,8 +4647,11 @@ def write_prepared_candidate(
             )
         binding.snapshot = actual
         return binding
-    except BaseException:
-        os.close(fd)
+    except BaseException as error:
+        finalize_descriptor_cleanup(
+            [("prepared_candidate", fd)],
+            primary_error=error,
+        )
         raise
 
 
@@ -4625,8 +4875,11 @@ def write_receipt(
             max_bytes=MAX_RECEIPT_BYTES,
         )
         return binding
-    except BaseException:
-        os.close(fd)
+    except BaseException as error:
+        finalize_descriptor_cleanup(
+            [("receipt", fd)],
+            primary_error=error,
+        )
         raise
 
 
@@ -4996,6 +5249,8 @@ def read_recovery_terminal_with_snapshot(
     )
     reservation: BoundFile | None = None
     result: BoundFile | None = None
+    outcome: tuple[dict[str, object], Snapshot] | None = None
+    primary_error: BaseException | None = None
     try:
         reservation = bind_regular_file(
             path,
@@ -5041,13 +5296,29 @@ def read_recovery_terminal_with_snapshot(
                     "recovery_terminal_conflict",
                     "recovery terminal result is not restored evidence",
                 )
-        return value, snapshot
+        outcome = (value, snapshot)
+        return outcome
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        if result is not None:
-            os.close(result.fd)
-        if reservation is not None:
-            os.close(reservation.fd)
-        os.close(parent.fd)
+        finalize_descriptor_cleanup(
+            [
+                *(
+                    [("recovery_terminal_result", result.fd)]
+                    if result is not None
+                    else []
+                ),
+                *(
+                    [("recovery_terminal_reservation", reservation.fd)]
+                    if reservation is not None
+                    else []
+                ),
+                ("recovery_terminal_parent", parent.fd),
+            ],
+            primary_error=primary_error,
+            payload=outcome[0] if outcome is not None else None,
+        )
 
 
 def read_recovery_terminal(path: Path) -> dict[str, object]:
@@ -5130,8 +5401,11 @@ def reserve_recovery_terminal(
                 "reserved recovery terminal is not bound to this transaction",
             )
         return binding
-    except BaseException:
-        os.close(fd)
+    except BaseException as error:
+        finalize_descriptor_cleanup(
+            [("recovery_terminal_reservation", fd)],
+            primary_error=error,
+        )
         raise
 
 
@@ -5646,6 +5920,8 @@ def rollback(
     backup_binding: BoundFile | None = None
     live_binding: BoundFile | None = None
     exchange_completed = False
+    outcome: tuple[bool, dict[str, object]] | None = None
+    primary_error: BaseException | None = None
     try:
         stage._validate_rules_parent()
         backup_binding = bind_regular_file(
@@ -5663,10 +5939,14 @@ def rollback(
             backup_actual,
         )
         if backup_mismatches:
-            return False, {
-                "rollback_status": "backup_changed",
-                "mismatched_properties": backup_mismatches,
-            }
+            outcome = (
+                False,
+                {
+                    "rollback_status": "backup_changed",
+                    "mismatched_properties": backup_mismatches,
+                },
+            )
+            return outcome
         live_binding = bind_regular_file(
             rules,
             stage.rules_parent_binding,
@@ -5679,11 +5959,15 @@ def rollback(
         )
         live_mismatches = property_mismatches(installed, live)
         if live_mismatches:
-            return False, {
-                "rollback_status": "live_no_longer_installed",
-                "mismatched_properties": live_mismatches,
-                "actual_live": live.to_json(),
-            }
+            outcome = (
+                False,
+                {
+                    "rollback_status": "live_no_longer_installed",
+                    "mismatched_properties": live_mismatches,
+                    "actual_live": live.to_json(),
+                },
+            )
+            return outcome
         revalidate_lock(lock_binding, stage.rules_parent_binding)
         validate_bound_regular_file(
             backup_binding,
@@ -5739,12 +6023,16 @@ def rollback(
                 unchanged_live
             ):
                 stage.mutation_uncertain = False
-                return False, {
-                    "rollback_status": "atomic_exchange_failed",
-                    "rollback_message": str(atomic_error),
-                    "backup_observation": unchanged_backup,
-                    "live_observation": unchanged_live,
-                }
+                outcome = (
+                    False,
+                    {
+                        "rollback_status": "atomic_exchange_failed",
+                        "rollback_message": str(atomic_error),
+                        "backup_observation": unchanged_backup,
+                        "live_observation": unchanged_live,
+                    },
+                )
+                return outcome
             raise stage._uncertain_mutation(
                 operation="rollback_exchange",
                 source=backup_binding,
@@ -5816,16 +6104,24 @@ def rollback(
             original,
             restored,
         ):
-            return False, {
-                "rollback_status": "recovery_required",
-                "recovery_reason": "rollback_verification_failed",
-                "mismatched_properties": restored_mismatches,
-                "actual_live": restored.to_json(),
-            }
-        return True, {
-            "rollback_status": "rolled_back",
-            "restored": restored.to_json(),
-        }
+            outcome = (
+                False,
+                {
+                    "rollback_status": "recovery_required",
+                    "recovery_reason": "rollback_verification_failed",
+                    "mismatched_properties": restored_mismatches,
+                    "actual_live": restored.to_json(),
+                },
+            )
+            return outcome
+        outcome = (
+            True,
+            {
+                "rollback_status": "rolled_back",
+                "restored": restored.to_json(),
+            },
+        )
+        return outcome
     except (OSError, TransactionError) as error:
         error_status = (
             error.status if isinstance(error, TransactionError) else "rollback_failed"
@@ -5840,11 +6136,28 @@ def rollback(
             result["recovery_reason"] = error_status
         if isinstance(error, TransactionError):
             result.update(error.details)
-        return False, result
+        outcome = (False, result)
+        return outcome
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        for binding in (live_binding, backup_binding):
-            if binding is not None:
-                os.close(binding.fd)
+        finalize_descriptor_cleanup(
+            [
+                *(
+                    [("rollback_live_rules", live_binding.fd)]
+                    if live_binding is not None
+                    else []
+                ),
+                *(
+                    [("rollback_backup", backup_binding.fd)]
+                    if backup_binding is not None
+                    else []
+                ),
+            ],
+            primary_error=primary_error,
+            payload=outcome[1] if outcome is not None else None,
+        )
 
 
 def _apply_transaction_inner(
@@ -5878,6 +6191,16 @@ def _apply_transaction_inner(
         )
     backup = rules.parent / args.backup_name
     lock = rules.parent / ".default.rules.apply.lock"
+    reject_fixed_stage_namespace_overlap(
+        rules.parent,
+        [
+            ("receipt", receipt),
+            ("recovery_terminal", recovery_terminal),
+            ("recovery_terminal_result", recovery_terminal_result),
+            ("prepared_candidate", prepared_recovery_candidate),
+            ("lock", lock),
+        ],
+    )
     if (
         candidate_source == rules
         or receipt in (rules, backup, lock, candidate_source)
@@ -6027,6 +6350,8 @@ def _apply_transaction_inner(
                     rules.parent,
                     label="rules",
                 )
+                no_change_outcome: tuple[int, dict[str, object]] | None = None
+                no_change_error: BaseException | None = None
                 try:
                     revalidate_lock(lock_binding, no_change_parent_binding)
                     current_bytes, current = read_bound_regular_child(
@@ -6035,18 +6360,26 @@ def _apply_transaction_inner(
                         label="live_rules",
                     )
                     if current.nlink != 1:
-                        return EXIT_LIVE_CONFLICT, {
-                            "status": "live_rules_object_policy_unsupported",
-                            "rules_path": str(rules),
-                            "object_policy": {"nlink": current.nlink},
-                        }
+                        no_change_outcome = (
+                            EXIT_LIVE_CONFLICT,
+                            {
+                                "status": "live_rules_object_policy_unsupported",
+                                "rules_path": str(rules),
+                                "object_policy": {"nlink": current.nlink},
+                            },
+                        )
+                        return no_change_outcome
                     if not hmac.compare_digest(current.sha256, expected_sha256):
-                        return EXIT_LIVE_CONFLICT, {
-                            "status": "expected_digest_mismatch",
-                            "rules_path": str(rules),
-                            "expected_sha256": expected_sha256,
-                            "actual_sha256": current.sha256,
-                        }
+                        no_change_outcome = (
+                            EXIT_LIVE_CONFLICT,
+                            {
+                                "status": "expected_digest_mismatch",
+                                "rules_path": str(rules),
+                                "expected_sha256": expected_sha256,
+                                "actual_sha256": current.sha256,
+                            },
+                        )
+                        return no_change_outcome
                     revalidate_candidate_source(
                         candidate_source,
                         source_snapshot,
@@ -6058,14 +6391,29 @@ def _apply_transaction_inner(
                             rules_parent_expected=no_change_parent_binding.snapshot,
                         )
                         revalidate_lock(lock_binding, no_change_parent_binding)
-                        return 0, {
-                            "status": "no_change_after_lock",
-                            "rules_path": str(rules),
-                            "sha256": current.sha256,
-                        }
+                        no_change_outcome = (
+                            0,
+                            {
+                                "status": "no_change_after_lock",
+                                "rules_path": str(rules),
+                                "sha256": current.sha256,
+                            },
+                        )
+                        return no_change_outcome
                     revalidate_lock(lock_binding, no_change_parent_binding)
+                except BaseException as error:
+                    no_change_error = error
+                    raise
                 finally:
-                    os.close(no_change_parent_binding.fd)
+                    finalize_descriptor_cleanup(
+                        [("rules_parent", no_change_parent_binding.fd)],
+                        primary_error=no_change_error,
+                        payload=(
+                            no_change_outcome[1]
+                            if no_change_outcome is not None
+                            else None
+                        ),
+                    )
             lock_acquired = False
 
         # The first validator sees only an unlinked descriptor-backed copy.  No
@@ -6260,11 +6608,17 @@ def _apply_transaction_inner(
                         transaction_id=transaction_id,
                         parent=receipt_parent,
                     )
-                except BaseException:
-                    os.close(prepared_binding.fd)
+                except BaseException as error:
+                    finalize_descriptor_cleanup(
+                        [("prepared_candidate", prepared_binding.fd)],
+                        primary_error=error,
+                    )
                     raise
-            except BaseException:
-                os.close(receipt_parent.fd)
+            except BaseException as error:
+                finalize_descriptor_cleanup(
+                    [("receipt_parent", receipt_parent.fd)],
+                    primary_error=error,
+                )
                 raise
             evidence = ApplyEvidenceBindings(
                 lock=lock_binding,
@@ -8557,6 +8911,29 @@ def _recover_transaction_bound(
             label="prepared_candidate_parent",
             require_object_policy=True,
         )
+    derived_terminal = recovery_terminal_path(receipt_path)
+    derived_terminal_result = recovery_terminal_result_path(derived_terminal)
+    derived_prepared_candidate = prepared_candidate_path(receipt_path)
+    reject_fixed_stage_namespace_overlap(
+        rules.parent,
+        [
+            ("receipt", receipt_path),
+            ("recovery_terminal", derived_terminal),
+            ("recovery_terminal_result", derived_terminal_result),
+            ("prepared_candidate", derived_prepared_candidate),
+            ("lock", lock),
+            *(
+                [("recorded_recovery_terminal", terminal_path)]
+                if terminal_path is not None
+                else []
+            ),
+            *(
+                [("recorded_prepared_candidate", prepared_candidate)]
+                if prepared_candidate is not None
+                else []
+            ),
+        ],
+    )
     terminal_expected: Snapshot | None = None
     if receipt.get("recovery_terminal") is not None:
         if terminal_path is None:
