@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 
 
 SCHEMA_VERSION = 4
@@ -47,6 +48,7 @@ PRIVATE_STAGE_NAME = ".default.rules.transaction-stage"
 PREPARED_CANDIDATE_SUFFIX = ".prepared-candidate"
 RECOVERY_TERMINAL_RESULT_SUFFIX = ".result"
 RECOVERY_TERMINAL_TEMP_MARKER = ".result-pending-"
+PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON = "private_stage_descriptor_close_failed"
 # The legacy stage_cleanup_retained quarantine status is intentionally not emitted.
 VALIDATOR_TERM_GRACE_SECONDS = 0.25
 VALIDATOR_KILL_DRAIN_SECONDS = 1.0
@@ -153,6 +155,7 @@ class Snapshot:
         *,
         label: str,
         require_object_policy: bool = True,
+        legacy_historical_object_policy: bool = False,
     ) -> Snapshot:
         if not isinstance(value, dict):
             raise TransactionError("receipt_invalid", f"{label} is not an object")
@@ -173,7 +176,32 @@ class Snapshot:
                 "receipt_invalid",
                 f"{label} is missing object_policy",
             )
-        nlink = object_policy.get("nlink") if isinstance(object_policy, dict) else None
+        if legacy_historical_object_policy and object_policy is not None:
+            if not isinstance(object_policy, dict):
+                raise TransactionError(
+                    "receipt_invalid",
+                    f"{label}.object_policy is invalid",
+                )
+            legacy_nlink = object_policy.get("nlink")
+            if (
+                not isinstance(legacy_nlink, int)
+                or isinstance(legacy_nlink, bool)
+                or legacy_nlink != 1
+            ):
+                raise TransactionError(
+                    "receipt_invalid",
+                    (
+                        f"{label}.object_policy.nlink must be 1 when present "
+                        "in a schema-v1 receipt"
+                    ),
+                )
+        nlink = (
+            None
+            if legacy_historical_object_policy
+            else (
+                object_policy.get("nlink") if isinstance(object_policy, dict) else None
+            )
+        )
         fields = {
             "device": identity.get("device"),
             "inode": identity.get("inode"),
@@ -526,6 +554,37 @@ def finalize_descriptor_cleanup(
     return failures
 
 
+def private_stage_descriptor_cleanup_failures(
+    warnings: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Normalize stage-close warnings for durable result payloads."""
+
+    normalized: list[dict[str, object]] = []
+    for warning in warnings:
+        if warning.get("status") != "descriptor_cleanup_failed":
+            continue
+        failures = warning.get("cleanup_failures")
+        if not isinstance(failures, list):
+            continue
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            descriptor = failure.get("descriptor")
+            descriptor_class = (
+                descriptor.split(":", 1)[0]
+                if isinstance(descriptor, str)
+                else "private_stage"
+            )
+            normalized.append(
+                {
+                    **failure,
+                    "cleanup_reason": PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON,
+                    "descriptor_class": descriptor_class,
+                }
+            )
+    return normalized
+
+
 def current_nlink_mismatches(expected: Snapshot, actual_nlink: int | None) -> bool:
     """Enforce current link policy even when a legacy receipt omitted it.
 
@@ -860,32 +919,207 @@ def path_namespaces_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
+def normalized_namespace_component(component: str) -> str:
+    """Return a conservative case/Unicode-insensitive component key."""
+
+    normalized = unicodedata.normalize("NFKC", component)
+    return unicodedata.normalize("NFKC", normalized.casefold())
+
+
+def component_namespaces_overlap(
+    left: tuple[str, ...],
+    right: tuple[str, ...],
+) -> bool:
+    shorter = min(len(left), len(right))
+    return left[:shorter] == right[:shorter]
+
+
+def bound_namespace_directory_identity(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[int, int, int] | None:
+    """Bind one existing directory without following its final symlink."""
+
+    flags = (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            return None
+        raise TransactionError(
+            "path_invalid",
+            f"cannot bind {label} directory identity: {error}",
+        ) from error
+    primary_error: BaseException | None = None
+    identity: tuple[int, int, int] | None = None
+    try:
+        descriptor_stat = os.fstat(fd)
+        path_stat = os.stat(path, follow_symlinks=False)
+        descriptor_identity = (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+            stat.S_IFMT(descriptor_stat.st_mode),
+        )
+        path_identity = (
+            path_stat.st_dev,
+            path_stat.st_ino,
+            stat.S_IFMT(path_stat.st_mode),
+        )
+        if descriptor_identity != path_identity:
+            raise TransactionError(
+                "path_invalid",
+                f"{label} directory identity changed during namespace admission",
+            )
+        identity = descriptor_identity
+        return identity
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        finalize_descriptor_cleanup(
+            [(f"namespace_directory:{label}", fd)],
+            primary_error=primary_error,
+        )
+
+
+def bound_namespace_ancestor_identities(
+    path: Path,
+    *,
+    label: str,
+) -> set[tuple[int, int, int]]:
+    identities: set[tuple[int, int, int]] = set()
+    for index, candidate in enumerate((path, *path.parents)):
+        identity = bound_namespace_directory_identity(
+            candidate,
+            label=f"{label}_ancestor_{index}",
+        )
+        if identity is not None:
+            identities.add(identity)
+    return identities
+
+
+def namespace_components_under_bound_parent(
+    path: Path,
+    *,
+    bound_parent_identity: tuple[int, int, int],
+    label: str,
+) -> set[tuple[str, ...]]:
+    sequences: set[tuple[str, ...]] = set()
+    forms = (
+        path,
+        canonical_namespace_path(path, label=label),
+    )
+    for form_index, form in enumerate(forms):
+        for ancestor_index, ancestor in enumerate((form, *form.parents)):
+            identity = bound_namespace_directory_identity(
+                ancestor,
+                label=f"{label}_form_{form_index}_ancestor_{ancestor_index}",
+            )
+            if identity != bound_parent_identity:
+                continue
+            relative = form.relative_to(ancestor)
+            sequences.add(
+                tuple(
+                    normalized_namespace_component(component)
+                    for component in relative.parts
+                )
+            )
+            break
+    return sequences
+
+
 def reject_fixed_stage_namespace_overlap(
     rules_parent: Path,
     paths: list[tuple[str, Path]],
 ) -> None:
-    """Reject lexical and canonical overlap with the fixed stage namespace."""
+    """Reject string, identity, case, and Unicode aliases of the fixed stage."""
 
     fixed_stage = rules_parent / PRIVATE_STAGE_NAME
     stage_forms = (
         fixed_stage,
         canonical_namespace_path(fixed_stage, label="fixed_stage"),
     )
+    rules_parent_identity = bound_namespace_directory_identity(
+        rules_parent,
+        label="rules_parent",
+    )
+    if rules_parent_identity is None:
+        raise TransactionError(
+            "path_invalid",
+            "rules parent disappeared during transaction namespace admission",
+        )
+    stage_identity = next(
+        (
+            identity
+            for index, stage_form in enumerate(stage_forms)
+            if (
+                identity := bound_namespace_directory_identity(
+                    stage_form,
+                    label=f"fixed_stage_form_{index}",
+                )
+            )
+            is not None
+        ),
+        None,
+    )
+    stage_ancestor_identities: set[tuple[int, int, int]] = set()
+    for index, stage_form in enumerate(stage_forms):
+        stage_ancestor_identities.update(
+            bound_namespace_ancestor_identities(
+                stage_form,
+                label=f"fixed_stage_form_{index}",
+            )
+        )
+    normalized_stage = (normalized_namespace_component(PRIVATE_STAGE_NAME),)
     for label, path in paths:
         path_forms = (
             path,
             canonical_namespace_path(path, label=label),
         )
-        if any(
+        string_overlap = any(
             path_namespaces_overlap(path_form, stage_form)
             for path_form in path_forms
             for stage_form in stage_forms
-        ):
+        )
+        path_ancestor_identities: set[tuple[int, int, int]] = set()
+        path_leaf_identities: set[tuple[int, int, int]] = set()
+        for index, path_form in enumerate(path_forms):
+            path_ancestor_identities.update(
+                bound_namespace_ancestor_identities(
+                    path_form,
+                    label=f"{label}_form_{index}",
+                )
+            )
+            identity = bound_namespace_directory_identity(
+                path_form,
+                label=f"{label}_form_{index}",
+            )
+            if identity is not None:
+                path_leaf_identities.add(identity)
+        identity_overlap = (
+            stage_identity is not None and stage_identity in path_ancestor_identities
+        ) or bool(path_leaf_identities & stage_ancestor_identities)
+        component_overlap = any(
+            component_namespaces_overlap(components, normalized_stage)
+            for components in namespace_components_under_bound_parent(
+                path,
+                bound_parent_identity=rules_parent_identity,
+                label=label,
+            )
+        )
+        if string_overlap or identity_overlap or component_overlap:
             raise TransactionError(
                 "path_invalid",
                 (
                     f"{label} overlaps the fixed transaction-stage namespace "
-                    "by leaf, ancestor, descendant, or canonical alias"
+                    "by leaf, ancestor, descendant, canonical identity, "
+                    "case folding, or Unicode normalization"
                 ),
                 details={
                     "path": str(path),
@@ -3183,11 +3417,22 @@ def validate_existing_fixed_stage_is_empty(
     assert stage is not None
     warnings = stage.cleanup(retain=False)
     if warnings:
+        descriptor_failures = private_stage_descriptor_cleanup_failures(warnings)
         raise TransactionError(
             "recovery_required",
             "existing fixed transaction stage cleanup could not be verified",
             exit_code=EXIT_POST_REPLACE_FAILED,
-            details={"cleanup_refusals": warnings},
+            details={
+                "cleanup_refusals": warnings,
+                **(
+                    {
+                        "cleanup_reason": (PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON),
+                        "cleanup_failures": descriptor_failures,
+                    }
+                    if descriptor_failures
+                    else {}
+                ),
+            },
         )
 
 
@@ -5916,6 +6161,8 @@ def rollback(
     installed: Snapshot,
     backup_expected: Snapshot,
     pre_exchange_revalidate: Callable[[], None] | None = None,
+    mutation_attempt: Callable[[], None] | None = None,
+    mutation_complete: Callable[[], None] | None = None,
 ) -> tuple[bool, dict[str, object]]:
     backup_binding: BoundFile | None = None
     live_binding: BoundFile | None = None
@@ -5984,6 +6231,8 @@ def rollback(
             pre_exchange_revalidate()
 
         atomic_error: OSError | None = None
+        if mutation_attempt is not None:
+            mutation_attempt()
         stage.mutation_uncertain = True
         try:
             atomic_rename_exchange(
@@ -6088,6 +6337,8 @@ def rollback(
             )
         stage.mutation_uncertain = False
         exchange_completed = True
+        if mutation_complete is not None:
+            mutation_complete()
         os.fsync(stage.rules_parent_fd)
         if pre_exchange_revalidate is not None:
             pre_exchange_revalidate()
@@ -6244,6 +6495,7 @@ def _apply_transaction_inner(
     replacement_started = False
     finalized = False
     rules_parent_binding: BoundDirectory | None = None
+    stage_cleanup_failures: list[dict[str, object]] = []
 
     def finalize_apply_state() -> None:
         nonlocal finalized, retain_stage
@@ -6288,6 +6540,19 @@ def _apply_transaction_inner(
             for warning in warnings
             if warning.get("status") == "stage_cleanup_refused"
         ]
+        descriptor_failures = private_stage_descriptor_cleanup_failures(warnings)
+        stage_cleanup_failures.extend(descriptor_failures)
+        if pending_success_status is not None and descriptor_failures:
+            raise TransactionError(
+                "recovery_required",
+                "cannot report success while private-stage descriptor cleanup is uncertain",
+                exit_code=EXIT_POST_REPLACE_FAILED,
+                details={
+                    "operation_status": pending_success_status,
+                    "reason": PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON,
+                    "cleanup_reason": PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON,
+                },
+            )
         if (
             pending_success_status is not None or replacement_started
         ) and cleanup_refusals:
@@ -6313,22 +6578,27 @@ def _apply_transaction_inner(
             ) from evidence_error
 
     def close_apply_state() -> list[dict[str, object]]:
+        failures = list(stage_cleanup_failures)
         try:
             if evidence is not None:
-                return evidence.close()
+                failures.extend(evidence.close())
+                return failures
             if rules_parent_binding is not None:
-                return close_descriptors_best_effort(
-                    [("rules_parent", rules_parent_binding.fd)]
+                failures.extend(
+                    close_descriptors_best_effort(
+                        [("rules_parent", rules_parent_binding.fd)]
+                    )
                 )
+                return failures
         except BaseException as error:
-            return [
+            failures.append(
                 structured_operation_failure(
                     "close",
                     "apply_evidence_group",
                     error,
                 )
-            ]
-        return []
+            )
+        return failures
 
     cleanup_callbacks.append(close_apply_state)
 
@@ -7739,11 +8009,25 @@ def recover_schema_v3_transaction(
                 **error_details,
             }
         terminal_cleanup_warnings = terminal_stage.cleanup(retain=False)
+        terminal_descriptor_failures = private_stage_descriptor_cleanup_failures(
+            terminal_cleanup_warnings
+        )
+        mutation_tracker.record_cleanup_failures(terminal_descriptor_failures)
         if terminal_cleanup_warnings:
             return EXIT_POST_REPLACE_FAILED, {
                 "status": "recovery_required",
                 "transaction_state": state,
-                "reason": "stage_cleanup_refused",
+                "operation_status": "already_original",
+                "reason": (
+                    PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON
+                    if terminal_descriptor_failures
+                    else "stage_cleanup_refused"
+                ),
+                **(
+                    {"cleanup_reason": (PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON)}
+                    if terminal_descriptor_failures
+                    else {}
+                ),
                 "cleanup_refusals": terminal_cleanup_warnings,
                 **mutation_tracker.details(state=state),
             }
@@ -7932,6 +8216,22 @@ def recover_schema_v3_transaction(
                 for warning in warnings
                 if warning.get("status") == "stage_cleanup_refused"
             ]
+            descriptor_failures = private_stage_descriptor_cleanup_failures(warnings)
+            mutation_tracker.record_cleanup_failures(descriptor_failures)
+            if pending_success and descriptor_failures:
+                raise TransactionError(
+                    "recovery_required",
+                    (
+                        "cannot report recovered while private-stage "
+                        "descriptor cleanup is uncertain"
+                    ),
+                    exit_code=EXIT_POST_REPLACE_FAILED,
+                    details={
+                        "operation_status": "recovered",
+                        "reason": PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON,
+                        "cleanup_reason": (PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON),
+                    },
+                )
             if pending_success and cleanup_refusals:
                 raise TransactionError(
                     "recovery_required",
@@ -8597,6 +8897,14 @@ def recover_legacy_transaction(
                 original=original,
                 installed=installed,
                 backup_expected=backup_expected,
+                mutation_attempt=lambda: mutation_tracker.enter(
+                    "legacy_rollback_exchange",
+                    state="legacy_installed",
+                ),
+                mutation_complete=lambda: mutation_tracker.complete(
+                    "legacy_rollback_exchange",
+                    state="legacy_original",
+                ),
             )
             if not rolled_back:
                 if rollback_result.get("rollback_status") == "recovery_required":
@@ -8604,6 +8912,7 @@ def recover_legacy_transaction(
                     return EXIT_POST_REPLACE_FAILED, {
                         "status": "recovery_required",
                         "rollback": rollback_result,
+                        **mutation_tracker.details(state="legacy_unknown"),
                     }
                 return EXIT_RECOVERY_REFUSED, {
                     "status": "recovery_refused",
@@ -8649,6 +8958,7 @@ def recover_legacy_transaction(
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": "recovery_required",
                     "rollback": rollback_result,
+                    **mutation_tracker.details(state="legacy_original"),
                     "recovery_terminal_failure": {
                         "status": error.status,
                         "message": str(error),
@@ -8685,6 +8995,22 @@ def recover_legacy_transaction(
                 for warning in warnings
                 if warning.get("status") == "stage_cleanup_refused"
             ]
+            descriptor_failures = private_stage_descriptor_cleanup_failures(warnings)
+            mutation_tracker.record_cleanup_failures(descriptor_failures)
+            if pending_success_status is not None and descriptor_failures:
+                raise TransactionError(
+                    "recovery_required",
+                    (
+                        "cannot report success while private-stage descriptor "
+                        "cleanup is uncertain"
+                    ),
+                    exit_code=EXIT_POST_REPLACE_FAILED,
+                    details={
+                        "operation_status": pending_success_status,
+                        "reason": PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON,
+                        "cleanup_reason": (PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON),
+                    },
+                )
             if pending_success_status is not None and cleanup_refusals:
                 raise TransactionError(
                     "recovery_required",
@@ -8730,6 +9056,11 @@ def recover_legacy_transaction(
                     or error.status
                 ),
                 "message": str(error),
+                **(
+                    mutation_tracker.details()
+                    if mutation_tracker.mutation_started
+                    else {}
+                ),
                 **error.details,
             }
         return EXIT_RECOVERY_REFUSED, {
@@ -8832,21 +9163,25 @@ def _recover_transaction_bound(
         receipt.get("rules_parent"),
         label="rules_parent",
         require_object_policy=require_object_policy,
+        legacy_historical_object_policy=receipt_schema_version == 1,
     )
     original = Snapshot.from_json(
         receipt.get("original"),
         label="original",
         require_object_policy=require_object_policy,
+        legacy_historical_object_policy=receipt_schema_version == 1,
     )
     installed = Snapshot.from_json(
         receipt.get("installed"),
         label="installed",
         require_object_policy=require_object_policy,
+        legacy_historical_object_policy=receipt_schema_version == 1,
     )
     backup_expected = Snapshot.from_json(
         receipt.get("backup"),
         label="backup",
         require_object_policy=require_object_policy,
+        legacy_historical_object_policy=receipt_schema_version == 1,
     )
     staged_backup: Path | None = None
     staged_parent_expected: Snapshot | None = None

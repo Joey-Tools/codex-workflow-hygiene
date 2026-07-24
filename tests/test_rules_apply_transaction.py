@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import errno
 import fcntl
 import hashlib
@@ -283,6 +283,79 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 "{rules}",
             ],
         )
+
+    def apply_argv(self) -> list[str]:
+        namespace = self.apply_namespace()
+        return [
+            "apply",
+            "--candidate",
+            namespace.candidate,
+            "--candidate-sha256",
+            namespace.candidate_sha256,
+            "--expected-sha256",
+            namespace.expected_sha256,
+            "--backup-name",
+            namespace.backup_name,
+            "--receipt",
+            namespace.receipt,
+            "--validator-timeout-seconds",
+            str(namespace.validator_timeout_seconds),
+            "--lock-timeout-seconds",
+            str(namespace.lock_timeout_seconds),
+            "--",
+            *namespace.validator_command,
+        ]
+
+    def recover_argv(self) -> list[str]:
+        return [
+            "recover",
+            "--receipt",
+            str(self.receipt),
+            "--lock-timeout-seconds",
+            "2",
+        ]
+
+    @contextmanager
+    def fault_private_stage_descriptor_closes(self):
+        real_close_descriptors = TRANSACTION.close_descriptors_best_effort
+        closed: list[tuple[str, int]] = []
+
+        def close_stage_with_faults(
+            descriptors: list[tuple[str, int]],
+            *,
+            release_uncertain: bool = False,
+        ) -> list[dict[str, object]]:
+            if [descriptor for descriptor, _fd in descriptors] == [
+                "private_stage",
+                "rules_parent",
+            ]:
+                failures: list[dict[str, object]] = []
+                for index, (descriptor, fd) in enumerate(descriptors):
+                    TRANSACTION.os.close(fd)
+                    closed.append((descriptor, fd))
+                    error_number = errno.EIO if index == 0 else errno.EINTR
+                    failures.append(
+                        TRANSACTION.structured_operation_failure(
+                            "close",
+                            descriptor,
+                            OSError(
+                                error_number,
+                                f"fault-injected {descriptor} close",
+                            ),
+                        )
+                    )
+                return failures
+            return real_close_descriptors(
+                descriptors,
+                release_uncertain=release_uncertain,
+            )
+
+        with mock.patch.object(
+            TRANSACTION,
+            "close_descriptors_best_effort",
+            side_effect=close_stage_with_faults,
+        ):
+            yield closed
 
     def create_apply_evidence(
         self,
@@ -2923,6 +2996,86 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     "already_original",
                 )
 
+    def test_schema_v3_recovery_stage_close_faults_are_structured(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        stage_root = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        receipt["schema_version"] = 3
+        receipt["staged_backup_parent"] = TRANSACTION.Snapshot.from_stat(
+            stage_root.stat(follow_symlinks=False),
+            b"",
+        ).to_json()
+        receipt.pop("prepared_candidate_path", None)
+        receipt.pop("prepared_candidate_parent", None)
+        self.receipt.write_text(
+            json.dumps(receipt, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.receipt.chmod(0o600)
+        stdout = io.StringIO()
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            self.fault_private_stage_descriptor_closes() as closed,
+            redirect_stdout(stdout),
+            redirect_stderr(io.StringIO()),
+        ):
+            code = TRANSACTION.main(self.recover_argv())
+
+        self.assertEqual(code, 30)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["operation_status"], "recovered")
+        self.assertEqual(
+            payload["cleanup_reason"],
+            TRANSACTION.PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON,
+        )
+        self.assertEqual(
+            [failure["descriptor_class"] for failure in payload["cleanup_failures"]],
+            ["private_stage", "rules_parent"],
+        )
+        self.assertEqual(len(closed), 2)
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_schema_v4_recovery_stage_close_faults_are_structured(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        stdout = io.StringIO()
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            self.fault_private_stage_descriptor_closes() as closed,
+            redirect_stdout(stdout),
+            redirect_stderr(io.StringIO()),
+        ):
+            code = TRANSACTION.main(self.recover_argv())
+
+        self.assertEqual(code, 30)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["operation_status"], "recovered")
+        self.assertEqual(
+            payload["cleanup_reason"],
+            TRANSACTION.PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON,
+        )
+        self.assertEqual(
+            [failure["descriptor_class"] for failure in payload["cleanup_failures"]],
+            ["private_stage", "rules_parent"],
+        )
+        self.assertEqual(len(closed), 2)
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
     def test_post_exchange_backup_publication_failure_is_recoverable(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         stderr = io.StringIO()
@@ -3865,6 +4018,27 @@ class RulesApplyTransactionTests(unittest.TestCase):
         )
         self.assertEqual(list(stage.iterdir()), [])
 
+    def test_stage_casefold_alias_is_rejected_before_any_write(self) -> None:
+        self.receipt = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME.swapcase()
+
+        payload = self.assert_stage_namespace_receipt_rejected()
+
+        self.assertIn("case folding", payload["message"])
+        self.assertFalse(self.receipt.exists())
+
+    def test_stage_unicode_alias_is_rejected_before_any_write(self) -> None:
+        unicode_alias = TRANSACTION.PRIVATE_STAGE_NAME.replace("s", "\u017f", 1)
+        self.assertEqual(
+            TRANSACTION.normalized_namespace_component(unicode_alias),
+            TRANSACTION.normalized_namespace_component(TRANSACTION.PRIVATE_STAGE_NAME),
+        )
+        self.receipt = self.rules_dir / unicode_alias
+
+        payload = self.assert_stage_namespace_receipt_rejected()
+
+        self.assertIn("Unicode normalization", payload["message"])
+        self.assertFalse(self.receipt.exists())
+
     def test_stage_name_prefix_sibling_is_not_namespace_overlap(self) -> None:
         receipt_parent = self.rules_dir / (f"{TRANSACTION.PRIVATE_STAGE_NAME}-shadow")
         receipt_parent.mkdir(mode=0o700)
@@ -4456,6 +4630,37 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(payload["status"], "recovered")
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
 
+    def test_legacy_v1_rejects_explicit_non_single_link_policy_downgrade(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        receipt = self.rewrite_receipt_as_legacy_v1()
+        for key in ("original", "installed", "backup"):
+            receipt[key]["object_policy"] = {"nlink": 2}
+        self.receipt.write_text(
+            json.dumps(receipt, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.receipt.chmod(0o600)
+        os.link(self.rules, self.root / "downgraded-live-hardlink")
+        os.link(self.backup, self.root / "downgraded-backup-hardlink")
+
+        recovered = self.run_recover()
+
+        self.assertEqual(recovered.returncode, 50, recovered.stderr)
+        payload = json.loads(recovered.stdout)
+        self.assertEqual(payload["status"], "receipt_invalid")
+        self.assertIn(
+            "object_policy.nlink must be 1 when present",
+            payload["message"],
+        )
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+        self.assertEqual(self.rules.stat().st_nlink, 2)
+        self.assertEqual(self.backup.stat().st_nlink, 2)
+
     def test_legacy_v1_recovery_rejects_current_live_hardlink(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         applied = self.run_apply()
@@ -4618,6 +4823,137 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(payload["status"], "recovery_refused")
         self.assertIn("object_policy", payload["mismatched_properties"])
 
+    def test_legacy_completed_exchange_then_parent_drift_requires_recovery(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.rewrite_receipt_as_legacy_v1()
+        real_rollback = TRANSACTION.rollback
+        moved_parent = self.root / "task.bound"
+        drifted = False
+
+        def rollback_then_replace_parent(
+            **kwargs: object,
+        ) -> tuple[bool, dict[str, object]]:
+            nonlocal drifted
+            result = real_rollback(**kwargs)
+            if result[0] and not drifted:
+                drifted = True
+                os.rename(self.receipt.parent, moved_parent)
+                self.receipt.parent.mkdir(mode=0o700)
+            return result
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "rollback",
+                side_effect=rollback_then_replace_parent,
+            ),
+        ):
+            code, payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertTrue(drifted)
+        self.assertEqual(code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["reason"], "receipt_parent_changed")
+        self.assertEqual(
+            Path(payload["recovery_locators"]["receipt"]).resolve(),
+            self.receipt.resolve(),
+        )
+        self.assertTrue(
+            any(
+                event["operation"] == "legacy_rollback_exchange"
+                and event["phase"] == "completion"
+                for event in payload["mutation_journal"]
+            )
+        )
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_legacy_completed_exchange_then_lock_close_fault_requires_recovery(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.rewrite_receipt_as_legacy_v1()
+        real_close_descriptors = TRANSACTION.close_descriptors_best_effort
+
+        def fail_lock_close(
+            descriptors: list[tuple[str, int]],
+            *,
+            release_uncertain: bool = False,
+        ) -> list[dict[str, object]]:
+            if (
+                release_uncertain
+                and descriptors
+                and descriptors[0][0] == "transaction_lock"
+            ):
+                TRANSACTION.os.close(descriptors[0][1])
+                return [
+                    TRANSACTION.structured_operation_failure(
+                        "close",
+                        "transaction_lock",
+                        OSError(errno.EIO, "fault-injected legacy lock close"),
+                        release_uncertain=True,
+                    )
+                ]
+            return real_close_descriptors(
+                descriptors,
+                release_uncertain=release_uncertain,
+            )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "close_descriptors_best_effort",
+                side_effect=fail_lock_close,
+            ),
+        ):
+            code, payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertEqual(code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["reason"], "lock_close_failed")
+        self.assertEqual(
+            payload["cleanup_failures"][0]["descriptor"],
+            "transaction_lock",
+        )
+        self.assertTrue(payload["cleanup_failures"][0]["release_uncertain"])
+        self.assertTrue(
+            any(
+                event["operation"] == "legacy_rollback_exchange"
+                and event["phase"] == "completion"
+                for event in payload["mutation_journal"]
+            )
+        )
+        self.assertEqual(
+            Path(payload["recovery_locators"]["backup"]).resolve(),
+            self.backup.resolve(),
+        )
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
     def test_legacy_recovery_rejects_rules_parent_replacement(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         applied = self.run_apply()
@@ -4732,6 +5068,50 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(payload["reason"], "fault_injected")
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_legacy_recovery_stage_close_faults_are_structured_in_stdout(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.rewrite_receipt_as_legacy_v1()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            self.fault_private_stage_descriptor_closes() as closed,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            code = TRANSACTION.main(self.recover_argv())
+
+        self.assertEqual(code, 30)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["operation_status"], "recovered")
+        self.assertEqual(
+            payload["cleanup_reason"],
+            TRANSACTION.PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON,
+        )
+        self.assertEqual(
+            [failure["descriptor_class"] for failure in payload["cleanup_failures"]],
+            ["private_stage", "rules_parent"],
+        )
+        self.assertTrue(
+            any(
+                event["operation"] == "legacy_rollback_exchange"
+                for event in payload["mutation_journal"]
+            )
+        )
+        self.assertEqual(len(closed), 2)
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+        self.assertIn("descriptor_cleanup_failed", stderr.getvalue())
 
     def test_recover_rejects_v2_receipt_with_non_single_link_policy(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -4868,6 +5248,49 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertTrue(
             any(
                 warning["status"] == "stage_cleanup_refused"
+                for warning in cleanup["warnings"]
+            )
+        )
+
+    def test_apply_stage_close_faults_are_structured_in_stdout(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            self.fault_private_stage_descriptor_closes() as closed,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            code = TRANSACTION.main(self.apply_argv())
+
+        self.assertEqual(code, 30)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["operation_status"], "applied")
+        self.assertEqual(
+            payload["cleanup_reason"],
+            TRANSACTION.PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON,
+        )
+        self.assertEqual(
+            [failure["descriptor_class"] for failure in payload["cleanup_failures"]],
+            ["private_stage", "rules_parent"],
+        )
+        self.assertEqual(
+            [failure["descriptor"] for failure in payload["cleanup_failures"]],
+            ["private_stage", "rules_parent"],
+        )
+        self.assertEqual(len(closed), 2)
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+        cleanup = json.loads(stderr.getvalue().strip())
+        self.assertTrue(
+            any(
+                warning["status"] == "descriptor_cleanup_failed"
                 for warning in cleanup["warnings"]
             )
         )

@@ -58,6 +58,17 @@ superseded_by:
   overlapping the fixed stage by leaf, ancestry, or canonical alias.
 - Extended structured best-effort descriptor cleanup and primary-outcome
   precedence to every remaining bind, read, rollback, and stage helper.
+- Normalized every schema-v1 receipt snapshot's historical link policy to
+  unknown, rejecting an explicitly supplied non-single link count before it
+  can authorize matching current hardlinks.
+- Extended the fixed-stage namespace gate to descriptor-bound directory
+  identities and conservative NFKC/casefold component comparison.
+- Added legacy rollback mutation entry/completion events before exchange, so
+  parent or lock finalization failure retains the journal and recovery
+  locators.
+- Routed private-stage descriptor-close uncertainty into apply and every
+  recovery result; a would-be clean success now exits nonzero with its original
+  operation status and stable FD classes in stdout JSON.
 - Removed the unlocked no-change fast path; apparent no-change now validates
   under the shared writer lock and returns only `no_change_after_lock`.
 - Bound idempotent recovery to exact original or persisted recovery-terminal
@@ -107,15 +118,29 @@ superseded_by:
   in a deterministic best-effort-all pass. EIO/EINTR on one descriptor cannot
   skip later closes or replace an existing apply/recovery terminal status.
 - Legacy schema-v1 receipts treat absent historical `nlink` as unknown history,
-  while every current regular transaction object still has to prove
-  `st_nlink == 1`; hardlinks before exchange, during exchange, after restore,
-  or before `already_original` fail closed.
+  ignore an explicit valid historical `nlink: 1`, and reject any explicit
+  non-single value as receipt tampering, while every current regular
+  transaction object still has to prove `st_nlink == 1`; hardlinks before
+  exchange, during exchange, after restore, or before `already_original` fail
+  closed.
 - Apply and recovery reject receipt, terminal/result, prepared, and lock
   namespaces that are the fixed stage itself, its ancestor/descendant, or a
-  canonical/symlink alias before any new persistent transaction write.
+  canonical/symlink, case-fold, or Unicode-normalized alias before any new
+  persistent transaction write. Existing directory components are anchored by
+  descriptor identity; absent leaves compare normalized component sequences
+  only under the same bound rules parent.
 - Bind/read/rollback helpers now use the same deterministic best-effort close
   primitive as terminal evidence; structured close faults attach to the
   established property, tamper, or rollback result.
+- Legacy rollback records mutation entry before the exchange attempt and
+  completion immediately after a proved exchange. A later receipt-parent,
+  control, or lock-close failure therefore remains `recovery_required` with
+  the mutation journal and receipt/live/backup/terminal locators.
+- Private-stage cleanup failures join the same structured accumulator for
+  apply and schema-v1/v2/v3/v4 recovery. Existing failure results keep their
+  terminal status; an otherwise successful apply/recovery reports
+  `recovery_required`, records `operation_status`, and exposes stable
+  `cleanup_reason` plus `descriptor_class` fields.
 - Recovery reads the immutable terminal result and exact live/backup roles
   under the lock before strict terminal validation; an `O/M` v4 primary state
   gets a bounded stage/prepared probe to prove exact `Q` or retain possible
@@ -144,7 +169,7 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 152 passed on Python 3.13. New cases cover fixed
+- Rules transaction tests: 161 passed on Python 3.13. New cases cover fixed
   stage zero-artifact failures, parse-to-lock receipt races, delegated-v3
   post-mutation receipt and parent changes, every terminal publication crash
   point, successful retry, terminal truncation prohibition, terminal/primary
@@ -155,8 +180,12 @@ superseded_by:
   uncertainty, persistent evidence lifetime, deterministic multi-close
   EIO/EINTR, primary-result preservation for recovered/required/refused,
   schema-v1 current hardlink boundaries, receipt/stage namespace overlap, and
-  bind/read/rollback multi-close precedence.
-- Full repository suite covered 1,214 tests. Only the same 4 sandbox-only GPG
+  bind/read/rollback multi-close precedence. The latest 9 cases cover
+  schema-v1 explicit-link downgrade attempts, legacy post-exchange
+  parent/lock finalization failures, case-folded and Unicode-normalized stage
+  aliases, and structured private-stage close failures across apply plus
+  schema-v1/v3/v4 recovery.
+- Full repository suite covered 1,223 tests. Only the same 4 sandbox-only GPG
   merge-fixture errors remained; their exact keybox-enabled rerun passed 4 of
   4 outside the sandbox.
 - Ruff check and Ruff format-check passed for both changed Python files.
