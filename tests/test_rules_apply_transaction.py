@@ -624,6 +624,71 @@ class RulesApplyTransactionTests(unittest.TestCase):
         )
         self.assert_no_private_stage()
 
+    def test_new_stage_and_lock_normalize_restrictive_owner_umask(self) -> None:
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        stage: object | None = None
+        previous_umask = os.umask(0o200)
+        try:
+            with TRANSACTION.shared_lock(
+                lock,
+                timeout_seconds=2.0,
+            ):
+                self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+            stage = TRANSACTION.PrivateStage(self.rules_dir)
+            self.assertEqual(stat.S_IMODE(stage.path.stat().st_mode), 0o700)
+        finally:
+            if stage is not None:
+                stage.cleanup()
+            os.umask(previous_umask)
+
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+        self.assert_no_private_stage()
+
+    def test_read_stable_classifies_hardlink_drift_as_object_policy(self) -> None:
+        alias = self.root / "candidate.alias"
+        real_read_bound_fd = TRANSACTION.read_bound_fd
+        linked = False
+
+        def link_after_descriptor_read(
+            fd: int,
+            *,
+            label: str,
+            max_bytes: int = TRANSACTION.MAX_RULES_BYTES,
+        ) -> tuple[bytes, object]:
+            nonlocal linked
+            payload, snapshot = real_read_bound_fd(
+                fd,
+                label=label,
+                max_bytes=max_bytes,
+            )
+            if not linked:
+                os.link(self.candidate, alias)
+                linked = True
+            return payload, snapshot
+
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "read_bound_fd",
+                side_effect=link_after_descriptor_read,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.read_stable(
+                self.candidate,
+                label="candidate_source",
+            )
+
+        self.assertTrue(linked)
+        self.assertEqual(
+            raised.exception.status,
+            "candidate_source_object_policy_changed",
+        )
+        self.assertEqual(
+            raised.exception.details["mismatched_properties"],
+            ["object_policy"],
+        )
+
     def test_candidate_digest_mismatch_is_rejected_before_staging(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
 

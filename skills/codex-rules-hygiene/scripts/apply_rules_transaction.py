@@ -1291,8 +1291,10 @@ def read_stable(
                 status = f"{label}_identity_changed"
             elif "content" in mismatches:
                 status = f"{label}_content_changed"
-            else:
+            elif "access_policy" in mismatches:
                 status = f"{label}_access_policy_changed"
+            else:
+                status = f"{label}_object_policy_changed"
             raise TransactionError(
                 status,
                 f"{label} path changed after it was read",
@@ -2128,9 +2130,11 @@ class PrivateStage:
             )
             raise
         self.stage_name = PRIVATE_STAGE_NAME
+        stage_created = False
         if not recovery_mode:
             try:
                 os.mkdir(self.stage_name, 0o700, dir_fd=self.rules_parent_fd)
+                stage_created = True
             except FileExistsError:
                 pass
             except OSError as error:
@@ -2157,6 +2161,32 @@ class PrivateStage:
                 dir_fd=self.rules_parent_fd,
             )
             stage_stat = os.fstat(self.stage_fd)
+            if stage_created:
+                created_path_stat = os.stat(
+                    self.stage_name,
+                    dir_fd=self.rules_parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(stage_stat.st_mode)
+                    or stage_stat.st_uid != os.geteuid()
+                    or (
+                        stage_stat.st_dev,
+                        stage_stat.st_ino,
+                        stat.S_IFMT(stage_stat.st_mode),
+                    )
+                    != (
+                        created_path_stat.st_dev,
+                        created_path_stat.st_ino,
+                        stat.S_IFMT(created_path_stat.st_mode),
+                    )
+                ):
+                    raise TransactionError(
+                        "private_stage_invalid",
+                        "new staging directory changed before policy normalization",
+                    )
+                os.fchmod(self.stage_fd, 0o700)
+                stage_stat = os.fstat(self.stage_fd)
             stage_path_stat = os.stat(
                 self.stage_name,
                 dir_fd=self.rules_parent_fd,
@@ -3531,11 +3561,13 @@ def shared_lock(
     fd = -1
     locked = False
     binding: BoundFile | None = None
+    lock_created = False
     primary_error: BaseException | None = None
     primary_traceback: object | None = None
     try:
         try:
             fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+            lock_created = True
         except FileExistsError:
             fd = open_untrusted_regular_file(
                 path,
@@ -3548,6 +3580,9 @@ def shared_lock(
                 "lock_invalid",
                 "transaction lock is not a regular file",
             )
+        if lock_created:
+            os.fchmod(fd, 0o600)
+            opened_lock = os.fstat(fd)
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:

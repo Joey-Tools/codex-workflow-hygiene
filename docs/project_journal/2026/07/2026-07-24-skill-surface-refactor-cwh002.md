@@ -149,6 +149,14 @@ superseded_by:
   immediately from the returned descriptor. FIFO substitution is therefore a
   typed fail-closed result rather than an unbounded wait, including before the
   first lock, after validator return, and during lock-held recovery.
+- A newly created fixed stage or lock is distinguished from retained
+  infrastructure. After the new object is bound and its type/path identity is
+  proved, the transaction normalizes the held descriptor to `0700` or `0600`;
+  a restrictive caller umask can no longer strand an unusable persistent
+  stage or lock, while pre-existing objects are never silently chmodded.
+- Path revalidation reports link-count drift as `object_policy_changed`
+  instead of conflating it with an access-policy change. The structured status
+  and `mismatched_properties` now identify the same protected property.
 - Recovery reads the immutable terminal result and exact live/backup roles
   under the lock before strict terminal validation; an `O/M` v4 primary state
   gets a bounded stage/prepared probe to prove exact `Q` or retain possible
@@ -177,7 +185,7 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 165 passed on Python 3.13. New cases cover fixed
+- Rules transaction tests: 167 passed on Python 3.13. New cases cover fixed
   stage zero-artifact failures, parse-to-lock receipt races, delegated-v3
   post-mutation receipt and parent changes, every terminal publication crash
   point, successful retry, terminal truncation prohibition, terminal/primary
@@ -195,8 +203,10 @@ superseded_by:
   schema-v1/v3/v4 recovery. The final 4 cases prove that an initial candidate
   FIFO, an existing lock FIFO, a post-validator candidate FIFO replacement,
   and a lock-held recovery backup FIFO all fail promptly without creating new
-  transaction artifacts.
-- Full repository suite covered 1,227 tests. Only the same 4 sandbox-only GPG
+  transaction artifacts. Two additional cases cover restrictive-owner umask
+  normalization for newly created infrastructure and exact object-policy
+  classification for a hardlink race.
+- Full repository suite covered 1,229 tests. Only the same 4 sandbox-only GPG
   merge-fixture errors remained; their exact keybox-enabled rerun passed 4 of
   4 outside the sandbox.
 - Ruff check and Ruff format-check passed for both changed Python files.
