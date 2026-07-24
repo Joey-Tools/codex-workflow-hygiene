@@ -1664,6 +1664,76 @@ class RulesApplyTransactionTests(unittest.TestCase):
             evidence.close()
             stage.cleanup()
 
+    def test_backup_case_alias_is_reproved_missing_before_exchange(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        backup_alias = self.rules_dir / self.backup_name.swapcase()
+        real_move = TRANSACTION.PrivateStage.move_to
+        real_observe = TRANSACTION.observe_directory_entry
+
+        def occupy_alias_then_move(
+            stage: object,
+            path: Path,
+            target: Path,
+            target_expected: object,
+            *,
+            pre_exchange_revalidate: object = None,
+        ) -> object:
+            backup_alias.write_bytes(LATER_RULES)
+            backup_alias.chmod(0o640)
+            return real_move(
+                stage,
+                path,
+                target,
+                target_expected,
+                pre_exchange_revalidate=pre_exchange_revalidate,
+            )
+
+        def observe_case_insensitive_alias(
+            directory_fd: int,
+            name: str,
+            *,
+            expected: object = None,
+        ) -> dict[str, object]:
+            if name == self.backup.name and backup_alias.exists():
+                return real_observe(
+                    directory_fd,
+                    backup_alias.name,
+                    expected=expected,
+                )
+            return real_observe(directory_fd, name, expected=expected)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "move_to",
+                autospec=True,
+                side_effect=occupy_alias_then_move,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "observe_directory_entry",
+                side_effect=observe_case_insensitive_alias,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_exchange",
+            ) as atomic_exchange,
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(raised.exception.status, "recovery_required")
+        self.assertEqual(raised.exception.details["reason"], "backup_exists")
+        atomic_exchange.assert_not_called()
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(backup_alias.read_bytes(), LATER_RULES)
+        self.assertTrue(self.receipt.is_file())
+
     def test_validator_output_ceiling_terminates_the_process_group(self) -> None:
         self.write_validator(
             f"""\
@@ -3438,6 +3508,78 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.backup.read_bytes(), NEW_RULES)
         self.assert_no_private_stage()
 
+    def test_reserved_terminal_does_not_downgrade_unknown_post_exchange_state(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+
+        def refuse_publication(
+            _stage: object,
+            _path: Path,
+            _backup: Path,
+        ) -> object:
+            raise TRANSACTION.TransactionError(
+                "atomic_no_replace_failed",
+                "fault-injected publication failure",
+            )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "publish_backup",
+                autospec=True,
+                side_effect=refuse_publication,
+            ),
+            redirect_stderr(io.StringIO()),
+        ):
+            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(exit_code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        staged = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME / "candidate"
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(staged.read_bytes(), OLD_RULES)
+        self.assertFalse(TRANSACTION.prepared_candidate_path(self.receipt).exists())
+        self.backup.write_bytes(LATER_RULES)
+        self.backup.chmod(0o640)
+
+        recovered = self.run_recover()
+
+        self.assertEqual(recovered.returncode, 30, recovered.stderr)
+        recovered_payload = json.loads(recovered.stdout)
+        self.assertEqual(recovered_payload["status"], "recovery_required")
+        self.assertEqual(
+            recovered_payload["reason"],
+            "schema_v4_state_unrecognized",
+        )
+        self.assertEqual(
+            recovered_payload["observed_roles"],
+            {
+                "live": "I",
+                "backup": "?",
+                "staged_backup": "O",
+                "prepared_candidate": "M",
+            },
+        )
+        self.assertTrue(
+            any(
+                event["operation"] == "prior_exchange_state"
+                and event["phase"] == "observed"
+                for event in recovered_payload["mutation_journal"]
+            )
+        )
+        terminal = json.loads(
+            TRANSACTION.recovery_terminal_path(self.receipt).read_text(encoding="utf-8")
+        )
+        self.assertEqual(terminal["state"], "reserved")
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(self.backup.read_bytes(), LATER_RULES)
+        self.assertEqual(staged.read_bytes(), OLD_RULES)
+
     def test_recovery_publication_fsync_failure_records_committed_state(
         self,
     ) -> None:
@@ -4351,6 +4493,40 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertIn("Unicode normalization", payload["message"])
         self.assertFalse(self.receipt.exists())
 
+    def test_transaction_leaf_casefold_and_nfkc_aliases_are_rejected_pairwise(
+        self,
+    ) -> None:
+        lock_name = ".default.rules.apply.lock"
+        aliases = (
+            lock_name.swapcase(),
+            lock_name.replace("s", "\u017f", 1),
+        )
+        self.write_validator("raise SystemExit(0)\n")
+
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                self.assertEqual(
+                    TRANSACTION.normalized_namespace_component(alias),
+                    TRANSACTION.normalized_namespace_component(lock_name),
+                )
+                self.receipt = self.rules_dir / alias
+
+                result = self.run_apply()
+
+                self.assertEqual(result.returncode, 50, result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["status"], "path_invalid")
+                self.assertIn(
+                    "descriptor-bound parent leaf",
+                    payload["message"],
+                )
+                self.assertEqual(payload["left_label"], "lock")
+                self.assertEqual(payload["right_label"], "receipt")
+                self.assertFalse(
+                    (self.rules_dir / ".default.rules.apply.lock").exists()
+                )
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+
     def test_stage_name_prefix_sibling_is_not_namespace_overlap(self) -> None:
         receipt_parent = self.rules_dir / (f"{TRANSACTION.PRIVATE_STAGE_NAME}-shadow")
         receipt_parent.mkdir(mode=0o700)
@@ -4931,6 +5107,146 @@ class RulesApplyTransactionTests(unittest.TestCase):
         )
         self.assertFalse(pending_locator.exists())
 
+    def test_pending_terminal_locator_rejects_unlink_and_replacement_races(
+        self,
+    ) -> None:
+        for action in ("unlink", "replace"):
+            with (
+                self.subTest(action=action),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-pending-retention-{action}."
+                ) as temp_dir,
+            ):
+                case_root = Path(temp_dir)
+                self.codex_home = case_root / "codex-home"
+                self.rules_dir = self.codex_home / "rules"
+                self.rules_dir.mkdir(parents=True)
+                self.rules = self.rules_dir / "default.rules"
+                self.rules.write_bytes(OLD_RULES)
+                self.rules.chmod(0o640)
+                self.candidate = case_root / "candidate.rules"
+                self.candidate.write_bytes(NEW_RULES)
+                self.receipt = case_root / "task" / "recovery.json"
+                self.receipt.parent.mkdir(mode=0o700)
+                self.backup_name = f"default.rules.bak-pending-{action}"
+                self.backup = self.rules_dir / self.backup_name
+                self.validator = case_root / "validator.py"
+                self.write_validator("raise SystemExit(0)\n")
+                applied = self.run_apply()
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+
+                real_validate = TRANSACTION.RecoveryTerminalEvidence.validate
+                real_observe = TRANSACTION.observe_directory_entry
+                validation_failed = False
+                entry_mutated = False
+
+                def fail_with_pending(evidence: object) -> dict[str, object]:
+                    nonlocal validation_failed
+                    assert isinstance(
+                        evidence,
+                        TRANSACTION.RecoveryTerminalEvidence,
+                    )
+                    pending_prefix = (
+                        f"{evidence.result_path.name}"
+                        f"{TRANSACTION.RECOVERY_TERMINAL_TEMP_MARKER}"
+                    )
+                    if (
+                        not validation_failed
+                        and evidence.result is None
+                        and any(
+                            child.name.startswith(pending_prefix)
+                            for child in evidence.parent.path.iterdir()
+                        )
+                    ):
+                        validation_failed = True
+                        raise TRANSACTION.TransactionError(
+                            "fault_injected_control_failure",
+                            "fault-injected pre-rename control failure",
+                        )
+                    return real_validate(evidence)
+
+                def mutate_pending_before_observation(
+                    directory_fd: int,
+                    name: str,
+                    *,
+                    expected: object = None,
+                ) -> dict[str, object]:
+                    nonlocal entry_mutated
+                    if (
+                        not entry_mutated
+                        and expected is not None
+                        and TRANSACTION.RECOVERY_TERMINAL_TEMP_MARKER in name
+                    ):
+                        matched_observation = real_observe(
+                            directory_fd,
+                            name,
+                            expected=expected,
+                        )
+                        entry_mutated = True
+                        if action == "unlink":
+                            os.unlink(name, dir_fd=directory_fd)
+                        else:
+                            os.rename(
+                                name,
+                                f"{name}.attacker-bound",
+                                src_dir_fd=directory_fd,
+                                dst_dir_fd=directory_fd,
+                            )
+                            replacement_fd = os.open(
+                                name,
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                                0o600,
+                                dir_fd=directory_fd,
+                            )
+                            try:
+                                os.write(replacement_fd, b"replacement\n")
+                            finally:
+                                os.close(replacement_fd)
+                        return matched_observation
+                    return real_observe(
+                        directory_fd,
+                        name,
+                        expected=expected,
+                    )
+
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION.RecoveryTerminalEvidence,
+                        "validate",
+                        autospec=True,
+                        side_effect=fail_with_pending,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "observe_directory_entry",
+                        side_effect=mutate_pending_before_observation,
+                    ),
+                ):
+                    code, payload = TRANSACTION.recover_transaction(
+                        SimpleNamespace(
+                            receipt=str(self.receipt),
+                            lock_timeout_seconds=2.0,
+                        )
+                    )
+
+                self.assertTrue(validation_failed)
+                self.assertTrue(entry_mutated)
+                self.assertEqual(code, 30)
+                self.assertEqual(payload["status"], "recovery_required")
+                self.assertEqual(
+                    payload["retention_status"],
+                    "retention_incomplete",
+                )
+                self.assertIsNone(payload.get("pending_locator"))
+                self.assertEqual(
+                    payload["pending_retention"]["retention_status"],
+                    "retention_incomplete",
+                )
+
     def test_terminal_result_publication_never_truncates_reservation(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         applied = self.run_apply()
@@ -5021,6 +5337,102 @@ class RulesApplyTransactionTests(unittest.TestCase):
             terminal.resolve(),
         )
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+
+    def test_schema_v4_same_inode_terminal_rewrite_is_binding_change(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        terminal = Path(receipt["recovery_terminal_path"])
+        reservation = json.loads(terminal.read_text(encoding="utf-8"))
+        reservation_inode = terminal.stat().st_ino
+        terminal.write_text(
+            json.dumps(
+                {
+                    "schema_version": TRANSACTION.RECOVERY_TERMINAL_SCHEMA_VERSION,
+                    "transaction_id": receipt["transaction_id"],
+                    "created_unix_ns": reservation["created_unix_ns"],
+                    "state": TRANSACTION.RECOVERY_TERMINAL_RESTORED,
+                    "evidence_kind": "original-identity",
+                    "restored": receipt["original"],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        terminal.chmod(0o600)
+        self.assertEqual(terminal.stat().st_ino, reservation_inode)
+
+        recovered = self.run_recover()
+
+        self.assertEqual(recovered.returncode, 30, recovered.stderr)
+        payload = json.loads(recovered.stdout)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["reason"], "recovery_terminal_binding_changed")
+        self.assertIn("content", payload["mismatched_properties"])
+        self.assertEqual(payload["transaction_state"], "C")
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+
+    def test_schema_v3_explicitly_accepts_same_inode_terminal_rewrite(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        stage_root = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        receipt["schema_version"] = 3
+        receipt["staged_backup_parent"] = TRANSACTION.Snapshot.from_stat(
+            stage_root.stat(follow_symlinks=False),
+            b"",
+        ).to_json()
+        receipt.pop("prepared_candidate_path", None)
+        receipt.pop("prepared_candidate_parent", None)
+        self.receipt.write_text(
+            json.dumps(receipt, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.receipt.chmod(0o600)
+        rules_fd = os.open(
+            self.rules_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            TRANSACTION.atomic_rename_exchange(
+                rules_fd,
+                self.backup.name,
+                rules_fd,
+                self.rules.name,
+            )
+        finally:
+            os.close(rules_fd)
+        terminal = Path(receipt["recovery_terminal_path"])
+        reservation = json.loads(terminal.read_text(encoding="utf-8"))
+        reservation_inode = terminal.stat().st_ino
+        terminal.write_text(
+            json.dumps(
+                {
+                    "schema_version": TRANSACTION.RECOVERY_TERMINAL_SCHEMA_VERSION,
+                    "transaction_id": receipt["transaction_id"],
+                    "created_unix_ns": reservation["created_unix_ns"],
+                    "state": TRANSACTION.RECOVERY_TERMINAL_RESTORED,
+                    "evidence_kind": "original-identity",
+                    "restored": receipt["original"],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        terminal.chmod(0o600)
+        self.assertEqual(terminal.stat().st_ino, reservation_inode)
+
+        recovered = self.run_recover()
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        payload = json.loads(recovered.stdout)
+        self.assertEqual(payload["status"], "already_original")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
 
     def test_schema_v3_state_p_replaced_terminal_requires_recovery(self) -> None:
         self.write_validator("raise SystemExit(0)\n")

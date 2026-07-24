@@ -162,9 +162,10 @@ superseded_by:
 - Recovery-terminal result publication now carries exact pending retention
   evidence through every pre-rename failure. A locator is emitted only after
   descriptor, entry, exact bytes, owner-only access, one-link policy, and both
-  fsyncs pass; other outcomes say `retention_incomplete`. Retry adopts one
-  reservation-time-bound exact pending result or blocks without creating
-  another unknown pending file.
+  fsyncs pass, the entry observation matches, and the bound parent plus
+  descriptor are revalidated again; unlink or replacement races say
+  `retention_incomplete`. Retry adopts one reservation-time-bound exact
+  pending result or blocks without creating another unknown pending file.
 - Recovery reads the immutable terminal result and exact live/backup roles
   under the lock before strict terminal validation; an `O/M` v4 primary state
   gets a bounded stage/prepared probe to prove exact `Q` or retain possible
@@ -172,6 +173,18 @@ superseded_by:
   or ambiguous post-mutation state records observed mutation and returns
   `recovery_required`; only proved pre-mutation `Q` drift remains
   `recovery_refused`.
+- A reserved terminal clears deferred mutation evidence only after the full
+  v4 role tuple proves `Q`. Exact installed live plus exact original staged
+  evidence now proves a prior exchange even when backup is unknown and the
+  prepared leaf is missing.
+- Schema-v4 binds the terminal reservation's exact identity, size/digest,
+  access policy, and link policy to the receipt regardless of decoded state.
+  Only schema-v3 explicitly accepts the historical same-inode restored
+  rewrite.
+- Transaction leaves sharing one held parent are rejected pairwise when their
+  names collide after NFKC normalization and case folding. Immediately before
+  live exchange, apply revalidates controls and proves the backup leaf still
+  missing, including case-insensitive alias occupancy.
 - Validator execution rejects nonfinite deadlines, caps aggregate captured
   output, and independently enumerates live same-PGID members on Darwin and
   Linux before accepting completion, including descendants whose standard
@@ -193,7 +206,7 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 172 passed on Python 3.13. New cases cover fixed
+- Rules transaction tests: 178 passed on Python 3.13. New cases cover fixed
   stage zero-artifact failures, parse-to-lock receipt races, delegated-v3
   post-mutation receipt and parent changes, every terminal publication crash
   point, successful retry, terminal truncation prohibition, terminal/primary
@@ -216,8 +229,13 @@ superseded_by:
   replacement fails without chmod or deletion; a new lock path replacement
   or hardlink fails before fchmod; and terminal-result pending files either
   produce exact durable locators or explicit incomplete-retention evidence
-  without accumulating unknown pending files across retries.
-- Full repository suite passed all 1,234 tests.
+  without accumulating unknown pending files across retries. The final 6
+  adversarial cases cover pairwise case-folded and NFKC leaf aliases,
+  case-insensitive backup occupancy immediately before exchange, reserved
+  terminal handling for ambiguous post-exchange roles, strict schema-v4 and
+  explicitly relaxed schema-v3 same-inode terminal rewrites, and pending
+  locator unlink/replacement races after an initially matching observation.
+- Full repository suite passed all 1,240 tests.
 - Ruff check and Ruff format-check passed for both changed Python files.
 - `codex-rules-hygiene` passed the official skill validator through an
   isolated `uv` PyYAML environment after the direct installed wrapper reported

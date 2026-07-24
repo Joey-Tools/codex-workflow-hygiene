@@ -926,6 +926,84 @@ def normalized_namespace_component(component: str) -> str:
     return unicodedata.normalize("NFKC", normalized.casefold())
 
 
+def reject_normalized_transaction_leaf_aliases(
+    paths: list[tuple[str, Path]],
+) -> None:
+    """Reject pairwise aliases while every shared parent identity stays bound."""
+
+    parents: dict[Path, BoundDirectory] = {}
+    admitted: list[tuple[str, Path, tuple[int, int], str]] = []
+    primary_error: BaseException | None = None
+    try:
+        for label, path in paths:
+            if path.name in ("", ".", "..") or Path(path.name).name != path.name:
+                raise TransactionError(
+                    "path_invalid",
+                    f"{label} must name one transaction leaf",
+                )
+            parent_path = canonical_namespace_path(
+                path.parent,
+                label=f"{label}_parent",
+            )
+            parent = parents.get(parent_path)
+            if parent is None:
+                parent = bind_directory(
+                    parent_path,
+                    label=f"{label}_namespace_parent",
+                )
+                parents[parent_path] = parent
+            validate_bound_directory(parent)
+            admitted.append(
+                (
+                    label,
+                    path,
+                    (parent.snapshot.device, parent.snapshot.inode),
+                    normalized_namespace_component(path.name),
+                )
+            )
+
+        for index, (left_label, left_path, left_parent, left_leaf) in enumerate(
+            admitted
+        ):
+            for right_label, right_path, right_parent, right_leaf in admitted[
+                index + 1 :
+            ]:
+                if left_parent != right_parent or left_leaf != right_leaf:
+                    continue
+                raise TransactionError(
+                    "path_invalid",
+                    (
+                        f"{left_label} and {right_label} alias the same "
+                        "descriptor-bound parent leaf after NFKC normalization "
+                        "and case folding"
+                    ),
+                    details={
+                        "left_label": left_label,
+                        "left_path": str(left_path),
+                        "right_label": right_label,
+                        "right_path": str(right_path),
+                        "normalized_leaf": left_leaf,
+                        "parent_identity": {
+                            "device": left_parent[0],
+                            "inode": left_parent[1],
+                        },
+                    },
+                )
+        for parent in parents.values():
+            validate_bound_directory(parent)
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        finalize_descriptor_cleanup(
+            [
+                (f"namespace_parent:{index}", parent.fd)
+                for index, parent in enumerate(parents.values())
+            ],
+            primary_error=primary_error,
+        )
+
+
 def component_namespaces_overlap(
     left: tuple[str, ...],
     right: tuple[str, ...],
@@ -5457,6 +5535,7 @@ class RecoveryTerminalEvidence:
     reservation: BoundFile
     expected_reservation: Snapshot
     transaction_id: str
+    allow_legacy_reservation_rewrite: bool = False
     result: BoundFile | None = None
     closed: bool = False
 
@@ -5492,15 +5571,18 @@ class RecoveryTerminalEvidence:
             label="recovery_terminal",
         )
         reservation = decode_recovery_terminal(reservation_payload)
-        if reservation.get("state") == RECOVERY_TERMINAL_RESERVED:
-            reservation_mismatches = property_mismatches(
+        if (
+            self.allow_legacy_reservation_rewrite
+            and reservation.get("state") == RECOVERY_TERMINAL_RESTORED
+        ):
+            # Schema v3 may have rewritten this exact inode before the
+            # crash-safe two-slot protocol was introduced.
+            reservation_mismatches = identity_access_and_object_policy_mismatches(
                 self.expected_reservation,
                 reservation_snapshot,
             )
         else:
-            # Legacy receipts may have rewritten this exact inode before the
-            # crash-safe two-slot protocol was introduced.
-            reservation_mismatches = identity_access_and_object_policy_mismatches(
+            reservation_mismatches = property_mismatches(
                 self.expected_reservation,
                 reservation_snapshot,
             )
@@ -5575,6 +5657,7 @@ def bind_recovery_terminal_evidence(
     parent: BoundDirectory,
     expected_reservation: Snapshot,
     transaction_id: str,
+    allow_legacy_reservation_rewrite: bool = False,
 ) -> RecoveryTerminalEvidence:
     reservation = bind_regular_file(
         path,
@@ -5588,6 +5671,7 @@ def bind_recovery_terminal_evidence(
         reservation=reservation,
         expected_reservation=expected_reservation,
         transaction_id=transaction_id,
+        allow_legacy_reservation_rewrite=allow_legacy_reservation_rewrite,
     )
     try:
         # Initial recovery may adopt a result left durably published by a prior
@@ -5859,16 +5943,32 @@ def pending_recovery_terminal_retention(
             inspected_binding,
             payload,
         )
+        pending_observation = observe_directory_entry(
+            evidence.parent.fd,
+            name,
+            expected=persisted,
+        )
+        if not observation_matches(pending_observation):
+            raise TransactionError(
+                "recovery_terminal_result_pending_binding_changed",
+                (
+                    "pending recovery terminal result has no exact "
+                    "descriptor-bound namespace locator"
+                ),
+                details={"pending_observation": pending_observation},
+            )
+        validate_bound_directory(evidence.parent)
+        persisted = validate_pending_recovery_terminal_result(
+            evidence,
+            inspected_binding,
+            payload,
+        )
         retention.update(
             {
                 "retention_status": "verified_pending_result",
                 "pending_locator": str(path),
                 "pending_result": persisted.to_json(),
-                "pending_observation": observe_directory_entry(
-                    evidence.parent.fd,
-                    name,
-                    expected=persisted,
-                ),
+                "pending_observation": pending_observation,
             }
         )
     except BaseException as error:
@@ -6848,6 +6948,17 @@ def _apply_transaction_inner(
         )
     backup = rules.parent / args.backup_name
     lock = rules.parent / ".default.rules.apply.lock"
+    reject_normalized_transaction_leaf_aliases(
+        [
+            ("rules", rules),
+            ("backup", backup),
+            ("lock", lock),
+            ("receipt", receipt),
+            ("recovery_terminal", recovery_terminal),
+            ("recovery_terminal_result", recovery_terminal_result),
+            ("prepared_candidate", prepared_recovery_candidate),
+        ]
+    )
     reject_fixed_stage_namespace_overlap(
         rules.parent,
         [
@@ -6858,24 +6969,16 @@ def _apply_transaction_inner(
             ("lock", lock),
         ],
     )
-    if (
-        candidate_source == rules
-        or receipt in (rules, backup, lock, candidate_source)
-        or recovery_terminal in (rules, backup, lock, candidate_source, receipt)
-        or recovery_terminal_result
-        in (rules, backup, lock, candidate_source, receipt, recovery_terminal)
-        or prepared_recovery_candidate
-        in (
-            rules,
-            backup,
-            lock,
-            candidate_source,
-            receipt,
-            recovery_terminal,
-            recovery_terminal_result,
-        )
+    if candidate_source in (
+        rules,
+        backup,
+        lock,
+        receipt,
+        recovery_terminal,
+        recovery_terminal_result,
+        prepared_recovery_candidate,
     ):
-        raise TransactionError("path_invalid", "transaction paths must be distinct")
+        raise TransactionError("path_invalid", "candidate source must be distinct")
 
     candidate_bytes, source_snapshot = read_stable(
         candidate_source,
@@ -7378,12 +7481,29 @@ def _apply_transaction_inner(
                     "backup_path": str(backup),
                 }
 
+            def validate_pre_exchange_controls() -> None:
+                evidence.validate()
+                backup_observation = observe_directory_entry(
+                    rules_parent_binding.fd,
+                    backup.name,
+                )
+                if backup_observation.get("state") != "missing":
+                    raise TransactionError(
+                        "backup_exists",
+                        (
+                            "backup or a filesystem-equivalent alias appeared "
+                            "before the live exchange"
+                        ),
+                        details={"backup_observation": backup_observation},
+                    )
+                evidence.validate()
+
             try:
                 installed_expected = stage.move_to(
                     candidate,
                     rules,
                     final_live,
-                    pre_exchange_revalidate=evidence.validate,
+                    pre_exchange_revalidate=validate_pre_exchange_controls,
                 )
                 replacement_started = True
                 evidence.validate()
@@ -8114,6 +8234,11 @@ def observe_recovery_primary_state(
             mutation_tracker.observe_prior_mutation(
                 "prior_transaction_state",
                 state=state,
+            )
+        elif roles[0] == "I" and roles[2] == "O":
+            mutation_tracker.observe_prior_mutation(
+                "prior_exchange_state",
+                state="unknown",
             )
         elif state != "Q":
             mutation_tracker.defer_possible_prior_mutation(
@@ -9659,6 +9784,17 @@ def _recover_transaction_bound(
     derived_terminal = recovery_terminal_path(receipt_path)
     derived_terminal_result = recovery_terminal_result_path(derived_terminal)
     derived_prepared_candidate = prepared_candidate_path(receipt_path)
+    reject_normalized_transaction_leaf_aliases(
+        [
+            ("rules", rules),
+            ("backup", backup),
+            ("lock", lock),
+            ("receipt", receipt_path),
+            ("recovery_terminal", derived_terminal),
+            ("recovery_terminal_result", derived_terminal_result),
+            ("prepared_candidate", derived_prepared_candidate),
+        ]
+    )
     reject_fixed_stage_namespace_overlap(
         rules.parent,
         [
@@ -9800,10 +9936,13 @@ def _recover_transaction_bound(
                         parent=receipt_evidence.parent,
                         expected_reservation=terminal_expected,
                         transaction_id=transaction_id,
+                        allow_legacy_reservation_rewrite=(receipt_schema_version == 3),
                     )
                     preflight_terminal = terminal_evidence.validate()
+                    observed_state = mutation_tracker.last_observed or {}
                     if preflight_terminal.get("state") == RECOVERY_TERMINAL_RESERVED:
-                        mutation_tracker.clear_deferred_mutation()
+                        if observed_state.get("transaction_state") == "Q":
+                            mutation_tracker.clear_deferred_mutation()
                     else:
                         mutation_tracker.promote_deferred_mutation()
                     validate_controls()
