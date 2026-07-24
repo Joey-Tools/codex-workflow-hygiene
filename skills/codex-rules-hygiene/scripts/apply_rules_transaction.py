@@ -24,12 +24,13 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
 
-SCHEMA_VERSION = 2
-SUPPORTED_SCHEMA_VERSIONS = frozenset((1, SCHEMA_VERSION))
+SCHEMA_VERSION = 3
+SUPPORTED_SCHEMA_VERSIONS = frozenset((1, 2, SCHEMA_VERSION))
 RECOVERY_TERMINAL_SCHEMA_VERSION = 1
 RECOVERY_TERMINAL_RESERVED = "reserved"
 RECOVERY_TERMINAL_RESTORED = "restored"
@@ -41,6 +42,9 @@ DEFAULT_VALIDATOR_TIMEOUT_SECONDS = 60.0
 DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
 MAX_VALIDATOR_OUTPUT_BYTES = 128 * 1024
 MAX_XATTR_NAME_BYTES = 64 * 1024
+MAX_STAGE_DIRECTORY_ENTRIES = 1024
+PRIVATE_STAGE_NAME = ".default.rules.transaction-stage"
+# The legacy stage_cleanup_retained quarantine status is intentionally not emitted.
 VALIDATOR_TERM_GRACE_SECONDS = 0.25
 VALIDATOR_KILL_DRAIN_SECONDS = 1.0
 MANAGED_VALIDATOR_SIGNALS = tuple(
@@ -731,7 +735,11 @@ def revalidate_candidate_source(
     *,
     candidate_sha256: str,
 ) -> bytes:
-    payload, actual = read_stable(path, label="candidate_source")
+    payload, actual = read_stable(
+        path,
+        label="candidate_source",
+        require_modeled_metadata=True,
+    )
     mismatches = property_mismatches(expected, actual)
     if not hmac.compare_digest(actual.sha256, candidate_sha256):
         if "content" not in mismatches:
@@ -1400,8 +1408,37 @@ def _write_exclusive_bound(
         raise
 
 
+def bounded_directory_entries(
+    directory_fd: int,
+    *,
+    limit: int = MAX_STAGE_DIRECTORY_ENTRIES,
+) -> tuple[list[str], bool]:
+    """Read at most ``limit + 1`` directory entry names."""
+
+    names: list[str] = []
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            names.append(entry.name)
+            if len(names) > limit:
+                return names, True
+    return names, False
+
+
 class PrivateStage:
-    def __init__(self, rules_parent: Path) -> None:
+    def __init__(
+        self,
+        rules_parent: Path,
+        *,
+        rules_parent_expected: Snapshot | None = None,
+        recovery_stage_expected: Snapshot | None = None,
+        recovery_candidate_expected: Snapshot | None = None,
+    ) -> None:
+        recovery_mode = recovery_stage_expected is not None
+        if recovery_candidate_expected is not None and not recovery_mode:
+            raise TransactionError(
+                "receipt_invalid",
+                "recovery candidate binding requires a stage snapshot",
+            )
         directory_flags = (
             os.O_RDONLY
             | os.O_CLOEXEC
@@ -1412,18 +1449,31 @@ class PrivateStage:
         self.rules_parent_fd = os.open(rules_parent, directory_flags)
         parent_stat = os.fstat(self.rules_parent_fd)
         parent_path_stat = os.stat(rules_parent, follow_symlinks=False)
+        parent_snapshot = (
+            rules_parent_expected
+            if rules_parent_expected is not None
+            else Snapshot.from_stat(parent_stat, b"")
+        )
         parent_mismatches = directory_property_mismatches(
-            Snapshot.from_stat(parent_stat, b""),
-            parent_path_stat,
+            parent_snapshot,
+            parent_stat,
+        )
+        parent_mismatches.extend(
+            mismatch
+            for mismatch in directory_property_mismatches(
+                parent_snapshot,
+                parent_path_stat,
+            )
+            if mismatch not in parent_mismatches
         )
         if parent_mismatches:
             os.close(self.rules_parent_fd)
             raise TransactionError(
                 "rules_directory_changed",
-                "rules directory path no longer names the bound directory",
+                "rules directory no longer matches the bound transaction directory",
                 details={"mismatched_properties": parent_mismatches},
             )
-        self.rules_parent_snapshot = Snapshot.from_stat(parent_stat, b"")
+        self.rules_parent_snapshot = parent_snapshot
         self.rules_parent_binding = BoundDirectory(
             path=rules_parent,
             fd=self.rules_parent_fd,
@@ -1435,21 +1485,18 @@ class PrivateStage:
         except BaseException:
             os.close(self.rules_parent_fd)
             raise
-        self.stage_name = ""
-        for _attempt in range(128):
-            candidate = f".rules-apply-{secrets.token_hex(8)}"
+        self.stage_name = PRIVATE_STAGE_NAME
+        if not recovery_mode:
             try:
-                os.mkdir(candidate, 0o700, dir_fd=self.rules_parent_fd)
+                os.mkdir(self.stage_name, 0o700, dir_fd=self.rules_parent_fd)
             except FileExistsError:
-                continue
-            self.stage_name = candidate
-            break
-        if not self.stage_name:
-            os.close(self.rules_parent_fd)
-            raise TransactionError(
-                "private_stage_unavailable",
-                "cannot allocate a unique private staging directory",
-            )
+                pass
+            except OSError as error:
+                os.close(self.rules_parent_fd)
+                raise TransactionError(
+                    "private_stage_unavailable",
+                    f"cannot create the private staging directory: {error}",
+                ) from error
         self.path = rules_parent / self.stage_name
         try:
             self.stage_fd = os.open(
@@ -1463,18 +1510,62 @@ class PrivateStage:
                 dir_fd=self.rules_parent_fd,
                 follow_symlinks=False,
             )
+            stage_snapshot = (
+                recovery_stage_expected
+                if recovery_stage_expected is not None
+                else Snapshot.from_stat(stage_stat, b"")
+            )
             if (
                 not stat.S_ISDIR(stage_stat.st_mode)
                 or stage_stat.st_uid != os.geteuid()
                 or stat.S_IMODE(stage_stat.st_mode) != 0o700
                 or directory_property_mismatches(
-                    Snapshot.from_stat(stage_stat, b""),
+                    stage_snapshot,
+                    stage_stat,
+                )
+                or directory_property_mismatches(
+                    stage_snapshot,
                     stage_path_stat,
                 )
             ):
                 raise TransactionError(
                     "private_stage_invalid",
                     "staging directory is not the bound owner-only directory",
+                )
+            reject_unmodeled_metadata_fd(
+                self.stage_fd,
+                label="private_stage",
+                require_directory=True,
+            )
+            stage_entries, entries_exceeded = bounded_directory_entries(
+                self.stage_fd
+            )
+            if entries_exceeded:
+                raise TransactionError(
+                    "private_stage_retained",
+                    "private staging evidence exceeds the inspection bound",
+                    details={"entry_count_lower_bound": len(stage_entries)},
+                )
+            expected_entries = (
+                ["candidate"] if recovery_candidate_expected is not None else []
+            )
+            if sorted(stage_entries) != expected_entries:
+                raise TransactionError(
+                    "private_stage_retained",
+                    (
+                        "private staging evidence does not match the receipt-bound "
+                        "recovery candidate"
+                        if recovery_mode
+                        else (
+                            "private staging evidence from an unfinished transaction "
+                            "requires recovery before a new apply"
+                        )
+                    ),
+                    details={
+                        "retained_entries": sorted(stage_entries),
+                        "expected_entries": expected_entries,
+                        "stage_path": str(self.path),
+                    },
                 )
         except BaseException as error:
             stage_identity_details: dict[str, object] = {
@@ -1497,11 +1588,52 @@ class PrivateStage:
             if isinstance(error, TransactionError):
                 error.details.setdefault("retained_stage", stage_identity_details)
             raise
-        self.stage_snapshot = Snapshot.from_stat(stage_stat, b"")
+        self.stage_snapshot = stage_snapshot
         self.files: dict[Path, BoundFile] = {}
         self.extra_fds: list[int] = []
+        self.known_parent_names: set[str] = {"default.rules"}
         self.mutation_uncertain = False
         self.closed = False
+        if recovery_candidate_expected is not None:
+            recovery_candidate = self.path / "candidate"
+            stage_parent = BoundDirectory(
+                path=self.path,
+                fd=self.stage_fd,
+                snapshot=self.stage_snapshot,
+                label="private_stage",
+                require_owner_private=True,
+            )
+            try:
+                binding = bind_regular_file(
+                    recovery_candidate,
+                    stage_parent,
+                    label="staged_backup",
+                )
+                _payload, actual = validate_bound_regular_file(
+                    binding,
+                    stage_parent,
+                    label="staged_backup",
+                )
+                mismatches = property_mismatches(
+                    recovery_candidate_expected,
+                    actual,
+                )
+                if mismatches:
+                    raise TransactionError(
+                        "staged_backup_changed",
+                        "staged recovery candidate no longer matches the receipt",
+                        exit_code=EXIT_RECOVERY_REFUSED,
+                        details={"mismatched_properties": mismatches},
+                    )
+            except BaseException:
+                if "binding" in locals():
+                    os.close(binding.fd)
+                self.closed = True
+                os.close(self.stage_fd)
+                os.close(self.rules_parent_fd)
+                raise
+            binding.snapshot = actual
+            self.files[recovery_candidate] = binding
 
     def _rules_parent_path_is_bound(self) -> bool:
         try:
@@ -1559,6 +1691,46 @@ class PrivateStage:
                 "staging directory identity or access policy changed",
                 details={"mismatched_properties": mismatches},
             )
+        reject_unmodeled_metadata_fd(
+            self.stage_fd,
+            label="private_stage",
+            require_directory=True,
+        )
+        try:
+            final_actual = os.fstat(self.stage_fd)
+            final_path_actual = os.stat(
+                self.stage_name,
+                dir_fd=self.rules_parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise TransactionError(
+                "private_stage_changed",
+                f"staging directory changed during metadata admission: {error}",
+            ) from error
+        final_mismatches = directory_property_mismatches(
+            self.stage_snapshot,
+            final_actual,
+        )
+        final_mismatches.extend(
+            item
+            for item in directory_property_mismatches(
+                self.stage_snapshot,
+                final_path_actual,
+            )
+            if item not in final_mismatches
+        )
+        if final_mismatches:
+            raise TransactionError(
+                "private_stage_changed",
+                "staging directory changed during metadata admission",
+                details={"mismatched_properties": final_mismatches},
+            )
+        reject_unmodeled_metadata_fd(
+            self.stage_fd,
+            label="private_stage",
+            require_directory=True,
+        )
 
     def _binding(self, path: Path) -> BoundFile:
         try:
@@ -1709,6 +1881,7 @@ class PrivateStage:
         except BaseException:
             os.close(fd)
             raise
+        self.known_parent_names.add(target.name)
         return BoundFile(
             path=target,
             name=target.name,
@@ -2153,6 +2326,7 @@ class PrivateStage:
         source.path = backup
         source.name = backup.name
         source.snapshot = actual
+        self.known_parent_names.add(backup.name)
         self.extra_fds.append(source.fd)
         self.mutation_uncertain = False
         return source
@@ -2163,18 +2337,28 @@ class PrivateStage:
         expected: Snapshot,
     ) -> str | None:
         try:
-            names = os.listdir(directory_fd)
+            entries = os.scandir(directory_fd)
         except OSError:
             return None
-        if len(names) > 1024:
-            return None
-        for name in names:
-            try:
-                entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            except OSError:
-                continue
-            if (entry.st_dev, entry.st_ino) == (expected.device, expected.inode):
-                return name
+        inspected = 0
+        with entries:
+            for item in entries:
+                inspected += 1
+                if inspected > MAX_STAGE_DIRECTORY_ENTRIES:
+                    return None
+                try:
+                    entry = os.stat(
+                        item.name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    continue
+                if (entry.st_dev, entry.st_ino) == (
+                    expected.device,
+                    expected.inode,
+                ):
+                    return item.name
         return None
 
     @staticmethod
@@ -2199,11 +2383,33 @@ class PrivateStage:
     def _locator_for_snapshot(self, expected: Snapshot) -> Path | None:
         if not self._rules_parent_path_is_bound():
             return None
-        root_name = self._find_bound_entry(
-            self.rules_parent_fd,
-            self.stage_snapshot,
+        root_name = (
+            self.stage_name
+            if self._entry_identity_matches(
+                self.rules_parent_fd,
+                self.stage_name,
+                self.stage_snapshot,
+            )
+            else self._find_bound_entry(
+                self.rules_parent_fd,
+                self.stage_snapshot,
+            )
         )
-        stage_name = self._find_bound_entry(self.stage_fd, expected)
+        stage_name: str | None = None
+        for binding in self.files.values():
+            if (
+                (binding.snapshot.device, binding.snapshot.inode)
+                == (expected.device, expected.inode)
+                and self._entry_identity_matches(
+                    self.stage_fd,
+                    binding.name,
+                    expected,
+                )
+            ):
+                stage_name = binding.name
+                break
+        if stage_name is None:
+            stage_name = self._find_bound_entry(self.stage_fd, expected)
         if root_name is not None and stage_name is not None:
             locator = self.rules_parent / root_name / stage_name
             if (
@@ -2221,7 +2427,20 @@ class PrivateStage:
             ):
                 return locator
             return None
-        parent_name = self._find_bound_entry(self.rules_parent_fd, expected)
+        parent_name: str | None = None
+        for known_name in sorted(self.known_parent_names):
+            if self._entry_identity_matches(
+                self.rules_parent_fd,
+                known_name,
+                expected,
+            ):
+                parent_name = known_name
+                break
+        if parent_name is None:
+            parent_name = self._find_bound_entry(
+                self.rules_parent_fd,
+                expected,
+            )
         if parent_name is not None:
             locator = self.rules_parent / parent_name
             if (
@@ -2243,88 +2462,39 @@ class PrivateStage:
         self.files.clear()
         self.extra_fds.clear()
 
-    def _cleanup_disposable_stage(self) -> list[dict[str, object]]:
-        """Quarantine, but never path-delete, a disposable private stage.
+    def _cleanup_fixed_stage(self) -> list[dict[str, object]]:
+        """Close an empty persistent stage without pathname deletion.
 
-        POSIX exposes no compare-and-unlink or compare-and-rmdir operation. A
-        stat immediately before either syscall still permits a replacement to
-        be deleted. The protected property here is non-destruction: move one
-        namespace entry with atomic no-clobber semantics, then prove whether
-        the quarantined directory is the descriptor-bound stage. A racing
-        replacement may be moved, but it is never deleted; an unproved move is
-        a cleanup refusal rather than a false success.
+        The fixed owner-private stage is infrastructure shared by serialized
+        transactions.  A successful apply moves its only child to the formal
+        backup path, so cleanup merely proves that the bound root is unchanged
+        and empty.  Any remaining or replacement entry is recovery/uncertain
+        evidence and is retained without unlink, rmdir, or inode reuse.
         """
 
         warnings: list[dict[str, object]] = []
-        quarantine_name = f".default.rules.cleanup-retained-{secrets.token_hex(16)}"
-        quarantine_path = self.rules_parent / quarantine_name
         try:
             self._validate_rules_parent()
             self._validate_stage_root()
-            if (
-                observe_directory_entry(
-                    self.rules_parent_fd,
-                    quarantine_name,
-                ).get("state")
-                != "missing"
-            ):
+            entries, entries_exceeded = bounded_directory_entries(self.stage_fd)
+            if entries_exceeded:
                 raise TransactionError(
                     "stage_cleanup_refused",
-                    "cleanup quarantine destination unexpectedly exists",
+                    "private staging evidence exceeds the cleanup inspection bound",
+                    details={"entry_count_lower_bound": len(entries)},
                 )
-            atomic_rename_no_replace(
-                self.rules_parent_fd,
-                self.stage_name,
-                self.rules_parent_fd,
-                quarantine_name,
-            )
-            self._validate_rules_parent()
-            try:
-                quarantined = os.stat(
-                    quarantine_name,
-                    dir_fd=self.rules_parent_fd,
-                    follow_symlinks=False,
-                )
-            except OSError as error:
+            if entries:
                 raise TransactionError(
                     "stage_cleanup_refused",
-                    f"cannot bind cleanup quarantine after move: {error}",
-                ) from error
-            mismatches = directory_property_mismatches(
-                self.stage_snapshot,
-                quarantined,
-            )
-            source_observation = observe_directory_entry(
-                self.rules_parent_fd,
-                self.stage_name,
-            )
-            if mismatches or source_observation.get("state") != "missing":
-                raise TransactionError(
-                    "stage_cleanup_refused",
-                    "cleanup quarantine does not bind the disposable stage",
+                    "private stage still contains retained recovery or uncertain "
+                    "objects",
                     details={
-                        "mismatched_properties": mismatches,
-                        "source_observation": source_observation,
-                        "quarantine_observation": observe_directory_entry(
-                            self.rules_parent_fd,
-                            quarantine_name,
-                        ),
+                        "retained_entries": sorted(entries),
+                        "stage_path": str(self.path),
                     },
                 )
-            warnings.append(
-                {
-                    "status": "stage_cleanup_retained",
-                    "retention_status": "verified_quarantine",
-                    "reason": "conditional_path_delete_unavailable",
-                    "bound_identity": {
-                        "device": self.stage_snapshot.device,
-                        "inode": self.stage_snapshot.inode,
-                    },
-                    "recovery_locator": str(quarantine_path),
-                    "last_known_path": str(self.path),
-                    "cleanup_policy": "atomic_no_clobber_quarantine_no_delete",
-                }
-            )
+            self._validate_stage_root()
+            self._validate_rules_parent()
         except (OSError, TransactionError) as error:
             locator = self._locator_for_snapshot(self.stage_snapshot)
             warnings.append(
@@ -2338,7 +2508,7 @@ class PrivateStage:
                     "message": str(error),
                     "last_known_path": str(self.path),
                     "recovery_locator": (str(locator) if locator is not None else None),
-                    "cleanup_policy": "retain_without_path_delete",
+                    "cleanup_policy": "persistent_stage_retain_without_path_delete",
                 }
             )
             if isinstance(error, TransactionError) and error.details:
@@ -2354,7 +2524,7 @@ class PrivateStage:
         if self.closed:
             return []
         if not retain:
-            return self._cleanup_disposable_stage()
+            return self._cleanup_fixed_stage()
         warnings: list[dict[str, object]] = []
         root_locator = self._locator_for_snapshot(self.stage_snapshot)
         for binding in self.files.values():
@@ -2445,6 +2615,53 @@ class PrivateStage:
         return warnings
 
 
+def validate_existing_fixed_stage_is_empty(rules_parent: Path) -> None:
+    stage_path = rules_parent / PRIVATE_STAGE_NAME
+    try:
+        stage_stat = os.stat(stage_path, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise TransactionError(
+            "recovery_required",
+            f"cannot inspect existing fixed transaction stage: {error}",
+            exit_code=EXIT_POST_REPLACE_FAILED,
+            details={"stage_status": "private_stage_unreadable"},
+        ) from error
+
+    stage: PrivateStage | None = None
+    try:
+        stage = PrivateStage(
+            rules_parent,
+            recovery_stage_expected=Snapshot.from_stat(stage_stat, b""),
+        )
+    except (OSError, TransactionError) as error:
+        error_status = (
+            error.status
+            if isinstance(error, TransactionError)
+            else "private_stage_unreadable"
+        )
+        error_details = error.details if isinstance(error, TransactionError) else {}
+        raise TransactionError(
+            "recovery_required",
+            "existing fixed transaction stage requires recovery before no-change",
+            exit_code=EXIT_POST_REPLACE_FAILED,
+            details={
+                "stage_status": error_status,
+                "stage_message": str(error),
+                **error_details,
+            },
+        ) from error
+    warnings = stage.cleanup(retain=False)
+    if warnings:
+        raise TransactionError(
+            "recovery_required",
+            "existing fixed transaction stage cleanup could not be verified",
+            exit_code=EXIT_POST_REPLACE_FAILED,
+            details={"cleanup_refusals": warnings},
+        )
+
+
 def lock_snapshot(path: Path, file_stat: os.stat_result) -> Snapshot:
     if (
         not stat.S_ISREG(file_stat.st_mode)
@@ -2466,7 +2683,12 @@ def lock_snapshot(path: Path, file_stat: os.stat_result) -> Snapshot:
 
 
 @contextmanager
-def shared_lock(path: Path, *, timeout_seconds: float):
+def shared_lock(
+    path: Path,
+    *,
+    timeout_seconds: float,
+    before_release: Callable[[], None] | None = None,
+):
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise TransactionError(
             "arguments_invalid",
@@ -2477,11 +2699,13 @@ def shared_lock(path: Path, *, timeout_seconds: float):
         fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         fd = os.open(path, flags)
+    locked = False
     try:
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -2493,7 +2717,11 @@ def shared_lock(path: Path, *, timeout_seconds: float):
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         yield lock_snapshot(path, os.fstat(fd))
     finally:
-        os.close(fd)
+        try:
+            if locked and before_release is not None:
+                before_release()
+        finally:
+            os.close(fd)
 
 
 def revalidate_lock(path: Path, expected: Snapshot) -> None:
@@ -2726,6 +2954,7 @@ def _signal_validator_group(
         raise TransactionError(
             "validator_cleanup_failed",
             f"cannot signal validator process group {process_group_id}: {error}",
+            details={"errno": error.errno},
         ) from error
 
 
@@ -2855,9 +3084,10 @@ def _emergency_stop_validator_process_group(
     """Bound cleanup that does not depend on waitid, proc, or libproc.
 
     This path is used after supervisor setup, observation, signal-handler, or
-    process-inventory failures.  The protected property is process-group
-    quiescence: signal the complete ``start_new_session`` group, drain its
-    owned pipes, and reap the direct child within fixed TERM/KILL deadlines.
+    process-inventory failures.  The protected properties are process-group
+    quiescence and PGID identity: the unreaped ``start_new_session`` leader
+    pins its numeric PID/PGID until all group signals finish.  Reaping is the
+    terminal action; no numeric PGID operation is permitted afterwards.
     """
 
     cleanup_errors: list[dict[str, object]] = []
@@ -2871,6 +3101,15 @@ def _emergency_stop_validator_process_group(
             }
         )
 
+    if process.returncode is not None:
+        record(
+            "process-group-identity-anchor",
+            RuntimeError(
+                "validator leader was already reaped; refusing numeric PGID cleanup"
+            ),
+        )
+        return cleanup_errors
+
     def signal_group(signum: int) -> None:
         try:
             os.killpg(process.pid, signum)
@@ -2879,7 +3118,9 @@ def _emergency_stop_validator_process_group(
         except BaseException as error:
             record(f"killpg:{signum}", error)
             try:
-                process.send_signal(signum)
+                # Popen.send_signal() polls first and can reap a zombie leader.
+                # Direct os.kill preserves the unreaped PID/PGID identity anchor.
+                os.kill(process.pid, signum)
             except ProcessLookupError:
                 return
             except BaseException as direct_error:
@@ -2919,6 +3160,9 @@ def _emergency_stop_validator_process_group(
     signal_group(signal.SIGKILL)
     kill_deadline = time.monotonic() + VALIDATOR_KILL_DRAIN_SECONDS
     drain_until(kill_deadline)
+    # Reissue the group kill before, never after, releasing the unreaped
+    # leader that pins this transaction's numeric PGID.
+    signal_group(signal.SIGKILL)
     try:
         process.wait(timeout=max(0.0, kill_deadline - time.monotonic()))
     except subprocess.TimeoutExpired as error:
@@ -2930,11 +3174,6 @@ def _emergency_stop_validator_process_group(
             record("kill-and-reap-direct-child", final_error)
     except BaseException as error:
         record("reap-direct-child", error)
-    # A direct child can exit before a same-group descendant.  Reissue the
-    # group kill while the bound PGID is still the transaction's session ID.
-    signal_group(signal.SIGKILL)
-    if selector is not None:
-        drain_until(kill_deadline)
     return cleanup_errors
 
 
@@ -2947,6 +3186,45 @@ def _stop_validator_process_group(
     max_output_bytes: int,
 ) -> tuple[int, bool]:
     process_group_id = process.pid
+
+    def signal_group_with_zombie_refresh(
+        signum: int,
+        *,
+        child_was_exited: bool,
+        known_members: tuple[int, ...],
+    ) -> tuple[bool, tuple[int, ...]]:
+        try:
+            _signal_validator_group(
+                process_group_id,
+                signum,
+                allow_zombie_only=child_was_exited,
+            )
+            return child_was_exited, known_members
+        except TransactionError as error:
+            if error.details.get("errno") != errno.EPERM:
+                raise
+            # Darwin can report EPERM for a group whose only remaining member
+            # became a zombie between the nonreaping exit probe and killpg.
+            # Refresh that exact unreaped leader and the group inventory before
+            # accepting the signal as unnecessary.
+            refresh_deadline = time.monotonic() + 0.02
+            while True:
+                refreshed_exit = exit_observer.child_exited()
+                refreshed_members = _live_validator_group_member_pids(
+                    process_group_id,
+                    leader_pid=process.pid,
+                )
+                if refreshed_exit and not refreshed_members:
+                    return refreshed_exit, refreshed_members
+                if refreshed_members or time.monotonic() >= refresh_deadline:
+                    raise
+                time.sleep(
+                    min(
+                        0.001,
+                        max(0.0, refresh_deadline - time.monotonic()),
+                    )
+                )
+
     child_exited = exit_observer.child_exited()
     live_members = _live_validator_group_member_pids(
         process_group_id,
@@ -2954,11 +3232,12 @@ def _stop_validator_process_group(
     )
     descendants_detected = bool(live_members)
     if not (child_exited and not selector.get_map() and not live_members):
-        _signal_validator_group(
-            process_group_id,
+        child_exited, live_members = signal_group_with_zombie_refresh(
             signal.SIGTERM,
-            allow_zombie_only=child_exited,
+            child_was_exited=child_exited,
+            known_members=live_members,
         )
+        descendants_detected = descendants_detected or bool(live_members)
     term_deadline = time.monotonic() + VALIDATOR_TERM_GRACE_SECONDS
     while time.monotonic() < term_deadline:
         remaining = term_deadline - time.monotonic()
@@ -2979,86 +3258,58 @@ def _stop_validator_process_group(
             break
     quiescent = child_exited and not selector.get_map() and not live_members
     if not quiescent:
-        _signal_validator_group(
-            process_group_id,
+        child_exited, live_members = signal_group_with_zombie_refresh(
             signal.SIGKILL,
-            allow_zombie_only=child_exited,
+            child_was_exited=child_exited,
+            known_members=live_members,
         )
+        descendants_detected = descendants_detected or bool(live_members)
 
     kill_deadline = time.monotonic() + VALIDATOR_KILL_DRAIN_SECONDS
-    while selector.get_map() and time.monotonic() < kill_deadline:
+    while time.monotonic() < kill_deadline:
         remaining = kill_deadline - time.monotonic()
-        _read_validator_events(
-            selector,
-            buffers,
-            max_output_bytes=max_output_bytes,
-            timeout_seconds=min(0.02, remaining),
-            retain=False,
+        if selector.get_map():
+            _read_validator_events(
+                selector,
+                buffers,
+                max_output_bytes=max_output_bytes,
+                timeout_seconds=min(0.02, remaining),
+                retain=False,
+            )
+        else:
+            time.sleep(min(0.01, max(0.0, remaining)))
+        child_exited = exit_observer.child_exited()
+        live_members = _live_validator_group_member_pids(
+            process_group_id,
+            leader_pid=process.pid,
+        )
+        descendants_detected = descendants_detected or bool(live_members)
+        if child_exited and not selector.get_map() and not live_members:
+            break
+
+    child_exited = exit_observer.child_exited()
+    surviving_members = _live_validator_group_member_pids(
+        process_group_id,
+        leader_pid=process.pid,
+    )
+    descendants_detected = descendants_detected or bool(surviving_members)
+    if not child_exited or surviving_members or selector.get_map():
+        raise TransactionError(
+            "validator_cleanup_failed",
+            "validator process group did not become quiescent before leader reap",
+            details={
+                "direct_child_exited": child_exited,
+                "surviving_pids": list(surviving_members),
+                "open_output_streams": len(selector.get_map()),
+            },
         )
     try:
         returncode = process.wait(timeout=max(0.0, kill_deadline - time.monotonic()))
     except subprocess.TimeoutExpired as error:
         raise TransactionError(
             "validator_cleanup_failed",
-            "validator direct child survived process-group SIGKILL",
+            "validator direct child could not be reaped after group quiescence",
         ) from error
-    post_reap_members = _live_validator_group_member_pids(
-        process_group_id,
-        leader_pid=-1,
-    )
-    if post_reap_members:
-        descendants_detected = True
-        _signal_validator_group(
-            process_group_id,
-            signal.SIGTERM,
-            allow_zombie_only=True,
-        )
-        post_reap_term_deadline = min(
-            kill_deadline,
-            time.monotonic() + VALIDATOR_TERM_GRACE_SECONDS,
-        )
-        while time.monotonic() < post_reap_term_deadline:
-            post_reap_members = _live_validator_group_member_pids(
-                process_group_id,
-                leader_pid=-1,
-            )
-            if not post_reap_members:
-                break
-            time.sleep(
-                min(
-                    0.01,
-                    max(0.0, post_reap_term_deadline - time.monotonic()),
-                )
-            )
-        if post_reap_members:
-            _signal_validator_group(
-                process_group_id,
-                signal.SIGKILL,
-                allow_zombie_only=True,
-            )
-    while (
-        _live_validator_group_member_pids(
-            process_group_id,
-            leader_pid=-1,
-        )
-        and time.monotonic() < kill_deadline
-    ):
-        time.sleep(min(0.01, max(0.0, kill_deadline - time.monotonic())))
-    surviving_members = _live_validator_group_member_pids(
-        process_group_id,
-        leader_pid=-1,
-    )
-    if surviving_members:
-        raise TransactionError(
-            "validator_cleanup_failed",
-            "live validator process-group members remained after SIGKILL",
-            details={"surviving_pids": list(surviving_members)},
-        )
-    if selector.get_map():
-        raise TransactionError(
-            "validator_cleanup_failed",
-            "validator output pipes remained open after process-group SIGKILL",
-        )
     return returncode, descendants_detected
 
 
@@ -3083,6 +3334,24 @@ def _start_validator_signal_supervision() -> tuple[
                 "single-threaded POSIX main thread"
             ),
         )
+    sigchld = getattr(signal, "SIGCHLD", None)
+    if sigchld is None or signal.getsignal(sigchld) != signal.SIG_DFL:
+        raise TransactionError(
+            "validator_supervision_unsupported",
+            (
+                "validator signal supervision requires the default SIGCHLD "
+                "disposition so only its final wait can reap the PGID leader"
+            ),
+        )
+    try:
+        # Reinstall the default disposition to clear any inherited auto-reap
+        # flags that a native caller may have paired with SIG_DFL.
+        signal.signal(sigchld, signal.SIG_DFL)
+    except (OSError, ValueError) as error:
+        raise TransactionError(
+            "validator_supervision_unsupported",
+            f"cannot normalize SIGCHLD supervision: {error}",
+        ) from error
 
     inherited_mask = pthread_sigmask(
         signal.SIG_BLOCK,
@@ -3153,11 +3422,219 @@ def _restore_validator_signal_supervision(
         pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
 
 
+class AnonymousValidatorInput:
+    """Descriptor-backed, unnamed copy used only by the first validator."""
+
+    def __init__(self, payload: bytes) -> None:
+        self._file = tempfile.TemporaryFile(mode="w+b", buffering=0)
+        self.fd = self._file.fileno()
+        if self.fd < 3:
+            duplicate = fcntl.fcntl(
+                self.fd,
+                fcntl.F_DUPFD_CLOEXEC,
+                3,
+            )
+            self._file.close()
+            self._file = os.fdopen(duplicate, "w+b", buffering=0)
+            self.fd = duplicate
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(self.fd, payload[offset:])
+                if written <= 0:
+                    raise TransactionError(
+                        "validator_input_write_failed",
+                        "short write to anonymous validator input",
+                        exit_code=EXIT_VALIDATION_FAILED,
+                    )
+                offset += written
+            os.fchmod(self.fd, 0o600)
+            os.fsync(self.fd)
+            reject_unmodeled_metadata_fd(
+                self.fd,
+                label="validator_input",
+            )
+            actual_payload, snapshot = read_bound_fd(
+                self.fd,
+                label="validator_input",
+            )
+            if (
+                actual_payload != payload
+                or snapshot.uid != os.geteuid()
+                or snapshot.mode != 0o600
+                or snapshot.nlink != 0
+            ):
+                raise TransactionError(
+                    "validator_input_unsupported",
+                    (
+                        "platform did not provide an owner-only, unlinked regular "
+                        "validator input"
+                    ),
+                    exit_code=EXIT_VALIDATION_FAILED,
+                    details={"actual": snapshot.to_json()},
+                )
+            self.expected = snapshot
+            if sys.platform.startswith("linux") and Path(
+                f"/proc/self/fd/{self.fd}"
+            ).exists():
+                self.path = Path(f"/proc/self/fd/{self.fd}")
+            elif Path(f"/dev/fd/{self.fd}").exists():
+                self.path = Path(f"/dev/fd/{self.fd}")
+            else:
+                raise TransactionError(
+                    "validator_fd_path_unsupported",
+                    "platform has no validator-visible descriptor path",
+                    exit_code=EXIT_VALIDATION_FAILED,
+                )
+            self.validate()
+        except BaseException:
+            self.close()
+            raise
+
+    def validate(self) -> Snapshot:
+        _payload, actual = read_bound_fd(
+            self.fd,
+            label="validator_input",
+        )
+        try:
+            reject_unmodeled_metadata_fd(
+                self.fd,
+                label="validator_input",
+            )
+        except TransactionError as error:
+            raise TransactionError(
+                "validator_input_changed",
+                "anonymous validator input acquired unsupported metadata",
+                exit_code=EXIT_VALIDATION_FAILED,
+                details={
+                    "metadata_status": error.status,
+                    **error.details,
+                },
+            ) from error
+        mismatches = property_mismatches(self.expected, actual)
+        try:
+            path_fd = os.open(
+                self.path,
+                os.O_RDONLY | os.O_CLOEXEC,
+            )
+        except OSError as error:
+            raise TransactionError(
+                "validator_fd_path_unsupported",
+                f"validator descriptor path is unavailable: {error}",
+                exit_code=EXIT_VALIDATION_FAILED,
+            ) from error
+        try:
+            path_actual = os.fstat(path_fd)
+        finally:
+            os.close(path_fd)
+        mismatches.extend(
+            mismatch
+            for mismatch in stat_property_mismatches(
+                self.expected,
+                path_actual,
+            )
+            if mismatch not in mismatches
+        )
+        if mismatches:
+            raise TransactionError(
+                "validator_input_changed",
+                "anonymous validator input changed during validation",
+                exit_code=EXIT_VALIDATION_FAILED,
+                details={"mismatched_properties": mismatches},
+            )
+        try:
+            reject_unmodeled_metadata_fd(
+                self.fd,
+                label="validator_input",
+            )
+        except TransactionError as error:
+            raise TransactionError(
+                "validator_input_changed",
+                "anonymous validator input metadata changed during admission",
+                exit_code=EXIT_VALIDATION_FAILED,
+                details={
+                    "metadata_status": error.status,
+                    **error.details,
+                },
+            ) from error
+        _final_payload, final_actual = read_bound_fd(
+            self.fd,
+            label="validator_input",
+        )
+        final_mismatches = property_mismatches(
+            self.expected,
+            final_actual,
+        )
+        try:
+            final_path_fd = os.open(
+                self.path,
+                os.O_RDONLY | os.O_CLOEXEC,
+            )
+        except OSError as error:
+            raise TransactionError(
+                "validator_fd_path_unsupported",
+                f"validator descriptor path is unavailable: {error}",
+                exit_code=EXIT_VALIDATION_FAILED,
+            ) from error
+        try:
+            final_path_actual = os.fstat(final_path_fd)
+        finally:
+            os.close(final_path_fd)
+        final_mismatches.extend(
+            mismatch
+            for mismatch in stat_property_mismatches(
+                self.expected,
+                final_path_actual,
+            )
+            if mismatch not in final_mismatches
+        )
+        if final_mismatches:
+            raise TransactionError(
+                "validator_input_changed",
+                "anonymous validator input changed during final revalidation",
+                exit_code=EXIT_VALIDATION_FAILED,
+                details={"mismatched_properties": final_mismatches},
+            )
+        try:
+            reject_unmodeled_metadata_fd(
+                self.fd,
+                label="validator_input",
+            )
+        except TransactionError as error:
+            raise TransactionError(
+                "validator_input_changed",
+                "anonymous validator input metadata changed during final revalidation",
+                exit_code=EXIT_VALIDATION_FAILED,
+                details={
+                    "metadata_status": error.status,
+                    **error.details,
+                },
+            ) from error
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        return final_actual
+
+    def close(self) -> None:
+        if not self._file.closed:
+            self._file.close()
+
+    def __enter__(self) -> AnonymousValidatorInput:
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: object,
+        _exc_value: object,
+        _traceback: object,
+    ) -> None:
+        self.close()
+
+
 def run_validator(
     command_template: list[str],
     rules_path: Path,
     *,
     timeout_seconds: float,
+    pass_fds: tuple[int, ...] = (),
 ) -> ValidatorResult:
     if (
         not math.isfinite(timeout_seconds)
@@ -3202,6 +3679,7 @@ def run_validator(
                     stderr=subprocess.PIPE,
                     start_new_session=True,
                     close_fds=True,
+                    pass_fds=pass_fds,
                 )
             except OSError as error:
                 _arm_validator_signal_supervision(
@@ -3400,6 +3878,8 @@ def receipt_payload(
     original: Snapshot,
     installed: Snapshot,
     backup_snapshot: Snapshot,
+    staged_backup: Path,
+    staged_backup_parent: Snapshot,
     recovery_terminal: Path,
     recovery_terminal_snapshot: Snapshot,
 ) -> dict[str, object]:
@@ -3417,6 +3897,8 @@ def receipt_payload(
         "original": original.to_json(),
         "installed": installed.to_json(),
         "backup": backup_snapshot.to_json(),
+        "staged_backup_path": str(staged_backup),
+        "staged_backup_parent": staged_backup_parent.to_json(),
         "recovery_terminal": recovery_terminal_snapshot.to_json(),
     }
 
@@ -3998,6 +4480,7 @@ class ApplyEvidenceBindings:
     recovery_terminal: BoundFile
     backup: BoundFile | None = None
     receipt: BoundFile | None = None
+    closed: bool = False
 
     def validate(self) -> None:
         self.stage._validate_rules_parent()
@@ -4025,6 +4508,9 @@ class ApplyEvidenceBindings:
         validate_bound_directory(self.receipt_parent)
 
     def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
         for binding in (self.receipt, self.recovery_terminal):
             if binding is not None:
                 os.close(binding.fd)
@@ -4042,24 +4528,39 @@ def rollback(
     installed: Snapshot,
     backup_expected: Snapshot,
 ) -> tuple[bool, dict[str, object]]:
+    backup_binding: BoundFile | None = None
+    live_binding: BoundFile | None = None
+    exchange_completed = False
     try:
-        reject_unmodeled_metadata(backup, label="backup")
-        backup_bytes, backup_actual = read_stable(
+        stage._validate_rules_parent()
+        backup_binding = bind_regular_file(
             backup,
+            stage.rules_parent_binding,
             label="backup",
-            require_modeled_metadata=True,
         )
-        backup_mismatches = property_mismatches(backup_expected, backup_actual)
+        _backup_bytes, backup_actual = validate_bound_regular_file(
+            backup_binding,
+            stage.rules_parent_binding,
+            label="backup",
+        )
+        backup_mismatches = property_mismatches(
+            backup_expected,
+            backup_actual,
+        )
         if backup_mismatches:
             return False, {
                 "rollback_status": "backup_changed",
                 "mismatched_properties": backup_mismatches,
             }
-        reject_unmodeled_metadata(rules)
-        _live_bytes, live = read_stable(
+        live_binding = bind_regular_file(
             rules,
+            stage.rules_parent_binding,
             label="live_rules",
-            require_modeled_metadata=True,
+        )
+        _live_bytes, live = validate_bound_regular_file(
+            live_binding,
+            stage.rules_parent_binding,
+            label="live_rules",
         )
         live_mismatches = property_mismatches(installed, live)
         if live_mismatches:
@@ -4068,45 +4569,138 @@ def rollback(
                 "mismatched_properties": live_mismatches,
                 "actual_live": live.to_json(),
             }
-        rollback_path, rollback_snapshot = stage.create("rollback", backup_bytes)
-        rollback_snapshot = stage.set_policy(
-            rollback_path,
-            rollback_snapshot,
-            original,
-        )
         revalidate_lock(lock, lock_expected)
-        reject_unmodeled_metadata(rules)
-        _final_bytes, final_live = read_stable(
-            rules,
+        validate_bound_regular_file(
+            backup_binding,
+            stage.rules_parent_binding,
+            label="backup",
+        )
+        validate_bound_regular_file(
+            live_binding,
+            stage.rules_parent_binding,
             label="live_rules",
-            require_modeled_metadata=True,
         )
-        final_mismatches = property_mismatches(installed, final_live)
-        if final_mismatches:
-            return False, {
-                "rollback_status": "live_changed_before_rollback",
-                "mismatched_properties": final_mismatches,
-                "actual_live": final_live.to_json(),
-            }
-        restored_expected = stage.move_to(
-            rollback_path,
-            rules,
-            final_live,
+        stage._validate_rules_parent()
+
+        atomic_error: OSError | None = None
+        stage.mutation_uncertain = True
+        try:
+            atomic_rename_exchange(
+                stage.rules_parent_fd,
+                backup_binding.name,
+                stage.rules_parent_fd,
+                live_binding.name,
+            )
+        except TransactionError:
+            stage.mutation_uncertain = False
+            raise
+        except OSError as error:
+            atomic_error = error
+
+        backup_observation = observe_directory_entry(
+            stage.rules_parent_fd,
+            backup_binding.name,
+            expected=installed,
         )
-        fsync_file_and_parent(rules)
+        live_observation = observe_directory_entry(
+            stage.rules_parent_fd,
+            live_binding.name,
+            expected=original,
+        )
+        if atomic_error is not None:
+            unchanged_backup = observe_directory_entry(
+                stage.rules_parent_fd,
+                backup_binding.name,
+                expected=backup_expected,
+            )
+            unchanged_live = observe_directory_entry(
+                stage.rules_parent_fd,
+                live_binding.name,
+                expected=installed,
+            )
+            if observation_matches(unchanged_backup) and observation_matches(
+                unchanged_live
+            ):
+                stage.mutation_uncertain = False
+                return False, {
+                    "rollback_status": "atomic_exchange_failed",
+                    "rollback_message": str(atomic_error),
+                    "backup_observation": unchanged_backup,
+                    "live_observation": unchanged_live,
+                }
+            raise stage._uncertain_mutation(
+                operation="rollback_exchange",
+                source=backup_binding,
+                destination_binding=live_binding,
+                destination=rules,
+                source_observation=backup_observation,
+                destination_observation=live_observation,
+                destination_expected=installed,
+                error=atomic_error,
+            ) from atomic_error
+
+        try:
+            _original_bytes, original_after = read_bound_fd(
+                backup_binding.fd,
+                label="rollback_original",
+            )
+            _installed_bytes, installed_after = read_bound_fd(
+                live_binding.fd,
+                label="rollback_displaced_installed",
+            )
+            reject_unmodeled_metadata_fd(
+                backup_binding.fd,
+                label="rollback_original",
+            )
+            reject_unmodeled_metadata_fd(
+                live_binding.fd,
+                label="rollback_displaced_installed",
+            )
+        except TransactionError as error:
+            raise stage._uncertain_mutation(
+                operation="rollback_exchange",
+                source=backup_binding,
+                destination_binding=live_binding,
+                destination=rules,
+                source_observation=backup_observation,
+                destination_observation=live_observation,
+                destination_expected=installed,
+            ) from error
+        if (
+            property_mismatches(backup_expected, original_after)
+            or property_mismatches(installed, installed_after)
+            or not observation_matches(backup_observation)
+            or not observation_matches(live_observation)
+        ):
+            raise stage._uncertain_mutation(
+                operation="rollback_exchange",
+                source=backup_binding,
+                destination_binding=live_binding,
+                destination=rules,
+                source_observation=backup_observation,
+                destination_observation=live_observation,
+                destination_expected=installed,
+            )
+        stage.mutation_uncertain = False
+        exchange_completed = True
+        os.fsync(stage.rules_parent_fd)
         _restored_bytes, restored = read_stable(
             rules,
             label="live_rules",
             require_modeled_metadata=True,
         )
-        if property_mismatches(
-            restored_expected, restored
-        ) or not content_access_and_object_policy_match(
+        restored_mismatches = property_mismatches(
+            backup_expected,
+            restored,
+        )
+        if restored_mismatches or not content_access_and_object_policy_match(
             original,
             restored,
         ):
             return False, {
-                "rollback_status": "rollback_verification_failed",
+                "rollback_status": "recovery_required",
+                "recovery_reason": "rollback_verification_failed",
+                "mismatched_properties": restored_mismatches,
                 "actual_live": restored.to_json(),
             }
         return True, {
@@ -4114,17 +4708,28 @@ def rollback(
             "restored": restored.to_json(),
         }
     except (OSError, TransactionError) as error:
+        error_status = (
+            error.status
+            if isinstance(error, TransactionError)
+            else "rollback_failed"
+        )
         result: dict[str, object] = {
             "rollback_status": (
-                error.status
-                if isinstance(error, TransactionError)
-                else "rollback_failed"
+                "recovery_required"
+                if exchange_completed
+                else error_status
             ),
             "rollback_message": str(error),
         }
+        if exchange_completed:
+            result["recovery_reason"] = error_status
         if isinstance(error, TransactionError):
             result.update(error.details)
         return False, result
+    finally:
+        for binding in (live_binding, backup_binding):
+            if binding is not None:
+                os.close(binding.fd)
 
 
 def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
@@ -4163,6 +4768,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
     candidate_bytes, source_snapshot = read_stable(
         candidate_source,
         label="candidate_source",
+        require_modeled_metadata=True,
     )
     if not hmac.compare_digest(source_snapshot.sha256, candidate_sha256):
         raise TransactionError(
@@ -4180,6 +4786,51 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
     lock_acquired = False
     retain_stage = False
     pending_success_status: str | None = None
+    replacement_started = False
+
+    def finalize_apply_state() -> None:
+        try:
+            if evidence is not None:
+                evidence.close()
+        finally:
+            effective_retain_stage = retain_stage or (
+                stage is not None and stage.mutation_uncertain
+            )
+            warnings = (
+                stage.cleanup(retain=effective_retain_stage)
+                if stage is not None
+                else []
+            )
+        if warnings:
+            print(
+                json.dumps(
+                    {
+                        "status": "cleanup_warning",
+                        "lock_acquired": lock_acquired,
+                        "warnings": warnings,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+        cleanup_refusals = [
+            warning
+            for warning in warnings
+            if warning.get("status") == "stage_cleanup_refused"
+        ]
+        if (
+            pending_success_status is not None or replacement_started
+        ) and cleanup_refusals:
+            raise TransactionError(
+                "recovery_required",
+                "cannot finalize a replaced transaction while fixed stage cleanup is unverified",
+                exit_code=EXIT_POST_REPLACE_FAILED,
+                details={
+                    "operation_status": pending_success_status,
+                    "cleanup_refusals": cleanup_refusals,
+                },
+            )
+
     try:
         # A no-op needs neither a validator process nor a staging directory.
         # The unlocked read is only a hint; every protected live property and
@@ -4218,6 +4869,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     candidate_sha256=candidate_sha256,
                 )
                 if current_bytes == candidate_bytes:
+                    validate_existing_fixed_stage_is_empty(rules.parent)
                     return 0, {
                         "status": "no_change_after_lock",
                         "rules_path": str(rules),
@@ -4225,34 +4877,33 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     }
             lock_acquired = False
 
-        stage = PrivateStage(rules.parent)
-        candidate, candidate_snapshot = stage.create("candidate", candidate_bytes)
-        pre_validation = run_validator(
-            args.validator_command,
-            candidate,
-            timeout_seconds=args.validator_timeout_seconds,
-        )
-        if not pre_validation.valid:
-            stage.validate(candidate, candidate_snapshot, label="private_candidate")
+        # The first validator sees only an unlinked descriptor-backed copy.  No
+        # rules-parent stage exists until the copy and the caller-owned audited
+        # source have both survived full protected-property revalidation.
+        with AnonymousValidatorInput(candidate_bytes) as validation_input:
+            pre_validation = run_validator(
+                args.validator_command,
+                validation_input.path,
+                timeout_seconds=args.validator_timeout_seconds,
+                pass_fds=(validation_input.fd,),
+            )
+            validation_input.validate()
             revalidate_candidate_source(
                 candidate_source,
                 source_snapshot,
                 candidate_sha256=candidate_sha256,
             )
+        if not pre_validation.valid:
             return EXIT_VALIDATION_FAILED, {
                 "status": "candidate_validation_failed",
                 "validator": pre_validation.to_json(),
                 "rules_path": str(rules),
             }
-        stage.validate(candidate, candidate_snapshot, label="private_candidate")
-        revalidate_candidate_source(
-            candidate_source,
-            source_snapshot,
-            candidate_sha256=candidate_sha256,
-        )
 
         with shared_lock(
-            lock, timeout_seconds=args.lock_timeout_seconds
+            lock,
+            timeout_seconds=args.lock_timeout_seconds,
+            before_release=finalize_apply_state,
         ) as lock_expected:
             lock_acquired = True
             current_bytes, current = read_stable(
@@ -4274,6 +4925,12 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     "actual_sha256": current.sha256,
                 }
             if current_bytes == candidate_bytes:
+                revalidate_candidate_source(
+                    candidate_source,
+                    source_snapshot,
+                    candidate_sha256=candidate_sha256,
+                )
+                validate_existing_fixed_stage_is_empty(rules.parent)
                 pending_success_status = "no_change_after_lock"
                 return 0, {
                     "status": "no_change_after_lock",
@@ -4281,6 +4938,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     "sha256": current.sha256,
                 }
 
+            stage = PrivateStage(rules.parent)
             transaction_id = secrets.token_hex(16)
             receipt_parent = bind_directory(
                 receipt.parent,
@@ -4328,23 +4986,22 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             evidence.validate()
 
             parent_expected = stage.rules_parent_snapshot
-            backup_stage, backup_stage_snapshot = stage.create("backup", current_bytes)
-            backup_stage_snapshot = stage.set_policy(
-                backup_stage,
-                backup_stage_snapshot,
-                current,
+            revalidate_candidate_source(
+                candidate_source,
+                source_snapshot,
+                candidate_sha256=candidate_sha256,
             )
-            backup_binding = stage.publish_backup(backup_stage, backup)
-            backup_snapshot = backup_binding.snapshot
-            evidence.backup = backup_binding
-            os.fsync(stage.rules_parent_fd)
-            evidence.validate()
-
+            candidate, candidate_snapshot = stage.create(
+                "candidate",
+                candidate_bytes,
+            )
             installed_snapshot = stage.set_policy(
                 candidate,
                 candidate_snapshot,
                 current,
             )
+            os.fsync(stage.stage_fd)
+            os.fsync(stage.rules_parent_fd)
             transaction_receipt = receipt_payload(
                 transaction_id=transaction_id,
                 rules=rules,
@@ -4355,7 +5012,9 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 parent=parent_expected,
                 original=current,
                 installed=installed_snapshot,
-                backup_snapshot=backup_snapshot,
+                backup_snapshot=current,
+                staged_backup=candidate,
+                staged_backup_parent=stage.stage_snapshot,
                 recovery_terminal=recovery_terminal,
                 recovery_terminal_snapshot=evidence.recovery_terminal.snapshot,
             )
@@ -4388,10 +5047,60 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     final_live,
                     pre_exchange_revalidate=evidence.validate,
                 )
+                replacement_started = True
             except TransactionError as error:
                 error.details.setdefault("receipt_path", str(receipt))
                 error.details.setdefault("backup_path", str(backup))
                 raise
+            # The exchange leaves the exact original live inode bound at the
+            # staged candidate path.  Publish that object itself as the formal
+            # no-clobber backup so a successful transaction leaves no child
+            # inode in its private stage.
+            try:
+                backup_binding = stage.publish_backup(candidate, backup)
+            except TransactionError as error:
+                retain_stage = True
+                return EXIT_POST_REPLACE_FAILED, {
+                    "status": "recovery_required",
+                    "post_replace_failure": {
+                        "status": error.status,
+                        "message": str(error),
+                        **error.details,
+                    },
+                    "receipt_path": str(receipt),
+                    "backup_path": str(backup),
+                    "staged_backup_path": str(candidate),
+                }
+            backup_snapshot = backup_binding.snapshot
+            if property_mismatches(current, backup_snapshot):
+                retain_stage = True
+                return EXIT_POST_REPLACE_FAILED, {
+                    "status": "recovery_required",
+                    "post_replace_failure": {
+                        "status": "backup_identity_mismatch",
+                        "mismatched_properties": property_mismatches(
+                            current,
+                            backup_snapshot,
+                        ),
+                    },
+                    "receipt_path": str(receipt),
+                    "backup_path": str(backup),
+                    "staged_backup_path": str(candidate),
+                }
+            evidence.backup = backup_binding
+            try:
+                os.fsync(stage.stage_fd)
+                os.fsync(stage.rules_parent_fd)
+            except OSError as error:
+                return EXIT_POST_REPLACE_FAILED, {
+                    "status": "recovery_required",
+                    "post_replace_failure": {
+                        "status": "backup_publication_fsync_failed",
+                        "message": str(error),
+                    },
+                    "receipt_path": str(receipt),
+                    "backup_path": str(backup),
+                }
             post_failure: dict[str, object] | None = None
             try:
                 evidence.validate()
@@ -4644,37 +5353,409 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             retain_stage = True
         raise
     finally:
-        try:
-            if evidence is not None:
-                evidence.close()
-        finally:
-            warnings = stage.cleanup(retain=retain_stage) if stage is not None else []
-        if warnings:
-            print(
-                json.dumps(
-                    {
-                        "status": "cleanup_warning",
-                        "lock_acquired": lock_acquired,
-                        "warnings": warnings,
-                    },
-                    sort_keys=True,
+        finalize_apply_state()
+
+
+def publish_staged_backup_for_recovery(
+    *,
+    stage: PrivateStage,
+    backup: Path,
+    staged_backup: Path,
+    original: Snapshot,
+) -> Snapshot:
+    backup_binding = stage.publish_backup(staged_backup, backup)
+    persisted = backup_binding.snapshot
+    mismatches = property_mismatches(original, persisted)
+    if mismatches:
+        raise stage._uncertain_mutation(
+            operation="recovery_no_replace",
+            source=backup_binding,
+            destination_binding=None,
+            destination=backup,
+            source_observation=observe_directory_entry(
+                stage.stage_fd,
+                staged_backup.name,
+            ),
+            destination_observation=observe_directory_entry(
+                stage.rules_parent_fd,
+                backup.name,
+                expected=original,
+            ),
+        )
+    return persisted
+
+
+def recovery_entry_snapshot(path: Path, *, label: str) -> Snapshot | None:
+    try:
+        _payload, snapshot = read_stable(
+            path,
+            label=label,
+            require_modeled_metadata=True,
+        )
+    except TransactionError as error:
+        if error.status == f"{label}_missing":
+            return None
+        raise
+    return snapshot
+
+
+def recovery_snapshot_role(
+    actual: Snapshot | None,
+    *,
+    original: Snapshot,
+    installed: Snapshot,
+) -> str:
+    if actual is None:
+        return "M"
+    if not property_mismatches(original, actual):
+        return "O"
+    if not property_mismatches(installed, actual):
+        return "I"
+    return "?"
+
+
+def recover_schema_v3_transaction(
+    *,
+    rules: Path,
+    lock: Path,
+    lock_expected: Snapshot,
+    backup: Path,
+    staged_backup: Path,
+    rules_parent_expected: Snapshot,
+    staged_parent_expected: Snapshot,
+    original: Snapshot,
+    installed: Snapshot,
+    terminal_path: Path,
+    terminal_expected: Snapshot,
+    transaction_id: str,
+) -> tuple[int, dict[str, object]]:
+    try:
+        live_actual = recovery_entry_snapshot(rules, label="live_rules")
+        backup_actual = recovery_entry_snapshot(backup, label="backup")
+        staged_actual = recovery_entry_snapshot(
+            staged_backup,
+            label="staged_backup",
+        )
+    except TransactionError as error:
+        return EXIT_RECOVERY_REFUSED, {
+            "status": "recovery_refused",
+            "reason": error.status,
+            "message": str(error),
+            **error.details,
+        }
+    roles = (
+        recovery_snapshot_role(
+            live_actual,
+            original=original,
+            installed=installed,
+        ),
+        recovery_snapshot_role(
+            backup_actual,
+            original=original,
+            installed=installed,
+        ),
+        recovery_snapshot_role(
+            staged_actual,
+            original=original,
+            installed=installed,
+        ),
+    )
+    states = {
+        ("O", "M", "I"): "P",
+        ("I", "M", "O"): "X",
+        ("I", "O", "M"): "C",
+        ("O", "I", "M"): "R",
+    }
+    state = states.get(roles)
+    if state is None:
+        if (
+            live_actual is not None
+            and content_access_and_object_policy_match(original, live_actual)
+            and property_mismatches(original, live_actual)
+        ):
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "original_identity_untrusted",
+                "mismatched_properties": ["object_identity"],
+                "actual_live": live_actual.to_json(),
+            }
+        return EXIT_RECOVERY_REFUSED, {
+            "status": "recovery_refused",
+            "reason": "schema_v3_state_unrecognized",
+            "observed_roles": {
+                "live": roles[0],
+                "backup": roles[1],
+                "staged_backup": roles[2],
+            },
+            "actual": {
+                "live": live_actual.to_json() if live_actual is not None else None,
+                "backup": (
+                    backup_actual.to_json() if backup_actual is not None else None
                 ),
-                file=sys.stderr,
+                "staged_backup": (
+                    staged_actual.to_json() if staged_actual is not None else None
+                ),
+            },
+        }
+
+    try:
+        terminal, terminal_actual = read_recovery_terminal_with_snapshot(
+            terminal_path
+        )
+    except TransactionError as error:
+        return EXIT_RECOVERY_REFUSED, {
+            "status": "recovery_refused",
+            "reason": error.status,
+            "message": str(error),
+            **error.details,
+        }
+    if terminal.get("state") == RECOVERY_TERMINAL_RESERVED:
+        terminal_binding_mismatches = property_mismatches(
+            terminal_expected,
+            terminal_actual,
+        )
+    else:
+        terminal_binding_mismatches = identity_access_and_object_policy_mismatches(
+            terminal_expected,
+            terminal_actual,
+        )
+    if terminal_binding_mismatches:
+        return EXIT_RECOVERY_REFUSED, {
+            "status": "recovery_refused",
+            "reason": "recovery_terminal_binding_changed",
+            "mismatched_properties": terminal_binding_mismatches,
+        }
+    if terminal.get("transaction_id") != transaction_id:
+        return EXIT_RECOVERY_REFUSED, {
+            "status": "recovery_refused",
+            "reason": "recovery_terminal_transaction_mismatch",
+        }
+    if terminal.get("state") == RECOVERY_TERMINAL_RESTORED:
+        if state != "R" or live_actual is None:
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "recovery_terminal_state_mismatch",
+                "transaction_state": state,
+            }
+        terminal_restored = Snapshot.from_json(
+            terminal.get("restored"),
+            label="recovery_terminal.restored",
+            require_object_policy=True,
+        )
+        terminal_mismatches = property_mismatches(
+            terminal_restored,
+            live_actual,
+        )
+        if terminal_mismatches or property_mismatches(original, live_actual):
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "recovery_terminal_live_mismatch",
+                "mismatched_properties": terminal_mismatches,
+                "actual_live": live_actual.to_json(),
+            }
+        try:
+            terminal_stage = PrivateStage(
+                rules.parent,
+                rules_parent_expected=rules_parent_expected,
+                recovery_stage_expected=staged_parent_expected,
             )
-        cleanup_refusals = [
-            warning
-            for warning in warnings
-            if warning.get("status") == "stage_cleanup_refused"
-        ]
-        if pending_success_status is not None and cleanup_refusals:
-            raise TransactionError(
-                "stage_cleanup_refused",
-                "cannot report success because disposable stage cleanup was refused",
-                details={
-                    "operation_status": pending_success_status,
-                    "cleanup_refusals": cleanup_refusals,
-                },
+        except (OSError, TransactionError) as error:
+            error_status = (
+                error.status
+                if isinstance(error, TransactionError)
+                else "recovery_io_failed"
             )
+            error_details = (
+                error.details if isinstance(error, TransactionError) else {}
+            )
+            return EXIT_POST_REPLACE_FAILED, {
+                "status": "recovery_required",
+                "transaction_state": state,
+                "reason": error_status,
+                "message": str(error),
+                **error_details,
+            }
+        terminal_cleanup_warnings = terminal_stage.cleanup(retain=False)
+        if terminal_cleanup_warnings:
+            return EXIT_POST_REPLACE_FAILED, {
+                "status": "recovery_required",
+                "transaction_state": state,
+                "reason": "stage_cleanup_refused",
+                "cleanup_refusals": terminal_cleanup_warnings,
+            }
+        return 0, {
+            "status": "already_original",
+            "rules_path": str(rules),
+            "live": live_actual.to_json(),
+            "identity_evidence": "recovery_terminal",
+        }
+    if terminal.get("state") != RECOVERY_TERMINAL_RESERVED:
+        return EXIT_RECOVERY_REFUSED, {
+            "status": "recovery_refused",
+            "reason": "recovery_terminal_state_invalid",
+        }
+
+    stage_candidate_expected = (
+        installed
+        if state == "P"
+        else original
+        if state == "X"
+        else None
+    )
+    stage: PrivateStage | None = None
+    retain_stage = False
+    pending_success = False
+    rollback_result: dict[str, object] | None = None
+    try:
+        stage = PrivateStage(
+            rules.parent,
+            rules_parent_expected=rules_parent_expected,
+            recovery_stage_expected=staged_parent_expected,
+            recovery_candidate_expected=stage_candidate_expected,
+        )
+        revalidate_lock(lock, lock_expected)
+        if state == "P":
+            assert staged_actual is not None
+            stage.move_to(
+                staged_backup,
+                rules,
+                original,
+                pre_exchange_revalidate=lambda: revalidate_lock(
+                    lock,
+                    lock_expected,
+                ),
+            )
+            state = "X"
+            os.fsync(stage.stage_fd)
+            os.fsync(stage.rules_parent_fd)
+        if state == "X":
+            publish_staged_backup_for_recovery(
+                stage=stage,
+                backup=backup,
+                staged_backup=staged_backup,
+                original=original,
+            )
+            state = "C"
+            os.fsync(stage.stage_fd)
+            os.fsync(stage.rules_parent_fd)
+        if state == "C":
+            rolled_back, rollback_result = rollback(
+                stage=stage,
+                rules=rules,
+                lock=lock,
+                lock_expected=lock_expected,
+                backup=backup,
+                original=original,
+                installed=installed,
+                backup_expected=original,
+            )
+            if not rolled_back:
+                recovery_required = (
+                    rollback_result.get("rollback_status") == "recovery_required"
+                    or stage.mutation_uncertain
+                )
+                retain_stage = recovery_required
+                return (
+                    EXIT_POST_REPLACE_FAILED
+                    if recovery_required
+                    else EXIT_RECOVERY_REFUSED
+                ), {
+                    "status": (
+                        "recovery_required"
+                        if recovery_required
+                        else "recovery_refused"
+                    ),
+                    "transaction_state": "C",
+                    "rollback": rollback_result,
+                }
+            os.fsync(stage.stage_fd)
+            os.fsync(stage.rules_parent_fd)
+            state = "R"
+
+        _restored_bytes, restored = read_stable(
+            rules,
+            label="live_rules",
+            require_modeled_metadata=True,
+        )
+        _displaced_bytes, displaced = read_stable(
+            backup,
+            label="backup",
+            require_modeled_metadata=True,
+        )
+        if property_mismatches(original, restored) or property_mismatches(
+            installed,
+            displaced,
+        ):
+            retain_stage = True
+            return EXIT_POST_REPLACE_FAILED, {
+                "status": "recovery_required",
+                "reason": "schema_v3_restored_state_unverified",
+                "actual_live": restored.to_json(),
+                "actual_backup": displaced.to_json(),
+            }
+        terminal_result = record_recovery_terminal(
+            terminal_path,
+            transaction_id=transaction_id,
+            original=original,
+            restored=restored,
+            expected_reservation=terminal_expected,
+        )
+        verify_restored_terminal(rules, restored)
+        pending_success = True
+        return 0, {
+            "status": "recovered",
+            "rules_path": str(rules),
+            "rollback": rollback_result,
+            "recovery_terminal": terminal_result,
+        }
+    except (OSError, TransactionError) as error:
+        error_status = (
+            error.status
+            if isinstance(error, TransactionError)
+            else "recovery_io_failed"
+        )
+        error_details = error.details if isinstance(error, TransactionError) else {}
+        retain_stage = error_status == "recovery_required" or (
+            stage is not None and stage.mutation_uncertain
+        )
+        if state in ("X", "C", "R") or retain_stage:
+            return EXIT_POST_REPLACE_FAILED, {
+                "status": "recovery_required",
+                "transaction_state": state,
+                "reason": error_status,
+                "message": str(error),
+                **error_details,
+            }
+        return EXIT_RECOVERY_REFUSED, {
+            "status": "recovery_refused",
+            "transaction_state": state,
+            "reason": error_status,
+            "message": str(error),
+            **error_details,
+        }
+    finally:
+        if stage is not None:
+            warnings = stage.cleanup(retain=retain_stage)
+            if warnings:
+                print(
+                    json.dumps(
+                        {"status": "cleanup_warning", "warnings": warnings},
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+            cleanup_refusals = [
+                warning
+                for warning in warnings
+                if warning.get("status") == "stage_cleanup_refused"
+            ]
+            if pending_success and cleanup_refusals:
+                raise TransactionError(
+                    "recovery_required",
+                    "cannot report recovered while fixed stage cleanup is unverified",
+                    exit_code=EXIT_POST_REPLACE_FAILED,
+                    details={"cleanup_refusals": cleanup_refusals},
+                )
 
 
 def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
@@ -4749,6 +5830,41 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
         label="backup",
         require_object_policy=require_object_policy,
     )
+    staged_backup: Path | None = None
+    staged_parent_expected: Snapshot | None = None
+    if receipt_schema_version >= 3:
+        backup_receipt_mismatches = property_mismatches(
+            original,
+            backup_expected,
+        )
+        if backup_receipt_mismatches:
+            raise TransactionError(
+                "receipt_invalid",
+                "schema-v3 backup snapshot must exactly match original",
+                details={
+                    "mismatched_properties": backup_receipt_mismatches,
+                },
+            )
+        staged_backup_raw = receipt.get("staged_backup_path")
+        if not isinstance(staged_backup_raw, str):
+            raise TransactionError(
+                "receipt_invalid",
+                "schema-v3 receipt is missing staged_backup_path",
+            )
+        staged_backup = Path(staged_backup_raw)
+        expected_staged_backup = (
+            rules.parent / PRIVATE_STAGE_NAME / "candidate"
+        )
+        if not staged_backup.is_absolute() or staged_backup != expected_staged_backup:
+            raise TransactionError(
+                "receipt_invalid",
+                "staged backup path is not the fixed transaction-stage candidate",
+            )
+        staged_parent_expected = Snapshot.from_json(
+            receipt.get("staged_backup_parent"),
+            label="staged_backup_parent",
+            require_object_policy=True,
+        )
     terminal_expected: Snapshot | None = None
     if receipt.get("recovery_terminal") is not None:
         if terminal_path is None:
@@ -4766,6 +5882,15 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                 "receipt_invalid",
                 "recovery_terminal.object_policy.nlink must be 1",
             )
+    if receipt_schema_version >= 3 and (
+        terminal_path is None
+        or terminal_expected is None
+        or not isinstance(transaction_id, str)
+    ):
+        raise TransactionError(
+            "receipt_invalid",
+            "schema-v3 receipt requires a bound recovery terminal",
+        )
     if require_object_policy:
         for label, snapshot in (
             ("original", original),
@@ -4790,6 +5915,26 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
 
     stage: PrivateStage | None = None
     with shared_lock(lock, timeout_seconds=args.lock_timeout_seconds) as lock_expected:
+        if receipt_schema_version >= 3:
+            assert staged_backup is not None
+            assert staged_parent_expected is not None
+            assert terminal_path is not None
+            assert terminal_expected is not None
+            assert isinstance(transaction_id, str)
+            return recover_schema_v3_transaction(
+                rules=rules,
+                lock=lock,
+                lock_expected=lock_expected,
+                backup=backup,
+                staged_backup=staged_backup,
+                rules_parent_expected=parent_expected,
+                staged_parent_expected=staged_parent_expected,
+                original=original,
+                installed=installed,
+                terminal_path=terminal_path,
+                terminal_expected=terminal_expected,
+                transaction_id=transaction_id,
+            )
         try:
             _live_bytes, live = read_stable(
                 rules,
@@ -4897,6 +6042,22 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                 "mismatched_properties": live_mismatches,
                 "actual_live": live.to_json(),
             }
+        try:
+            os.stat(backup, follow_symlinks=False)
+            backup_missing = False
+        except FileNotFoundError:
+            backup_missing = True
+        except OSError as error:
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "backup_unreadable",
+                "message": str(error),
+            }
+        if backup_missing:
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "backup_missing",
+            }
         stage = PrivateStage(rules.parent)
         retain_stage = False
         pending_success_status: str | None = None
@@ -4989,7 +6150,7 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                 raise TransactionError(
                     "stage_cleanup_refused",
                     (
-                        "cannot report success because disposable stage cleanup "
+                        "cannot report success because fixed stage cleanup "
                         "was refused"
                     ),
                     details={

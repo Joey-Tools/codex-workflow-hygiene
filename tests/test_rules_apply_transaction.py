@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 import errno
+import fcntl
 import hashlib
 import importlib.util
 import io
@@ -89,6 +90,14 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
     def assert_no_private_stage(self) -> None:
         self.assertEqual(list(self.rules_dir.glob(".rules-apply-*")), [])
+        self.assertEqual(
+            list(self.rules_dir.glob(".default.rules.cleanup-retained-*")),
+            [],
+        )
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        if stage.exists():
+            self.assertTrue(stage.is_dir())
+            self.assertEqual(list(stage.iterdir()), [])
 
     def write_sleeping_validator(self, pid_path: Path) -> None:
         self.write_validator(
@@ -394,14 +403,15 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 "name": path.name,
                 "file_mode": file_mode,
                 "parent_mode": parent_mode,
+                "nlink": path.stat().st_nlink,
                 "content": path.read_text(encoding="utf-8"),
             }
             with Path(os.environ["VALIDATOR_LOG"]).open(
                 "a", encoding="utf-8"
             ) as handle:
                 handle.write(json.dumps(row, sort_keys=True) + "\\n")
-            if path.name == "candidate" and (
-                file_mode != 0o600 or parent_mode != 0o700
+            if path.name != "default.rules" and (
+                file_mode != 0o600 or path.stat().st_nlink != 0
             ):
                 raise SystemExit(7)
             """
@@ -428,14 +438,14 @@ class RulesApplyTransactionTests(unittest.TestCase):
             json.loads(line)
             for line in validator_log.read_text(encoding="utf-8").splitlines()
         ]
-        self.assertEqual(
-            [row["name"] for row in validator_rows], ["candidate", "default.rules"]
-        )
+        self.assertTrue(validator_rows[0]["name"].isdigit())
+        self.assertEqual(validator_rows[1]["name"], "default.rules")
         self.assertEqual(validator_rows[0]["file_mode"], 0o600)
-        self.assertEqual(validator_rows[0]["parent_mode"], 0o700)
+        self.assertEqual(validator_rows[0]["nlink"], 0)
+        self.assertEqual(validator_rows[0]["content"].encode(), NEW_RULES)
         self.assertEqual(validator_rows[1]["file_mode"], 0o640)
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["schema_version"], 3)
         self.assertEqual(
             receipt["rules_parent"]["identity"],
             {
@@ -445,6 +455,15 @@ class RulesApplyTransactionTests(unittest.TestCase):
         )
         self.assertEqual(receipt["installed"]["object_policy"], {"nlink": 1})
         self.assertEqual(receipt["backup"]["object_policy"], {"nlink": 1})
+        self.assertEqual(receipt["backup"], receipt["original"])
+        self.assertEqual(
+            Path(receipt["staged_backup_path"]).resolve(),
+            (
+                self.rules_dir
+                / TRANSACTION.PRIVATE_STAGE_NAME
+                / "candidate"
+            ).resolve(),
+        )
         self.assertEqual(
             receipt["recovery_terminal"]["object_policy"],
             {"nlink": 1},
@@ -483,7 +502,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
             import sys
 
             path = Path(sys.argv[1])
-            if path.name == "candidate":
+            if path.name != "default.rules":
                 source = Path(os.environ["CANDIDATE_SOURCE"])
                 replacement = source.with_name("candidate.replacement")
                 replacement.write_bytes(source.read_bytes())
@@ -512,25 +531,95 @@ class RulesApplyTransactionTests(unittest.TestCase):
     def test_candidate_changed_by_validator_is_rejected_before_lock(self) -> None:
         self.write_validator(
             """\
+            import os
             from pathlib import Path
             import sys
 
             path = Path(sys.argv[1])
-            path.write_bytes(b"validator changed candidate\\n")
+            fd = int(path.name)
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, b"validator changed candidate\\n", 0)
             """
         )
 
         result = self.run_apply()
 
-        self.assertEqual(result.returncode, 50, result.stderr)
+        self.assertEqual(result.returncode, 10, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["status"], "private_candidate_changed")
+        self.assertEqual(payload["status"], "validator_input_changed")
         self.assertIn("content", payload["mismatched_properties"])
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.receipt.exists())
         self.assertFalse((self.rules_dir / ".default.rules.apply.lock").exists())
         self.assert_no_private_stage()
+
+    def test_candidate_access_change_via_inherited_fd_is_rejected(self) -> None:
+        self.write_validator(
+            """\
+            import os
+            from pathlib import Path
+            import sys
+
+            fd = int(Path(sys.argv[1]).name)
+            os.fchmod(fd, 0o640)
+            """
+        )
+
+        result = self.run_apply()
+
+        self.assertEqual(result.returncode, 10, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "validator_input_changed")
+        self.assertEqual(payload["mismatched_properties"], ["access_policy"])
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse((self.rules_dir / ".default.rules.apply.lock").exists())
+        self.assert_no_private_stage()
+
+    def test_anonymous_validator_input_rejects_object_policy_drift(self) -> None:
+        with TRANSACTION.AnonymousValidatorInput(NEW_RULES) as validator_input:
+            real_read_bound_fd = TRANSACTION.read_bound_fd
+
+            def report_added_link(
+                fd: int,
+                *,
+                label: str,
+                max_bytes: int = TRANSACTION.MAX_RULES_BYTES,
+            ) -> tuple[bytes, object]:
+                payload, actual = real_read_bound_fd(
+                    fd,
+                    label=label,
+                    max_bytes=max_bytes,
+                )
+                if fd == validator_input.fd:
+                    actual = TRANSACTION.Snapshot(
+                        device=actual.device,
+                        inode=actual.inode,
+                        size=actual.size,
+                        sha256=actual.sha256,
+                        mode=actual.mode,
+                        uid=actual.uid,
+                        gid=actual.gid,
+                        nlink=(actual.nlink or 0) + 1,
+                    )
+                return payload, actual
+
+            with (
+                mock.patch.object(
+                    TRANSACTION,
+                    "read_bound_fd",
+                    side_effect=report_added_link,
+                ),
+                self.assertRaises(TRANSACTION.TransactionError) as raised,
+            ):
+                validator_input.validate()
+
+        self.assertEqual(raised.exception.status, "validator_input_changed")
+        self.assertIn(
+            "object_policy",
+            raised.exception.details["mismatched_properties"],
+        )
 
     def test_rejected_unchanged_candidate_stage_is_removed(self) -> None:
         self.write_validator("raise SystemExit(7)\n")
@@ -544,6 +633,28 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.receipt.exists())
+        self.assert_no_private_stage()
+
+    def test_repeated_validation_failures_do_not_consume_stage_capacity(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(7)\n")
+
+        for attempt in range(12):
+            with self.subTest(attempt=attempt):
+                result = self.run_apply()
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertEqual(
+                    json.loads(result.stdout)["status"],
+                    "candidate_validation_failed",
+                )
+                self.assertFalse(self.receipt.exists())
+                self.assert_no_private_stage()
+
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(json.loads(applied.stdout)["status"], "applied")
         self.assert_no_private_stage()
 
     def test_candidate_hardlinked_by_validator_is_rejected_before_lock(self) -> None:
@@ -560,10 +671,10 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         result = self.run_apply()
 
-        self.assertEqual(result.returncode, 50, result.stderr)
+        self.assertEqual(result.returncode, 10, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["status"], "private_candidate_changed")
-        self.assertEqual(payload["mismatched_properties"], ["object_policy"])
+        self.assertEqual(payload["status"], "candidate_validation_failed")
+        self.assertNotEqual(payload["validator"]["returncode"], 0)
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.receipt.exists())
@@ -576,9 +687,12 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         result = self.run_apply()
 
-        self.assertEqual(result.returncode, 50, result.stderr)
+        self.assertEqual(result.returncode, 10, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["status"], "unsupported_extended_attributes")
+        self.assertIn(
+            payload["status"],
+            {"candidate_validation_failed", "validator_input_changed"},
+        )
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.receipt.exists())
@@ -591,9 +705,12 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         result = self.run_apply()
 
-        self.assertEqual(result.returncode, 50, result.stderr)
+        self.assertEqual(result.returncode, 10, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["status"], "unsupported_access_control_list")
+        self.assertIn(
+            payload["status"],
+            {"candidate_validation_failed", "validator_input_changed"},
+        )
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.receipt.exists())
@@ -616,7 +733,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
         self.assertTrue(self.backup.exists())
         self.assertTrue(self.receipt.exists())
-        self.assertTrue(list(self.rules_dir.glob(".rules-apply-*")))
+        self.assert_no_private_stage()
 
     def test_metadata_inspection_capability_failure_is_fail_closed(self) -> None:
         stage = TRANSACTION.PrivateStage(self.rules_dir)
@@ -1024,6 +1141,248 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status, "validator_cleanup_failed")
         self.assert_process_exited(self.wait_for_pid_path(pid_path))
+
+    @unittest.skipUnless(hasattr(signal, "SIGCHLD"), "POSIX SIGCHLD required")
+    def test_validator_rejects_external_sigchld_reaping_policy(self) -> None:
+        real_getsignal = TRANSACTION.signal.getsignal
+
+        def nondefault_sigchld(signum: int) -> object:
+            if signum == signal.SIGCHLD:
+                return signal.SIG_IGN
+            return real_getsignal(signum)
+
+        with (
+            mock.patch.object(
+                TRANSACTION.signal,
+                "getsignal",
+                side_effect=nondefault_sigchld,
+            ),
+            mock.patch.object(TRANSACTION.subprocess, "Popen") as popen,
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.run_validator(
+                [sys.executable, str(self.validator), "{rules}"],
+                self.candidate,
+                timeout_seconds=2,
+            )
+
+        self.assertEqual(
+            raised.exception.status,
+            "validator_supervision_unsupported",
+        )
+        self.assertIn("SIGCHLD", str(raised.exception))
+        popen.assert_not_called()
+
+    def test_normal_cleanup_never_uses_pgid_after_leader_reap(self) -> None:
+        state = {"reaped": False, "inventory_calls": 0}
+
+        class FakeProcess:
+            pid = 424_242
+            returncode: int | None = None
+
+            def wait(self, timeout: float) -> int:
+                self.returncode = 0
+                state["reaped"] = True
+                return 0
+
+        class FakeObserver:
+            @staticmethod
+            def child_exited() -> bool:
+                return True
+
+        process = FakeProcess()
+        selector = mock.Mock()
+        selector.get_map.return_value = {}
+
+        def inventory(
+            process_group_id: int,
+            *,
+            leader_pid: int,
+        ) -> tuple[int, ...]:
+            self.assertFalse(
+                state["reaped"],
+                "a reused numeric PGID was inspected after leader reap",
+            )
+            self.assertEqual(process_group_id, process.pid)
+            self.assertEqual(leader_pid, process.pid)
+            state["inventory_calls"] += 1
+            return (515_151,) if state["inventory_calls"] == 1 else ()
+
+        def signal_group(
+            process_group_id: int,
+            signum: int,
+            *,
+            allow_zombie_only: bool = False,
+        ) -> None:
+            self.assertFalse(
+                state["reaped"],
+                "a reused numeric PGID was signaled after leader reap",
+            )
+            self.assertEqual(process_group_id, process.pid)
+            self.assertIn(signum, (signal.SIGTERM, signal.SIGKILL))
+            self.assertTrue(allow_zombie_only)
+
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "VALIDATOR_TERM_GRACE_SECONDS",
+                0,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "_live_validator_group_member_pids",
+                side_effect=inventory,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "_signal_validator_group",
+                side_effect=signal_group,
+            ),
+        ):
+            returncode, descendants_terminated = (
+                TRANSACTION._stop_validator_process_group(
+                    process,
+                    FakeObserver(),
+                    selector,
+                    {"stdout": bytearray(), "stderr": bytearray()},
+                    max_output_bytes=TRANSACTION.MAX_VALIDATOR_OUTPUT_BYTES,
+                )
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertTrue(descendants_terminated)
+        self.assertTrue(state["reaped"])
+        self.assertGreaterEqual(state["inventory_calls"], 3)
+
+    def test_normal_cleanup_accepts_verified_zombie_only_eperm_race(self) -> None:
+        state = {"exit_probes": 0, "reaped": False}
+
+        class FakeProcess:
+            pid = 525_252
+            returncode: int | None = None
+
+            def wait(self, timeout: float) -> int:
+                self.returncode = 0
+                state["reaped"] = True
+                return 0
+
+        class FakeObserver:
+            @staticmethod
+            def child_exited() -> bool:
+                state["exit_probes"] += 1
+                return state["exit_probes"] > 1
+
+        selector = mock.Mock()
+        selector.get_map.return_value = {}
+        permission_error = PermissionError(
+            errno.EPERM,
+            "fault-injected zombie-only process group",
+        )
+
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "VALIDATOR_TERM_GRACE_SECONDS",
+                0,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "VALIDATOR_KILL_DRAIN_SECONDS",
+                0,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "_live_validator_group_member_pids",
+                return_value=(),
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "killpg",
+                side_effect=permission_error,
+            ) as killpg,
+        ):
+            returncode, descendants_terminated = (
+                TRANSACTION._stop_validator_process_group(
+                    FakeProcess(),
+                    FakeObserver(),
+                    selector,
+                    {"stdout": bytearray(), "stderr": bytearray()},
+                    max_output_bytes=TRANSACTION.MAX_VALIDATOR_OUTPUT_BYTES,
+                )
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertFalse(descendants_terminated)
+        self.assertTrue(state["reaped"])
+        self.assertGreaterEqual(state["exit_probes"], 2)
+        killpg.assert_called_once_with(FakeProcess.pid, signal.SIGTERM)
+
+    def test_emergency_cleanup_never_signals_pgid_after_leader_reap(self) -> None:
+        state = {"reaped": False}
+
+        class FakeProcess:
+            pid = 626_262
+            returncode: int | None = None
+
+            def wait(self, timeout: float) -> int:
+                self.returncode = 0
+                state["reaped"] = True
+                return 0
+
+        def kill_group(process_group_id: int, signum: int) -> None:
+            self.assertFalse(
+                state["reaped"],
+                "a reused numeric PGID was signaled after leader reap",
+            )
+            self.assertEqual(process_group_id, FakeProcess.pid)
+            self.assertIn(signum, (signal.SIGTERM, signal.SIGKILL))
+
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "VALIDATOR_TERM_GRACE_SECONDS",
+                0,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "VALIDATOR_KILL_DRAIN_SECONDS",
+                0,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "killpg",
+                side_effect=kill_group,
+            ) as killpg,
+        ):
+            cleanup_errors = (
+                TRANSACTION._emergency_stop_validator_process_group(
+                    FakeProcess(),
+                    None,
+                    {"stdout": bytearray(), "stderr": bytearray()},
+                    max_output_bytes=TRANSACTION.MAX_VALIDATOR_OUTPUT_BYTES,
+                )
+            )
+
+        self.assertEqual(cleanup_errors, [])
+        self.assertTrue(state["reaped"])
+        self.assertEqual(killpg.call_count, 3)
+
+    def test_reaped_leader_refuses_late_emergency_pgid_cleanup(self) -> None:
+        process = SimpleNamespace(pid=737_373, returncode=0)
+
+        with mock.patch.object(TRANSACTION.os, "killpg") as killpg:
+            cleanup_errors = TRANSACTION._emergency_stop_validator_process_group(
+                process,
+                None,
+                {"stdout": bytearray(), "stderr": bytearray()},
+                max_output_bytes=TRANSACTION.MAX_VALIDATOR_OUTPUT_BYTES,
+            )
+
+        killpg.assert_not_called()
+        self.assertEqual(
+            cleanup_errors[0]["operation"],
+            "process-group-identity-anchor",
+        )
 
     def test_validator_cancellation_still_terminates_and_reaps(self) -> None:
         pid_path = self.root / "validator-cancellation.pid"
@@ -1563,7 +1922,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
             import sys
 
             path = Path(sys.argv[1])
-            if path.name == "candidate":
+            if path.name != "default.rules":
                 live = Path(os.environ["LIVE_RULES"])
                 later = Path(os.environ["LATER_RULES"])
                 later.write_bytes(b'prefix_rule(pattern=["gh", "pr", "view"], decision="allow")\\n')
@@ -1683,6 +2042,102 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertFalse(validator_marker.exists())
         self.assert_no_private_stage()
 
+    def test_no_change_refuses_retained_fixed_stage_evidence(self) -> None:
+        self.candidate.write_bytes(OLD_RULES)
+        validator_marker = self.root / "validator-ran"
+        self.write_validator(
+            f"""\
+            from pathlib import Path
+
+            Path({str(validator_marker)!r}).write_text("ran", encoding="ascii")
+            """
+        )
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        stage.mkdir(mode=0o700)
+        retained = stage / "candidate"
+        retained.write_bytes(NEW_RULES)
+        retained.chmod(0o600)
+
+        result = self.run_apply()
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["stage_status"], "private_stage_retained")
+        self.assertFalse(validator_marker.exists())
+        self.assertEqual(retained.read_bytes(), NEW_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+
+    def test_concurrent_no_change_revalidates_candidate_source(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_revalidate = TRANSACTION.revalidate_candidate_source
+        revalidation_count = 0
+
+        def install_expected_live(
+            _command: list[str],
+            _path: Path,
+            *,
+            timeout_seconds: float,
+            pass_fds: tuple[int, ...] = (),
+        ) -> object:
+            del timeout_seconds, pass_fds
+            replacement = self.rules_dir / ".concurrent-expected-live"
+            replacement.write_bytes(NEW_RULES)
+            replacement.chmod(0o640)
+            os.replace(replacement, self.rules)
+            return TRANSACTION.ValidatorResult(0, "", "")
+
+        def replace_source_on_second_revalidation(
+            path: Path,
+            expected: object,
+            *,
+            candidate_sha256: str,
+        ) -> bytes:
+            nonlocal revalidation_count
+            revalidation_count += 1
+            if revalidation_count == 2:
+                replacement = self.root / "candidate.replacement"
+                replacement.write_bytes(self.candidate.read_bytes())
+                os.replace(replacement, self.candidate)
+            return real_revalidate(
+                path,
+                expected,
+                candidate_sha256=candidate_sha256,
+            )
+
+        namespace = self.apply_namespace()
+        namespace.expected_sha256 = hashlib.sha256(NEW_RULES).hexdigest()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "run_validator",
+                side_effect=install_expected_live,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "revalidate_candidate_source",
+                side_effect=replace_source_on_second_revalidation,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(namespace)
+
+        self.assertEqual(raised.exception.status, "candidate_source_changed")
+        self.assertEqual(
+            raised.exception.details["mismatched_properties"],
+            ["object_identity"],
+        )
+        self.assertEqual(revalidation_count, 2)
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assert_no_private_stage()
+
     def test_no_change_rejects_live_metadata_anomaly_after_lock(self) -> None:
         self.candidate.write_bytes(OLD_RULES)
         self.write_validator("raise SystemExit(0)\n")
@@ -1749,8 +2204,99 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(payload["rollback"]["rollback_status"], "rolled_back")
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertEqual(stat.S_IMODE(self.rules.stat().st_mode), 0o640)
-        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
         self.assertTrue(self.receipt.is_file())
+        self.assert_no_private_stage()
+
+    def test_rollback_post_exchange_fsync_failure_requires_recovery(self) -> None:
+        self.write_validator(
+            """\
+            from pathlib import Path
+            import sys
+
+            if Path(sys.argv[1]).name == "default.rules":
+                raise SystemExit(9)
+            """
+        )
+        real_exchange = TRANSACTION.atomic_rename_exchange
+        real_fsync = TRANSACTION.os.fsync
+        rollback_parent_fd: int | None = None
+        rollback_exchange_completed = False
+        failure_injected = False
+
+        def observe_exchange(
+            source_dir_fd: int,
+            source_name: str,
+            destination_dir_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal rollback_exchange_completed, rollback_parent_fd
+            real_exchange(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
+            if (
+                source_name == self.backup.name
+                and destination_name == self.rules.name
+            ):
+                rollback_parent_fd = source_dir_fd
+                rollback_exchange_completed = True
+
+        def fail_rollback_parent_fsync(fd: int) -> None:
+            nonlocal failure_injected
+            if (
+                rollback_exchange_completed
+                and fd == rollback_parent_fd
+                and not failure_injected
+            ):
+                failure_injected = True
+                raise OSError(
+                    errno.EIO,
+                    "fault-injected rollback parent fsync failure",
+                )
+            real_fsync(fd)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_exchange",
+                side_effect=observe_exchange,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "fsync",
+                side_effect=fail_rollback_parent_fsync,
+            ),
+        ):
+            exit_code, payload = TRANSACTION.apply_transaction(
+                self.apply_namespace()
+            )
+
+        self.assertTrue(failure_injected)
+        self.assertEqual(exit_code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(
+            payload["rollback"]["rollback_status"],
+            "recovery_required",
+        )
+        self.assertEqual(
+            payload["rollback"]["recovery_reason"],
+            "rollback_failed",
+        )
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+        recovered = self.run_recover()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(json.loads(recovered.stdout)["status"], "recovered")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
         self.assert_no_private_stage()
 
     def test_read_only_live_rules_apply_and_rollback(self) -> None:
@@ -1802,7 +2348,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     import sys
 
                     path = Path(sys.argv[1])
-                    if path.name == "candidate":
+                    if path.name != "default.rules":
                         raise SystemExit(0)
                     action = os.environ["POST_ACTION"]
                     if action == "replace":
@@ -1900,6 +2446,402 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertEqual(stat.S_IMODE(self.rules.stat().st_mode), 0o640)
 
+    def test_recover_converges_every_schema_v3_transaction_state(self) -> None:
+        for state in ("P", "X", "C", "R"):
+            with (
+                self.subTest(state=state),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-recovery-state-{state}."
+                ) as temp_dir,
+            ):
+                case_root = Path(temp_dir)
+                self.codex_home = case_root / "codex-home"
+                self.rules_dir = self.codex_home / "rules"
+                self.rules_dir.mkdir(parents=True)
+                self.rules = self.rules_dir / "default.rules"
+                self.rules.write_bytes(OLD_RULES)
+                self.rules.chmod(0o640)
+                self.candidate = case_root / "candidate.rules"
+                self.candidate.write_bytes(NEW_RULES)
+                self.receipt = case_root / "task" / "recovery.json"
+                self.receipt.parent.mkdir(mode=0o700)
+                self.backup_name = f"default.rules.bak-state-{state}"
+                self.backup = self.rules_dir / self.backup_name
+                self.validator = case_root / "validator.py"
+                self.write_validator("raise SystemExit(0)\n")
+
+                applied = self.run_apply()
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+                staged = (
+                    self.rules_dir
+                    / TRANSACTION.PRIVATE_STAGE_NAME
+                    / "candidate"
+                )
+                if state in ("P", "X"):
+                    os.rename(self.backup, staged)
+                if state == "P":
+                    stage_fd = os.open(
+                        staged.parent,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    )
+                    rules_fd = os.open(
+                        self.rules_dir,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    )
+                    try:
+                        TRANSACTION.atomic_rename_exchange(
+                            stage_fd,
+                            staged.name,
+                            rules_fd,
+                            self.rules.name,
+                        )
+                    finally:
+                        os.close(rules_fd)
+                        os.close(stage_fd)
+                elif state == "R":
+                    rules_fd = os.open(
+                        self.rules_dir,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    )
+                    try:
+                        TRANSACTION.atomic_rename_exchange(
+                            rules_fd,
+                            self.backup.name,
+                            rules_fd,
+                            self.rules.name,
+                        )
+                    finally:
+                        os.close(rules_fd)
+
+                recovered = self.run_recover()
+
+                self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                self.assertEqual(
+                    json.loads(recovered.stdout)["status"],
+                    "recovered",
+                )
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+                self.assert_no_private_stage()
+
+                repeated = self.run_recover()
+                self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                self.assertEqual(
+                    json.loads(repeated.stdout)["status"],
+                    "already_original",
+                )
+
+    def test_post_exchange_backup_publication_failure_is_recoverable(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        stderr = io.StringIO()
+
+        def refuse_publication(
+            _stage: object,
+            _path: Path,
+            _backup: Path,
+        ) -> object:
+            raise TRANSACTION.TransactionError(
+                "atomic_no_replace_failed",
+                "fault-injected publication failure",
+            )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "publish_backup",
+                autospec=True,
+                side_effect=refuse_publication,
+            ),
+            redirect_stderr(stderr),
+        ):
+            exit_code, payload = TRANSACTION.apply_transaction(
+                self.apply_namespace()
+            )
+
+        self.assertEqual(exit_code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertFalse(self.backup.exists())
+        staged = (
+            self.rules_dir
+            / TRANSACTION.PRIVATE_STAGE_NAME
+            / "candidate"
+        )
+        self.assertEqual(staged.read_bytes(), OLD_RULES)
+        cleanup = json.loads(stderr.getvalue().strip())
+        self.assertTrue(
+            any(
+                warning["status"] == "retained_staged_file"
+                for warning in cleanup["warnings"]
+            )
+        )
+
+        recovered = self.run_recover()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(json.loads(recovered.stdout)["status"], "recovered")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+        self.assert_no_private_stage()
+
+    def test_recovery_publication_fsync_failure_records_committed_state(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        staged = (
+            self.rules_dir
+            / TRANSACTION.PRIVATE_STAGE_NAME
+            / "candidate"
+        )
+        os.rename(self.backup, staged)
+
+        real_publish = TRANSACTION.PrivateStage.publish_backup
+        real_fsync = TRANSACTION.os.fsync
+        published_stage: object | None = None
+        failure_injected = False
+
+        def observe_publication(
+            stage: object,
+            path: Path,
+            backup: Path,
+        ) -> object:
+            nonlocal published_stage
+            assert isinstance(stage, TRANSACTION.PrivateStage)
+            result = real_publish(stage, path, backup)
+            published_stage = stage
+            return result
+
+        def fail_first_stage_fsync(fd: int) -> None:
+            nonlocal failure_injected
+            if (
+                isinstance(published_stage, TRANSACTION.PrivateStage)
+                and fd == published_stage.stage_fd
+                and not failure_injected
+            ):
+                failure_injected = True
+                raise OSError(
+                    errno.EIO,
+                    "fault-injected recovery stage fsync failure",
+                )
+            real_fsync(fd)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "publish_backup",
+                autospec=True,
+                side_effect=observe_publication,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "fsync",
+                side_effect=fail_first_stage_fsync,
+            ),
+        ):
+            exit_code, payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertTrue(failure_injected)
+        self.assertEqual(exit_code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["transaction_state"], "C")
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+        self.assert_no_private_stage()
+
+        recovered = self.run_recover()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(json.loads(recovered.stdout)["status"], "recovered")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+        self.assert_no_private_stage()
+
+    def test_post_publication_stage_fsync_failure_requires_recovery(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_publish = TRANSACTION.PrivateStage.publish_backup
+        real_fsync = TRANSACTION.os.fsync
+        published_stage: object | None = None
+        failure_injected = False
+
+        def observe_publication(
+            stage: object,
+            path: Path,
+            backup: Path,
+        ) -> object:
+            nonlocal published_stage
+            assert isinstance(stage, TRANSACTION.PrivateStage)
+            result = real_publish(stage, path, backup)
+            published_stage = stage
+            return result
+
+        def fail_first_stage_fsync(fd: int) -> None:
+            nonlocal failure_injected
+            if (
+                isinstance(published_stage, TRANSACTION.PrivateStage)
+                and fd == published_stage.stage_fd
+                and not failure_injected
+            ):
+                failure_injected = True
+                raise OSError(errno.EIO, "fault-injected stage fsync failure")
+            real_fsync(fd)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "publish_backup",
+                autospec=True,
+                side_effect=observe_publication,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "fsync",
+                side_effect=fail_first_stage_fsync,
+            ),
+        ):
+            exit_code, payload = TRANSACTION.apply_transaction(
+                self.apply_namespace()
+            )
+
+        self.assertTrue(failure_injected)
+        self.assertEqual(exit_code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(
+            payload["post_replace_failure"]["status"],
+            "backup_publication_fsync_failed",
+        )
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+        self.assert_no_private_stage()
+
+        recovered = self.run_recover()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_receipt_and_backup_publication_fsync_both_directories(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        events: list[str] = []
+        stage_fds: dict[str, int] = {}
+        real_create = TRANSACTION.PrivateStage.create
+        real_publish = TRANSACTION.PrivateStage.publish_backup
+        real_write_receipt = TRANSACTION.write_receipt
+        real_fsync = TRANSACTION.os.fsync
+        real_fsync_live = TRANSACTION.fsync_file_and_parent
+
+        def observe_create(
+            stage: object,
+            name: str,
+            payload: bytes,
+        ) -> tuple[Path, object]:
+            assert isinstance(stage, TRANSACTION.PrivateStage)
+            stage_fds["stage"] = stage.stage_fd
+            stage_fds["rules"] = stage.rules_parent_fd
+            return real_create(stage, name, payload)
+
+        def observe_publish(
+            stage: object,
+            path: Path,
+            backup: Path,
+        ) -> object:
+            assert isinstance(stage, TRANSACTION.PrivateStage)
+            events.append("publish_begin")
+            result = real_publish(stage, path, backup)
+            events.append("publish_end")
+            return result
+
+        def observe_receipt(*args: object, **kwargs: object) -> object:
+            events.append("receipt_begin")
+            return real_write_receipt(*args, **kwargs)
+
+        def observe_fsync(fd: int) -> None:
+            for label, expected_fd in stage_fds.items():
+                if fd == expected_fd:
+                    events.append(f"fsync_{label}")
+            real_fsync(fd)
+
+        def observe_live_fsync(path: Path) -> None:
+            events.append("live_fsync_begin")
+            real_fsync_live(path)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "create",
+                autospec=True,
+                side_effect=observe_create,
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "publish_backup",
+                autospec=True,
+                side_effect=observe_publish,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "write_receipt",
+                side_effect=observe_receipt,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "fsync",
+                side_effect=observe_fsync,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "fsync_file_and_parent",
+                side_effect=observe_live_fsync,
+            ),
+        ):
+            exit_code, payload = TRANSACTION.apply_transaction(
+                self.apply_namespace()
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["status"], "applied")
+        receipt_index = events.index("receipt_begin")
+        self.assertLess(
+            max(
+                index
+                for index, event in enumerate(events)
+                if event == "fsync_stage" and index < receipt_index
+            ),
+            receipt_index,
+        )
+        self.assertLess(
+            max(
+                index
+                for index, event in enumerate(events)
+                if event == "fsync_rules" and index < receipt_index
+            ),
+            receipt_index,
+        )
+        publication_end = events.index("publish_end")
+        live_fsync_begin = events.index("live_fsync_begin")
+        publication_durability = events[publication_end + 1 : live_fsync_begin]
+        self.assertIn("fsync_stage", publication_durability)
+        self.assertIn("fsync_rules", publication_durability)
+
     def test_recover_refuses_same_original_bytes_on_untrusted_new_inode(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         applied = self.run_apply()
@@ -1941,6 +2883,32 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(terminal.stat().st_mode), 0o600)
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assert_no_private_stage()
+
+    def test_repeated_recover_does_not_hide_retained_fixed_stage_evidence(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        recovered = self.run_recover()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        retained = stage / "unexpected"
+        retained.write_bytes(b"retained recovery evidence\n")
+
+        repeated = self.run_recover()
+
+        self.assertEqual(repeated.returncode, 30, repeated.stderr)
+        payload = json.loads(repeated.stdout)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["transaction_state"], "R")
+        self.assertEqual(payload["reason"], "private_stage_retained")
+        self.assertEqual(
+            retained.read_bytes(),
+            b"retained recovery evidence\n",
+        )
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
 
     def test_recover_refuses_replaced_terminal_reservation(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -2003,7 +2971,32 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertIn("object_policy.nlink must be 1", payload["message"])
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
 
-    def test_atomic_exchange_unsupported_uses_disposable_cleanup(self) -> None:
+    def test_recover_rejects_schema_v3_backup_snapshot_not_equal_original(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        receipt["backup"]["identity"]["inode"] += 1
+        self.receipt.write_text(
+            json.dumps(receipt, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.receipt.chmod(0o600)
+
+        recovered = self.run_recover()
+
+        self.assertEqual(recovered.returncode, 50, recovered.stderr)
+        payload = json.loads(recovered.stdout)
+        self.assertEqual(payload["status"], "receipt_invalid")
+        self.assertIn(
+            "backup snapshot must exactly match original",
+            payload["message"],
+        )
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+
+    def test_atomic_exchange_unsupported_retains_receipt_bound_stage(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         stderr = io.StringIO()
 
@@ -2027,20 +3020,20 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status, "atomic_rename_unsupported")
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
-        self.assert_no_private_stage()
-        retained = list(self.rules_dir.glob(".default.rules.cleanup-retained-*"))
-        self.assertEqual(len(retained), 1)
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        self.assertEqual((stage / "candidate").read_bytes(), NEW_RULES)
+        self.assertTrue(self.receipt.is_file())
+        self.assertFalse(self.backup.exists())
+        self.assertEqual(list(self.rules_dir.glob(".rules-apply-*")), [])
+        self.assertEqual(
+            list(self.rules_dir.glob(".default.rules.cleanup-retained-*")),
+            [],
+        )
         cleanup = json.loads(stderr.getvalue().strip())
         self.assertEqual(cleanup["status"], "cleanup_warning")
         self.assertTrue(
             any(
-                warning["status"] == "stage_cleanup_retained"
-                for warning in cleanup["warnings"]
-            )
-        )
-        self.assertFalse(
-            any(
-                warning["status"] == "retained_staging_directory"
+                warning["status"] == "stage_cleanup_refused"
                 for warning in cleanup["warnings"]
             )
         )
@@ -2048,25 +3041,14 @@ class RulesApplyTransactionTests(unittest.TestCase):
     def test_cleanup_refusal_overrides_pending_applied_success(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         stderr = io.StringIO()
-        real_no_replace = TRANSACTION.atomic_rename_no_replace
+        real_cleanup = TRANSACTION.PrivateStage._cleanup_fixed_stage
 
-        def refuse_disposable_stage_move(
-            source_directory_fd: int,
-            source_name: str,
-            destination_directory_fd: int,
-            destination_name: str,
-        ) -> None:
-            if source_name.startswith(".rules-apply-"):
-                raise TRANSACTION.TransactionError(
-                    "atomic_rename_unsupported",
-                    "fault-injected cleanup quarantine refusal",
-                )
-            real_no_replace(
-                source_directory_fd,
-                source_name,
-                destination_directory_fd,
-                destination_name,
-            )
+        def inject_unexpected_entry(
+            stage: object,
+        ) -> list[dict[str, object]]:
+            assert isinstance(stage, TRANSACTION.PrivateStage)
+            (stage.path / "unexpected").write_bytes(b"retained evidence\n")
+            return real_cleanup(stage)
 
         with (
             mock.patch.dict(
@@ -2074,22 +3056,27 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 {"CODEX_HOME": str(self.codex_home)},
             ),
             mock.patch.object(
-                TRANSACTION,
-                "atomic_rename_no_replace",
-                side_effect=refuse_disposable_stage_move,
+                TRANSACTION.PrivateStage,
+                "_cleanup_fixed_stage",
+                autospec=True,
+                side_effect=inject_unexpected_entry,
             ),
             redirect_stderr(stderr),
             self.assertRaises(TRANSACTION.TransactionError) as raised,
         ):
             TRANSACTION.apply_transaction(self.apply_namespace())
 
-        self.assertEqual(raised.exception.status, "stage_cleanup_refused")
+        self.assertEqual(raised.exception.status, "recovery_required")
+        self.assertEqual(raised.exception.exit_code, 30)
         self.assertEqual(raised.exception.details["operation_status"], "applied")
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
         self.assertTrue(self.backup.is_file())
         self.assertTrue(self.receipt.is_file())
-        stages = list(self.rules_dir.glob(".rules-apply-*"))
-        self.assertEqual(len(stages), 1)
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        self.assertEqual(
+            (stage / "unexpected").read_bytes(),
+            b"retained evidence\n",
+        )
         cleanup = json.loads(stderr.getvalue().strip())
         self.assertTrue(
             any(
@@ -2098,7 +3085,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
             )
         )
 
-    def test_verified_cleanup_retention_does_not_change_applied_success(
+    def test_successful_apply_leaves_fixed_stage_empty_without_warning(
         self,
     ) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -2107,17 +3094,88 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "applied")
-        cleanup = json.loads(result.stderr.strip())
-        self.assertEqual(cleanup["status"], "cleanup_warning")
-        self.assertTrue(
-            any(
-                warning["status"] == "stage_cleanup_retained"
-                for warning in cleanup["warnings"]
-            )
-        )
+        self.assertEqual(result.stderr, "")
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assert_no_private_stage()
 
-    def test_verified_cleanup_retention_does_not_change_recovered_success(
+    def test_successful_apply_cleans_fixed_stage_before_releasing_lock(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        real_cleanup = TRANSACTION.PrivateStage._cleanup_fixed_stage
+        cleanup_observed = False
+
+        def assert_lock_still_held(stage: object) -> list[dict[str, object]]:
+            nonlocal cleanup_observed
+            assert isinstance(stage, TRANSACTION.PrivateStage)
+            probe_fd = os.open(lock, os.O_RDWR | os.O_CLOEXEC)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(
+                        probe_fd,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+            finally:
+                os.close(probe_fd)
+            cleanup_observed = True
+            return real_cleanup(stage)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "_cleanup_fixed_stage",
+                autospec=True,
+                side_effect=assert_lock_still_held,
+            ),
+        ):
+            exit_code, payload = TRANSACTION.apply_transaction(
+                self.apply_namespace()
+            )
+
+        self.assertTrue(cleanup_observed)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["status"], "applied")
+        self.assert_no_private_stage()
+
+    def test_repeated_successful_applies_reuse_one_empty_stage_root(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+
+        for attempt in range(12):
+            with self.subTest(attempt=attempt):
+                current = self.rules.read_bytes()
+                candidate = NEW_RULES if current == OLD_RULES else OLD_RULES
+                self.candidate.write_bytes(candidate)
+                self.receipt = (
+                    self.root
+                    / "task"
+                    / f"recovery-{attempt:02d}.json"
+                )
+                self.backup_name = f"default.rules.bak-repeat-{attempt:02d}"
+                self.backup = self.rules_dir / self.backup_name
+                result = self.run_apply(
+                    expected_sha256=hashlib.sha256(current).hexdigest(),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    json.loads(result.stdout)["status"],
+                    "applied",
+                )
+                self.assertEqual(self.rules.read_bytes(), candidate)
+                self.assertEqual(self.backup.read_bytes(), current)
+                self.assert_no_private_stage()
+
+        stage_roots = list(
+            self.rules_dir.glob(TRANSACTION.PRIVATE_STAGE_NAME)
+        )
+        self.assertEqual(len(stage_roots), 1)
+        self.assertEqual(list(stage_roots[0].iterdir()), [])
+
+    def test_successful_recover_leaves_fixed_stage_empty_without_warning(
         self,
     ) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -2128,14 +3186,10 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertEqual(json.loads(recovered.stdout)["status"], "recovered")
-        cleanup = json.loads(recovered.stderr.strip())
-        self.assertTrue(
-            any(
-                warning["status"] == "stage_cleanup_retained"
-                for warning in cleanup["warnings"]
-            )
-        )
+        self.assertEqual(recovered.stderr, "")
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+        self.assert_no_private_stage()
 
 
 class RulesApplyPrimitiveRaceTests(unittest.TestCase):
@@ -2497,7 +3551,9 @@ class RulesApplyPrimitiveRaceTests(unittest.TestCase):
     ) -> None:
         for action in ("content", "hardlink", "access"):
             with self.subTest(action=action):
-                stage = TRANSACTION.PrivateStage(self.rules_dir)
+                case_rules_dir = self.root / f"rules-{action}"
+                case_rules_dir.mkdir()
+                stage = TRANSACTION.PrivateStage(case_rules_dir)
                 source, _source_expected = stage.create("candidate", NEW_RULES)
                 source_binding = stage._binding(source)
                 real_locator = stage._locator_for_snapshot
@@ -2753,6 +3809,23 @@ class RulesApplyPrimitiveRaceTests(unittest.TestCase):
         finally:
             stage.cleanup()
 
+    def test_stage_root_metadata_is_revalidated_before_candidate_create(
+        self,
+    ) -> None:
+        stage = TRANSACTION.PrivateStage(self.rules_dir)
+        RulesApplyTransactionTests.add_test_xattr(self, stage.path)
+
+        try:
+            with self.assertRaises(TRANSACTION.TransactionError) as raised:
+                stage.create("candidate", NEW_RULES)
+
+            self.assertEqual(
+                raised.exception.status,
+                "unsupported_extended_attributes",
+            )
+        finally:
+            stage.cleanup()
+
     def test_exchange_revalidates_single_link_immediately_before_mutation(self) -> None:
         stage = TRANSACTION.PrivateStage(self.rules_dir)
         source, _source_expected = stage.create("candidate", NEW_RULES)
@@ -2944,7 +4017,24 @@ class RulesApplyPrimitiveRaceTests(unittest.TestCase):
         ]
         self.assertEqual(retained_roots[0]["recovery_locator"], str(moved_root))
 
-    def test_disposable_cleanup_never_removes_replacement_leaf(self) -> None:
+    def test_known_backup_locator_ignores_large_sibling_inventory(self) -> None:
+        for index in range(TRANSACTION.MAX_STAGE_DIRECTORY_ENTRIES + 8):
+            sibling = self.rules_dir / f"default.rules.bak-sibling-{index:04d}"
+            sibling.write_bytes(b"sibling\n")
+        stage = TRANSACTION.PrivateStage(self.rules_dir)
+        source, _expected = stage.create("candidate", NEW_RULES)
+        backup = self.rules_dir / "default.rules.bak-known"
+
+        published = stage.publish_backup(source, backup)
+        try:
+            locator = stage._locator_for_snapshot(published.snapshot)
+        finally:
+            stage.cleanup(retain=False)
+
+        self.assertEqual(locator, backup)
+        self.assertEqual(backup.read_bytes(), NEW_RULES)
+
+    def test_fixed_stage_cleanup_never_removes_replacement_leaf(self) -> None:
         stage = TRANSACTION.PrivateStage(self.rules_dir)
         source, _expected = stage.create("candidate", NEW_RULES)
         moved_source = stage.path / "candidate.bound"
@@ -2953,20 +4043,20 @@ class RulesApplyPrimitiveRaceTests(unittest.TestCase):
 
         warnings = stage.cleanup(retain=False)
 
-        retained = next(
+        refused = next(
             warning
             for warning in warnings
-            if warning["status"] == "stage_cleanup_retained"
+            if warning["status"] == "stage_cleanup_refused"
         )
-        quarantine = Path(retained["recovery_locator"])
         self.assertEqual(
-            (quarantine / source.name).read_bytes(),
+            source.read_bytes(),
             b"replacement cleanup leaf\n",
         )
-        self.assertEqual((quarantine / moved_source.name).read_bytes(), NEW_RULES)
-        self.assertFalse(stage.path.exists())
+        self.assertEqual(moved_source.read_bytes(), NEW_RULES)
+        self.assertEqual(refused["recovery_locator"], str(stage.path))
+        self.assertTrue(stage.path.exists())
 
-    def test_disposable_cleanup_never_removes_replacement_root(self) -> None:
+    def test_fixed_stage_cleanup_never_removes_replacement_root(self) -> None:
         stage = TRANSACTION.PrivateStage(self.rules_dir)
         source, _expected = stage.create("candidate", NEW_RULES)
         moved_root = self.rules_dir / ".moved-disposable-stage"
@@ -2987,7 +4077,7 @@ class RulesApplyPrimitiveRaceTests(unittest.TestCase):
         self.assertEqual(refused["reason"], "private_stage_changed")
         self.assertEqual(refused["recovery_locator"], str(moved_root))
 
-    def test_disposable_cleanup_never_calls_path_delete_primitives(self) -> None:
+    def test_fixed_stage_cleanup_never_calls_path_delete_primitives(self) -> None:
         stage = TRANSACTION.PrivateStage(self.rules_dir)
         source, _expected = stage.create("candidate", NEW_RULES)
 
@@ -2999,69 +4089,35 @@ class RulesApplyPrimitiveRaceTests(unittest.TestCase):
 
         unlink.assert_not_called()
         rmdir.assert_not_called()
-        retained = next(
-            warning
-            for warning in warnings
-            if warning["status"] == "stage_cleanup_retained"
-        )
-        quarantine = Path(retained["recovery_locator"])
-        self.assertEqual((quarantine / source.name).read_bytes(), NEW_RULES)
-
-    def test_disposable_cleanup_retains_post_move_root_replacement(self) -> None:
-        stage = TRANSACTION.PrivateStage(self.rules_dir)
-        source, _expected = stage.create("candidate", NEW_RULES)
-        real_move = TRANSACTION.atomic_rename_no_replace
-
-        def move_then_replace_source(
-            source_directory_fd: int,
-            source_name: str,
-            destination_directory_fd: int,
-            destination_name: str,
-        ) -> None:
-            real_move(
-                source_directory_fd,
-                source_name,
-                destination_directory_fd,
-                destination_name,
-            )
-            os.mkdir(source_name, 0o700, dir_fd=source_directory_fd)
-            replacement_directory_fd = os.open(
-                source_name,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                dir_fd=source_directory_fd,
-            )
-            try:
-                replacement_fd = os.open(
-                    "replacement",
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=replacement_directory_fd,
-                )
-                try:
-                    os.write(replacement_fd, b"replacement stage tree\n")
-                finally:
-                    os.close(replacement_fd)
-            finally:
-                os.close(replacement_directory_fd)
-
-        with mock.patch.object(
-            TRANSACTION,
-            "atomic_rename_no_replace",
-            side_effect=move_then_replace_source,
-        ):
-            warnings = stage.cleanup(retain=False)
-
         refused = next(
             warning
             for warning in warnings
             if warning["status"] == "stage_cleanup_refused"
         )
-        quarantine = Path(refused["recovery_locator"])
-        self.assertEqual((quarantine / source.name).read_bytes(), NEW_RULES)
-        self.assertEqual(
-            (stage.path / "replacement").read_bytes(),
-            b"replacement stage tree\n",
+        self.assertEqual(refused["recovery_locator"], str(stage.path))
+        self.assertEqual(source.read_bytes(), NEW_RULES)
+
+    def test_fixed_stage_cleanup_does_not_move_or_reuse_children(self) -> None:
+        stage = TRANSACTION.PrivateStage(self.rules_dir)
+        source, _expected = stage.create("candidate", NEW_RULES)
+        replacement = stage.path / "replacement"
+        replacement.write_bytes(b"replacement stage tree\n")
+
+        with mock.patch.object(
+            TRANSACTION,
+            "atomic_rename_no_replace",
+        ) as atomic_move:
+            warnings = stage.cleanup(retain=False)
+
+        atomic_move.assert_not_called()
+        refused = next(
+            warning
+            for warning in warnings
+            if warning["status"] == "stage_cleanup_refused"
         )
+        self.assertEqual(refused["recovery_locator"], str(stage.path))
+        self.assertEqual(source.read_bytes(), NEW_RULES)
+        self.assertEqual(replacement.read_bytes(), b"replacement stage tree\n")
 
     def test_atomic_exchange_unsupported_fails_without_fallback(self) -> None:
         stage = TRANSACTION.PrivateStage(self.rules_dir)
