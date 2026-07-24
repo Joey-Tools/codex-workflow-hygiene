@@ -13,7 +13,9 @@ def json_dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def extract_python_block_after(workflow: str, heading: str, marker: str = "```bash\npython3 - <<'PY'\n") -> str:
+def extract_python_block_after(
+    workflow: str, heading: str, marker: str = "```bash\npython3 - <<'PY'\n"
+) -> str:
     section_start = workflow.index(heading)
     code_start = workflow.index(marker, section_start) + len(marker)
     return workflow[code_start : workflow.index("\nPY\n```", code_start)]
@@ -42,14 +44,19 @@ class SkillStructureTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         skill_root = root / "skills/bounded-command-output"
         skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
-        patterns = (skill_root / "references/command-patterns.md").read_text(encoding="utf-8")
+        patterns = (skill_root / "references/command-patterns.md").read_text(
+            encoding="utf-8"
+        )
         supervisor = skill_root / "scripts/run_process_group_deadline.py"
         interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
 
         self.assertIn("genuinely broad, noisy, or long-running", skill)
         self.assertIn("Do not use for routine exact commands", skill)
         self.assertIn("at least one property is real", skill)
-        self.assertIn("Do not trigger merely because every command could theoretically hang", skill)
+        self.assertIn(
+            "Do not trigger merely because every command could theoretically hang",
+            skill,
+        )
         self.assertIn("Small visible output can still qualify", skill)
         self.assertIn("## Keep Three Budgets Separate", skill)
         self.assertIn("Bound the producer", skill)
@@ -62,8 +69,12 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("On non-POSIX runtimes", skill)
         self.assertIn("one enforced aggregate byte ceiling", skill)
         self.assertIn("all per-command caps fit inside that aggregate ceiling", skill)
-        self.assertIn("producer volume, runtime, retained bytes, and visible output", skill)
-        self.assertIn("Start interruptible long-running work in a pollable PTY shape", skill)
+        self.assertIn(
+            "producer volume, runtime, retained bytes, and visible output", skill
+        )
+        self.assertIn(
+            "Start interruptible long-running work in a pollable PTY shape", skill
+        )
         self.assertIn("Apply this skill alongside the task's domain skill", skill)
         self.assertIn("genuinely broad, noisy, or long-running command", patterns)
         self.assertIn(
@@ -84,7 +95,9 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("Quoting a value inside a host-language template", patterns)
         self.assertIn("Preserve the pipeline producer's status", patterns)
         self.assertIn("Parallel launch does not create an output budget", patterns)
-        self.assertIn("one aggregate visible-output and retained-byte ceiling", patterns)
+        self.assertIn(
+            "one aggregate visible-output and retained-byte ceiling", patterns
+        )
         self.assertNotIn("/usr/bin/sqlite3", patterns)
         self.assertNotIn("/usr/bin/du", patterns)
         self.assertIn("Do not print the complete inventory", patterns)
@@ -97,11 +110,16 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("terminate the producer with a bounded grace period", patterns)
         self.assertIn("tail -c 8192 <task-log>", patterns)
         self.assertIn("tr '\\r' '\\n'", patterns)
-        self.assertIn("SQLite `.timeout` controls how long the client waits for a busy lock", patterns)
+        self.assertIn(
+            "SQLite `.timeout` controls how long the client waits for a busy lock",
+            patterns,
+        )
         self.assertIn("it is not a query-execution deadline", patterns)
         self.assertIn("Broad macOS `du` walks", patterns)
         self.assertIn("A PTY and repeated polling", patterns)
-        self.assertIn("report every timed-out branch as unknown or incomplete", patterns)
+        self.assertIn(
+            "report every timed-out branch as unknown or incomplete", patterns
+        )
         self.assertIn("macOS does not ship GNU `timeout`", patterns)
         self.assertIn("Do not use an in-process Perl `alarm` plus `exec`", patterns)
         self.assertIn("exit status `142` cannot distinguish", patterns)
@@ -129,7 +147,10 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("require neither root, a container", patterns)
         self.assertIn("an uninterruptible kernel call cannot be preempted", patterns)
         self.assertIn("capped at one year solely", patterns)
-        self.assertIn("retained-output byte ceilings remain a separate caller responsibility", patterns)
+        self.assertIn(
+            "retained-output byte ceilings remain a separate caller responsibility",
+            patterns,
+        )
         self.assertIn("keep an outer pipe reader waiting for EOF", patterns)
         self.assertIn("or prove group quiescence", patterns)
         self.assertIn("not a real-time scheduler", patterns)
@@ -154,7 +175,9 @@ class SkillStructureTests(unittest.TestCase):
         helper_text = helper.read_text(encoding="utf-8")
 
         audit = skill.split("### Audit Mode", 1)[1].split("### Apply Mode", 1)[0]
-        apply_mode = skill.split("### Apply Mode", 1)[1].split("## Audit Workflow", 1)[0]
+        apply_mode = skill.split("### Apply Mode", 1)[1].split("## Audit Workflow", 1)[
+            0
+        ]
         audit_workflow = skill.split("## Audit Workflow", 1)[1].split(
             "## Apply Transaction", 1
         )[0]
@@ -172,19 +195,25 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("Keep the run read-only", audit)
         self.assertIn("Choose a light audit", audit)
         self.assertIn("choose a full audit", audit)
-        self.assertIn("leave `default.rules`, baselines, safety snapshots, and journals unchanged", audit)
+        self.assertIn(
+            "leave `default.rules`, baselines, safety snapshots, and journals unchanged",
+            audit,
+        )
         self.assertIn("An audit-only request never becomes writable", audit)
         self.assertIn("cleanup/apply", apply_mode)
         self.assertIn("active task already authorizes applying it", apply_mode)
         self.assertIn("report a no-op and create nothing", apply_mode)
-        self.assertIn("audited live-rules SHA-256 digest", apply_mode)
+        self.assertIn("audited live-rules bytes", apply_mode)
+        self.assertIn("exact candidate bytes", apply_mode)
         self.assertIn("do not rewrite live rules directly", apply_mode)
-        self.assertIn("Record the SHA-256 digest", audit_workflow)
+        self.assertIn("Record separate SHA-256 digests", audit_workflow)
         self.assertIn("exact candidate bytes", audit_workflow)
         self.assertIn("Keep the audit read-only", audit_workflow)
         self.assertIn("bootstrap inventory", cold_start_audit)
         self.assertIn("exact full-cleanup plan", cold_start_audit)
-        self.assertIn("Do not create the safety backup or clean baseline", cold_start_audit)
+        self.assertIn(
+            "Do not create the safety backup or clean baseline", cold_start_audit
+        )
         for phrase in (
             "shared lock",
             "owner-private staging directory",
@@ -197,14 +226,12 @@ class SkillStructureTests(unittest.TestCase):
             "necessary adopted-journal",
         ):
             self.assertIn(phrase, transaction)
-        self.assertIn("stop before creating a backup or touching live rules", transaction)
+        self.assertIn(
+            "stop before creating a backup or touching live rules", transaction
+        )
         self.assertIn("instead of bootstrapping a tracker", transaction)
         self.assertLess(
-            transaction.index("validate the candidate"),
-            transaction.index("acquires the shared lock"),
-        )
-        self.assertLess(
-            transaction.index("acquires the shared lock"),
+            transaction.index("For a real change"),
             transaction.index("atomic no-replace rename"),
         )
         self.assertIn("`audit` is read-only", cadence)
@@ -223,7 +250,10 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("descriptor_only_or_unlocatable", cadence)
         self.assertIn("Modification times are not treated as policy mutation", cadence)
         self.assertIn("not a kernel compare-and-swap", cadence)
-        self.assertIn("requires every legitimate writer to honor the same persistent lock", cadence)
+        self.assertIn(
+            "requires every legitimate writer to honor the same persistent lock",
+            cadence,
+        )
         self.assertIn("Missing, unreadable, wrong-type", cadence)
         write_instruction = (
             r"(?im)^\s*(?:[-*]|\d+\.).*"
@@ -277,7 +307,9 @@ class SkillStructureTests(unittest.TestCase):
         interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
 
         locate = skill.split("### Locate", 1)[1].split("### Corpus", 1)[0]
-        corpus = skill.split("### Corpus", 1)[1].split("## Compose Remote Coverage", 1)[0]
+        corpus = skill.split("### Corpus", 1)[1].split("## Compose Remote Coverage", 1)[
+            0
+        ]
         self.assertIn("exact session ID, thread ID, recent prior turn", locate)
         self.assertIn("Do not invoke `scripts/build_session_corpus.py`", locate)
         self.assertIn("scripts/build_session_corpus.py", corpus)
@@ -330,29 +362,41 @@ class SkillStructureTests(unittest.TestCase):
         )
         self.assertIn("Do not duplicate system scaffolding", skill)
         self.assertFalse((skill_root / "references/description-patterns.md").exists())
-        self.assertIn("Use $skill-creator for general authoring and scaffolding", interface)
-        self.assertIn("use $codex-skill-authoring to place, layer, and validate", interface)
+        self.assertIn(
+            "Use $skill-creator for general authoring and scaffolding", interface
+        )
+        self.assertIn(
+            "use $codex-skill-authoring to place, layer, and validate", interface
+        )
         self.assertNotIn("concise concise", interface)
 
     def test_session_mining_avoids_per_record_jsonl_key_dumps(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         self.assertIn("Count record shapes or lines before details", skill)
-        self.assertIn("Do not dump full JSONL records or whole per-record inventories", skill)
+        self.assertIn(
+            "Do not dump full JSONL records or whole per-record inventories", skill
+        )
         self.assertIn("inspect one record or aggregate unique keys once", workflow)
         self.assertIn("jq -R 'fromjson | keys'", workflow)
         self.assertIn("aggregate unique keys once", workflow)
 
-    def test_session_mining_schema_recipe_bounds_and_validates_physical_records(self) -> None:
+    def test_session_mining_schema_recipe_bounds_and_validates_physical_records(
+        self,
+    ) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         code = extract_python_block_after(
             workflow,
             "For JSONL schema checks",
-            marker='```bash\npython3 - "$JSONL_PATH" <<\'PY\'\n',
+            marker="```bash\npython3 - \"$JSONL_PATH\" <<'PY'\n",
         )
 
         self.assertIn("path.open('rb')", code)
@@ -411,8 +455,7 @@ class SkillStructureTests(unittest.TestCase):
         self.assertEqual(
             summary["unique_key_utf8_bytes"],
             sum(
-                len(key.encode("utf-8"))
-                for key in set(valid_first) | set(valid_later)
+                len(key.encode("utf-8")) for key in set(valid_first) | set(valid_later)
             ),
         )
         self.assertFalse(summary["unique_keys_truncated"])
@@ -422,13 +465,13 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_schema_recipe_bounds_global_unique_key_state(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         code = extract_python_block_after(
             workflow,
             "For JSONL schema checks",
-            marker='```bash\npython3 - "$JSONL_PATH" <<\'PY\'\n',
+            marker="```bash\npython3 - \"$JSONL_PATH\" <<'PY'\n",
         )
 
         def run_recipe(records: list[dict[str, int]]) -> tuple[dict[str, object], int]:
@@ -510,9 +553,9 @@ class SkillStructureTests(unittest.TestCase):
         self,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         code = extract_python_block_after(workflow, "Broad keyword searches across")
 
         self.assertIn("history.jsonl", code)
@@ -548,11 +591,16 @@ class SkillStructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir) / ".codex"
             codex_home.mkdir()
-            history_payload = b'not-json-review-malformed\n'
+            history_payload = b"not-json-review-malformed\n"
             history_payload += b'"review-non-object"\n'
             history_payload += b'{"text":"review-invalid-utf8-\xff"}\n'
             history_payload += b"9" * 5000 + b"\n"
-            history_payload += b"[" * 1100 + f'"review {deep_decoy}"'.encode("utf-8") + b"]" * 1100 + b"\n"
+            history_payload += (
+                b"[" * 1100
+                + f'"review {deep_decoy}"'.encode("utf-8")
+                + b"]" * 1100
+                + b"\n"
+            )
             history_payload += b"x" * (1024 * 1024) + b"\r"
             history_payload += (
                 json_dumps(
@@ -679,9 +727,9 @@ class SkillStructureTests(unittest.TestCase):
         self,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         code = extract_python_block_after(workflow, "Broad keyword searches across")
 
         def run_recipe(
@@ -693,7 +741,9 @@ class SkillStructureTests(unittest.TestCase):
                 codex_home.mkdir()
                 if history_records is not None:
                     (codex_home / "history.jsonl").write_text(
-                        "".join(f"{json_dumps(record)}\n" for record in history_records),
+                        "".join(
+                            f"{json_dumps(record)}\n" for record in history_records
+                        ),
                         encoding="utf-8",
                     )
                 if index_records is not None:
@@ -737,8 +787,7 @@ class SkillStructureTests(unittest.TestCase):
         self.assertEqual(match_rows[1]["id"], "index-fair-00")
         self.assertEqual(
             {row["id"] for row in match_rows},
-            {"index-fair-00"}
-            | {f"history-fair-{index:02d}" for index in range(19)},
+            {"index-fair-00"} | {f"history-fair-{index:02d}" for index in range(19)},
         )
         self.assertEqual(scan_meta["match_rows_emitted"], 20)
         self.assertTrue(scan_meta["global_output_truncated"])
@@ -796,15 +845,21 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_avoids_whole_record_tostring_searches(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
         recipe_start = workflow.index(marker) + len(marker)
         keyword_recipe = workflow[
             recipe_start : workflow.index("\nPY\n" + (chr(96) * 3), recipe_start)
         ]
         self.assertIn("parse only the fields and nearby records needed", skill)
-        self.assertIn("tool outputs only when failures or approval friction matter", skill)
+        self.assertIn(
+            "tool outputs only when failures or approval friction matter", skill
+        )
         self.assertIn("Do not use `jq 'select(tostring | contains", workflow)
         self.assertIn("filter on record shape and specific fields", workflow)
         self.assertIn("function_call_output", workflow)
@@ -829,7 +884,9 @@ class SkillStructureTests(unittest.TestCase):
         self.assertNotIn("snippet = ' '.join(text.split())[:", workflow)
         self.assertIn("path.open('rb')", keyword_recipe)
         self.assertIn("handle.readline(max_record_bytes + 1)", keyword_recipe)
-        self.assertIn("while raw_line and not raw_line.endswith(b'\\n'):", keyword_recipe)
+        self.assertIn(
+            "while raw_line and not raw_line.endswith(b'\\n'):", keyword_recipe
+        )
         self.assertIn("def iter_text(value):", keyword_recipe)
         self.assertIn("def normalized_characters(parts):", keyword_recipe)
         self.assertIn("yield from iter_text(item)", keyword_recipe)
@@ -864,18 +921,30 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_avoids_whole_codex_home_searches(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         self.assertIn("read your rollout", skill)
-        self.assertIn("never point raw `rg` at all of `$CODEX_HOME` / `~/.codex`", skill)
+        self.assertIn(
+            "never point raw `rg` at all of `$CODEX_HOME` / `~/.codex`", skill
+        )
         self.assertIn('Recent prior turn or "read your rollout":', workflow)
         self.assertIn("Do not run keyword `rg -n ... ~/.codex`", workflow)
-        self.assertIn("installed skills, overlays, caches, and package payloads", workflow)
+        self.assertIn(
+            "installed skills, overlays, caches, and package payloads", workflow
+        )
 
     def test_session_mining_requires_replay_boundary_detection(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("copied/restamped history", skill)
         self.assertIn("A strict record-timestamp filter is not sufficient", skill)
@@ -887,22 +956,33 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_requires_active_and_archived_union_corpus(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(encoding="utf-8")
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
-        corpus_helper = root / "skills/codex-session-mining/scripts/build_session_corpus.py"
+        skill = (root / "skills/codex-session-mining/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
+        corpus_helper = (
+            root / "skills/codex-session-mining/scripts/build_session_corpus.py"
+        )
 
         self.assertIn("active-plus-archived", skill)
         self.assertIn("Inventory both existing active and archived roots", skill)
         self.assertIn("an old path can contain a genuine later continuation", skill)
         self.assertIn("Group candidates by lifecycle identity", skill)
         self.assertIn("Do not deduplicate by basename alone", skill)
-        self.assertIn('for root in "$CODEX_ROOT/sessions" "$CODEX_ROOT/archived_sessions"', workflow)
+        self.assertIn(
+            'for root in "$CODEX_ROOT/sessions" "$CODEX_ROOT/archived_sessions"',
+            workflow,
+        )
         self.assertIn("current-host corpus inventory", workflow)
         self.assertIn("set -euo pipefail", workflow)
         self.assertIn("scripts/build_session_corpus.py", skill)
         self.assertTrue(corpus_helper.is_file())
         self.assertTrue(os.access(corpus_helper, os.X_OK))
-        self.assertIn('python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py"', workflow)
+        self.assertIn(
+            'python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py"', workflow
+        )
         self.assertIn('--codex-home "$CODEX_ROOT"', workflow)
         self.assertIn('--start "$LOWER_BOUND"', workflow)
         self.assertIn('--end "$UPPER_BOUND"', workflow)
@@ -927,9 +1007,13 @@ class SkillStructureTests(unittest.TestCase):
             "preserve every matching human prompt after that boundary", workflow
         )
         self.assertIn("`session_meta` from explicit lifecycle IDs alone", workflow)
-        self.assertIn("synthetic child, subagent, and external-review prompts", workflow)
+        self.assertIn(
+            "synthetic child, subagent, and external-review prompts", workflow
+        )
         self.assertIn("first user-shaped record is an automation wrapper", workflow)
-        self.assertIn("active, archived, union, and accepted-after-deduplication counts", workflow)
+        self.assertIn(
+            "active, archived, union, and accepted-after-deduplication counts", workflow
+        )
         recursive_archive_glob = "archived_sessions/**/rollout-*.jsonl"
         self.assertIn(recursive_archive_glob, skill)
         self.assertIn(recursive_archive_glob, workflow)
@@ -941,9 +1025,9 @@ class SkillStructureTests(unittest.TestCase):
         skill = (root / "skills/codex-session-mining/SKILL.md").read_text(
             encoding="utf-8"
         )
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         recipe = extract_bash_block_after(
             workflow,
             "Bounded date range and current-host corpus inventory:",
@@ -951,8 +1035,10 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("LOWER_BOUND=2026-03-12T00:00:00Z", recipe)
         self.assertIn("UPPER_BOUND=2026-03-14T00:00:00Z", recipe)
         self.assertIn('CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"', recipe)
-        self.assertIn('python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py"', recipe)
-        self.assertIn('--sample-limit 20', recipe)
+        self.assertIn(
+            'python3 "$SESSION_MINING_SKILL/scripts/build_session_corpus.py"', recipe
+        )
+        self.assertIn("--sample-limit 20", recipe)
         self.assertIn("full-root scan, not as a requested-window scan", skill)
         self.assertIn("previous runtime and current corpus scale", skill)
         self.assertIn("incomplete/failed snapshot", skill)
@@ -975,10 +1061,17 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("Cleanup of the failed-run path is optional", workflow)
         self.assertIn("does not close the check-to-delete replacement window", workflow)
         self.assertIn("trusted descriptor-relative cleanup primitive", workflow)
-        self.assertIn("binds both the verified parent directory and target directory identities", workflow)
-        self.assertIn("If only pathname-based recursive deletion is available", workflow)
+        self.assertIn(
+            "binds both the verified parent directory and target directory identities",
+            workflow,
+        )
+        self.assertIn(
+            "If only pathname-based recursive deletion is available", workflow
+        )
         self.assertIn("classify that result separately as missing", workflow)
-        self.assertIn("do not recreate it or delete anything at that pathname", workflow)
+        self.assertIn(
+            "do not recreate it or delete anything at that pathname", workflow
+        )
         self.assertIn("do not claim this run verified cleanup", workflow)
         self.assertIn("baseline identity is unavailable", workflow)
         self.assertIn("revalidation is unreadable", workflow)
@@ -988,9 +1081,9 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_exact_session_recipe_propagates_find_failure(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         recipe = extract_bash_block_after(workflow, "Exact session ID:")
         self.assertIn('CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"', recipe)
         self.assertIn('python3 - "$SESSION_ID" "$CODEX_ROOT"', recipe)
@@ -1033,11 +1126,13 @@ class SkillStructureTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 23)
             self.assertIn("find-failed", completed.stderr)
 
-    def test_session_mining_exact_session_recipe_tolerates_missing_and_malformed_indexes(self) -> None:
+    def test_session_mining_exact_session_recipe_tolerates_missing_and_malformed_indexes(
+        self,
+    ) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         recipe = extract_bash_block_after(workflow, "Exact session ID:")
         self.assertIn("if not path.is_file():", recipe)
         self.assertIn("except OSError:", recipe)
@@ -1055,11 +1150,15 @@ class SkillStructureTests(unittest.TestCase):
             home = temp / "home"
             codex_home = temp / "custom-codex"
             session_id = "019ce6e8-a5e3-76e1-91a2-799837c70d1e"
-            active = codex_home / f"sessions/2026/03/12/rollout-active-{session_id}.jsonl"
+            active = (
+                codex_home / f"sessions/2026/03/12/rollout-active-{session_id}.jsonl"
+            )
             uppercase = codex_home / (
                 f"sessions/2026/03/13/rollout-uppercase-{session_id.upper()}.jsonl"
             )
-            archived = codex_home / f"archived_sessions/rollout-archived-{session_id}.jsonl"
+            archived = (
+                codex_home / f"archived_sessions/rollout-archived-{session_id}.jsonl"
+            )
             expected = {active, uppercase, archived}
             for path in expected:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -1077,7 +1176,9 @@ class SkillStructureTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(missing.returncode, 0, missing.stderr)
-            self.assertEqual({Path(line) for line in missing.stdout.splitlines()}, expected)
+            self.assertEqual(
+                {Path(line) for line in missing.stdout.splitlines()}, expected
+            )
 
             session_index = codex_home / "session_index.jsonl"
             bare_cr_tail_marker = "bare-cr-tail-index-marker"
@@ -1142,7 +1243,9 @@ class SkillStructureTests(unittest.TestCase):
             wrong_case = codex_home / (
                 f"archived_sessions/rollout-opaque-{opaque_id.lower()}.jsonl"
             )
-            glob_decoy = codex_home / "archived_sessions/rollout-opaque-OpaqueXYZI.jsonl"
+            glob_decoy = (
+                codex_home / "archived_sessions/rollout-opaque-OpaqueXYZI.jsonl"
+            )
             opaque.write_text("{}\n", encoding="utf-8")
             wrong_case.write_text("{}\n", encoding="utf-8")
             glob_decoy.write_text("{}\n", encoding="utf-8")
@@ -1166,9 +1269,9 @@ class SkillStructureTests(unittest.TestCase):
         self,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         recipe = extract_bash_block_after(workflow, "Exact session ID:")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1205,7 +1308,9 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_retrospective_bounds_operator_output(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        skill = (root / "skills/codex-session-retrospective/SKILL.md").read_text(encoding="utf-8")
+        skill = (root / "skills/codex-session-retrospective/SKILL.md").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("task-scoped ignored log", skill)
         self.assertIn("progress markers", skill)
@@ -1220,8 +1325,12 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_recent_turn_recipe_reads_both_indexes(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
-        code = extract_python_block_after(workflow, 'Recent prior turn or "read your rollout":')
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
+        code = extract_python_block_after(
+            workflow, 'Recent prior turn or "read your rollout":'
+        )
 
         self.assertIn("heapq.heapreplace(latest, item)", code)
         self.assertIn("handle.readline(max_record_bytes + 1)", code)
@@ -1231,7 +1340,11 @@ class SkillStructureTests(unittest.TestCase):
             codex_home = Path(home) / ".codex"
             codex_home.mkdir()
             history_rows = [
-                {"session_id": f"history-{index}", "ts": f"2026-06-04T00:{index:02d}:00Z", "text": f"history row {index}"}
+                {
+                    "session_id": f"history-{index}",
+                    "ts": f"2026-06-04T00:{index:02d}:00Z",
+                    "text": f"history row {index}",
+                }
                 for index in range(20)
             ]
             oversized_marker = "oversized-record-marker"
@@ -1269,12 +1382,15 @@ class SkillStructureTests(unittest.TestCase):
             (codex_home / "history.jsonl").write_bytes(history_payload)
             long_index_value = "z" * 1000
             (codex_home / "session_index.jsonl").write_text(
-                json_dumps({
-                    "session_id": "index-session",
-                    "updated_at": "2026-06-03T00:00:00Z",
-                    "cwd": f"/tmp/{long_index_value}",
-                    "thread_name": "session index row",
-                }) + "\n",
+                json_dumps(
+                    {
+                        "session_id": "index-session",
+                        "updated_at": "2026-06-03T00:00:00Z",
+                        "cwd": f"/tmp/{long_index_value}",
+                        "thread_name": "session index row",
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
 
@@ -1298,7 +1414,9 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_exact_probe_handles_real_record_shapes(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
         start = workflow.index(marker) + len(marker)
         code = workflow[start : workflow.index("\nPY\n```", start)]
@@ -1313,7 +1431,15 @@ class SkillStructureTests(unittest.TestCase):
         )
 
         output = result.stdout
-        for kind in ("history", "session_meta", "turn_context", "user_message", "function_call_output", "task_complete", "thread/start"):
+        for kind in (
+            "history",
+            "session_meta",
+            "turn_context",
+            "user_message",
+            "function_call_output",
+            "task_complete",
+            "thread/start",
+        ):
             self.assertIn(f":{kind}:", output)
         self.assertIn("top-level output", output)
 
@@ -1329,9 +1455,9 @@ class SkillStructureTests(unittest.TestCase):
         self,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
         start = workflow.index(marker) + len(marker)
         code = workflow[start : workflow.index("\nPY\n" + (chr(96) * 3), start)]
@@ -1374,9 +1500,9 @@ class SkillStructureTests(unittest.TestCase):
         self,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
         start = workflow.index(marker) + len(marker)
         code = workflow[start : workflow.index("\nPY\n" + (chr(96) * 3), start)]
@@ -1433,17 +1559,15 @@ class SkillStructureTests(unittest.TestCase):
         self,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
         start = workflow.index(marker) + len(marker)
         code = workflow[start : workflow.index("\nPY\n" + (chr(96) * 3), start)]
         row = {
             "type": "outer\nkind\x00" + ("T" * 220_000),
-            "timestamp": {
-                "nested": "timestamp-dict-marker-" + ("Q" * 220_000)
-            },
+            "timestamp": {"nested": "timestamp-dict-marker-" + ("Q" * 220_000)},
             "ts": "2026-07-17T00:00:00Z\nforged-ts-line\x1b" + ("Z" * 110_000),
             "payload": {
                 "type": {
@@ -1491,9 +1615,9 @@ class SkillStructureTests(unittest.TestCase):
         self,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
         start = workflow.index(marker) + len(marker)
         code = workflow[start : workflow.index("\nPY\n" + (chr(96) * 3), start)]
@@ -1540,9 +1664,9 @@ class SkillStructureTests(unittest.TestCase):
         self,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(
-            encoding="utf-8"
-        )
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
         marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
         start = workflow.index(marker) + len(marker)
         code = workflow[start : workflow.index("\nPY\n" + (chr(96) * 3), start)]
@@ -1582,8 +1706,12 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_failure_probe_handles_event_message_fields(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
-        code = extract_python_block_after(workflow, "Focus on tool failures or approval friction:")
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
+        code = extract_python_block_after(
+            workflow, "Focus on tool failures or approval friction:"
+        )
         jsonl = root / "tests/fixtures/codex_session_mining_exact_probe.jsonl"
         env = dict(os.environ, CODEX_ROLLOUT_SAMPLE=str(jsonl))
 
@@ -1600,10 +1728,16 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn(":turn_context:None:", result.stdout)
         self.assertIn("approval_policy", result.stdout)
 
-    def test_session_mining_bounded_rollout_probe_handles_structured_user_messages(self) -> None:
+    def test_session_mining_bounded_rollout_probe_handles_structured_user_messages(
+        self,
+    ) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
-        code = extract_python_block_after(workflow, "Search a bounded rollout set without dumping full JSONL records:")
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
+        code = extract_python_block_after(
+            workflow, "Search a bounded rollout set without dumping full JSONL records:"
+        )
         jsonl = root / "tests/fixtures/codex_session_mining_exact_probe.jsonl"
         env = dict(os.environ, CODEX_ROLLOUT_SAMPLE=str(jsonl))
 
@@ -1620,8 +1754,12 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_bounded_rollout_probe_caps_output(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
-        code = extract_python_block_after(workflow, "Search a bounded rollout set without dumping full JSONL records:")
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
+        code = extract_python_block_after(
+            workflow, "Search a bounded rollout set without dumping full JSONL records:"
+        )
         jsonl = root / "tests/fixtures/codex_session_mining_many_thread_start.jsonl"
         env = dict(os.environ, CODEX_ROLLOUT_SAMPLE=str(jsonl))
 
@@ -1640,9 +1778,16 @@ class SkillStructureTests(unittest.TestCase):
 
     def test_session_mining_bounded_rollout_probe_skips_tool_output(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
-        code = extract_python_block_after(workflow, "Search a bounded rollout set without dumping full JSONL records:")
-        jsonl = root / "tests/fixtures/codex_session_mining_tool_output_then_thread_start.jsonl"
+        workflow = (
+            root / "skills/codex-session-mining/references/workflow.md"
+        ).read_text(encoding="utf-8")
+        code = extract_python_block_after(
+            workflow, "Search a bounded rollout set without dumping full JSONL records:"
+        )
+        jsonl = (
+            root
+            / "tests/fixtures/codex_session_mining_tool_output_then_thread_start.jsonl"
+        )
         env = dict(os.environ, CODEX_ROLLOUT_SAMPLE=str(jsonl))
 
         result = subprocess.run(

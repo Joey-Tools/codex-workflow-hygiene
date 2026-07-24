@@ -686,6 +686,31 @@ def read_stable(
         os.close(fd)
 
 
+def revalidate_candidate_source(
+    path: Path,
+    expected: Snapshot,
+    *,
+    candidate_sha256: str,
+) -> bytes:
+    payload, actual = read_stable(path, label="candidate_source")
+    mismatches = property_mismatches(expected, actual)
+    if not hmac.compare_digest(actual.sha256, candidate_sha256):
+        if "content" not in mismatches:
+            mismatches.append("content")
+    if mismatches:
+        raise TransactionError(
+            "candidate_source_changed",
+            "candidate source changed after its audited bytes were admitted",
+            exit_code=EXIT_VALIDATION_FAILED,
+            details={
+                "mismatched_properties": mismatches,
+                "expected_candidate_sha256": candidate_sha256,
+                "actual_candidate_sha256": actual.sha256,
+            },
+        )
+    return payload
+
+
 def directory_snapshot(path: Path) -> Snapshot:
     try:
         file_stat = os.stat(path, follow_symlinks=False)
@@ -2156,9 +2181,138 @@ class PrivateStage:
                 return locator
         return None
 
-    def cleanup(self) -> list[dict[str, object]]:
+    def _close_bindings(self) -> None:
+        for binding in self.files.values():
+            os.close(binding.fd)
+        for fd in self.extra_fds:
+            os.close(fd)
+        self.files.clear()
+        self.extra_fds.clear()
+
+    def _cleanup_disposable_stage(self) -> list[dict[str, object]]:
+        """Remove only transaction-bound leaves from the private stage.
+
+        The protected property is namespace ownership by this transaction:
+        the held stage directory must still have the original identity and
+        access policy, and every removed leaf must still name an object held by
+        ``self.files``.  Unknown or replacement entries are never removed.
+        """
+
+        warnings: list[dict[str, object]] = []
+        try:
+            self._validate_rules_parent()
+            self._validate_stage_root()
+            names = os.listdir(self.stage_fd)
+            if len(names) > 1024:
+                raise TransactionError(
+                    "stage_cleanup_refused",
+                    "staging directory exceeds the cleanup entry bound",
+                )
+            bound_identities = {
+                (file_stat.st_dev, file_stat.st_ino)
+                for binding in self.files.values()
+                for file_stat in (os.fstat(binding.fd),)
+            }
+            for name in names:
+                try:
+                    entry = os.stat(
+                        name,
+                        dir_fd=self.stage_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                identity = (entry.st_dev, entry.st_ino)
+                if identity not in bound_identities:
+                    warnings.append(
+                        {
+                            "status": "stage_cleanup_unexpected_entry",
+                            "last_known_path": str(self.path / name),
+                            "bound_identity": stat_identity(entry),
+                        }
+                    )
+                    continue
+                self._validate_rules_parent()
+                self._validate_stage_root()
+                rechecked = os.stat(
+                    name,
+                    dir_fd=self.stage_fd,
+                    follow_symlinks=False,
+                )
+                if (rechecked.st_dev, rechecked.st_ino) != identity:
+                    warnings.append(
+                        {
+                            "status": "stage_cleanup_entry_changed",
+                            "last_known_path": str(self.path / name),
+                            "expected_identity": {
+                                "device": identity[0],
+                                "inode": identity[1],
+                            },
+                            "actual_identity": stat_identity(rechecked),
+                        }
+                    )
+                    continue
+                os.unlink(name, dir_fd=self.stage_fd)
+                if (
+                    observe_directory_entry(self.stage_fd, name).get("state")
+                    != "missing"
+                ):
+                    warnings.append(
+                        {
+                            "status": "stage_cleanup_unverified",
+                            "last_known_path": str(self.path / name),
+                        }
+                    )
+            self._validate_rules_parent()
+            self._validate_stage_root()
+            remaining = os.listdir(self.stage_fd)
+            if not remaining:
+                os.rmdir(self.stage_name, dir_fd=self.rules_parent_fd)
+                if (
+                    observe_directory_entry(
+                        self.rules_parent_fd,
+                        self.stage_name,
+                    ).get("state")
+                    != "missing"
+                ):
+                    warnings.append(
+                        {
+                            "status": "stage_cleanup_root_unverified",
+                            "last_known_path": str(self.path),
+                        }
+                    )
+            else:
+                warnings.append(
+                    {
+                        "status": "stage_cleanup_incomplete",
+                        "last_known_path": str(self.path),
+                        "remaining_entry_count": len(remaining),
+                    }
+                )
+        except (OSError, TransactionError) as error:
+            warnings.append(
+                {
+                    "status": (
+                        error.status
+                        if isinstance(error, TransactionError)
+                        else "stage_cleanup_failed"
+                    ),
+                    "message": str(error),
+                    "last_known_path": str(self.path),
+                }
+            )
+        finally:
+            self._close_bindings()
+            self.closed = True
+            os.close(self.stage_fd)
+            os.close(self.rules_parent_fd)
+        return warnings
+
+    def cleanup(self, *, retain: bool = True) -> list[dict[str, object]]:
         if self.closed:
             return []
+        if not retain:
+            return self._cleanup_disposable_stage()
         warnings: list[dict[str, object]] = []
         root_locator = self._locator_for_snapshot(self.stage_snapshot)
         for binding in self.files.values():
@@ -2649,6 +2803,99 @@ def _read_validator_events(
     return overflow, progressed
 
 
+def _emergency_stop_validator_process_group(
+    process: subprocess.Popen[bytes],
+    selector: selectors.BaseSelector | None,
+    buffers: dict[str, bytearray],
+    *,
+    max_output_bytes: int,
+) -> list[dict[str, object]]:
+    """Bound cleanup that does not depend on waitid, proc, or libproc.
+
+    This path is used after supervisor setup, observation, signal-handler, or
+    process-inventory failures.  The protected property is process-group
+    quiescence: signal the complete ``start_new_session`` group, drain its
+    owned pipes, and reap the direct child within fixed TERM/KILL deadlines.
+    """
+
+    cleanup_errors: list[dict[str, object]] = []
+
+    def record(label: str, error: BaseException) -> None:
+        cleanup_errors.append(
+            {
+                "operation": label,
+                "error_type": type(error).__name__,
+                "message": compact(str(error)),
+            }
+        )
+
+    def signal_group(signum: int) -> None:
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            return
+        except BaseException as error:
+            record(f"killpg:{signum}", error)
+            try:
+                process.send_signal(signum)
+            except ProcessLookupError:
+                return
+            except BaseException as direct_error:
+                record(f"signal-direct-child:{signum}", direct_error)
+
+    def drain_until(deadline: float) -> None:
+        while time.monotonic() < deadline:
+            try:
+                has_streams = selector is not None and bool(selector.get_map())
+            except BaseException as error:
+                record("inspect-validator-output", error)
+                break
+            if not has_streams:
+                try:
+                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+                except BaseException as error:
+                    record("wait-for-validator-exit", error)
+                    break
+                continue
+            try:
+                _read_validator_events(
+                    selector,
+                    buffers,
+                    max_output_bytes=max_output_bytes,
+                    timeout_seconds=min(
+                        0.02,
+                        max(0.0, deadline - time.monotonic()),
+                    ),
+                    retain=False,
+                )
+            except BaseException as error:
+                record("drain-validator-output", error)
+                break
+
+    signal_group(signal.SIGTERM)
+    drain_until(time.monotonic() + VALIDATOR_TERM_GRACE_SECONDS)
+    signal_group(signal.SIGKILL)
+    kill_deadline = time.monotonic() + VALIDATOR_KILL_DRAIN_SECONDS
+    drain_until(kill_deadline)
+    try:
+        process.wait(timeout=max(0.0, kill_deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as error:
+        record("reap-direct-child", error)
+        try:
+            process.kill()
+            process.wait(timeout=0.1)
+        except BaseException as final_error:
+            record("kill-and-reap-direct-child", final_error)
+    except BaseException as error:
+        record("reap-direct-child", error)
+    # A direct child can exit before a same-group descendant.  Reissue the
+    # group kill while the bound PGID is still the transaction's session ID.
+    signal_group(signal.SIGKILL)
+    if selector is not None:
+        drain_until(kill_deadline)
+    return cleanup_errors
+
+
 def _stop_validator_process_group(
     process: subprocess.Popen[bytes],
     exit_observer: _ValidatorExitObserver,
@@ -2813,27 +3060,24 @@ def run_validator(
             "validator_launch_failed",
             f"cannot launch validator: {error}",
         ) from error
-    try:
-        exit_observer = _ValidatorExitObserver(process)
-    except TransactionError:
-        _signal_validator_group(process.pid, signal.SIGKILL)
-        process.wait()
-        raise
-    assert process.stdout is not None
-    assert process.stderr is not None
-    selector = selectors.DefaultSelector()
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
-    for stream, label in (
-        (process.stdout, "stdout"),
-        (process.stderr, "stderr"),
-    ):
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream, selectors.EVENT_READ, label)
-
+    exit_observer: _ValidatorExitObserver | None = None
+    selector: selectors.BaseSelector | None = None
     timed_out = False
     output_limit_exceeded = False
     descendants_terminated = False
     try:
+        exit_observer = _ValidatorExitObserver(process)
+        assert process.stdout is not None
+        assert process.stderr is not None
+        selector = selectors.DefaultSelector()
+        for stream, label in (
+            (process.stdout, "stdout"),
+            (process.stderr, "stderr"),
+        ):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, label)
+
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2891,6 +3135,8 @@ def run_validator(
                 bytes(buffers["stderr"]).decode("utf-8", "replace"),
             )
 
+        assert exit_observer is not None
+        assert selector is not None
         _returncode, cleanup_descendants = _stop_validator_process_group(
             process,
             exit_observer,
@@ -2907,11 +3153,26 @@ def run_validator(
             output_limit_exceeded=output_limit_exceeded,
             descendants_terminated=descendants_terminated,
         )
+    except BaseException as error:
+        cleanup_errors = _emergency_stop_validator_process_group(
+            process,
+            selector,
+            buffers,
+            max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
+        )
+        if cleanup_errors and isinstance(error, TransactionError):
+            error.details.setdefault(
+                "emergency_cleanup_errors",
+                cleanup_errors,
+            )
+        raise
     finally:
-        exit_observer.close()
-        selector.close()
+        if exit_observer is not None:
+            exit_observer.close()
+        if selector is not None:
+            selector.close()
         for stream in (process.stdout, process.stderr):
-            if not stream.closed:
+            if stream is not None and not stream.closed:
                 stream.close()
 
 
@@ -2956,6 +3217,7 @@ def receipt_payload(
     lock: Path,
     backup: Path,
     expected_sha256: str,
+    candidate_sha256: str,
     parent: Snapshot,
     original: Snapshot,
     installed: Snapshot,
@@ -2972,6 +3234,7 @@ def receipt_payload(
         "backup_path": str(backup),
         "recovery_terminal_path": str(recovery_terminal),
         "expected_sha256": expected_sha256,
+        "candidate_sha256": candidate_sha256,
         "rules_parent": parent.to_json(),
         "original": original.to_json(),
         "installed": installed.to_json(),
@@ -3693,6 +3956,12 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             "expected_digest_invalid",
             "--expected-sha256 must be 64 lowercase hexadecimal characters",
         )
+    candidate_sha256 = args.candidate_sha256.lower()
+    if not valid_sha256(candidate_sha256):
+        raise TransactionError(
+            "candidate_digest_invalid",
+            "--candidate-sha256 must be 64 lowercase hexadecimal characters",
+        )
     rules = codex_rules_path()
     candidate_source = resolved_leaf(args.candidate, label="candidate")
     receipt = resolved_leaf(args.receipt, label="receipt")
@@ -3713,15 +3982,71 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
     ):
         raise TransactionError("path_invalid", "transaction paths must be distinct")
 
-    candidate_bytes, _source_snapshot = read_stable(
+    candidate_bytes, source_snapshot = read_stable(
         candidate_source,
         label="candidate_source",
     )
+    if not hmac.compare_digest(source_snapshot.sha256, candidate_sha256):
+        raise TransactionError(
+            "candidate_digest_mismatch",
+            "candidate source does not match the audited candidate SHA-256",
+            exit_code=EXIT_VALIDATION_FAILED,
+            details={
+                "expected_candidate_sha256": candidate_sha256,
+                "actual_candidate_sha256": source_snapshot.sha256,
+            },
+        )
 
-    stage = PrivateStage(rules.parent)
+    stage: PrivateStage | None = None
     evidence: ApplyEvidenceBindings | None = None
     lock_acquired = False
+    retain_stage = False
     try:
+        # A no-op needs neither a validator process nor a staging directory.
+        # The unlocked read is only a hint; every protected live property and
+        # the candidate source are revalidated under the shared writer lock.
+        live_hint, _live_hint_snapshot = read_stable(
+            rules,
+            label="live_rules",
+        )
+        if live_hint == candidate_bytes:
+            with shared_lock(
+                lock,
+                timeout_seconds=args.lock_timeout_seconds,
+            ) as _lock_expected:
+                lock_acquired = True
+                current_bytes, current = read_stable(
+                    rules,
+                    label="live_rules",
+                    require_modeled_metadata=True,
+                )
+                if current.nlink != 1:
+                    return EXIT_LIVE_CONFLICT, {
+                        "status": "live_rules_object_policy_unsupported",
+                        "rules_path": str(rules),
+                        "object_policy": {"nlink": current.nlink},
+                    }
+                if not hmac.compare_digest(current.sha256, expected_sha256):
+                    return EXIT_LIVE_CONFLICT, {
+                        "status": "expected_digest_mismatch",
+                        "rules_path": str(rules),
+                        "expected_sha256": expected_sha256,
+                        "actual_sha256": current.sha256,
+                    }
+                revalidate_candidate_source(
+                    candidate_source,
+                    source_snapshot,
+                    candidate_sha256=candidate_sha256,
+                )
+                if current_bytes == candidate_bytes:
+                    return 0, {
+                        "status": "no_change_after_lock",
+                        "rules_path": str(rules),
+                        "sha256": current.sha256,
+                    }
+            lock_acquired = False
+
+        stage = PrivateStage(rules.parent)
         candidate, candidate_snapshot = stage.create("candidate", candidate_bytes)
         pre_validation = run_validator(
             args.validator_command,
@@ -3729,12 +4054,23 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             timeout_seconds=args.validator_timeout_seconds,
         )
         if not pre_validation.valid:
+            stage.validate(candidate, candidate_snapshot, label="private_candidate")
+            revalidate_candidate_source(
+                candidate_source,
+                source_snapshot,
+                candidate_sha256=candidate_sha256,
+            )
             return EXIT_VALIDATION_FAILED, {
                 "status": "candidate_validation_failed",
                 "validator": pre_validation.to_json(),
                 "rules_path": str(rules),
             }
         stage.validate(candidate, candidate_snapshot, label="private_candidate")
+        revalidate_candidate_source(
+            candidate_source,
+            source_snapshot,
+            candidate_sha256=candidate_sha256,
+        )
 
         with shared_lock(
             lock, timeout_seconds=args.lock_timeout_seconds
@@ -3835,6 +4171,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 lock=lock,
                 backup=backup,
                 expected_sha256=expected_sha256,
+                candidate_sha256=candidate_sha256,
                 parent=parent_expected,
                 original=current,
                 installed=installed_snapshot,
@@ -3879,6 +4216,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             try:
                 evidence.validate()
             except TransactionError as error:
+                retain_stage = True
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": "recovery_required",
                     "post_replace_failure": {
@@ -3904,6 +4242,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     require_modeled_metadata=True,
                 )
             except TransactionError as error:
+                retain_stage = True
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": "recovery_required",
                     "post_replace_failure": {
@@ -3916,6 +4255,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             try:
                 evidence.validate()
             except TransactionError as error:
+                retain_stage = True
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": "recovery_required",
                     "post_replace_failure": {
@@ -3931,6 +4271,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 installed_live,
             )
             if installed_mismatches:
+                retain_stage = True
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": "recovery_required",
                     "post_replace_failure": {
@@ -3958,6 +4299,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             try:
                 evidence.validate()
             except TransactionError as error:
+                retain_stage = True
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": "recovery_required",
                     "post_replace_failure": {
@@ -3975,6 +4317,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     require_modeled_metadata=True,
                 )
             except TransactionError as error:
+                retain_stage = True
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": "recovery_required",
                     "post_replace_failure": {
@@ -3987,6 +4330,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             try:
                 evidence.validate()
             except TransactionError as error:
+                retain_stage = True
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": "recovery_required",
                     "post_replace_failure": {
@@ -3999,6 +4343,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 }
             post_mismatches = property_mismatches(installed_expected, post_live)
             if post_mismatches:
+                retain_stage = True
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": "recovery_required",
                     "post_replace_failure": {
@@ -4014,6 +4359,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 try:
                     evidence.validate()
                 except TransactionError as error:
+                    retain_stage = True
                     return EXIT_POST_REPLACE_FAILED, {
                         "status": "recovery_required",
                         "post_replace_failure": post_failure,
@@ -4058,6 +4404,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                         )
                         verify_restored_terminal(rules, restored)
                     except TransactionError as error:
+                        retain_stage = True
                         return EXIT_POST_REPLACE_FAILED, {
                             "status": "recovery_required",
                             "post_replace_failure": post_failure,
@@ -4070,6 +4417,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                             "receipt_path": str(receipt),
                             "backup_path": str(backup),
                         }
+                retain_stage = not rolled_back
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": (
                         "post_replace_failed_rolled_back"
@@ -4086,6 +4434,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             try:
                 evidence.validate()
             except TransactionError as error:
+                retain_stage = True
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": "recovery_required",
                     "post_replace_failure": {
@@ -4107,10 +4456,18 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     post_validation.to_json() if post_validation is not None else None
                 ),
             }
+    except BaseException as error:
+        if (
+            isinstance(error, TransactionError) and error.status == "recovery_required"
+        ) or evidence is not None:
+            retain_stage = True
+        raise
     finally:
-        if evidence is not None:
-            evidence.close()
-        warnings = stage.cleanup()
+        try:
+            if evidence is not None:
+                evidence.close()
+        finally:
+            warnings = stage.cleanup(retain=retain_stage) if stage is not None else []
         if warnings:
             print(
                 json.dumps(
@@ -4346,6 +4703,7 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                 "actual_live": live.to_json(),
             }
         stage = PrivateStage(rules.parent)
+        retain_stage = False
         try:
             rolled_back, rollback_result = rollback(
                 stage=stage,
@@ -4359,6 +4717,7 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
             )
             if not rolled_back:
                 if rollback_result.get("rollback_status") == "recovery_required":
+                    retain_stage = True
                     return EXIT_POST_REPLACE_FAILED, {
                         "status": "recovery_required",
                         "rollback": rollback_result,
@@ -4390,6 +4749,7 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                 )
                 verify_restored_terminal(rules, restored)
             except TransactionError as error:
+                retain_stage = True
                 return EXIT_POST_REPLACE_FAILED, {
                     "status": "recovery_required",
                     "rollback": rollback_result,
@@ -4405,8 +4765,11 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                 "rollback": rollback_result,
                 "recovery_terminal": terminal,
             }
+        except BaseException:
+            retain_stage = True
+            raise
         finally:
-            warnings = stage.cleanup()
+            warnings = stage.cleanup(retain=retain_stage)
             if warnings:
                 print(
                     json.dumps(
@@ -4427,6 +4790,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     apply_parser = subparsers.add_parser("apply")
     apply_parser.add_argument("--candidate", required=True)
+    apply_parser.add_argument("--candidate-sha256", required=True)
     apply_parser.add_argument("--expected-sha256", required=True)
     apply_parser.add_argument("--backup-name", required=True)
     apply_parser.add_argument("--receipt", required=True)

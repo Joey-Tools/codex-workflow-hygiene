@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import pwd
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -85,6 +86,45 @@ class RulesApplyTransactionTests(unittest.TestCase):
         environment["CODEX_HOME"] = str(self.codex_home)
         environment.update(updates)
         return environment
+
+    def assert_no_private_stage(self) -> None:
+        self.assertEqual(list(self.rules_dir.glob(".rules-apply-*")), [])
+
+    def write_sleeping_validator(self, pid_path: Path) -> None:
+        self.write_validator(
+            f"""\
+            from pathlib import Path
+            import os
+            import time
+
+            Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding="ascii")
+            while True:
+                time.sleep(1)
+            """
+        )
+
+    def wait_for_pid_path(self, pid_path: Path) -> int:
+        deadline = time.monotonic() + 2
+        while not pid_path.exists():
+            if time.monotonic() >= deadline:
+                self.fail(f"validator did not publish its PID: {pid_path}")
+            time.sleep(0.01)
+        return int(pid_path.read_text(encoding="ascii"))
+
+    def assert_process_exited(self, pid: int) -> None:
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() >= deadline:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self.fail(f"validator process {pid} remained alive")
+            time.sleep(0.01)
 
     def xattr_validator_source(self, *, live_only: bool = False) -> str:
         probe = self.root / "xattr-probe"
@@ -215,6 +255,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
     def apply_namespace(self) -> SimpleNamespace:
         return SimpleNamespace(
             expected_sha256=hashlib.sha256(OLD_RULES).hexdigest(),
+            candidate_sha256=hashlib.sha256(NEW_RULES).hexdigest(),
             candidate=str(self.candidate),
             receipt=str(self.receipt),
             backup_name=self.backup_name,
@@ -271,10 +312,14 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self,
         *,
         expected_sha256: str | None = None,
+        candidate_sha256: str | None = None,
         environment: dict[str, str] | None = None,
         validator_timeout: str = "5",
     ) -> subprocess.CompletedProcess[str]:
         expected = expected_sha256 or hashlib.sha256(OLD_RULES).hexdigest()
+        candidate_digest = (
+            candidate_sha256 or hashlib.sha256(self.candidate.read_bytes()).hexdigest()
+        )
         return subprocess.run(
             [
                 sys.executable,
@@ -282,6 +327,8 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 "apply",
                 "--candidate",
                 str(self.candidate),
+                "--candidate-sha256",
+                candidate_digest,
                 "--expected-sha256",
                 expected,
                 "--backup-name",
@@ -400,6 +447,60 @@ class RulesApplyTransactionTests(unittest.TestCase):
         )
         self.assertEqual(terminal["state"], "reserved")
         self.assertEqual(terminal["transaction_id"], receipt["transaction_id"])
+        self.assertEqual(
+            receipt["candidate_sha256"],
+            hashlib.sha256(NEW_RULES).hexdigest(),
+        )
+        self.assert_no_private_stage()
+
+    def test_candidate_digest_mismatch_is_rejected_before_staging(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+
+        result = self.run_apply(candidate_sha256="0" * 64)
+
+        self.assertEqual(result.returncode, 10, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "candidate_digest_mismatch")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assert_no_private_stage()
+
+    def test_candidate_source_replacement_after_validation_is_rejected(
+        self,
+    ) -> None:
+        self.write_validator(
+            """\
+            import os
+            from pathlib import Path
+            import sys
+
+            path = Path(sys.argv[1])
+            if path.name == "candidate":
+                source = Path(os.environ["CANDIDATE_SOURCE"])
+                replacement = source.with_name("candidate.replacement")
+                replacement.write_bytes(source.read_bytes())
+                os.replace(replacement, source)
+            """
+        )
+
+        result = self.run_apply(
+            environment=self.helper_environment(
+                CANDIDATE_SOURCE=str(self.candidate),
+            )
+        )
+
+        self.assertEqual(result.returncode, 10, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "candidate_source_changed")
+        self.assertEqual(
+            payload["mismatched_properties"],
+            ["object_identity"],
+        )
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assert_no_private_stage()
 
     def test_candidate_changed_by_validator_is_rejected_before_lock(self) -> None:
         self.write_validator(
@@ -422,6 +523,21 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.receipt.exists())
         self.assertFalse((self.rules_dir / ".default.rules.apply.lock").exists())
+        self.assert_no_private_stage()
+
+    def test_rejected_unchanged_candidate_stage_is_removed(self) -> None:
+        self.write_validator("raise SystemExit(7)\n")
+
+        result = self.run_apply()
+
+        self.assertEqual(result.returncode, 10, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "candidate_validation_failed")
+        self.assertEqual(payload["validator"]["returncode"], 7)
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assert_no_private_stage()
 
     def test_candidate_hardlinked_by_validator_is_rejected_before_lock(self) -> None:
         self.write_validator(
@@ -444,6 +560,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.receipt.exists())
+        self.assert_no_private_stage()
 
     def test_candidate_xattr_injected_by_validator_is_rejected_before_lock(
         self,
@@ -492,6 +609,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
         self.assertTrue(self.backup.exists())
         self.assertTrue(self.receipt.exists())
+        self.assertTrue(list(self.rules_dir.glob(".rules-apply-*")))
 
     def test_metadata_inspection_capability_failure_is_fail_closed(self) -> None:
         stage = TRANSACTION.PrivateStage(self.rules_dir)
@@ -820,6 +938,170 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124)
         self.assertLess(time.monotonic() - started, 3)
 
+    def test_validator_waitid_failure_still_terminates_and_reaps(self) -> None:
+        pid_path = self.root / "validator-waitid-failure.pid"
+        self.write_sleeping_validator(pid_path)
+
+        def fail_waitid(*_args: object, **_kwargs: object) -> None:
+            self.wait_for_pid_path(pid_path)
+            raise OSError(errno.EIO, "fault-injected waitid failure")
+
+        with (
+            mock.patch.object(
+                TRANSACTION.os,
+                "waitid",
+                side_effect=fail_waitid,
+            ),
+            self.assertRaises(OSError),
+        ):
+            TRANSACTION.run_validator(
+                [sys.executable, str(self.validator), "{rules}"],
+                self.candidate,
+                timeout_seconds=2,
+            )
+
+        self.assert_process_exited(self.wait_for_pid_path(pid_path))
+
+    def test_validator_inventory_failure_still_terminates_and_reaps(self) -> None:
+        pid_path = self.root / "validator-inventory-failure.pid"
+        self.write_sleeping_validator(pid_path)
+
+        def fail_inventory(*_args: object, **_kwargs: object) -> tuple[int, ...]:
+            self.wait_for_pid_path(pid_path)
+            raise TRANSACTION.TransactionError(
+                "validator_cleanup_failed",
+                "fault-injected process inventory failure",
+            )
+
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "_live_validator_group_member_pids",
+                side_effect=fail_inventory,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.run_validator(
+                [sys.executable, str(self.validator), "{rules}"],
+                self.candidate,
+                timeout_seconds=0.1,
+            )
+
+        self.assertEqual(raised.exception.status, "validator_cleanup_failed")
+        self.assert_process_exited(self.wait_for_pid_path(pid_path))
+
+    def test_validator_signal_failure_still_terminates_and_reaps(self) -> None:
+        pid_path = self.root / "validator-signal-failure.pid"
+        self.write_sleeping_validator(pid_path)
+
+        def fail_signal(*_args: object, **_kwargs: object) -> None:
+            self.wait_for_pid_path(pid_path)
+            raise TRANSACTION.TransactionError(
+                "validator_cleanup_failed",
+                "fault-injected managed signal failure",
+            )
+
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "_signal_validator_group",
+                side_effect=fail_signal,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.run_validator(
+                [sys.executable, str(self.validator), "{rules}"],
+                self.candidate,
+                timeout_seconds=0.1,
+            )
+
+        self.assertEqual(raised.exception.status, "validator_cleanup_failed")
+        self.assert_process_exited(self.wait_for_pid_path(pid_path))
+
+    def test_validator_cancellation_still_terminates_and_reaps(self) -> None:
+        pid_path = self.root / "validator-cancellation.pid"
+        self.write_sleeping_validator(pid_path)
+
+        def interrupt_read(*_args: object, **_kwargs: object) -> tuple[bool, bool]:
+            self.wait_for_pid_path(pid_path)
+            raise KeyboardInterrupt
+
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "_read_validator_events",
+                side_effect=interrupt_read,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            TRANSACTION.run_validator(
+                [sys.executable, str(self.validator), "{rules}"],
+                self.candidate,
+                timeout_seconds=2,
+            )
+
+        self.assert_process_exited(self.wait_for_pid_path(pid_path))
+
+    def test_validator_cancellation_cleans_same_group_descendant(self) -> None:
+        leader_pid_path = self.root / "validator-cancel-leader.pid"
+        child_pid_path = self.root / "validator-cancel-child.pid"
+        child_script = self.root / "validator-cancel-child.py"
+        child_script.write_text(
+            textwrap.dedent(
+                f"""\
+                from pathlib import Path
+                import os
+                import time
+
+                Path({str(child_pid_path)!r}).write_text(
+                    str(os.getpid()),
+                    encoding="ascii",
+                )
+                while True:
+                    time.sleep(1)
+                """
+            ),
+            encoding="utf-8",
+        )
+        self.write_validator(
+            f"""\
+            from pathlib import Path
+            import os
+            import subprocess
+            import sys
+            import time
+
+            Path({str(leader_pid_path)!r}).write_text(
+                str(os.getpid()),
+                encoding="ascii",
+            )
+            subprocess.Popen([sys.executable, {str(child_script)!r}])
+            while True:
+                time.sleep(1)
+            """
+        )
+
+        def interrupt_read(*_args: object, **_kwargs: object) -> tuple[bool, bool]:
+            self.wait_for_pid_path(child_pid_path)
+            raise KeyboardInterrupt
+
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "_read_validator_events",
+                side_effect=interrupt_read,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            TRANSACTION.run_validator(
+                [sys.executable, str(self.validator), "{rules}"],
+                self.candidate,
+                timeout_seconds=2,
+            )
+
+        self.assert_process_exited(self.wait_for_pid_path(leader_pid_path))
+        self.assert_process_exited(self.wait_for_pid_path(child_pid_path))
+
     def test_validator_descendant_is_terminated_after_leader_exit(self) -> None:
         pid_path = self.root / "validator-descendant.pid"
         ready_path = self.root / "validator-descendant.ready"
@@ -1070,7 +1352,15 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
     def test_no_change_succeeds_only_after_locked_metadata_admission(self) -> None:
         self.candidate.write_bytes(OLD_RULES)
-        self.write_validator("raise SystemExit(0)\n")
+        validator_marker = self.root / "validator-ran"
+        self.write_validator(
+            f"""\
+            from pathlib import Path
+
+            Path({str(validator_marker)!r}).write_text("ran", encoding="ascii")
+            raise SystemExit(9)
+            """
+        )
 
         result = self.run_apply()
 
@@ -1082,6 +1372,8 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertFalse(self.receipt.exists())
         self.assertFalse(TRANSACTION.recovery_terminal_path(self.receipt).exists())
         self.assertTrue((self.rules_dir / ".default.rules.apply.lock").is_file())
+        self.assertFalse(validator_marker.exists())
+        self.assert_no_private_stage()
 
     def test_no_change_rejects_live_metadata_anomaly_after_lock(self) -> None:
         self.candidate.write_bytes(OLD_RULES)
@@ -1151,6 +1443,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.rules.stat().st_mode), 0o640)
         self.assertEqual(self.backup.read_bytes(), OLD_RULES)
         self.assertTrue(self.receipt.is_file())
+        self.assert_no_private_stage()
 
     def test_read_only_live_rules_apply_and_rollback(self) -> None:
         self.rules.chmod(0o444)
@@ -1339,6 +1632,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertTrue(terminal.is_file())
         self.assertEqual(stat.S_IMODE(terminal.stat().st_mode), 0o600)
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assert_no_private_stage()
 
     def test_recover_refuses_replaced_terminal_reservation(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -2207,6 +2501,42 @@ class RulesApplyPrimitiveRaceTests(unittest.TestCase):
             if warning["status"] == "retained_staging_directory"
         ]
         self.assertEqual(retained_roots[0]["recovery_locator"], str(moved_root))
+
+    def test_disposable_cleanup_never_removes_replacement_leaf(self) -> None:
+        stage = TRANSACTION.PrivateStage(self.rules_dir)
+        source, _expected = stage.create("candidate", NEW_RULES)
+        moved_source = stage.path / "candidate.bound"
+        os.rename(source, moved_source)
+        source.write_bytes(b"replacement cleanup leaf\n")
+
+        warnings = stage.cleanup(retain=False)
+
+        self.assertEqual(source.read_bytes(), b"replacement cleanup leaf\n")
+        self.assertFalse(moved_source.exists())
+        self.assertTrue(stage.path.is_dir())
+        self.assertTrue(
+            any(
+                warning["status"] == "stage_cleanup_unexpected_entry"
+                for warning in warnings
+            )
+        )
+
+    def test_disposable_cleanup_never_removes_replacement_root(self) -> None:
+        stage = TRANSACTION.PrivateStage(self.rules_dir)
+        source, _expected = stage.create("candidate", NEW_RULES)
+        moved_root = self.rules_dir / ".moved-disposable-stage"
+        os.rename(stage.path, moved_root)
+        stage.path.mkdir(mode=0o700)
+        replacement_leaf = stage.path / "replacement"
+        replacement_leaf.write_bytes(b"replacement stage tree\n")
+
+        warnings = stage.cleanup(retain=False)
+
+        self.assertEqual(replacement_leaf.read_bytes(), b"replacement stage tree\n")
+        self.assertEqual((moved_root / source.name).read_bytes(), NEW_RULES)
+        self.assertTrue(
+            any(warning["status"] == "private_stage_changed" for warning in warnings)
+        )
 
     def test_atomic_exchange_unsupported_fails_without_fallback(self) -> None:
         stage = TRANSACTION.PrivateStage(self.rules_dir)
