@@ -8,7 +8,7 @@ from array import array
 from collections.abc import Callable
 from contextlib import contextmanager
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
 import fcntl
 import hashlib
@@ -45,6 +45,8 @@ MAX_XATTR_NAME_BYTES = 64 * 1024
 MAX_STAGE_DIRECTORY_ENTRIES = 1024
 PRIVATE_STAGE_NAME = ".default.rules.transaction-stage"
 PREPARED_CANDIDATE_SUFFIX = ".prepared-candidate"
+RECOVERY_TERMINAL_RESULT_SUFFIX = ".result"
+RECOVERY_TERMINAL_TEMP_MARKER = ".result-pending-"
 # The legacy stage_cleanup_retained quarantine status is intentionally not emitted.
 VALIDATOR_TERM_GRACE_SECONDS = 0.25
 VALIDATOR_KILL_DRAIN_SECONDS = 1.0
@@ -266,6 +268,56 @@ class BoundDirectory:
     snapshot: Snapshot
     label: str
     require_owner_private: bool = False
+
+
+@dataclass
+class RecoveryMutationTracker:
+    """Record when recovery may have changed receipt-bound transaction state."""
+
+    locators: dict[str, str]
+    mutation_started: bool = False
+    events: list[dict[str, str]] = field(default_factory=list)
+    last_observed: dict[str, object] | None = None
+
+    def enter(self, operation: str, *, state: str) -> None:
+        self.mutation_started = True
+        self.events.append(
+            {
+                "operation": operation,
+                "phase": "entry",
+                "state": state,
+            }
+        )
+
+    def complete(self, operation: str, *, state: str) -> None:
+        self.events.append(
+            {
+                "operation": operation,
+                "phase": "completion",
+                "state": state,
+            }
+        )
+
+    def observe(self, observed: dict[str, object]) -> None:
+        self.last_observed = observed
+
+    def details(
+        self,
+        *,
+        state: str | None = None,
+        observed: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        effective_observed = observed if observed is not None else self.last_observed
+        return {
+            "mutation_journal": list(self.events),
+            "recovery_locators": dict(self.locators),
+            **({"transaction_state": state} if state is not None else {}),
+            **(
+                {"observed_state": effective_observed}
+                if effective_observed is not None
+                else {}
+            ),
+        }
 
 
 def valid_sha256(value: str) -> bool:
@@ -4367,9 +4419,74 @@ def write_receipt(
         raise
 
 
-def read_receipt_with_parent_snapshot(
-    path: Path,
-) -> tuple[dict[str, object], Snapshot]:
+def decode_receipt(payload: bytes) -> dict[str, object]:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TransactionError(
+            "receipt_invalid",
+            f"cannot parse recovery receipt: {error}",
+        ) from error
+    schema_version = value.get("schema_version") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in SUPPORTED_SCHEMA_VERSIONS
+    ):
+        raise TransactionError(
+            "receipt_invalid",
+            "unsupported recovery receipt schema",
+        )
+    return value
+
+
+@dataclass
+class RecoveryReceiptEvidence:
+    """Keep exact receipt bytes and their parent namespace bound through recovery."""
+
+    parent: BoundDirectory
+    binding: BoundFile
+    value: dict[str, object]
+    closed: bool = False
+
+    def validate(self) -> dict[str, object]:
+        payload, snapshot = validate_bound_regular_file(
+            self.binding,
+            self.parent,
+            label="receipt",
+            max_bytes=MAX_RECEIPT_BYTES,
+        )
+        if (
+            snapshot.uid != os.geteuid()
+            or snapshot.mode != 0o600
+            or snapshot.nlink != 1
+        ):
+            raise TransactionError(
+                "receipt_invalid",
+                "recovery receipt is not owner-only and single-link",
+            )
+        value = decode_receipt(payload)
+        if value != self.value:
+            raise TransactionError(
+                "receipt_changed",
+                "recovery receipt decoded value changed",
+                details={"mismatched_properties": ["content"]},
+            )
+        validate_bound_directory(self.parent)
+        return value
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            os.close(self.binding.fd)
+        finally:
+            os.close(self.parent.fd)
+
+
+def bind_recovery_receipt(path: Path) -> RecoveryReceiptEvidence:
     parent = bind_directory(
         path.parent,
         label="receipt",
@@ -4398,38 +4515,28 @@ def read_receipt_with_parent_snapshot(
                 "receipt_invalid",
                 "recovery receipt is not owner-only and single-link",
             )
-        try:
-            value = json.loads(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise TransactionError(
-                "receipt_invalid",
-                f"cannot parse recovery receipt: {error}",
-            ) from error
-        schema_version = (
-            value.get("schema_version") if isinstance(value, dict) else None
+        evidence = RecoveryReceiptEvidence(
+            parent=parent,
+            binding=binding,
+            value=decode_receipt(payload),
         )
-        if (
-            not isinstance(value, dict)
-            or not isinstance(schema_version, int)
-            or isinstance(schema_version, bool)
-            or schema_version not in SUPPORTED_SCHEMA_VERSIONS
-        ):
-            raise TransactionError(
-                "receipt_invalid",
-                "unsupported recovery receipt schema",
-            )
-        validate_bound_regular_file(
-            binding,
-            parent,
-            label="receipt",
-            max_bytes=MAX_RECEIPT_BYTES,
-        )
-        validate_bound_directory(parent)
-        return value, parent.snapshot
-    finally:
+        evidence.validate()
+        return evidence
+    except BaseException:
         if binding is not None:
             os.close(binding.fd)
         os.close(parent.fd)
+        raise
+
+
+def read_receipt_with_parent_snapshot(
+    path: Path,
+) -> tuple[dict[str, object], Snapshot]:
+    evidence = bind_recovery_receipt(path)
+    try:
+        return evidence.validate(), evidence.parent.snapshot
+    finally:
+        evidence.close()
 
 
 def read_receipt(path: Path) -> dict[str, object]:
@@ -4477,6 +4584,163 @@ def decode_recovery_terminal(payload: bytes) -> dict[str, object]:
     return value
 
 
+def recovery_terminal_result_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}{RECOVERY_TERMINAL_RESULT_SUFFIX}")
+
+
+@dataclass
+class RecoveryTerminalEvidence:
+    """Bind the immutable reservation and optional atomically published result."""
+
+    path: Path
+    parent: BoundDirectory
+    reservation: BoundFile
+    expected_reservation: Snapshot
+    transaction_id: str
+    result: BoundFile | None = None
+    closed: bool = False
+
+    @property
+    def result_path(self) -> Path:
+        return recovery_terminal_result_path(self.path)
+
+    @staticmethod
+    def _require_private_single_link(
+        snapshot: Snapshot,
+        *,
+        label: str,
+    ) -> None:
+        if (
+            snapshot.uid != os.geteuid()
+            or snapshot.mode != 0o600
+            or snapshot.nlink != 1
+        ):
+            raise TransactionError(
+                f"{label}_invalid",
+                f"{label} is not owner-only and single-link",
+            )
+
+    def validate(self) -> dict[str, object]:
+        reservation_payload, reservation_snapshot = validate_bound_regular_file(
+            self.reservation,
+            self.parent,
+            label="recovery_terminal",
+            max_bytes=MAX_RECEIPT_BYTES,
+        )
+        self._require_private_single_link(
+            reservation_snapshot,
+            label="recovery_terminal",
+        )
+        reservation = decode_recovery_terminal(reservation_payload)
+        if reservation.get("state") == RECOVERY_TERMINAL_RESERVED:
+            reservation_mismatches = property_mismatches(
+                self.expected_reservation,
+                reservation_snapshot,
+            )
+        else:
+            # Legacy receipts may have rewritten this exact inode before the
+            # crash-safe two-slot protocol was introduced.
+            reservation_mismatches = identity_access_and_object_policy_mismatches(
+                self.expected_reservation,
+                reservation_snapshot,
+            )
+        if reservation_mismatches:
+            raise TransactionError(
+                "recovery_terminal_binding_changed",
+                "recovery terminal no longer names the receipt-bound object",
+                details={"mismatched_properties": reservation_mismatches},
+            )
+        if reservation.get("transaction_id") != self.transaction_id:
+            raise TransactionError(
+                "recovery_terminal_transaction_mismatch",
+                "recovery terminal belongs to another transaction",
+            )
+
+        if self.result is None:
+            result_observation = observe_directory_entry(
+                self.parent.fd,
+                self.result_path.name,
+            )
+            if result_observation.get("state") != "missing":
+                raise TransactionError(
+                    "recovery_terminal_result_changed",
+                    "recovery terminal result appeared outside the bound publication",
+                    details={"result_observation": result_observation},
+                )
+            validate_bound_directory(self.parent)
+            return reservation
+
+        result_payload, result_snapshot = validate_bound_regular_file(
+            self.result,
+            self.parent,
+            label="recovery_terminal_result",
+            max_bytes=MAX_RECEIPT_BYTES,
+        )
+        self._require_private_single_link(
+            result_snapshot,
+            label="recovery_terminal_result",
+        )
+        result = decode_recovery_terminal(result_payload)
+        if (
+            result.get("transaction_id") != self.transaction_id
+            or result.get("state") != RECOVERY_TERMINAL_RESTORED
+        ):
+            raise TransactionError(
+                "recovery_terminal_conflict",
+                "published recovery terminal result is not restored evidence for "
+                "this transaction",
+            )
+        validate_bound_directory(self.parent)
+        return result
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.result is not None:
+            os.close(self.result.fd)
+        os.close(self.reservation.fd)
+
+
+def bind_recovery_terminal_evidence(
+    path: Path,
+    *,
+    parent: BoundDirectory,
+    expected_reservation: Snapshot,
+    transaction_id: str,
+) -> RecoveryTerminalEvidence:
+    reservation = bind_regular_file(
+        path,
+        parent,
+        label="recovery_terminal",
+        max_bytes=MAX_RECEIPT_BYTES,
+    )
+    evidence = RecoveryTerminalEvidence(
+        path=path,
+        parent=parent,
+        reservation=reservation,
+        expected_reservation=expected_reservation,
+        transaction_id=transaction_id,
+    )
+    try:
+        # Initial recovery may adopt a result left durably published by a prior
+        # process. After this point, absence/presence is descriptor-bound.
+        result_path = evidence.result_path
+        observation = observe_directory_entry(parent.fd, result_path.name)
+        if observation.get("state") != "missing":
+            evidence.result = bind_regular_file(
+                result_path,
+                parent,
+                label="recovery_terminal_result",
+                max_bytes=MAX_RECEIPT_BYTES,
+            )
+        evidence.validate()
+        return evidence
+    except BaseException:
+        evidence.close()
+        raise
+
+
 def read_recovery_terminal_with_snapshot(
     path: Path,
 ) -> tuple[dict[str, object], Snapshot]:
@@ -4485,40 +4749,59 @@ def read_recovery_terminal_with_snapshot(
         label="recovery_terminal",
         require_owner_private=True,
     )
-    binding: BoundFile | None = None
+    reservation: BoundFile | None = None
+    result: BoundFile | None = None
     try:
-        binding = bind_regular_file(
+        reservation = bind_regular_file(
             path,
             parent,
             label="recovery_terminal",
             max_bytes=MAX_RECEIPT_BYTES,
         )
-        payload, snapshot = validate_bound_regular_file(
-            binding,
+        reservation_payload, snapshot = validate_bound_regular_file(
+            reservation,
             parent,
             label="recovery_terminal",
             max_bytes=MAX_RECEIPT_BYTES,
         )
+        RecoveryTerminalEvidence._require_private_single_link(
+            snapshot,
+            label="recovery_terminal",
+        )
+        value = decode_recovery_terminal(reservation_payload)
+        result_path = recovery_terminal_result_path(path)
         if (
-            snapshot.uid != os.geteuid()
-            or snapshot.mode != 0o600
-            or snapshot.nlink != 1
+            observe_directory_entry(parent.fd, result_path.name).get("state")
+            != "missing"
         ):
-            raise TransactionError(
-                "recovery_terminal_invalid",
-                "recovery terminal evidence is not owner-only and single-link",
+            result = bind_regular_file(
+                result_path,
+                parent,
+                label="recovery_terminal_result",
+                max_bytes=MAX_RECEIPT_BYTES,
             )
-        value = decode_recovery_terminal(payload)
-        validate_bound_regular_file(
-            binding,
-            parent,
-            label="recovery_terminal",
-            max_bytes=MAX_RECEIPT_BYTES,
-        )
+            result_payload, result_snapshot = validate_bound_regular_file(
+                result,
+                parent,
+                label="recovery_terminal_result",
+                max_bytes=MAX_RECEIPT_BYTES,
+            )
+            RecoveryTerminalEvidence._require_private_single_link(
+                result_snapshot,
+                label="recovery_terminal_result",
+            )
+            value = decode_recovery_terminal(result_payload)
+            if value.get("state") != RECOVERY_TERMINAL_RESTORED:
+                raise TransactionError(
+                    "recovery_terminal_conflict",
+                    "recovery terminal result is not restored evidence",
+                )
         return value, snapshot
     finally:
-        if binding is not None:
-            os.close(binding.fd)
+        if result is not None:
+            os.close(result.fd)
+        if reservation is not None:
+            os.close(reservation.fd)
         os.close(parent.fd)
 
 
@@ -4607,68 +4890,112 @@ def reserve_recovery_terminal(
         raise
 
 
-def rewrite_bound_regular_file(
-    binding: BoundFile,
-    parent: BoundDirectory,
+def publish_recovery_terminal_result(
+    evidence: RecoveryTerminalEvidence,
     payload: bytes,
-    *,
-    label: str,
-    max_bytes: int,
-) -> Snapshot:
-    if len(payload) > max_bytes:
+) -> BoundFile:
+    if len(payload) > MAX_RECEIPT_BYTES:
         raise TransactionError(
-            f"{label}_too_large",
-            f"{label} exceeds the {max_bytes}-byte limit",
+            "recovery_terminal_invalid",
+            "recovery terminal result exceeds the receipt byte limit",
         )
-    _current_payload, current = validate_bound_regular_file(
-        binding,
-        parent,
-        label=label,
-        max_bytes=max_bytes,
-    )
-    os.lseek(binding.fd, 0, os.SEEK_SET)
-    offset = 0
-    while offset < len(payload):
-        written = os.write(binding.fd, payload[offset:])
-        if written <= 0:
-            raise TransactionError("write_failed", f"short write to {binding.path}")
-        offset += written
-    os.ftruncate(binding.fd, len(payload))
-    os.fsync(binding.fd)
-    persisted, actual = read_bound_fd(
-        binding.fd,
-        label=label,
-        max_bytes=max_bytes,
-    )
-    reject_unmodeled_metadata_fd(binding.fd, label=label)
-    mismatches: list[str] = []
-    if (current.device, current.inode) != (actual.device, actual.inode):
-        mismatches.append("object_identity")
-    if persisted != payload or actual.size != len(payload):
-        mismatches.append("content")
-    if (current.mode, current.uid, current.gid) != (
-        actual.mode,
-        actual.uid,
-        actual.gid,
-    ):
-        mismatches.append("access_policy")
-    if current.nlink != actual.nlink:
-        mismatches.append("object_policy")
-    if mismatches:
+    if evidence.result is not None:
+        evidence.validate()
+        return evidence.result
+
+    current = evidence.validate()
+    if current.get("state") != RECOVERY_TERMINAL_RESERVED:
         raise TransactionError(
-            f"{label}_changed",
-            f"{label} changed while its bound object was updated",
-            details={"mismatched_properties": mismatches},
+            "recovery_terminal_conflict",
+            "only a reserved recovery terminal can publish a result slot",
         )
-    binding.snapshot = actual
-    os.fsync(parent.fd)
-    validate_bound_regular_file(
-        binding,
-        parent,
-        label=label,
-        max_bytes=max_bytes,
+
+    result_path = evidence.result_path
+    temporary_name = (
+        f"{result_path.name}{RECOVERY_TERMINAL_TEMP_MARKER}{secrets.token_hex(16)}"
     )
-    return actual
+    temporary_path = result_path.with_name(temporary_name)
+    fd, snapshot = _write_exclusive_bound(
+        temporary_path,
+        payload,
+        directory_fd=evidence.parent.fd,
+        name=temporary_name,
+    )
+    binding = BoundFile(
+        path=temporary_path,
+        name=temporary_name,
+        fd=fd,
+        snapshot=snapshot,
+    )
+    published = False
+    try:
+        validate_bound_regular_file(
+            binding,
+            evidence.parent,
+            label="recovery_terminal_result_pending",
+            max_bytes=MAX_RECEIPT_BYTES,
+        )
+        RecoveryTerminalEvidence._require_private_single_link(
+            snapshot,
+            label="recovery_terminal_result_pending",
+        )
+        evidence.validate()
+        try:
+            atomic_rename_no_replace(
+                evidence.parent.fd,
+                temporary_name,
+                evidence.parent.fd,
+                result_path.name,
+            )
+        except (OSError, TransactionError) as error:
+            result_observation = observe_directory_entry(
+                evidence.parent.fd,
+                result_path.name,
+                expected=snapshot,
+            )
+            pending_observation = observe_directory_entry(
+                evidence.parent.fd,
+                temporary_name,
+                expected=snapshot,
+            )
+            if not observation_matches(result_observation):
+                raise TransactionError(
+                    "recovery_required",
+                    "recovery terminal result publication did not reach a "
+                    "provable terminal namespace state",
+                    exit_code=EXIT_POST_REPLACE_FAILED,
+                    details={
+                        "reason": (
+                            error.status
+                            if isinstance(error, TransactionError)
+                            else "terminal_result_publish_failed"
+                        ),
+                        "result_observation": result_observation,
+                        "pending_observation": pending_observation,
+                        "pending_locator": (
+                            str(temporary_path)
+                            if observation_matches(pending_observation)
+                            else None
+                        ),
+                    },
+                ) from error
+        binding.path = result_path
+        binding.name = result_path.name
+        evidence.result = binding
+        published = True
+        validate_bound_regular_file(
+            binding,
+            evidence.parent,
+            label="recovery_terminal_result",
+            max_bytes=MAX_RECEIPT_BYTES,
+        )
+        os.fsync(evidence.parent.fd)
+        evidence.validate()
+        return binding
+    except BaseException:
+        if not published:
+            os.close(binding.fd)
+        raise
 
 
 def record_recovery_terminal(
@@ -4679,6 +5006,8 @@ def record_recovery_terminal(
     restored: Snapshot,
     binding: BoundFile | None = None,
     parent: BoundDirectory | None = None,
+    evidence: RecoveryTerminalEvidence | None = None,
+    result_binding_sink: list[BoundFile] | None = None,
     allow_unreserved_legacy: bool = False,
     expected_reservation: Snapshot | None = None,
 ) -> dict[str, object]:
@@ -4708,9 +5037,49 @@ def record_recovery_terminal(
             "recovery_terminal_invalid",
             "recovery terminal evidence is too large",
         )
+    if evidence is not None:
+        if (
+            evidence.path != path
+            or evidence.transaction_id != transaction_id
+            or evidence.parent.path != path.parent
+        ):
+            raise TransactionError(
+                "recovery_terminal_conflict",
+                "bound recovery terminal evidence does not match this publication",
+            )
+        existing = evidence.validate()
+        if existing.get("state") == RECOVERY_TERMINAL_RESTORED:
+            existing_restored = Snapshot.from_json(
+                existing.get("restored"),
+                label="recovery_terminal.restored",
+                require_object_policy=True,
+            )
+            if property_mismatches(restored, existing_restored):
+                raise TransactionError(
+                    "recovery_terminal_conflict",
+                    "existing recovery terminal evidence does not match this recovery",
+                )
+            return existing
+        published = publish_recovery_terminal_result(evidence, encoded)
+        persisted = evidence.validate()
+        persisted_restored = Snapshot.from_json(
+            persisted.get("restored"),
+            label="recovery_terminal.restored",
+            require_object_policy=True,
+        )
+        if property_mismatches(restored, persisted_restored):
+            raise TransactionError(
+                "recovery_terminal_conflict",
+                "recovery terminal result changed after publication",
+            )
+        if result_binding_sink is not None and published not in result_binding_sink:
+            result_binding_sink.append(published)
+        return persisted
+
     owns_parent = parent is None
     owns_binding = binding is None
     created_legacy_terminal = False
+    local_evidence: RecoveryTerminalEvidence | None = None
     try:
         if parent is None:
             parent = bind_directory(
@@ -4725,7 +5094,6 @@ def record_recovery_terminal(
                     parent,
                     label="recovery_terminal",
                     max_bytes=MAX_RECEIPT_BYTES,
-                    writable=True,
                 )
             except TransactionError as error:
                 if (
@@ -4773,75 +5141,39 @@ def record_recovery_terminal(
                     "legacy recovery terminal publication changed",
                 )
             return existing
-        if expected_reservation is not None:
-            if existing.get("state") == RECOVERY_TERMINAL_RESERVED:
-                reservation_mismatches = property_mismatches(
-                    expected_reservation,
-                    snapshot,
-                )
-            else:
-                reservation_mismatches = identity_access_and_object_policy_mismatches(
-                    expected_reservation,
-                    snapshot,
-                )
-            if reservation_mismatches:
-                raise TransactionError(
-                    "recovery_terminal_conflict",
-                    "recovery terminal no longer names the reserved object",
-                    details={
-                        "mismatched_properties": reservation_mismatches,
-                    },
-                )
+        local_evidence = RecoveryTerminalEvidence(
+            path=path,
+            parent=parent,
+            reservation=binding,
+            expected_reservation=expected_reservation or snapshot,
+            transaction_id=transaction_id,
+        )
+        result_path = local_evidence.result_path
+        if (
+            observe_directory_entry(parent.fd, result_path.name).get("state")
+            != "missing"
+        ):
+            local_evidence.result = bind_regular_file(
+                result_path,
+                parent,
+                label="recovery_terminal_result",
+                max_bytes=MAX_RECEIPT_BYTES,
+            )
+        existing = local_evidence.validate()
         if existing.get("state") == RECOVERY_TERMINAL_RESTORED:
             existing_restored = Snapshot.from_json(
                 existing.get("restored"),
                 label="recovery_terminal.restored",
                 require_object_policy=True,
             )
-            if existing.get("transaction_id") != transaction_id or property_mismatches(
-                restored, existing_restored
-            ):
+            if property_mismatches(restored, existing_restored):
                 raise TransactionError(
                     "recovery_terminal_conflict",
                     "existing recovery terminal evidence does not match this recovery",
                 )
             return existing
-        if (
-            existing.get("transaction_id") != transaction_id
-            or existing.get("state") != RECOVERY_TERMINAL_RESERVED
-        ):
-            raise TransactionError(
-                "recovery_terminal_conflict",
-                "recovery terminal reservation belongs to another transaction",
-            )
-        snapshot = rewrite_bound_regular_file(
-            binding,
-            parent,
-            encoded,
-            label="recovery_terminal",
-            max_bytes=MAX_RECEIPT_BYTES,
-        )
-        existing_restored = Snapshot.from_json(
-            payload.get("restored"),
-            label="recovery_terminal.restored",
-            require_object_policy=True,
-        )
-        if (
-            snapshot.uid != os.geteuid()
-            or snapshot.mode != 0o600
-            or snapshot.nlink != 1
-        ):
-            raise TransactionError(
-                "recovery_terminal_invalid",
-                "recovery terminal evidence is not owner-only and single-link",
-            )
-        persisted_payload, _actual = validate_bound_regular_file(
-            binding,
-            parent,
-            label="recovery_terminal",
-            max_bytes=MAX_RECEIPT_BYTES,
-        )
-        persisted = decode_recovery_terminal(persisted_payload)
+        published = publish_recovery_terminal_result(local_evidence, encoded)
+        persisted = local_evidence.validate()
         persisted_restored = Snapshot.from_json(
             persisted.get("restored"),
             label="recovery_terminal.restored",
@@ -4851,14 +5183,24 @@ def record_recovery_terminal(
             persisted.get("transaction_id") != transaction_id
             or persisted.get("state") != RECOVERY_TERMINAL_RESTORED
             or property_mismatches(restored, persisted_restored)
-            or property_mismatches(existing_restored, persisted_restored)
         ):
             raise TransactionError(
                 "recovery_terminal_conflict",
                 "recovery terminal evidence changed after publication",
             )
+        if result_binding_sink is not None and published not in result_binding_sink:
+            result_binding_sink.append(published)
         return persisted
     finally:
+        if (
+            local_evidence is not None
+            and local_evidence.result is not None
+            and (
+                result_binding_sink is None
+                or local_evidence.result not in result_binding_sink
+            )
+        ):
+            os.close(local_evidence.result.fd)
         if owns_binding and binding is not None:
             os.close(binding.fd)
         if owns_parent and parent is not None:
@@ -4894,6 +5236,7 @@ class ApplyEvidenceBindings:
     stage: PrivateStage | None = None
     backup: BoundFile | None = None
     receipt: BoundFile | None = None
+    recovery_terminal_result: BoundFile | None = None
     candidate_in_stage: bool = False
     restored: bool = False
     closed: bool = False
@@ -4917,6 +5260,13 @@ class ApplyEvidenceBindings:
             label="recovery_terminal",
             max_bytes=MAX_RECEIPT_BYTES,
         )
+        if self.recovery_terminal_result is not None:
+            validate_bound_regular_file(
+                self.recovery_terminal_result,
+                self.receipt_parent,
+                label="recovery_terminal_result",
+                max_bytes=MAX_RECEIPT_BYTES,
+            )
         if self.receipt is not None:
             validate_bound_regular_file(
                 self.receipt,
@@ -4972,7 +5322,11 @@ class ApplyEvidenceBindings:
             return
         self.closed = True
         close_errors: list[BaseException] = []
-        bindings = [self.receipt, self.recovery_terminal]
+        bindings = [
+            self.receipt,
+            self.recovery_terminal_result,
+            self.recovery_terminal,
+        ]
         if not self.stage_owns_prepared_candidate():
             bindings.append(self.prepared_candidate)
         for binding in bindings:
@@ -5000,6 +5354,7 @@ def rollback(
     original: Snapshot,
     installed: Snapshot,
     backup_expected: Snapshot,
+    pre_exchange_revalidate: Callable[[], None] | None = None,
 ) -> tuple[bool, dict[str, object]]:
     backup_binding: BoundFile | None = None
     live_binding: BoundFile | None = None
@@ -5054,6 +5409,8 @@ def rollback(
             label="live_rules",
         )
         stage._validate_rules_parent()
+        if pre_exchange_revalidate is not None:
+            pre_exchange_revalidate()
 
         atomic_error: OSError | None = None
         stage.mutation_uncertain = True
@@ -5157,6 +5514,8 @@ def rollback(
         stage.mutation_uncertain = False
         exchange_completed = True
         os.fsync(stage.rules_parent_fd)
+        if pre_exchange_revalidate is not None:
+            pre_exchange_revalidate()
         _restored_bytes, restored = read_bound_regular_child(
             rules,
             stage.rules_parent_binding,
@@ -5218,6 +5577,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
     candidate_source = resolved_leaf(args.candidate, label="candidate")
     receipt = resolved_leaf(args.receipt, label="receipt")
     recovery_terminal = recovery_terminal_path(receipt)
+    recovery_terminal_result = recovery_terminal_result_path(recovery_terminal)
     prepared_recovery_candidate = prepared_candidate_path(receipt)
     if Path(
         args.backup_name
@@ -5232,8 +5592,18 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
         candidate_source == rules
         or receipt in (rules, backup, lock, candidate_source)
         or recovery_terminal in (rules, backup, lock, candidate_source, receipt)
-        or prepared_recovery_candidate
+        or recovery_terminal_result
         in (rules, backup, lock, candidate_source, receipt, recovery_terminal)
+        or prepared_recovery_candidate
+        in (
+            rules,
+            backup,
+            lock,
+            candidate_source,
+            receipt,
+            recovery_terminal,
+            recovery_terminal_result,
+        )
     ):
         raise TransactionError("path_invalid", "transaction paths must be distinct")
 
@@ -5529,6 +5899,21 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     )
                 if (
                     observe_directory_entry(
+                        receipt_parent.fd,
+                        recovery_terminal_result.name,
+                    ).get("state")
+                    != "missing"
+                ):
+                    raise TransactionError(
+                        "recovery_terminal_result_exists",
+                        (
+                            "recovery terminal result path already exists before "
+                            "this transaction"
+                        ),
+                        exit_code=EXIT_LIVE_CONFLICT,
+                    )
+                if (
+                    observe_directory_entry(
                         rules_parent_binding.fd,
                         backup.name,
                     ).get("state")
@@ -5539,6 +5924,17 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                         f"backup already exists: {backup}",
                         exit_code=EXIT_LIVE_CONFLICT,
                     )
+                revalidate_candidate_source(
+                    candidate_source,
+                    source_snapshot,
+                    candidate_sha256=candidate_sha256,
+                )
+                validate_existing_fixed_stage_is_empty(
+                    rules.parent,
+                    rules_parent_expected=rules_parent_binding.snapshot,
+                )
+                revalidate_lock(lock_binding, rules_parent_binding)
+                validate_bound_directory(receipt_parent)
                 revalidate_candidate_source(
                     candidate_source,
                     source_snapshot,
@@ -5896,6 +6292,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                             label="rollback.restored",
                             require_object_policy=True,
                         )
+                        terminal_result_bindings: list[BoundFile] = []
                         recovery_terminal_result = record_recovery_terminal(
                             recovery_terminal,
                             transaction_id=str(transaction_receipt["transaction_id"]),
@@ -5908,7 +6305,12 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                                 label="recovery_terminal",
                                 require_object_policy=True,
                             ),
+                            result_binding_sink=terminal_result_bindings,
                         )
+                        if terminal_result_bindings:
+                            evidence.recovery_terminal_result = (
+                                terminal_result_bindings[0]
+                            )
                         verify_restored_terminal(rules, restored)
                         evidence.restored = True
                     except TransactionError as error:
@@ -6154,10 +6556,14 @@ def recover_schema_v3_transaction(
     terminal_path: Path,
     terminal_expected: Snapshot,
     transaction_id: str,
+    terminal_evidence: RecoveryTerminalEvidence,
+    validate_controls: Callable[[], None],
+    mutation_tracker: RecoveryMutationTracker,
 ) -> tuple[int, dict[str, object]]:
     rules_parent_binding: BoundDirectory | None = None
     staged_parent_binding: BoundDirectory | None = None
     try:
+        validate_controls()
         rules_parent_binding = bind_directory(
             rules.parent,
             label="rules",
@@ -6187,6 +6593,7 @@ def recover_schema_v3_transaction(
         )
         validate_bound_directory(rules_parent_binding)
         revalidate_lock(lock_binding, rules_parent_binding)
+        validate_controls()
     except TransactionError as error:
         return EXIT_RECOVERY_REFUSED, {
             "status": "recovery_refused",
@@ -6253,36 +6660,34 @@ def recover_schema_v3_transaction(
                 ),
             },
         }
+    mutation_tracker.observe(
+        {
+            "transaction_state": state,
+            "roles": {
+                "live": roles[0],
+                "backup": roles[1],
+                "staged_backup": roles[2],
+            },
+            "snapshots": {
+                "live": live_actual.to_json() if live_actual is not None else None,
+                "backup": backup_actual.to_json()
+                if backup_actual is not None
+                else None,
+                "staged_backup": (
+                    staged_actual.to_json() if staged_actual is not None else None
+                ),
+            },
+        }
+    )
 
     try:
-        terminal, terminal_actual = read_recovery_terminal_with_snapshot(terminal_path)
+        terminal = terminal_evidence.validate()
     except TransactionError as error:
         return EXIT_RECOVERY_REFUSED, {
             "status": "recovery_refused",
             "reason": error.status,
             "message": str(error),
             **error.details,
-        }
-    if terminal.get("state") == RECOVERY_TERMINAL_RESERVED:
-        terminal_binding_mismatches = property_mismatches(
-            terminal_expected,
-            terminal_actual,
-        )
-    else:
-        terminal_binding_mismatches = identity_access_and_object_policy_mismatches(
-            terminal_expected,
-            terminal_actual,
-        )
-    if terminal_binding_mismatches:
-        return EXIT_RECOVERY_REFUSED, {
-            "status": "recovery_refused",
-            "reason": "recovery_terminal_binding_changed",
-            "mismatched_properties": terminal_binding_mismatches,
-        }
-    if terminal.get("transaction_id") != transaction_id:
-        return EXIT_RECOVERY_REFUSED, {
-            "status": "recovery_refused",
-            "reason": "recovery_terminal_transaction_mismatch",
         }
     if terminal.get("state") == RECOVERY_TERMINAL_RESTORED:
         if state != "R" or live_actual is None:
@@ -6362,21 +6767,27 @@ def recover_schema_v3_transaction(
             recovery_candidate_expected=stage_candidate_expected,
         )
         revalidate_lock(lock_binding, stage.rules_parent_binding)
+        validate_controls()
         if state == "P":
             assert staged_actual is not None
+            mutation_tracker.enter("P_to_X", state="P")
             stage.move_to(
                 staged_backup,
                 rules,
                 original,
-                pre_exchange_revalidate=lambda: revalidate_lock(
-                    lock_binding,
-                    stage.rules_parent_binding,
+                pre_exchange_revalidate=lambda: (
+                    revalidate_lock(lock_binding, stage.rules_parent_binding),
+                    validate_controls(),
                 ),
             )
             state = "X"
             os.fsync(stage.stage_fd)
             os.fsync(stage.rules_parent_fd)
+            mutation_tracker.complete("P_to_X", state=state)
+            validate_controls()
         if state == "X":
+            validate_controls()
+            mutation_tracker.enter("X_to_C", state="X")
             publish_staged_backup_for_recovery(
                 stage=stage,
                 backup=backup,
@@ -6386,7 +6797,11 @@ def recover_schema_v3_transaction(
             state = "C"
             os.fsync(stage.stage_fd)
             os.fsync(stage.rules_parent_fd)
+            mutation_tracker.complete("X_to_C", state=state)
+            validate_controls()
         if state == "C":
+            validate_controls()
+            mutation_tracker.enter("C_to_R", state="C")
             rolled_back, rollback_result = rollback(
                 stage=stage,
                 rules=rules,
@@ -6395,10 +6810,12 @@ def recover_schema_v3_transaction(
                 original=original,
                 installed=installed,
                 backup_expected=original,
+                pre_exchange_revalidate=validate_controls,
             )
             if not rolled_back:
                 recovery_required = (
-                    rollback_result.get("rollback_status") == "recovery_required"
+                    mutation_tracker.mutation_started
+                    or rollback_result.get("rollback_status") == "recovery_required"
                     or stage.mutation_uncertain
                 )
                 retain_stage = recovery_required
@@ -6412,10 +6829,13 @@ def recover_schema_v3_transaction(
                     ),
                     "transaction_state": "C",
                     "rollback": rollback_result,
+                    **mutation_tracker.details(state="C"),
                 }
             os.fsync(stage.stage_fd)
             os.fsync(stage.rules_parent_fd)
             state = "R"
+            mutation_tracker.complete("C_to_R", state=state)
+            validate_controls()
 
         _restored_bytes, restored = read_stable(
             rules,
@@ -6438,13 +6858,18 @@ def recover_schema_v3_transaction(
                 "actual_live": restored.to_json(),
                 "actual_backup": displaced.to_json(),
             }
+        validate_controls()
+        mutation_tracker.enter("terminal_publish", state="R")
         terminal_result = record_recovery_terminal(
             terminal_path,
             transaction_id=transaction_id,
             original=original,
             restored=restored,
             expected_reservation=terminal_expected,
+            evidence=terminal_evidence,
         )
+        mutation_tracker.complete("terminal_publish", state="R")
+        validate_controls()
         verify_restored_terminal(rules, restored)
         pending_success = True
         return 0, {
@@ -6463,12 +6888,17 @@ def recover_schema_v3_transaction(
         retain_stage = error_status == "recovery_required" or (
             stage is not None and stage.mutation_uncertain
         )
-        if state in ("X", "C", "R") or retain_stage:
+        if (
+            mutation_tracker.mutation_started
+            or state in ("X", "C", "R")
+            or retain_stage
+        ):
             return EXIT_POST_REPLACE_FAILED, {
                 "status": "recovery_required",
                 "transaction_state": state,
                 "reason": error_status,
                 "message": str(error),
+                **mutation_tracker.details(state=state),
                 **error_details,
             }
         return EXIT_RECOVERY_REFUSED, {
@@ -6517,13 +6947,15 @@ def recover_schema_v4_transaction(
     terminal_path: Path,
     terminal_expected: Snapshot,
     transaction_id: str,
+    terminal_evidence: RecoveryTerminalEvidence,
+    validate_controls: Callable[[], None],
+    mutation_tracker: RecoveryMutationTracker,
 ) -> tuple[int, dict[str, object]]:
     rules_parent: BoundDirectory | None = None
     prepared_parent: BoundDirectory | None = None
     prepared_binding: BoundFile | None = None
-    terminal_binding: BoundFile | None = None
-    terminal_update_started = False
     try:
+        validate_controls()
         rules_parent = bind_directory(
             rules.parent,
             label="rules",
@@ -6536,6 +6968,7 @@ def recover_schema_v4_transaction(
             expected=prepared_parent_expected,
         )
         revalidate_lock(lock_binding, rules_parent)
+        validate_controls()
         live_actual = recovery_entry_snapshot_bound(
             rules,
             rules_parent,
@@ -6638,6 +7071,31 @@ def recover_schema_v4_transaction(
                     ),
                 },
             }
+        mutation_tracker.observe(
+            {
+                "transaction_state": state,
+                "roles": {
+                    "live": roles[0],
+                    "backup": roles[1],
+                    "staged_backup": roles[2],
+                    "prepared_candidate": roles[3],
+                },
+                "snapshots": {
+                    "live": live_actual.to_json() if live_actual is not None else None,
+                    "backup": (
+                        backup_actual.to_json() if backup_actual is not None else None
+                    ),
+                    "staged_backup": (
+                        staged_actual.to_json() if staged_actual is not None else None
+                    ),
+                    "prepared_candidate": (
+                        prepared_actual.to_json()
+                        if prepared_actual is not None
+                        else None
+                    ),
+                },
+            }
+        )
 
         if state != "Q":
             if stage_parent_actual is None:
@@ -6647,6 +7105,7 @@ def recover_schema_v4_transaction(
                     "transaction_state": state,
                 }
             revalidate_lock(lock_binding, rules_parent)
+            validate_controls()
             result = recover_schema_v3_transaction(
                 rules=rules,
                 lock_binding=lock_binding,
@@ -6659,48 +7118,18 @@ def recover_schema_v4_transaction(
                 terminal_path=terminal_path,
                 terminal_expected=terminal_expected,
                 transaction_id=transaction_id,
+                terminal_evidence=terminal_evidence,
+                validate_controls=validate_controls,
+                mutation_tracker=mutation_tracker,
             )
             revalidate_lock(lock_binding, rules_parent)
             validate_bound_directory(prepared_parent)
+            validate_controls()
             return result
 
         assert live_actual is not None
         assert prepared_binding is not None
-        terminal_binding = bind_regular_file(
-            terminal_path,
-            prepared_parent,
-            label="recovery_terminal",
-            max_bytes=MAX_RECEIPT_BYTES,
-            writable=True,
-        )
-        terminal_payload, terminal_actual = validate_bound_regular_file(
-            terminal_binding,
-            prepared_parent,
-            label="recovery_terminal",
-            max_bytes=MAX_RECEIPT_BYTES,
-        )
-        terminal = decode_recovery_terminal(terminal_payload)
-        if terminal.get("state") == RECOVERY_TERMINAL_RESERVED:
-            terminal_mismatches = property_mismatches(
-                terminal_expected,
-                terminal_actual,
-            )
-        else:
-            terminal_mismatches = identity_access_and_object_policy_mismatches(
-                terminal_expected,
-                terminal_actual,
-            )
-        if terminal_mismatches:
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
-                "reason": "recovery_terminal_binding_changed",
-                "mismatched_properties": terminal_mismatches,
-            }
-        if terminal.get("transaction_id") != transaction_id:
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
-                "reason": "recovery_terminal_transaction_mismatch",
-            }
+        terminal = terminal_evidence.validate()
         terminal_result: dict[str, object]
         if terminal.get("state") == RECOVERY_TERMINAL_RESTORED:
             terminal_restored = Snapshot.from_json(
@@ -6725,16 +7154,18 @@ def recover_schema_v4_transaction(
             terminal_result = terminal
             result_status = "already_original"
         elif terminal.get("state") == RECOVERY_TERMINAL_RESERVED:
-            terminal_update_started = True
+            validate_controls()
+            mutation_tracker.enter("terminal_publish", state="Q")
             terminal_result = record_recovery_terminal(
                 terminal_path,
                 transaction_id=transaction_id,
                 original=original,
                 restored=live_actual,
-                binding=terminal_binding,
-                parent=prepared_parent,
                 expected_reservation=terminal_expected,
+                evidence=terminal_evidence,
             )
+            mutation_tracker.complete("terminal_publish", state="Q")
+            validate_controls()
             result_status = "recovered"
         else:
             return EXIT_RECOVERY_REFUSED, {
@@ -6781,6 +7212,7 @@ def recover_schema_v4_transaction(
             }
         revalidate_lock(lock_binding, rules_parent)
         validate_bound_directory(prepared_parent)
+        validate_controls()
         return 0, {
             "status": result_status,
             "transaction_state": "Q",
@@ -6804,7 +7236,7 @@ def recover_schema_v4_transaction(
             "stage_cleanup_refused",
         }
         if (
-            terminal_update_started
+            mutation_tracker.mutation_started
             or error_status == "recovery_required"
             or error_status in stage_recovery_statuses
         ):
@@ -6837,6 +7269,7 @@ def recover_schema_v4_transaction(
                 "transaction_state": state_hint,
                 "reason": error_status,
                 "message": str(error),
+                **mutation_tracker.details(state=state_hint),
                 **error_details,
             }
         return EXIT_RECOVERY_REFUSED, {
@@ -6846,7 +7279,7 @@ def recover_schema_v4_transaction(
             **error_details,
         }
     finally:
-        for binding in (terminal_binding, prepared_binding):
+        for binding in (prepared_binding,):
             if binding is not None:
                 os.close(binding.fd)
         for parent in (prepared_parent, rules_parent):
@@ -7211,9 +7644,14 @@ def recover_legacy_transaction(
             os.close(rules_parent.fd)
 
 
-def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
-    receipt_path = resolved_leaf(args.receipt, label="receipt")
-    receipt, receipt_parent_expected = read_receipt_with_parent_snapshot(receipt_path)
+def _recover_transaction_bound(
+    args: argparse.Namespace,
+    *,
+    receipt_path: Path,
+    receipt_evidence: RecoveryReceiptEvidence,
+) -> tuple[int, dict[str, object]]:
+    receipt = receipt_evidence.value
+    receipt_parent_expected = receipt_evidence.parent.snapshot
     receipt_schema_version = receipt["schema_version"]
     assert isinstance(receipt_schema_version, int)
     require_object_policy = receipt_schema_version >= 2
@@ -7383,61 +7821,164 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                     "receipt_invalid",
                     f"{label}.object_policy.nlink must be 1",
                 )
-    with shared_lock(lock, timeout_seconds=args.lock_timeout_seconds) as lock_binding:
-        if receipt_schema_version >= 4:
-            assert staged_backup is not None
-            assert prepared_candidate is not None
-            assert prepared_parent_expected is not None
-            assert terminal_path is not None
-            assert terminal_expected is not None
-            assert isinstance(transaction_id, str)
-            return recover_schema_v4_transaction(
-                rules=rules,
-                lock_binding=lock_binding,
-                backup=backup,
-                staged_backup=staged_backup,
-                prepared_candidate=prepared_candidate,
-                rules_parent_expected=parent_expected,
-                prepared_parent_expected=prepared_parent_expected,
-                original=original,
-                installed=installed,
-                terminal_path=terminal_path,
-                terminal_expected=terminal_expected,
-                transaction_id=transaction_id,
-            )
-        if receipt_schema_version == 3:
-            assert staged_backup is not None
-            assert staged_parent_expected is not None
-            assert terminal_path is not None
-            assert terminal_expected is not None
-            assert isinstance(transaction_id, str)
-            return recover_schema_v3_transaction(
-                rules=rules,
-                lock_binding=lock_binding,
-                backup=backup,
-                staged_backup=staged_backup,
-                rules_parent_expected=parent_expected,
-                staged_parent_expected=staged_parent_expected,
-                original=original,
-                installed=installed,
-                terminal_path=terminal_path,
-                terminal_expected=terminal_expected,
-                transaction_id=transaction_id,
-            )
-        return recover_legacy_transaction(
-            rules=rules,
-            lock_binding=lock_binding,
-            backup=backup,
-            receipt_parent_path=receipt_path.parent,
-            receipt_parent_expected=receipt_parent_expected,
-            rules_parent_expected=parent_expected,
-            original=original,
-            installed=installed,
-            backup_expected=backup_expected,
-            terminal_path=terminal_path,
-            terminal_expected=terminal_expected,
-            transaction_id=transaction_id,
+    mutation_tracker = RecoveryMutationTracker(
+        locators={
+            "receipt": str(receipt_path),
+            "live": str(rules),
+            "backup": str(backup),
+            "staged_backup": str(staged_backup) if staged_backup is not None else "",
+            "prepared_candidate": (
+                str(prepared_candidate) if prepared_candidate is not None else ""
+            ),
+            "recovery_terminal": (
+                str(terminal_path) if terminal_path is not None else ""
+            ),
+            "recovery_terminal_result": (
+                str(recovery_terminal_result_path(terminal_path))
+                if terminal_path is not None
+                else ""
+            ),
+        }
+    )
+    terminal_evidence: RecoveryTerminalEvidence | None = None
+    lock_acquired = False
+
+    def validate_controls() -> None:
+        receipt_evidence.validate()
+        if terminal_evidence is not None:
+            terminal_evidence.validate()
+
+    def before_lock_release() -> None:
+        try:
+            validate_controls()
+        except TransactionError as error:
+            if mutation_tracker.mutation_started:
+                raise TransactionError(
+                    "recovery_required",
+                    "receipt-bound recovery evidence changed before lock release",
+                    exit_code=EXIT_POST_REPLACE_FAILED,
+                    details={
+                        "reason": error.status,
+                        "message": str(error),
+                        **mutation_tracker.details(),
+                        **error.details,
+                    },
+                ) from error
+            raise
+
+    try:
+        try:
+            with shared_lock(
+                lock,
+                timeout_seconds=args.lock_timeout_seconds,
+                before_release=before_lock_release,
+            ) as lock_binding:
+                lock_acquired = True
+                receipt_evidence.validate()
+                if receipt_schema_version >= 3:
+                    assert terminal_path is not None
+                    assert terminal_expected is not None
+                    assert isinstance(transaction_id, str)
+                    terminal_evidence = bind_recovery_terminal_evidence(
+                        terminal_path,
+                        parent=receipt_evidence.parent,
+                        expected_reservation=terminal_expected,
+                        transaction_id=transaction_id,
+                    )
+                    validate_controls()
+                if receipt_schema_version >= 4:
+                    assert staged_backup is not None
+                    assert prepared_candidate is not None
+                    assert prepared_parent_expected is not None
+                    assert terminal_path is not None
+                    assert terminal_expected is not None
+                    assert isinstance(transaction_id, str)
+                    return recover_schema_v4_transaction(
+                        rules=rules,
+                        lock_binding=lock_binding,
+                        backup=backup,
+                        staged_backup=staged_backup,
+                        prepared_candidate=prepared_candidate,
+                        rules_parent_expected=parent_expected,
+                        prepared_parent_expected=prepared_parent_expected,
+                        original=original,
+                        installed=installed,
+                        terminal_path=terminal_path,
+                        terminal_expected=terminal_expected,
+                        transaction_id=transaction_id,
+                        terminal_evidence=terminal_evidence,
+                        validate_controls=validate_controls,
+                        mutation_tracker=mutation_tracker,
+                    )
+                if receipt_schema_version == 3:
+                    assert staged_backup is not None
+                    assert staged_parent_expected is not None
+                    assert terminal_path is not None
+                    assert terminal_expected is not None
+                    assert isinstance(transaction_id, str)
+                    return recover_schema_v3_transaction(
+                        rules=rules,
+                        lock_binding=lock_binding,
+                        backup=backup,
+                        staged_backup=staged_backup,
+                        rules_parent_expected=parent_expected,
+                        staged_parent_expected=staged_parent_expected,
+                        original=original,
+                        installed=installed,
+                        terminal_path=terminal_path,
+                        terminal_expected=terminal_expected,
+                        transaction_id=transaction_id,
+                        terminal_evidence=terminal_evidence,
+                        validate_controls=validate_controls,
+                        mutation_tracker=mutation_tracker,
+                    )
+                return recover_legacy_transaction(
+                    rules=rules,
+                    lock_binding=lock_binding,
+                    backup=backup,
+                    receipt_parent_path=receipt_path.parent,
+                    receipt_parent_expected=receipt_parent_expected,
+                    rules_parent_expected=parent_expected,
+                    original=original,
+                    installed=installed,
+                    backup_expected=backup_expected,
+                    terminal_path=terminal_path,
+                    terminal_expected=terminal_expected,
+                    transaction_id=transaction_id,
+                )
+        except TransactionError as error:
+            if not lock_acquired:
+                raise
+            if mutation_tracker.mutation_started or error.status == "recovery_required":
+                return EXIT_POST_REPLACE_FAILED, {
+                    "status": "recovery_required",
+                    "reason": error.details.get("reason") or error.status,
+                    "message": str(error),
+                    **mutation_tracker.details(),
+                    **error.details,
+                }
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": error.status,
+                "message": str(error),
+                **error.details,
+            }
+    finally:
+        if terminal_evidence is not None:
+            terminal_evidence.close()
+
+
+def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
+    receipt_path = resolved_leaf(args.receipt, label="receipt")
+    receipt_evidence = bind_recovery_receipt(receipt_path)
+    try:
+        return _recover_transaction_bound(
+            args,
+            receipt_path=receipt_path,
+            receipt_evidence=receipt_evidence,
         )
+    finally:
+        receipt_evidence.close()
 
 
 def build_parser() -> argparse.ArgumentParser:

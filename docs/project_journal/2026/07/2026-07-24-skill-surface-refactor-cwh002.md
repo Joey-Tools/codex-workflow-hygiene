@@ -29,6 +29,16 @@ superseded_by:
   property, metadata, and directory-entry admission.
 - Reserved and identity-bound the recovery-terminal leaf before backup
   publication, and made stale terminal evidence a pre-mutation conflict.
+- Kept the receipt and every parent descriptor bound from secure parse through
+  the recovery lock, every mutation, terminal publication, final validation,
+  and lock release.
+- Replaced in-place recovery-terminal rewriting with an immutable reservation
+  plus an atomically published, directory-fsynced result slot.
+- Moved fixed stage and terminal-result admission under the recovery lock and
+  ahead of every candidate, receipt, terminal, or backup artifact.
+- Added one mutation tracker shared across schema-v4 recovery and delegated
+  schema-v3 recovery so every post-mutation ambiguity reports
+  `recovery_required` with retained evidence and locators.
 - Removed the unlocked no-change fast path; apparent no-change now validates
   under the shared writer lock and returns only `no_change_after_lock`.
 - Bound idempotent recovery to exact original or persisted recovery-terminal
@@ -51,10 +61,23 @@ superseded_by:
   overwrite a later legitimate live state and reports retained recovery
   evidence instead; schema-v2 receipts add link policy while schema-v1
   recovery remains supported.
-- Schema-v2 receipts now also bind the reserved recovery-terminal identity.
-  Backup, receipt, terminal, rules parent, and receipt parent remain open and
-  are revalidated immediately before exchange and throughout installed
-  verification.
+- Schema-v4 receipts bind the reserved recovery-terminal identity and prepared
+  stage. Recovery holds exact receipt, terminal, result, rules-parent, and
+  receipt-parent descriptors through terminal validation and writer-lock
+  release; path, identity, content, access, link, and parent bindings are
+  revalidated at mutation-aware boundaries.
+- Recovery-terminal publication never truncates or rewrites the reservation.
+  It fsyncs a unique owner-private pending file, atomically renames it
+  no-replace to the fixed `.result` slot, fsyncs the parent, and validates the
+  bound result. A crash leaves either the prior valid reservation or a
+  recoverable published result.
+- Recovery preflights the fixed stage and terminal-result slot under the lock.
+  Missing, replaced, retained, or invalid fixed evidence fails before any new
+  candidate, receipt, terminal, or backup artifact is created.
+- A shared mutation journal records entry and completion for publication,
+  exchange, cleanup, and restore operations across schema-v4 and delegated
+  schema-v3 paths. Once mutation may have started, later binding or validation
+  failures cannot be downgraded to `recovery_refused`.
 - Validator execution rejects nonfinite deadlines, caps aggregate captured
   output, and independently enumerates live same-PGID members on Darwin and
   Linux before accepting completion, including descendants whose standard
@@ -76,12 +99,11 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 55 passed on Python 3.13. New cases cover closed
-  validator stdio, compliant concurrent writers, locked no-change metadata
-  admission, stale/replaced terminal reservations, and backup/receipt/parent
-  replacement, hardlink, file-flag, xattr, and ACL races.
-- The focused rules, structure, and validator-wrapper run passed 97 tests.
-- Full repository suite covered 1,117 tests. Only the same 4 sandbox-only GPG
+- Rules transaction tests: 123 passed on Python 3.13. New cases cover fixed
+  stage zero-artifact failures, parse-to-lock receipt races, delegated-v3
+  post-mutation receipt and parent changes, every terminal publication crash
+  point, successful retry, and the prohibition on terminal truncation.
+- Full repository suite covered 1,185 tests. Only the same 4 sandbox-only GPG
   merge-fixture errors remained; their exact keybox-enabled rerun passed 4 of
   4 outside the sandbox.
 - Ruff check and Ruff format-check passed for both changed Python files.

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 import errno
 import fcntl
 import hashlib
@@ -2158,6 +2158,94 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.receipt.exists())
 
+    def assert_no_real_change_transaction_artifacts(self) -> None:
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(TRANSACTION.prepared_candidate_path(self.receipt).exists())
+        self.assertFalse(terminal.exists())
+        self.assertFalse(TRANSACTION.recovery_terminal_result_path(terminal).exists())
+
+    def test_real_change_preflights_retained_stage_before_any_artifact(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        stage.mkdir(mode=0o700)
+        retained = stage / "unexpected"
+        retained.write_bytes(b"retained recovery evidence\n")
+
+        result = self.run_apply()
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["stage_status"], "private_stage_retained")
+        self.assertEqual(retained.read_bytes(), b"retained recovery evidence\n")
+        self.assert_no_real_change_transaction_artifacts()
+
+    def test_real_change_preflights_invalid_stage_before_any_artifact(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        stage.mkdir(mode=0o700)
+        stage.chmod(0o755)
+
+        result = self.run_apply()
+
+        self.assertEqual(result.returncode, 30, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertIn(
+            payload["stage_status"],
+            {
+                "private_stage_invalid",
+                "private_stage_parent_not_private",
+                "private_stage_parent_changed",
+            },
+        )
+        self.assert_no_real_change_transaction_artifacts()
+
+    def test_real_change_preflights_stage_replacement_before_any_artifact(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        stage.mkdir(mode=0o700)
+        moved_stage = self.root / "stage.bound"
+        real_stage_init = TRANSACTION.PrivateStage.__init__
+        replaced = False
+
+        def replace_before_stage_bind(
+            stage_object: object,
+            rules_parent: Path,
+            **kwargs: object,
+        ) -> None:
+            nonlocal replaced
+            if kwargs.get("recovery_stage_expected") is not None and not replaced:
+                replaced = True
+                os.rename(stage, moved_stage)
+                stage.mkdir(mode=0o700)
+            real_stage_init(stage_object, rules_parent, **kwargs)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "__init__",
+                autospec=True,
+                side_effect=replace_before_stage_bind,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertTrue(replaced)
+        self.assertEqual(raised.exception.status, "recovery_required")
+        self.assert_no_real_change_transaction_artifacts()
+        self.assertTrue(moved_stage.is_dir())
+        self.assertTrue(stage.is_dir())
+
     def test_concurrent_no_change_revalidates_candidate_source(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         real_revalidate = TRANSACTION.revalidate_candidate_source
@@ -2255,6 +2343,24 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.receipt.exists())
         self.assertEqual(terminal.read_text(encoding="utf-8"), "stale\n")
+
+    def test_stale_recovery_terminal_result_blocks_before_backup(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        result_path = TRANSACTION.recovery_terminal_result_path(terminal)
+        result_path.write_text("stale\n", encoding="utf-8")
+        result_path.chmod(0o600)
+
+        result = self.run_apply()
+
+        self.assertEqual(result.returncode, 20, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "recovery_terminal_result_exists")
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(TRANSACTION.prepared_candidate_path(self.receipt).exists())
+        self.assertFalse(terminal.exists())
+        self.assertEqual(result_path.read_text(encoding="utf-8"), "stale\n")
 
     def test_hardlinked_live_rules_are_rejected_before_backup(self) -> None:
         live_alias = self.rules_dir / "default.rules.alias"
@@ -3354,6 +3460,319 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(terminal.stat().st_mode), 0o600)
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assert_no_private_stage()
+
+    def test_delegated_v3_receipt_races_after_mutation_require_recovery(
+        self,
+    ) -> None:
+        for action in ("replace", "content", "hardlink", "mode", "parent"):
+            with (
+                self.subTest(action=action),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-recovery-receipt-{action}."
+                ) as temp_dir,
+            ):
+                case_root = Path(temp_dir)
+                self.codex_home = case_root / "codex-home"
+                self.rules_dir = self.codex_home / "rules"
+                self.rules_dir.mkdir(parents=True)
+                self.rules = self.rules_dir / "default.rules"
+                self.rules.write_bytes(OLD_RULES)
+                self.rules.chmod(0o640)
+                self.candidate = case_root / "candidate.rules"
+                self.candidate.write_bytes(NEW_RULES)
+                self.receipt = case_root / "task" / "recovery.json"
+                self.receipt.parent.mkdir(mode=0o700)
+                self.backup_name = f"default.rules.bak-receipt-{action}"
+                self.backup = self.rules_dir / self.backup_name
+                self.validator = case_root / "validator.py"
+                self.write_validator("raise SystemExit(0)\n")
+                applied = self.run_apply()
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+                receipt_bytes = self.receipt.read_bytes()
+                real_rollback = TRANSACTION.rollback
+                mutated = False
+
+                def mutate_receipt_after_rollback(
+                    **kwargs: object,
+                ) -> tuple[bool, dict[str, object]]:
+                    nonlocal mutated
+                    result = real_rollback(**kwargs)
+                    if not result[0] or mutated:
+                        return result
+                    mutated = True
+                    if action == "replace":
+                        moved = self.receipt.with_name("recovery.bound")
+                        os.rename(self.receipt, moved)
+                        self.receipt.write_bytes(receipt_bytes)
+                        self.receipt.chmod(0o600)
+                    elif action == "content":
+                        self.receipt.write_bytes(receipt_bytes + b" ")
+                    elif action == "hardlink":
+                        os.link(
+                            self.receipt,
+                            self.receipt.with_name("recovery.alias"),
+                        )
+                    elif action == "mode":
+                        self.receipt.chmod(0o640)
+                    else:
+                        moved_parent = case_root / "task.bound"
+                        os.rename(self.receipt.parent, moved_parent)
+                        self.receipt.parent.mkdir(mode=0o700)
+                    return result
+
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "rollback",
+                        side_effect=mutate_receipt_after_rollback,
+                    ),
+                ):
+                    code, payload = TRANSACTION.recover_transaction(
+                        SimpleNamespace(
+                            receipt=str(self.receipt),
+                            lock_timeout_seconds=2.0,
+                        )
+                    )
+
+                self.assertTrue(mutated)
+                self.assertEqual(code, 30)
+                self.assertEqual(payload["status"], "recovery_required")
+                self.assertEqual(
+                    Path(payload["recovery_locators"]["receipt"]).resolve(),
+                    self.receipt.resolve(),
+                )
+                journal = payload["mutation_journal"]
+                self.assertTrue(
+                    any(
+                        event["operation"] == "C_to_R" and event["phase"] == "entry"
+                        for event in journal
+                    )
+                )
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_receipt_change_between_parse_and_lock_is_recovery_refused(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        receipt_bytes = self.receipt.read_bytes()
+        real_shared_lock = TRANSACTION.shared_lock
+        mutated = False
+
+        @contextmanager
+        def mutate_before_lock(*args: object, **kwargs: object):
+            nonlocal mutated
+            self.receipt.write_bytes(receipt_bytes + b" ")
+            mutated = True
+            with real_shared_lock(*args, **kwargs) as binding:
+                yield binding
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "shared_lock",
+                side_effect=mutate_before_lock,
+            ),
+        ):
+            code, payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertTrue(mutated)
+        self.assertEqual(code, 40)
+        self.assertEqual(payload["status"], "recovery_refused")
+        self.assertEqual(payload["reason"], "receipt_changed")
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+
+    def test_terminal_result_publication_crash_points_are_retryable(self) -> None:
+        for fault in (
+            "write",
+            "file_fsync",
+            "rename_before",
+            "rename_after",
+            "directory_fsync",
+        ):
+            with (
+                self.subTest(fault=fault),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-terminal-crash-{fault}."
+                ) as temp_dir,
+            ):
+                case_root = Path(temp_dir)
+                self.codex_home = case_root / "codex-home"
+                self.rules_dir = self.codex_home / "rules"
+                self.rules_dir.mkdir(parents=True)
+                self.rules = self.rules_dir / "default.rules"
+                self.rules.write_bytes(OLD_RULES)
+                self.rules.chmod(0o640)
+                self.candidate = case_root / "candidate.rules"
+                self.candidate.write_bytes(NEW_RULES)
+                self.receipt = case_root / "task" / "recovery.json"
+                self.receipt.parent.mkdir(mode=0o700)
+                self.backup_name = f"default.rules.bak-terminal-{fault}"
+                self.backup = self.rules_dir / self.backup_name
+                self.validator = case_root / "validator.py"
+                self.write_validator("raise SystemExit(0)\n")
+                applied = self.run_apply()
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+                terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+                reservation = terminal.read_bytes()
+                real_exclusive = TRANSACTION._write_exclusive_bound
+                real_atomic = TRANSACTION.atomic_rename_no_replace
+                real_write = TRANSACTION.os.write
+                real_fsync = TRANSACTION.os.fsync
+                injected = False
+                rename_completed = False
+
+                def faulting_exclusive(
+                    path: Path,
+                    payload: bytes,
+                    **kwargs: object,
+                ) -> tuple[int, object]:
+                    nonlocal injected
+                    if TRANSACTION.RECOVERY_TERMINAL_TEMP_MARKER not in path.name:
+                        return real_exclusive(path, payload, **kwargs)
+                    if fault == "write":
+
+                        def fail_write(fd: int, data: bytes) -> int:
+                            nonlocal injected
+                            if not injected:
+                                injected = True
+                                raise OSError(errno.EIO, "fault-injected result write")
+                            return real_write(fd, data)
+
+                        with mock.patch.object(
+                            TRANSACTION.os,
+                            "write",
+                            side_effect=fail_write,
+                        ):
+                            return real_exclusive(path, payload, **kwargs)
+                    if fault == "file_fsync":
+
+                        def fail_file_fsync(fd: int) -> None:
+                            nonlocal injected
+                            if not injected:
+                                injected = True
+                                raise OSError(
+                                    errno.EIO,
+                                    "fault-injected result file fsync",
+                                )
+                            real_fsync(fd)
+
+                        with mock.patch.object(
+                            TRANSACTION.os,
+                            "fsync",
+                            side_effect=fail_file_fsync,
+                        ):
+                            return real_exclusive(path, payload, **kwargs)
+                    return real_exclusive(path, payload, **kwargs)
+
+                def faulting_atomic(*args: object) -> None:
+                    nonlocal injected, rename_completed
+                    if fault == "rename_before" and not injected:
+                        injected = True
+                        raise OSError(errno.EIO, "fault-injected pre-rename crash")
+                    real_atomic(*args)
+                    rename_completed = True
+                    if fault == "rename_after" and not injected:
+                        injected = True
+                        raise OSError(errno.EIO, "fault-injected post-rename crash")
+
+                def faulting_fsync(fd: int) -> None:
+                    nonlocal injected
+                    if fault == "directory_fsync" and rename_completed and not injected:
+                        injected = True
+                        raise OSError(errno.EIO, "fault-injected directory fsync")
+                    real_fsync(fd)
+
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_write_exclusive_bound",
+                        side_effect=faulting_exclusive,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "atomic_rename_no_replace",
+                        side_effect=faulting_atomic,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION.os,
+                        "fsync",
+                        side_effect=faulting_fsync,
+                    ),
+                ):
+                    first_code, first = TRANSACTION.recover_transaction(
+                        SimpleNamespace(
+                            receipt=str(self.receipt),
+                            lock_timeout_seconds=2.0,
+                        )
+                    )
+
+                self.assertTrue(injected)
+                self.assertEqual(terminal.read_bytes(), reservation)
+                if fault == "rename_after":
+                    self.assertEqual(first_code, 0)
+                else:
+                    self.assertEqual(first_code, 30)
+                    self.assertEqual(first["status"], "recovery_required")
+                    self.assertTrue(first["mutation_journal"])
+
+                repeated = self.run_recover()
+                self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                self.assertIn(
+                    json.loads(repeated.stdout)["status"],
+                    {"recovered", "already_original"},
+                )
+                self.assertEqual(terminal.read_bytes(), reservation)
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_terminal_result_publication_never_truncates_reservation(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        reservation = terminal.read_bytes()
+
+        with (
+            mock.patch.object(
+                TRANSACTION.os,
+                "ftruncate",
+                side_effect=AssertionError("terminal publication must not truncate"),
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+        ):
+            code, payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "recovered")
+        self.assertEqual(terminal.read_bytes(), reservation)
+        self.assertTrue(TRANSACTION.recovery_terminal_result_path(terminal).is_file())
 
     def test_repeated_recover_does_not_hide_retained_fixed_stage_evidence(
         self,
