@@ -22,6 +22,10 @@ superseded_by:
   recovery copies and explicit incomplete-retention results.
 - Added single-link object policy to candidate, live-file, receipt, recovery,
   and pre/post-mutation validation.
+- Added descriptor-backed file-flag, xattr, and ACL admission plus a bounded
+  validator process-group supervisor.
+- Bound idempotent recovery to exact original or persisted recovery-terminal
+  identity, and revalidated recovery copies after locator binding.
 - Reduced the Joey authoring overlay to placement and validation policy while
   respecting non-default `CODEX_HOME`.
 - Strengthened structural tests for the complete audit and cold-start paths.
@@ -40,6 +44,13 @@ superseded_by:
   overwrite a later legitimate live state and reports retained recovery
   evidence instead; schema-v2 receipts add link policy while schema-v1
   recovery remains supported.
+- Validator execution now rejects nonfinite deadlines, caps aggregate captured
+  output, and terminates/drains its process group on timeout, overflow, or
+  surviving descendants.
+- A recovery copy is verified only after rereading the held origin and copy
+  descriptors and rechecking content, access/link policy, metadata admission,
+  and directory-entry binding. Recovery refuses same-content replacement
+  inodes unless a transaction-bound recovery-terminal record names them.
 - `codex-skill-authoring` resolves the active skill root from `CODEX_HOME` or
   the loaded skill directory rather than assuming `$HOME/.codex`.
 - The active audit workflow remains read-only; apply behavior is isolated in
@@ -53,17 +64,21 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 27 passed on Python 3.13 and system Python 3.9.6,
+- Rules transaction tests: 39 passed on Python 3.13 and system Python 3.9.6,
   including source/destination unlink, parent replacement, validator/set-policy
   hardlink, immediate pre-mutation revalidation, post-mutation link drift,
-  `EEXIST` plus source unlink, read-only-live, and schema-v1 recovery cases.
-- The focused rules plus structure run passed 28 tests on both Python versions.
-- Full repository suite: 1,085 of 1,089 tests passed in the sandbox; the same 4
-  sandbox-only GPG merge-fixture failures passed in the exact keybox-enabled
-  rerun (4 of 4).
+  `EEXIST` plus source unlink, read-only-live, schema-v1 recovery, xattr/ACL
+  injection, recovery-copy content/link/access races, terminal-identity
+  idempotence, and validator overflow/timeout/descendant cases.
+- The focused rules plus structure run passed 40 tests on both Python versions.
+- Full repository suite covered 1,101 tests. After the one changed structure
+  assertion was corrected and rerun, only the same 4 sandbox-only GPG
+  merge-fixture errors remained; their exact keybox-enabled rerun passed 4 of
+  4.
 - Ruff check passed for all changed Python files. The helper and transaction
   tests pass Ruff format; the repository's pre-existing structure-test format
   drift remains and was not mechanically expanded.
-- `codex-rules-hygiene` passed the official skill validator through the
-  existing offline PyYAML environment.
+- `codex-rules-hygiene` passed the official skill validator through an
+  isolated `uv` PyYAML environment after the direct local Python lacked
+  `PyYAML`.
 - `git diff --check` passed, and generated Python caches were removed.
