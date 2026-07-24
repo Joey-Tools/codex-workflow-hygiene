@@ -1210,6 +1210,38 @@ def verify_entry_binding(
         )
 
 
+def open_untrusted_regular_file(
+    path: str | Path,
+    *,
+    label: str,
+    writable: bool = False,
+    dir_fd: int | None = None,
+) -> int:
+    """Open one untrusted pathname without waiting on a FIFO replacement."""
+
+    flags = (
+        (os.O_RDWR if writable else os.O_RDONLY)
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    fd = os.open(path, flags, dir_fd=dir_fd)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise TransactionError(
+                f"{label}_not_regular",
+                f"{label} is not a regular file",
+            )
+    except BaseException as error:
+        finalize_descriptor_cleanup(
+            [(label, fd)],
+            primary_error=error,
+        )
+        raise
+    return fd
+
+
 def read_stable(
     path: Path,
     *,
@@ -1217,9 +1249,8 @@ def read_stable(
     max_bytes: int = MAX_RULES_BYTES,
     require_modeled_metadata: bool = False,
 ) -> tuple[bytes, Snapshot]:
-    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags)
+        fd = open_untrusted_regular_file(path, label=label)
     except FileNotFoundError as error:
         raise TransactionError(f"{label}_missing", f"{label} is missing") from error
     except PermissionError as error:
@@ -1757,13 +1788,13 @@ def bind_regular_file(
             "path_invalid",
             f"{label} must be one child of its bound parent",
         )
-    flags = (
-        (os.O_RDWR if writable else os.O_RDONLY)
-        | os.O_CLOEXEC
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
     try:
-        fd = os.open(path.name, flags, dir_fd=parent.fd)
+        fd = open_untrusted_regular_file(
+            path.name,
+            label=label,
+            writable=writable,
+            dir_fd=parent.fd,
+        )
     except FileNotFoundError as error:
         raise TransactionError(f"{label}_missing", f"{label} is missing") from error
     except OSError as error:
@@ -2487,9 +2518,12 @@ class PrivateStage:
                 "path_invalid",
                 "exchange target must be one rules-directory child",
             )
-        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
         try:
-            fd = os.open(target.name, flags, dir_fd=self.rules_parent_fd)
+            fd = open_untrusted_regular_file(
+                target.name,
+                label="live_rules",
+                dir_fd=self.rules_parent_fd,
+            )
         except OSError as error:
             raise TransactionError(
                 "live_rules_unreadable",
@@ -3488,7 +3522,12 @@ def shared_lock(
             "arguments_invalid",
             "lock timeout must be finite and positive",
         )
-    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDWR
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     fd = -1
     locked = False
     binding: BoundFile | None = None
@@ -3498,7 +3537,17 @@ def shared_lock(
         try:
             fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
-            fd = os.open(path, flags)
+            fd = open_untrusted_regular_file(
+                path,
+                label="transaction_lock",
+                writable=True,
+            )
+        opened_lock = os.fstat(fd)
+        if not stat.S_ISREG(opened_lock.st_mode):
+            raise TransactionError(
+                "lock_invalid",
+                "transaction lock is not a regular file",
+            )
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:
@@ -4776,8 +4825,10 @@ def run_validator(
 
 
 def fsync_file_and_parent(path: Path) -> None:
-    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+    fd = open_untrusted_regular_file(
+        path,
+        label="fsync_file",
+    )
     primary_error: BaseException | None = None
     try:
         os.fsync(fd)
@@ -7064,9 +7115,13 @@ def _apply_transaction_inner(
                 }
             try:
                 fsync_file_and_parent(rules)
-            except OSError as error:
+            except (OSError, TransactionError) as error:
                 post_failure = {
-                    "status": "post_replace_fsync_failed",
+                    "status": (
+                        error.status
+                        if isinstance(error, TransactionError)
+                        else "post_replace_fsync_failed"
+                    ),
                     "message": str(error),
                 }
 

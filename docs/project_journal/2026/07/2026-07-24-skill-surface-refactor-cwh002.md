@@ -69,6 +69,9 @@ superseded_by:
 - Routed private-stage descriptor-close uncertainty into apply and every
   recovery result; a would-be clean success now exits nonzero with its original
   operation status and stable FD classes in stdout JSON.
+- Made every untrusted regular-file pathname binding nonblocking and no-follow
+  with immediate descriptor file-type proof, so FIFO replacement cannot stall
+  pre-lock, post-validator, exchange-target, or recovery execution.
 - Removed the unlocked no-change fast path; apparent no-change now validates
   under the shared writer lock and returns only `no_change_after_lock`.
 - Bound idempotent recovery to exact original or persisted recovery-terminal
@@ -141,6 +144,11 @@ superseded_by:
   terminal status; an otherwise successful apply/recovery reports
   `recovery_required`, records `operation_status`, and exposes stable
   `cleanup_reason` plus `descriptor_class` fields.
+- Candidate, live, backup, receipt, prepared, staged, and terminal pathname
+  bindings open with nonblocking/no-follow semantics and prove `S_ISREG`
+  immediately from the returned descriptor. FIFO substitution is therefore a
+  typed fail-closed result rather than an unbounded wait, including before the
+  first lock, after validator return, and during lock-held recovery.
 - Recovery reads the immutable terminal result and exact live/backup roles
   under the lock before strict terminal validation; an `O/M` v4 primary state
   gets a bounded stage/prepared probe to prove exact `Q` or retain possible
@@ -169,7 +177,7 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 161 passed on Python 3.13. New cases cover fixed
+- Rules transaction tests: 165 passed on Python 3.13. New cases cover fixed
   stage zero-artifact failures, parse-to-lock receipt races, delegated-v3
   post-mutation receipt and parent changes, every terminal publication crash
   point, successful retry, terminal truncation prohibition, terminal/primary
@@ -184,8 +192,11 @@ superseded_by:
   schema-v1 explicit-link downgrade attempts, legacy post-exchange
   parent/lock finalization failures, case-folded and Unicode-normalized stage
   aliases, and structured private-stage close failures across apply plus
-  schema-v1/v3/v4 recovery.
-- Full repository suite covered 1,223 tests. Only the same 4 sandbox-only GPG
+  schema-v1/v3/v4 recovery. The final 4 cases prove that an initial candidate
+  FIFO, an existing lock FIFO, a post-validator candidate FIFO replacement,
+  and a lock-held recovery backup FIFO all fail promptly without creating new
+  transaction artifacts.
+- Full repository suite covered 1,227 tests. Only the same 4 sandbox-only GPG
   merge-fixture errors remained; their exact keybox-enabled rerun passed 4 of
   4 outside the sandbox.
 - Ruff check and Ruff format-check passed for both changed Python files.

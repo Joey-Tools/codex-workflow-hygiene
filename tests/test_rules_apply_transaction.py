@@ -426,6 +426,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         candidate_sha256: str | None = None,
         environment: dict[str, str] | None = None,
         validator_timeout: str = "5",
+        timeout: float = 15,
     ) -> subprocess.CompletedProcess[str]:
         expected = expected_sha256 or hashlib.sha256(OLD_RULES).hexdigest()
         candidate_digest = (
@@ -459,10 +460,10 @@ class RulesApplyTransactionTests(unittest.TestCase):
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=15,
+            timeout=timeout,
         )
 
-    def run_recover(self) -> subprocess.CompletedProcess[str]:
+    def run_recover(self, *, timeout: float = 15) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 sys.executable,
@@ -478,7 +479,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=15,
+            timeout=timeout,
         )
 
     def rewrite_receipt_as_legacy_v1(self) -> dict[str, object]:
@@ -636,6 +637,46 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertFalse(self.receipt.exists())
         self.assert_no_private_stage()
 
+    def test_candidate_fifo_is_rejected_without_blocking_before_lock(self) -> None:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO creation is unavailable")
+        self.write_validator("raise SystemExit(0)\n")
+        candidate_digest = hashlib.sha256(NEW_RULES).hexdigest()
+        self.candidate.unlink()
+        os.mkfifo(self.candidate, 0o600)
+
+        result = self.run_apply(
+            candidate_sha256=candidate_digest,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 50, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "candidate_source_not_regular")
+        self.assertFalse((self.rules_dir / ".default.rules.apply.lock").exists())
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assert_no_private_stage()
+
+    def test_existing_lock_fifo_is_rejected_without_blocking_before_flock(
+        self,
+    ) -> None:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO creation is unavailable")
+        self.write_validator("raise SystemExit(0)\n")
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        os.mkfifo(lock, 0o600)
+
+        result = self.run_apply(timeout=5)
+
+        self.assertEqual(result.returncode, 50, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "transaction_lock_not_regular")
+        self.assertTrue(stat.S_ISFIFO(lock.stat().st_mode))
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assert_no_private_stage()
+
     def test_candidate_source_replacement_after_validation_is_rejected(
         self,
     ) -> None:
@@ -668,6 +709,39 @@ class RulesApplyTransactionTests(unittest.TestCase):
             ["object_identity"],
         )
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assert_no_private_stage()
+
+    def test_candidate_fifo_replacement_after_validator_does_not_block(self) -> None:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO creation is unavailable")
+        self.write_validator(
+            """\
+            import os
+            from pathlib import Path
+            import sys
+
+            path = Path(sys.argv[1])
+            if path.name != "default.rules":
+                source = Path(os.environ["CANDIDATE_SOURCE"])
+                source.unlink()
+                os.mkfifo(source, 0o600)
+            """
+        )
+
+        result = self.run_apply(
+            environment=self.helper_environment(
+                CANDIDATE_SOURCE=str(self.candidate),
+            ),
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 50, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "candidate_source_not_regular")
+        self.assertTrue(stat.S_ISFIFO(self.candidate.stat().st_mode))
+        self.assertFalse((self.rules_dir / ".default.rules.apply.lock").exists())
         self.assertFalse(self.backup.exists())
         self.assertFalse(self.receipt.exists())
         self.assert_no_private_stage()
@@ -2871,6 +2945,28 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     self.assertEqual(stat.S_IMODE(self.rules.stat().st_mode), 0o600)
                 else:
                     self.assertFalse(self.rules.exists())
+
+    def test_recovery_backup_fifo_is_rejected_without_blocking_under_lock(
+        self,
+    ) -> None:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO creation is unavailable")
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.backup.unlink()
+        os.mkfifo(self.backup, 0o600)
+
+        recovered = self.run_recover(timeout=5)
+
+        self.assertEqual(recovered.returncode, 40, recovered.stderr)
+        payload = json.loads(recovered.stdout)
+        self.assertEqual(payload["status"], "recovery_refused")
+        self.assertEqual(payload["reason"], "backup_not_regular")
+        self.assertTrue(stat.S_ISFIFO(self.backup.stat().st_mode))
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertTrue(self.receipt.exists())
+        self.assert_no_private_stage()
 
     @unittest.skipUnless(os.name == "posix", "helper requires POSIX signals and flock")
     def test_recover_restores_after_process_dies_post_replace(self) -> None:
