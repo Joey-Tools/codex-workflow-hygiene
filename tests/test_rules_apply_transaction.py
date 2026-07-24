@@ -3170,6 +3170,261 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertEqual(prepared.read_bytes(), NEW_RULES)
 
+    def test_schema_v4_q_result_with_replaced_prepared_requires_recovery_on_retry(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "__init__",
+                side_effect=TRANSACTION.TransactionError(
+                    "private_stage_unavailable",
+                    "fault-injected stage creation failure",
+                ),
+            ),
+            self.assertRaises(TRANSACTION.TransactionError),
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        prepared = TRANSACTION.prepared_candidate_path(self.receipt)
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_HOME": str(self.codex_home)},
+        ):
+            first_code, first = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertEqual(first_code, 0)
+        self.assertEqual(first["status"], "recovered")
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        self.assertTrue(TRANSACTION.recovery_terminal_result_path(terminal).is_file())
+        replacement = prepared.with_name(f"{prepared.name}.replacement")
+        replacement.write_bytes(NEW_RULES)
+        replacement.chmod(0o600)
+        os.replace(replacement, prepared)
+
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                recovered = self.run_recover()
+                self.assertEqual(recovered.returncode, 30, recovered.stderr)
+                payload = json.loads(recovered.stdout)
+                self.assertEqual(payload["status"], "recovery_required")
+                self.assertEqual(
+                    payload["reason"],
+                    "schema_v4_state_unrecognized",
+                )
+                self.assertEqual(
+                    payload["observed_state"]["terminal_state"],
+                    TRANSACTION.RECOVERY_TERMINAL_RESTORED,
+                )
+                self.assertEqual(
+                    payload["observed_state"]["roles"]["prepared_candidate"],
+                    "?",
+                )
+                self.assertTrue(
+                    any(
+                        event["operation"] == "terminal_publish"
+                        and event["phase"] == "observed"
+                        for event in payload["mutation_journal"]
+                    )
+                )
+                self.assertEqual(
+                    Path(payload["recovery_locators"]["prepared_candidate"]).resolve(),
+                    prepared.resolve(),
+                )
+
+    def test_schema_v4_q_reserved_prepared_drift_is_pre_mutation_refusal(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "__init__",
+                side_effect=TRANSACTION.TransactionError(
+                    "private_stage_unavailable",
+                    "fault-injected stage creation failure",
+                ),
+            ),
+            self.assertRaises(TRANSACTION.TransactionError),
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        prepared = TRANSACTION.prepared_candidate_path(self.receipt)
+        replacement = prepared.with_name(f"{prepared.name}.replacement")
+        replacement.write_bytes(NEW_RULES)
+        replacement.chmod(0o600)
+        os.replace(replacement, prepared)
+
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                recovered = self.run_recover()
+                self.assertEqual(recovered.returncode, 40, recovered.stderr)
+                payload = json.loads(recovered.stdout)
+                self.assertEqual(payload["status"], "recovery_refused")
+                self.assertEqual(
+                    payload["reason"],
+                    "schema_v4_state_unrecognized",
+                )
+                self.assertNotIn("mutation_journal", payload)
+                self.assertFalse(
+                    TRANSACTION.recovery_terminal_result_path(
+                        TRANSACTION.recovery_terminal_path(self.receipt)
+                    ).exists()
+                )
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertFalse(self.backup.exists())
+
+    def test_schema_v4_q_or_p_unknown_stage_is_ambiguous_recovery_required(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "__init__",
+                side_effect=TRANSACTION.TransactionError(
+                    "private_stage_unavailable",
+                    "fault-injected stage creation failure",
+                ),
+            ),
+            self.assertRaises(TRANSACTION.TransactionError),
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        stage.mkdir(mode=0o700)
+        unknown_candidate = stage / "candidate"
+        unknown_candidate.write_bytes(LATER_RULES)
+        unknown_candidate.chmod(0o600)
+
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                recovered = self.run_recover()
+                self.assertEqual(recovered.returncode, 30, recovered.stderr)
+                payload = json.loads(recovered.stdout)
+                self.assertEqual(payload["status"], "recovery_required")
+                self.assertEqual(
+                    payload["reason"],
+                    "schema_v4_state_unrecognized",
+                )
+                self.assertTrue(
+                    any(
+                        event["operation"] == "possible_prior_transaction_state"
+                        and event["phase"] == "observed"
+                        and event["state"] == "P"
+                        for event in payload["mutation_journal"]
+                    )
+                )
+                self.assertEqual(
+                    payload["observed_state"]["roles"]["staged_backup"],
+                    "?",
+                )
+                self.assertEqual(
+                    Path(payload["recovery_locators"]["staged_backup"]).resolve(),
+                    unknown_candidate.resolve(),
+                )
+
+    def test_schema_v4_r_unknown_stage_candidate_delegation_and_retry_require_recovery(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        rules_fd = os.open(
+            self.rules_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            TRANSACTION.atomic_rename_exchange(
+                rules_fd,
+                self.backup.name,
+                rules_fd,
+                self.rules.name,
+            )
+        finally:
+            os.close(rules_fd)
+
+        stage_candidate = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME / "candidate"
+        real_recover_v3 = TRANSACTION.recover_schema_v3_transaction
+        injected = False
+
+        def inject_unknown_candidate(**kwargs: object) -> tuple[int, dict[str, object]]:
+            nonlocal injected
+            if not injected:
+                stage_candidate.write_bytes(LATER_RULES)
+                stage_candidate.chmod(0o600)
+                injected = True
+            return real_recover_v3(**kwargs)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "recover_schema_v3_transaction",
+                side_effect=inject_unknown_candidate,
+            ),
+        ):
+            first_code, first = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertTrue(injected)
+        self.assertEqual(first_code, 30)
+        self.assertEqual(first["status"], "recovery_required")
+        self.assertEqual(first["reason"], "schema_v3_state_unrecognized")
+        self.assertTrue(
+            any(
+                event["operation"] == "prior_transaction_state"
+                and event["phase"] == "observed"
+                and event["state"] == "R"
+                for event in first["mutation_journal"]
+            )
+        )
+        self.assertEqual(
+            Path(first["recovery_locators"]["staged_backup"]).resolve(),
+            stage_candidate.resolve(),
+        )
+
+        repeated = self.run_recover()
+        self.assertEqual(repeated.returncode, 30, repeated.stderr)
+        repeated_payload = json.loads(repeated.stdout)
+        self.assertEqual(repeated_payload["status"], "recovery_required")
+        self.assertEqual(
+            repeated_payload["reason"],
+            "schema_v4_state_unrecognized",
+        )
+        self.assertEqual(
+            repeated_payload["observed_state"]["roles"]["staged_backup"],
+            "?",
+        )
+        self.assertTrue(repeated_payload["mutation_journal"])
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
     def test_schema_v4_p_recovery_after_move_fsync_failure(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         real_move = TRANSACTION.move_prepared_candidate_to_stage
@@ -4141,6 +4396,131 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["status"], "applied")
         self.assert_no_private_stage()
+
+    def test_apply_closes_terminal_result_evidence_only_after_lock_exit(
+        self,
+    ) -> None:
+        self.write_validator(
+            """\
+            from pathlib import Path
+            import sys
+
+            if Path(sys.argv[1]).name == "default.rules":
+                raise SystemExit(9)
+            """
+        )
+        real_close = TRANSACTION.ApplyEvidenceBindings.close
+        close_observed = False
+
+        def assert_close_order(bindings: object) -> None:
+            nonlocal close_observed
+            assert isinstance(bindings, TRANSACTION.ApplyEvidenceBindings)
+            assert bindings.receipt is not None
+            assert bindings.recovery_terminal_result is not None
+            for fd in (
+                bindings.receipt.fd,
+                bindings.recovery_terminal.fd,
+                bindings.recovery_terminal_result.fd,
+                bindings.receipt_parent.fd,
+                bindings.rules_parent.fd,
+            ):
+                os.fstat(fd)
+            with self.assertRaises(OSError) as lock_closed:
+                os.fstat(bindings.lock.fd)
+            self.assertEqual(lock_closed.exception.errno, errno.EBADF)
+            close_observed = True
+            real_close(bindings)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.ApplyEvidenceBindings,
+                "close",
+                autospec=True,
+                side_effect=assert_close_order,
+            ),
+        ):
+            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertTrue(close_observed)
+        self.assertEqual(exit_code, 30)
+        self.assertEqual(payload["status"], "post_replace_failed_rolled_back")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_lock_path_replacement_failure_preserves_evidence_until_lock_exit(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        moved_lock = self.rules_dir / ".default.rules.apply.lock.bound"
+        real_cleanup = TRANSACTION.PrivateStage._cleanup_fixed_stage
+        real_close = TRANSACTION.ApplyEvidenceBindings.close
+        close_observed = False
+        lock_replaced = False
+
+        def replace_lock_after_cleanup(stage: object) -> list[dict[str, object]]:
+            nonlocal lock_replaced
+            assert isinstance(stage, TRANSACTION.PrivateStage)
+            result = real_cleanup(stage)
+            os.rename(lock, moved_lock)
+            lock.write_bytes(b"")
+            lock.chmod(0o600)
+            lock_replaced = True
+            return result
+
+        def assert_bound_evidence_then_fail_close(bindings: object) -> None:
+            nonlocal close_observed
+            assert isinstance(bindings, TRANSACTION.ApplyEvidenceBindings)
+            assert bindings.receipt is not None
+            for fd in (
+                bindings.receipt.fd,
+                bindings.recovery_terminal.fd,
+                bindings.receipt_parent.fd,
+                bindings.rules_parent.fd,
+            ):
+                os.fstat(fd)
+            with self.assertRaises(OSError) as lock_closed:
+                os.fstat(bindings.lock.fd)
+            self.assertEqual(lock_closed.exception.errno, errno.EBADF)
+            close_observed = True
+            real_close(bindings)
+            raise OSError(errno.EIO, "fault-injected evidence close failure")
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "_cleanup_fixed_stage",
+                autospec=True,
+                side_effect=replace_lock_after_cleanup,
+            ),
+            mock.patch.object(
+                TRANSACTION.ApplyEvidenceBindings,
+                "close",
+                autospec=True,
+                side_effect=assert_bound_evidence_then_fail_close,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertTrue(lock_replaced)
+        self.assertTrue(close_observed)
+        self.assertEqual(raised.exception.status, "recovery_required")
+        self.assertEqual(raised.exception.exit_code, 30)
+        self.assertEqual(raised.exception.details["reason"], "lock_changed")
+        notes = getattr(raised.exception, "__notes__", [])
+        self.assertTrue(any("descriptor cleanup also failed" in note for note in notes))
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+        self.assertTrue(self.receipt.is_file())
 
     def test_repeated_successful_applies_reuse_one_empty_stage_root(self) -> None:
         self.write_validator("raise SystemExit(0)\n")

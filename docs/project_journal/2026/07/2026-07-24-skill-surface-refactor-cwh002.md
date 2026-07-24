@@ -39,6 +39,11 @@ superseded_by:
 - Added one mutation tracker shared across schema-v4 recovery and delegated
   schema-v3 recovery so every post-mutation ambiguity reports
   `recovery_required` with retained evidence and locators.
+- Deferred persistent apply-evidence descriptor closure until after the shared
+  lock has completed its final revalidation and closed its own descriptor.
+- Classified recovery from immutable terminal results and live/backup roles
+  before auxiliary prepared/stage exactness, so damaged retry evidence cannot
+  downgrade a prior or possible mutation to a pre-mutation refusal.
 - Removed the unlocked no-change fast path; apparent no-change now validates
   under the shared writer lock and returns only `no_change_after_lock`.
 - Bound idempotent recovery to exact original or persisted recovery-terminal
@@ -78,6 +83,15 @@ superseded_by:
   exchange, cleanup, and restore operations across schema-v4 and delegated
   schema-v3 paths. Once mutation may have started, later binding or validation
   failures cannot be downgraded to `recovery_refused`.
+- Apply final validation and stage cleanup still run under the shared lock, but
+  receipt, terminal, result, and parent evidence remains descriptor-bound
+  until the lock context completes its own post-callback revalidation. A later
+  descriptor-close failure cannot mask an active lock or recovery failure.
+- Recovery reads the immutable terminal result and exact live/backup roles
+  before prepared/stage probes. A published `Q` result, completed `C` to `R`
+  transition, or ambiguous `Q`/`P` stage state records observed prior mutation
+  and returns `recovery_required`; only provably pre-mutation drift remains
+  `recovery_refused`.
 - Validator execution rejects nonfinite deadlines, caps aggregate captured
   output, and independently enumerates live same-PGID members on Darwin and
   Linux before accepting completion, including descendants whose standard
@@ -99,11 +113,13 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 123 passed on Python 3.13. New cases cover fixed
+- Rules transaction tests: 129 passed on Python 3.13. New cases cover fixed
   stage zero-artifact failures, parse-to-lock receipt races, delegated-v3
   post-mutation receipt and parent changes, every terminal publication crash
-  point, successful retry, and the prohibition on terminal truncation.
-- Full repository suite covered 1,185 tests. Only the same 4 sandbox-only GPG
+  point, successful retry, terminal truncation prohibition, terminal/primary
+  evidence taking precedence over auxiliary drift, ambiguous retry states, and
+  apply-evidence lifetime through final lock revalidation.
+- Full repository suite covered 1,191 tests. Only the same 4 sandbox-only GPG
   merge-fixture errors remained; their exact keybox-enabled rerun passed 4 of
   4 outside the sandbox.
 - Ruff check and Ruff format-check passed for both changed Python files.

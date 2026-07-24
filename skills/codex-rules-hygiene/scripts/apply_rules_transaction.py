@@ -298,6 +298,18 @@ class RecoveryMutationTracker:
             }
         )
 
+    def observe_prior_mutation(self, operation: str, *, state: str) -> None:
+        """Record durable evidence that an earlier recovery may have mutated state."""
+
+        self.mutation_started = True
+        event = {
+            "operation": operation,
+            "phase": "observed",
+            "state": state,
+        }
+        if event not in self.events:
+            self.events.append(event)
+
     def observe(self, observed: dict[str, object]) -> None:
         self.last_observed = observed
 
@@ -5242,6 +5254,8 @@ class ApplyEvidenceBindings:
     closed: bool = False
 
     def stage_owns_prepared_candidate(self) -> bool:
+        if self.candidate_in_stage:
+            return True
         if self.stage is None:
             return False
         if any(
@@ -5649,9 +5663,6 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 except TransactionError as error:
                     retain_stage = True
                     evidence_error = error
-                evidence.close()
-            elif rules_parent_binding is not None:
-                os.close(rules_parent_binding.fd)
         finally:
             effective_retain_stage = retain_stage or (
                 stage is not None and stage.mutation_uncertain
@@ -5701,6 +5712,26 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     **evidence_error.details,
                 },
             ) from evidence_error
+
+    def close_apply_state() -> None:
+        close_error: BaseException | None = None
+        try:
+            if evidence is not None:
+                evidence.close()
+            elif rules_parent_binding is not None:
+                os.close(rules_parent_binding.fd)
+        except BaseException as error:
+            close_error = error
+        if close_error is None:
+            return
+        active_error = sys.exc_info()[1]
+        if active_error is not None:
+            active_error.add_note(
+                "apply evidence descriptor cleanup also failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+            return
+        raise close_error
 
     try:
         # A no-op needs neither a validator process nor a staging directory.
@@ -6399,7 +6430,15 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             ) from error
         raise
     finally:
-        finalize_apply_state()
+        try:
+            finalize_apply_state()
+        finally:
+            # shared_lock closes its lock descriptor only after the
+            # before-release validation/cleanup callback and final lock
+            # revalidation. Keep every recovery-evidence descriptor bound
+            # until that context has completely exited, then close all
+            # evidence without masking an already-active failure.
+            close_apply_state()
 
 
 def publish_staged_backup_for_recovery(
@@ -6562,18 +6601,16 @@ def recover_schema_v3_transaction(
 ) -> tuple[int, dict[str, object]]:
     rules_parent_binding: BoundDirectory | None = None
     staged_parent_binding: BoundDirectory | None = None
+    live_actual: Snapshot | None = None
+    backup_actual: Snapshot | None = None
+    staged_actual: Snapshot | None = None
+    terminal: dict[str, object] | None = None
+    primary_state_hint: str | None = None
     try:
-        validate_controls()
         rules_parent_binding = bind_directory(
             rules.parent,
             label="rules",
             expected=rules_parent_expected,
-        )
-        staged_parent_binding = bind_directory(
-            staged_backup.parent,
-            label="private_stage",
-            require_owner_private=True,
-            expected=staged_parent_expected,
         )
         revalidate_lock(lock_binding, rules_parent_binding)
         live_actual = recovery_entry_snapshot_bound(
@@ -6586,6 +6623,57 @@ def recover_schema_v3_transaction(
             rules_parent_binding,
             label="backup",
         )
+        live_role = recovery_snapshot_role(
+            live_actual,
+            original=original,
+            installed=installed,
+        )
+        backup_role = recovery_snapshot_role(
+            backup_actual,
+            original=original,
+            installed=installed,
+        )
+        primary_state_hint = {
+            ("O", "M"): "P",
+            ("I", "M"): "X",
+            ("I", "O"): "C",
+            ("O", "I"): "R",
+        }.get((live_role, backup_role))
+        terminal = terminal_evidence.validate()
+        primary_observation: dict[str, object] = {
+            "transaction_state_hint": primary_state_hint,
+            "roles": {
+                "live": live_role,
+                "backup": backup_role,
+                "staged_backup": "unprobed",
+            },
+            "snapshots": {
+                "live": live_actual.to_json() if live_actual is not None else None,
+                "backup": (
+                    backup_actual.to_json() if backup_actual is not None else None
+                ),
+                "staged_backup": "unprobed",
+            },
+            "terminal_state": terminal.get("state"),
+        }
+        mutation_tracker.observe(primary_observation)
+        if terminal.get("state") == RECOVERY_TERMINAL_RESTORED:
+            mutation_tracker.observe_prior_mutation(
+                "terminal_publish",
+                state=primary_state_hint or "unknown",
+            )
+        elif primary_state_hint is not None:
+            mutation_tracker.observe_prior_mutation(
+                "prior_transaction_state",
+                state=primary_state_hint,
+            )
+        validate_controls()
+        staged_parent_binding = bind_directory(
+            staged_backup.parent,
+            label="private_stage",
+            require_owner_private=True,
+            expected=staged_parent_expected,
+        )
         staged_actual = recovery_entry_snapshot_bound(
             staged_backup,
             staged_parent_binding,
@@ -6595,6 +6683,14 @@ def recover_schema_v3_transaction(
         revalidate_lock(lock_binding, rules_parent_binding)
         validate_controls()
     except TransactionError as error:
+        if mutation_tracker.mutation_started:
+            return EXIT_POST_REPLACE_FAILED, {
+                "status": "recovery_required",
+                "reason": error.status,
+                "message": str(error),
+                **mutation_tracker.details(state=primary_state_hint),
+                **error.details,
+            }
         return EXIT_RECOVERY_REFUSED, {
             "status": "recovery_refused",
             "reason": error.status,
@@ -6630,11 +6726,35 @@ def recover_schema_v3_transaction(
         ("O", "I", "M"): "R",
     }
     state = states.get(roles)
+    observed_state: dict[str, object] = {
+        "transaction_state": state,
+        "transaction_state_hint": primary_state_hint,
+        "roles": {
+            "live": roles[0],
+            "backup": roles[1],
+            "staged_backup": roles[2],
+        },
+        "snapshots": {
+            "live": live_actual.to_json() if live_actual is not None else None,
+            "backup": backup_actual.to_json() if backup_actual is not None else None,
+            "staged_backup": (
+                staged_actual.to_json() if staged_actual is not None else None
+            ),
+        },
+        "terminal_state": terminal.get("state") if terminal is not None else None,
+    }
+    mutation_tracker.observe(observed_state)
+    if state is not None:
+        mutation_tracker.observe_prior_mutation(
+            "prior_transaction_state",
+            state=state,
+        )
     if state is None:
         if (
             live_actual is not None
             and content_access_and_object_policy_match(original, live_actual)
             and property_mismatches(original, live_actual)
+            and not mutation_tracker.mutation_started
         ):
             return EXIT_RECOVERY_REFUSED, {
                 "status": "recovery_refused",
@@ -6642,8 +6762,17 @@ def recover_schema_v3_transaction(
                 "mismatched_properties": ["object_identity"],
                 "actual_live": live_actual.to_json(),
             }
-        return EXIT_RECOVERY_REFUSED, {
-            "status": "recovery_refused",
+        classification_code = (
+            EXIT_POST_REPLACE_FAILED
+            if mutation_tracker.mutation_started
+            else EXIT_RECOVERY_REFUSED
+        )
+        return classification_code, {
+            "status": (
+                "recovery_required"
+                if mutation_tracker.mutation_started
+                else "recovery_refused"
+            ),
             "reason": "schema_v3_state_unrecognized",
             "observed_roles": {
                 "live": roles[0],
@@ -6659,42 +6788,23 @@ def recover_schema_v3_transaction(
                     staged_actual.to_json() if staged_actual is not None else None
                 ),
             },
+            **(
+                mutation_tracker.details(
+                    state=primary_state_hint,
+                    observed=observed_state,
+                )
+                if mutation_tracker.mutation_started
+                else {}
+            ),
         }
-    mutation_tracker.observe(
-        {
-            "transaction_state": state,
-            "roles": {
-                "live": roles[0],
-                "backup": roles[1],
-                "staged_backup": roles[2],
-            },
-            "snapshots": {
-                "live": live_actual.to_json() if live_actual is not None else None,
-                "backup": backup_actual.to_json()
-                if backup_actual is not None
-                else None,
-                "staged_backup": (
-                    staged_actual.to_json() if staged_actual is not None else None
-                ),
-            },
-        }
-    )
-
-    try:
-        terminal = terminal_evidence.validate()
-    except TransactionError as error:
-        return EXIT_RECOVERY_REFUSED, {
-            "status": "recovery_refused",
-            "reason": error.status,
-            "message": str(error),
-            **error.details,
-        }
+    assert terminal is not None
     if terminal.get("state") == RECOVERY_TERMINAL_RESTORED:
         if state != "R" or live_actual is None:
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
+            return EXIT_POST_REPLACE_FAILED, {
+                "status": "recovery_required",
                 "reason": "recovery_terminal_state_mismatch",
                 "transaction_state": state,
+                **mutation_tracker.details(state=state),
             }
         terminal_restored = Snapshot.from_json(
             terminal.get("restored"),
@@ -6706,11 +6816,12 @@ def recover_schema_v3_transaction(
             live_actual,
         )
         if terminal_mismatches or property_mismatches(original, live_actual):
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
+            return EXIT_POST_REPLACE_FAILED, {
+                "status": "recovery_required",
                 "reason": "recovery_terminal_live_mismatch",
                 "mismatched_properties": terminal_mismatches,
                 "actual_live": live_actual.to_json(),
+                **mutation_tracker.details(state=state),
             }
         try:
             terminal_stage = PrivateStage(
@@ -6730,6 +6841,7 @@ def recover_schema_v3_transaction(
                 "transaction_state": state,
                 "reason": error_status,
                 "message": str(error),
+                **mutation_tracker.details(state=state),
                 **error_details,
             }
         terminal_cleanup_warnings = terminal_stage.cleanup(retain=False)
@@ -6739,6 +6851,7 @@ def recover_schema_v3_transaction(
                 "transaction_state": state,
                 "reason": "stage_cleanup_refused",
                 "cleanup_refusals": terminal_cleanup_warnings,
+                **mutation_tracker.details(state=state),
             }
         return 0, {
             "status": "already_original",
@@ -6747,9 +6860,10 @@ def recover_schema_v3_transaction(
             "identity_evidence": "recovery_terminal",
         }
     if terminal.get("state") != RECOVERY_TERMINAL_RESERVED:
-        return EXIT_RECOVERY_REFUSED, {
-            "status": "recovery_refused",
+        return EXIT_POST_REPLACE_FAILED, {
+            "status": "recovery_required",
             "reason": "recovery_terminal_state_invalid",
+            **mutation_tracker.details(state=state),
         }
 
     stage_candidate_expected = (
@@ -6954,21 +7068,19 @@ def recover_schema_v4_transaction(
     rules_parent: BoundDirectory | None = None
     prepared_parent: BoundDirectory | None = None
     prepared_binding: BoundFile | None = None
+    live_actual: Snapshot | None = None
+    backup_actual: Snapshot | None = None
+    staged_actual: Snapshot | None = None
+    prepared_actual: Snapshot | None = None
+    terminal: dict[str, object] | None = None
+    primary_state_hint: str | None = None
     try:
-        validate_controls()
         rules_parent = bind_directory(
             rules.parent,
             label="rules",
             expected=rules_parent_expected,
         )
-        prepared_parent = bind_directory(
-            prepared_candidate.parent,
-            label="prepared_candidate",
-            require_owner_private=True,
-            expected=prepared_parent_expected,
-        )
         revalidate_lock(lock_binding, rules_parent)
-        validate_controls()
         live_actual = recovery_entry_snapshot_bound(
             rules,
             rules_parent,
@@ -6978,6 +7090,59 @@ def recover_schema_v4_transaction(
             backup,
             rules_parent,
             label="backup",
+        )
+        live_role = recovery_snapshot_role(
+            live_actual,
+            original=original,
+            installed=installed,
+        )
+        backup_role = recovery_snapshot_role(
+            backup_actual,
+            original=original,
+            installed=installed,
+        )
+        primary_state_hint = {
+            ("O", "M"): "Q_or_P",
+            ("I", "M"): "X",
+            ("I", "O"): "C",
+            ("O", "I"): "R",
+        }.get((live_role, backup_role))
+        terminal = terminal_evidence.validate()
+        primary_observation: dict[str, object] = {
+            "transaction_state_hint": primary_state_hint,
+            "roles": {
+                "live": live_role,
+                "backup": backup_role,
+                "staged_backup": "unprobed",
+                "prepared_candidate": "unprobed",
+            },
+            "snapshots": {
+                "live": live_actual.to_json() if live_actual is not None else None,
+                "backup": (
+                    backup_actual.to_json() if backup_actual is not None else None
+                ),
+                "staged_backup": "unprobed",
+                "prepared_candidate": "unprobed",
+            },
+            "terminal_state": terminal.get("state"),
+        }
+        mutation_tracker.observe(primary_observation)
+        if terminal.get("state") == RECOVERY_TERMINAL_RESTORED:
+            mutation_tracker.observe_prior_mutation(
+                "terminal_publish",
+                state=primary_state_hint or "unknown",
+            )
+        elif primary_state_hint in ("X", "C", "R"):
+            mutation_tracker.observe_prior_mutation(
+                "prior_transaction_state",
+                state=primary_state_hint,
+            )
+        validate_controls()
+        prepared_parent = bind_directory(
+            prepared_candidate.parent,
+            label="prepared_candidate",
+            require_owner_private=True,
+            expected=prepared_parent_expected,
         )
         stage_parent_actual, staged_actual = probe_fixed_stage_for_recovery(
             rules_parent
@@ -7030,6 +7195,43 @@ def recover_schema_v4_transaction(
             ("O", "I", "M", "M"): "R",
         }
         state = states.get(roles)
+        observed_state: dict[str, object] = {
+            "transaction_state": state,
+            "transaction_state_hint": primary_state_hint,
+            "roles": {
+                "live": roles[0],
+                "backup": roles[1],
+                "staged_backup": roles[2],
+                "prepared_candidate": roles[3],
+            },
+            "snapshots": {
+                "live": live_actual.to_json() if live_actual is not None else None,
+                "backup": (
+                    backup_actual.to_json() if backup_actual is not None else None
+                ),
+                "staged_backup": (
+                    staged_actual.to_json() if staged_actual is not None else None
+                ),
+                "prepared_candidate": (
+                    prepared_actual.to_json() if prepared_actual is not None else None
+                ),
+            },
+            "terminal_state": terminal.get("state") if terminal is not None else None,
+        }
+        mutation_tracker.observe(observed_state)
+        if state in ("P", "X", "C", "R"):
+            mutation_tracker.observe_prior_mutation(
+                "prior_transaction_state",
+                state=state,
+            )
+        elif state is None and primary_state_hint == "Q_or_P" and roles[2] != "M":
+            # With original live, no backup, and a non-missing/unknown stage
+            # candidate, the observation is ambiguous between a damaged P
+            # retry and unrelated drift. It is not proof of untouched Q.
+            mutation_tracker.observe_prior_mutation(
+                "possible_prior_transaction_state",
+                state="P",
+            )
         if state is None:
             if (
                 live_actual is not None
@@ -7038,6 +7240,7 @@ def recover_schema_v4_transaction(
                     live_actual,
                 )
                 and property_mismatches(original, live_actual)
+                and not mutation_tracker.mutation_started
             ):
                 return EXIT_RECOVERY_REFUSED, {
                     "status": "recovery_refused",
@@ -7045,8 +7248,16 @@ def recover_schema_v4_transaction(
                     "mismatched_properties": ["object_identity"],
                     "actual_live": live_actual.to_json(),
                 }
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
+            return (
+                EXIT_POST_REPLACE_FAILED
+                if mutation_tracker.mutation_started
+                else EXIT_RECOVERY_REFUSED
+            ), {
+                "status": (
+                    "recovery_required"
+                    if mutation_tracker.mutation_started
+                    else "recovery_refused"
+                ),
                 "reason": "schema_v4_state_unrecognized",
                 "observed_roles": {
                     "live": roles[0],
@@ -7070,39 +7281,23 @@ def recover_schema_v4_transaction(
                         else None
                     ),
                 },
+                **(
+                    mutation_tracker.details(
+                        state=primary_state_hint,
+                        observed=observed_state,
+                    )
+                    if mutation_tracker.mutation_started
+                    else {}
+                ),
             }
-        mutation_tracker.observe(
-            {
-                "transaction_state": state,
-                "roles": {
-                    "live": roles[0],
-                    "backup": roles[1],
-                    "staged_backup": roles[2],
-                    "prepared_candidate": roles[3],
-                },
-                "snapshots": {
-                    "live": live_actual.to_json() if live_actual is not None else None,
-                    "backup": (
-                        backup_actual.to_json() if backup_actual is not None else None
-                    ),
-                    "staged_backup": (
-                        staged_actual.to_json() if staged_actual is not None else None
-                    ),
-                    "prepared_candidate": (
-                        prepared_actual.to_json()
-                        if prepared_actual is not None
-                        else None
-                    ),
-                },
-            }
-        )
 
         if state != "Q":
             if stage_parent_actual is None:
-                return EXIT_RECOVERY_REFUSED, {
-                    "status": "recovery_refused",
+                return EXIT_POST_REPLACE_FAILED, {
+                    "status": "recovery_required",
                     "reason": "schema_v4_stage_missing",
                     "transaction_state": state,
+                    **mutation_tracker.details(state=state),
                 }
             revalidate_lock(lock_binding, rules_parent)
             validate_controls()
@@ -7129,7 +7324,7 @@ def recover_schema_v4_transaction(
 
         assert live_actual is not None
         assert prepared_binding is not None
-        terminal = terminal_evidence.validate()
+        assert terminal is not None
         terminal_result: dict[str, object]
         if terminal.get("state") == RECOVERY_TERMINAL_RESTORED:
             terminal_restored = Snapshot.from_json(
@@ -7145,11 +7340,12 @@ def recover_schema_v4_transaction(
                 original,
                 live_actual,
             ):
-                return EXIT_RECOVERY_REFUSED, {
-                    "status": "recovery_refused",
+                return EXIT_POST_REPLACE_FAILED, {
+                    "status": "recovery_required",
                     "reason": "recovery_terminal_live_mismatch",
                     "mismatched_properties": terminal_live_mismatches,
                     "actual_live": live_actual.to_json(),
+                    **mutation_tracker.details(state="Q"),
                 }
             terminal_result = terminal
             result_status = "already_original"
@@ -7168,9 +7364,10 @@ def recover_schema_v4_transaction(
             validate_controls()
             result_status = "recovered"
         else:
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
+            return EXIT_POST_REPLACE_FAILED, {
+                "status": "recovery_required",
                 "reason": "recovery_terminal_state_invalid",
+                **mutation_tracker.details(state="Q"),
             }
 
         final_live = recovery_entry_snapshot_bound(
@@ -7209,6 +7406,7 @@ def recover_schema_v4_transaction(
                 "status": "recovery_required",
                 "transaction_state": "Q",
                 "reason": "schema_v4_prepared_state_changed",
+                **mutation_tracker.details(state="Q"),
             }
         revalidate_lock(lock_binding, rules_parent)
         validate_bound_directory(prepared_parent)
