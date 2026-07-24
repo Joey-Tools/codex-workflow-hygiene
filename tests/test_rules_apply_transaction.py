@@ -2963,6 +2963,115 @@ class RulesApplyTransactionTests(unittest.TestCase):
         os.name == "posix" and hasattr(signal, "pthread_sigmask"),
         "validator signal supervision requires POSIX signal masks",
     )
+    def test_post_replace_managed_signal_rolls_back_and_reports_recovery(
+        self,
+    ) -> None:
+        validator_pid_path = self.root / "post-replace-validator.pid"
+        ready_path = self.root / "post-replace-validator.ready"
+        self.write_validator(
+            f"""\
+            from pathlib import Path
+            import os
+            import sys
+            import time
+
+            rules = Path(sys.argv[1])
+            if rules.name != "default.rules":
+                raise SystemExit(0)
+            Path({str(validator_pid_path)!r}).write_text(
+                str(os.getpid()),
+                encoding="ascii",
+            )
+            Path({str(ready_path)!r}).write_text("ready", encoding="ascii")
+            while True:
+                time.sleep(1)
+            """
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(HELPER),
+                *self.apply_argv(),
+            ],
+            env=self.helper_environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        validator_pid: int | None = None
+        try:
+            self.wait_for_path(ready_path, label="post-replace validator")
+            validator_pid = self.wait_for_pid_path(validator_pid_path)
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=10)
+
+            self.assertEqual(
+                process.returncode,
+                128 + signal.SIGTERM,
+                stderr,
+            )
+            payload = json.loads(stdout)
+            self.assertEqual(payload["status"], "interrupted")
+            self.assertEqual(payload["signal"], signal.SIGTERM)
+            self.assertEqual(
+                payload["interrupted_phase"],
+                "post_replace_validation",
+            )
+            recovery = payload["post_replace_recovery"]
+            self.assertEqual(recovery["exit_code"], 30)
+            self.assertEqual(
+                recovery["status"],
+                "post_replace_failed_rolled_back",
+            )
+            self.assertEqual(
+                recovery["post_replace_failure"]["status"],
+                "post_replace_validation_interrupted",
+            )
+            self.assertEqual(
+                recovery["rollback"]["rollback_status"],
+                "rolled_back",
+            )
+            self.assertEqual(
+                Path(payload["receipt_path"]).resolve(),
+                self.receipt.resolve(),
+            )
+            self.assertEqual(
+                Path(payload["backup_path"]).resolve(),
+                self.backup.resolve(),
+            )
+            self.assertEqual(
+                Path(payload["recovery_locators"]["receipt"]).resolve(),
+                self.receipt.resolve(),
+            )
+            self.assertEqual(
+                Path(payload["recovery_locators"]["backup"]).resolve(),
+                self.backup.resolve(),
+            )
+            self.assertEqual(
+                Path(payload["recovery_locators"]["recovery_terminal"]).resolve(),
+                TRANSACTION.recovery_terminal_path(self.receipt).resolve(),
+            )
+            self.assertNotIn("Traceback", stderr)
+            self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+            self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+            self.assertTrue(self.receipt.is_file())
+            self.assertTrue(
+                TRANSACTION.recovery_terminal_result_path(
+                    TRANSACTION.recovery_terminal_path(self.receipt)
+                ).is_file()
+            )
+            self.assert_no_private_stage()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            if validator_pid is not None:
+                self.assert_process_exited(validator_pid)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "validator signal supervision requires POSIX signal masks",
+    )
     def test_real_signal_in_popen_handoff_is_deferred_until_cleanup(self) -> None:
         leader_pid_path = self.root / "validator-handoff-leader.pid"
         driver = self.root / "validator-handoff-driver.py"
@@ -4056,9 +4165,29 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
                 recover = self.run_recover()
 
-                self.assertEqual(recover.returncode, 40, recover.stderr)
+                self.assertEqual(recover.returncode, 30, recover.stderr)
                 recovery_payload = json.loads(recover.stdout)
-                self.assertEqual(recovery_payload["status"], "recovery_refused")
+                self.assertEqual(recovery_payload["status"], "recovery_required")
+                self.assertEqual(
+                    recovery_payload["reason"],
+                    "schema_v4_state_unrecognized",
+                )
+                self.assertIn(
+                    {
+                        "operation": "possible_prior_transaction_state",
+                        "phase": "observed",
+                        "state": "unknown",
+                    },
+                    recovery_payload["mutation_journal"],
+                )
+                self.assertEqual(
+                    Path(recovery_payload["recovery_locators"]["receipt"]).resolve(),
+                    self.receipt.resolve(),
+                )
+                self.assertEqual(
+                    Path(recovery_payload["recovery_locators"]["backup"]).resolve(),
+                    self.backup.resolve(),
+                )
                 if action in ("replace", "content"):
                     self.assertEqual(self.rules.read_bytes(), LATER_RULES)
                 elif action == "access":
@@ -4876,7 +5005,139 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     prepared.resolve(),
                 )
 
-    def test_schema_v4_q_reserved_prepared_drift_is_pre_mutation_refusal(
+    def test_schema_v4_p_stage_candidate_loss_requires_recovery(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "__init__",
+                side_effect=TRANSACTION.TransactionError(
+                    "private_stage_unavailable",
+                    "fault-injected stage creation failure",
+                ),
+            ),
+            self.assertRaises(TRANSACTION.TransactionError),
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        prepared = TRANSACTION.prepared_candidate_path(self.receipt)
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        stage.mkdir(mode=0o700)
+        staged = stage / "candidate"
+        os.rename(prepared, staged)
+        stage_fd = os.open(
+            stage,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        prepared_parent_fd = os.open(
+            prepared.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(stage_fd)
+            os.fsync(prepared_parent_fd)
+            staged.unlink()
+            os.fsync(stage_fd)
+        finally:
+            os.close(prepared_parent_fd)
+            os.close(stage_fd)
+
+        recovered = self.run_recover()
+
+        self.assertEqual(recovered.returncode, 30, recovered.stderr)
+        payload = json.loads(recovered.stdout)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["reason"], "schema_v4_state_unrecognized")
+        self.assertEqual(payload["transaction_state"], "Q_or_P")
+        self.assertEqual(
+            payload["observed_roles"],
+            {
+                "live": "O",
+                "backup": "M",
+                "staged_backup": "M",
+                "prepared_candidate": "M",
+            },
+        )
+        self.assertTrue(
+            any(
+                event["operation"] == "possible_prior_transaction_state"
+                and event["phase"] == "observed"
+                and event["state"] == "Q_or_P"
+                for event in payload["mutation_journal"]
+            )
+        )
+        self.assertEqual(
+            Path(payload["recovery_locators"]["staged_backup"]).resolve(),
+            staged.resolve(),
+        )
+        self.assertEqual(
+            Path(payload["recovery_locators"]["prepared_candidate"]).resolve(),
+            prepared.resolve(),
+        )
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+
+    def test_schema_v4_r_backup_loss_requires_recovery(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        rules_fd = os.open(
+            self.rules_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            TRANSACTION.atomic_rename_exchange(
+                rules_fd,
+                self.backup.name,
+                rules_fd,
+                self.rules.name,
+            )
+            os.fsync(rules_fd)
+            os.unlink(self.backup.name, dir_fd=rules_fd)
+            os.fsync(rules_fd)
+        finally:
+            os.close(rules_fd)
+
+        recovered = self.run_recover()
+
+        self.assertEqual(recovered.returncode, 30, recovered.stderr)
+        payload = json.loads(recovered.stdout)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["reason"], "schema_v4_state_unrecognized")
+        self.assertEqual(payload["transaction_state"], "Q_or_P")
+        self.assertEqual(
+            payload["observed_roles"],
+            {
+                "live": "O",
+                "backup": "M",
+                "staged_backup": "M",
+                "prepared_candidate": "M",
+            },
+        )
+        self.assertTrue(
+            any(
+                event["operation"] == "possible_prior_transaction_state"
+                and event["phase"] == "observed"
+                and event["state"] == "Q_or_P"
+                for event in payload["mutation_journal"]
+            )
+        )
+        self.assertEqual(
+            Path(payload["recovery_locators"]["backup"]).resolve(),
+            self.backup.resolve(),
+        )
+        self.assertEqual(
+            Path(payload["recovery_locators"]["receipt"]).resolve(),
+            self.receipt.resolve(),
+        )
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+
+    def test_schema_v4_reserved_prepared_drift_requires_recovery(
         self,
     ) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -4906,14 +5167,28 @@ class RulesApplyTransactionTests(unittest.TestCase):
         for attempt in range(2):
             with self.subTest(attempt=attempt):
                 recovered = self.run_recover()
-                self.assertEqual(recovered.returncode, 40, recovered.stderr)
+                self.assertEqual(recovered.returncode, 30, recovered.stderr)
                 payload = json.loads(recovered.stdout)
-                self.assertEqual(payload["status"], "recovery_refused")
+                self.assertEqual(payload["status"], "recovery_required")
                 self.assertEqual(
                     payload["reason"],
                     "schema_v4_state_unrecognized",
                 )
-                self.assertNotIn("mutation_journal", payload)
+                self.assertTrue(
+                    any(
+                        event["operation"] == "possible_prior_transaction_state"
+                        and event["state"] == "Q_or_P"
+                        for event in payload["mutation_journal"]
+                    )
+                )
+                self.assertEqual(
+                    payload["observed_state"]["roles"]["prepared_candidate"],
+                    "?",
+                )
+                self.assertEqual(
+                    Path(payload["recovery_locators"]["prepared_candidate"]).resolve(),
+                    prepared.resolve(),
+                )
                 self.assertFalse(
                     TRANSACTION.recovery_terminal_result_path(
                         TRANSACTION.recovery_terminal_path(self.receipt)
@@ -5462,7 +5737,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertFalse(TRANSACTION.prepared_candidate_path(self.receipt).exists())
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
 
-    def test_recover_refuses_same_original_bytes_on_untrusted_new_inode(self) -> None:
+    def test_recover_requires_operator_for_untrusted_post_apply_inode(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         applied = self.run_apply()
         self.assertEqual(applied.returncode, 0, applied.stderr)
@@ -5473,11 +5748,26 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         recovered = self.run_recover()
 
-        self.assertEqual(recovered.returncode, 40, recovered.stderr)
+        self.assertEqual(recovered.returncode, 30, recovered.stderr)
         payload = json.loads(recovered.stdout)
-        self.assertEqual(payload["status"], "recovery_refused")
-        self.assertEqual(payload["reason"], "original_identity_untrusted")
-        self.assertEqual(payload["mismatched_properties"], ["object_identity"])
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["reason"], "schema_v4_state_unrecognized")
+        self.assertIn(
+            {
+                "operation": "possible_prior_transaction_state",
+                "phase": "observed",
+                "state": "unknown",
+            },
+            payload["mutation_journal"],
+        )
+        self.assertEqual(
+            Path(payload["recovery_locators"]["receipt"]).resolve(),
+            self.receipt.resolve(),
+        )
+        self.assertEqual(
+            Path(payload["recovery_locators"]["backup"]).resolve(),
+            self.backup.resolve(),
+        )
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
 
     def test_recover_is_idempotent_with_bound_terminal_identity(self) -> None:
@@ -7617,7 +7907,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
             ["recovery_receipt", "receipt_parent"],
         )
 
-    def test_recovery_refused_preserves_primary_with_receipt_close_faults(
+    def test_ambiguous_q_or_p_preserves_required_with_receipt_close_faults(
         self,
     ) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -7678,9 +7968,25 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(code, 40)
-        self.assertEqual(payload["status"], "recovery_refused")
+        self.assertEqual(code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
         self.assertEqual(payload["reason"], "schema_v4_state_unrecognized")
+        self.assertIn(
+            {
+                "operation": "possible_prior_transaction_state",
+                "phase": "observed",
+                "state": "Q_or_P",
+            },
+            payload["mutation_journal"],
+        )
+        self.assertEqual(
+            Path(payload["recovery_locators"]["receipt"]).resolve(),
+            self.receipt.resolve(),
+        )
+        self.assertEqual(
+            Path(payload["recovery_locators"]["prepared_candidate"]).resolve(),
+            prepared.resolve(),
+        )
         self.assertEqual(
             [failure["descriptor"] for failure in payload["cleanup_failures"]],
             ["recovery_receipt", "receipt_parent"],

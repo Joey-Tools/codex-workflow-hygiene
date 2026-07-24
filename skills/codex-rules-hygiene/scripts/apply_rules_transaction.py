@@ -98,6 +98,7 @@ class ForwardedValidatorSignal(Exception):
         super().__init__(signum)
         self.signum = signum
         self.cleanup_errors: list[dict[str, object]] = []
+        self.recovery_details: dict[str, object] = {}
 
 
 class ValidatorSignalGate:
@@ -7347,9 +7348,51 @@ def _apply_transaction_inner(
     retain_stage = False
     pending_success_status: str | None = None
     replacement_started = False
+    post_replace_signal: ForwardedValidatorSignal | None = None
+    post_replace_signal_traceback: object | None = None
     finalized = False
     rules_parent_binding: BoundDirectory | None = None
     stage_cleanup_failures: list[dict[str, object]] = []
+
+    def apply_recovery_locators() -> dict[str, str]:
+        return {
+            "receipt": str(receipt),
+            "live": str(rules),
+            "backup": str(backup),
+            "staged_backup": str(rules.parent / PRIVATE_STAGE_NAME / "candidate"),
+            "prepared_candidate": str(prepared_recovery_candidate),
+            "recovery_terminal": str(recovery_terminal),
+            "recovery_terminal_result": str(
+                recovery_terminal_result_path(recovery_terminal)
+            ),
+        }
+
+    def bind_post_replace_signal_recovery(
+        recovery: dict[str, object],
+    ) -> None:
+        if post_replace_signal is None:
+            return
+        post_replace_signal.recovery_details = {
+            "interrupted_phase": "post_replace_validation",
+            "receipt_path": str(receipt),
+            "backup_path": str(backup),
+            "recovery_locators": apply_recovery_locators(),
+            "post_replace_recovery": recovery,
+        }
+
+    def finish_post_replace_outcome(
+        value: tuple[int, dict[str, object]],
+    ) -> tuple[int, dict[str, object]]:
+        if post_replace_signal is None:
+            return value
+        exit_code, payload = value
+        bind_post_replace_signal_recovery(
+            {
+                "exit_code": exit_code,
+                **payload,
+            }
+        )
+        raise post_replace_signal.with_traceback(post_replace_signal_traceback)
 
     def finalize_apply_state() -> None:
         nonlocal finalized, retain_stage
@@ -8010,31 +8053,51 @@ def _apply_transaction_inner(
 
             post_validation: ValidatorResult | None = None
             if post_failure is None:
-                post_validation = run_validator(
-                    args.validator_command,
-                    rules,
-                    timeout_seconds=args.validator_timeout_seconds,
-                )
-                if not post_validation.valid:
+                try:
+                    post_validation = run_validator(
+                        args.validator_command,
+                        rules,
+                        timeout_seconds=args.validator_timeout_seconds,
+                    )
+                except ForwardedValidatorSignal as event:
+                    post_replace_signal = event
+                    post_replace_signal_traceback = event.__traceback__
                     post_failure = {
-                        "status": "post_replace_validation_failed",
-                        "validator": post_validation.to_json(),
+                        "status": "post_replace_validation_interrupted",
+                        "signal": event.signum,
+                        "signal_name": signal.Signals(event.signum).name,
+                        **(
+                            {"validator_cleanup_errors": list(event.cleanup_errors)}
+                            if event.cleanup_errors
+                            else {}
+                        ),
                     }
+                else:
+                    if not post_validation.valid:
+                        post_failure = {
+                            "status": "post_replace_validation_failed",
+                            "validator": post_validation.to_json(),
+                        }
 
             try:
                 evidence.validate()
             except TransactionError as error:
                 retain_stage = True
-                return EXIT_POST_REPLACE_FAILED, {
-                    "status": "recovery_required",
-                    "post_replace_failure": {
-                        "status": error.status,
-                        "message": str(error),
-                        **error.details,
-                    },
-                    "receipt_path": str(receipt),
-                    "backup_path": str(backup),
-                }
+                return finish_post_replace_outcome(
+                    (
+                        EXIT_POST_REPLACE_FAILED,
+                        {
+                            "status": "recovery_required",
+                            "post_replace_failure": {
+                                "status": error.status,
+                                "message": str(error),
+                                **error.details,
+                            },
+                            "receipt_path": str(receipt),
+                            "backup_path": str(backup),
+                        },
+                    )
+                )
             try:
                 _post_bytes, post_live = read_bound_regular_child(
                     rules,
@@ -8043,59 +8106,79 @@ def _apply_transaction_inner(
                 )
             except TransactionError as error:
                 retain_stage = True
-                return EXIT_POST_REPLACE_FAILED, {
-                    "status": "recovery_required",
-                    "post_replace_failure": {
-                        "status": error.status,
-                        "message": str(error),
-                    },
-                    "receipt_path": str(receipt),
-                    "backup_path": str(backup),
-                }
+                return finish_post_replace_outcome(
+                    (
+                        EXIT_POST_REPLACE_FAILED,
+                        {
+                            "status": "recovery_required",
+                            "post_replace_failure": {
+                                "status": error.status,
+                                "message": str(error),
+                            },
+                            "receipt_path": str(receipt),
+                            "backup_path": str(backup),
+                        },
+                    )
+                )
             try:
                 evidence.validate()
             except TransactionError as error:
                 retain_stage = True
-                return EXIT_POST_REPLACE_FAILED, {
-                    "status": "recovery_required",
-                    "post_replace_failure": {
-                        "status": error.status,
-                        "message": str(error),
-                        **error.details,
-                    },
-                    "receipt_path": str(receipt),
-                    "backup_path": str(backup),
-                }
+                return finish_post_replace_outcome(
+                    (
+                        EXIT_POST_REPLACE_FAILED,
+                        {
+                            "status": "recovery_required",
+                            "post_replace_failure": {
+                                "status": error.status,
+                                "message": str(error),
+                                **error.details,
+                            },
+                            "receipt_path": str(receipt),
+                            "backup_path": str(backup),
+                        },
+                    )
+                )
             post_mismatches = property_mismatches(installed_expected, post_live)
             if post_mismatches:
                 retain_stage = True
-                return EXIT_POST_REPLACE_FAILED, {
-                    "status": "recovery_required",
-                    "post_replace_failure": {
-                        "status": "live_changed_after_replace",
-                        "mismatched_properties": post_mismatches,
-                    },
-                    "actual_live": post_live.to_json(),
-                    "receipt_path": str(receipt),
-                    "backup_path": str(backup),
-                }
+                return finish_post_replace_outcome(
+                    (
+                        EXIT_POST_REPLACE_FAILED,
+                        {
+                            "status": "recovery_required",
+                            "post_replace_failure": {
+                                "status": "live_changed_after_replace",
+                                "mismatched_properties": post_mismatches,
+                            },
+                            "actual_live": post_live.to_json(),
+                            "receipt_path": str(receipt),
+                            "backup_path": str(backup),
+                        },
+                    )
+                )
 
             if post_failure is not None:
                 try:
                     evidence.validate()
                 except TransactionError as error:
                     retain_stage = True
-                    return EXIT_POST_REPLACE_FAILED, {
-                        "status": "recovery_required",
-                        "post_replace_failure": post_failure,
-                        "recovery_evidence_failure": {
-                            "status": error.status,
-                            "message": str(error),
-                            **error.details,
-                        },
-                        "receipt_path": str(receipt),
-                        "backup_path": str(backup),
-                    }
+                    return finish_post_replace_outcome(
+                        (
+                            EXIT_POST_REPLACE_FAILED,
+                            {
+                                "status": "recovery_required",
+                                "post_replace_failure": post_failure,
+                                "recovery_evidence_failure": {
+                                    "status": error.status,
+                                    "message": str(error),
+                                    **error.details,
+                                },
+                                "receipt_path": str(receipt),
+                                "backup_path": str(backup),
+                            },
+                        )
+                    )
                 rolled_back, rollback_result = rollback(
                     stage=stage,
                     rules=rules,
@@ -8136,31 +8219,41 @@ def _apply_transaction_inner(
                         evidence.restored = True
                     except TransactionError as error:
                         retain_stage = True
-                        return EXIT_POST_REPLACE_FAILED, {
-                            "status": "recovery_required",
+                        return finish_post_replace_outcome(
+                            (
+                                EXIT_POST_REPLACE_FAILED,
+                                {
+                                    "status": "recovery_required",
+                                    "post_replace_failure": post_failure,
+                                    "rollback": rollback_result,
+                                    "recovery_terminal_failure": {
+                                        "status": error.status,
+                                        "message": str(error),
+                                        **error.details,
+                                    },
+                                    "receipt_path": str(receipt),
+                                    "backup_path": str(backup),
+                                },
+                            )
+                        )
+                retain_stage = not rolled_back
+                return finish_post_replace_outcome(
+                    (
+                        EXIT_POST_REPLACE_FAILED,
+                        {
+                            "status": (
+                                "post_replace_failed_rolled_back"
+                                if rolled_back
+                                else "recovery_required"
+                            ),
                             "post_replace_failure": post_failure,
                             "rollback": rollback_result,
-                            "recovery_terminal_failure": {
-                                "status": error.status,
-                                "message": str(error),
-                                **error.details,
-                            },
+                            "recovery_terminal": recovery_terminal_result,
                             "receipt_path": str(receipt),
                             "backup_path": str(backup),
-                        }
-                retain_stage = not rolled_back
-                return EXIT_POST_REPLACE_FAILED, {
-                    "status": (
-                        "post_replace_failed_rolled_back"
-                        if rolled_back
-                        else "recovery_required"
-                    ),
-                    "post_replace_failure": post_failure,
-                    "rollback": rollback_result,
-                    "recovery_terminal": recovery_terminal_result,
-                    "receipt_path": str(receipt),
-                    "backup_path": str(backup),
-                }
+                        },
+                    )
+                )
 
             try:
                 evidence.validate()
@@ -8189,6 +8282,43 @@ def _apply_transaction_inner(
                 ),
             }
     except BaseException as error:
+        if post_replace_signal is not None and error is not post_replace_signal:
+            retain_stage = True
+            recovery_failure = {
+                "status": (
+                    error.status
+                    if isinstance(error, TransactionError)
+                    else "post_replace_recovery_failed"
+                ),
+                "message": str(error),
+                **(error.details if isinstance(error, TransactionError) else {}),
+            }
+            bind_post_replace_signal_recovery(
+                {
+                    "exit_code": EXIT_POST_REPLACE_FAILED,
+                    "status": "recovery_required",
+                    "post_replace_failure": {
+                        "status": "post_replace_validation_interrupted",
+                        "signal": post_replace_signal.signum,
+                        "signal_name": signal.Signals(post_replace_signal.signum).name,
+                    },
+                    "recovery_failure": recovery_failure,
+                }
+            )
+            attach_failures_to_exception(
+                post_replace_signal,
+                "post_replace_recovery_failures",
+                [
+                    structured_operation_failure(
+                        "post-replace-recovery",
+                        "unexpected-recovery-error",
+                        error,
+                    )
+                ],
+            )
+            raise post_replace_signal.with_traceback(
+                post_replace_signal_traceback
+            ) from error
         if (
             isinstance(error, TransactionError) and error.status == "recovery_required"
         ) or (stage is not None and stage.mutation_uncertain):
@@ -9343,6 +9473,7 @@ def recover_schema_v4_transaction(
                 state="P",
             )
         if state is None:
+            mutation_tracker.promote_deferred_mutation()
             if (
                 live_actual is not None
                 and content_access_and_object_policy_match(
@@ -10321,9 +10452,11 @@ def _recover_transaction_bound(
                     )
                     preflight_terminal = terminal_evidence.validate()
                     observed_state = mutation_tracker.last_observed or {}
-                    if preflight_terminal.get("state") == RECOVERY_TERMINAL_RESERVED:
-                        if observed_state.get("transaction_state") == "Q":
-                            mutation_tracker.clear_deferred_mutation()
+                    if (
+                        preflight_terminal.get("state") == RECOVERY_TERMINAL_RESERVED
+                        and observed_state.get("transaction_state") == "Q"
+                    ):
+                        mutation_tracker.clear_deferred_mutation()
                     else:
                         mutation_tracker.promote_deferred_mutation()
                     validate_controls()
@@ -10574,9 +10707,18 @@ def main(argv: list[str] | None = None) -> int:
             "status": "interrupted",
             "signal": event.signum,
             "signal_name": signal.Signals(event.signum).name,
+            **event.recovery_details,
         }
         if event.cleanup_errors:
             payload["validator_cleanup_errors"] = event.cleanup_errors
+        for attribute, key in (
+            ("post_replace_recovery_failures", "post_replace_recovery_failures"),
+            ("lock_finalization_failures", "lock_finalization_failures"),
+            ("cleanup_failures", "cleanup_failures"),
+        ):
+            failures = getattr(event, attribute, None)
+            if isinstance(failures, list):
+                payload[key] = failures
     except TransactionError as error:
         exit_code = error.exit_code
         payload = {

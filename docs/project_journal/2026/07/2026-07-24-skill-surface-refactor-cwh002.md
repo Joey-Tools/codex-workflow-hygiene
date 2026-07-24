@@ -80,6 +80,12 @@ superseded_by:
 - Unified validator finalization around one primary-error accumulator so raw
   wait/read errors and forwarded signals survive TERM/KILL, drain/reap,
   observer, selector, pipe, and signal-restoration failures.
+- Routed a managed signal from the post-replacement validator through the
+  normal rollback/recovery state machine while retaining the signal-derived
+  exit code and `interrupted` as the primary outcome.
+- Promoted deferred schema-v4 possible-prior-state evidence whenever a
+  reserved terminal does not accompany exact `Q`, including state-none loss
+  of a `P` candidate or `R` backup.
 - Bound idempotent recovery to exact original or persisted recovery-terminal
   identity, and revalidated recovery copies after locator binding.
 - Reduced the Joey authoring overlay to placement and validation policy while
@@ -184,9 +190,11 @@ superseded_by:
   `recovery_required`; only proved pre-mutation `Q` drift remains
   `recovery_refused`.
 - A reserved terminal clears deferred mutation evidence only after the full
-  v4 role tuple proves `Q`. Exact installed live plus exact original staged
-  evidence now proves a prior exchange even when backup is unknown and the
-  prepared leaf is missing.
+  v4 role tuple proves `Q`. Every other reserved-terminal or state-none
+  observation promotes `possible_prior_transaction_state` when mutation
+  cannot be excluded; exact installed live plus exact original staged evidence
+  also proves a prior exchange even when backup is unknown and the prepared
+  leaf is missing.
 - Schema-v4 binds the terminal reservation's exact identity, size/digest,
   access policy, and link policy to the receipt regardless of decoded state.
   Only schema-v3 explicitly accepts the historical same-inode restored
@@ -204,6 +212,10 @@ superseded_by:
   traceback, and attaches each secondary failure in stable structured order.
   Cleanup-only uncertainty is `validator_cleanup_failed`; restored handler
   identities and the inherited signal mask are reread before success.
+- A managed signal during the second validator completes rollback or records
+  operator recovery before it is re-raised. Its JSON result keeps the signal
+  primary and includes exact receipt, backup, terminal, prepared, and staged
+  recovery locators plus the nested rollback/recovery outcome.
 - An apparent apply or no-change result cannot remain successful after final
   evidence or rules-parent close uncertainty. It reports
   `final_evidence_descriptor_close_failed`, retains the original
@@ -226,7 +238,7 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 190 passed on Python 3.13. New cases cover fixed
+- Rules transaction tests: 193 passed on Python 3.13. New cases cover fixed
   stage zero-artifact failures, parse-to-lock receipt races, delegated-v3
   post-mutation receipt and parent changes, every terminal publication crash
   point, successful retry, terminal truncation prohibition, terminal/primary
@@ -266,8 +278,18 @@ superseded_by:
   validation; and preservation of every secondary validator cleanup failure
   when a post-replacement raw I/O error becomes `recovery_required`. Ten
   focused compatibility cases passed on system Python 3.9.6.
-- Full repository suite covered all 1,252 tests. The sandboxed run passed
-  1,248 and failed only four unrelated temporary merge-commit fixtures because
+- The newest focused compatibility run passed 7/7 on system Python 3.9.6,
+  including post-replacement signal rollback, `P` candidate loss, `R` backup
+  loss, reserved prepared drift, and validator cleanup-primary precedence.
+- The three newest transaction cases cover a real managed `SIGTERM` during the
+  live-path validator plus durable `P`-candidate and `R`-backup loss. The
+  signal case proves rollback, primary exit `128 + signal`, nested recovery
+  evidence, exact locators, terminal publication, and validator quiescence;
+  the schema-v4 cases prove `recovery_required` with mutation journal and
+  locators. Existing later-live-state and untrusted-inode cases now assert the
+  same conservative possible-prior-state contract.
+- Full repository suite covered all 1,255 tests. The sandboxed run passed
+  1,251 and failed only four unrelated temporary merge-commit fixtures because
   sandbox GPG could not reach `~/.gnupg/keyboxd`; those exact four tests passed
   in the approved narrow GPG-capable rerun.
 - Ruff check and Ruff format-check passed for both changed Python files.
