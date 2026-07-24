@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+from typing import BinaryIO
 import unicodedata
 
 
@@ -49,6 +50,7 @@ PREPARED_CANDIDATE_SUFFIX = ".prepared-candidate"
 RECOVERY_TERMINAL_RESULT_SUFFIX = ".result"
 RECOVERY_TERMINAL_TEMP_MARKER = ".result-pending-"
 PRIVATE_STAGE_DESCRIPTOR_CLEANUP_REASON = "private_stage_descriptor_close_failed"
+FINAL_EVIDENCE_DESCRIPTOR_CLEANUP_REASON = "final_evidence_descriptor_close_failed"
 # The legacy stage_cleanup_retained quarantine status is intentionally not emitted.
 VALIDATOR_TERM_GRACE_SECONDS = 0.25
 VALIDATOR_KILL_DRAIN_SECONDS = 1.0
@@ -527,6 +529,109 @@ def attach_failures_to_exception(
     )
 
 
+def attach_validator_failures_to_exception(
+    error: BaseException,
+    failures: list[dict[str, object]],
+) -> None:
+    """Attach validator finalization evidence without displacing the primary."""
+
+    if not failures:
+        return
+    try:
+        if isinstance(error, ForwardedValidatorSignal):
+            error.cleanup_errors.extend(failures)
+        elif isinstance(error, TransactionError):
+            existing = error.details.get("validator_cleanup_failures")
+            if isinstance(existing, list):
+                existing.extend(failures)
+            else:
+                error.details["validator_cleanup_failures"] = list(failures)
+        else:
+            existing = getattr(error, "validator_cleanup_failures", None)
+            if isinstance(existing, list):
+                existing.extend(failures)
+            else:
+                setattr(error, "validator_cleanup_failures", list(failures))
+    except BaseException:
+        # The original exception and traceback are authoritative. Exception
+        # implementations with hostile attribute hooks must not replace them.
+        pass
+    add_exception_note_compat(
+        error,
+        "validator finalization also failed: "
+        + "; ".join(
+            f"{failure.get('descriptor', failure.get('operation', 'unknown'))}: "
+            f"{failure['error_type']}: {failure['message']}"
+            for failure in failures
+        ),
+    )
+
+
+@dataclass
+class ValidatorFailureAccumulator:
+    """Preserve one body failure while attempting every validator finalizer."""
+
+    primary_error: BaseException | None = None
+    primary_traceback: object | None = None
+    secondary_failures: list[dict[str, object]] = field(default_factory=list)
+
+    def capture_primary(self, error: BaseException) -> None:
+        if self.primary_error is None:
+            self.primary_error = error
+            self.primary_traceback = error.__traceback__
+            return
+        self.record("additional-primary", error)
+
+    def record(self, descriptor: str, error: BaseException) -> None:
+        self.secondary_failures.append(
+            structured_operation_failure(
+                "validator-finalization",
+                descriptor,
+                error,
+            )
+        )
+
+    def extend(self, failures: list[dict[str, object]]) -> None:
+        self.secondary_failures.extend(failures)
+
+    def attempt(
+        self,
+        descriptor: str,
+        operation: Callable[[], object],
+    ) -> object | None:
+        try:
+            return operation()
+        except BaseException as error:
+            if (
+                isinstance(error, ForwardedValidatorSignal)
+                and self.primary_error is None
+            ):
+                self.capture_primary(error)
+            else:
+                self.record(descriptor, error)
+            return None
+
+    def finish(self, result: ValidatorResult | None) -> ValidatorResult:
+        if self.primary_error is not None:
+            attach_validator_failures_to_exception(
+                self.primary_error,
+                self.secondary_failures,
+            )
+            raise self.primary_error.with_traceback(self.primary_traceback)
+        if self.secondary_failures:
+            raise TransactionError(
+                "validator_cleanup_failed",
+                "validator finalization could not be verified",
+                details={"validator_cleanup_failures": list(self.secondary_failures)},
+            )
+        if result is None:
+            raise TransactionError(
+                "validator_cleanup_failed",
+                "validator exited without a terminal result",
+            )
+        return result
+
+
 def descriptor_cleanup_error(
     failures: list[dict[str, object]],
     *,
@@ -568,6 +673,44 @@ def finalize_descriptor_cleanup(
             message=message,
         )
     return failures
+
+
+def final_evidence_cleanup_uncertain_outcome(
+    outcome: tuple[int, dict[str, object]],
+    failures: list[dict[str, object]],
+) -> tuple[int, dict[str, object]]:
+    """Turn an apparent apply success into explicit recovery uncertainty."""
+
+    payload = dict(outcome[1])
+    operation_status = payload.get("status")
+    payload.update(
+        {
+            "status": "recovery_required",
+            "operation_status": operation_status,
+            "reason": FINAL_EVIDENCE_DESCRIPTOR_CLEANUP_REASON,
+            "cleanup_reason": FINAL_EVIDENCE_DESCRIPTOR_CLEANUP_REASON,
+        }
+    )
+    attach_cleanup_failures_to_payload(payload, failures)
+    return EXIT_POST_REPLACE_FAILED, payload
+
+
+def final_evidence_cleanup_uncertain_error(
+    outcome: tuple[int, dict[str, object]],
+    failures: list[dict[str, object]],
+) -> TransactionError:
+    _exit_code, payload = final_evidence_cleanup_uncertain_outcome(
+        outcome,
+        failures,
+    )
+    details = dict(payload)
+    details.pop("status", None)
+    return TransactionError(
+        "recovery_required",
+        "final transaction evidence descriptor cleanup could not be verified",
+        exit_code=EXIT_POST_REPLACE_FAILED,
+        details=details,
+    )
 
 
 def private_stage_descriptor_cleanup_failures(
@@ -4184,8 +4327,9 @@ class _ValidatorExitObserver:
 
     def close(self) -> None:
         if self.kqueue is not None:
-            self.kqueue.close()
+            kqueue = self.kqueue
             self.kqueue = None
+            kqueue.close()
 
 
 def _read_validator_events(
@@ -4208,7 +4352,6 @@ def _read_validator_events(
         progressed = True
         if not chunk:
             selector.unregister(stream)
-            stream.close()
             continue
         if not retain:
             continue
@@ -4241,15 +4384,15 @@ def _emergency_stop_validator_process_group(
     cleanup_errors: list[dict[str, object]] = []
 
     def record(label: str, error: BaseException) -> None:
-        cleanup_errors.append(
-            {
-                "operation": label,
-                "error_type": type(error).__name__,
-                "message": compact(str(error)),
-            }
-        )
+        failure = structured_operation_failure(label, label, error)
+        cleanup_errors.append(failure)
 
-    if process.returncode is not None:
+    try:
+        already_reaped = process.returncode is not None
+    except BaseException as error:
+        record("inspect-process-group-identity-anchor", error)
+        already_reaped = False
+    if already_reaped:
         record(
             "process-group-identity-anchor",
             RuntimeError(
@@ -4274,8 +4417,24 @@ def _emergency_stop_validator_process_group(
             except BaseException as direct_error:
                 record(f"signal-direct-child:{signum}", direct_error)
 
-    def drain_until(deadline: float) -> None:
-        while time.monotonic() < deadline:
+    def deadline_after(duration: float, label: str) -> float | None:
+        try:
+            return time.monotonic() + duration
+        except BaseException as error:
+            record(label, error)
+            return None
+
+    def drain_until(deadline: float | None) -> None:
+        if deadline is None:
+            return
+        while True:
+            try:
+                now = time.monotonic()
+            except BaseException as error:
+                record("read-validator-cleanup-clock", error)
+                break
+            if now >= deadline:
+                break
             try:
                 has_streams = selector is not None and bool(selector.get_map())
             except BaseException as error:
@@ -4283,7 +4442,7 @@ def _emergency_stop_validator_process_group(
                 break
             if not has_streams:
                 try:
-                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+                    time.sleep(min(0.01, max(0.0, deadline - now)))
                 except BaseException as error:
                     record("wait-for-validator-exit", error)
                     break
@@ -4295,7 +4454,7 @@ def _emergency_stop_validator_process_group(
                     max_output_bytes=max_output_bytes,
                     timeout_seconds=min(
                         0.02,
-                        max(0.0, deadline - time.monotonic()),
+                        max(0.0, deadline - now),
                     ),
                     retain=False,
                 )
@@ -4304,24 +4463,49 @@ def _emergency_stop_validator_process_group(
                 break
 
     signal_group(signal.SIGTERM)
-    drain_until(time.monotonic() + VALIDATOR_TERM_GRACE_SECONDS)
+    drain_until(
+        deadline_after(
+            VALIDATOR_TERM_GRACE_SECONDS,
+            "start-validator-term-deadline",
+        )
+    )
     signal_group(signal.SIGKILL)
-    kill_deadline = time.monotonic() + VALIDATOR_KILL_DRAIN_SECONDS
+    kill_deadline = deadline_after(
+        VALIDATOR_KILL_DRAIN_SECONDS,
+        "start-validator-kill-deadline",
+    )
     drain_until(kill_deadline)
     # Reissue the group kill before, never after, releasing the unreaped
     # leader that pins this transaction's numeric PGID.
     signal_group(signal.SIGKILL)
+    reap_timeout = 0.0
+    if kill_deadline is not None:
+        try:
+            reap_timeout = max(0.0, kill_deadline - time.monotonic())
+        except BaseException as error:
+            record("read-validator-reap-clock", error)
     try:
-        process.wait(timeout=max(0.0, kill_deadline - time.monotonic()))
+        process.wait(timeout=reap_timeout)
     except subprocess.TimeoutExpired as error:
         record("reap-direct-child", error)
         try:
             process.kill()
+        except BaseException as kill_error:
+            record("kill-direct-child", kill_error)
+        try:
             process.wait(timeout=0.1)
-        except BaseException as final_error:
-            record("kill-and-reap-direct-child", final_error)
+        except BaseException as reap_error:
+            record("final-reap-direct-child", reap_error)
     except BaseException as error:
         record("reap-direct-child", error)
+        try:
+            process.kill()
+        except BaseException as kill_error:
+            record("kill-direct-child-after-reap-failure", kill_error)
+        try:
+            process.wait(timeout=0.1)
+        except BaseException as reap_error:
+            record("final-reap-direct-child-after-failure", reap_error)
     return cleanup_errors
 
 
@@ -4513,24 +4697,39 @@ def _start_validator_signal_supervision() -> tuple[
             previous_handlers[signum] = signal.getsignal(signum)
             signal.signal(signum, gate.handle)
     except BaseException as error:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
-        pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
-        raise TransactionError(
+        launch_error = TransactionError(
             "validator_supervision_unsupported",
             f"cannot install validator signal supervision: {error}",
-        ) from error
+        )
+        attach_validator_failures_to_exception(
+            launch_error,
+            _restore_validator_signal_supervision(
+                gate,
+                previous_handlers,
+                set(inherited_mask),
+            ),
+        )
+        raise launch_error from error
 
     # Popen and its child inherit the launcher's original mask.  The gate is
     # deliberately unarmed here: a signal delivered before Popen returns is
     # latched, not raised before the parent owns the child's PID/PGID.
     try:
         pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
-    except BaseException:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
-        pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
-        raise
+    except BaseException as error:
+        launch_error = TransactionError(
+            "validator_supervision_unsupported",
+            f"cannot restore inherited signal mask before validator launch: {error}",
+        )
+        attach_validator_failures_to_exception(
+            launch_error,
+            _restore_validator_signal_supervision(
+                gate,
+                previous_handlers,
+                set(inherited_mask),
+            ),
+        )
+        raise launch_error from error
     return gate, previous_handlers, set(inherited_mask), supervisor_mask
 
 
@@ -4539,35 +4738,130 @@ def _arm_validator_signal_supervision(
     supervisor_mask: set[signal.Signals],
 ) -> None:
     pthread_sigmask = signal.pthread_sigmask
+    primary_error: BaseException | None = None
+    primary_traceback: object | None = None
     try:
         gate.arm()
-    finally:
-        # If the launcher blocked a managed signal, unblocking it here causes
-        # the now-armed handler to raise only after Popen returned a bound PID.
+    except BaseException as error:
+        primary_error = error
+        primary_traceback = error.__traceback__
+    try:
+        # If the launcher blocked a managed signal, unblocking it here causes the
+        # now-armed handler to raise only after Popen returned a bound PID.
         pthread_sigmask(signal.SIG_SETMASK, supervisor_mask)
+    except BaseException as error:
+        if primary_error is None:
+            raise
+        attach_validator_failures_to_exception(
+            primary_error,
+            [
+                structured_operation_failure(
+                    "validator-finalization",
+                    "arm-signal-mask",
+                    error,
+                )
+            ],
+        )
+    if primary_error is not None:
+        raise primary_error.with_traceback(primary_traceback)
 
 
-def _quiesce_validator_signal_supervision(gate: ValidatorSignalGate) -> None:
+def _quiesce_validator_signal_supervision(
+    gate: ValidatorSignalGate,
+) -> list[dict[str, object]]:
     """Prevent later managed signals from interrupting synchronous cleanup."""
 
-    gate.close()
+    failures: list[dict[str, object]] = []
+    try:
+        gate.close()
+    except BaseException as error:
+        failures.append(
+            structured_operation_failure(
+                "validator-finalization",
+                "signal-gate-quiesce",
+                error,
+            )
+        )
     for signum in MANAGED_VALIDATOR_SIGNALS:
-        signal.signal(signum, signal.SIG_IGN)
+        try:
+            signal.signal(signum, signal.SIG_IGN)
+        except BaseException as error:
+            failures.append(
+                structured_operation_failure(
+                    "validator-finalization",
+                    f"signal-quiesce:{signal.Signals(signum).name}",
+                    error,
+                )
+            )
+    return failures
 
 
 def _restore_validator_signal_supervision(
     gate: ValidatorSignalGate,
     previous_handlers: dict[int, signal.Handlers],
     inherited_mask: set[signal.Signals],
-) -> None:
+) -> list[dict[str, object]]:
+    """Best-effort restoration plus post-replacement identity validation."""
+
+    failures: list[dict[str, object]] = []
+
+    def attempt(descriptor: str, operation: Callable[[], object]) -> object | None:
+        try:
+            return operation()
+        except BaseException as error:
+            failures.append(
+                structured_operation_failure(
+                    "validator-finalization",
+                    descriptor,
+                    error,
+                )
+            )
+            return None
+
     pthread_sigmask = signal.pthread_sigmask
-    pthread_sigmask(signal.SIG_BLOCK, MANAGED_VALIDATOR_SIGNALS)
-    try:
-        gate.close()
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
-    finally:
-        pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
+    attempt(
+        "signal-restore:block-managed",
+        lambda: pthread_sigmask(signal.SIG_BLOCK, MANAGED_VALIDATOR_SIGNALS),
+    )
+    attempt("signal-restore:gate-close", gate.close)
+    for signum, handler in previous_handlers.items():
+        signal_name = signal.Signals(signum).name
+        attempt(
+            f"signal-restore:handler:{signal_name}",
+            lambda signum=signum, handler=handler: signal.signal(
+                signum,
+                handler,
+            ),
+        )
+    for signum, handler in previous_handlers.items():
+        signal_name = signal.Signals(signum).name
+
+        def validate_handler(
+            signum: int = signum,
+            handler: signal.Handlers = handler,
+        ) -> None:
+            observed = signal.getsignal(signum)
+            if observed != handler:
+                raise RuntimeError(
+                    f"{signal.Signals(signum).name} handler replacement did not persist"
+                )
+
+        attempt(
+            f"signal-restore:validate-handler:{signal_name}",
+            validate_handler,
+        )
+    attempt(
+        "signal-restore:set-inherited-mask",
+        lambda: pthread_sigmask(signal.SIG_SETMASK, inherited_mask),
+    )
+
+    def validate_mask() -> None:
+        observed = pthread_sigmask(signal.SIG_BLOCK, set())
+        if set(observed) != set(inherited_mask):
+            raise RuntimeError("inherited signal mask replacement did not persist")
+
+    attempt("signal-restore:validate-mask", validate_mask)
+    return failures
 
 
 class AnonymousValidatorInput:
@@ -4826,115 +5120,132 @@ def run_validator(
         supervisor_signal_mask,
     ) = _start_validator_signal_supervision()
     process: subprocess.Popen[bytes] | None = None
+    stdout_stream: BinaryIO | None = None
+    stderr_stream: BinaryIO | None = None
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     exit_observer: _ValidatorExitObserver | None = None
     selector: selectors.BaseSelector | None = None
     timed_out = False
     output_limit_exceeded = False
     descendants_terminated = False
-    try:
+    failures = ValidatorFailureAccumulator()
+    result: ValidatorResult | None = None
+
+    def execute_validator() -> ValidatorResult:
+        nonlocal process
+        nonlocal stdout_stream
+        nonlocal stderr_stream
+        nonlocal exit_observer
+        nonlocal selector
+        nonlocal timed_out
+        nonlocal output_limit_exceeded
+        nonlocal descendants_terminated
         try:
-            try:
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                    close_fds=True,
-                    pass_fds=pass_fds,
-                )
-            except OSError as error:
-                _arm_validator_signal_supervision(
-                    signal_gate,
-                    supervisor_signal_mask,
-                )
-                raise TransactionError(
-                    "validator_launch_failed",
-                    f"cannot launch validator: {error}",
-                ) from error
-            except BaseException:
-                _arm_validator_signal_supervision(
-                    signal_gate,
-                    supervisor_signal_mask,
-                )
-                raise
-            _arm_validator_signal_supervision(
-                signal_gate,
-                supervisor_signal_mask,
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                close_fds=True,
+                pass_fds=pass_fds,
             )
+        except OSError as error:
+            launch_error = TransactionError(
+                "validator_launch_failed",
+                f"cannot launch validator: {error}",
+            )
+            try:
+                _arm_validator_signal_supervision(
+                    signal_gate,
+                    supervisor_signal_mask,
+                )
+            except BaseException as arm_error:
+                attach_validator_failures_to_exception(
+                    launch_error,
+                    [
+                        structured_operation_failure(
+                            "validator-finalization",
+                            "arm-after-launch-failure",
+                            arm_error,
+                        )
+                    ],
+                )
+            raise launch_error from error
+        except BaseException as error:
+            primary_traceback = error.__traceback__
+            try:
+                _arm_validator_signal_supervision(
+                    signal_gate,
+                    supervisor_signal_mask,
+                )
+            except BaseException as arm_error:
+                attach_validator_failures_to_exception(
+                    error,
+                    [
+                        structured_operation_failure(
+                            "validator-finalization",
+                            "arm-after-launch-failure",
+                            arm_error,
+                        )
+                    ],
+                )
+            raise error.with_traceback(primary_traceback)
+        _arm_validator_signal_supervision(
+            signal_gate,
+            supervisor_signal_mask,
+        )
 
-            exit_observer = _ValidatorExitObserver(process)
-            assert process.stdout is not None
-            assert process.stderr is not None
-            selector = selectors.DefaultSelector()
-            for stream, label in (
-                (process.stdout, "stdout"),
-                (process.stderr, "stderr"),
-            ):
-                os.set_blocking(stream.fileno(), False)
-                selector.register(stream, selectors.EVENT_READ, label)
+        stdout_stream = process.stdout
+        stderr_stream = process.stderr
+        exit_observer = _ValidatorExitObserver(process)
+        assert stdout_stream is not None
+        assert stderr_stream is not None
+        selector = selectors.DefaultSelector()
+        for stream, label in (
+            (stdout_stream, "stdout"),
+            (stderr_stream, "stderr"),
+        ):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, label)
 
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                    break
-                overflow, _progressed = _read_validator_events(
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            overflow, _progressed = _read_validator_events(
+                selector,
+                buffers,
+                max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
+                timeout_seconds=min(0.05, remaining),
+                retain=True,
+            )
+            if overflow:
+                output_limit_exceeded = True
+                break
+            if not exit_observer.child_exited():
+                continue
+
+            # Reap every byte already made readable by the direct child.
+            # A still-open pipe or surviving group member then belongs to a
+            # descendant and is not an acceptable terminal state.
+            while selector.get_map():
+                overflow, progressed = _read_validator_events(
                     selector,
                     buffers,
                     max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
-                    timeout_seconds=min(0.05, remaining),
+                    timeout_seconds=0.01,
                     retain=True,
                 )
                 if overflow:
                     output_limit_exceeded = True
                     break
-                if not exit_observer.child_exited():
-                    continue
-
-                # Reap every byte already made readable by the direct child.
-                # A still-open pipe or surviving group member then belongs to
-                # a descendant and is not an acceptable terminal state.
-                while selector.get_map():
-                    overflow, progressed = _read_validator_events(
-                        selector,
-                        buffers,
-                        max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
-                        timeout_seconds=0.01,
-                        retain=True,
-                    )
-                    if overflow:
-                        output_limit_exceeded = True
-                        break
-                    if not progressed:
-                        break
-                if output_limit_exceeded:
+                if not progressed:
                     break
-                returncode, cleanup_descendants = _stop_validator_process_group(
-                    process,
-                    exit_observer,
-                    selector,
-                    buffers,
-                    max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
-                )
-                descendants_terminated = descendants_terminated or cleanup_descendants
-                if descendants_terminated:
-                    return ValidatorResult(
-                        125,
-                        bytes(buffers["stdout"]).decode("utf-8", "replace"),
-                        bytes(buffers["stderr"]).decode("utf-8", "replace"),
-                        descendants_terminated=True,
-                    )
-                return ValidatorResult(
-                    returncode,
-                    bytes(buffers["stdout"]).decode("utf-8", "replace"),
-                    bytes(buffers["stderr"]).decode("utf-8", "replace"),
-                )
-
-            assert exit_observer is not None
-            assert selector is not None
-            _returncode, cleanup_descendants = _stop_validator_process_group(
+            if output_limit_exceeded:
+                break
+            returncode, cleanup_descendants = _stop_validator_process_group(
                 process,
                 exit_observer,
                 selector,
@@ -4942,57 +5253,74 @@ def run_validator(
                 max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
             )
             descendants_terminated = descendants_terminated or cleanup_descendants
+            if descendants_terminated:
+                return ValidatorResult(
+                    125,
+                    bytes(buffers["stdout"]).decode("utf-8", "replace"),
+                    bytes(buffers["stderr"]).decode("utf-8", "replace"),
+                    descendants_terminated=True,
+                )
             return ValidatorResult(
-                124 if timed_out else 125,
+                returncode,
                 bytes(buffers["stdout"]).decode("utf-8", "replace"),
                 bytes(buffers["stderr"]).decode("utf-8", "replace"),
-                timed_out=timed_out,
-                output_limit_exceeded=output_limit_exceeded,
-                descendants_terminated=descendants_terminated,
             )
-        except ForwardedValidatorSignal as event:
-            _quiesce_validator_signal_supervision(signal_gate)
-            if process is not None:
-                event.cleanup_errors = _emergency_stop_validator_process_group(
-                    process,
-                    selector,
-                    buffers,
-                    max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
-                )
-            raise
-        except BaseException as error:
-            _quiesce_validator_signal_supervision(signal_gate)
-            cleanup_errors = (
-                _emergency_stop_validator_process_group(
-                    process,
-                    selector,
-                    buffers,
-                    max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
-                )
-                if process is not None
-                else []
-            )
-            if cleanup_errors and isinstance(error, TransactionError):
-                error.details.setdefault(
-                    "emergency_cleanup_errors",
-                    cleanup_errors,
-                )
-            raise
-        finally:
-            if exit_observer is not None:
-                exit_observer.close()
-            if selector is not None:
-                selector.close()
-            if process is not None:
-                for stream in (process.stdout, process.stderr):
-                    if stream is not None and not stream.closed:
-                        stream.close()
-    finally:
-        _restore_validator_signal_supervision(
-            signal_gate,
-            previous_signal_handlers,
-            inherited_signal_mask,
+
+        assert exit_observer is not None
+        assert selector is not None
+        _returncode, cleanup_descendants = _stop_validator_process_group(
+            process,
+            exit_observer,
+            selector,
+            buffers,
+            max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
         )
+        descendants_terminated = descendants_terminated or cleanup_descendants
+        return ValidatorResult(
+            124 if timed_out else 125,
+            bytes(buffers["stdout"]).decode("utf-8", "replace"),
+            bytes(buffers["stderr"]).decode("utf-8", "replace"),
+            timed_out=timed_out,
+            output_limit_exceeded=output_limit_exceeded,
+            descendants_terminated=descendants_terminated,
+        )
+
+    try:
+        result = execute_validator()
+    except BaseException as error:
+        failures.capture_primary(error)
+        failures.extend(_quiesce_validator_signal_supervision(signal_gate))
+        if process is not None:
+            emergency_result = failures.attempt(
+                "emergency-process-group-cleanup",
+                lambda: _emergency_stop_validator_process_group(
+                    process,
+                    selector,
+                    buffers,
+                    max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
+                ),
+            )
+            if isinstance(emergency_result, list):
+                failures.extend(emergency_result)
+    finally:
+        if exit_observer is not None:
+            failures.attempt("exit-observer-close", exit_observer.close)
+        if selector is not None:
+            failures.attempt("selector-close", selector.close)
+        for label, stream in (
+            ("stdout-pipe-close", stdout_stream),
+            ("stderr-pipe-close", stderr_stream),
+        ):
+            if stream is not None:
+                failures.attempt(label, stream.close)
+        failures.extend(
+            _restore_validator_signal_supervision(
+                signal_gate,
+                previous_signal_handlers,
+                inherited_signal_mask,
+            )
+        )
+    return failures.finish(result)
 
 
 def fsync_file_and_parent(path: Path) -> None:
@@ -7201,15 +7529,30 @@ def _apply_transaction_inner(
                     no_change_error = error
                     raise
                 finally:
-                    finalize_descriptor_cleanup(
-                        [("rules_parent", no_change_parent_binding.fd)],
-                        primary_error=no_change_error,
-                        payload=(
-                            no_change_outcome[1]
-                            if no_change_outcome is not None
-                            else None
-                        ),
+                    no_change_cleanup_failures = close_descriptors_best_effort(
+                        [("rules_parent", no_change_parent_binding.fd)]
                     )
+                    if no_change_cleanup_failures:
+                        if no_change_error is not None:
+                            attach_failures_to_exception(
+                                no_change_error,
+                                "cleanup_failures",
+                                no_change_cleanup_failures,
+                            )
+                        elif (
+                            no_change_outcome is not None and no_change_outcome[0] == 0
+                        ):
+                            raise final_evidence_cleanup_uncertain_error(
+                                no_change_outcome,
+                                no_change_cleanup_failures,
+                            )
+                        elif no_change_outcome is not None:
+                            attach_cleanup_failures_to_payload(
+                                no_change_outcome[1],
+                                no_change_cleanup_failures,
+                            )
+                        else:
+                            raise descriptor_cleanup_error(no_change_cleanup_failures)
             lock_acquired = False
 
         # The first validator sees only an unlinked descriptor-backed copy.  No
@@ -7859,6 +8202,11 @@ def _apply_transaction_inner(
                 and error.status == "recovery_required"
             )
         ):
+            validator_cleanup_failures = getattr(
+                error,
+                "validator_cleanup_failures",
+                None,
+            )
             raise TransactionError(
                 "recovery_required",
                 "durable prepared transaction evidence requires explicit recovery",
@@ -7871,6 +8219,11 @@ def _apply_transaction_inner(
                     ),
                     "message": str(error),
                     **(error.details if isinstance(error, TransactionError) else {}),
+                    **(
+                        {"validator_cleanup_failures": list(validator_cleanup_failures)}
+                        if isinstance(validator_cleanup_failures, list)
+                        else {}
+                    ),
                     "receipt_path": str(receipt),
                     "prepared_candidate_path": str(prepared_recovery_candidate),
                 },
@@ -7886,7 +8239,6 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
     primary_error: BaseException | None = None
     try:
         outcome = _apply_transaction_inner(args, cleanup_callbacks)
-        return outcome
     except BaseException as error:
         primary_error = error
         raise
@@ -7911,9 +8263,21 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     failures,
                 )
             elif outcome is not None:
-                attach_cleanup_failures_to_payload(outcome[1], failures)
+                if outcome[0] == 0:
+                    outcome = final_evidence_cleanup_uncertain_outcome(
+                        outcome,
+                        failures,
+                    )
+                else:
+                    attach_cleanup_failures_to_payload(outcome[1], failures)
             else:
                 raise descriptor_cleanup_error(failures)
+    if outcome is None:
+        raise TransactionError(
+            "runtime_error",
+            "apply transaction returned without a terminal outcome",
+        )
+    return outcome
 
 
 def publish_staged_backup_for_recovery(
@@ -10226,6 +10590,13 @@ def main(argv: list[str] | None = None) -> int:
         cleanup_failures = getattr(error, "cleanup_failures", None)
         if isinstance(cleanup_failures, list):
             payload["cleanup_failures"] = cleanup_failures
+        validator_cleanup_failures = getattr(
+            error,
+            "validator_cleanup_failures",
+            None,
+        )
+        if isinstance(validator_cleanup_failures, list):
+            payload["validator_cleanup_failures"] = validator_cleanup_failures
     emit(payload)
     return exit_code
 

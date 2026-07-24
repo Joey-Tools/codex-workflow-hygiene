@@ -357,6 +357,71 @@ class RulesApplyTransactionTests(unittest.TestCase):
         ):
             yield closed
 
+    @contextmanager
+    def fault_final_rules_parent_close(self, error_number: int):
+        real_bind_directory = TRANSACTION.bind_directory
+        real_close_descriptors = TRANSACTION.close_descriptors_best_effort
+        state: dict[str, int | None] = {
+            "outer_fd": None,
+            "fault_calls": 0,
+        }
+
+        def capture_outer_rules_parent(
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            binding = real_bind_directory(path, *args, **kwargs)
+            assert isinstance(binding, TRANSACTION.BoundDirectory)
+            # The no-change branch binds its outer evidence before the
+            # short-lived fixed-stage probe binds the same parent again.
+            if (
+                kwargs.get("label") == "rules"
+                and Path(path).resolve() == self.rules_dir.resolve()
+                and state["outer_fd"] is None
+            ):
+                state["outer_fd"] = binding.fd
+            return binding
+
+        def fail_outer_rules_parent_close(
+            descriptors: list[tuple[str, int]],
+            *,
+            release_uncertain: bool = False,
+        ) -> list[dict[str, object]]:
+            if state["outer_fd"] is not None and descriptors == [
+                ("rules_parent", state["outer_fd"])
+            ]:
+                state["fault_calls"] += 1
+                TRANSACTION.os.close(descriptors[0][1])
+                return [
+                    TRANSACTION.structured_operation_failure(
+                        "close",
+                        "rules_parent",
+                        OSError(
+                            error_number,
+                            "fault-injected final rules-parent close",
+                        ),
+                    )
+                ]
+            return real_close_descriptors(
+                descriptors,
+                release_uncertain=release_uncertain,
+            )
+
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "bind_directory",
+                side_effect=capture_outer_rules_parent,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "close_descriptors_best_effort",
+                side_effect=fail_outer_rules_parent_close,
+            ),
+        ):
+            yield state
+
     def create_apply_evidence(
         self,
     ) -> tuple[object, object]:
@@ -1867,6 +1932,429 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         self.assert_process_exited(self.wait_for_pid_path(pid_path))
 
+    def test_validator_failure_accumulator_preserves_raw_primary_failure(
+        self,
+    ) -> None:
+        finalizer_descriptors = [
+            "emergency-process-group",
+            "exit-observer",
+            "selector",
+            "stdout",
+            "stderr",
+        ]
+
+        for primary_label, error_number in (
+            ("waitid", errno.EIO),
+            ("read", errno.EINTR),
+        ):
+            with self.subTest(primary=primary_label):
+                accumulator = TRANSACTION.ValidatorFailureAccumulator()
+                primary = OSError(
+                    error_number,
+                    f"fault-injected raw {primary_label} failure",
+                )
+                try:
+                    raise primary
+                except OSError as caught:
+                    accumulator.capture_primary(caught)
+
+                finalizers = [
+                    mock.Mock(
+                        side_effect=OSError(
+                            errno.EIO,
+                            f"fault-injected {descriptor} failure",
+                        )
+                    )
+                    for descriptor in finalizer_descriptors
+                ]
+                for descriptor, finalizer in zip(
+                    finalizer_descriptors,
+                    finalizers,
+                ):
+                    accumulator.attempt(descriptor, finalizer)
+                accumulator.extend(
+                    [
+                        TRANSACTION.structured_operation_failure(
+                            "validator-finalization",
+                            "signal-restore",
+                            RuntimeError("fault-injected signal restoration failure"),
+                        )
+                    ]
+                )
+
+                with self.assertRaises(OSError) as raised:
+                    accumulator.finish(TRANSACTION.ValidatorResult(0, "", ""))
+
+                self.assertIs(raised.exception, primary)
+                for finalizer in finalizers:
+                    finalizer.assert_called_once_with()
+                failures = getattr(
+                    primary,
+                    "validator_cleanup_failures",
+                )
+                self.assertEqual(
+                    [failure["descriptor"] for failure in failures],
+                    [*finalizer_descriptors, "signal-restore"],
+                )
+                self.assertTrue(
+                    all(
+                        failure["operation"] == "validator-finalization"
+                        for failure in failures
+                    )
+                )
+
+    def test_run_validator_preserves_raw_primary_while_finalizing_every_resource(
+        self,
+    ) -> None:
+        for primary_label, error_number in (
+            ("waitid", errno.EIO),
+            ("read", errno.EINTR),
+        ):
+            with self.subTest(primary=primary_label):
+                primary = OSError(
+                    error_number,
+                    f"fault-injected raw {primary_label} failure",
+                )
+                gate = mock.Mock()
+                observer = mock.Mock()
+                selector = mock.Mock()
+                stdout = mock.Mock()
+                stderr = mock.Mock()
+                stdout.fileno.return_value = 101
+                stderr.fileno.return_value = 102
+                observer.child_exited.side_effect = (
+                    primary if primary_label == "waitid" else None
+                )
+                observer.close.side_effect = OSError(
+                    errno.EIO,
+                    "fault-injected observer close failure",
+                )
+                selector.close.side_effect = OSError(
+                    errno.EIO,
+                    "fault-injected selector close failure",
+                )
+                stdout.close.side_effect = OSError(
+                    errno.EIO,
+                    "fault-injected stdout close failure",
+                )
+                stderr.close.side_effect = OSError(
+                    errno.EIO,
+                    "fault-injected stderr close failure",
+                )
+                process = SimpleNamespace(
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+                read_events = mock.Mock(
+                    side_effect=(primary if primary_label == "read" else None),
+                    return_value=(False, False),
+                )
+                quiesce_failure = TRANSACTION.structured_operation_failure(
+                    "validator-finalization",
+                    "signal-quiesce",
+                    OSError(
+                        errno.EIO,
+                        "fault-injected signal quiesce failure",
+                    ),
+                )
+                restore_failure = TRANSACTION.structured_operation_failure(
+                    "validator-finalization",
+                    "signal-restore",
+                    OSError(
+                        errno.EIO,
+                        "fault-injected signal restore failure",
+                    ),
+                )
+                emergency_failures = [
+                    TRANSACTION.structured_operation_failure(
+                        "validator-emergency-cleanup",
+                        descriptor,
+                        OSError(
+                            errno.EIO,
+                            f"fault-injected {descriptor} failure",
+                        ),
+                    )
+                    for descriptor in (
+                        "term",
+                        "drain",
+                        "kill",
+                        "reap",
+                    )
+                ]
+
+                with (
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_validator_exit_observer_supported",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_start_validator_signal_supervision",
+                        return_value=(gate, {}, set(), set()),
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_arm_validator_signal_supervision",
+                    ) as arm_supervision,
+                    mock.patch.object(
+                        TRANSACTION.subprocess,
+                        "Popen",
+                        return_value=process,
+                    ) as popen,
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_ValidatorExitObserver",
+                        return_value=observer,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION.selectors,
+                        "DefaultSelector",
+                        return_value=selector,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION.os,
+                        "set_blocking",
+                    ) as set_blocking,
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_read_validator_events",
+                        read_events,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_quiesce_validator_signal_supervision",
+                        return_value=[quiesce_failure],
+                    ) as quiesce,
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_emergency_stop_validator_process_group",
+                        return_value=emergency_failures,
+                    ) as emergency_cleanup,
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_restore_validator_signal_supervision",
+                        return_value=[restore_failure],
+                    ) as restore,
+                    self.assertRaises(OSError) as raised,
+                ):
+                    TRANSACTION.run_validator(
+                        [sys.executable, "{rules}"],
+                        self.candidate,
+                        timeout_seconds=2,
+                    )
+
+                self.assertIs(raised.exception, primary)
+                popen.assert_called_once()
+                arm_supervision.assert_called_once_with(gate, set())
+                self.assertEqual(set_blocking.call_count, 2)
+                quiesce.assert_called_once_with(gate)
+                emergency_cleanup.assert_called_once()
+                observer.close.assert_called_once_with()
+                selector.close.assert_called_once_with()
+                stdout.close.assert_called_once_with()
+                stderr.close.assert_called_once_with()
+                restore.assert_called_once_with(gate, {}, set())
+                cleanup_failures = getattr(
+                    primary,
+                    "validator_cleanup_failures",
+                )
+                self.assertEqual(
+                    [failure["descriptor"] for failure in cleanup_failures],
+                    [
+                        "signal-quiesce",
+                        "term",
+                        "drain",
+                        "kill",
+                        "reap",
+                        "exit-observer-close",
+                        "selector-close",
+                        "stdout-pipe-close",
+                        "stderr-pipe-close",
+                        "signal-restore",
+                    ],
+                )
+
+    def test_validator_failure_accumulator_preserves_forwarded_signal(
+        self,
+    ) -> None:
+        accumulator = TRANSACTION.ValidatorFailureAccumulator()
+        forwarded = TRANSACTION.ForwardedValidatorSignal(signal.SIGTERM)
+        accumulator.capture_primary(forwarded)
+        accumulator.record(
+            "selector",
+            OSError(errno.EIO, "fault-injected selector close failure"),
+        )
+
+        with self.assertRaises(TRANSACTION.ForwardedValidatorSignal) as raised:
+            accumulator.finish(TRANSACTION.ValidatorResult(0, "", ""))
+
+        self.assertIs(raised.exception, forwarded)
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertEqual(
+            [failure["descriptor"] for failure in forwarded.cleanup_errors],
+            ["selector"],
+        )
+
+    def test_validator_failure_accumulator_rejects_cleanup_only_failure(
+        self,
+    ) -> None:
+        accumulator = TRANSACTION.ValidatorFailureAccumulator()
+        selector_close = mock.Mock(
+            side_effect=OSError(
+                errno.EIO,
+                "fault-injected selector close failure",
+            )
+        )
+        accumulator.attempt("selector", selector_close)
+
+        with self.assertRaises(TRANSACTION.TransactionError) as raised:
+            accumulator.finish(TRANSACTION.ValidatorResult(0, "", ""))
+
+        selector_close.assert_called_once_with()
+        self.assertEqual(
+            raised.exception.status,
+            "validator_cleanup_failed",
+        )
+        self.assertEqual(
+            raised.exception.details["validator_cleanup_failures"][0]["descriptor"],
+            "selector",
+        )
+
+    def test_signal_restore_postcondition_failure_blocks_validator_success(
+        self,
+    ) -> None:
+        previous_handler = signal.SIG_DFL
+        inherited_mask = {signal.SIGTERM}
+
+        for failure_kind in ("handler", "mask"):
+            with self.subTest(postcondition=failure_kind):
+                gate = mock.Mock()
+                restored_handler = (
+                    signal.SIG_IGN if failure_kind == "handler" else previous_handler
+                )
+                restored_mask = inherited_mask if failure_kind == "handler" else set()
+                pthread_sigmask = mock.Mock(
+                    side_effect=[
+                        set(),
+                        set(),
+                        restored_mask,
+                    ]
+                )
+                with (
+                    mock.patch.object(
+                        TRANSACTION.signal,
+                        "pthread_sigmask",
+                        pthread_sigmask,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION.signal,
+                        "signal",
+                    ) as install_handler,
+                    mock.patch.object(
+                        TRANSACTION.signal,
+                        "getsignal",
+                        return_value=restored_handler,
+                    ) as get_handler,
+                ):
+                    failures = TRANSACTION._restore_validator_signal_supervision(
+                        gate,
+                        {signal.SIGTERM: previous_handler},
+                        inherited_mask,
+                    )
+
+                accumulator = TRANSACTION.ValidatorFailureAccumulator()
+                accumulator.extend(failures)
+                with self.assertRaises(TRANSACTION.TransactionError) as raised:
+                    accumulator.finish(TRANSACTION.ValidatorResult(0, "", ""))
+
+                expected_descriptor = (
+                    "signal-restore:validate-handler:SIGTERM"
+                    if failure_kind == "handler"
+                    else "signal-restore:validate-mask"
+                )
+                self.assertEqual(
+                    [failure["descriptor"] for failure in failures],
+                    [expected_descriptor],
+                )
+                self.assertEqual(
+                    raised.exception.status,
+                    "validator_cleanup_failed",
+                )
+                self.assertEqual(
+                    raised.exception.details["validator_cleanup_failures"][0][
+                        "descriptor"
+                    ],
+                    expected_descriptor,
+                )
+                gate.close.assert_called_once_with()
+                install_handler.assert_called_once_with(
+                    signal.SIGTERM,
+                    previous_handler,
+                )
+                get_handler.assert_called_once_with(signal.SIGTERM)
+                self.assertEqual(pthread_sigmask.call_count, 3)
+
+        gate = mock.Mock()
+        gate.close.side_effect = OSError(
+            errno.EIO,
+            "fault-injected gate close failure",
+        )
+        pthread_sigmask = mock.Mock(
+            side_effect=[
+                OSError(errno.EIO, "fault-injected signal block failure"),
+                OSError(errno.EIO, "fault-injected mask restore failure"),
+                set(),
+            ]
+        )
+        with (
+            mock.patch.object(
+                TRANSACTION.signal,
+                "pthread_sigmask",
+                pthread_sigmask,
+            ),
+            mock.patch.object(
+                TRANSACTION.signal,
+                "signal",
+                side_effect=[
+                    OSError(errno.EIO, "fault-injected first handler failure"),
+                    signal.SIG_DFL,
+                ],
+            ) as install_handler,
+            mock.patch.object(
+                TRANSACTION.signal,
+                "getsignal",
+                side_effect=[
+                    signal.SIG_IGN,
+                    OSError(errno.EIO, "fault-injected second handler read"),
+                ],
+            ) as get_handler,
+        ):
+            failures = TRANSACTION._restore_validator_signal_supervision(
+                gate,
+                {
+                    signal.SIGINT: signal.SIG_DFL,
+                    signal.SIGTERM: signal.SIG_DFL,
+                },
+                inherited_mask,
+            )
+
+        self.assertEqual(install_handler.call_count, 2)
+        self.assertEqual(get_handler.call_count, 2)
+        self.assertEqual(pthread_sigmask.call_count, 3)
+        self.assertEqual(
+            [failure["descriptor"] for failure in failures],
+            [
+                "signal-restore:block-managed",
+                "signal-restore:gate-close",
+                "signal-restore:handler:SIGINT",
+                "signal-restore:validate-handler:SIGINT",
+                "signal-restore:validate-handler:SIGTERM",
+                "signal-restore:set-inherited-mask",
+                "signal-restore:validate-mask",
+            ],
+        )
+
     def test_validator_inventory_failure_still_terminates_and_reaps(self) -> None:
         pid_path = self.root / "validator-inventory-failure.pid"
         self.write_sleeping_validator(pid_path)
@@ -2145,6 +2633,92 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(cleanup_errors, [])
         self.assertTrue(state["reaped"])
         self.assertEqual(killpg.call_count, 3)
+
+        class FaultingProcess:
+            pid = 626_263
+            returncode: int | None = None
+
+            def __init__(self) -> None:
+                self.wait_calls = 0
+                self.kill_calls = 0
+
+            def wait(self, timeout: float) -> int:
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired("validator", timeout)
+                raise OSError(errno.ECHILD, "fault-injected final reap failure")
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                raise OSError(errno.EPERM, "fault-injected child kill failure")
+
+        faulting_process = FaultingProcess()
+        selector = mock.Mock()
+        selector.get_map.return_value = {"stdout": object()}
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "VALIDATOR_TERM_GRACE_SECONDS",
+                0.1,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "VALIDATOR_KILL_DRAIN_SECONDS",
+                0.1,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "killpg",
+                side_effect=OSError(
+                    errno.EIO,
+                    "fault-injected process-group signal failure",
+                ),
+            ) as faulting_killpg,
+            mock.patch.object(
+                TRANSACTION.os,
+                "kill",
+                side_effect=OSError(
+                    errno.EPERM,
+                    "fault-injected direct signal failure",
+                ),
+            ) as direct_signal,
+            mock.patch.object(
+                TRANSACTION,
+                "_read_validator_events",
+                side_effect=OSError(
+                    errno.EIO,
+                    "fault-injected output drain failure",
+                ),
+            ) as drain,
+        ):
+            combined_failures = TRANSACTION._emergency_stop_validator_process_group(
+                faulting_process,
+                selector,
+                {"stdout": bytearray(), "stderr": bytearray()},
+                max_output_bytes=TRANSACTION.MAX_VALIDATOR_OUTPUT_BYTES,
+            )
+
+        self.assertEqual(faulting_killpg.call_count, 3)
+        self.assertEqual(direct_signal.call_count, 3)
+        self.assertEqual(drain.call_count, 2)
+        self.assertEqual(faulting_process.wait_calls, 2)
+        self.assertEqual(faulting_process.kill_calls, 1)
+        self.assertEqual(
+            [failure["descriptor"] for failure in combined_failures],
+            [
+                f"killpg:{signal.SIGTERM}",
+                f"signal-direct-child:{signal.SIGTERM}",
+                "drain-validator-output",
+                f"killpg:{signal.SIGKILL}",
+                f"signal-direct-child:{signal.SIGKILL}",
+                "drain-validator-output",
+                f"killpg:{signal.SIGKILL}",
+                f"signal-direct-child:{signal.SIGKILL}",
+                "reap-direct-child",
+                "kill-direct-child",
+                "final-reap-direct-child",
+            ],
+        )
 
     def test_reaped_leader_refuses_late_emergency_pgid_cleanup(self) -> None:
         process = SimpleNamespace(pid=737_373, returncode=0)
@@ -2821,6 +3395,78 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertFalse(validator_marker.exists())
         self.assert_no_private_stage()
 
+    def test_no_change_final_rules_parent_close_failure_requires_recovery(
+        self,
+    ) -> None:
+        self.candidate.write_bytes(OLD_RULES)
+        validator_marker = self.root / "validator-ran"
+        self.write_validator(
+            f"""\
+            from pathlib import Path
+
+            Path({str(validator_marker)!r}).write_text("ran", encoding="ascii")
+            """
+        )
+        argv = self.apply_argv()
+        digest_index = argv.index("--candidate-sha256") + 1
+        argv[digest_index] = hashlib.sha256(OLD_RULES).hexdigest()
+
+        for error_number in (errno.EIO, errno.EINTR):
+            with self.subTest(errno=errno.errorcode[error_number]):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    self.fault_final_rules_parent_close(error_number) as close_state,
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    code = TRANSACTION.main(argv)
+
+                self.assertEqual(close_state["fault_calls"], 1)
+                self.assertIsNotNone(close_state["outer_fd"])
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(code, 30)
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(payload["status"], "recovery_required")
+                self.assertEqual(
+                    payload["operation_status"],
+                    "no_change_after_lock",
+                )
+                self.assertEqual(
+                    payload["reason"],
+                    "final_evidence_descriptor_close_failed",
+                )
+                self.assertEqual(
+                    payload["cleanup_reason"],
+                    "final_evidence_descriptor_close_failed",
+                )
+                self.assertEqual(
+                    payload["cleanup_failures"][0]["descriptor"],
+                    "rules_parent",
+                )
+                self.assertEqual(
+                    payload["cleanup_failures"][0]["errno"],
+                    error_number,
+                )
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertFalse(self.backup.exists())
+                self.assertFalse(self.receipt.exists())
+                self.assertFalse(
+                    TRANSACTION.prepared_candidate_path(self.receipt).exists()
+                )
+                terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+                self.assertFalse(terminal.exists())
+                self.assertFalse(
+                    TRANSACTION.recovery_terminal_result_path(terminal).exists()
+                )
+                self.assertFalse(validator_marker.exists())
+                self.assert_no_private_stage()
+
     def test_no_change_refuses_retained_fixed_stage_evidence(self) -> None:
         self.candidate.write_bytes(OLD_RULES)
         validator_marker = self.root / "validator-ran"
@@ -2935,6 +3581,72 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assert_no_real_change_transaction_artifacts()
         self.assertTrue(moved_stage.is_dir())
         self.assertTrue(stage.is_dir())
+
+    def test_concurrent_no_change_final_rules_parent_close_requires_recovery(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+
+        def install_candidate_as_live(
+            _command: list[str],
+            _path: Path,
+            *,
+            timeout_seconds: float,
+            pass_fds: tuple[int, ...] = (),
+        ) -> object:
+            del timeout_seconds, pass_fds
+            replacement = self.rules_dir / ".concurrent-candidate-live"
+            replacement.write_bytes(NEW_RULES)
+            replacement.chmod(0o640)
+            os.replace(replacement, self.rules)
+            return TRANSACTION.ValidatorResult(0, "", "")
+
+        namespace = self.apply_namespace()
+        namespace.expected_sha256 = hashlib.sha256(NEW_RULES).hexdigest()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "run_validator",
+                side_effect=install_candidate_as_live,
+            ) as run_validator,
+            self.fault_final_rules_parent_close(errno.EIO) as close_state,
+        ):
+            code, payload = TRANSACTION.apply_transaction(namespace)
+
+        run_validator.assert_called_once()
+        self.assertEqual(close_state["fault_calls"], 1)
+        self.assertIsNotNone(close_state["outer_fd"])
+        self.assertEqual(code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(
+            payload["operation_status"],
+            "no_change_after_lock",
+        )
+        self.assertEqual(
+            payload["reason"],
+            "final_evidence_descriptor_close_failed",
+        )
+        self.assertEqual(
+            payload["cleanup_reason"],
+            "final_evidence_descriptor_close_failed",
+        )
+        self.assertEqual(
+            payload["cleanup_failures"][0]["descriptor"],
+            "rules_parent",
+        )
+        self.assertEqual(payload["cleanup_failures"][0]["errno"], errno.EIO)
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(TRANSACTION.prepared_candidate_path(self.receipt).exists())
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        self.assertFalse(terminal.exists())
+        self.assertFalse(TRANSACTION.recovery_terminal_result_path(terminal).exists())
+        self.assert_no_private_stage()
 
     def test_concurrent_no_change_revalidates_candidate_source(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -3090,6 +3802,64 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertEqual(stat.S_IMODE(self.rules.stat().st_mode), 0o640)
         self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+        self.assertTrue(self.receipt.is_file())
+        self.assert_no_private_stage()
+
+    def test_post_replace_validator_raw_failure_preserves_cleanup_evidence(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        primary = OSError(
+            errno.EIO,
+            "fault-injected post-replacement validator read failure",
+        )
+        primary.validator_cleanup_failures = [
+            TRANSACTION.structured_operation_failure(
+                "validator-emergency-cleanup",
+                descriptor,
+                OSError(
+                    errno.EIO,
+                    f"fault-injected {descriptor} failure",
+                ),
+            )
+            for descriptor in ("term", "drain", "kill", "reap")
+        ]
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "run_validator",
+                side_effect=[
+                    TRANSACTION.ValidatorResult(0, "", ""),
+                    primary,
+                ],
+            ) as run_validator,
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(run_validator.call_count, 2)
+        self.assertEqual(
+            run_validator.call_args_list[1].args[1].resolve(),
+            self.rules.resolve(),
+        )
+        self.assertEqual(raised.exception.status, "recovery_required")
+        self.assertEqual(raised.exception.exit_code, 30)
+        self.assertEqual(raised.exception.details["reason"], "apply_io_failed")
+        self.assertIs(raised.exception.__cause__, primary)
+        self.assertEqual(
+            [
+                failure["descriptor"]
+                for failure in raised.exception.details["validator_cleanup_failures"]
+            ],
+            ["term", "drain", "kill", "reap"],
+        )
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
         self.assertTrue(self.receipt.is_file())
         self.assert_no_private_stage()
 
@@ -6347,6 +7117,74 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(payload["status"], "post_replace_failed_rolled_back")
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_applied_final_evidence_close_failure_requires_recovery(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_close = TRANSACTION.ApplyEvidenceBindings.close
+        close_calls = 0
+
+        def fail_final_evidence_close(
+            bindings: object,
+        ) -> list[dict[str, object]]:
+            nonlocal close_calls
+            assert isinstance(bindings, TRANSACTION.ApplyEvidenceBindings)
+            close_calls += 1
+            failures = real_close(bindings)
+            failures.append(
+                TRANSACTION.structured_operation_failure(
+                    "close",
+                    "rules_parent",
+                    OSError(
+                        errno.EIO,
+                        "fault-injected final evidence close",
+                    ),
+                )
+            )
+            return failures
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.ApplyEvidenceBindings,
+                "close",
+                autospec=True,
+                side_effect=fail_final_evidence_close,
+            ),
+        ):
+            code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(close_calls, 1)
+        self.assertEqual(code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["operation_status"], "applied")
+        self.assertEqual(
+            payload["reason"],
+            "final_evidence_descriptor_close_failed",
+        )
+        self.assertEqual(
+            payload["cleanup_reason"],
+            "final_evidence_descriptor_close_failed",
+        )
+        self.assertEqual(
+            payload["cleanup_failures"][0]["descriptor"],
+            "rules_parent",
+        )
+        self.assertEqual(payload["cleanup_failures"][0]["errno"], errno.EIO)
+        self.assertEqual(
+            Path(payload["backup_path"]).resolve(),
+            self.backup.resolve(),
+        )
+        self.assertEqual(
+            Path(payload["receipt_path"]).resolve(),
+            self.receipt.resolve(),
+        )
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+        self.assertTrue(self.receipt.is_file())
+        self.assert_no_private_stage()
 
     def test_lock_path_replacement_failure_preserves_evidence_until_lock_exit(
         self,

@@ -3,7 +3,7 @@ id: 20260724-cwh002
 title: Skill Surface Refactor
 status: active
 created: 2026-07-24
-updated: 2026-07-24
+updated: 2026-07-25
 branch: codex/skill-surface-refactor
 pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/63
 supersedes: []
@@ -74,6 +74,12 @@ superseded_by:
   pre-lock, post-validator, exchange-target, or recovery execution.
 - Removed the unlocked no-change fast path; apparent no-change now validates
   under the shared writer lock and returns only `no_change_after_lock`.
+- Converted final persistent-evidence and rules-parent descriptor uncertainty
+  after `applied` or either no-change path into nonzero `recovery_required`
+  instead of attaching cleanup evidence to an exit-zero result.
+- Unified validator finalization around one primary-error accumulator so raw
+  wait/read errors and forwarded signals survive TERM/KILL, drain/reap,
+  observer, selector, pipe, and signal-restoration failures.
 - Bound idempotent recovery to exact original or persisted recovery-terminal
   identity, and revalidated recovery copies after locator binding.
 - Reduced the Joey authoring overlay to placement and validation policy while
@@ -193,6 +199,16 @@ superseded_by:
   output, and independently enumerates live same-PGID members on Darwin and
   Linux before accepting completion, including descendants whose standard
   streams all point to `/dev/null`.
+- Validator failure finalization attempts every remaining process-group,
+  observer, selector, and pipe operation, preserves the original exception and
+  traceback, and attaches each secondary failure in stable structured order.
+  Cleanup-only uncertainty is `validator_cleanup_failed`; restored handler
+  identities and the inherited signal mask are reread before success.
+- An apparent apply or no-change result cannot remain successful after final
+  evidence or rules-parent close uncertainty. It reports
+  `final_evidence_descriptor_close_failed`, retains the original
+  `operation_status` and recovery locators, and cannot refresh the rules
+  baseline.
 - A recovery copy is verified only after rereading the held origin and copy
   descriptors and rechecking content, access/link policy, metadata admission,
   and directory-entry binding. Recovery refuses same-content replacement
@@ -210,7 +226,7 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 181 passed on Python 3.13. New cases cover fixed
+- Rules transaction tests: 190 passed on Python 3.13. New cases cover fixed
   stage zero-artifact failures, parse-to-lock receipt races, delegated-v3
   post-mutation receipt and parent changes, every terminal publication crash
   point, successful retry, terminal truncation prohibition, terminal/primary
@@ -243,7 +259,17 @@ superseded_by:
   support cannot displace structured cleanup, lock-finalization, or pending
   retention evidence. Nine focused stage-close, lock-finalization, and
   pending-publication cases also passed on system Python 3.9.6.
-- Full repository suite passed all 1,243 tests.
+- The final 9 cases cover applied, fast no-change EIO/EINTR, and concurrent
+  no-change final-close uncertainty; raw wait/read primary preservation;
+  best-effort emergency/observer/selector/pipe/signal finalization; forwarded
+  signal preservation; cleanup-only failure; post-replacement handler/mask
+  validation; and preservation of every secondary validator cleanup failure
+  when a post-replacement raw I/O error becomes `recovery_required`. Ten
+  focused compatibility cases passed on system Python 3.9.6.
+- Full repository suite covered all 1,252 tests. The sandboxed run passed
+  1,248 and failed only four unrelated temporary merge-commit fixtures because
+  sandbox GPG could not reach `~/.gnupg/keyboxd`; those exact four tests passed
+  in the approved narrow GPG-capable rerun.
 - Ruff check and Ruff format-check passed for both changed Python files.
 - `codex-rules-hygiene` passed the official skill validator through an
   isolated `uv` PyYAML environment after the direct installed wrapper reported
