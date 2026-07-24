@@ -150,11 +150,21 @@ class SkillStructureTests(unittest.TestCase):
             encoding="utf-8"
         )
         interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
+        helper = skill_root / "scripts/apply_rules_transaction.py"
+        helper_text = helper.read_text(encoding="utf-8")
 
         audit = skill.split("### Audit Mode", 1)[1].split("### Apply Mode", 1)[0]
         apply_mode = skill.split("### Apply Mode", 1)[1].split("## Audit Workflow", 1)[0]
-        skill_before_apply = skill.split("### Apply Mode", 1)[0]
+        audit_workflow = skill.split("## Audit Workflow", 1)[1].split(
+            "## Apply Transaction", 1
+        )[0]
         cadence_before_apply = cadence.split("## Apply Checklist", 1)[0]
+        cold_start = cadence.split("## Cold-Start Bootstrap", 1)[1].split(
+            "## Classification Heuristics", 1
+        )[0]
+        cold_start_audit = cold_start.split("In audit mode:", 1)[1].split(
+            "In apply mode:", 1
+        )[0]
         transaction = skill.split("## Apply Transaction", 1)[1].split(
             "## Ownership And Guardrails", 1
         )[0]
@@ -167,33 +177,83 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("cleanup/apply", apply_mode)
         self.assertIn("active task already authorizes applying it", apply_mode)
         self.assertIn("report a no-op and create nothing", apply_mode)
+        self.assertIn("audited live-rules SHA-256 digest", apply_mode)
+        self.assertIn("do not rewrite live rules directly", apply_mode)
+        self.assertIn("Record the SHA-256 digest", audit_workflow)
+        self.assertIn("exact candidate bytes", audit_workflow)
+        self.assertIn("Keep the audit read-only", audit_workflow)
+        self.assertIn("bootstrap inventory", cold_start_audit)
+        self.assertIn("exact full-cleanup plan", cold_start_audit)
+        self.assertIn("Do not create the safety backup or clean baseline", cold_start_audit)
         for phrase in (
-            "timestamped safety backup",
-            "Rewrite only the reviewed rule set",
-            "Run the identified policy validator",
+            "shared lock",
+            "owner-private staging directory",
+            "SHA-256 digest",
+            "object identity, content digest, and owner/group/mode",
+            "same-filesystem atomic replacement",
+            "recovery_required",
             "refresh `default.rules.clean-baseline`",
             "necessary adopted-journal",
         ):
             self.assertIn(phrase, transaction)
-        self.assertIn("stop before backup or rewrite", transaction)
+        self.assertIn("stop before creating a backup or touching live rules", transaction)
         self.assertIn("instead of bootstrapping a tracker", transaction)
         self.assertLess(
-            transaction.index("timestamped safety backup"),
-            transaction.index("Rewrite only the reviewed rule set"),
+            transaction.index("validate the candidate"),
+            transaction.index("acquires the shared lock"),
         )
         self.assertLess(
-            transaction.index("Rewrite only the reviewed rule set"),
-            transaction.index("Run the identified policy validator"),
+            transaction.index("acquires the shared lock"),
+            transaction.index("atomic replacement"),
         )
         self.assertIn("`audit` is read-only", cadence)
         self.assertIn("## Apply Checklist", cadence)
         self.assertIn("Remain read-only until apply mode is authorized", cadence)
+        self.assertIn("## Transaction Safety Boundary", cadence)
+        self.assertIn("scripts/apply_rules_transaction.py", cadence)
+        self.assertIn("owner-only, single-link regular file", cadence)
+        self.assertIn("object identity (`device`, `inode`)", cadence)
+        self.assertIn("Modification times are not treated as policy mutation", cadence)
+        self.assertIn("not a kernel compare-and-swap", cadence)
+        self.assertIn("requires every legitimate writer to honor the same persistent lock", cadence)
+        self.assertIn("Missing, unreadable, wrong-type", cadence)
         write_instruction = (
             r"(?im)^\s*(?:[-*]|\d+\.).*"
             r"\b(?:back up|create|delete|remove|rewrite|refresh|update|write)\b"
         )
-        self.assertNotRegex(skill_before_apply, write_instruction)
-        self.assertNotRegex(cadence_before_apply, write_instruction)
+        read_only_sections = {
+            "audit mode": audit,
+            "complete audit workflow": audit_workflow,
+            "cadence audit sections": cadence_before_apply,
+            "cold-start audit branch": cold_start_audit,
+        }
+        for label, section in read_only_sections.items():
+            actionable_lines = "\n".join(
+                line
+                for line in section.splitlines()
+                if not any(
+                    marker in line.lower()
+                    for marker in (
+                        "do not ",
+                        "never ",
+                        "unchanged",
+                        "read-only",
+                    )
+                )
+            )
+            with self.subTest(read_only_section=label):
+                self.assertNotRegex(actionable_lines, write_instruction)
+        self.assertTrue(helper.is_file())
+        self.assertTrue(os.access(helper, os.X_OK))
+        for phrase in (
+            "fcntl.flock",
+            "expected_sha256",
+            "os.replace",
+            "property_mismatches",
+            "rollback",
+            "recovery_required",
+        ):
+            self.assertIn(phrase, helper_text)
         self.assertIn("Audit Codex rules without changing files", interface)
         self.assertIn("run a read-only audit", interface)
         self.assertNotIn("audit or apply", interface.lower())
@@ -228,6 +288,9 @@ class SkillStructureTests(unittest.TestCase):
         skill_root = root / "skills/codex-skill-authoring"
         skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
         interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
+        wrapper = (skill_root / "scripts/codex_skill_validate.py").read_text(
+            encoding="utf-8"
+        )
         frontmatter = skill.split("---", 2)[1]
 
         self.assertLess(len(skill.splitlines()), 80)
@@ -244,7 +307,17 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("`AGENTS.md` / `SKILL.md` / `references/` layering", skill)
         self.assertIn("approval-friendly argv", skill)
         self.assertIn("scripts/codex_skill_validate.py", skill)
-        self.assertIn(".system/skill-creator/scripts/quick_validate.py", skill)
+        self.assertIn("$skill-creator/scripts/quick_validate.py", skill)
+        self.assertIn("SKILL_AUTHORING_DIR", skill)
+        self.assertIn("SKILL_CREATOR_DIR", skill)
+        self.assertIn('CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"', skill)
+        self.assertNotIn('"$HOME/.codex/skills', skill)
+        self.assertIn("Path(__file__).resolve().parents[2]", wrapper)
+        self.assertIn('os.environ.get("CODEX_HOME")', wrapper)
+        self.assertIn(
+            'Path(".system/skill-creator/scripts/quick_validate.py")',
+            wrapper,
+        )
         self.assertIn("Do not duplicate system scaffolding", skill)
         self.assertFalse((skill_root / "references/description-patterns.md").exists())
         self.assertIn("Use $skill-creator for general authoring and scaffolding", interface)

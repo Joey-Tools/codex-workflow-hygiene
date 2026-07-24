@@ -44,13 +44,42 @@
 ## Apply Checklist
 
 1. Enter apply mode only when cleanup is requested or an audit has proved an exact change that the active task authorizes.
-2. Re-read `default.rules` and the selected comparison anchor; stop if either differs from the audited inputs. Identify the existing policy validator, and stop before backup or rewrite if no trustworthy validation gate can be named and run.
+2. Carry forward the exact audited `default.rules` SHA-256 digest, candidate bytes, selected comparison anchor, and existing policy validator. Stop before backup or replacement if any input is missing.
 3. If no content change remains, report a no-op and create nothing.
-4. Create one timestamped safety backup before rewriting.
-5. Rewrite only the reviewed entries and run the identified validator against the resulting policy.
-6. Refresh `default.rules.clean-baseline` only after a successful full cleanup with no intentionally retained drift debt.
-7. Write the necessary adopted-journal or focused-note update only for a durable decision actually applied or a successful full-cleanup baseline refresh. Use an existing owning-repo journal when already adopted; otherwise use a nearby focused note rather than bootstrapping a tracker.
-8. Never treat the new safety backup as the comparison anchor for the same apply.
+4. Require all legitimate writers to share the transaction lock. If a rules writer cannot honor that advisory-lock protocol, prove it quiescent for the complete compare/replace/post-validation window or stop.
+5. Put the reviewed bytes in a task-scoped candidate source and run the skill-relative helper:
+
+```bash
+RULES_HYGIENE_SKILL="<loaded-codex-rules-hygiene-dir>"
+python3 "$RULES_HYGIENE_SKILL/scripts/apply_rules_transaction.py" apply \
+  --candidate "$TASK_DIR/default.rules.candidate" \
+  --expected-sha256 "$EXPECTED_RULES_SHA256" \
+  --backup-name "default.rules.bak-$TIMESTAMP" \
+  --receipt "$TASK_DIR/rules-apply-recovery.json" \
+  -- <validator-argv> '{rules}'
+```
+
+6. The helper derives `rules/default.rules` and `.default.rules.apply.lock` from `CODEX_HOME`, with the ordinary Codex home as the fallback. Pass validator arguments directly; the helper replaces the one exact `'{rules}'` argument with first the private candidate path and then the live path. Do not wrap the validator in `bash -lc`.
+7. Accept only `applied`, `no_change`, or `no_change_after_lock` as successful apply outcomes. `post_replace_failed_rolled_back` means the requested cleanup did not apply. `recovery_required` means the helper observed missing, unreadable, or property-mismatched live state and deliberately refused to overwrite it.
+8. Keep the receipt and bound backup until post-replace checks and any required recovery decision finish. To retry the identity-bound rollback:
+
+```bash
+python3 "$RULES_HYGIENE_SKILL/scripts/apply_rules_transaction.py" recover \
+  --receipt "$TASK_DIR/rules-apply-recovery.json"
+```
+
+9. Refresh `default.rules.clean-baseline` only after a successful full cleanup with no intentionally retained drift debt.
+10. Write the necessary adopted-journal or focused-note update only for a durable decision actually applied or a successful full-cleanup baseline refresh. Use an existing owning-repo journal when already adopted; otherwise use a nearby focused note rather than bootstrapping a tracker.
+11. Never treat the new safety backup as the comparison anchor for the same apply.
+
+### Transaction Safety Boundary
+
+- Candidate validity protects exact bytes: the helper copies the source into a `0700` staging directory, creates an owner-only, single-link regular file with mode `0600`, validates it there, and rejects any validator-side identity, content, or access-policy change before publication.
+- Compare-and-replace protects three live properties under one shared lock: object identity (`device`, `inode`), content (`size`, SHA-256), and access policy (`uid`, `gid`, permission bits). Modification times are not treated as policy mutation when those selected properties remain stable.
+- The receipt also binds the rules-parent object identity. The helper refuses nonzero file flags or extended attributes because it cannot preserve them; callers must separately prove that platform ACLs are absent when ACL state is not exposed through those checks.
+- The expected SHA-256 digest binds apply to the audited bytes. Missing, unreadable, wrong-type, digest-mismatched, identity-replaced, content-mutated, and access-policy-changed states remain distinct outcomes.
+- `os.replace` provides same-filesystem atomic name replacement, not a kernel compare-and-swap. The no-lost-update guarantee therefore requires every legitimate writer to honor the same persistent lock; a writer that ignores it is outside the helper's enforcement boundary.
+- Automatic rollback and `recover` both require live rules to match the receipt's installed identity, content, and access policy and require the backup to match its bound identity, content, and access policy. A later replacement is preserved and reported, never overwritten merely because recovery was requested.
 
 ## Cold-Start Bootstrap
 
@@ -64,11 +93,11 @@ In audit mode:
 
 In apply mode:
 
-1. Revalidate the audited bootstrap inventory.
-2. Create one timestamped safety backup.
+1. Revalidate the audited bootstrap inventory through its expected SHA-256 digest.
+2. Use the Apply Checklist helper transaction to create the bound timestamped backup, validate the private candidate, and atomically replace live rules.
 3. Do not diff against that freshly created backup.
-4. Apply and validate the reviewed full cleanup.
-5. Only after that full cleanup succeeds, create `~/.codex/rules/default.rules.clean-baseline`.
+4. Treat rollback or `recovery_required` as a failed bootstrap.
+5. Only after the helper reports a successful full cleanup, create `~/.codex/rules/default.rules.clean-baseline`.
 
 ## Classification Heuristics
 

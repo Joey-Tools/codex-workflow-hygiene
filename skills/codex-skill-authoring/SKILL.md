@@ -53,11 +53,12 @@ Do not duplicate system scaffolding or mirror the system validator into this ski
 
 After following `$skill-creator`:
 
-1. Prefer `"$HOME/.codex/skills/codex-skill-authoring/scripts/codex_skill_validate.py" --report <task-scoped-report.json> <skill> [...]`.
-2. The wrapper must delegate to the installed `$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py`; do not edit or mirror that validator here.
-3. If the wrapper exists but is not executable, invoke its Python entrypoint directly.
-4. If the wrapper is unavailable, use `uv run --isolated --with pyyaml python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" <skill>`.
-5. Use direct `python3 .../quick_validate.py` only when its dependencies are already available or `uv` is inappropriate.
-6. Smoke-test every newly added helper script with a real invocation.
+1. Resolve `SKILL_AUTHORING_DIR` from the loaded `$codex-skill-authoring` directory; do not assume it lives under the default home.
+2. Prefer `python3 "$SKILL_AUTHORING_DIR/scripts/codex_skill_validate.py" --report <task-scoped-report.json> <skill> [...]`.
+3. The wrapper resolves the installed validator from `CODEX_HOME` and its loaded skill-root layout, then delegates to `$skill-creator/scripts/quick_validate.py`; do not edit or mirror that validator here.
+4. If the wrapper is unavailable, resolve `SKILL_CREATOR_DIR` from the loaded `$skill-creator` directory and use `uv run --isolated --with pyyaml python3 "$SKILL_CREATOR_DIR/scripts/quick_validate.py" <skill>`.
+5. Use direct `python3 "$SKILL_CREATOR_DIR/scripts/quick_validate.py" ...` only when its dependencies are already available or `uv` is inappropriate.
+6. When a command needs the Codex state root for another reason, set `CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"` once and derive paths from it.
+7. Smoke-test every newly added helper script with a real invocation.
 
 Treat this wrapper as the canonical local entrypoint, not as a replacement for the system skill's validation contract.

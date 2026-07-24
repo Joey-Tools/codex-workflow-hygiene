@@ -17,7 +17,6 @@ EXIT_VALIDATION_FAILED = 1
 EXIT_RUNTIME_ERROR = 2
 MAX_SUMMARY_MESSAGE_LENGTH = 240
 VALIDATOR_RELATIVE_PATH = Path(".system/skill-creator/scripts/quick_validate.py")
-DEFAULT_VALIDATOR = Path("~/.codex/skills") / VALIDATOR_RELATIVE_PATH
 PYTHON_RUNTIME_ERROR_PATTERNS = (
     "Traceback (most recent call last):",
     "SyntaxError:",
@@ -43,7 +42,10 @@ def default_validator_candidates() -> list[Path]:
     if codex_home:
         base = Path(codex_home).expanduser()
         candidates.extend([base / "skills" / VALIDATOR_RELATIVE_PATH, base / VALIDATOR_RELATIVE_PATH])
-    candidates.append(DEFAULT_VALIDATOR.expanduser())
+    loaded_skills_root = Path(__file__).resolve().parents[2]
+    candidates.append(loaded_skills_root / VALIDATOR_RELATIVE_PATH)
+    if not codex_home:
+        candidates.append(Path.home() / ".codex" / "skills" / VALIDATOR_RELATIVE_PATH)
 
     deduped: list[Path] = []
     seen: set[str] = set()

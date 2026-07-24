@@ -146,6 +146,50 @@ class SkillValidatorWrapperTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), "Skill is valid!")
 
+    def test_default_validator_resolves_from_loaded_skill_root(self) -> None:
+        skills_root = self.root / "portable-install" / "skills"
+        wrapper = (
+            skills_root
+            / "codex-skill-authoring"
+            / "scripts"
+            / "codex_skill_validate.py"
+        )
+        wrapper.parent.mkdir(parents=True)
+        wrapper.write_text(WRAPPER.read_text(encoding="utf-8"), encoding="utf-8")
+        validator = (
+            skills_root
+            / ".system"
+            / "skill-creator"
+            / "scripts"
+            / "quick_validate.py"
+        )
+        validator.parent.mkdir(parents=True)
+        validator.write_text(
+            self.validator.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        validator.chmod(0o755)
+        env = os.environ.copy()
+        env.pop("CODEX_HOME", None)
+        env.pop("CODEX_SKILL_VALIDATOR", None)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(wrapper),
+                "--no-uv",
+                str(self.valid_skill),
+            ],
+            check=False,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "Skill is valid!")
+
     def test_multiple_skill_stdout_uses_compact_messages(self) -> None:
         report = self.root / "report.json"
 

@@ -24,9 +24,9 @@ Always choose an explicit mode before inspecting or changing host state.
 ### Apply Mode
 
 - Use when the user requested cleanup/apply, or when a prior audit proved an exact change and the active task already authorizes applying it.
-- Revalidate the current rules and comparison anchor before writing. Stop if they no longer match the audited inputs.
+- Carry forward the audited live-rules SHA-256 digest and exact candidate bytes. Stop if either input is missing.
 - If there is no approved content change, report a no-op and create nothing.
-- Otherwise perform the ordered transaction below: backup, rewrite, validate, baseline refresh when eligible, then any necessary adopted-journal update.
+- Otherwise use the skill-relative transaction helper below; do not rewrite live rules directly.
 
 ## Audit Workflow
 
@@ -48,19 +48,28 @@ Always choose an explicit mode before inspecting or changing host state.
 - Use [$codex-skill-authoring](../codex-skill-authoring/SKILL.md) when the instruction layer or owner is unclear.
 - Use [$codex-session-mining](../codex-session-mining/SKILL.md) only for a targeted origin backtrace when the diff is ambiguous.
 
+4. Bind any proposed apply plan without writing host state.
+- Record the SHA-256 digest of the exact `default.rules` bytes that were audited.
+- Produce the exact candidate bytes or a deterministic patch that recreates them.
+- Name the comparison anchor and validator that apply mode must revalidate.
+- Keep the audit read-only: do not create the candidate file, backup, lock, receipt, baseline, or journal update.
+
 ## Apply Transaction
 
-1. Re-read and verify the audited inputs, then identify the existing rules-policy validator. If no trustworthy validation gate can be named and run, stop before backup or rewrite and report that missing gate.
-2. Create one timestamped safety backup such as `default.rules.bak-YYYYMMDD-HHMMSS`; never use that new backup as the current audit's comparison anchor.
-3. Rewrite only the reviewed rule set, preserving unrelated entries.
-4. Run the identified policy validator against the rewritten file before treating cleanup as successful.
-5. After a successful full cleanup with no intentionally retained drift debt, refresh `default.rules.clean-baseline` from the rewritten file. Never refresh it after audit mode, a light cleanup, or a failed/partial apply.
-6. Write only the necessary adopted-journal or focused-note update when apply adopts a durable rule/helper/skill decision or records the successful full-cleanup baseline. Use an owning repo's existing journal when already adopted; otherwise use a nearby focused note instead of bootstrapping a tracker. Do not journal a read-only audit or no-op apply.
+1. Identify the existing rules-policy validator. If no trustworthy validation gate can be named and run, stop before creating a backup or touching live rules.
+2. Require one writer protocol for the transaction. Every legitimate rules writer must use the helper's shared lock, or the caller must first prove other writers quiescent; POSIX advisory locks cannot protect against a writer that ignores them.
+3. Write the reviewed bytes only to a task-scoped candidate source, then invoke `scripts/apply_rules_transaction.py apply` with the audited expected SHA-256 digest, a fresh timestamped backup basename, an owner-private recovery receipt path, and direct validator argv containing one `'{rules}'` placeholder. The helper derives live `rules/default.rules` and its persistent lock from `CODEX_HOME` (falling back to the default Codex home).
+4. Let the helper copy and validate the candidate inside an owner-private staging directory before it acquires the shared lock. Under that lock it revalidates live object identity, content digest, and owner/group/mode, publishes the bound backup, records the recovery receipt, and performs a same-filesystem atomic replacement.
+5. Treat only `applied` or a verified no-change status as success. The helper re-runs the validator against live rules; a post-replace failure rolls back only while live still matches the exact installed identity, content, and access policy. If live is missing, unreadable, or mismatched, it preserves the backup and receipt and returns `recovery_required` instead of overwriting a later state.
+6. Use `scripts/apply_rules_transaction.py recover --receipt <path>` only for that receipt. Recovery revalidates the same lock, installed object, and bound backup before an atomic restore; it refuses a later replacement even when the bytes happen to look related.
+7. After a successful full cleanup with no intentionally retained drift debt, refresh `default.rules.clean-baseline` from the verified live file. Never refresh it after audit mode, a light cleanup, a rollback, `recovery_required`, or a failed/partial apply.
+8. Write only the necessary adopted-journal or focused-note update when apply adopts a durable rule/helper/skill decision or records the successful full-cleanup baseline. Use an owning repo's existing journal when already adopted; otherwise use a nearby focused note instead of bootstrapping a tracker. Do not journal a read-only audit or no-op apply.
 
 ## Ownership And Guardrails
 
 - Rules govern reusable approval families; skills decide when to use them; helpers encode repeated fragile mechanics.
+- Load [references/audit-cadence.md](references/audit-cadence.md) before apply mode for the helper command, output states, and recovery boundary.
 - Use `host_executable()` only to harden a small trusted basename family, not to excuse wrapper drift.
 - Do not widen rules because one literal was inconvenient.
 - Do not keep fixed issue IDs, PR numbers, prompt files, review bundles, or task-scoped temp paths after their stable owner is known.
-- Read [references/audit-cadence.md](references/audit-cadence.md) for light/full audit cadence, mode checklists, and classification examples.
+- Read [references/audit-cadence.md](references/audit-cadence.md) for light/full audit cadence and classification examples.
