@@ -24,6 +24,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -42,6 +43,11 @@ MAX_VALIDATOR_OUTPUT_BYTES = 128 * 1024
 MAX_XATTR_NAME_BYTES = 64 * 1024
 VALIDATOR_TERM_GRACE_SECONDS = 0.25
 VALIDATOR_KILL_DRAIN_SECONDS = 1.0
+MANAGED_VALIDATOR_SIGNALS = tuple(
+    getattr(signal, name)
+    for name in ("SIGINT", "SIGTERM", "SIGHUP")
+    if hasattr(signal, name)
+)
 
 LINUX_FS_IOC_GETFLAGS = 0x80086601
 LINUX_AUTOMATIC_FILE_FLAGS = (
@@ -74,6 +80,39 @@ class TransactionError(RuntimeError):
         self.status = status
         self.exit_code = exit_code
         self.details = details or {}
+
+
+class ForwardedValidatorSignal(Exception):
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+        self.cleanup_errors: list[dict[str, object]] = []
+
+
+class ValidatorSignalGate:
+    """Latch one managed signal until the validator PGID is parent-bound."""
+
+    def __init__(self) -> None:
+        self._armed = False
+        self._interrupt_raised = False
+        self._pending: int | None = None
+
+    def handle(self, signum: int, _frame: object) -> None:
+        if self._pending is None:
+            self._pending = signum
+        self._raise_pending_once()
+
+    def _raise_pending_once(self) -> None:
+        if self._armed and not self._interrupt_raised and self._pending is not None:
+            self._interrupt_raised = True
+            raise ForwardedValidatorSignal(self._pending)
+
+    def arm(self) -> None:
+        self._armed = True
+        self._raise_pending_once()
+
+    def close(self) -> None:
+        self._armed = False
 
 
 @dataclass(frozen=True)
@@ -1461,6 +1500,7 @@ class PrivateStage:
         self.stage_snapshot = Snapshot.from_stat(stage_stat, b"")
         self.files: dict[Path, BoundFile] = {}
         self.extra_fds: list[int] = []
+        self.mutation_uncertain = False
         self.closed = False
 
     def _rules_parent_path_is_bound(self) -> bool:
@@ -1801,6 +1841,7 @@ class PrivateStage:
         destination_expected: Snapshot | None = None,
         error: OSError | None = None,
     ) -> TransactionError:
+        self.mutation_uncertain = True
         source_locator = self._locator_for_snapshot(source.snapshot)
         source_retention = self._preserve_bound_file(source, role="source")
         retention: dict[str, object] = {"source": source_retention}
@@ -1896,6 +1937,7 @@ class PrivateStage:
         if pre_exchange_revalidate is not None:
             pre_exchange_revalidate()
         atomic_error: OSError | None = None
+        self.mutation_uncertain = True
         try:
             atomic_rename_exchange(
                 self.stage_fd,
@@ -1903,6 +1945,9 @@ class PrivateStage:
                 self.rules_parent_fd,
                 target.name,
             )
+        except TransactionError:
+            self.mutation_uncertain = False
+            raise
         except OSError as error:
             atomic_error = error
 
@@ -1930,6 +1975,7 @@ class PrivateStage:
             if observation_matches(initial_source) and observation_matches(
                 initial_destination
             ):
+                self.mutation_uncertain = False
                 self.extra_fds.remove(target_binding.fd)
                 os.close(target_binding.fd)
                 raise TransactionError(
@@ -1998,6 +2044,7 @@ class PrivateStage:
         self.extra_fds.remove(target_binding.fd)
         source.fd = target_binding.fd
         source.snapshot = target_actual
+        self.mutation_uncertain = False
         return expected
 
     def publish_backup(self, path: Path, backup: Path) -> BoundFile:
@@ -2022,6 +2069,7 @@ class PrivateStage:
             )
         self.validate(path, expected, label="private_backup")
         atomic_error: OSError | None = None
+        self.mutation_uncertain = True
         try:
             atomic_rename_no_replace(
                 self.stage_fd,
@@ -2029,6 +2077,9 @@ class PrivateStage:
                 self.rules_parent_fd,
                 backup.name,
             )
+        except TransactionError:
+            self.mutation_uncertain = False
+            raise
         except OSError as error:
             atomic_error = error
         source_observation = observe_directory_entry(
@@ -2045,6 +2096,7 @@ class PrivateStage:
             if atomic_error.errno == errno.EEXIST and observation_matches(
                 source_observation
             ):
+                self.mutation_uncertain = False
                 raise TransactionError(
                     "backup_exists",
                     f"backup already exists: {backup}",
@@ -2054,6 +2106,7 @@ class PrivateStage:
                 observation_matches(source_observation)
                 and destination_observation.get("state") == "missing"
             ):
+                self.mutation_uncertain = False
                 raise TransactionError(
                     "atomic_no_replace_failed",
                     f"atomic backup publication failed without moving the source: {atomic_error}",
@@ -2101,6 +2154,7 @@ class PrivateStage:
         source.name = backup.name
         source.snapshot = actual
         self.extra_fds.append(source.fd)
+        self.mutation_uncertain = False
         return source
 
     def _find_bound_entry(
@@ -2190,117 +2244,105 @@ class PrivateStage:
         self.extra_fds.clear()
 
     def _cleanup_disposable_stage(self) -> list[dict[str, object]]:
-        """Remove only transaction-bound leaves from the private stage.
+        """Quarantine, but never path-delete, a disposable private stage.
 
-        The protected property is namespace ownership by this transaction:
-        the held stage directory must still have the original identity and
-        access policy, and every removed leaf must still name an object held by
-        ``self.files``.  Unknown or replacement entries are never removed.
+        POSIX exposes no compare-and-unlink or compare-and-rmdir operation. A
+        stat immediately before either syscall still permits a replacement to
+        be deleted. The protected property here is non-destruction: move one
+        namespace entry with atomic no-clobber semantics, then prove whether
+        the quarantined directory is the descriptor-bound stage. A racing
+        replacement may be moved, but it is never deleted; an unproved move is
+        a cleanup refusal rather than a false success.
         """
 
         warnings: list[dict[str, object]] = []
+        quarantine_name = f".default.rules.cleanup-retained-{secrets.token_hex(16)}"
+        quarantine_path = self.rules_parent / quarantine_name
         try:
             self._validate_rules_parent()
             self._validate_stage_root()
-            names = os.listdir(self.stage_fd)
-            if len(names) > 1024:
+            if (
+                observe_directory_entry(
+                    self.rules_parent_fd,
+                    quarantine_name,
+                ).get("state")
+                != "missing"
+            ):
                 raise TransactionError(
                     "stage_cleanup_refused",
-                    "staging directory exceeds the cleanup entry bound",
+                    "cleanup quarantine destination unexpectedly exists",
                 )
-            bound_identities = {
-                (file_stat.st_dev, file_stat.st_ino)
-                for binding in self.files.values()
-                for file_stat in (os.fstat(binding.fd),)
-            }
-            for name in names:
-                try:
-                    entry = os.stat(
-                        name,
-                        dir_fd=self.stage_fd,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    continue
-                identity = (entry.st_dev, entry.st_ino)
-                if identity not in bound_identities:
-                    warnings.append(
-                        {
-                            "status": "stage_cleanup_unexpected_entry",
-                            "last_known_path": str(self.path / name),
-                            "bound_identity": stat_identity(entry),
-                        }
-                    )
-                    continue
-                self._validate_rules_parent()
-                self._validate_stage_root()
-                rechecked = os.stat(
-                    name,
-                    dir_fd=self.stage_fd,
+            atomic_rename_no_replace(
+                self.rules_parent_fd,
+                self.stage_name,
+                self.rules_parent_fd,
+                quarantine_name,
+            )
+            self._validate_rules_parent()
+            try:
+                quarantined = os.stat(
+                    quarantine_name,
+                    dir_fd=self.rules_parent_fd,
                     follow_symlinks=False,
                 )
-                if (rechecked.st_dev, rechecked.st_ino) != identity:
-                    warnings.append(
-                        {
-                            "status": "stage_cleanup_entry_changed",
-                            "last_known_path": str(self.path / name),
-                            "expected_identity": {
-                                "device": identity[0],
-                                "inode": identity[1],
-                            },
-                            "actual_identity": stat_identity(rechecked),
-                        }
-                    )
-                    continue
-                os.unlink(name, dir_fd=self.stage_fd)
-                if (
-                    observe_directory_entry(self.stage_fd, name).get("state")
-                    != "missing"
-                ):
-                    warnings.append(
-                        {
-                            "status": "stage_cleanup_unverified",
-                            "last_known_path": str(self.path / name),
-                        }
-                    )
-            self._validate_rules_parent()
-            self._validate_stage_root()
-            remaining = os.listdir(self.stage_fd)
-            if not remaining:
-                os.rmdir(self.stage_name, dir_fd=self.rules_parent_fd)
-                if (
-                    observe_directory_entry(
-                        self.rules_parent_fd,
-                        self.stage_name,
-                    ).get("state")
-                    != "missing"
-                ):
-                    warnings.append(
-                        {
-                            "status": "stage_cleanup_root_unverified",
-                            "last_known_path": str(self.path),
-                        }
-                    )
-            else:
-                warnings.append(
-                    {
-                        "status": "stage_cleanup_incomplete",
-                        "last_known_path": str(self.path),
-                        "remaining_entry_count": len(remaining),
-                    }
+            except OSError as error:
+                raise TransactionError(
+                    "stage_cleanup_refused",
+                    f"cannot bind cleanup quarantine after move: {error}",
+                ) from error
+            mismatches = directory_property_mismatches(
+                self.stage_snapshot,
+                quarantined,
+            )
+            source_observation = observe_directory_entry(
+                self.rules_parent_fd,
+                self.stage_name,
+            )
+            if mismatches or source_observation.get("state") != "missing":
+                raise TransactionError(
+                    "stage_cleanup_refused",
+                    "cleanup quarantine does not bind the disposable stage",
+                    details={
+                        "mismatched_properties": mismatches,
+                        "source_observation": source_observation,
+                        "quarantine_observation": observe_directory_entry(
+                            self.rules_parent_fd,
+                            quarantine_name,
+                        ),
+                    },
                 )
-        except (OSError, TransactionError) as error:
             warnings.append(
                 {
-                    "status": (
+                    "status": "stage_cleanup_retained",
+                    "retention_status": "verified_quarantine",
+                    "reason": "conditional_path_delete_unavailable",
+                    "bound_identity": {
+                        "device": self.stage_snapshot.device,
+                        "inode": self.stage_snapshot.inode,
+                    },
+                    "recovery_locator": str(quarantine_path),
+                    "last_known_path": str(self.path),
+                    "cleanup_policy": "atomic_no_clobber_quarantine_no_delete",
+                }
+            )
+        except (OSError, TransactionError) as error:
+            locator = self._locator_for_snapshot(self.stage_snapshot)
+            warnings.append(
+                {
+                    "status": "stage_cleanup_refused",
+                    "reason": (
                         error.status
                         if isinstance(error, TransactionError)
                         else "stage_cleanup_failed"
                     ),
                     "message": str(error),
                     "last_known_path": str(self.path),
+                    "recovery_locator": (str(locator) if locator is not None else None),
+                    "cleanup_policy": "retain_without_path_delete",
                 }
             )
+            if isinstance(error, TransactionError) and error.details:
+                warnings[-1]["details"] = error.details
         finally:
             self._close_bindings()
             self.closed = True
@@ -3020,6 +3062,97 @@ def _stop_validator_process_group(
     return returncode, descendants_detected
 
 
+def _start_validator_signal_supervision() -> tuple[
+    ValidatorSignalGate,
+    dict[int, signal.Handlers],
+    set[signal.Signals],
+    set[signal.Signals],
+]:
+    """Install a first-signal gate before any validator process can exist."""
+
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if (
+        not callable(pthread_sigmask)
+        or threading.current_thread() is not threading.main_thread()
+        or threading.active_count() != 1
+    ):
+        raise TransactionError(
+            "validator_supervision_unsupported",
+            (
+                "validator signal supervision requires a standalone "
+                "single-threaded POSIX main thread"
+            ),
+        )
+
+    inherited_mask = pthread_sigmask(
+        signal.SIG_BLOCK,
+        MANAGED_VALIDATOR_SIGNALS,
+    )
+    supervisor_mask = set(inherited_mask).difference(MANAGED_VALIDATOR_SIGNALS)
+    gate = ValidatorSignalGate()
+    previous_handlers: dict[int, signal.Handlers] = {}
+    try:
+        for signum in MANAGED_VALIDATOR_SIGNALS:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, gate.handle)
+    except BaseException as error:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
+        raise TransactionError(
+            "validator_supervision_unsupported",
+            f"cannot install validator signal supervision: {error}",
+        ) from error
+
+    # Popen and its child inherit the launcher's original mask.  The gate is
+    # deliberately unarmed here: a signal delivered before Popen returns is
+    # latched, not raised before the parent owns the child's PID/PGID.
+    try:
+        pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
+    except BaseException:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
+        raise
+    return gate, previous_handlers, set(inherited_mask), supervisor_mask
+
+
+def _arm_validator_signal_supervision(
+    gate: ValidatorSignalGate,
+    supervisor_mask: set[signal.Signals],
+) -> None:
+    pthread_sigmask = signal.pthread_sigmask
+    try:
+        gate.arm()
+    finally:
+        # If the launcher blocked a managed signal, unblocking it here causes
+        # the now-armed handler to raise only after Popen returned a bound PID.
+        pthread_sigmask(signal.SIG_SETMASK, supervisor_mask)
+
+
+def _quiesce_validator_signal_supervision(gate: ValidatorSignalGate) -> None:
+    """Prevent later managed signals from interrupting synchronous cleanup."""
+
+    gate.close()
+    for signum in MANAGED_VALIDATOR_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
+
+
+def _restore_validator_signal_supervision(
+    gate: ValidatorSignalGate,
+    previous_handlers: dict[int, signal.Handlers],
+    inherited_mask: set[signal.Signals],
+) -> None:
+    pthread_sigmask = signal.pthread_sigmask
+    pthread_sigmask(signal.SIG_BLOCK, MANAGED_VALIDATOR_SIGNALS)
+    try:
+        gate.close()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+    finally:
+        pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
+
+
 def run_validator(
     command_template: list[str],
     rules_path: Path,
@@ -3046,20 +3179,13 @@ def run_validator(
         for argument in command_template
     ]
     deadline = time.monotonic() + timeout_seconds
-    try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            close_fds=True,
-        )
-    except OSError as error:
-        raise TransactionError(
-            "validator_launch_failed",
-            f"cannot launch validator: {error}",
-        ) from error
+    (
+        signal_gate,
+        previous_signal_handlers,
+        inherited_signal_mask,
+        supervisor_signal_mask,
+    ) = _start_validator_signal_supervision()
+    process: subprocess.Popen[bytes] | None = None
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     exit_observer: _ValidatorExitObserver | None = None
     selector: selectors.BaseSelector | None = None
@@ -3067,54 +3193,107 @@ def run_validator(
     output_limit_exceeded = False
     descendants_terminated = False
     try:
-        exit_observer = _ValidatorExitObserver(process)
-        assert process.stdout is not None
-        assert process.stderr is not None
-        selector = selectors.DefaultSelector()
-        for stream, label in (
-            (process.stdout, "stdout"),
-            (process.stderr, "stderr"),
-        ):
-            os.set_blocking(stream.fileno(), False)
-            selector.register(stream, selectors.EVENT_READ, label)
-
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                break
-            overflow, _progressed = _read_validator_events(
-                selector,
-                buffers,
-                max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
-                timeout_seconds=min(0.05, remaining),
-                retain=True,
+        try:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            except OSError as error:
+                _arm_validator_signal_supervision(
+                    signal_gate,
+                    supervisor_signal_mask,
+                )
+                raise TransactionError(
+                    "validator_launch_failed",
+                    f"cannot launch validator: {error}",
+                ) from error
+            except BaseException:
+                _arm_validator_signal_supervision(
+                    signal_gate,
+                    supervisor_signal_mask,
+                )
+                raise
+            _arm_validator_signal_supervision(
+                signal_gate,
+                supervisor_signal_mask,
             )
-            if overflow:
-                output_limit_exceeded = True
-                break
-            if not exit_observer.child_exited():
-                continue
 
-            # Reap every byte already made readable by the direct child. Any
-            # still-open pipe or surviving group member then belongs to a
-            # descendant and is not an acceptable validator terminal state.
-            while selector.get_map():
-                overflow, progressed = _read_validator_events(
+            exit_observer = _ValidatorExitObserver(process)
+            assert process.stdout is not None
+            assert process.stderr is not None
+            selector = selectors.DefaultSelector()
+            for stream, label in (
+                (process.stdout, "stdout"),
+                (process.stderr, "stderr"),
+            ):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, label)
+
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                overflow, _progressed = _read_validator_events(
                     selector,
                     buffers,
                     max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
-                    timeout_seconds=0.01,
+                    timeout_seconds=min(0.05, remaining),
                     retain=True,
                 )
                 if overflow:
                     output_limit_exceeded = True
                     break
-                if not progressed:
+                if not exit_observer.child_exited():
+                    continue
+
+                # Reap every byte already made readable by the direct child.
+                # A still-open pipe or surviving group member then belongs to
+                # a descendant and is not an acceptable terminal state.
+                while selector.get_map():
+                    overflow, progressed = _read_validator_events(
+                        selector,
+                        buffers,
+                        max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
+                        timeout_seconds=0.01,
+                        retain=True,
+                    )
+                    if overflow:
+                        output_limit_exceeded = True
+                        break
+                    if not progressed:
+                        break
+                if output_limit_exceeded:
                     break
-            if output_limit_exceeded:
-                break
-            returncode, cleanup_descendants = _stop_validator_process_group(
+                returncode, cleanup_descendants = _stop_validator_process_group(
+                    process,
+                    exit_observer,
+                    selector,
+                    buffers,
+                    max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
+                )
+                descendants_terminated = descendants_terminated or cleanup_descendants
+                if descendants_terminated:
+                    return ValidatorResult(
+                        125,
+                        bytes(buffers["stdout"]).decode("utf-8", "replace"),
+                        bytes(buffers["stderr"]).decode("utf-8", "replace"),
+                        descendants_terminated=True,
+                    )
+                return ValidatorResult(
+                    returncode,
+                    bytes(buffers["stdout"]).decode("utf-8", "replace"),
+                    bytes(buffers["stderr"]).decode("utf-8", "replace"),
+                )
+
+            assert exit_observer is not None
+            assert selector is not None
+            _returncode, cleanup_descendants = _stop_validator_process_group(
                 process,
                 exit_observer,
                 selector,
@@ -3122,58 +3301,57 @@ def run_validator(
                 max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
             )
             descendants_terminated = descendants_terminated or cleanup_descendants
-            if descendants_terminated:
-                return ValidatorResult(
-                    125,
-                    bytes(buffers["stdout"]).decode("utf-8", "replace"),
-                    bytes(buffers["stderr"]).decode("utf-8", "replace"),
-                    descendants_terminated=True,
-                )
             return ValidatorResult(
-                returncode,
+                124 if timed_out else 125,
                 bytes(buffers["stdout"]).decode("utf-8", "replace"),
                 bytes(buffers["stderr"]).decode("utf-8", "replace"),
+                timed_out=timed_out,
+                output_limit_exceeded=output_limit_exceeded,
+                descendants_terminated=descendants_terminated,
             )
-
-        assert exit_observer is not None
-        assert selector is not None
-        _returncode, cleanup_descendants = _stop_validator_process_group(
-            process,
-            exit_observer,
-            selector,
-            buffers,
-            max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
-        )
-        descendants_terminated = descendants_terminated or cleanup_descendants
-        return ValidatorResult(
-            124 if timed_out else 125,
-            bytes(buffers["stdout"]).decode("utf-8", "replace"),
-            bytes(buffers["stderr"]).decode("utf-8", "replace"),
-            timed_out=timed_out,
-            output_limit_exceeded=output_limit_exceeded,
-            descendants_terminated=descendants_terminated,
-        )
-    except BaseException as error:
-        cleanup_errors = _emergency_stop_validator_process_group(
-            process,
-            selector,
-            buffers,
-            max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
-        )
-        if cleanup_errors and isinstance(error, TransactionError):
-            error.details.setdefault(
-                "emergency_cleanup_errors",
-                cleanup_errors,
+        except ForwardedValidatorSignal as event:
+            _quiesce_validator_signal_supervision(signal_gate)
+            if process is not None:
+                event.cleanup_errors = _emergency_stop_validator_process_group(
+                    process,
+                    selector,
+                    buffers,
+                    max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
+                )
+            raise
+        except BaseException as error:
+            _quiesce_validator_signal_supervision(signal_gate)
+            cleanup_errors = (
+                _emergency_stop_validator_process_group(
+                    process,
+                    selector,
+                    buffers,
+                    max_output_bytes=MAX_VALIDATOR_OUTPUT_BYTES,
+                )
+                if process is not None
+                else []
             )
-        raise
+            if cleanup_errors and isinstance(error, TransactionError):
+                error.details.setdefault(
+                    "emergency_cleanup_errors",
+                    cleanup_errors,
+                )
+            raise
+        finally:
+            if exit_observer is not None:
+                exit_observer.close()
+            if selector is not None:
+                selector.close()
+            if process is not None:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None and not stream.closed:
+                        stream.close()
     finally:
-        if exit_observer is not None:
-            exit_observer.close()
-        if selector is not None:
-            selector.close()
-        for stream in (process.stdout, process.stderr):
-            if stream is not None and not stream.closed:
-                stream.close()
+        _restore_validator_signal_supervision(
+            signal_gate,
+            previous_signal_handlers,
+            inherited_signal_mask,
+        )
 
 
 def fsync_file_and_parent(path: Path) -> None:
@@ -4001,6 +4179,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
     evidence: ApplyEvidenceBindings | None = None
     lock_acquired = False
     retain_stage = False
+    pending_success_status: str | None = None
     try:
         # A no-op needs neither a validator process nor a staging directory.
         # The unlocked read is only a hint; every protected live property and
@@ -4095,6 +4274,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     "actual_sha256": current.sha256,
                 }
             if current_bytes == candidate_bytes:
+                pending_success_status = "no_change_after_lock"
                 return 0, {
                     "status": "no_change_after_lock",
                     "rules_path": str(rules),
@@ -4445,6 +4625,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     "receipt_path": str(receipt),
                     "backup_path": str(backup),
                 }
+            pending_success_status = "applied"
             return 0, {
                 "status": "applied",
                 "transaction_id": transaction_receipt["transaction_id"],
@@ -4459,7 +4640,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
     except BaseException as error:
         if (
             isinstance(error, TransactionError) and error.status == "recovery_required"
-        ) or evidence is not None:
+        ) or (stage is not None and stage.mutation_uncertain):
             retain_stage = True
         raise
     finally:
@@ -4479,6 +4660,20 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     sort_keys=True,
                 ),
                 file=sys.stderr,
+            )
+        cleanup_refusals = [
+            warning
+            for warning in warnings
+            if warning.get("status") == "stage_cleanup_refused"
+        ]
+        if pending_success_status is not None and cleanup_refusals:
+            raise TransactionError(
+                "stage_cleanup_refused",
+                "cannot report success because disposable stage cleanup was refused",
+                details={
+                    "operation_status": pending_success_status,
+                    "cleanup_refusals": cleanup_refusals,
+                },
             )
 
 
@@ -4704,6 +4899,7 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
             }
         stage = PrivateStage(rules.parent)
         retain_stage = False
+        pending_success_status: str | None = None
         try:
             rolled_back, rollback_result = rollback(
                 stage=stage,
@@ -4732,6 +4928,7 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                 require_object_policy=True,
             )
             if terminal_path is None:
+                pending_success_status = "recovered"
                 return 0, {
                     "status": "recovered",
                     "rules_path": str(rules),
@@ -4759,14 +4956,19 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                         **error.details,
                     },
                 }
+            pending_success_status = "recovered"
             return 0, {
                 "status": "recovered",
                 "rules_path": str(rules),
                 "rollback": rollback_result,
                 "recovery_terminal": terminal,
             }
-        except BaseException:
-            retain_stage = True
+        except BaseException as error:
+            if (
+                isinstance(error, TransactionError)
+                and error.status == "recovery_required"
+            ) or stage.mutation_uncertain:
+                retain_stage = True
             raise
         finally:
             warnings = stage.cleanup(retain=retain_stage)
@@ -4777,6 +4979,23 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                         sort_keys=True,
                     ),
                     file=sys.stderr,
+                )
+            cleanup_refusals = [
+                warning
+                for warning in warnings
+                if warning.get("status") == "stage_cleanup_refused"
+            ]
+            if pending_success_status is not None and cleanup_refusals:
+                raise TransactionError(
+                    "stage_cleanup_refused",
+                    (
+                        "cannot report success because disposable stage cleanup "
+                        "was refused"
+                    ),
+                    details={
+                        "operation_status": pending_success_status,
+                        "cleanup_refusals": cleanup_refusals,
+                    },
                 )
 
 
@@ -4861,6 +5080,15 @@ def main(argv: list[str] | None = None) -> int:
             exit_code, payload = apply_transaction(args)
         else:
             exit_code, payload = recover_transaction(args)
+    except ForwardedValidatorSignal as event:
+        exit_code = min(255, 128 + event.signum)
+        payload = {
+            "status": "interrupted",
+            "signal": event.signum,
+            "signal_name": signal.Signals(event.signum).name,
+        }
+        if event.cleanup_errors:
+            payload["validator_cleanup_errors"] = event.cleanup_errors
     except TransactionError as error:
         exit_code = error.exit_code
         payload = {

@@ -111,6 +111,13 @@ class RulesApplyTransactionTests(unittest.TestCase):
             time.sleep(0.01)
         return int(pid_path.read_text(encoding="ascii"))
 
+    def wait_for_path(self, path: Path, *, label: str) -> None:
+        deadline = time.monotonic() + 3
+        while not path.exists():
+            if time.monotonic() >= deadline:
+                self.fail(f"{label} did not become ready: {path}")
+            time.sleep(0.01)
+
     def assert_process_exited(self, pid: int) -> None:
         deadline = time.monotonic() + 2
         while True:
@@ -1102,6 +1109,307 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assert_process_exited(self.wait_for_pid_path(leader_pid_path))
         self.assert_process_exited(self.wait_for_pid_path(child_pid_path))
 
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "validator signal supervision requires POSIX signal masks",
+    )
+    def test_real_managed_signal_waits_for_validator_group_cleanup(self) -> None:
+        leader_pid_path = self.root / "validator-signal-leader.pid"
+        child_pid_path = self.root / "validator-signal-child.pid"
+        ready_path = self.root / "validator-signal.ready"
+        leader_term_path = self.root / "validator-signal-leader.term"
+        child_term_path = self.root / "validator-signal-child.term"
+        child_script = self.root / "validator-signal-child.py"
+        child_script.write_text(
+            textwrap.dedent(
+                f"""\
+                from pathlib import Path
+                import os
+                import signal
+                import time
+
+                term_path = Path({str(child_term_path)!r})
+
+                def record_term(_signum, _frame):
+                    term_path.write_text("term", encoding="ascii")
+
+                signal.signal(signal.SIGTERM, record_term)
+                Path({str(child_pid_path)!r}).write_text(
+                    str(os.getpid()),
+                    encoding="ascii",
+                )
+                while True:
+                    time.sleep(1)
+                """
+            ),
+            encoding="utf-8",
+        )
+        self.write_validator(
+            f"""\
+            from pathlib import Path
+            import os
+            import signal
+            import subprocess
+            import sys
+            import time
+
+            term_path = Path({str(leader_term_path)!r})
+
+            def record_term(_signum, _frame):
+                term_path.write_text("term", encoding="ascii")
+
+            signal.signal(signal.SIGTERM, record_term)
+            Path({str(leader_pid_path)!r}).write_text(
+                str(os.getpid()),
+                encoding="ascii",
+            )
+            subprocess.Popen([sys.executable, {str(child_script)!r}])
+            child_pid_path = Path({str(child_pid_path)!r})
+            while not child_pid_path.exists():
+                time.sleep(0.01)
+            Path({str(ready_path)!r}).write_text("ready", encoding="ascii")
+            while True:
+                time.sleep(1)
+            """
+        )
+        command = [
+            sys.executable,
+            str(HELPER),
+            "apply",
+            "--candidate",
+            str(self.candidate),
+            "--candidate-sha256",
+            hashlib.sha256(NEW_RULES).hexdigest(),
+            "--expected-sha256",
+            hashlib.sha256(OLD_RULES).hexdigest(),
+            "--backup-name",
+            self.backup_name,
+            "--receipt",
+            str(self.receipt),
+            "--validator-timeout-seconds=5",
+            "--lock-timeout-seconds",
+            "2",
+            "--",
+            sys.executable,
+            str(self.validator),
+            "{rules}",
+        ]
+
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            with self.subTest(signal=signal.Signals(signum).name):
+                for path in (
+                    leader_pid_path,
+                    child_pid_path,
+                    ready_path,
+                    leader_term_path,
+                    child_term_path,
+                ):
+                    path.unlink(missing_ok=True)
+                process = subprocess.Popen(
+                    command,
+                    env=self.helper_environment(),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                leader_pid: int | None = None
+                child_pid: int | None = None
+                try:
+                    self.wait_for_path(ready_path, label="validator process group")
+                    leader_pid = self.wait_for_pid_path(leader_pid_path)
+                    child_pid = self.wait_for_pid_path(child_pid_path)
+                    process.send_signal(signum)
+                    stdout, stderr = process.communicate(timeout=8)
+
+                    self.assertEqual(process.returncode, 128 + signum, stderr)
+                    payload = json.loads(stdout)
+                    self.assertEqual(payload["status"], "interrupted")
+                    self.assertEqual(payload["signal"], signum)
+                    self.assertEqual(
+                        payload["signal_name"],
+                        signal.Signals(signum).name,
+                    )
+                    self.assertNotIn("Traceback", stderr)
+                    self.assert_process_exited(leader_pid)
+                    self.assert_process_exited(child_pid)
+                    self.assertTrue(leader_term_path.is_file())
+                    self.assertTrue(child_term_path.is_file())
+                    self.assertFalse(self.backup.exists())
+                    self.assertFalse(self.receipt.exists())
+                    self.assert_no_private_stage()
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=2)
+                    if leader_pid is not None:
+                        try:
+                            os.killpg(leader_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "validator signal supervision requires POSIX signal masks",
+    )
+    def test_real_signal_in_popen_handoff_is_deferred_until_cleanup(self) -> None:
+        leader_pid_path = self.root / "validator-handoff-leader.pid"
+        driver = self.root / "validator-handoff-driver.py"
+        self.write_validator(
+            """\
+            import time
+
+            while True:
+                time.sleep(1)
+            """
+        )
+        driver.write_text(
+            textwrap.dedent(
+                f"""\
+                import importlib.util
+                import json
+                import os
+                from pathlib import Path
+                import signal
+                import sys
+
+                spec = importlib.util.spec_from_file_location(
+                    "handoff_transaction",
+                    {str(HELPER)!r},
+                )
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                real_popen = module.subprocess.Popen
+
+                def signal_before_return(*args, **kwargs):
+                    process = real_popen(*args, **kwargs)
+                    Path({str(leader_pid_path)!r}).write_text(
+                        str(process.pid),
+                        encoding="ascii",
+                    )
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return process
+
+                module.subprocess.Popen = signal_before_return
+                try:
+                    module.run_validator(
+                        [
+                            sys.executable,
+                            {str(self.validator)!r},
+                            "{{rules}}",
+                        ],
+                        Path({str(self.candidate)!r}),
+                        timeout_seconds=5,
+                    )
+                except module.ForwardedValidatorSignal as event:
+                    print(
+                        json.dumps(
+                            {{
+                                "status": "interrupted",
+                                "signal": event.signum,
+                            }}
+                        )
+                    )
+                    raise SystemExit(128 + event.signum)
+                raise SystemExit(99)
+                """
+            ),
+            encoding="utf-8",
+        )
+        leader_pid: int | None = None
+        try:
+            result = subprocess.run(
+                [sys.executable, str(driver)],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            leader_pid = self.wait_for_pid_path(leader_pid_path)
+
+            self.assertEqual(result.returncode, 128 + signal.SIGTERM, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["status"], "interrupted")
+            self.assertNotIn("Traceback", result.stderr)
+            self.assert_process_exited(leader_pid)
+        finally:
+            if leader_pid is not None:
+                try:
+                    os.killpg(leader_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "validator signal supervision requires POSIX signal masks",
+    )
+    def test_validator_restores_signal_handlers_and_mask(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        previous_handlers = {
+            signum: signal.getsignal(signum)
+            for signum in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+        }
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        result = TRANSACTION.run_validator(
+            [sys.executable, str(self.validator), "{rules}"],
+            self.candidate,
+            timeout_seconds=2,
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(
+            {
+                signum: signal.getsignal(signum)
+                for signum in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+            },
+            previous_handlers,
+        )
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            previous_mask,
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "validator signal supervision requires POSIX signal masks",
+    )
+    def test_validator_launch_failure_restores_signal_handlers_and_mask(
+        self,
+    ) -> None:
+        previous_handlers = {
+            signum: signal.getsignal(signum)
+            for signum in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+        }
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        with (
+            mock.patch.object(
+                TRANSACTION.subprocess,
+                "Popen",
+                side_effect=FileNotFoundError(errno.ENOENT, "fault-injected"),
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.run_validator(
+                [sys.executable, str(self.validator), "{rules}"],
+                self.candidate,
+                timeout_seconds=2,
+            )
+
+        self.assertEqual(raised.exception.status, "validator_launch_failed")
+        self.assertEqual(
+            {
+                signum: signal.getsignal(signum)
+                for signum in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+            },
+            previous_handlers,
+        )
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            previous_mask,
+        )
+
     def test_validator_descendant_is_terminated_after_leader_exit(self) -> None:
         pid_path = self.root / "validator-descendant.pid"
         ready_path = self.root / "validator-descendant.ready"
@@ -1694,6 +2002,140 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(payload["status"], "receipt_invalid")
         self.assertIn("object_policy.nlink must be 1", payload["message"])
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+
+    def test_atomic_exchange_unsupported_uses_disposable_cleanup(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_exchange",
+                side_effect=TRANSACTION.TransactionError(
+                    "atomic_rename_unsupported",
+                    "fault-injected unsupported exchange",
+                ),
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(raised.exception.status, "atomic_rename_unsupported")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assert_no_private_stage()
+        retained = list(self.rules_dir.glob(".default.rules.cleanup-retained-*"))
+        self.assertEqual(len(retained), 1)
+        cleanup = json.loads(stderr.getvalue().strip())
+        self.assertEqual(cleanup["status"], "cleanup_warning")
+        self.assertTrue(
+            any(
+                warning["status"] == "stage_cleanup_retained"
+                for warning in cleanup["warnings"]
+            )
+        )
+        self.assertFalse(
+            any(
+                warning["status"] == "retained_staging_directory"
+                for warning in cleanup["warnings"]
+            )
+        )
+
+    def test_cleanup_refusal_overrides_pending_applied_success(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        stderr = io.StringIO()
+        real_no_replace = TRANSACTION.atomic_rename_no_replace
+
+        def refuse_disposable_stage_move(
+            source_directory_fd: int,
+            source_name: str,
+            destination_directory_fd: int,
+            destination_name: str,
+        ) -> None:
+            if source_name.startswith(".rules-apply-"):
+                raise TRANSACTION.TransactionError(
+                    "atomic_rename_unsupported",
+                    "fault-injected cleanup quarantine refusal",
+                )
+            real_no_replace(
+                source_directory_fd,
+                source_name,
+                destination_directory_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_no_replace",
+                side_effect=refuse_disposable_stage_move,
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(raised.exception.status, "stage_cleanup_refused")
+        self.assertEqual(raised.exception.details["operation_status"], "applied")
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertTrue(self.backup.is_file())
+        self.assertTrue(self.receipt.is_file())
+        stages = list(self.rules_dir.glob(".rules-apply-*"))
+        self.assertEqual(len(stages), 1)
+        cleanup = json.loads(stderr.getvalue().strip())
+        self.assertTrue(
+            any(
+                warning["status"] == "stage_cleanup_refused"
+                for warning in cleanup["warnings"]
+            )
+        )
+
+    def test_verified_cleanup_retention_does_not_change_applied_success(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+
+        result = self.run_apply()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["status"], "applied")
+        cleanup = json.loads(result.stderr.strip())
+        self.assertEqual(cleanup["status"], "cleanup_warning")
+        self.assertTrue(
+            any(
+                warning["status"] == "stage_cleanup_retained"
+                for warning in cleanup["warnings"]
+            )
+        )
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+
+    def test_verified_cleanup_retention_does_not_change_recovered_success(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+
+        recovered = self.run_recover()
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(json.loads(recovered.stdout)["status"], "recovered")
+        cleanup = json.loads(recovered.stderr.strip())
+        self.assertTrue(
+            any(
+                warning["status"] == "stage_cleanup_retained"
+                for warning in cleanup["warnings"]
+            )
+        )
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
 
 
 class RulesApplyPrimitiveRaceTests(unittest.TestCase):
@@ -2511,15 +2953,18 @@ class RulesApplyPrimitiveRaceTests(unittest.TestCase):
 
         warnings = stage.cleanup(retain=False)
 
-        self.assertEqual(source.read_bytes(), b"replacement cleanup leaf\n")
-        self.assertFalse(moved_source.exists())
-        self.assertTrue(stage.path.is_dir())
-        self.assertTrue(
-            any(
-                warning["status"] == "stage_cleanup_unexpected_entry"
-                for warning in warnings
-            )
+        retained = next(
+            warning
+            for warning in warnings
+            if warning["status"] == "stage_cleanup_retained"
         )
+        quarantine = Path(retained["recovery_locator"])
+        self.assertEqual(
+            (quarantine / source.name).read_bytes(),
+            b"replacement cleanup leaf\n",
+        )
+        self.assertEqual((quarantine / moved_source.name).read_bytes(), NEW_RULES)
+        self.assertFalse(stage.path.exists())
 
     def test_disposable_cleanup_never_removes_replacement_root(self) -> None:
         stage = TRANSACTION.PrivateStage(self.rules_dir)
@@ -2534,8 +2979,88 @@ class RulesApplyPrimitiveRaceTests(unittest.TestCase):
 
         self.assertEqual(replacement_leaf.read_bytes(), b"replacement stage tree\n")
         self.assertEqual((moved_root / source.name).read_bytes(), NEW_RULES)
-        self.assertTrue(
-            any(warning["status"] == "private_stage_changed" for warning in warnings)
+        refused = next(
+            warning
+            for warning in warnings
+            if warning["status"] == "stage_cleanup_refused"
+        )
+        self.assertEqual(refused["reason"], "private_stage_changed")
+        self.assertEqual(refused["recovery_locator"], str(moved_root))
+
+    def test_disposable_cleanup_never_calls_path_delete_primitives(self) -> None:
+        stage = TRANSACTION.PrivateStage(self.rules_dir)
+        source, _expected = stage.create("candidate", NEW_RULES)
+
+        with (
+            mock.patch.object(TRANSACTION.os, "unlink") as unlink,
+            mock.patch.object(TRANSACTION.os, "rmdir") as rmdir,
+        ):
+            warnings = stage.cleanup(retain=False)
+
+        unlink.assert_not_called()
+        rmdir.assert_not_called()
+        retained = next(
+            warning
+            for warning in warnings
+            if warning["status"] == "stage_cleanup_retained"
+        )
+        quarantine = Path(retained["recovery_locator"])
+        self.assertEqual((quarantine / source.name).read_bytes(), NEW_RULES)
+
+    def test_disposable_cleanup_retains_post_move_root_replacement(self) -> None:
+        stage = TRANSACTION.PrivateStage(self.rules_dir)
+        source, _expected = stage.create("candidate", NEW_RULES)
+        real_move = TRANSACTION.atomic_rename_no_replace
+
+        def move_then_replace_source(
+            source_directory_fd: int,
+            source_name: str,
+            destination_directory_fd: int,
+            destination_name: str,
+        ) -> None:
+            real_move(
+                source_directory_fd,
+                source_name,
+                destination_directory_fd,
+                destination_name,
+            )
+            os.mkdir(source_name, 0o700, dir_fd=source_directory_fd)
+            replacement_directory_fd = os.open(
+                source_name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=source_directory_fd,
+            )
+            try:
+                replacement_fd = os.open(
+                    "replacement",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=replacement_directory_fd,
+                )
+                try:
+                    os.write(replacement_fd, b"replacement stage tree\n")
+                finally:
+                    os.close(replacement_fd)
+            finally:
+                os.close(replacement_directory_fd)
+
+        with mock.patch.object(
+            TRANSACTION,
+            "atomic_rename_no_replace",
+            side_effect=move_then_replace_source,
+        ):
+            warnings = stage.cleanup(retain=False)
+
+        refused = next(
+            warning
+            for warning in warnings
+            if warning["status"] == "stage_cleanup_refused"
+        )
+        quarantine = Path(refused["recovery_locator"])
+        self.assertEqual((quarantine / source.name).read_bytes(), NEW_RULES)
+        self.assertEqual(
+            (stage.path / "replacement").read_bytes(),
+            b"replacement stage tree\n",
         )
 
     def test_atomic_exchange_unsupported_fails_without_fallback(self) -> None:

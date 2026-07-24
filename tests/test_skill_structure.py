@@ -250,6 +250,12 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("descriptor_only_or_unlocatable", cadence)
         self.assertIn("Modification times are not treated as policy mutation", cadence)
         self.assertIn("not a kernel compare-and-swap", cadence)
+        self.assertIn("first-signal gate", cadence)
+        self.assertIn("returns `128 + signal`", cadence)
+        self.assertIn("no compare-and-unlink or compare-and-rmdir", cadence)
+        self.assertIn("stage_cleanup_retained", cadence)
+        self.assertIn("stage_cleanup_refused", cadence)
+        self.assertIn("not recovery evidence", cadence)
         self.assertIn(
             "requires every legitimate writer to honor the same persistent lock",
             cadence,
@@ -291,9 +297,14 @@ class SkillStructureTests(unittest.TestCase):
             "property_mismatches",
             "rollback",
             "recovery_required",
+            "MANAGED_VALIDATOR_SIGNALS",
+            "stage_cleanup_retained",
+            "stage_cleanup_refused",
         ):
             self.assertIn(phrase, helper_text)
         self.assertNotIn("os.replace", helper_text)
+        self.assertNotIn("os.unlink", helper_text)
+        self.assertNotIn("os.rmdir", helper_text)
         self.assertIn("Audit Codex rules without changing files", interface)
         self.assertIn("run a read-only audit", interface)
         self.assertNotIn("audit or apply", interface.lower())
