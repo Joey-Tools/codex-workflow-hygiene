@@ -985,16 +985,24 @@ class RulesApplyTransactionTests(unittest.TestCase):
             real_close(fd)
 
         try:
-            with (
-                mock.patch.object(
-                    TRANSACTION.os,
-                    "close",
-                    side_effect=interrupt_first_close,
-                ),
-                self.assertRaises(KeyboardInterrupt),
+            with mock.patch.object(
+                TRANSACTION.os,
+                "close",
+                side_effect=interrupt_first_close,
             ):
-                evidence.close()
+                failures = evidence.close()
 
+            self.assertEqual(
+                failures,
+                [
+                    {
+                        "operation": "close",
+                        "descriptor": "recovery_receipt",
+                        "error_type": "KeyboardInterrupt",
+                        "message": "fault-injected evidence close",
+                    }
+                ],
+            )
             for fd in expected_closed:
                 with self.assertRaises(OSError) as closed:
                     os.fstat(fd)
@@ -3288,6 +3296,44 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 self.assertEqual(self.rules.read_bytes(), OLD_RULES)
                 self.assertFalse(self.backup.exists())
 
+    def test_schema_v4_proven_q_replaced_terminal_is_pre_mutation_refusal(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "__init__",
+                side_effect=TRANSACTION.TransactionError(
+                    "private_stage_unavailable",
+                    "fault-injected stage creation failure",
+                ),
+            ),
+            self.assertRaises(TRANSACTION.TransactionError),
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        reservation = terminal.read_bytes()
+        terminal.rename(terminal.with_name("recovery.bound"))
+        terminal.write_bytes(reservation)
+        terminal.chmod(0o600)
+
+        recovered = self.run_recover()
+
+        self.assertEqual(recovered.returncode, 40, recovered.stderr)
+        payload = json.loads(recovered.stdout)
+        self.assertEqual(payload["status"], "recovery_refused")
+        self.assertEqual(payload["reason"], "recovery_terminal_binding_changed")
+        self.assertEqual(payload["transaction_state"], "Q")
+        self.assertNotIn("mutation_journal", payload)
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+
     def test_schema_v4_q_or_p_unknown_stage_is_ambiguous_recovery_required(
         self,
     ) -> None:
@@ -4055,7 +4101,9 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertEqual(self.backup.read_bytes(), NEW_RULES)
 
-    def test_recover_refuses_replaced_terminal_reservation(self) -> None:
+    def test_recover_requires_evidence_for_replaced_terminal_after_state_c(
+        self,
+    ) -> None:
         self.write_validator("raise SystemExit(0)\n")
         applied = self.run_apply()
         self.assertEqual(applied.returncode, 0, applied.stderr)
@@ -4068,12 +4116,87 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         recovered = self.run_recover()
 
-        self.assertEqual(recovered.returncode, 40, recovered.stderr)
+        self.assertEqual(recovered.returncode, 30, recovered.stderr)
         payload = json.loads(recovered.stdout)
-        self.assertEqual(payload["status"], "recovery_refused")
+        self.assertEqual(payload["status"], "recovery_required")
         self.assertEqual(payload["reason"], "recovery_terminal_binding_changed")
         self.assertEqual(payload["mismatched_properties"], ["object_identity"])
+        self.assertEqual(payload["transaction_state"], "C")
+        self.assertTrue(
+            any(
+                event["operation"] == "prior_transaction_state"
+                and event["phase"] == "observed"
+                and event["state"] == "C"
+                for event in payload["mutation_journal"]
+            )
+        )
+        self.assertEqual(
+            Path(payload["recovery_locators"]["recovery_terminal"]).resolve(),
+            terminal.resolve(),
+        )
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+
+    def test_schema_v3_state_p_replaced_terminal_requires_recovery(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        stage_root = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        receipt["schema_version"] = 3
+        receipt["staged_backup_parent"] = TRANSACTION.Snapshot.from_stat(
+            stage_root.stat(follow_symlinks=False),
+            b"",
+        ).to_json()
+        receipt.pop("prepared_candidate_path", None)
+        receipt.pop("prepared_candidate_parent", None)
+        self.receipt.write_text(
+            json.dumps(receipt, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.receipt.chmod(0o600)
+        staged = stage_root / "candidate"
+        os.rename(self.backup, staged)
+        stage_fd = os.open(
+            stage_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        rules_fd = os.open(
+            self.rules_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            TRANSACTION.atomic_rename_exchange(
+                stage_fd,
+                staged.name,
+                rules_fd,
+                self.rules.name,
+            )
+        finally:
+            os.close(rules_fd)
+            os.close(stage_fd)
+        terminal = Path(receipt["recovery_terminal_path"])
+        reservation = terminal.read_bytes()
+        terminal.rename(terminal.with_name("recovery.bound"))
+        terminal.write_bytes(reservation)
+        terminal.chmod(0o600)
+
+        recovered = self.run_recover()
+
+        self.assertEqual(recovered.returncode, 30, recovered.stderr)
+        payload = json.loads(recovered.stdout)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["reason"], "recovery_terminal_binding_changed")
+        self.assertEqual(payload["transaction_state"], "P")
+        self.assertTrue(
+            any(
+                event["operation"] == "prior_transaction_state"
+                and event["state"] == "P"
+                for event in payload["mutation_journal"]
+            )
+        )
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertEqual(staged.read_bytes(), NEW_RULES)
 
     def test_recover_accepts_legacy_v1_receipt_without_link_policy(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -4521,6 +4644,425 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
         self.assertEqual(self.backup.read_bytes(), OLD_RULES)
         self.assertTrue(self.receipt.is_file())
+
+    def test_shared_lock_final_revalidation_wins_over_close_failure(
+        self,
+    ) -> None:
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        real_revalidate = TRANSACTION.revalidate_lock
+        real_close = TRANSACTION.os.close
+        revalidation_count = 0
+        lock_fd: int | None = None
+
+        def fail_final_revalidation(binding: object) -> None:
+            nonlocal revalidation_count
+            revalidation_count += 1
+            if revalidation_count == 3:
+                raise TRANSACTION.TransactionError(
+                    "lock_changed",
+                    "fault-injected final lock replacement",
+                    details={"mismatched_properties": ["object_identity"]},
+                )
+            real_revalidate(binding)
+
+        def fail_lock_close(fd: int) -> None:
+            if fd == lock_fd:
+                real_close(fd)
+                raise OSError(errno.EIO, "fault-injected lock close")
+            real_close(fd)
+
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "revalidate_lock",
+                side_effect=fail_final_revalidation,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "close",
+                side_effect=fail_lock_close,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            with TRANSACTION.shared_lock(lock, timeout_seconds=2.0) as binding:
+                lock_fd = binding.fd
+
+        self.assertEqual(raised.exception.status, "lock_changed")
+        self.assertEqual(
+            raised.exception.details["mismatched_properties"],
+            ["object_identity"],
+        )
+        self.assertEqual(
+            raised.exception.details["cleanup_failures"],
+            [
+                {
+                    "operation": "close",
+                    "descriptor": "transaction_lock",
+                    "error_type": "OSError",
+                    "message": "[Errno 5] fault-injected lock close",
+                    "errno": errno.EIO,
+                    "errno_name": "EIO",
+                    "release_uncertain": True,
+                }
+            ],
+        )
+        assert lock_fd is not None
+        with self.assertRaises(OSError) as closed:
+            os.fstat(lock_fd)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_shared_lock_close_only_failure_is_structured(self) -> None:
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        real_close = TRANSACTION.os.close
+        lock_fd: int | None = None
+
+        def interrupt_lock_close(fd: int) -> None:
+            if fd == lock_fd:
+                real_close(fd)
+                raise OSError(errno.EINTR, "fault-injected interrupted close")
+            real_close(fd)
+
+        with (
+            mock.patch.object(
+                TRANSACTION.os,
+                "close",
+                side_effect=interrupt_lock_close,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            with TRANSACTION.shared_lock(lock, timeout_seconds=2.0) as binding:
+                lock_fd = binding.fd
+
+        self.assertEqual(raised.exception.status, "lock_close_failed")
+        self.assertEqual(
+            raised.exception.details["cleanup_failures"][0]["descriptor"],
+            "transaction_lock",
+        )
+        self.assertEqual(
+            raised.exception.details["cleanup_failures"][0]["errno"],
+            errno.EINTR,
+        )
+        self.assertTrue(
+            raised.exception.details["cleanup_failures"][0]["release_uncertain"]
+        )
+
+    def test_apply_keeps_evidence_bound_until_lock_close_fault_is_classified(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_close_descriptors = TRANSACTION.close_descriptors_best_effort
+        real_evidence_close = TRANSACTION.ApplyEvidenceBindings.close
+        evidence_close_observed = False
+
+        def fail_lock_descriptor_close(
+            descriptors: list[tuple[str, int]],
+            *,
+            release_uncertain: bool = False,
+        ) -> list[dict[str, object]]:
+            if (
+                release_uncertain
+                and descriptors
+                and descriptors[0][0] == "transaction_lock"
+            ):
+                TRANSACTION.os.close(descriptors[0][1])
+                return [
+                    TRANSACTION.structured_operation_failure(
+                        "close",
+                        "transaction_lock",
+                        OSError(errno.EIO, "fault-injected lock close"),
+                        release_uncertain=True,
+                    )
+                ]
+            return real_close_descriptors(
+                descriptors,
+                release_uncertain=release_uncertain,
+            )
+
+        def assert_evidence_bound(bindings: object) -> list[dict[str, object]]:
+            nonlocal evidence_close_observed
+            assert isinstance(bindings, TRANSACTION.ApplyEvidenceBindings)
+            assert bindings.receipt is not None
+            for fd in (
+                bindings.receipt.fd,
+                bindings.recovery_terminal.fd,
+                bindings.receipt_parent.fd,
+                bindings.rules_parent.fd,
+            ):
+                os.fstat(fd)
+            with self.assertRaises(OSError) as lock_closed:
+                os.fstat(bindings.lock.fd)
+            self.assertEqual(lock_closed.exception.errno, errno.EBADF)
+            evidence_close_observed = True
+            return real_evidence_close(bindings)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "close_descriptors_best_effort",
+                side_effect=fail_lock_descriptor_close,
+            ),
+            mock.patch.object(
+                TRANSACTION.ApplyEvidenceBindings,
+                "close",
+                autospec=True,
+                side_effect=assert_evidence_bound,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertTrue(evidence_close_observed)
+        self.assertEqual(raised.exception.status, "recovery_required")
+        self.assertEqual(raised.exception.details["reason"], "lock_close_failed")
+        self.assertEqual(
+            raised.exception.details["cleanup_failures"][0]["descriptor"],
+            "transaction_lock",
+        )
+        self.assertTrue(
+            raised.exception.details["cleanup_failures"][0]["release_uncertain"]
+        )
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+        self.assertTrue(self.receipt.is_file())
+
+    def test_recovered_terminal_result_preserves_multi_close_failures(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        real_terminal_close = TRANSACTION.RecoveryTerminalEvidence.close
+        real_receipt_close = TRANSACTION.RecoveryReceiptEvidence.close
+        real_os_close = TRANSACTION.os.close
+        closed_fds: list[int] = []
+
+        def faulting_close(
+            faults: dict[int, tuple[int, str]],
+        ):
+            def close(fd: int) -> None:
+                real_os_close(fd)
+                closed_fds.append(fd)
+                if fd in faults:
+                    error_number, message = faults[fd]
+                    raise OSError(error_number, message)
+
+            return close
+
+        def close_terminal(evidence: object) -> list[dict[str, object]]:
+            assert isinstance(evidence, TRANSACTION.RecoveryTerminalEvidence)
+            assert evidence.result is not None
+            with mock.patch.object(
+                TRANSACTION.os,
+                "close",
+                side_effect=faulting_close(
+                    {
+                        evidence.result.fd: (
+                            errno.EIO,
+                            "fault-injected result close",
+                        ),
+                        evidence.reservation.fd: (
+                            errno.EINTR,
+                            "fault-injected reservation close",
+                        ),
+                    }
+                ),
+            ):
+                return real_terminal_close(evidence)
+
+        def close_receipt(evidence: object) -> list[dict[str, object]]:
+            assert isinstance(evidence, TRANSACTION.RecoveryReceiptEvidence)
+            with mock.patch.object(
+                TRANSACTION.os,
+                "close",
+                side_effect=faulting_close(
+                    {
+                        evidence.binding.fd: (
+                            errno.EIO,
+                            "fault-injected receipt close",
+                        ),
+                        evidence.parent.fd: (
+                            errno.EINTR,
+                            "fault-injected receipt parent close",
+                        ),
+                    }
+                ),
+            ):
+                return real_receipt_close(evidence)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.RecoveryTerminalEvidence,
+                "close",
+                autospec=True,
+                side_effect=close_terminal,
+            ),
+            mock.patch.object(
+                TRANSACTION.RecoveryReceiptEvidence,
+                "close",
+                autospec=True,
+                side_effect=close_receipt,
+            ),
+        ):
+            code, payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "recovered")
+        self.assertEqual(
+            [failure["descriptor"] for failure in payload["cleanup_failures"]],
+            [
+                "recovery_terminal_result",
+                "recovery_terminal_reservation",
+                "recovery_receipt",
+                "receipt_parent",
+            ],
+        )
+        self.assertEqual(
+            [failure["errno"] for failure in payload["cleanup_failures"]],
+            [errno.EIO, errno.EINTR, errno.EIO, errno.EINTR],
+        )
+        self.assertEqual(len(closed_fds), 4)
+        for fd in closed_fds:
+            with self.assertRaises(OSError) as closed:
+                os.fstat(fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_recovery_required_preserves_primary_with_receipt_close_faults(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        terminal = Path(receipt["recovery_terminal_path"])
+        reservation = terminal.read_bytes()
+        terminal.rename(terminal.with_name("recovery.bound"))
+        terminal.write_bytes(reservation)
+        terminal.chmod(0o600)
+        real_receipt_close = TRANSACTION.RecoveryReceiptEvidence.close
+        real_os_close = TRANSACTION.os.close
+
+        def close_receipt(evidence: object) -> list[dict[str, object]]:
+            assert isinstance(evidence, TRANSACTION.RecoveryReceiptEvidence)
+
+            def fault_close(fd: int) -> None:
+                real_os_close(fd)
+                raise OSError(errno.EIO, "fault-injected receipt close")
+
+            with mock.patch.object(
+                TRANSACTION.os,
+                "close",
+                side_effect=fault_close,
+            ):
+                return real_receipt_close(evidence)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.RecoveryReceiptEvidence,
+                "close",
+                autospec=True,
+                side_effect=close_receipt,
+            ),
+        ):
+            code, payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertEqual(code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["reason"], "recovery_terminal_binding_changed")
+        self.assertEqual(
+            [failure["descriptor"] for failure in payload["cleanup_failures"]],
+            ["recovery_receipt", "receipt_parent"],
+        )
+
+    def test_recovery_refused_preserves_primary_with_receipt_close_faults(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "__init__",
+                side_effect=TRANSACTION.TransactionError(
+                    "private_stage_unavailable",
+                    "fault-injected stage creation failure",
+                ),
+            ),
+            self.assertRaises(TRANSACTION.TransactionError),
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+        prepared = TRANSACTION.prepared_candidate_path(self.receipt)
+        replacement = prepared.with_name(f"{prepared.name}.replacement")
+        replacement.write_bytes(NEW_RULES)
+        replacement.chmod(0o600)
+        os.replace(replacement, prepared)
+        real_receipt_close = TRANSACTION.RecoveryReceiptEvidence.close
+        real_os_close = TRANSACTION.os.close
+
+        def close_receipt(evidence: object) -> list[dict[str, object]]:
+            assert isinstance(evidence, TRANSACTION.RecoveryReceiptEvidence)
+
+            def fault_close(fd: int) -> None:
+                real_os_close(fd)
+                raise OSError(errno.EINTR, "fault-injected receipt close")
+
+            with mock.patch.object(
+                TRANSACTION.os,
+                "close",
+                side_effect=fault_close,
+            ):
+                return real_receipt_close(evidence)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.RecoveryReceiptEvidence,
+                "close",
+                autospec=True,
+                side_effect=close_receipt,
+            ),
+        ):
+            code, payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertEqual(code, 40)
+        self.assertEqual(payload["status"], "recovery_refused")
+        self.assertEqual(payload["reason"], "schema_v4_state_unrecognized")
+        self.assertEqual(
+            [failure["descriptor"] for failure in payload["cleanup_failures"]],
+            ["recovery_receipt", "receipt_parent"],
+        )
 
     def test_repeated_successful_applies_reuse_one_empty_stage_root(self) -> None:
         self.write_validator("raise SystemExit(0)\n")

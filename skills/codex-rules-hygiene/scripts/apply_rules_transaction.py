@@ -278,6 +278,8 @@ class RecoveryMutationTracker:
     mutation_started: bool = False
     events: list[dict[str, str]] = field(default_factory=list)
     last_observed: dict[str, object] | None = None
+    cleanup_failures: list[dict[str, object]] = field(default_factory=list)
+    deferred_mutation_events: list[dict[str, str]] = field(default_factory=list)
 
     def enter(self, operation: str, *, state: str) -> None:
         self.mutation_started = True
@@ -310,8 +312,45 @@ class RecoveryMutationTracker:
         if event not in self.events:
             self.events.append(event)
 
+    def defer_possible_prior_mutation(
+        self,
+        operation: str,
+        *,
+        state: str,
+    ) -> None:
+        event = {
+            "operation": operation,
+            "phase": "observed",
+            "state": state,
+        }
+        if event not in self.deferred_mutation_events:
+            self.deferred_mutation_events.append(event)
+
+    def promote_deferred_mutation(self) -> None:
+        if not self.deferred_mutation_events:
+            return
+        self.mutation_started = True
+        for event in self.deferred_mutation_events:
+            if event not in self.events:
+                self.events.append(event)
+        self.deferred_mutation_events.clear()
+
+    def clear_deferred_mutation(self) -> None:
+        self.deferred_mutation_events.clear()
+
     def observe(self, observed: dict[str, object]) -> None:
         self.last_observed = observed
+
+    def record_cleanup_failures(
+        self,
+        failures: list[dict[str, object]],
+    ) -> None:
+        self.cleanup_failures.extend(failures)
+
+    def take_cleanup_failures(self) -> list[dict[str, object]]:
+        failures = list(self.cleanup_failures)
+        self.cleanup_failures.clear()
+        return failures
 
     def details(
         self,
@@ -320,6 +359,12 @@ class RecoveryMutationTracker:
         observed: dict[str, object] | None = None,
     ) -> dict[str, object]:
         effective_observed = observed if observed is not None else self.last_observed
+        if state is None and effective_observed is not None:
+            observed_state = effective_observed.get("transaction_state")
+            observed_hint = effective_observed.get("transaction_state_hint")
+            candidate = observed_state or observed_hint
+            if isinstance(candidate, str):
+                state = candidate
         return {
             "mutation_journal": list(self.events),
             "recovery_locators": dict(self.locators),
@@ -342,6 +387,113 @@ def compact(value: str) -> str:
     if len(value) <= MAX_DIAGNOSTIC_CHARS:
         return value
     return value[: MAX_DIAGNOSTIC_CHARS - 3] + "..."
+
+
+def structured_operation_failure(
+    operation: str,
+    descriptor: str,
+    error: BaseException,
+    *,
+    release_uncertain: bool = False,
+) -> dict[str, object]:
+    failure: dict[str, object] = {
+        "operation": operation,
+        "descriptor": descriptor,
+        "error_type": type(error).__name__,
+        "message": compact(str(error)),
+    }
+    if isinstance(error, OSError) and error.errno is not None:
+        failure["errno"] = error.errno
+        failure["errno_name"] = errno.errorcode.get(error.errno, "UNKNOWN")
+    if release_uncertain:
+        failure["release_uncertain"] = True
+    return failure
+
+
+def close_descriptors_best_effort(
+    descriptors: list[tuple[str, int]],
+    *,
+    release_uncertain: bool = False,
+) -> list[dict[str, object]]:
+    """Attempt every distinct descriptor close exactly once.
+
+    POSIX leaves the descriptor state after an interrupted ``close`` unsuitable
+    for a blind retry. Record the uncertainty instead of risking a later,
+    reused descriptor number.
+    """
+
+    failures: list[dict[str, object]] = []
+    attempted: set[int] = set()
+    for descriptor, fd in descriptors:
+        if fd in attempted:
+            continue
+        attempted.add(fd)
+        try:
+            os.close(fd)
+        except BaseException as error:
+            failures.append(
+                structured_operation_failure(
+                    "close",
+                    descriptor,
+                    error,
+                    release_uncertain=release_uncertain,
+                )
+            )
+    return failures
+
+
+def attach_cleanup_failures_to_payload(
+    payload: dict[str, object],
+    failures: list[dict[str, object]],
+) -> None:
+    if not failures:
+        return
+    existing = payload.get("cleanup_failures")
+    if isinstance(existing, list):
+        existing.extend(failures)
+    else:
+        payload["cleanup_failures"] = list(failures)
+
+
+def attach_failures_to_exception(
+    error: BaseException,
+    key: str,
+    failures: list[dict[str, object]],
+) -> None:
+    if not failures:
+        return
+    if isinstance(error, TransactionError):
+        existing = error.details.get(key)
+        if isinstance(existing, list):
+            existing.extend(failures)
+        else:
+            error.details[key] = list(failures)
+    else:
+        existing = getattr(error, key, None)
+        if isinstance(existing, list):
+            existing.extend(failures)
+        else:
+            setattr(error, key, list(failures))
+    error.add_note(
+        "descriptor cleanup also failed: "
+        + "; ".join(
+            f"{failure['descriptor']}: {failure['error_type']}: {failure['message']}"
+            for failure in failures
+        )
+    )
+
+
+def descriptor_cleanup_error(
+    failures: list[dict[str, object]],
+    *,
+    status: str = "descriptor_cleanup_failed",
+    message: str = "descriptor cleanup could not be completed",
+) -> TransactionError:
+    return TransactionError(
+        status,
+        message,
+        details={"cleanup_failures": list(failures)},
+    )
 
 
 def property_mismatches(expected: Snapshot, actual: Snapshot) -> list[str]:
@@ -2880,13 +3032,16 @@ def shared_lock(
             "lock timeout must be finite and positive",
         )
     flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        fd = os.open(path, flags)
+    fd = -1
     locked = False
     binding: BoundFile | None = None
+    primary_error: BaseException | None = None
+    primary_traceback: object | None = None
     try:
+        try:
+            fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            fd = os.open(path, flags)
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:
@@ -2909,27 +3064,71 @@ def shared_lock(
         )
         revalidate_lock(binding)
         yield binding
+    except BaseException as error:
+        primary_error = error
+        primary_traceback = error.__traceback__
     finally:
-        try:
-            if locked and binding is not None:
-                finalization_errors: list[BaseException] = []
+        finalization_errors: list[tuple[str, BaseException]] = []
+        if locked and binding is not None:
+            finalizers: list[tuple[str, Callable[[], None]]] = [
+                ("pre-release-revalidation", lambda: revalidate_lock(binding)),
+            ]
+            if before_release is not None:
+                finalizers.append(("before-release", before_release))
+            finalizers.append(
+                ("final-release-revalidation", lambda: revalidate_lock(binding))
+            )
+            for label, finalizer in finalizers:
                 try:
-                    revalidate_lock(binding)
+                    finalizer()
                 except BaseException as error:
-                    finalization_errors.append(error)
-                try:
-                    if before_release is not None:
-                        before_release()
-                except BaseException as error:
-                    finalization_errors.append(error)
-                try:
-                    revalidate_lock(binding)
-                except BaseException as error:
-                    finalization_errors.append(error)
-                if finalization_errors:
-                    raise finalization_errors[0]
-        finally:
-            os.close(fd)
+                    finalization_errors.append((label, error))
+
+        if primary_error is None and finalization_errors:
+            _label, primary_error = finalization_errors.pop(0)
+            primary_traceback = primary_error.__traceback__
+        if primary_error is not None and finalization_errors:
+            attach_failures_to_exception(
+                primary_error,
+                "lock_finalization_failures",
+                [
+                    structured_operation_failure(
+                        "lock-finalization",
+                        label,
+                        error,
+                    )
+                    for label, error in finalization_errors
+                ],
+            )
+
+        close_failures = (
+            close_descriptors_best_effort(
+                [("transaction_lock", fd)],
+                release_uncertain=True,
+            )
+            if fd >= 0
+            else []
+        )
+        if close_failures:
+            if primary_error is not None:
+                attach_failures_to_exception(
+                    primary_error,
+                    "cleanup_failures",
+                    close_failures,
+                )
+            else:
+                primary_error = descriptor_cleanup_error(
+                    close_failures,
+                    status="lock_close_failed",
+                    message=(
+                        "transaction lock descriptor close failed; lock release "
+                        "cannot be proven"
+                    ),
+                )
+                primary_traceback = primary_error.__traceback__
+
+        if primary_error is not None:
+            raise primary_error.with_traceback(primary_traceback)
 
 
 def revalidate_lock(
@@ -4488,14 +4687,16 @@ class RecoveryReceiptEvidence:
         validate_bound_directory(self.parent)
         return value
 
-    def close(self) -> None:
+    def close(self) -> list[dict[str, object]]:
         if self.closed:
-            return
+            return []
         self.closed = True
-        try:
-            os.close(self.binding.fd)
-        finally:
-            os.close(self.parent.fd)
+        return close_descriptors_best_effort(
+            [
+                ("recovery_receipt", self.binding.fd),
+                ("receipt_parent", self.parent.fd),
+            ]
+        )
 
 
 def bind_recovery_receipt(path: Path) -> RecoveryReceiptEvidence:
@@ -4534,10 +4735,14 @@ def bind_recovery_receipt(path: Path) -> RecoveryReceiptEvidence:
         )
         evidence.validate()
         return evidence
-    except BaseException:
-        if binding is not None:
-            os.close(binding.fd)
-        os.close(parent.fd)
+    except BaseException as error:
+        failures = close_descriptors_best_effort(
+            [
+                *(([("recovery_receipt", binding.fd)]) if binding is not None else []),
+                ("receipt_parent", parent.fd),
+            ]
+        )
+        attach_failures_to_exception(error, "cleanup_failures", failures)
         raise
 
 
@@ -4545,10 +4750,27 @@ def read_receipt_with_parent_snapshot(
     path: Path,
 ) -> tuple[dict[str, object], Snapshot]:
     evidence = bind_recovery_receipt(path)
+    result: tuple[dict[str, object], Snapshot] | None = None
+    primary_error: BaseException | None = None
     try:
-        return evidence.validate(), evidence.parent.snapshot
+        result = evidence.validate(), evidence.parent.snapshot
+        return result
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        evidence.close()
+        failures = evidence.close()
+        if failures:
+            if primary_error is not None:
+                attach_failures_to_exception(
+                    primary_error,
+                    "cleanup_failures",
+                    failures,
+                )
+            elif result is not None:
+                attach_cleanup_failures_to_payload(result[0], failures)
+            else:
+                raise descriptor_cleanup_error(failures)
 
 
 def read_receipt(path: Path) -> dict[str, object]:
@@ -4705,13 +4927,20 @@ class RecoveryTerminalEvidence:
         validate_bound_directory(self.parent)
         return result
 
-    def close(self) -> None:
+    def close(self) -> list[dict[str, object]]:
         if self.closed:
-            return
+            return []
         self.closed = True
-        if self.result is not None:
-            os.close(self.result.fd)
-        os.close(self.reservation.fd)
+        return close_descriptors_best_effort(
+            [
+                *(
+                    [("recovery_terminal_result", self.result.fd)]
+                    if self.result is not None
+                    else []
+                ),
+                ("recovery_terminal_reservation", self.reservation.fd),
+            ]
+        )
 
 
 def bind_recovery_terminal_evidence(
@@ -4748,8 +4977,12 @@ def bind_recovery_terminal_evidence(
             )
         evidence.validate()
         return evidence
-    except BaseException:
-        evidence.close()
+    except BaseException as error:
+        attach_failures_to_exception(
+            error,
+            "cleanup_failures",
+            evidence.close(),
+        )
         raise
 
 
@@ -5004,9 +5237,15 @@ def publish_recovery_terminal_result(
         os.fsync(evidence.parent.fd)
         evidence.validate()
         return binding
-    except BaseException:
+    except BaseException as error:
         if not published:
-            os.close(binding.fd)
+            attach_failures_to_exception(
+                error,
+                "cleanup_failures",
+                close_descriptors_best_effort(
+                    [("recovery_terminal_result_pending", binding.fd)]
+                ),
+            )
         raise
 
 
@@ -5092,6 +5331,8 @@ def record_recovery_terminal(
     owns_binding = binding is None
     created_legacy_terminal = False
     local_evidence: RecoveryTerminalEvidence | None = None
+    outcome: dict[str, object] | None = None
+    primary_error: BaseException | None = None
     try:
         if parent is None:
             parent = bind_directory(
@@ -5152,7 +5393,8 @@ def record_recovery_terminal(
                     "recovery_terminal_conflict",
                     "legacy recovery terminal publication changed",
                 )
-            return existing
+            outcome = existing
+            return outcome
         local_evidence = RecoveryTerminalEvidence(
             path=path,
             parent=parent,
@@ -5183,7 +5425,8 @@ def record_recovery_terminal(
                     "recovery_terminal_conflict",
                     "existing recovery terminal evidence does not match this recovery",
                 )
-            return existing
+            outcome = existing
+            return outcome
         published = publish_recovery_terminal_result(local_evidence, encoded)
         persisted = local_evidence.validate()
         persisted_restored = Snapshot.from_json(
@@ -5202,8 +5445,13 @@ def record_recovery_terminal(
             )
         if result_binding_sink is not None and published not in result_binding_sink:
             result_binding_sink.append(published)
-        return persisted
+        outcome = persisted
+        return outcome
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
+        descriptors: list[tuple[str, int]] = []
         if (
             local_evidence is not None
             and local_evidence.result is not None
@@ -5212,11 +5460,28 @@ def record_recovery_terminal(
                 or local_evidence.result not in result_binding_sink
             )
         ):
-            os.close(local_evidence.result.fd)
+            descriptors.append(
+                (
+                    "recovery_terminal_result",
+                    local_evidence.result.fd,
+                )
+            )
         if owns_binding and binding is not None:
-            os.close(binding.fd)
+            descriptors.append(("recovery_terminal_reservation", binding.fd))
         if owns_parent and parent is not None:
-            os.close(parent.fd)
+            descriptors.append(("recovery_terminal_parent", parent.fd))
+        failures = close_descriptors_best_effort(descriptors)
+        if failures:
+            if primary_error is not None:
+                attach_failures_to_exception(
+                    primary_error,
+                    "cleanup_failures",
+                    failures,
+                )
+            elif outcome is not None:
+                attach_cleanup_failures_to_payload(outcome, failures)
+            else:
+                raise descriptor_cleanup_error(failures)
 
 
 def verify_restored_terminal(rules: Path, expected: Snapshot) -> Snapshot:
@@ -5331,32 +5596,40 @@ class ApplyEvidenceBindings:
             )
         self.validate_controls()
 
-    def close(self) -> None:
+    def close(self) -> list[dict[str, object]]:
         if self.closed:
-            return
+            return []
         self.closed = True
-        close_errors: list[BaseException] = []
-        bindings = [
-            self.receipt,
-            self.recovery_terminal_result,
-            self.recovery_terminal,
+        descriptors: list[tuple[str, int]] = [
+            *(
+                [
+                    (
+                        "recovery_terminal_result",
+                        self.recovery_terminal_result.fd,
+                    )
+                ]
+                if self.recovery_terminal_result is not None
+                else []
+            ),
+            (
+                "recovery_terminal_reservation",
+                self.recovery_terminal.fd,
+            ),
+            *(
+                [("recovery_receipt", self.receipt.fd)]
+                if self.receipt is not None
+                else []
+            ),
         ]
         if not self.stage_owns_prepared_candidate():
-            bindings.append(self.prepared_candidate)
-        for binding in bindings:
-            if binding is None:
-                continue
-            try:
-                os.close(binding.fd)
-            except BaseException as error:
-                close_errors.append(error)
-        for parent in (self.receipt_parent, self.rules_parent):
-            try:
-                os.close(parent.fd)
-            except BaseException as error:
-                close_errors.append(error)
-        if close_errors:
-            raise close_errors[0]
+            descriptors.append(("prepared_candidate", self.prepared_candidate.fd))
+        descriptors.extend(
+            [
+                ("receipt_parent", self.receipt_parent.fd),
+                ("rules_parent", self.rules_parent.fd),
+            ]
+        )
+        return close_descriptors_best_effort(descriptors)
 
 
 def rollback(
@@ -5574,7 +5847,10 @@ def rollback(
                 os.close(binding.fd)
 
 
-def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
+def _apply_transaction_inner(
+    args: argparse.Namespace,
+    cleanup_callbacks: list[Callable[[], list[dict[str, object]]]],
+) -> tuple[int, dict[str, object]]:
     expected_sha256 = args.expected_sha256.lower()
     if not valid_sha256(expected_sha256):
         raise TransactionError(
@@ -5713,25 +5989,25 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 },
             ) from evidence_error
 
-    def close_apply_state() -> None:
-        close_error: BaseException | None = None
+    def close_apply_state() -> list[dict[str, object]]:
         try:
             if evidence is not None:
-                evidence.close()
-            elif rules_parent_binding is not None:
-                os.close(rules_parent_binding.fd)
+                return evidence.close()
+            if rules_parent_binding is not None:
+                return close_descriptors_best_effort(
+                    [("rules_parent", rules_parent_binding.fd)]
+                )
         except BaseException as error:
-            close_error = error
-        if close_error is None:
-            return
-        active_error = sys.exc_info()[1]
-        if active_error is not None:
-            active_error.add_note(
-                "apply evidence descriptor cleanup also failed: "
-                f"{type(close_error).__name__}: {close_error}"
-            )
-            return
-        raise close_error
+            return [
+                structured_operation_failure(
+                    "close",
+                    "apply_evidence_group",
+                    error,
+                )
+            ]
+        return []
+
+    cleanup_callbacks.append(close_apply_state)
 
     try:
         # A no-op needs neither a validator process nor a staging directory.
@@ -6430,15 +6706,43 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             ) from error
         raise
     finally:
-        try:
-            finalize_apply_state()
-        finally:
-            # shared_lock closes its lock descriptor only after the
-            # before-release validation/cleanup callback and final lock
-            # revalidation. Keep every recovery-evidence descriptor bound
-            # until that context has completely exited, then close all
-            # evidence without masking an already-active failure.
-            close_apply_state()
+        finalize_apply_state()
+
+
+def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
+    cleanup_callbacks: list[Callable[[], list[dict[str, object]]]] = []
+    outcome: tuple[int, dict[str, object]] | None = None
+    primary_error: BaseException | None = None
+    try:
+        outcome = _apply_transaction_inner(args, cleanup_callbacks)
+        return outcome
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        failures: list[dict[str, object]] = []
+        for callback in cleanup_callbacks:
+            try:
+                failures.extend(callback())
+            except BaseException as error:
+                failures.append(
+                    structured_operation_failure(
+                        "close",
+                        "apply_evidence_group",
+                        error,
+                    )
+                )
+        if failures:
+            if primary_error is not None:
+                attach_failures_to_exception(
+                    primary_error,
+                    "cleanup_failures",
+                    failures,
+                )
+            elif outcome is not None:
+                attach_cleanup_failures_to_payload(outcome[1], failures)
+            else:
+                raise descriptor_cleanup_error(failures)
 
 
 def publish_staged_backup_for_recovery(
@@ -6537,6 +6841,7 @@ def probe_fixed_stage_for_recovery(
         require_owner_private=True,
         expected=stage_snapshot,
     )
+    primary_error: BaseException | None = None
     try:
         entries, entries_exceeded = bounded_directory_entries(stage_parent.fd)
         if entries_exceeded:
@@ -6563,8 +6868,22 @@ def probe_fixed_stage_for_recovery(
         validate_bound_directory(stage_parent)
         validate_bound_directory(rules_parent)
         return stage_parent.snapshot, candidate
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        os.close(stage_parent.fd)
+        failures = close_descriptors_best_effort(
+            [("private_stage_parent", stage_parent.fd)]
+        )
+        if failures:
+            if primary_error is not None:
+                attach_failures_to_exception(
+                    primary_error,
+                    "cleanup_failures",
+                    failures,
+                )
+            else:
+                raise descriptor_cleanup_error(failures)
 
 
 def recovery_snapshot_role(
@@ -6580,6 +6899,215 @@ def recovery_snapshot_role(
     if not property_mismatches(installed, actual):
         return "I"
     return "?"
+
+
+def observe_recovery_primary_state(
+    *,
+    receipt_schema_version: int,
+    rules: Path,
+    lock_binding: BoundFile,
+    backup: Path,
+    prepared_candidate: Path | None,
+    rules_parent_expected: Snapshot,
+    prepared_parent_expected: Snapshot | None,
+    original: Snapshot,
+    installed: Snapshot,
+    mutation_tracker: RecoveryMutationTracker,
+) -> None:
+    """Record transaction roles before strict terminal evidence can fail."""
+
+    rules_parent: BoundDirectory | None = None
+    prepared_parent: BoundDirectory | None = None
+    prepared_binding: BoundFile | None = None
+    try:
+        rules_parent = bind_directory(
+            rules.parent,
+            label="rules",
+            expected=rules_parent_expected,
+        )
+        revalidate_lock(lock_binding, rules_parent)
+        live_actual = recovery_entry_snapshot_bound(
+            rules,
+            rules_parent,
+            label="live_rules",
+        )
+        backup_actual = recovery_entry_snapshot_bound(
+            backup,
+            rules_parent,
+            label="backup",
+        )
+        live_role = recovery_snapshot_role(
+            live_actual,
+            original=original,
+            installed=installed,
+        )
+        backup_role = recovery_snapshot_role(
+            backup_actual,
+            original=original,
+            installed=installed,
+        )
+        primary_state_hint = {
+            ("O", "M"): "P" if receipt_schema_version == 3 else "Q_or_P",
+            ("I", "M"): "X",
+            ("I", "O"): "C",
+            ("O", "I"): "R",
+        }.get((live_role, backup_role))
+        primary_observation: dict[str, object] = {
+            "transaction_state_hint": primary_state_hint,
+            "roles": {
+                "live": live_role,
+                "backup": backup_role,
+                "staged_backup": "unprobed",
+                **(
+                    {"prepared_candidate": "unprobed"}
+                    if receipt_schema_version >= 4
+                    else {}
+                ),
+            },
+            "snapshots": {
+                "live": live_actual.to_json() if live_actual is not None else None,
+                "backup": (
+                    backup_actual.to_json() if backup_actual is not None else None
+                ),
+                "staged_backup": "unprobed",
+                **(
+                    {"prepared_candidate": "unprobed"}
+                    if receipt_schema_version >= 4
+                    else {}
+                ),
+            },
+            "terminal_state": "unvalidated",
+        }
+        mutation_tracker.observe(primary_observation)
+
+        if receipt_schema_version == 3:
+            mutation_tracker.observe_prior_mutation(
+                (
+                    "prior_transaction_state"
+                    if primary_state_hint is not None
+                    else "possible_prior_transaction_state"
+                ),
+                state=primary_state_hint or "unknown",
+            )
+            return
+
+        assert receipt_schema_version >= 4
+        assert prepared_candidate is not None
+        assert prepared_parent_expected is not None
+        if primary_state_hint in ("X", "C", "R"):
+            mutation_tracker.observe_prior_mutation(
+                "prior_transaction_state",
+                state=primary_state_hint,
+            )
+        try:
+            prepared_parent = bind_directory(
+                prepared_candidate.parent,
+                label="prepared_candidate",
+                require_owner_private=True,
+                expected=prepared_parent_expected,
+            )
+            _stage_parent, staged_actual = probe_fixed_stage_for_recovery(rules_parent)
+            try:
+                prepared_binding = bind_regular_file(
+                    prepared_candidate,
+                    prepared_parent,
+                    label="prepared_candidate",
+                )
+            except TransactionError as error:
+                if error.status != "prepared_candidate_missing":
+                    raise
+                prepared_actual = None
+            else:
+                _prepared_payload, prepared_actual = validate_bound_regular_file(
+                    prepared_binding,
+                    prepared_parent,
+                    label="prepared_candidate",
+                )
+        except BaseException:
+            if not mutation_tracker.mutation_started:
+                mutation_tracker.defer_possible_prior_mutation(
+                    "possible_prior_transaction_state",
+                    state=primary_state_hint or "unknown",
+                )
+            raise
+
+        roles = (
+            live_role,
+            backup_role,
+            recovery_snapshot_role(
+                staged_actual,
+                original=original,
+                installed=installed,
+            ),
+            recovery_snapshot_role(
+                prepared_actual,
+                original=original,
+                installed=installed,
+            ),
+        )
+        state = {
+            ("O", "M", "M", "I"): "Q",
+            ("O", "M", "I", "M"): "P",
+            ("I", "M", "O", "M"): "X",
+            ("I", "O", "M", "M"): "C",
+            ("O", "I", "M", "M"): "R",
+        }.get(roles)
+        observed_state: dict[str, object] = {
+            "transaction_state": state,
+            "transaction_state_hint": primary_state_hint,
+            "roles": {
+                "live": roles[0],
+                "backup": roles[1],
+                "staged_backup": roles[2],
+                "prepared_candidate": roles[3],
+            },
+            "snapshots": {
+                "live": live_actual.to_json() if live_actual is not None else None,
+                "backup": (
+                    backup_actual.to_json() if backup_actual is not None else None
+                ),
+                "staged_backup": (
+                    staged_actual.to_json() if staged_actual is not None else None
+                ),
+                "prepared_candidate": (
+                    prepared_actual.to_json() if prepared_actual is not None else None
+                ),
+            },
+            "terminal_state": "unvalidated",
+        }
+        mutation_tracker.observe(observed_state)
+        if state in ("P", "X", "C", "R"):
+            mutation_tracker.observe_prior_mutation(
+                "prior_transaction_state",
+                state=state,
+            )
+        elif state != "Q":
+            mutation_tracker.defer_possible_prior_mutation(
+                "possible_prior_transaction_state",
+                state=primary_state_hint or "unknown",
+            )
+    finally:
+        mutation_tracker.record_cleanup_failures(
+            close_descriptors_best_effort(
+                [
+                    *(
+                        [("prepared_candidate", prepared_binding.fd)]
+                        if prepared_binding is not None
+                        else []
+                    ),
+                    *(
+                        [("prepared_candidate_parent", prepared_parent.fd)]
+                        if prepared_parent is not None
+                        else []
+                    ),
+                    *(
+                        [("rules_parent_probe", rules_parent.fd)]
+                        if rules_parent is not None
+                        else []
+                    ),
+                ]
+            )
+        )
 
 
 def recover_schema_v3_transaction(
@@ -6698,10 +7226,22 @@ def recover_schema_v3_transaction(
             **error.details,
         }
     finally:
-        if staged_parent_binding is not None:
-            os.close(staged_parent_binding.fd)
-        if rules_parent_binding is not None:
-            os.close(rules_parent_binding.fd)
+        mutation_tracker.record_cleanup_failures(
+            close_descriptors_best_effort(
+                [
+                    *(
+                        [("private_stage_parent", staged_parent_binding.fd)]
+                        if staged_parent_binding is not None
+                        else []
+                    ),
+                    *(
+                        [("rules_parent", rules_parent_binding.fd)]
+                        if rules_parent_binding is not None
+                        else []
+                    ),
+                ]
+            )
+        )
     roles = (
         recovery_snapshot_role(
             live_actual,
@@ -7477,12 +8017,27 @@ def recover_schema_v4_transaction(
             **error_details,
         }
     finally:
-        for binding in (prepared_binding,):
-            if binding is not None:
-                os.close(binding.fd)
-        for parent in (prepared_parent, rules_parent):
-            if parent is not None:
-                os.close(parent.fd)
+        mutation_tracker.record_cleanup_failures(
+            close_descriptors_best_effort(
+                [
+                    *(
+                        [("prepared_candidate", prepared_binding.fd)]
+                        if prepared_binding is not None
+                        else []
+                    ),
+                    *(
+                        [("prepared_candidate_parent", prepared_parent.fd)]
+                        if prepared_parent is not None
+                        else []
+                    ),
+                    *(
+                        [("rules_parent", rules_parent.fd)]
+                        if rules_parent is not None
+                        else []
+                    ),
+                ]
+            )
+        )
 
 
 def recover_legacy_transaction(
@@ -7499,6 +8054,7 @@ def recover_legacy_transaction(
     terminal_path: Path | None,
     terminal_expected: Snapshot | None,
     transaction_id: object,
+    mutation_tracker: RecoveryMutationTracker,
 ) -> tuple[int, dict[str, object]]:
     rules_parent: BoundDirectory | None = None
     receipt_parent: BoundDirectory | None = None
@@ -7829,17 +8385,36 @@ def recover_legacy_transaction(
             **error.details,
         }
     finally:
-        if terminal_binding is not None:
-            os.close(terminal_binding.fd)
+        final_error: BaseException | None = None
         if rules_parent is not None and receipt_parent is not None:
             try:
                 revalidate_lock(lock_binding, rules_parent)
                 validate_bound_directory(receipt_parent)
-            finally:
-                os.close(receipt_parent.fd)
-                os.close(rules_parent.fd)
-        elif rules_parent is not None:
-            os.close(rules_parent.fd)
+            except BaseException as error:
+                final_error = error
+        mutation_tracker.record_cleanup_failures(
+            close_descriptors_best_effort(
+                [
+                    *(
+                        [("recovery_terminal_reservation", terminal_binding.fd)]
+                        if terminal_binding is not None
+                        else []
+                    ),
+                    *(
+                        [("receipt_parent", receipt_parent.fd)]
+                        if receipt_parent is not None
+                        else []
+                    ),
+                    *(
+                        [("rules_parent", rules_parent.fd)]
+                        if rules_parent is not None
+                        else []
+                    ),
+                ]
+            )
+        )
+        if final_error is not None:
+            raise final_error
 
 
 def _recover_transaction_bound(
@@ -8040,6 +8615,15 @@ def _recover_transaction_bound(
     )
     terminal_evidence: RecoveryTerminalEvidence | None = None
     lock_acquired = False
+    outcome: tuple[int, dict[str, object]] | None = None
+    primary_error: BaseException | None = None
+
+    def record_outcome(
+        value: tuple[int, dict[str, object]],
+    ) -> tuple[int, dict[str, object]]:
+        nonlocal outcome
+        outcome = value
+        return value
 
     def validate_controls() -> None:
         receipt_evidence.validate()
@@ -8077,12 +8661,29 @@ def _recover_transaction_bound(
                     assert terminal_path is not None
                     assert terminal_expected is not None
                     assert isinstance(transaction_id, str)
+                    observe_recovery_primary_state(
+                        receipt_schema_version=receipt_schema_version,
+                        rules=rules,
+                        lock_binding=lock_binding,
+                        backup=backup,
+                        prepared_candidate=prepared_candidate,
+                        rules_parent_expected=parent_expected,
+                        prepared_parent_expected=prepared_parent_expected,
+                        original=original,
+                        installed=installed,
+                        mutation_tracker=mutation_tracker,
+                    )
                     terminal_evidence = bind_recovery_terminal_evidence(
                         terminal_path,
                         parent=receipt_evidence.parent,
                         expected_reservation=terminal_expected,
                         transaction_id=transaction_id,
                     )
+                    preflight_terminal = terminal_evidence.validate()
+                    if preflight_terminal.get("state") == RECOVERY_TERMINAL_RESERVED:
+                        mutation_tracker.clear_deferred_mutation()
+                    else:
+                        mutation_tracker.promote_deferred_mutation()
                     validate_controls()
                 if receipt_schema_version >= 4:
                     assert staged_backup is not None
@@ -8091,22 +8692,24 @@ def _recover_transaction_bound(
                     assert terminal_path is not None
                     assert terminal_expected is not None
                     assert isinstance(transaction_id, str)
-                    return recover_schema_v4_transaction(
-                        rules=rules,
-                        lock_binding=lock_binding,
-                        backup=backup,
-                        staged_backup=staged_backup,
-                        prepared_candidate=prepared_candidate,
-                        rules_parent_expected=parent_expected,
-                        prepared_parent_expected=prepared_parent_expected,
-                        original=original,
-                        installed=installed,
-                        terminal_path=terminal_path,
-                        terminal_expected=terminal_expected,
-                        transaction_id=transaction_id,
-                        terminal_evidence=terminal_evidence,
-                        validate_controls=validate_controls,
-                        mutation_tracker=mutation_tracker,
+                    return record_outcome(
+                        recover_schema_v4_transaction(
+                            rules=rules,
+                            lock_binding=lock_binding,
+                            backup=backup,
+                            staged_backup=staged_backup,
+                            prepared_candidate=prepared_candidate,
+                            rules_parent_expected=parent_expected,
+                            prepared_parent_expected=prepared_parent_expected,
+                            original=original,
+                            installed=installed,
+                            terminal_path=terminal_path,
+                            terminal_expected=terminal_expected,
+                            transaction_id=transaction_id,
+                            terminal_evidence=terminal_evidence,
+                            validate_controls=validate_controls,
+                            mutation_tracker=mutation_tracker,
+                        )
                     )
                 if receipt_schema_version == 3:
                     assert staged_backup is not None
@@ -8114,69 +8717,132 @@ def _recover_transaction_bound(
                     assert terminal_path is not None
                     assert terminal_expected is not None
                     assert isinstance(transaction_id, str)
-                    return recover_schema_v3_transaction(
+                    return record_outcome(
+                        recover_schema_v3_transaction(
+                            rules=rules,
+                            lock_binding=lock_binding,
+                            backup=backup,
+                            staged_backup=staged_backup,
+                            rules_parent_expected=parent_expected,
+                            staged_parent_expected=staged_parent_expected,
+                            original=original,
+                            installed=installed,
+                            terminal_path=terminal_path,
+                            terminal_expected=terminal_expected,
+                            transaction_id=transaction_id,
+                            terminal_evidence=terminal_evidence,
+                            validate_controls=validate_controls,
+                            mutation_tracker=mutation_tracker,
+                        )
+                    )
+                return record_outcome(
+                    recover_legacy_transaction(
                         rules=rules,
                         lock_binding=lock_binding,
                         backup=backup,
-                        staged_backup=staged_backup,
+                        receipt_parent_path=receipt_path.parent,
+                        receipt_parent_expected=receipt_parent_expected,
                         rules_parent_expected=parent_expected,
-                        staged_parent_expected=staged_parent_expected,
                         original=original,
                         installed=installed,
+                        backup_expected=backup_expected,
                         terminal_path=terminal_path,
                         terminal_expected=terminal_expected,
                         transaction_id=transaction_id,
-                        terminal_evidence=terminal_evidence,
-                        validate_controls=validate_controls,
                         mutation_tracker=mutation_tracker,
                     )
-                return recover_legacy_transaction(
-                    rules=rules,
-                    lock_binding=lock_binding,
-                    backup=backup,
-                    receipt_parent_path=receipt_path.parent,
-                    receipt_parent_expected=receipt_parent_expected,
-                    rules_parent_expected=parent_expected,
-                    original=original,
-                    installed=installed,
-                    backup_expected=backup_expected,
-                    terminal_path=terminal_path,
-                    terminal_expected=terminal_expected,
-                    transaction_id=transaction_id,
                 )
         except TransactionError as error:
             if not lock_acquired:
                 raise
+            mutation_tracker.promote_deferred_mutation()
             if mutation_tracker.mutation_started or error.status == "recovery_required":
-                return EXIT_POST_REPLACE_FAILED, {
-                    "status": "recovery_required",
-                    "reason": error.details.get("reason") or error.status,
-                    "message": str(error),
-                    **mutation_tracker.details(),
-                    **error.details,
-                }
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
-                "reason": error.status,
-                "message": str(error),
-                **error.details,
-            }
+                return record_outcome(
+                    (
+                        EXIT_POST_REPLACE_FAILED,
+                        {
+                            "status": "recovery_required",
+                            "reason": error.details.get("reason") or error.status,
+                            "message": str(error),
+                            **mutation_tracker.details(),
+                            **error.details,
+                        },
+                    )
+                )
+            return record_outcome(
+                (
+                    EXIT_RECOVERY_REFUSED,
+                    {
+                        "status": "recovery_refused",
+                        "reason": error.status,
+                        "message": str(error),
+                        **(
+                            {
+                                "transaction_state": (
+                                    mutation_tracker.last_observed.get(
+                                        "transaction_state"
+                                    )
+                                    or mutation_tracker.last_observed.get(
+                                        "transaction_state_hint"
+                                    )
+                                ),
+                                "observed_state": mutation_tracker.last_observed,
+                            }
+                            if mutation_tracker.last_observed is not None
+                            else {}
+                        ),
+                        **error.details,
+                    },
+                )
+            )
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
         if terminal_evidence is not None:
-            terminal_evidence.close()
+            mutation_tracker.record_cleanup_failures(terminal_evidence.close())
+        failures = mutation_tracker.take_cleanup_failures()
+        if failures:
+            if primary_error is not None:
+                attach_failures_to_exception(
+                    primary_error,
+                    "cleanup_failures",
+                    failures,
+                )
+            elif outcome is not None:
+                attach_cleanup_failures_to_payload(outcome[1], failures)
+            else:
+                raise descriptor_cleanup_error(failures)
 
 
 def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
     receipt_path = resolved_leaf(args.receipt, label="receipt")
     receipt_evidence = bind_recovery_receipt(receipt_path)
+    outcome: tuple[int, dict[str, object]] | None = None
+    primary_error: BaseException | None = None
     try:
-        return _recover_transaction_bound(
+        outcome = _recover_transaction_bound(
             args,
             receipt_path=receipt_path,
             receipt_evidence=receipt_evidence,
         )
+        return outcome
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        receipt_evidence.close()
+        failures = receipt_evidence.close()
+        if failures:
+            if primary_error is not None:
+                attach_failures_to_exception(
+                    primary_error,
+                    "cleanup_failures",
+                    failures,
+                )
+            elif outcome is not None:
+                attach_cleanup_failures_to_payload(outcome[1], failures)
+            else:
+                raise descriptor_cleanup_error(failures)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -8279,6 +8945,9 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as error:
         exit_code = EXIT_RUNTIME_ERROR
         payload = {"status": "runtime_error", "message": str(error)}
+        cleanup_failures = getattr(error, "cleanup_failures", None)
+        if isinstance(cleanup_failures, list):
+            payload["cleanup_failures"] = cleanup_failures
     emit(payload)
     return exit_code
 
