@@ -2130,11 +2130,9 @@ class PrivateStage:
             )
             raise
         self.stage_name = PRIVATE_STAGE_NAME
-        stage_created = False
         if not recovery_mode:
             try:
                 os.mkdir(self.stage_name, 0o700, dir_fd=self.rules_parent_fd)
-                stage_created = True
             except FileExistsError:
                 pass
             except OSError as error:
@@ -2155,38 +2153,29 @@ class PrivateStage:
                 raise
         self.path = rules_parent / self.stage_name
         try:
-            self.stage_fd = os.open(
-                self.stage_name,
-                directory_flags,
-                dir_fd=self.rules_parent_fd,
-            )
-            stage_stat = os.fstat(self.stage_fd)
-            if stage_created:
-                created_path_stat = os.stat(
+            try:
+                self.stage_fd = os.open(
                     self.stage_name,
+                    directory_flags,
                     dir_fd=self.rules_parent_fd,
-                    follow_symlinks=False,
                 )
-                if (
-                    not stat.S_ISDIR(stage_stat.st_mode)
-                    or stage_stat.st_uid != os.geteuid()
-                    or (
-                        stage_stat.st_dev,
-                        stage_stat.st_ino,
-                        stat.S_IFMT(stage_stat.st_mode),
-                    )
-                    != (
-                        created_path_stat.st_dev,
-                        created_path_stat.st_ino,
-                        stat.S_IFMT(created_path_stat.st_mode),
-                    )
-                ):
-                    raise TransactionError(
-                        "private_stage_invalid",
-                        "new staging directory changed before policy normalization",
-                    )
-                os.fchmod(self.stage_fd, 0o700)
-                stage_stat = os.fstat(self.stage_fd)
+            except OSError as error:
+                raise TransactionError(
+                    "private_stage_unavailable",
+                    (
+                        "cannot bind the fixed staging directory; the helper "
+                        "will not chmod or remove an unbound pathname"
+                    ),
+                    details={
+                        "stage_observation": observe_directory_entry(
+                            self.rules_parent_fd,
+                            self.stage_name,
+                        ),
+                        "errno": error.errno,
+                        "message": str(error),
+                    },
+                ) from error
+            stage_stat = os.fstat(self.stage_fd)
             stage_path_stat = os.stat(
                 self.stage_name,
                 dir_fd=self.rules_parent_fd,
@@ -3512,12 +3501,15 @@ def lock_snapshot(path: Path, file_stat: os.stat_result) -> Snapshot:
             "transaction lock is not an owner-only, single-link regular file",
         )
     path_stat = os.stat(path, follow_symlinks=False)
-    if (path_stat.st_dev, path_stat.st_ino) != (file_stat.st_dev, file_stat.st_ino):
+    snapshot = Snapshot.from_stat(file_stat, b"")
+    path_mismatches = lock_property_mismatches(snapshot, path_stat)
+    if path_mismatches:
         raise TransactionError(
             "lock_identity_changed",
-            "transaction lock path was replaced",
+            "transaction lock path no longer names the bound lock object",
+            details={"mismatched_properties": path_mismatches},
         )
-    return Snapshot.from_stat(path_stat, b"")
+    return snapshot
 
 
 def lock_property_mismatches(
@@ -3538,6 +3530,54 @@ def lock_property_mismatches(
     if expected.nlink != actual.st_nlink:
         mismatches.append("object_policy")
     return mismatches
+
+
+def validate_created_lock_before_policy(
+    path: Path,
+    fd: int,
+) -> Snapshot:
+    """Bind the O_EXCL-created lock before mutating its access policy.
+
+    The returned descriptor, not the pathname, is authoritative creation
+    identity. The pathname is only accepted after it names that exact
+    single-link, current-owner regular file. A later race cannot redirect
+    ``fchmod`` away from the descriptor-created object.
+    """
+
+    descriptor_stat = os.fstat(fd)
+    try:
+        path_stat = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise TransactionError(
+            "lock_missing",
+            "new transaction lock disappeared before policy normalization",
+        ) from error
+    except OSError as error:
+        raise TransactionError(
+            "lock_unreadable",
+            f"new transaction lock cannot be rebound: {error}",
+        ) from error
+    descriptor_snapshot = Snapshot.from_stat(descriptor_stat, b"")
+    mismatches = lock_property_mismatches(descriptor_snapshot, path_stat)
+    if (
+        not stat.S_ISREG(descriptor_stat.st_mode)
+        or descriptor_stat.st_uid != os.geteuid()
+        or descriptor_stat.st_nlink != 1
+    ):
+        if not stat.S_ISREG(descriptor_stat.st_mode) and "file_type" not in mismatches:
+            mismatches.append("file_type")
+        if descriptor_stat.st_uid != os.geteuid() and "access_policy" not in mismatches:
+            mismatches.append("access_policy")
+        if descriptor_stat.st_nlink != 1 and "object_policy" not in mismatches:
+            mismatches.append("object_policy")
+    if mismatches:
+        raise TransactionError(
+            "lock_invalid",
+            "new transaction lock is not the exact current-owner single-link "
+            "regular file returned by O_EXCL",
+            details={"mismatched_properties": mismatches},
+        )
+    return descriptor_snapshot
 
 
 @contextmanager
@@ -3581,8 +3621,10 @@ def shared_lock(
                 "transaction lock is not a regular file",
             )
         if lock_created:
+            validate_created_lock_before_policy(path, fd)
             os.fchmod(fd, 0o600)
             opened_lock = os.fstat(fd)
+            lock_snapshot(path, opened_lock)
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:
@@ -5740,6 +5782,233 @@ def reserve_recovery_terminal(
         raise
 
 
+def validate_pending_recovery_terminal_result(
+    evidence: RecoveryTerminalEvidence,
+    binding: BoundFile,
+    payload: bytes,
+) -> Snapshot:
+    """Prove a pending result's durable descriptor and namespace binding."""
+
+    actual_payload, actual = validate_bound_regular_file(
+        binding,
+        evidence.parent,
+        label="recovery_terminal_result_pending",
+        max_bytes=MAX_RECEIPT_BYTES,
+    )
+    RecoveryTerminalEvidence._require_private_single_link(
+        actual,
+        label="recovery_terminal_result_pending",
+    )
+    if not hmac.compare_digest(actual_payload, payload):
+        raise TransactionError(
+            "recovery_terminal_result_pending_content_changed",
+            "pending recovery terminal result does not contain the exact result",
+            details={"mismatched_properties": ["content"]},
+        )
+    os.fsync(binding.fd)
+    os.fsync(evidence.parent.fd)
+    persisted_payload, persisted = validate_bound_regular_file(
+        binding,
+        evidence.parent,
+        label="recovery_terminal_result_pending",
+        max_bytes=MAX_RECEIPT_BYTES,
+    )
+    if not hmac.compare_digest(persisted_payload, payload):
+        raise TransactionError(
+            "recovery_terminal_result_pending_content_changed",
+            "pending recovery terminal result changed during durability binding",
+            details={"mismatched_properties": ["content"]},
+        )
+    RecoveryTerminalEvidence._require_private_single_link(
+        persisted,
+        label="recovery_terminal_result_pending",
+    )
+    return persisted
+
+
+def pending_recovery_terminal_retention(
+    evidence: RecoveryTerminalEvidence,
+    *,
+    path: Path,
+    name: str,
+    payload: bytes,
+    binding: BoundFile | None,
+) -> dict[str, object]:
+    """Return exact pending retention evidence without replacing a failure."""
+
+    inspected_binding = binding
+    owns_binding = False
+    retention: dict[str, object] = {
+        "retention_status": "retention_incomplete",
+        "pending_locator": None,
+        "last_known_path": str(path),
+        "cleanup_policy": "retain_without_unlink",
+    }
+    try:
+        if inspected_binding is None:
+            inspected_binding = bind_regular_file(
+                path,
+                evidence.parent,
+                label="recovery_terminal_result_pending",
+                max_bytes=MAX_RECEIPT_BYTES,
+                writable=True,
+            )
+            owns_binding = True
+        persisted = validate_pending_recovery_terminal_result(
+            evidence,
+            inspected_binding,
+            payload,
+        )
+        retention.update(
+            {
+                "retention_status": "verified_pending_result",
+                "pending_locator": str(path),
+                "pending_result": persisted.to_json(),
+                "pending_observation": observe_directory_entry(
+                    evidence.parent.fd,
+                    name,
+                    expected=persisted,
+                ),
+            }
+        )
+    except BaseException as error:
+        retention["pending_observation"] = observe_directory_entry(
+            evidence.parent.fd,
+            name,
+        )
+        retention["retention_error"] = {
+            "status": (
+                error.status
+                if isinstance(error, TransactionError)
+                else "pending_retention_validation_failed"
+            ),
+            "message": compact(str(error)),
+            **(
+                {"details": error.details}
+                if isinstance(error, TransactionError) and error.details
+                else {}
+            ),
+        }
+    finally:
+        if owns_binding and inspected_binding is not None:
+            cleanup_failures = close_descriptors_best_effort(
+                [("recovery_terminal_result_pending_inspection", inspected_binding.fd)]
+            )
+            if cleanup_failures:
+                retention["retention_status"] = "retention_incomplete"
+                retention["pending_locator"] = None
+                retention["cleanup_failures"] = cleanup_failures
+    return retention
+
+
+def attach_pending_recovery_terminal_retention(
+    error: BaseException,
+    retention: dict[str, object],
+) -> None:
+    if isinstance(error, TransactionError):
+        error.details["pending_retention"] = retention
+        error.details["retention_status"] = retention["retention_status"]
+        if retention.get("pending_locator") is not None:
+            error.details["pending_locator"] = retention["pending_locator"]
+        else:
+            error.details.pop("pending_locator", None)
+        return
+    setattr(error, "pending_retention", retention)
+    error.add_note(
+        f"pending recovery terminal retention: {retention['retention_status']}"
+    )
+
+
+def reusable_pending_recovery_terminal_result(
+    evidence: RecoveryTerminalEvidence,
+    payload: bytes,
+) -> BoundFile | None:
+    """Adopt one exact prior pending result, or block without accumulating."""
+
+    result_path = evidence.result_path
+    prefix = f"{result_path.name}{RECOVERY_TERMINAL_TEMP_MARKER}"
+    entries, exceeded = bounded_directory_entries(evidence.parent.fd)
+    pending_names = sorted(name for name in entries if name.startswith(prefix))
+    if exceeded:
+        raise TransactionError(
+            "recovery_required",
+            "cannot prove the pending-result namespace is bounded",
+            exit_code=EXIT_POST_REPLACE_FAILED,
+            details={
+                "reason": "pending_result_inventory_incomplete",
+                "retention_status": "retention_incomplete",
+                "pending_locator": None,
+                "entry_count_lower_bound": len(entries),
+            },
+        )
+    if not pending_names:
+        return None
+    if len(pending_names) != 1:
+        raise TransactionError(
+            "recovery_required",
+            "multiple pending recovery terminal results require operator recovery",
+            exit_code=EXIT_POST_REPLACE_FAILED,
+            details={
+                "reason": "pending_result_ambiguous",
+                "retention_status": "retention_incomplete",
+                "pending_locator": None,
+                "pending_names": pending_names,
+            },
+        )
+
+    pending_name = pending_names[0]
+    pending_path = result_path.with_name(pending_name)
+    binding: BoundFile | None = None
+    try:
+        binding = bind_regular_file(
+            pending_path,
+            evidence.parent,
+            label="recovery_terminal_result_pending",
+            max_bytes=MAX_RECEIPT_BYTES,
+            writable=True,
+        )
+        validate_pending_recovery_terminal_result(
+            evidence,
+            binding,
+            payload,
+        )
+        return binding
+    except BaseException as error:
+        retention = pending_recovery_terminal_retention(
+            evidence,
+            path=pending_path,
+            name=pending_name,
+            payload=payload,
+            binding=binding,
+        )
+        close_failures = (
+            close_descriptors_best_effort(
+                [("recovery_terminal_result_pending", binding.fd)]
+            )
+            if binding is not None
+            else []
+        )
+        if close_failures:
+            retention["retention_status"] = "retention_incomplete"
+            retention["pending_locator"] = None
+            retention["cleanup_failures"] = close_failures
+        raise TransactionError(
+            "recovery_required",
+            "existing pending recovery terminal result cannot be safely reused",
+            exit_code=EXIT_POST_REPLACE_FAILED,
+            details={
+                "reason": (
+                    error.status
+                    if isinstance(error, TransactionError)
+                    else "pending_result_reuse_failed"
+                ),
+                "retention_status": retention["retention_status"],
+                "pending_locator": retention.get("pending_locator"),
+                "pending_retention": retention,
+            },
+        ) from error
+
+
 def publish_recovery_terminal_result(
     evidence: RecoveryTerminalEvidence,
     payload: bytes,
@@ -5761,33 +6030,44 @@ def publish_recovery_terminal_result(
         )
 
     result_path = evidence.result_path
-    temporary_name = (
-        f"{result_path.name}{RECOVERY_TERMINAL_TEMP_MARKER}{secrets.token_hex(16)}"
-    )
-    temporary_path = result_path.with_name(temporary_name)
-    fd, snapshot = _write_exclusive_bound(
-        temporary_path,
-        payload,
-        directory_fd=evidence.parent.fd,
-        name=temporary_name,
-    )
-    binding = BoundFile(
-        path=temporary_path,
-        name=temporary_name,
-        fd=fd,
-        snapshot=snapshot,
-    )
+    binding = reusable_pending_recovery_terminal_result(evidence, payload)
+    if binding is None:
+        temporary_name = (
+            f"{result_path.name}{RECOVERY_TERMINAL_TEMP_MARKER}{secrets.token_hex(16)}"
+        )
+        temporary_path = result_path.with_name(temporary_name)
+        try:
+            fd, snapshot = _write_exclusive_bound(
+                temporary_path,
+                payload,
+                directory_fd=evidence.parent.fd,
+                name=temporary_name,
+            )
+        except BaseException as error:
+            retention = pending_recovery_terminal_retention(
+                evidence,
+                path=temporary_path,
+                name=temporary_name,
+                payload=payload,
+                binding=None,
+            )
+            attach_pending_recovery_terminal_retention(error, retention)
+            raise
+        binding = BoundFile(
+            path=temporary_path,
+            name=temporary_name,
+            fd=fd,
+            snapshot=snapshot,
+        )
+    else:
+        temporary_name = binding.name
+        temporary_path = binding.path
     published = False
     try:
-        validate_bound_regular_file(
+        validate_pending_recovery_terminal_result(
+            evidence,
             binding,
-            evidence.parent,
-            label="recovery_terminal_result_pending",
-            max_bytes=MAX_RECEIPT_BYTES,
-        )
-        RecoveryTerminalEvidence._require_private_single_link(
-            snapshot,
-            label="recovery_terminal_result_pending",
+            payload,
         )
         evidence.validate()
         try:
@@ -5801,12 +6081,12 @@ def publish_recovery_terminal_result(
             result_observation = observe_directory_entry(
                 evidence.parent.fd,
                 result_path.name,
-                expected=snapshot,
+                expected=binding.snapshot,
             )
             pending_observation = observe_directory_entry(
                 evidence.parent.fd,
                 temporary_name,
-                expected=snapshot,
+                expected=binding.snapshot,
             )
             if not observation_matches(result_observation):
                 raise TransactionError(
@@ -5844,6 +6124,14 @@ def publish_recovery_terminal_result(
         return binding
     except BaseException as error:
         if not published:
+            retention = pending_recovery_terminal_retention(
+                evidence,
+                path=temporary_path,
+                name=temporary_name,
+                payload=payload,
+                binding=binding,
+            )
+            attach_pending_recovery_terminal_retention(error, retention)
             attach_failures_to_exception(
                 error,
                 "cleanup_failures",
@@ -5852,6 +6140,37 @@ def publish_recovery_terminal_result(
                 ),
             )
         raise
+
+
+def encode_recovery_terminal_result(
+    payload: dict[str, object],
+    *,
+    reservation: dict[str, object] | None = None,
+) -> tuple[dict[str, object], bytes]:
+    """Encode one retry-stable result for an immutable reservation."""
+
+    stable_payload = dict(payload)
+    if reservation is not None:
+        reservation_created = reservation.get("created_unix_ns")
+        stable_payload["created_unix_ns"] = (
+            reservation_created
+            if isinstance(reservation_created, int)
+            else int.from_bytes(
+                hashlib.sha256(
+                    str(stable_payload["transaction_id"]).encode("utf-8")
+                ).digest()[:8],
+                "big",
+            )
+        )
+    encoded = (
+        json.dumps(stable_payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_RECEIPT_BYTES:
+        raise TransactionError(
+            "recovery_terminal_invalid",
+            "recovery terminal evidence is too large",
+        )
+    return stable_payload, encoded
 
 
 def record_recovery_terminal(
@@ -5885,14 +6204,7 @@ def record_recovery_terminal(
         "evidence_kind": evidence_kind,
         "restored": restored.to_json(),
     }
-    encoded = (
-        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
-    ).encode("utf-8")
-    if len(encoded) > MAX_RECEIPT_BYTES:
-        raise TransactionError(
-            "recovery_terminal_invalid",
-            "recovery terminal evidence is too large",
-        )
+    payload, encoded = encode_recovery_terminal_result(payload)
     if evidence is not None:
         if (
             evidence.path != path
@@ -5916,6 +6228,10 @@ def record_recovery_terminal(
                     "existing recovery terminal evidence does not match this recovery",
                 )
             return existing
+        payload, encoded = encode_recovery_terminal_result(
+            payload,
+            reservation=existing,
+        )
         published = publish_recovery_terminal_result(evidence, encoded)
         persisted = evidence.validate()
         persisted_restored = Snapshot.from_json(
@@ -6032,6 +6348,10 @@ def record_recovery_terminal(
                 )
             outcome = existing
             return outcome
+        payload, encoded = encode_recovery_terminal_result(
+            payload,
+            reservation=existing,
+        )
         published = publish_recovery_terminal_result(local_evidence, encoded)
         persisted = local_evidence.validate()
         persisted_restored = Snapshot.from_json(

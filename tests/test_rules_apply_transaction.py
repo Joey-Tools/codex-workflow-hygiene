@@ -624,9 +624,8 @@ class RulesApplyTransactionTests(unittest.TestCase):
         )
         self.assert_no_private_stage()
 
-    def test_new_stage_and_lock_normalize_restrictive_owner_umask(self) -> None:
+    def test_new_lock_normalizes_restrictive_owner_umask(self) -> None:
         lock = self.rules_dir / ".default.rules.apply.lock"
-        stage: object | None = None
         previous_umask = os.umask(0o200)
         try:
             with TRANSACTION.shared_lock(
@@ -634,15 +633,167 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 timeout_seconds=2.0,
             ):
                 self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
-            stage = TRANSACTION.PrivateStage(self.rules_dir)
-            self.assertEqual(stat.S_IMODE(stage.path.stat().st_mode), 0o700)
         finally:
-            if stage is not None:
-                stage.cleanup()
             os.umask(previous_umask)
 
         self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
         self.assert_no_private_stage()
+
+    def test_new_stage_with_owner_permissions_stripped_fails_without_chmod(
+        self,
+    ) -> None:
+        stage_path = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        previous_umask = os.umask(0o700)
+        try:
+            with (
+                mock.patch.object(
+                    TRANSACTION.os,
+                    "fchmod",
+                    side_effect=AssertionError(
+                        "an unbound named stage must never be chmodded"
+                    ),
+                ),
+                self.assertRaises(TRANSACTION.TransactionError) as raised,
+            ):
+                TRANSACTION.PrivateStage(self.rules_dir)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertIn(
+            raised.exception.status,
+            {"private_stage_unavailable", "private_stage_invalid"},
+        )
+        self.assertTrue(stage_path.is_dir())
+        self.assertEqual(stat.S_IMODE(stage_path.stat().st_mode), 0)
+        stage_path.rmdir()
+
+    def test_new_stage_replacement_before_open_is_not_chmodded(self) -> None:
+        stage_path = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        created_stage = self.root / "stage-created-before-replacement"
+        real_open = TRANSACTION.os.open
+        replaced = False
+
+        def replace_before_stage_open(
+            path: object,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            nonlocal replaced
+            if (
+                not replaced
+                and os.fspath(path) == TRANSACTION.PRIVATE_STAGE_NAME
+                and kwargs.get("dir_fd") is not None
+            ):
+                os.rename(stage_path, created_stage)
+                stage_path.mkdir(mode=0o700)
+                stage_path.chmod(0o500)
+                replaced = True
+            return real_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                TRANSACTION.os,
+                "open",
+                side_effect=replace_before_stage_open,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "fchmod",
+                side_effect=AssertionError(
+                    "a pathname replacement must never be chmodded"
+                ),
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.PrivateStage(self.rules_dir)
+
+        self.assertTrue(replaced)
+        self.assertEqual(raised.exception.status, "private_stage_invalid")
+        self.assertEqual(stat.S_IMODE(created_stage.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(stage_path.stat().st_mode), 0o500)
+
+    def test_new_lock_path_replacement_is_rejected_before_fchmod(self) -> None:
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        created_lock = self.root / "created-lock"
+        real_open = TRANSACTION.os.open
+        fchmod_calls: list[tuple[int, int]] = []
+
+        def replace_after_exclusive_open(
+            path: object,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            fd = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == os.fspath(lock) and flags & os.O_EXCL:
+                os.rename(lock, created_lock)
+                lock.write_bytes(b"replacement\n")
+                lock.chmod(0o640)
+            return fd
+
+        def record_fchmod(fd: int, mode: int) -> None:
+            fchmod_calls.append((fd, mode))
+
+        with (
+            mock.patch.object(
+                TRANSACTION.os,
+                "open",
+                side_effect=replace_after_exclusive_open,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "fchmod",
+                side_effect=record_fchmod,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            with TRANSACTION.shared_lock(lock, timeout_seconds=2.0):
+                self.fail("replaced lock must not be acquired")
+
+        self.assertEqual(raised.exception.status, "lock_invalid")
+        self.assertEqual(fchmod_calls, [])
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o640)
+
+    def test_new_lock_hardlink_is_rejected_before_fchmod(self) -> None:
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        alias = self.root / "lock-alias"
+        real_open = TRANSACTION.os.open
+        fchmod_calls: list[tuple[int, int]] = []
+
+        def link_after_exclusive_open(
+            path: object,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            fd = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == os.fspath(lock) and flags & os.O_EXCL:
+                os.link(lock, alias)
+            return fd
+
+        def record_fchmod(fd: int, mode: int) -> None:
+            fchmod_calls.append((fd, mode))
+
+        with (
+            mock.patch.object(
+                TRANSACTION.os,
+                "open",
+                side_effect=link_after_exclusive_open,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "fchmod",
+                side_effect=record_fchmod,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            with TRANSACTION.shared_lock(lock, timeout_seconds=2.0):
+                self.fail("hard-linked lock must not be acquired")
+
+        self.assertEqual(raised.exception.status, "lock_invalid")
+        self.assertEqual(fchmod_calls, [])
+        self.assertEqual(lock.stat().st_nlink, 2)
 
     def test_read_stable_classifies_hardlink_drift_as_object_policy(self) -> None:
         alias = self.root / "candidate.alias"
@@ -4614,16 +4765,171 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     self.assertEqual(first_code, 30)
                     self.assertEqual(first["status"], "recovery_required")
                     self.assertTrue(first["mutation_journal"])
+                    if fault in {"file_fsync", "rename_before"}:
+                        self.assertEqual(
+                            first["retention_status"],
+                            "verified_pending_result",
+                        )
+                        self.assertIsNotNone(first["pending_locator"])
+                    elif fault == "write":
+                        self.assertEqual(
+                            first["retention_status"],
+                            "retention_incomplete",
+                        )
+                        self.assertIsNone(first.get("pending_locator"))
 
                 repeated = self.run_recover()
-                self.assertEqual(repeated.returncode, 0, repeated.stderr)
-                self.assertIn(
-                    json.loads(repeated.stdout)["status"],
-                    {"recovered", "already_original"},
-                )
+                repeated_payload = json.loads(repeated.stdout)
+                if fault == "write":
+                    self.assertEqual(repeated.returncode, 30, repeated.stderr)
+                    self.assertEqual(
+                        repeated_payload["status"],
+                        "recovery_required",
+                    )
+                    self.assertEqual(
+                        repeated_payload["retention_status"],
+                        "retention_incomplete",
+                    )
+                    pending_prefix = (
+                        f"{terminal.name}"
+                        f"{TRANSACTION.RECOVERY_TERMINAL_RESULT_SUFFIX}"
+                        f"{TRANSACTION.RECOVERY_TERMINAL_TEMP_MARKER}"
+                    )
+                    self.assertEqual(
+                        len(
+                            [
+                                child
+                                for child in terminal.parent.iterdir()
+                                if child.name.startswith(pending_prefix)
+                            ]
+                        ),
+                        1,
+                    )
+                else:
+                    self.assertEqual(
+                        repeated.returncode,
+                        0,
+                        repeated.stderr + repeated.stdout,
+                    )
+                    self.assertIn(
+                        repeated_payload["status"],
+                        {"recovered", "already_original"},
+                    )
                 self.assertEqual(terminal.read_bytes(), reservation)
                 self.assertEqual(self.rules.read_bytes(), OLD_RULES)
                 self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_terminal_result_pre_rename_validation_failure_retains_exact_pending(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        real_validate = TRANSACTION.RecoveryTerminalEvidence.validate
+        injected = False
+
+        def fail_with_pending(evidence: object) -> dict[str, object]:
+            nonlocal injected
+            assert isinstance(evidence, TRANSACTION.RecoveryTerminalEvidence)
+            pending_prefix = (
+                f"{evidence.result_path.name}"
+                f"{TRANSACTION.RECOVERY_TERMINAL_TEMP_MARKER}"
+            )
+            if (
+                not injected
+                and evidence.result is None
+                and any(
+                    child.name.startswith(pending_prefix)
+                    for child in evidence.parent.path.iterdir()
+                )
+            ):
+                injected = True
+                raise TRANSACTION.TransactionError(
+                    "fault_injected_control_failure",
+                    "fault-injected pre-rename control failure",
+                )
+            return real_validate(evidence)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.RecoveryTerminalEvidence,
+                "validate",
+                autospec=True,
+                side_effect=fail_with_pending,
+            ),
+        ):
+            code, payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertTrue(injected)
+        self.assertEqual(code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(
+            payload["retention_status"],
+            "verified_pending_result",
+        )
+        pending_locator = Path(payload["pending_locator"])
+        self.assertTrue(pending_locator.is_file())
+
+        real_atomic = TRANSACTION.atomic_rename_no_replace
+        blocked_reuse_rename = False
+
+        def fail_reused_pending_rename(*args: object) -> None:
+            nonlocal blocked_reuse_rename
+            if (
+                not blocked_reuse_rename
+                and len(args) >= 2
+                and args[1] == pending_locator.name
+            ):
+                blocked_reuse_rename = True
+                raise OSError(errno.EIO, "fault-injected reused-pending rename")
+            real_atomic(*args)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_no_replace",
+                side_effect=fail_reused_pending_rename,
+            ),
+        ):
+            repeated_code, repeated_payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertTrue(blocked_reuse_rename)
+        self.assertEqual(repeated_code, 30)
+        self.assertEqual(repeated_payload["status"], "recovery_required")
+        self.assertEqual(
+            repeated_payload["retention_status"],
+            "verified_pending_result",
+        )
+        self.assertEqual(
+            repeated_payload["pending_locator"],
+            str(pending_locator),
+        )
+
+        repeated = self.run_recover()
+        self.assertEqual(
+            repeated.returncode,
+            0,
+            repeated.stderr + repeated.stdout,
+        )
+        self.assertFalse(pending_locator.exists())
 
     def test_terminal_result_publication_never_truncates_reservation(self) -> None:
         self.write_validator("raise SystemExit(0)\n")

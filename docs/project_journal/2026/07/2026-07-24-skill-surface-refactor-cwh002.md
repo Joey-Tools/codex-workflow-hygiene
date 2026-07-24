@@ -149,14 +149,22 @@ superseded_by:
   immediately from the returned descriptor. FIFO substitution is therefore a
   typed fail-closed result rather than an unbounded wait, including before the
   first lock, after validator return, and during lock-held recovery.
-- A newly created fixed stage or lock is distinguished from retained
-  infrastructure. After the new object is bound and its type/path identity is
-  proved, the transaction normalizes the held descriptor to `0700` or `0600`;
-  a restrictive caller umask can no longer strand an unusable persistent
-  stage or lock, while pre-existing objects are never silently chmodded.
+- A fixed stage is never assigned transaction-created identity from
+  `mkdir -> stat/open`, because `mkdir` returns no authoritative descriptor.
+  The helper only admits the currently bound owner-only empty stage; an
+  umask-stripped or replaced pathname fails closed and is neither chmodded nor
+  deleted. The `O_EXCL` lock FD is authoritative creation identity, so the
+  helper proves FD/path identity, owner, regular type, and one-link policy
+  before descriptor-only normalization and proves them again afterward.
 - Path revalidation reports link-count drift as `object_policy_changed`
   instead of conflating it with an access-policy change. The structured status
   and `mismatched_properties` now identify the same protected property.
+- Recovery-terminal result publication now carries exact pending retention
+  evidence through every pre-rename failure. A locator is emitted only after
+  descriptor, entry, exact bytes, owner-only access, one-link policy, and both
+  fsyncs pass; other outcomes say `retention_incomplete`. Retry adopts one
+  reservation-time-bound exact pending result or blocks without creating
+  another unknown pending file.
 - Recovery reads the immutable terminal result and exact live/backup roles
   under the lock before strict terminal validation; an `O/M` v4 primary state
   gets a bounded stage/prepared probe to prove exact `Q` or retain possible
@@ -185,7 +193,7 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 167 passed on Python 3.13. New cases cover fixed
+- Rules transaction tests: 172 passed on Python 3.13. New cases cover fixed
   stage zero-artifact failures, parse-to-lock receipt races, delegated-v3
   post-mutation receipt and parent changes, every terminal publication crash
   point, successful retry, terminal truncation prohibition, terminal/primary
@@ -203,16 +211,15 @@ superseded_by:
   schema-v1/v3/v4 recovery. The final 4 cases prove that an initial candidate
   FIFO, an existing lock FIFO, a post-validator candidate FIFO replacement,
   and a lock-held recovery backup FIFO all fail promptly without creating new
-  transaction artifacts. Two additional cases cover restrictive-owner umask
-  normalization for newly created infrastructure and exact object-policy
-  classification for a hardlink race.
-- Full repository suite covered 1,229 tests. Only the same 4 sandbox-only GPG
-  merge-fixture errors remained; their exact keybox-enabled rerun passed 4 of
-  4 outside the sandbox.
+  transaction artifacts. The final identity-boundary cases prove that a
+  newly named stage with restrictive owner permissions or a pre-open
+  replacement fails without chmod or deletion; a new lock path replacement
+  or hardlink fails before fchmod; and terminal-result pending files either
+  produce exact durable locators or explicit incomplete-retention evidence
+  without accumulating unknown pending files across retries.
+- Full repository suite passed all 1,234 tests.
 - Ruff check and Ruff format-check passed for both changed Python files.
 - `codex-rules-hygiene` passed the official skill validator through an
   isolated `uv` PyYAML environment after the direct installed wrapper reported
   that local Python lacked `PyYAML`.
-- `git diff --check` passed after the last source update; five generated
-  `__pycache__` directories were removed and the bounded cache rescan was
-  empty.
+- `git diff --check` passed after the last source update.
