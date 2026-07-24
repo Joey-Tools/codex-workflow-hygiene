@@ -299,6 +299,152 @@ class SessionLocatorTests(unittest.TestCase):
         self.assertEqual([match["line"] for match in source["matches"]], [5, 4, 2])
         self.assertTrue(source["matches_truncated"])
 
+    def test_index_byte_cap_is_schema_v2_partial_without_reading_sparse_body(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            index = codex_home / "session_index.jsonl"
+            with index.open("wb") as handle:
+                handle.truncate(LOCATE.MAX_INDEX_TOTAL_READ_BYTES // 3 + 1)
+            (codex_home / "history.jsonl").write_text("", encoding="utf-8")
+
+            completed, payload = self.run_locator(
+                codex_home,
+                "--thread-query",
+                "review helper",
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["status"], "partial")
+        source = payload["sources"][0]
+        self.assertEqual(source["status"], "partial")
+        self.assertEqual(source["reason"], "index-byte-cap-exceeded")
+        self.assertEqual(source["records_scanned"], 0)
+        self.assertEqual(source["index_bytes_processed"], 0)
+        self.assertGreater(
+            source["planned_index_read_bytes"],
+            source["index_total_read_byte_limit"],
+        )
+
+    def test_index_record_cap_stops_before_unbounded_tiny_record_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            index = codex_home / "session_index.jsonl"
+            index.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "id": f"session-{number}",
+                            "thread_name": "review helper",
+                            "ts": number,
+                        }
+                    )
+                    + "\n"
+                    for number in range(3)
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(LOCATE, "MAX_INDEX_RECORDS", 2):
+                source = self.scan_index(codex_home)
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn("index-record-cap-exceeded", source["reasons"])
+        self.assertEqual(source["records_scanned"], 2)
+        self.assertEqual(source["match_count"], 2)
+        self.assertEqual(source["content_scope"], "unverified")
+        self.assertLess(
+            source["index_bytes_processed"],
+            source["captured_prefix_bytes"],
+        )
+
+    def test_large_json_integer_is_malformed_and_scan_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            huge_integer = "9" * 4_301
+            rows = [
+                json.dumps(
+                    {
+                        "id": "before",
+                        "thread_name": "review helper",
+                        "ts": 1,
+                    }
+                ),
+                (
+                    '{"id":"malformed","thread_name":"review helper",'
+                    f'"ts":{huge_integer}}}'
+                ),
+                json.dumps(
+                    {
+                        "id": "after",
+                        "thread_name": "review helper",
+                        "ts": 2,
+                    }
+                ),
+            ]
+            (codex_home / "session_index.jsonl").write_text(
+                "\n".join(rows) + "\n",
+                encoding="utf-8",
+            )
+
+            source = self.scan_index(codex_home)
+
+        self.assertEqual(source["status"], "partial")
+        self.assertEqual(source["malformed_records"], 1)
+        self.assertEqual(source["records_scanned"], 3)
+        self.assertEqual(source["match_count"], 2)
+        self.assertEqual(
+            [match["id"] for match in source["matches"]],
+            ["after", "before"],
+        )
+
+    def test_timezone_normalization_overflow_is_a_missing_timestamp(self) -> None:
+        boundary_values = (
+            "0001-01-01T00:00:00+23:59",
+            "9999-12-31T23:59:59-23:59",
+        )
+        for value in boundary_values:
+            with self.subTest(value=value):
+                self.assertIsNone(LOCATE._normalize_index_timestamp(value))
+
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            rows = [
+                {
+                    "id": "underflow",
+                    "thread_name": "review helper",
+                    "updated_at": boundary_values[0],
+                },
+                {
+                    "id": "normal",
+                    "thread_name": "review helper",
+                    "updated_at": "2026-07-25T00:00:00Z",
+                },
+                {
+                    "id": "overflow",
+                    "thread_name": "review helper",
+                    "updated_at": boundary_values[1],
+                },
+            ]
+            (codex_home / "session_index.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            source = self.scan_index(codex_home, limit=3)
+
+        self.assertEqual(source["status"], "checked")
+        self.assertEqual(
+            [match["id"] for match in source["matches"]],
+            ["normal", "overflow", "underflow"],
+        )
+
     def test_rollout_filename_requires_exact_terminal_uuid(self) -> None:
         session_id = "019ef067-976b-7e41-928d-80361777330b"
         self.assertTrue(

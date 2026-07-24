@@ -32,6 +32,11 @@ during collection; it is not a final slice of an unbounded list. Index matches
 retain the newest normalized `updated_at` / `ts` values in a bounded heap and
 use source path plus physical line as deterministic tie-breakers.
 
+Each index caps 250,000 records and 192 MiB of aggregate reads across the scan
+and both prefix hashes. It rejects a three-pass prefix beyond that budget before
+body reads and reports `index-byte-cap-exceeded` or
+`index-record-cap-exceeded` as schema-v2 `partial`, never `checked`. Integers
+beyond 32 digits, invalid constants, and other parse failures are malformed; later records remain eligible.
 Only `FileNotFoundError` classifies an optional index or root as
 `unavailable`. A broken symlink, permission or I/O error, wrong type, path
 escape, or failed revalidation is `partial`.
@@ -49,6 +54,8 @@ escape, or failed revalidation is `partial`.
   `checked` as `stable-captured-prefix-with-later-append`; the appended records
   were not searched. Truncation, prefix mutation, rotation, replacement, or
   unreadable validation is `partial`.
+- Normalize timezone-aware ISO timestamps to UTC for newest-match ordering.
+  Invalid or year-crossing values are missing, never process-level failures.
 - Open every component from the filesystem root through `codex_home` and each
   rollout root with descriptor-relative no-follow directory opens. Enumerate
   from held directory descriptors and never traverse symlinks.

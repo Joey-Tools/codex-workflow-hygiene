@@ -21,6 +21,9 @@ from typing import Any, BinaryIO, Iterator
 MAX_RECORD_BYTES = 1024 * 1024
 DRAIN_CHUNK_BYTES = 64 * 1024
 PREFIX_HASH_CHUNK_BYTES = 64 * 1024
+MAX_INDEX_RECORDS = 250_000
+MAX_INDEX_TOTAL_READ_BYTES = 192 * 1024 * 1024
+MAX_JSON_INTEGER_DIGITS = 32
 MAX_FIELD_CHARS = 320
 MAX_PATH_CHARS = 4096
 MAX_SELECTOR_CHARS = 512
@@ -45,6 +48,17 @@ class CoveragePartial(RuntimeError):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+@dataclass(slots=True)
+class IndexReadBudget:
+    limit: int
+    consumed: int = 0
+
+    def consume(self, byte_count: int) -> None:
+        if byte_count < 0 or self.consumed + byte_count > self.limit:
+            raise CoveragePartial("index-byte-cap-exceeded")
+        self.consumed += byte_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,11 +144,14 @@ def _normalize_index_timestamp(value: object) -> int | None:
         candidate = f"{candidate[:-1]}+00:00"
     try:
         parsed = datetime.fromisoformat(candidate)
-    except ValueError:
+    except (OverflowError, ValueError):
         return None
     if parsed.tzinfo is None:
         return None
-    delta = parsed.astimezone(timezone.utc) - UTC_EPOCH
+    try:
+        delta = parsed.astimezone(timezone.utc) - UTC_EPOCH
+    except (OverflowError, ValueError):
+        return None
     return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
 
 
@@ -281,14 +298,18 @@ def _bounded_jsonl(
     handle: BinaryIO,
     prefix_bytes: int,
     digest: Any,
+    budget: IndexReadBudget,
 ) -> Iterator[tuple[int, bytes, bool]]:
     line_number = 0
     remaining = prefix_bytes
     while remaining:
+        if line_number >= MAX_INDEX_RECORDS:
+            raise CoveragePartial("index-record-cap-exceeded")
         read_limit = min(remaining, MAX_RECORD_BYTES + 1)
         raw_line = handle.readline(read_limit)
         if not raw_line:
             raise CoveragePartial("source-truncated-during-scan")
+        budget.consume(len(raw_line))
         digest.update(raw_line)
         remaining -= len(raw_line)
         line_number += 1
@@ -299,12 +320,17 @@ def _bounded_jsonl(
             raw_line = handle.readline(min(remaining, DRAIN_CHUNK_BYTES))
             if not raw_line:
                 raise CoveragePartial("source-truncated-during-scan")
+            budget.consume(len(raw_line))
             digest.update(raw_line)
             remaining -= len(raw_line)
         yield line_number, b"", True
 
 
-def _hash_prefix(descriptor: int, prefix_bytes: int) -> str:
+def _hash_prefix(
+    descriptor: int,
+    prefix_bytes: int,
+    budget: IndexReadBudget,
+) -> str:
     if not hasattr(os, "pread"):
         raise CoveragePartial("descriptor-prefix-revalidation-unavailable")
     digest = hashlib.sha256()
@@ -322,6 +348,7 @@ def _hash_prefix(descriptor: int, prefix_bytes: int) -> str:
             ) from error
         if not chunk:
             raise CoveragePartial("source-truncated-during-revalidation")
+        budget.consume(len(chunk))
         digest.update(chunk)
         offset += len(chunk)
     return digest.hexdigest()
@@ -334,6 +361,7 @@ def _validate_index_completion(
     initial_metadata: os.stat_result,
     prefix_bytes: int,
     expected_digest: str,
+    budget: IndexReadBudget,
 ) -> int:
     initial_binding = _binding(initial_metadata)
     try:
@@ -346,7 +374,7 @@ def _validate_index_completion(
         raise CoveragePartial("source-identity-or-access-policy-changed")
     if current_metadata.st_size < prefix_bytes:
         raise CoveragePartial("source-truncated-during-revalidation")
-    if _hash_prefix(descriptor, prefix_bytes) != expected_digest:
+    if _hash_prefix(descriptor, prefix_bytes, budget) != expected_digest:
         raise CoveragePartial("source-prefix-mutated")
 
     fresh_chain = _validated_fresh_directory_chain(chain)
@@ -369,7 +397,7 @@ def _validate_index_completion(
                 raise CoveragePartial("source-rotated-or-replaced")
             if fresh_metadata.st_size < prefix_bytes:
                 raise CoveragePartial("source-truncated-during-revalidation")
-            if _hash_prefix(fresh_descriptor, prefix_bytes) != expected_digest:
+            if _hash_prefix(fresh_descriptor, prefix_bytes, budget) != expected_digest:
                 raise CoveragePartial("source-prefix-mutated")
             try:
                 final_metadata = os.fstat(fresh_descriptor)
@@ -453,6 +481,25 @@ def _index_matches(
     )
 
 
+def _parse_bounded_json_integer(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise ValueError("JSON integer exceeds the locator digit limit")
+    return int(value)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant is not accepted: {value}")
+
+
+def _load_index_record(raw_line: bytes) -> Any:
+    return json.loads(
+        raw_line,
+        parse_constant=_reject_json_constant,
+        parse_int=_parse_bounded_json_integer,
+    )
+
+
 def _project_index_match(
     path: Path,
     line_number: int,
@@ -490,7 +537,11 @@ def _scan_index(
     source = _empty_source("index", path)
     source["append_after_boundary"] = False
     source["content_scope"] = "unverified"
+    source["index_bytes_processed"] = 0
+    source["index_record_limit"] = MAX_INDEX_RECORDS
+    source["index_total_read_byte_limit"] = MAX_INDEX_TOTAL_READ_BYTES
     retained_matches: list[tuple[tuple[int, int, str, int], dict[str, Any]]] = []
+    budget = IndexReadBudget(MAX_INDEX_TOTAL_READ_BYTES)
 
     try:
         chain = _open_absolute_directory_chain(codex_home)
@@ -522,23 +573,31 @@ def _scan_index(
         try:
             prefix_bytes = initial_metadata.st_size
             source["captured_prefix_bytes"] = prefix_bytes
+            planned_read_bytes = prefix_bytes * 3
+            source["planned_index_read_bytes"] = planned_read_bytes
+            if planned_read_bytes > budget.limit:
+                _mark_partial(source, "index-byte-cap-exceeded")
+                return source
+
             digest = hashlib.sha256()
+            scan_complete = True
             try:
                 with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
                     for line_number, raw_line, oversized in _bounded_jsonl(
                         handle,
                         prefix_bytes,
                         digest,
+                        budget,
                     ):
                         source["records_scanned"] += 1
                         if oversized:
                             source["oversized_records"] += 1
                             continue
                         try:
-                            row = json.loads(raw_line)
+                            row = _load_index_record(raw_line)
                         except (
                             UnicodeDecodeError,
-                            json.JSONDecodeError,
+                            ValueError,
                             RecursionError,
                         ):
                             source["malformed_records"] += 1
@@ -563,35 +622,40 @@ def _scan_index(
                         elif retained[0] > retained_matches[0][0]:
                             heapq.heapreplace(retained_matches, retained)
             except CoveragePartial as error:
+                scan_complete = False
                 _mark_partial(source, error.reason)
             except OSError as error:
+                scan_complete = False
                 _mark_partial(source, f"read-failed:{type(error).__name__}")
 
-            try:
-                final_size = _validate_index_completion(
-                    chain,
-                    name,
-                    descriptor,
-                    initial_metadata,
-                    prefix_bytes,
-                    digest.hexdigest(),
-                )
-            except CoveragePartial as error:
-                _mark_partial(source, error.reason)
-            except OSError as error:
-                _mark_partial(
-                    source,
-                    f"source-revalidation-failed:{type(error).__name__}",
-                )
-            else:
-                source["final_size_bytes"] = final_size
-                source["append_after_boundary"] = final_size > prefix_bytes
-                source["content_scope"] = (
-                    "stable-captured-prefix-with-later-append"
-                    if final_size > prefix_bytes
-                    else "stable-complete-file"
-                )
+            if scan_complete:
+                try:
+                    final_size = _validate_index_completion(
+                        chain,
+                        name,
+                        descriptor,
+                        initial_metadata,
+                        prefix_bytes,
+                        digest.hexdigest(),
+                        budget,
+                    )
+                except CoveragePartial as error:
+                    _mark_partial(source, error.reason)
+                except OSError as error:
+                    _mark_partial(
+                        source,
+                        f"source-revalidation-failed:{type(error).__name__}",
+                    )
+                else:
+                    source["final_size_bytes"] = final_size
+                    source["append_after_boundary"] = final_size > prefix_bytes
+                    source["content_scope"] = (
+                        "stable-captured-prefix-with-later-append"
+                        if final_size > prefix_bytes
+                        else "stable-complete-file"
+                    )
         finally:
+            source["index_bytes_processed"] = budget.consumed
             os.close(descriptor)
 
     source["matches"] = [

@@ -3,7 +3,7 @@ id: 20260724-cwh002
 title: Skill Surface Thinning
 status: completed
 created: 2026-07-24
-updated: 2026-07-24
+updated: 2026-07-25
 branch: wip/thin-bounded-mining-authoring
 pr:
 supersedes: []
@@ -43,6 +43,14 @@ superseded_by:
 - Index match retention now keeps the newest normalized `updated_at` / `ts`
   records in a fixed-size heap, with source path and physical line as stable
   tie-breakers.
+- Each index now has a 250,000-record cap and a 192 MiB aggregate content-read
+  budget shared by the scan and both prefix-revalidation hashes. A three-pass
+  prefix that cannot fit is rejected before body reads, and a record-budget
+  stop cannot claim stable-prefix coverage.
+- Index JSON parsing rejects integers beyond 32 digits and non-standard
+  constants as malformed records while continuing at the next physical record.
+  UTC normalization overflow at the supported year boundaries is treated as a
+  missing timestamp rather than escaping the schema-v2 response.
 - Rollout filename lookup accepts only the exact terminal lifecycle UUID, not
   UUID substrings, adjacent characters, or a non-terminal occurrence.
 - Rollout traversal stops with `partial` coverage at depth 32 or before its
@@ -64,14 +72,15 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -m unittest tests.test_skill_structure`: 25 tests passed,
+- `python3 -m unittest tests.test_skill_structure`: 29 tests passed,
   including append, prefix mutation, truncation, rotation, broken symlink,
   unreadable source/revalidation, directory replacement/escape, inventory
   drift, access-policy drift, newest-match retention, exact terminal UUID
-  matching, depth/component budgets, and 25-error retention-cap cases.
-- Full `python3 -m unittest discover -s tests`: 1,056 tests ran; only four
-  sandboxed temporary-Git signing fixtures failed because keyboxd was
-  inaccessible.
+  matching, depth/component budgets, index byte/record caps, oversized JSON
+  integers, UTC year-boundary overflow, and 25-error retention-cap cases.
+- Full `python3 -m unittest discover -s tests -q`: 1,060 tests ran; only four
+  unrelated sandboxed temporary-Git merge-signing fixtures failed because
+  keyboxd was inaccessible.
 - The exact four signing fixtures were rerun outside the sandbox and all passed.
 - System `$skill-creator` quick validation passed for `codex-session-mining`
   through the documented isolated `uv` + PyYAML fallback.
