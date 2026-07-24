@@ -65,6 +65,8 @@ Always choose an explicit mode before inspecting or changing host state.
 7. After a successful full cleanup with no intentionally retained drift debt, refresh `default.rules.clean-baseline` from the verified live file. Never refresh it after audit mode, a light cleanup, a rollback, `recovery_required`, or a failed/partial apply.
 8. Write only the necessary adopted-journal or focused-note update when apply adopts a durable rule/helper/skill decision or records the successful full-cleanup baseline. Use an owning repo's existing journal when already adopted; otherwise use a nearby focused note instead of bootstrapping a tracker. Do not journal a read-only audit or no-op apply.
 
+Cleanup, lock-finalization, and pending-result retention failures remain structured evidence on Python 3.9 and 3.10. Python 3.11+ exception notes are best-effort diagnostics only; missing or faulty `add_note` support never replaces the primary transaction outcome.
+
 ## Ownership And Guardrails
 
 - Rules govern reusable approval families; skills decide when to use them; helpers encode repeated fragile mechanics.

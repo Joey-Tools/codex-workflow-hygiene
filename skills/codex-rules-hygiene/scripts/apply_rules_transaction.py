@@ -483,6 +483,21 @@ def attach_cleanup_failures_to_payload(
         payload["cleanup_failures"] = list(failures)
 
 
+def add_exception_note_compat(error: BaseException, note: str) -> None:
+    """Attach a Python 3.11+ exception note without displacing the primary error."""
+
+    try:
+        add_note = getattr(error, "add_note", None)
+    except BaseException:
+        return
+    if not callable(add_note):
+        return
+    try:
+        add_note(note)
+    except BaseException:
+        return
+
+
 def attach_failures_to_exception(
     error: BaseException,
     key: str,
@@ -502,12 +517,13 @@ def attach_failures_to_exception(
             existing.extend(failures)
         else:
             setattr(error, key, list(failures))
-    error.add_note(
+    add_exception_note_compat(
+        error,
         "descriptor cleanup also failed: "
         + "; ".join(
             f"{failure['descriptor']}: {failure['error_type']}: {failure['message']}"
             for failure in failures
-        )
+        ),
     )
 
 
@@ -6014,8 +6030,9 @@ def attach_pending_recovery_terminal_retention(
             error.details.pop("pending_locator", None)
         return
     setattr(error, "pending_retention", retention)
-    error.add_note(
-        f"pending recovery terminal retention: {retention['retention_status']}"
+    add_exception_note_compat(
+        error,
+        f"pending recovery terminal retention: {retention['retention_status']}",
     )
 
 

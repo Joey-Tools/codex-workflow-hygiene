@@ -519,6 +519,71 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertFalse(lock.exists())
         return payload
 
+    def test_cleanup_attachment_preserves_primary_without_add_note(self) -> None:
+        class LegacyNoteError(Exception):
+            def __getattribute__(self, name: str) -> object:
+                if name == "add_note":
+                    raise AttributeError("add_note is unavailable")
+                return super().__getattribute__(name)
+
+        primary = LegacyNoteError("primary failure")
+        failure = TRANSACTION.structured_operation_failure(
+            "close",
+            "private_stage",
+            OSError(errno.EIO, "fault-injected close"),
+        )
+
+        TRANSACTION.attach_failures_to_exception(
+            primary,
+            "cleanup_failures",
+            [failure],
+        )
+
+        self.assertEqual(str(primary), "primary failure")
+        self.assertEqual(primary.cleanup_failures, [failure])
+
+    def test_pending_attachment_preserves_primary_without_add_note(self) -> None:
+        class LegacyNoteError(Exception):
+            def __getattribute__(self, name: str) -> object:
+                if name == "add_note":
+                    raise AttributeError("add_note is unavailable")
+                return super().__getattribute__(name)
+
+        primary = LegacyNoteError("primary pending failure")
+        retention = {
+            "retention_status": "verified_pending_result",
+            "pending_locator": str(self.receipt.with_suffix(".pending")),
+        }
+
+        TRANSACTION.attach_pending_recovery_terminal_retention(
+            primary,
+            retention,
+        )
+
+        self.assertEqual(str(primary), "primary pending failure")
+        self.assertIs(primary.pending_retention, retention)
+
+    def test_attachment_preserves_primary_when_add_note_fails(self) -> None:
+        class BrokenNoteError(Exception):
+            def add_note(self, _note: str) -> None:
+                raise OSError(errno.EIO, "fault-injected add_note failure")
+
+        primary = BrokenNoteError("primary failure")
+        failure = TRANSACTION.structured_operation_failure(
+            "lock-finalization",
+            "final-release-revalidation",
+            OSError(errno.EIO, "fault-injected finalization"),
+        )
+
+        TRANSACTION.attach_failures_to_exception(
+            primary,
+            "lock_finalization_failures",
+            [failure],
+        )
+
+        self.assertEqual(str(primary), "primary failure")
+        self.assertEqual(primary.lock_finalization_failures, [failure])
+
     def test_apply_validates_private_stage_before_atomic_replace(self) -> None:
         validator_log = self.root / "validator.jsonl"
         self.write_validator(
@@ -3313,7 +3378,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 stage_root = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
                 receipt["schema_version"] = 3
                 receipt["staged_backup_parent"] = TRANSACTION.Snapshot.from_stat(
-                    stage_root.stat(follow_symlinks=False),
+                    os.stat(stage_root, follow_symlinks=False),
                     b"",
                 ).to_json()
                 receipt.pop("prepared_candidate_path", None)
@@ -3386,7 +3451,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         stage_root = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
         receipt["schema_version"] = 3
         receipt["staged_backup_parent"] = TRANSACTION.Snapshot.from_stat(
-            stage_root.stat(follow_symlinks=False),
+            os.stat(stage_root, follow_symlinks=False),
             b"",
         ).to_json()
         receipt.pop("prepared_candidate_path", None)
@@ -5382,7 +5447,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         stage_root = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
         receipt["schema_version"] = 3
         receipt["staged_backup_parent"] = TRANSACTION.Snapshot.from_stat(
-            stage_root.stat(follow_symlinks=False),
+            os.stat(stage_root, follow_symlinks=False),
             b"",
         ).to_json()
         receipt.pop("prepared_candidate_path", None)
@@ -5442,7 +5507,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         stage_root = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
         receipt["schema_version"] = 3
         receipt["staged_backup_parent"] = TRANSACTION.Snapshot.from_stat(
-            stage_root.stat(follow_symlinks=False),
+            os.stat(stage_root, follow_symlinks=False),
             b"",
         ).to_json()
         receipt.pop("prepared_candidate_path", None)
@@ -6348,8 +6413,18 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(raised.exception.status, "recovery_required")
         self.assertEqual(raised.exception.exit_code, 30)
         self.assertEqual(raised.exception.details["reason"], "lock_changed")
-        notes = getattr(raised.exception, "__notes__", [])
-        self.assertTrue(any("descriptor cleanup also failed" in note for note in notes))
+        cleanup_failures = raised.exception.details["cleanup_failures"]
+        self.assertTrue(
+            any(
+                failure["descriptor"] == "apply_evidence_group"
+                for failure in cleanup_failures
+            )
+        )
+        if callable(getattr(raised.exception, "add_note", None)):
+            notes = getattr(raised.exception, "__notes__", [])
+            self.assertTrue(
+                any("descriptor cleanup also failed" in note for note in notes)
+            )
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
         self.assertEqual(self.backup.read_bytes(), OLD_RULES)
         self.assertTrue(self.receipt.is_file())

@@ -120,6 +120,10 @@ superseded_by:
 - Result, reservation, receipt, prepared evidence, and every held parent close
   in a deterministic best-effort-all pass. EIO/EINTR on one descriptor cannot
   skip later closes or replace an existing apply/recovery terminal status.
+- Cleanup, lock-finalization, and pending-result retention attachments keep
+  their structured evidence on Python 3.9 and 3.10. Python 3.11+ exception
+  notes are supplemental best-effort diagnostics; missing or faulty
+  `add_note` support cannot replace the primary status, exception, or locator.
 - Legacy schema-v1 receipts treat absent historical `nlink` as unknown history,
   ignore an explicit valid historical `nlink: 1`, and reject any explicit
   non-single value as receipt tampering, while every current regular
@@ -206,7 +210,7 @@ superseded_by:
 
 ## Evidence
 
-- Rules transaction tests: 178 passed on Python 3.13. New cases cover fixed
+- Rules transaction tests: 181 passed on Python 3.13. New cases cover fixed
   stage zero-artifact failures, parse-to-lock receipt races, delegated-v3
   post-mutation receipt and parent changes, every terminal publication crash
   point, successful retry, terminal truncation prohibition, terminal/primary
@@ -235,7 +239,11 @@ superseded_by:
   terminal handling for ambiguous post-exchange roles, strict schema-v4 and
   explicitly relaxed schema-v3 same-inode terminal rewrites, and pending
   locator unlink/replacement races after an initially matching observation.
-- Full repository suite passed all 1,240 tests.
+  The final 3 compatibility cases prove that missing or failing `add_note`
+  support cannot displace structured cleanup, lock-finalization, or pending
+  retention evidence. Nine focused stage-close, lock-finalization, and
+  pending-publication cases also passed on system Python 3.9.6.
+- Full repository suite passed all 1,243 tests.
 - Ruff check and Ruff format-check passed for both changed Python files.
 - `codex-rules-hygiene` passed the official skill validator through an
   isolated `uv` PyYAML environment after the direct installed wrapper reported
