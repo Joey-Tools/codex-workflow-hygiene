@@ -29,8 +29,8 @@ import threading
 import time
 
 
-SCHEMA_VERSION = 3
-SUPPORTED_SCHEMA_VERSIONS = frozenset((1, 2, SCHEMA_VERSION))
+SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSIONS = frozenset((1, 2, 3, SCHEMA_VERSION))
 RECOVERY_TERMINAL_SCHEMA_VERSION = 1
 RECOVERY_TERMINAL_RESERVED = "reserved"
 RECOVERY_TERMINAL_RESTORED = "restored"
@@ -44,6 +44,7 @@ MAX_VALIDATOR_OUTPUT_BYTES = 128 * 1024
 MAX_XATTR_NAME_BYTES = 64 * 1024
 MAX_STAGE_DIRECTORY_ENTRIES = 1024
 PRIVATE_STAGE_NAME = ".default.rules.transaction-stage"
+PREPARED_CANDIDATE_SUFFIX = ".prepared-candidate"
 # The legacy stage_cleanup_retained quarantine status is intentionally not emitted.
 VALIDATOR_TERM_GRACE_SECONDS = 0.25
 VALIDATOR_KILL_DRAIN_SECONDS = 1.0
@@ -1100,6 +1101,7 @@ def bind_directory(
     *,
     label: str,
     require_owner_private: bool = False,
+    expected: Snapshot | None = None,
 ) -> BoundDirectory:
     flags = (
         os.O_RDONLY
@@ -1124,7 +1126,9 @@ def bind_directory(
         binding = BoundDirectory(
             path=path,
             fd=fd,
-            snapshot=Snapshot.from_stat(file_stat, b""),
+            snapshot=(
+                expected if expected is not None else Snapshot.from_stat(file_stat, b"")
+            ),
             label=label,
             require_owner_private=require_owner_private,
         )
@@ -1235,6 +1239,30 @@ def bind_regular_file(
     except BaseException:
         os.close(fd)
         raise
+
+
+def read_bound_regular_child(
+    path: Path,
+    parent: BoundDirectory,
+    *,
+    label: str,
+    max_bytes: int = MAX_RULES_BYTES,
+) -> tuple[bytes, Snapshot]:
+    binding = bind_regular_file(
+        path,
+        parent,
+        label=label,
+        max_bytes=max_bytes,
+    )
+    try:
+        return validate_bound_regular_file(
+            binding,
+            parent,
+            label=label,
+            max_bytes=max_bytes,
+        )
+    finally:
+        os.close(binding.fd)
 
 
 def write_exclusive(
@@ -1447,40 +1475,39 @@ class PrivateStage:
         )
         self.rules_parent = rules_parent
         self.rules_parent_fd = os.open(rules_parent, directory_flags)
-        parent_stat = os.fstat(self.rules_parent_fd)
-        parent_path_stat = os.stat(rules_parent, follow_symlinks=False)
-        parent_snapshot = (
-            rules_parent_expected
-            if rules_parent_expected is not None
-            else Snapshot.from_stat(parent_stat, b"")
-        )
-        parent_mismatches = directory_property_mismatches(
-            parent_snapshot,
-            parent_stat,
-        )
-        parent_mismatches.extend(
-            mismatch
-            for mismatch in directory_property_mismatches(
-                parent_snapshot,
-                parent_path_stat,
-            )
-            if mismatch not in parent_mismatches
-        )
-        if parent_mismatches:
-            os.close(self.rules_parent_fd)
-            raise TransactionError(
-                "rules_directory_changed",
-                "rules directory no longer matches the bound transaction directory",
-                details={"mismatched_properties": parent_mismatches},
-            )
-        self.rules_parent_snapshot = parent_snapshot
-        self.rules_parent_binding = BoundDirectory(
-            path=rules_parent,
-            fd=self.rules_parent_fd,
-            snapshot=self.rules_parent_snapshot,
-            label="rules",
-        )
         try:
+            parent_stat = os.fstat(self.rules_parent_fd)
+            parent_path_stat = os.stat(rules_parent, follow_symlinks=False)
+            parent_snapshot = (
+                rules_parent_expected
+                if rules_parent_expected is not None
+                else Snapshot.from_stat(parent_stat, b"")
+            )
+            parent_mismatches = directory_property_mismatches(
+                parent_snapshot,
+                parent_stat,
+            )
+            parent_mismatches.extend(
+                mismatch
+                for mismatch in directory_property_mismatches(
+                    parent_snapshot,
+                    parent_path_stat,
+                )
+                if mismatch not in parent_mismatches
+            )
+            if parent_mismatches:
+                raise TransactionError(
+                    "rules_directory_changed",
+                    "rules directory no longer matches the bound transaction directory",
+                    details={"mismatched_properties": parent_mismatches},
+                )
+            self.rules_parent_snapshot = parent_snapshot
+            self.rules_parent_binding = BoundDirectory(
+                path=rules_parent,
+                fd=self.rules_parent_fd,
+                snapshot=self.rules_parent_snapshot,
+                label="rules",
+            )
             validate_bound_directory(self.rules_parent_binding)
         except BaseException:
             os.close(self.rules_parent_fd)
@@ -1497,6 +1524,9 @@ class PrivateStage:
                     "private_stage_unavailable",
                     f"cannot create the private staging directory: {error}",
                 ) from error
+            except BaseException:
+                os.close(self.rules_parent_fd)
+                raise
         self.path = rules_parent / self.stage_name
         try:
             self.stage_fd = os.open(
@@ -1537,9 +1567,7 @@ class PrivateStage:
                 label="private_stage",
                 require_directory=True,
             )
-            stage_entries, entries_exceeded = bounded_directory_entries(
-                self.stage_fd
-            )
+            stage_entries, entries_exceeded = bounded_directory_entries(self.stage_fd)
             if entries_exceeded:
                 raise TransactionError(
                     "private_stage_retained",
@@ -2213,10 +2241,15 @@ class PrivateStage:
                 destination_expected=target_expected,
             )
 
-        os.close(source.fd)
+        displaced_source_fd = source.fd
+        self.extra_fds.append(displaced_source_fd)
+        self.files[path] = BoundFile(
+            path=source.path,
+            name=source.name,
+            fd=target_binding.fd,
+            snapshot=target_actual,
+        )
         self.extra_fds.remove(target_binding.fd)
-        source.fd = target_binding.fd
-        source.snapshot = target_actual
         self.mutation_uncertain = False
         return expected
 
@@ -2322,12 +2355,12 @@ class PrivateStage:
                 source_observation=source_observation,
                 destination_observation=destination_observation,
             )
+        self.extra_fds.append(source.fd)
         self.files.pop(path, None)
         source.path = backup
         source.name = backup.name
         source.snapshot = actual
         self.known_parent_names.add(backup.name)
-        self.extra_fds.append(source.fd)
         self.mutation_uncertain = False
         return source
 
@@ -2397,14 +2430,13 @@ class PrivateStage:
         )
         stage_name: str | None = None
         for binding in self.files.values():
-            if (
-                (binding.snapshot.device, binding.snapshot.inode)
-                == (expected.device, expected.inode)
-                and self._entry_identity_matches(
-                    self.stage_fd,
-                    binding.name,
-                    expected,
-                )
+            if (binding.snapshot.device, binding.snapshot.inode) == (
+                expected.device,
+                expected.inode,
+            ) and self._entry_identity_matches(
+                self.stage_fd,
+                binding.name,
+                expected,
             ):
                 stage_name = binding.name
                 break
@@ -2455,12 +2487,40 @@ class PrivateStage:
         return None
 
     def _close_bindings(self) -> None:
-        for binding in self.files.values():
-            os.close(binding.fd)
-        for fd in self.extra_fds:
-            os.close(fd)
-        self.files.clear()
-        self.extra_fds.clear()
+        seen: set[int] = set()
+        close_errors: list[BaseException] = []
+        try:
+            for fd in (
+                *(binding.fd for binding in self.files.values()),
+                *self.extra_fds,
+            ):
+                if fd in seen:
+                    continue
+                seen.add(fd)
+                try:
+                    os.close(fd)
+                except BaseException as error:
+                    close_errors.append(error)
+        finally:
+            self.files.clear()
+            self.extra_fds.clear()
+        if close_errors:
+            raise close_errors[0]
+
+    def _close_all_descriptors(self) -> None:
+        close_errors: list[BaseException] = []
+        try:
+            self._close_bindings()
+        except BaseException as error:
+            close_errors.append(error)
+        self.closed = True
+        for fd in (self.stage_fd, self.rules_parent_fd):
+            try:
+                os.close(fd)
+            except BaseException as error:
+                close_errors.append(error)
+        if close_errors:
+            raise close_errors[0]
 
     def _cleanup_fixed_stage(self) -> list[dict[str, object]]:
         """Close an empty persistent stage without pathname deletion.
@@ -2514,10 +2574,7 @@ class PrivateStage:
             if isinstance(error, TransactionError) and error.details:
                 warnings[-1]["details"] = error.details
         finally:
-            self._close_bindings()
-            self.closed = True
-            os.close(self.stage_fd)
-            os.close(self.rules_parent_fd)
+            self._close_all_descriptors()
         return warnings
 
     def cleanup(self, *, retain: bool = True) -> list[dict[str, object]]:
@@ -2526,43 +2583,74 @@ class PrivateStage:
         if not retain:
             return self._cleanup_fixed_stage()
         warnings: list[dict[str, object]] = []
-        root_locator = self._locator_for_snapshot(self.stage_snapshot)
-        for binding in self.files.values():
-            locator = self._locator_for_snapshot(binding.snapshot)
-            current_stat = os.fstat(binding.fd)
-            persistently_retained = locator is not None and current_stat.st_nlink > 0
-            current_observation = observe_directory_entry(
-                self.stage_fd,
-                binding.name,
-                expected=binding.snapshot,
-            )
-            warnings.append(
-                {
-                    "status": (
-                        "retained_staged_file"
-                        if persistently_retained
-                        else "unretained_bound_file"
-                    ),
-                    "retention_status": (
-                        "verified_namespace_link"
-                        if persistently_retained
-                        else "descriptor_only_or_unlocatable"
-                    ),
-                    "bound_object": binding.snapshot.to_json(),
-                    "current_nlink": current_stat.st_nlink,
-                    "recovery_locator": str(locator) if locator is not None else None,
-                    "last_known_path": str(binding.path),
-                    "last_known_path_observation": current_observation,
-                }
-            )
-            os.close(binding.fd)
-        for fd in self.extra_fds:
-            try:
-                file_stat = os.fstat(fd)
-                locator = self._locator_for_snapshot(
-                    Snapshot.from_stat(file_stat, b""),
+        inspected_fds: set[int] = set()
+        try:
+            root_locator = self._locator_for_snapshot(self.stage_snapshot)
+            for binding in self.files.values():
+                inspected_fds.add(binding.fd)
+                try:
+                    locator = self._locator_for_snapshot(binding.snapshot)
+                    current_stat = os.fstat(binding.fd)
+                    persistently_retained = (
+                        locator is not None and current_stat.st_nlink > 0
+                    )
+                    current_observation = observe_directory_entry(
+                        self.stage_fd,
+                        binding.name,
+                        expected=binding.snapshot,
+                    )
+                except OSError as error:
+                    warnings.append(
+                        {
+                            "status": "unretained_bound_file",
+                            "retention_status": "inspection_failed",
+                            "last_known_path": str(binding.path),
+                            "message": str(error),
+                        }
+                    )
+                    continue
+                warnings.append(
+                    {
+                        "status": (
+                            "retained_staged_file"
+                            if persistently_retained
+                            else "unretained_bound_file"
+                        ),
+                        "retention_status": (
+                            "verified_namespace_link"
+                            if persistently_retained
+                            else "descriptor_only_or_unlocatable"
+                        ),
+                        "bound_object": binding.snapshot.to_json(),
+                        "current_nlink": current_stat.st_nlink,
+                        "recovery_locator": (
+                            str(locator) if locator is not None else None
+                        ),
+                        "last_known_path": str(binding.path),
+                        "last_known_path_observation": current_observation,
+                    }
                 )
-                persistently_retained = locator is not None and file_stat.st_nlink > 0
+            for fd in self.extra_fds:
+                if fd in inspected_fds:
+                    continue
+                inspected_fds.add(fd)
+                try:
+                    file_stat = os.fstat(fd)
+                    locator = self._locator_for_snapshot(
+                        Snapshot.from_stat(file_stat, b""),
+                    )
+                    persistently_retained = (
+                        locator is not None and file_stat.st_nlink > 0
+                    )
+                except OSError as error:
+                    warnings.append(
+                        {
+                            "status": "unretained_bound_file",
+                            "retention_status": "inspection_failed",
+                            "message": str(error),
+                        }
+                    )
+                    continue
                 warnings.append(
                     {
                         "status": (
@@ -2582,46 +2670,56 @@ class PrivateStage:
                         ),
                     }
                 )
-            finally:
-                os.close(fd)
-        warnings.append(
-            {
-                "status": (
-                    "retained_staging_directory"
-                    if root_locator is not None
-                    else "unretained_staging_directory"
-                ),
-                "retention_status": (
-                    "verified_namespace_link"
-                    if root_locator is not None
-                    else "descriptor_only_or_unlocatable"
-                ),
-                "bound_identity": {
-                    "device": self.stage_snapshot.device,
-                    "inode": self.stage_snapshot.inode,
-                },
-                "recovery_locator": (
-                    str(root_locator) if root_locator is not None else None
-                ),
-                "last_known_path": str(self.path),
-                "cleanup_policy": "retained_no_compare_then_delete",
-            }
-        )
-        self.files.clear()
-        self.extra_fds.clear()
-        self.closed = True
-        os.close(self.stage_fd)
-        os.close(self.rules_parent_fd)
-        return warnings
+            warnings.append(
+                {
+                    "status": (
+                        "retained_staging_directory"
+                        if root_locator is not None
+                        else "unretained_staging_directory"
+                    ),
+                    "retention_status": (
+                        "verified_namespace_link"
+                        if root_locator is not None
+                        else "descriptor_only_or_unlocatable"
+                    ),
+                    "bound_identity": {
+                        "device": self.stage_snapshot.device,
+                        "inode": self.stage_snapshot.inode,
+                    },
+                    "recovery_locator": (
+                        str(root_locator) if root_locator is not None else None
+                    ),
+                    "last_known_path": str(self.path),
+                    "cleanup_policy": "retained_no_compare_then_delete",
+                }
+            )
+            return warnings
+        finally:
+            self._close_all_descriptors()
 
 
-def validate_existing_fixed_stage_is_empty(rules_parent: Path) -> None:
-    stage_path = rules_parent / PRIVATE_STAGE_NAME
+def validate_existing_fixed_stage_is_empty(
+    rules_parent: Path,
+    *,
+    rules_parent_expected: Snapshot | None = None,
+) -> None:
+    rules_parent_binding = bind_directory(
+        rules_parent,
+        label="rules",
+        expected=rules_parent_expected,
+    )
     try:
-        stage_stat = os.stat(stage_path, follow_symlinks=False)
+        stage_stat = os.stat(
+            PRIVATE_STAGE_NAME,
+            dir_fd=rules_parent_binding.fd,
+            follow_symlinks=False,
+        )
     except FileNotFoundError:
+        validate_bound_directory(rules_parent_binding)
+        os.close(rules_parent_binding.fd)
         return
     except OSError as error:
+        os.close(rules_parent_binding.fd)
         raise TransactionError(
             "recovery_required",
             f"cannot inspect existing fixed transaction stage: {error}",
@@ -2633,6 +2731,7 @@ def validate_existing_fixed_stage_is_empty(rules_parent: Path) -> None:
     try:
         stage = PrivateStage(
             rules_parent,
+            rules_parent_expected=rules_parent_binding.snapshot,
             recovery_stage_expected=Snapshot.from_stat(stage_stat, b""),
         )
     except (OSError, TransactionError) as error:
@@ -2652,6 +2751,8 @@ def validate_existing_fixed_stage_is_empty(rules_parent: Path) -> None:
                 **error_details,
             },
         ) from error
+    finally:
+        os.close(rules_parent_binding.fd)
     warnings = stage.cleanup(retain=False)
     if warnings:
         raise TransactionError(
@@ -2682,6 +2783,26 @@ def lock_snapshot(path: Path, file_stat: os.stat_result) -> Snapshot:
     return Snapshot.from_stat(path_stat, b"")
 
 
+def lock_property_mismatches(
+    expected: Snapshot,
+    actual: os.stat_result,
+) -> list[str]:
+    mismatches: list[str] = []
+    if not stat.S_ISREG(actual.st_mode):
+        mismatches.append("file_type")
+    if (expected.device, expected.inode) != (actual.st_dev, actual.st_ino):
+        mismatches.append("object_identity")
+    if (expected.mode, expected.uid, expected.gid) != (
+        stat.S_IMODE(actual.st_mode),
+        actual.st_uid,
+        actual.st_gid,
+    ):
+        mismatches.append("access_policy")
+    if expected.nlink != actual.st_nlink:
+        mismatches.append("object_policy")
+    return mismatches
+
+
 @contextmanager
 def shared_lock(
     path: Path,
@@ -2700,6 +2821,7 @@ def shared_lock(
     except FileExistsError:
         fd = os.open(path, flags)
     locked = False
+    binding: BoundFile | None = None
     try:
         deadline = time.monotonic() + timeout_seconds
         while True:
@@ -2715,30 +2837,116 @@ def shared_lock(
                         exit_code=EXIT_LIVE_CONFLICT,
                     )
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        yield lock_snapshot(path, os.fstat(fd))
+        binding = BoundFile(
+            path=path,
+            name=path.name,
+            fd=fd,
+            snapshot=lock_snapshot(path, os.fstat(fd)),
+        )
+        revalidate_lock(binding)
+        yield binding
     finally:
         try:
-            if locked and before_release is not None:
-                before_release()
+            if locked and binding is not None:
+                finalization_errors: list[BaseException] = []
+                try:
+                    revalidate_lock(binding)
+                except BaseException as error:
+                    finalization_errors.append(error)
+                try:
+                    if before_release is not None:
+                        before_release()
+                except BaseException as error:
+                    finalization_errors.append(error)
+                try:
+                    revalidate_lock(binding)
+                except BaseException as error:
+                    finalization_errors.append(error)
+                if finalization_errors:
+                    raise finalization_errors[0]
         finally:
             os.close(fd)
 
 
-def revalidate_lock(path: Path, expected: Snapshot) -> None:
+def revalidate_lock(
+    binding: BoundFile,
+    parent: BoundDirectory | None = None,
+) -> None:
+    if parent is not None:
+        validate_bound_directory(parent)
     try:
-        actual_stat = os.stat(path, follow_symlinks=False)
+        descriptor_stat = os.fstat(binding.fd)
+        path_stat = (
+            os.stat(
+                binding.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            if parent is not None
+            else os.stat(binding.path, follow_symlinks=False)
+        )
     except FileNotFoundError as error:
         raise TransactionError(
             "lock_missing", "transaction lock disappeared"
         ) from error
-    actual = Snapshot.from_stat(actual_stat, b"")
-    mismatches = property_mismatches(expected, actual)
+    except OSError as error:
+        raise TransactionError(
+            "lock_unreadable",
+            f"transaction lock binding is unreadable: {error}",
+        ) from error
+    mismatches = lock_property_mismatches(binding.snapshot, descriptor_stat)
+    mismatches.extend(
+        mismatch
+        for mismatch in lock_property_mismatches(
+            binding.snapshot,
+            path_stat,
+        )
+        if mismatch not in mismatches
+    )
     if mismatches:
         raise TransactionError(
             "lock_changed",
             "transaction lock changed",
             details={"mismatched_properties": mismatches},
         )
+    reject_unmodeled_metadata_fd(binding.fd, label="lock")
+    try:
+        descriptor_final = os.fstat(binding.fd)
+        path_final = (
+            os.stat(
+                binding.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            if parent is not None
+            else os.stat(binding.path, follow_symlinks=False)
+        )
+    except OSError as error:
+        raise TransactionError(
+            "lock_unreadable",
+            f"transaction lock changed during metadata admission: {error}",
+        ) from error
+    final_mismatches = lock_property_mismatches(
+        binding.snapshot,
+        descriptor_final,
+    )
+    final_mismatches.extend(
+        mismatch
+        for mismatch in lock_property_mismatches(
+            binding.snapshot,
+            path_final,
+        )
+        if mismatch not in final_mismatches
+    )
+    if final_mismatches:
+        raise TransactionError(
+            "lock_changed",
+            "transaction lock changed during metadata admission",
+            details={"mismatched_properties": final_mismatches},
+        )
+    reject_unmodeled_metadata_fd(binding.fd, label="lock")
+    if parent is not None:
+        validate_bound_directory(parent)
 
 
 class _DarwinProcBsdInfo(ctypes.Structure):
@@ -3474,9 +3682,10 @@ class AnonymousValidatorInput:
                     details={"actual": snapshot.to_json()},
                 )
             self.expected = snapshot
-            if sys.platform.startswith("linux") and Path(
-                f"/proc/self/fd/{self.fd}"
-            ).exists():
+            if (
+                sys.platform.startswith("linux")
+                and Path(f"/proc/self/fd/{self.fd}").exists()
+            ):
                 self.path = Path(f"/proc/self/fd/{self.fd}")
             elif Path(f"/dev/fd/{self.fd}").exists():
                 self.path = Path(f"/dev/fd/{self.fd}")
@@ -3866,6 +4075,194 @@ def require_owner_private_directory(path: Path, *, label: str) -> None:
     os.close(binding.fd)
 
 
+def prepared_candidate_path(receipt: Path) -> Path:
+    return receipt.with_name(f"{receipt.name}{PREPARED_CANDIDATE_SUFFIX}")
+
+
+def write_prepared_candidate(
+    path: Path,
+    payload: bytes,
+    *,
+    parent: BoundDirectory,
+    policy: Snapshot,
+) -> BoundFile:
+    if path.parent != parent.path or Path(path.name).name != path.name:
+        raise TransactionError(
+            "path_invalid",
+            "prepared candidate must be one child of its bound parent",
+        )
+    if policy.uid != os.geteuid() or policy.nlink != 1:
+        raise TransactionError(
+            "unsupported_rules_policy",
+            "prepared candidate requires current-user, single-link live policy",
+        )
+    validate_bound_directory(parent)
+    fd, snapshot = _write_exclusive_bound(
+        path,
+        payload,
+        mode=policy.mode,
+        uid=policy.uid,
+        gid=policy.gid,
+        directory_fd=parent.fd,
+        name=path.name,
+    )
+    binding = BoundFile(
+        path=path,
+        name=path.name,
+        fd=fd,
+        snapshot=snapshot,
+    )
+    try:
+        validate_bound_regular_file(
+            binding,
+            parent,
+            label="prepared_candidate",
+        )
+        os.fsync(parent.fd)
+        _persisted, actual = validate_bound_regular_file(
+            binding,
+            parent,
+            label="prepared_candidate",
+        )
+        if property_mismatches(snapshot, actual):
+            raise TransactionError(
+                "prepared_candidate_changed",
+                "prepared candidate changed while its recovery locator was persisted",
+                details={
+                    "mismatched_properties": property_mismatches(
+                        snapshot,
+                        actual,
+                    )
+                },
+            )
+        binding.snapshot = actual
+        return binding
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def move_prepared_candidate_to_stage(
+    *,
+    stage: PrivateStage,
+    prepared: BoundFile,
+    prepared_parent: BoundDirectory,
+) -> tuple[Path, Snapshot]:
+    validate_bound_directory(prepared_parent)
+    validate_bound_regular_file(
+        prepared,
+        prepared_parent,
+        label="prepared_candidate",
+    )
+    stage._validate_rules_parent()
+    stage._validate_stage_root()
+    destination = stage.path / "candidate"
+    destination_before = observe_directory_entry(
+        stage.stage_fd,
+        destination.name,
+    )
+    if destination_before.get("state") != "missing":
+        raise TransactionError(
+            "recovery_required",
+            "fixed stage candidate exists before prepared publication",
+            exit_code=EXIT_POST_REPLACE_FAILED,
+            details={
+                "prepared_candidate_path": str(prepared.path),
+                "staged_candidate_path": str(destination),
+                "staged_candidate_observation": destination_before,
+            },
+        )
+    atomic_error: BaseException | None = None
+    stage.mutation_uncertain = True
+    try:
+        atomic_rename_no_replace(
+            prepared_parent.fd,
+            prepared.name,
+            stage.stage_fd,
+            destination.name,
+        )
+    except (OSError, TransactionError) as error:
+        atomic_error = error
+    source_observation = observe_directory_entry(
+        prepared_parent.fd,
+        prepared.name,
+        expected=prepared.snapshot,
+    )
+    destination_observation = observe_directory_entry(
+        stage.stage_fd,
+        destination.name,
+        expected=prepared.snapshot,
+    )
+    if atomic_error is not None:
+        stage.mutation_uncertain = not (
+            observation_matches(source_observation)
+            and destination_observation.get("state") == "missing"
+        )
+        raise TransactionError(
+            "recovery_required",
+            "prepared candidate publication did not reach a verified committed state",
+            exit_code=EXIT_POST_REPLACE_FAILED,
+            details={
+                "reason": (
+                    atomic_error.status
+                    if isinstance(atomic_error, TransactionError)
+                    else "prepared_candidate_move_failed"
+                ),
+                "message": str(atomic_error),
+                "prepared_candidate_path": str(prepared.path),
+                "staged_candidate_path": str(destination),
+                "source_observation": source_observation,
+                "destination_observation": destination_observation,
+            },
+        ) from atomic_error
+    try:
+        _payload, actual = read_bound_fd(
+            prepared.fd,
+            label="prepared_candidate",
+        )
+        reject_unmodeled_metadata_fd(
+            prepared.fd,
+            label="prepared_candidate",
+        )
+        stage._validate_rules_parent()
+        stage._validate_stage_root()
+    except TransactionError as error:
+        raise TransactionError(
+            "recovery_required",
+            "prepared candidate move could not be verified",
+            exit_code=EXIT_POST_REPLACE_FAILED,
+            details={
+                "reason": error.status,
+                "message": str(error),
+                **error.details,
+                "source_observation": source_observation,
+                "destination_observation": destination_observation,
+            },
+        ) from error
+    mismatches = property_mismatches(prepared.snapshot, actual)
+    if (
+        source_observation.get("state") != "missing"
+        or not observation_matches(destination_observation)
+        or mismatches
+    ):
+        raise TransactionError(
+            "recovery_required",
+            "prepared candidate move changed a bound protected property",
+            exit_code=EXIT_POST_REPLACE_FAILED,
+            details={
+                "mismatched_properties": mismatches,
+                "source_observation": source_observation,
+                "destination_observation": destination_observation,
+            },
+        )
+    prepared.path = destination
+    prepared.name = destination.name
+    prepared.snapshot = actual
+    stage.files[destination] = prepared
+    stage.mutation_uncertain = False
+    return destination, actual
+
+
 def receipt_payload(
     *,
     transaction_id: str,
@@ -3879,7 +4276,9 @@ def receipt_payload(
     installed: Snapshot,
     backup_snapshot: Snapshot,
     staged_backup: Path,
-    staged_backup_parent: Snapshot,
+    staged_backup_parent: Snapshot | None,
+    prepared_candidate: Path,
+    prepared_candidate_parent: Snapshot,
     recovery_terminal: Path,
     recovery_terminal_snapshot: Snapshot,
 ) -> dict[str, object]:
@@ -3898,7 +4297,11 @@ def receipt_payload(
         "installed": installed.to_json(),
         "backup": backup_snapshot.to_json(),
         "staged_backup_path": str(staged_backup),
-        "staged_backup_parent": staged_backup_parent.to_json(),
+        "staged_backup_parent": (
+            staged_backup_parent.to_json() if staged_backup_parent is not None else None
+        ),
+        "prepared_candidate_path": str(prepared_candidate),
+        "prepared_candidate_parent": prepared_candidate_parent.to_json(),
         "recovery_terminal": recovery_terminal_snapshot.to_json(),
     }
 
@@ -3964,7 +4367,9 @@ def write_receipt(
         raise
 
 
-def read_receipt(path: Path) -> dict[str, object]:
+def read_receipt_with_parent_snapshot(
+    path: Path,
+) -> tuple[dict[str, object], Snapshot]:
     parent = bind_directory(
         path.parent,
         label="receipt",
@@ -4019,11 +4424,17 @@ def read_receipt(path: Path) -> dict[str, object]:
             label="receipt",
             max_bytes=MAX_RECEIPT_BYTES,
         )
-        return value
+        validate_bound_directory(parent)
+        return value, parent.snapshot
     finally:
         if binding is not None:
             os.close(binding.fd)
         os.close(parent.fd)
+
+
+def read_receipt(path: Path) -> dict[str, object]:
+    value, _parent_snapshot = read_receipt_with_parent_snapshot(path)
+    return value
 
 
 def decode_recovery_terminal(payload: bytes) -> dict[str, object]:
@@ -4475,15 +4886,30 @@ def verify_restored_terminal(rules: Path, expected: Snapshot) -> Snapshot:
 
 @dataclass
 class ApplyEvidenceBindings:
-    stage: PrivateStage
+    lock: BoundFile
+    rules_parent: BoundDirectory
     receipt_parent: BoundDirectory
     recovery_terminal: BoundFile
+    prepared_candidate: BoundFile
+    stage: PrivateStage | None = None
     backup: BoundFile | None = None
     receipt: BoundFile | None = None
+    candidate_in_stage: bool = False
+    restored: bool = False
     closed: bool = False
 
-    def validate(self) -> None:
-        self.stage._validate_rules_parent()
+    def stage_owns_prepared_candidate(self) -> bool:
+        if self.stage is None:
+            return False
+        if any(
+            binding is self.prepared_candidate for binding in self.stage.files.values()
+        ):
+            return True
+        return self.prepared_candidate.fd in self.stage.extra_fds
+
+    def validate_controls(self) -> None:
+        validate_bound_directory(self.rules_parent)
+        revalidate_lock(self.lock, self.rules_parent)
         validate_bound_directory(self.receipt_parent)
         validate_bound_regular_file(
             self.recovery_terminal,
@@ -4491,12 +4917,6 @@ class ApplyEvidenceBindings:
             label="recovery_terminal",
             max_bytes=MAX_RECEIPT_BYTES,
         )
-        if self.backup is not None:
-            validate_bound_regular_file(
-                self.backup,
-                self.stage.rules_parent_binding,
-                label="backup",
-            )
         if self.receipt is not None:
             validate_bound_regular_file(
                 self.receipt,
@@ -4504,25 +4924,78 @@ class ApplyEvidenceBindings:
                 label="receipt",
                 max_bytes=MAX_RECEIPT_BYTES,
             )
-        self.stage._validate_rules_parent()
+        if self.stage is not None:
+            self.stage._validate_rules_parent()
+            self.stage._validate_stage_root()
+        validate_bound_directory(self.rules_parent)
+        revalidate_lock(self.lock, self.rules_parent)
         validate_bound_directory(self.receipt_parent)
+
+    def validate(self) -> None:
+        self.validate_controls()
+        if self.restored:
+            return
+        if self.backup is None:
+            if self.stage_owns_prepared_candidate():
+                if self.stage is None:
+                    raise TransactionError(
+                        "private_candidate_unbound",
+                        "prepared candidate moved without a bound private stage",
+                    )
+                staged_binding = self.stage._binding(self.prepared_candidate.path)
+                self.stage.validate(
+                    self.prepared_candidate.path,
+                    staged_binding.snapshot,
+                    label="private_candidate",
+                )
+            else:
+                validate_bound_regular_file(
+                    self.prepared_candidate,
+                    self.receipt_parent,
+                    label="prepared_candidate",
+                )
+        if self.backup is not None:
+            if self.stage is None:
+                raise TransactionError(
+                    "backup_unbound",
+                    "backup binding has no private stage",
+                )
+            validate_bound_regular_file(
+                self.backup,
+                self.stage.rules_parent_binding,
+                label="backup",
+            )
+        self.validate_controls()
 
     def close(self) -> None:
         if self.closed:
             return
         self.closed = True
-        for binding in (self.receipt, self.recovery_terminal):
-            if binding is not None:
+        close_errors: list[BaseException] = []
+        bindings = [self.receipt, self.recovery_terminal]
+        if not self.stage_owns_prepared_candidate():
+            bindings.append(self.prepared_candidate)
+        for binding in bindings:
+            if binding is None:
+                continue
+            try:
                 os.close(binding.fd)
-        os.close(self.receipt_parent.fd)
+            except BaseException as error:
+                close_errors.append(error)
+        for parent in (self.receipt_parent, self.rules_parent):
+            try:
+                os.close(parent.fd)
+            except BaseException as error:
+                close_errors.append(error)
+        if close_errors:
+            raise close_errors[0]
 
 
 def rollback(
     *,
     stage: PrivateStage,
     rules: Path,
-    lock: Path,
-    lock_expected: Snapshot,
+    lock_binding: BoundFile,
     backup: Path,
     original: Snapshot,
     installed: Snapshot,
@@ -4569,7 +5042,7 @@ def rollback(
                 "mismatched_properties": live_mismatches,
                 "actual_live": live.to_json(),
             }
-        revalidate_lock(lock, lock_expected)
+        revalidate_lock(lock_binding, stage.rules_parent_binding)
         validate_bound_regular_file(
             backup_binding,
             stage.rules_parent_binding,
@@ -4684,10 +5157,10 @@ def rollback(
         stage.mutation_uncertain = False
         exchange_completed = True
         os.fsync(stage.rules_parent_fd)
-        _restored_bytes, restored = read_stable(
+        _restored_bytes, restored = read_bound_regular_child(
             rules,
+            stage.rules_parent_binding,
             label="live_rules",
-            require_modeled_metadata=True,
         )
         restored_mismatches = property_mismatches(
             backup_expected,
@@ -4709,15 +5182,11 @@ def rollback(
         }
     except (OSError, TransactionError) as error:
         error_status = (
-            error.status
-            if isinstance(error, TransactionError)
-            else "rollback_failed"
+            error.status if isinstance(error, TransactionError) else "rollback_failed"
         )
         result: dict[str, object] = {
             "rollback_status": (
-                "recovery_required"
-                if exchange_completed
-                else error_status
+                "recovery_required" if exchange_completed else error_status
             ),
             "rollback_message": str(error),
         }
@@ -4749,6 +5218,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
     candidate_source = resolved_leaf(args.candidate, label="candidate")
     receipt = resolved_leaf(args.receipt, label="receipt")
     recovery_terminal = recovery_terminal_path(receipt)
+    prepared_recovery_candidate = prepared_candidate_path(receipt)
     if Path(
         args.backup_name
     ).name != args.backup_name or not args.backup_name.startswith("default.rules.bak-"):
@@ -4762,6 +5232,8 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
         candidate_source == rules
         or receipt in (rules, backup, lock, candidate_source)
         or recovery_terminal in (rules, backup, lock, candidate_source, receipt)
+        or prepared_recovery_candidate
+        in (rules, backup, lock, candidate_source, receipt, recovery_terminal)
     ):
         raise TransactionError("path_invalid", "transaction paths must be distinct")
 
@@ -4787,11 +5259,29 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
     retain_stage = False
     pending_success_status: str | None = None
     replacement_started = False
+    finalized = False
+    rules_parent_binding: BoundDirectory | None = None
 
     def finalize_apply_state() -> None:
+        nonlocal finalized, retain_stage
+        if finalized:
+            return
+        finalized = True
+        evidence_error: TransactionError | None = None
         try:
             if evidence is not None:
+                try:
+                    (
+                        evidence.validate_controls()
+                        if retain_stage or evidence.restored
+                        else evidence.validate()
+                    )
+                except TransactionError as error:
+                    retain_stage = True
+                    evidence_error = error
                 evidence.close()
+            elif rules_parent_binding is not None:
+                os.close(rules_parent_binding.fd)
         finally:
             effective_retain_stage = retain_stage or (
                 stage is not None and stage.mutation_uncertain
@@ -4830,6 +5320,17 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     "cleanup_refusals": cleanup_refusals,
                 },
             )
+        if evidence_error is not None and pending_success_status is not None:
+            raise TransactionError(
+                "recovery_required",
+                "bound transaction evidence changed before lock release",
+                exit_code=EXIT_POST_REPLACE_FAILED,
+                details={
+                    "reason": evidence_error.status,
+                    "message": str(evidence_error),
+                    **evidence_error.details,
+                },
+            ) from evidence_error
 
     try:
         # A no-op needs neither a validator process nor a staging directory.
@@ -4843,38 +5344,51 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             with shared_lock(
                 lock,
                 timeout_seconds=args.lock_timeout_seconds,
-            ) as _lock_expected:
+            ) as lock_binding:
                 lock_acquired = True
-                current_bytes, current = read_stable(
-                    rules,
-                    label="live_rules",
-                    require_modeled_metadata=True,
+                no_change_parent_binding = bind_directory(
+                    rules.parent,
+                    label="rules",
                 )
-                if current.nlink != 1:
-                    return EXIT_LIVE_CONFLICT, {
-                        "status": "live_rules_object_policy_unsupported",
-                        "rules_path": str(rules),
-                        "object_policy": {"nlink": current.nlink},
-                    }
-                if not hmac.compare_digest(current.sha256, expected_sha256):
-                    return EXIT_LIVE_CONFLICT, {
-                        "status": "expected_digest_mismatch",
-                        "rules_path": str(rules),
-                        "expected_sha256": expected_sha256,
-                        "actual_sha256": current.sha256,
-                    }
-                revalidate_candidate_source(
-                    candidate_source,
-                    source_snapshot,
-                    candidate_sha256=candidate_sha256,
-                )
-                if current_bytes == candidate_bytes:
-                    validate_existing_fixed_stage_is_empty(rules.parent)
-                    return 0, {
-                        "status": "no_change_after_lock",
-                        "rules_path": str(rules),
-                        "sha256": current.sha256,
-                    }
+                try:
+                    revalidate_lock(lock_binding, no_change_parent_binding)
+                    current_bytes, current = read_bound_regular_child(
+                        rules,
+                        no_change_parent_binding,
+                        label="live_rules",
+                    )
+                    if current.nlink != 1:
+                        return EXIT_LIVE_CONFLICT, {
+                            "status": "live_rules_object_policy_unsupported",
+                            "rules_path": str(rules),
+                            "object_policy": {"nlink": current.nlink},
+                        }
+                    if not hmac.compare_digest(current.sha256, expected_sha256):
+                        return EXIT_LIVE_CONFLICT, {
+                            "status": "expected_digest_mismatch",
+                            "rules_path": str(rules),
+                            "expected_sha256": expected_sha256,
+                            "actual_sha256": current.sha256,
+                        }
+                    revalidate_candidate_source(
+                        candidate_source,
+                        source_snapshot,
+                        candidate_sha256=candidate_sha256,
+                    )
+                    if current_bytes == candidate_bytes:
+                        validate_existing_fixed_stage_is_empty(
+                            rules.parent,
+                            rules_parent_expected=no_change_parent_binding.snapshot,
+                        )
+                        revalidate_lock(lock_binding, no_change_parent_binding)
+                        return 0, {
+                            "status": "no_change_after_lock",
+                            "rules_path": str(rules),
+                            "sha256": current.sha256,
+                        }
+                    revalidate_lock(lock_binding, no_change_parent_binding)
+                finally:
+                    os.close(no_change_parent_binding.fd)
             lock_acquired = False
 
         # The first validator sees only an unlinked descriptor-backed copy.  No
@@ -4904,12 +5418,17 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             lock,
             timeout_seconds=args.lock_timeout_seconds,
             before_release=finalize_apply_state,
-        ) as lock_expected:
+        ) as lock_binding:
             lock_acquired = True
-            current_bytes, current = read_stable(
+            rules_parent_binding = bind_directory(
+                rules.parent,
+                label="rules",
+            )
+            revalidate_lock(lock_binding, rules_parent_binding)
+            current_bytes, current = read_bound_regular_child(
                 rules,
+                rules_parent_binding,
                 label="live_rules",
-                require_modeled_metadata=True,
             )
             if current.nlink != 1:
                 return EXIT_LIVE_CONFLICT, {
@@ -4930,7 +5449,11 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     source_snapshot,
                     candidate_sha256=candidate_sha256,
                 )
-                validate_existing_fixed_stage_is_empty(rules.parent)
+                validate_existing_fixed_stage_is_empty(
+                    rules.parent,
+                    rules_parent_expected=rules_parent_binding.snapshot,
+                )
+                revalidate_lock(lock_binding, rules_parent_binding)
                 pending_success_status = "no_change_after_lock"
                 return 0, {
                     "status": "no_change_after_lock",
@@ -4938,7 +5461,6 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     "sha256": current.sha256,
                 }
 
-            stage = PrivateStage(rules.parent)
             transaction_id = secrets.token_hex(16)
             receipt_parent = bind_directory(
                 receipt.parent,
@@ -4946,6 +5468,23 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 require_owner_private=True,
             )
             try:
+                if receipt_parent.path == rules.parent / PRIVATE_STAGE_NAME:
+                    raise TransactionError(
+                        "path_invalid",
+                        "receipt parent cannot be the fixed transaction stage",
+                    )
+                if (
+                    receipt_parent.snapshot.device
+                    != rules_parent_binding.snapshot.device
+                ):
+                    raise TransactionError(
+                        "prepared_candidate_cross_device",
+                        (
+                            "receipt and rules parents must share one filesystem "
+                            "for atomic prepared-candidate publication"
+                        ),
+                        exit_code=EXIT_LIVE_CONFLICT,
+                    )
                 if (
                     observe_directory_entry(
                         receipt_parent.fd,
@@ -4960,7 +5499,37 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     )
                 if (
                     observe_directory_entry(
-                        stage.rules_parent_fd,
+                        receipt_parent.fd,
+                        prepared_recovery_candidate.name,
+                    ).get("state")
+                    != "missing"
+                ):
+                    raise TransactionError(
+                        "prepared_candidate_exists",
+                        (
+                            "prepared recovery candidate already exists: "
+                            f"{prepared_recovery_candidate}"
+                        ),
+                        exit_code=EXIT_LIVE_CONFLICT,
+                    )
+                if (
+                    observe_directory_entry(
+                        receipt_parent.fd,
+                        recovery_terminal.name,
+                    ).get("state")
+                    != "missing"
+                ):
+                    raise TransactionError(
+                        "recovery_terminal_exists",
+                        (
+                            "recovery terminal path already exists before this "
+                            "transaction"
+                        ),
+                        exit_code=EXIT_LIVE_CONFLICT,
+                    )
+                if (
+                    observe_directory_entry(
+                        rules_parent_binding.fd,
                         backup.name,
                     ).get("state")
                     != "missing"
@@ -4970,38 +5539,42 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                         f"backup already exists: {backup}",
                         exit_code=EXIT_LIVE_CONFLICT,
                     )
-                terminal_binding = reserve_recovery_terminal(
-                    recovery_terminal,
-                    transaction_id=transaction_id,
-                    parent=receipt_parent,
+                revalidate_candidate_source(
+                    candidate_source,
+                    source_snapshot,
+                    candidate_sha256=candidate_sha256,
                 )
+                prepared_binding = write_prepared_candidate(
+                    prepared_recovery_candidate,
+                    candidate_bytes,
+                    parent=receipt_parent,
+                    policy=current,
+                )
+                terminal_binding: BoundFile | None = None
+                try:
+                    terminal_binding = reserve_recovery_terminal(
+                        recovery_terminal,
+                        transaction_id=transaction_id,
+                        parent=receipt_parent,
+                    )
+                except BaseException:
+                    os.close(prepared_binding.fd)
+                    raise
             except BaseException:
                 os.close(receipt_parent.fd)
                 raise
             evidence = ApplyEvidenceBindings(
-                stage=stage,
+                lock=lock_binding,
+                rules_parent=rules_parent_binding,
                 receipt_parent=receipt_parent,
                 recovery_terminal=terminal_binding,
+                prepared_candidate=prepared_binding,
             )
             evidence.validate()
 
-            parent_expected = stage.rules_parent_snapshot
-            revalidate_candidate_source(
-                candidate_source,
-                source_snapshot,
-                candidate_sha256=candidate_sha256,
-            )
-            candidate, candidate_snapshot = stage.create(
-                "candidate",
-                candidate_bytes,
-            )
-            installed_snapshot = stage.set_policy(
-                candidate,
-                candidate_snapshot,
-                current,
-            )
-            os.fsync(stage.stage_fd)
-            os.fsync(stage.rules_parent_fd)
+            parent_expected = rules_parent_binding.snapshot
+            installed_snapshot = prepared_binding.snapshot
+            candidate = rules.parent / PRIVATE_STAGE_NAME / "candidate"
             transaction_receipt = receipt_payload(
                 transaction_id=transaction_id,
                 rules=rules,
@@ -5014,7 +5587,9 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 installed=installed_snapshot,
                 backup_snapshot=current,
                 staged_backup=candidate,
-                staged_backup_parent=stage.stage_snapshot,
+                staged_backup_parent=None,
+                prepared_candidate=prepared_recovery_candidate,
+                prepared_candidate_parent=receipt_parent.snapshot,
                 recovery_terminal=recovery_terminal,
                 recovery_terminal_snapshot=evidence.recovery_terminal.snapshot,
             )
@@ -5025,11 +5600,41 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             )
             evidence.validate()
 
-            revalidate_lock(lock, lock_expected)
-            _final_bytes, final_live = read_stable(
+            stage = PrivateStage(
+                rules.parent,
+                rules_parent_expected=rules_parent_binding.snapshot,
+            )
+            evidence.stage = stage
+            candidate, installed_snapshot = move_prepared_candidate_to_stage(
+                stage=stage,
+                prepared=evidence.prepared_candidate,
+                prepared_parent=evidence.receipt_parent,
+            )
+            evidence.candidate_in_stage = True
+            try:
+                os.fsync(stage.stage_fd)
+                os.fsync(stage.rules_parent_fd)
+                os.fsync(evidence.receipt_parent.fd)
+            except OSError as error:
+                retain_stage = True
+                raise TransactionError(
+                    "recovery_required",
+                    "prepared candidate move could not be made durable",
+                    exit_code=EXIT_POST_REPLACE_FAILED,
+                    details={
+                        "reason": "prepared_candidate_move_fsync_failed",
+                        "message": str(error),
+                        "receipt_path": str(receipt),
+                        "staged_backup_path": str(candidate),
+                    },
+                ) from error
+            evidence.validate()
+
+            revalidate_lock(lock_binding, rules_parent_binding)
+            _final_bytes, final_live = read_bound_regular_child(
                 rules,
+                rules_parent_binding,
                 label="live_rules",
-                require_modeled_metadata=True,
             )
             final_mismatches = property_mismatches(current, final_live)
             if final_mismatches:
@@ -5048,9 +5653,23 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     pre_exchange_revalidate=evidence.validate,
                 )
                 replacement_started = True
+                evidence.validate()
             except TransactionError as error:
                 error.details.setdefault("receipt_path", str(receipt))
                 error.details.setdefault("backup_path", str(backup))
+                if replacement_started:
+                    retain_stage = True
+                    return EXIT_POST_REPLACE_FAILED, {
+                        "status": "recovery_required",
+                        "post_replace_failure": {
+                            "status": error.status,
+                            "message": str(error),
+                            **error.details,
+                        },
+                        "receipt_path": str(receipt),
+                        "backup_path": str(backup),
+                        "staged_backup_path": str(candidate),
+                    }
                 raise
             # The exchange leaves the exact original live inode bound at the
             # staged candidate path.  Publish that object itself as the formal
@@ -5125,10 +5744,10 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 }
 
             try:
-                _installed_bytes, installed_live = read_stable(
+                _installed_bytes, installed_live = read_bound_regular_child(
                     rules,
+                    rules_parent_binding,
                     label="live_rules",
-                    require_modeled_metadata=True,
                 )
             except TransactionError as error:
                 retain_stage = True
@@ -5200,10 +5819,10 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                     "backup_path": str(backup),
                 }
             try:
-                _post_bytes, post_live = read_stable(
+                _post_bytes, post_live = read_bound_regular_child(
                     rules,
+                    rules_parent_binding,
                     label="live_rules",
-                    require_modeled_metadata=True,
                 )
             except TransactionError as error:
                 retain_stage = True
@@ -5263,8 +5882,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 rolled_back, rollback_result = rollback(
                     stage=stage,
                     rules=rules,
-                    lock=lock,
-                    lock_expected=lock_expected,
+                    lock_binding=lock_binding,
                     backup=backup,
                     original=current,
                     installed=installed_expected,
@@ -5292,6 +5910,7 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                             ),
                         )
                         verify_restored_terminal(rules, restored)
+                        evidence.restored = True
                     except TransactionError as error:
                         retain_stage = True
                         return EXIT_POST_REPLACE_FAILED, {
@@ -5351,6 +5970,31 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
             isinstance(error, TransactionError) and error.status == "recovery_required"
         ) or (stage is not None and stage.mutation_uncertain):
             retain_stage = True
+        if (
+            evidence is not None
+            and evidence.receipt is not None
+            and isinstance(error, (OSError, TransactionError))
+            and not (
+                isinstance(error, TransactionError)
+                and error.status == "recovery_required"
+            )
+        ):
+            raise TransactionError(
+                "recovery_required",
+                "durable prepared transaction evidence requires explicit recovery",
+                exit_code=EXIT_POST_REPLACE_FAILED,
+                details={
+                    "reason": (
+                        error.status
+                        if isinstance(error, TransactionError)
+                        else "apply_io_failed"
+                    ),
+                    "message": str(error),
+                    **(error.details if isinstance(error, TransactionError) else {}),
+                    "receipt_path": str(receipt),
+                    "prepared_candidate_path": str(prepared_recovery_candidate),
+                },
+            ) from error
         raise
     finally:
         finalize_apply_state()
@@ -5399,6 +6043,89 @@ def recovery_entry_snapshot(path: Path, *, label: str) -> Snapshot | None:
     return snapshot
 
 
+def recovery_entry_snapshot_bound(
+    path: Path,
+    parent: BoundDirectory,
+    *,
+    label: str,
+) -> Snapshot | None:
+    try:
+        _payload, snapshot = read_bound_regular_child(
+            path,
+            parent,
+            label=label,
+        )
+    except TransactionError as error:
+        if error.status == f"{label}_missing":
+            return None
+        raise
+    return snapshot
+
+
+def probe_fixed_stage_for_recovery(
+    rules_parent: BoundDirectory,
+) -> tuple[Snapshot | None, Snapshot | None]:
+    validate_bound_directory(rules_parent)
+    try:
+        stage_stat = os.stat(
+            PRIVATE_STAGE_NAME,
+            dir_fd=rules_parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        validate_bound_directory(rules_parent)
+        return None, None
+    except OSError as error:
+        raise TransactionError(
+            "private_stage_unreadable",
+            f"cannot inspect the fixed private stage: {error}",
+        ) from error
+    stage_snapshot = Snapshot.from_stat(stage_stat, b"")
+    if (
+        not stat.S_ISDIR(stage_stat.st_mode)
+        or stage_snapshot.uid != os.geteuid()
+        or stage_snapshot.mode != 0o700
+    ):
+        raise TransactionError(
+            "private_stage_invalid",
+            "fixed private stage is not an owner-only directory",
+        )
+    stage_parent = bind_directory(
+        rules_parent.path / PRIVATE_STAGE_NAME,
+        label="private_stage",
+        require_owner_private=True,
+        expected=stage_snapshot,
+    )
+    try:
+        entries, entries_exceeded = bounded_directory_entries(stage_parent.fd)
+        if entries_exceeded:
+            raise TransactionError(
+                "private_stage_retained",
+                "fixed private stage exceeds the recovery inspection bound",
+                details={"entry_count_lower_bound": len(entries)},
+            )
+        if sorted(entries) not in ([], ["candidate"]):
+            raise TransactionError(
+                "private_stage_retained",
+                "fixed private stage contains unrecognized recovery evidence",
+                details={"retained_entries": sorted(entries)},
+            )
+        candidate = (
+            recovery_entry_snapshot_bound(
+                stage_parent.path / "candidate",
+                stage_parent,
+                label="staged_backup",
+            )
+            if entries
+            else None
+        )
+        validate_bound_directory(stage_parent)
+        validate_bound_directory(rules_parent)
+        return stage_parent.snapshot, candidate
+    finally:
+        os.close(stage_parent.fd)
+
+
 def recovery_snapshot_role(
     actual: Snapshot | None,
     *,
@@ -5417,8 +6144,7 @@ def recovery_snapshot_role(
 def recover_schema_v3_transaction(
     *,
     rules: Path,
-    lock: Path,
-    lock_expected: Snapshot,
+    lock_binding: BoundFile,
     backup: Path,
     staged_backup: Path,
     rules_parent_expected: Snapshot,
@@ -5429,13 +6155,38 @@ def recover_schema_v3_transaction(
     terminal_expected: Snapshot,
     transaction_id: str,
 ) -> tuple[int, dict[str, object]]:
+    rules_parent_binding: BoundDirectory | None = None
+    staged_parent_binding: BoundDirectory | None = None
     try:
-        live_actual = recovery_entry_snapshot(rules, label="live_rules")
-        backup_actual = recovery_entry_snapshot(backup, label="backup")
-        staged_actual = recovery_entry_snapshot(
+        rules_parent_binding = bind_directory(
+            rules.parent,
+            label="rules",
+            expected=rules_parent_expected,
+        )
+        staged_parent_binding = bind_directory(
+            staged_backup.parent,
+            label="private_stage",
+            require_owner_private=True,
+            expected=staged_parent_expected,
+        )
+        revalidate_lock(lock_binding, rules_parent_binding)
+        live_actual = recovery_entry_snapshot_bound(
+            rules,
+            rules_parent_binding,
+            label="live_rules",
+        )
+        backup_actual = recovery_entry_snapshot_bound(
+            backup,
+            rules_parent_binding,
+            label="backup",
+        )
+        staged_actual = recovery_entry_snapshot_bound(
             staged_backup,
+            staged_parent_binding,
             label="staged_backup",
         )
+        validate_bound_directory(rules_parent_binding)
+        revalidate_lock(lock_binding, rules_parent_binding)
     except TransactionError as error:
         return EXIT_RECOVERY_REFUSED, {
             "status": "recovery_refused",
@@ -5443,6 +6194,11 @@ def recover_schema_v3_transaction(
             "message": str(error),
             **error.details,
         }
+    finally:
+        if staged_parent_binding is not None:
+            os.close(staged_parent_binding.fd)
+        if rules_parent_binding is not None:
+            os.close(rules_parent_binding.fd)
     roles = (
         recovery_snapshot_role(
             live_actual,
@@ -5499,9 +6255,7 @@ def recover_schema_v3_transaction(
         }
 
     try:
-        terminal, terminal_actual = read_recovery_terminal_with_snapshot(
-            terminal_path
-        )
+        terminal, terminal_actual = read_recovery_terminal_with_snapshot(terminal_path)
     except TransactionError as error:
         return EXIT_RECOVERY_REFUSED, {
             "status": "recovery_refused",
@@ -5565,9 +6319,7 @@ def recover_schema_v3_transaction(
                 if isinstance(error, TransactionError)
                 else "recovery_io_failed"
             )
-            error_details = (
-                error.details if isinstance(error, TransactionError) else {}
-            )
+            error_details = error.details if isinstance(error, TransactionError) else {}
             return EXIT_POST_REPLACE_FAILED, {
                 "status": "recovery_required",
                 "transaction_state": state,
@@ -5596,11 +6348,7 @@ def recover_schema_v3_transaction(
         }
 
     stage_candidate_expected = (
-        installed
-        if state == "P"
-        else original
-        if state == "X"
-        else None
+        installed if state == "P" else original if state == "X" else None
     )
     stage: PrivateStage | None = None
     retain_stage = False
@@ -5613,7 +6361,7 @@ def recover_schema_v3_transaction(
             recovery_stage_expected=staged_parent_expected,
             recovery_candidate_expected=stage_candidate_expected,
         )
-        revalidate_lock(lock, lock_expected)
+        revalidate_lock(lock_binding, stage.rules_parent_binding)
         if state == "P":
             assert staged_actual is not None
             stage.move_to(
@@ -5621,8 +6369,8 @@ def recover_schema_v3_transaction(
                 rules,
                 original,
                 pre_exchange_revalidate=lambda: revalidate_lock(
-                    lock,
-                    lock_expected,
+                    lock_binding,
+                    stage.rules_parent_binding,
                 ),
             )
             state = "X"
@@ -5642,8 +6390,7 @@ def recover_schema_v3_transaction(
             rolled_back, rollback_result = rollback(
                 stage=stage,
                 rules=rules,
-                lock=lock,
-                lock_expected=lock_expected,
+                lock_binding=lock_binding,
                 backup=backup,
                 original=original,
                 installed=installed,
@@ -5661,9 +6408,7 @@ def recover_schema_v3_transaction(
                     else EXIT_RECOVERY_REFUSED
                 ), {
                     "status": (
-                        "recovery_required"
-                        if recovery_required
-                        else "recovery_refused"
+                        "recovery_required" if recovery_required else "recovery_refused"
                     ),
                     "transaction_state": "C",
                     "rollback": rollback_result,
@@ -5758,9 +6503,717 @@ def recover_schema_v3_transaction(
                 )
 
 
+def recover_schema_v4_transaction(
+    *,
+    rules: Path,
+    lock_binding: BoundFile,
+    backup: Path,
+    staged_backup: Path,
+    prepared_candidate: Path,
+    rules_parent_expected: Snapshot,
+    prepared_parent_expected: Snapshot,
+    original: Snapshot,
+    installed: Snapshot,
+    terminal_path: Path,
+    terminal_expected: Snapshot,
+    transaction_id: str,
+) -> tuple[int, dict[str, object]]:
+    rules_parent: BoundDirectory | None = None
+    prepared_parent: BoundDirectory | None = None
+    prepared_binding: BoundFile | None = None
+    terminal_binding: BoundFile | None = None
+    terminal_update_started = False
+    try:
+        rules_parent = bind_directory(
+            rules.parent,
+            label="rules",
+            expected=rules_parent_expected,
+        )
+        prepared_parent = bind_directory(
+            prepared_candidate.parent,
+            label="prepared_candidate",
+            require_owner_private=True,
+            expected=prepared_parent_expected,
+        )
+        revalidate_lock(lock_binding, rules_parent)
+        live_actual = recovery_entry_snapshot_bound(
+            rules,
+            rules_parent,
+            label="live_rules",
+        )
+        backup_actual = recovery_entry_snapshot_bound(
+            backup,
+            rules_parent,
+            label="backup",
+        )
+        stage_parent_actual, staged_actual = probe_fixed_stage_for_recovery(
+            rules_parent
+        )
+        try:
+            prepared_binding = bind_regular_file(
+                prepared_candidate,
+                prepared_parent,
+                label="prepared_candidate",
+            )
+        except TransactionError as error:
+            if error.status == "prepared_candidate_missing":
+                prepared_actual = None
+            else:
+                raise
+        else:
+            _prepared_bytes, prepared_actual = validate_bound_regular_file(
+                prepared_binding,
+                prepared_parent,
+                label="prepared_candidate",
+            )
+
+        roles = (
+            recovery_snapshot_role(
+                live_actual,
+                original=original,
+                installed=installed,
+            ),
+            recovery_snapshot_role(
+                backup_actual,
+                original=original,
+                installed=installed,
+            ),
+            recovery_snapshot_role(
+                staged_actual,
+                original=original,
+                installed=installed,
+            ),
+            recovery_snapshot_role(
+                prepared_actual,
+                original=original,
+                installed=installed,
+            ),
+        )
+        states = {
+            ("O", "M", "M", "I"): "Q",
+            ("O", "M", "I", "M"): "P",
+            ("I", "M", "O", "M"): "X",
+            ("I", "O", "M", "M"): "C",
+            ("O", "I", "M", "M"): "R",
+        }
+        state = states.get(roles)
+        if state is None:
+            if (
+                live_actual is not None
+                and content_access_and_object_policy_match(
+                    original,
+                    live_actual,
+                )
+                and property_mismatches(original, live_actual)
+            ):
+                return EXIT_RECOVERY_REFUSED, {
+                    "status": "recovery_refused",
+                    "reason": "original_identity_untrusted",
+                    "mismatched_properties": ["object_identity"],
+                    "actual_live": live_actual.to_json(),
+                }
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "schema_v4_state_unrecognized",
+                "observed_roles": {
+                    "live": roles[0],
+                    "backup": roles[1],
+                    "staged_backup": roles[2],
+                    "prepared_candidate": roles[3],
+                },
+                "actual": {
+                    "live": (
+                        live_actual.to_json() if live_actual is not None else None
+                    ),
+                    "backup": (
+                        backup_actual.to_json() if backup_actual is not None else None
+                    ),
+                    "staged_backup": (
+                        staged_actual.to_json() if staged_actual is not None else None
+                    ),
+                    "prepared_candidate": (
+                        prepared_actual.to_json()
+                        if prepared_actual is not None
+                        else None
+                    ),
+                },
+            }
+
+        if state != "Q":
+            if stage_parent_actual is None:
+                return EXIT_RECOVERY_REFUSED, {
+                    "status": "recovery_refused",
+                    "reason": "schema_v4_stage_missing",
+                    "transaction_state": state,
+                }
+            revalidate_lock(lock_binding, rules_parent)
+            result = recover_schema_v3_transaction(
+                rules=rules,
+                lock_binding=lock_binding,
+                backup=backup,
+                staged_backup=staged_backup,
+                rules_parent_expected=rules_parent_expected,
+                staged_parent_expected=stage_parent_actual,
+                original=original,
+                installed=installed,
+                terminal_path=terminal_path,
+                terminal_expected=terminal_expected,
+                transaction_id=transaction_id,
+            )
+            revalidate_lock(lock_binding, rules_parent)
+            validate_bound_directory(prepared_parent)
+            return result
+
+        assert live_actual is not None
+        assert prepared_binding is not None
+        terminal_binding = bind_regular_file(
+            terminal_path,
+            prepared_parent,
+            label="recovery_terminal",
+            max_bytes=MAX_RECEIPT_BYTES,
+            writable=True,
+        )
+        terminal_payload, terminal_actual = validate_bound_regular_file(
+            terminal_binding,
+            prepared_parent,
+            label="recovery_terminal",
+            max_bytes=MAX_RECEIPT_BYTES,
+        )
+        terminal = decode_recovery_terminal(terminal_payload)
+        if terminal.get("state") == RECOVERY_TERMINAL_RESERVED:
+            terminal_mismatches = property_mismatches(
+                terminal_expected,
+                terminal_actual,
+            )
+        else:
+            terminal_mismatches = identity_access_and_object_policy_mismatches(
+                terminal_expected,
+                terminal_actual,
+            )
+        if terminal_mismatches:
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "recovery_terminal_binding_changed",
+                "mismatched_properties": terminal_mismatches,
+            }
+        if terminal.get("transaction_id") != transaction_id:
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "recovery_terminal_transaction_mismatch",
+            }
+        terminal_result: dict[str, object]
+        if terminal.get("state") == RECOVERY_TERMINAL_RESTORED:
+            terminal_restored = Snapshot.from_json(
+                terminal.get("restored"),
+                label="recovery_terminal.restored",
+                require_object_policy=True,
+            )
+            terminal_live_mismatches = property_mismatches(
+                terminal_restored,
+                live_actual,
+            )
+            if terminal_live_mismatches or property_mismatches(
+                original,
+                live_actual,
+            ):
+                return EXIT_RECOVERY_REFUSED, {
+                    "status": "recovery_refused",
+                    "reason": "recovery_terminal_live_mismatch",
+                    "mismatched_properties": terminal_live_mismatches,
+                    "actual_live": live_actual.to_json(),
+                }
+            terminal_result = terminal
+            result_status = "already_original"
+        elif terminal.get("state") == RECOVERY_TERMINAL_RESERVED:
+            terminal_update_started = True
+            terminal_result = record_recovery_terminal(
+                terminal_path,
+                transaction_id=transaction_id,
+                original=original,
+                restored=live_actual,
+                binding=terminal_binding,
+                parent=prepared_parent,
+                expected_reservation=terminal_expected,
+            )
+            result_status = "recovered"
+        else:
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "recovery_terminal_state_invalid",
+            }
+
+        final_live = recovery_entry_snapshot_bound(
+            rules,
+            rules_parent,
+            label="live_rules",
+        )
+        final_prepared_payload, final_prepared = validate_bound_regular_file(
+            prepared_binding,
+            prepared_parent,
+            label="prepared_candidate",
+        )
+        final_stage_parent, final_staged = probe_fixed_stage_for_recovery(rules_parent)
+        if (
+            final_live is None
+            or property_mismatches(original, final_live)
+            or property_mismatches(installed, final_prepared)
+            or final_staged is not None
+            or (
+                stage_parent_actual is not None
+                and (
+                    final_stage_parent is None
+                    or directory_property_mismatches(
+                        stage_parent_actual,
+                        os.stat(
+                            PRIVATE_STAGE_NAME,
+                            dir_fd=rules_parent.fd,
+                            follow_symlinks=False,
+                        ),
+                    )
+                )
+            )
+            or len(final_prepared_payload) != installed.size
+        ):
+            return EXIT_POST_REPLACE_FAILED, {
+                "status": "recovery_required",
+                "transaction_state": "Q",
+                "reason": "schema_v4_prepared_state_changed",
+            }
+        revalidate_lock(lock_binding, rules_parent)
+        validate_bound_directory(prepared_parent)
+        return 0, {
+            "status": result_status,
+            "transaction_state": "Q",
+            "rules_path": str(rules),
+            "live": final_live.to_json(),
+            "recovery_terminal": terminal_result,
+            "prepared_candidate_path": str(prepared_candidate),
+        }
+    except (OSError, TransactionError) as error:
+        error_status = (
+            error.status
+            if isinstance(error, TransactionError)
+            else "recovery_io_failed"
+        )
+        error_details = error.details if isinstance(error, TransactionError) else {}
+        stage_recovery_statuses = {
+            "private_stage_retained",
+            "private_stage_invalid",
+            "private_stage_unreadable",
+            "private_stage_changed",
+            "stage_cleanup_refused",
+        }
+        if (
+            terminal_update_started
+            or error_status == "recovery_required"
+            or error_status in stage_recovery_statuses
+        ):
+            live_role = (
+                recovery_snapshot_role(
+                    live_actual,
+                    original=original,
+                    installed=installed,
+                )
+                if "live_actual" in locals()
+                else "?"
+            )
+            backup_role = (
+                recovery_snapshot_role(
+                    backup_actual,
+                    original=original,
+                    installed=installed,
+                )
+                if "backup_actual" in locals()
+                else "?"
+            )
+            state_hint = {
+                ("O", "I"): "R",
+                ("I", "O"): "C",
+                ("I", "M"): "X",
+                ("O", "M"): "Q",
+            }.get((live_role, backup_role), "Q")
+            return EXIT_POST_REPLACE_FAILED, {
+                "status": "recovery_required",
+                "transaction_state": state_hint,
+                "reason": error_status,
+                "message": str(error),
+                **error_details,
+            }
+        return EXIT_RECOVERY_REFUSED, {
+            "status": "recovery_refused",
+            "reason": error_status,
+            "message": str(error),
+            **error_details,
+        }
+    finally:
+        for binding in (terminal_binding, prepared_binding):
+            if binding is not None:
+                os.close(binding.fd)
+        for parent in (prepared_parent, rules_parent):
+            if parent is not None:
+                os.close(parent.fd)
+
+
+def recover_legacy_transaction(
+    *,
+    rules: Path,
+    lock_binding: BoundFile,
+    backup: Path,
+    receipt_parent_path: Path,
+    receipt_parent_expected: Snapshot,
+    rules_parent_expected: Snapshot,
+    original: Snapshot,
+    installed: Snapshot,
+    backup_expected: Snapshot,
+    terminal_path: Path | None,
+    terminal_expected: Snapshot | None,
+    transaction_id: object,
+) -> tuple[int, dict[str, object]]:
+    rules_parent: BoundDirectory | None = None
+    receipt_parent: BoundDirectory | None = None
+    terminal_binding: BoundFile | None = None
+    stage: PrivateStage | None = None
+    try:
+        rules_parent = bind_directory(
+            rules.parent,
+            label="rules",
+            expected=rules_parent_expected,
+        )
+        receipt_parent = bind_directory(
+            receipt_parent_path,
+            label="receipt",
+            require_owner_private=True,
+            expected=receipt_parent_expected,
+        )
+        revalidate_lock(lock_binding, rules_parent)
+        try:
+            _live_bytes, live = read_bound_regular_child(
+                rules,
+                rules_parent,
+                label="live_rules",
+            )
+        except TransactionError as error:
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": error.status,
+                "message": str(error),
+            }
+        if property_mismatches(original, live) == []:
+            validate_existing_fixed_stage_is_empty(
+                rules.parent,
+                rules_parent_expected=rules_parent_expected,
+            )
+            revalidate_lock(lock_binding, rules_parent)
+            return 0, {
+                "status": "already_original",
+                "rules_path": str(rules),
+                "live": live.to_json(),
+                "identity_evidence": "receipt_original_identity",
+            }
+
+        terminal_was_missing = False
+        terminal: dict[str, object] | None = None
+        if terminal_path is not None:
+            try:
+                terminal_binding = bind_regular_file(
+                    terminal_path,
+                    receipt_parent,
+                    label="recovery_terminal",
+                    max_bytes=MAX_RECEIPT_BYTES,
+                    writable=True,
+                )
+                terminal_bytes, terminal_actual = validate_bound_regular_file(
+                    terminal_binding,
+                    receipt_parent,
+                    label="recovery_terminal",
+                    max_bytes=MAX_RECEIPT_BYTES,
+                )
+                terminal = decode_recovery_terminal(terminal_bytes)
+            except TransactionError as error:
+                if error.status == "recovery_terminal_missing":
+                    if terminal_expected is not None:
+                        return EXIT_RECOVERY_REFUSED, {
+                            "status": "recovery_refused",
+                            "reason": "recovery_terminal_missing",
+                        }
+                    terminal_was_missing = True
+                else:
+                    return EXIT_RECOVERY_REFUSED, {
+                        "status": "recovery_refused",
+                        "reason": error.status,
+                        "message": str(error),
+                        **error.details,
+                    }
+            if terminal is not None:
+                if terminal_expected is not None:
+                    if terminal.get("state") == RECOVERY_TERMINAL_RESERVED:
+                        terminal_binding_mismatches = property_mismatches(
+                            terminal_expected,
+                            terminal_actual,
+                        )
+                    else:
+                        terminal_binding_mismatches = (
+                            identity_access_and_object_policy_mismatches(
+                                terminal_expected,
+                                terminal_actual,
+                            )
+                        )
+                    if terminal_binding_mismatches:
+                        return EXIT_RECOVERY_REFUSED, {
+                            "status": "recovery_refused",
+                            "reason": "recovery_terminal_binding_changed",
+                            "mismatched_properties": terminal_binding_mismatches,
+                        }
+                if terminal.get("transaction_id") != transaction_id:
+                    return EXIT_RECOVERY_REFUSED, {
+                        "status": "recovery_refused",
+                        "reason": "recovery_terminal_transaction_mismatch",
+                    }
+                if terminal.get("state") == RECOVERY_TERMINAL_RESTORED:
+                    terminal_restored = Snapshot.from_json(
+                        terminal.get("restored"),
+                        label="recovery_terminal.restored",
+                        require_object_policy=True,
+                    )
+                    terminal_mismatches = property_mismatches(
+                        terminal_restored,
+                        live,
+                    )
+                    if (
+                        isinstance(transaction_id, str)
+                        and not terminal_mismatches
+                        and content_access_and_object_policy_match(
+                            original,
+                            live,
+                        )
+                    ):
+                        validate_existing_fixed_stage_is_empty(
+                            rules.parent,
+                            rules_parent_expected=rules_parent_expected,
+                        )
+                        revalidate_lock(lock_binding, rules_parent)
+                        return 0, {
+                            "status": "already_original",
+                            "rules_path": str(rules),
+                            "live": live.to_json(),
+                            "identity_evidence": "recovery_terminal",
+                        }
+                    return EXIT_RECOVERY_REFUSED, {
+                        "status": "recovery_refused",
+                        "reason": "recovery_terminal_live_mismatch",
+                        "mismatched_properties": terminal_mismatches,
+                        "actual_live": live.to_json(),
+                    }
+
+        if content_access_and_object_policy_match(original, live):
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "original_identity_untrusted",
+                "mismatched_properties": ["object_identity"],
+                "actual_live": live.to_json(),
+            }
+        live_mismatches = property_mismatches(installed, live)
+        if live_mismatches:
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "live_no_longer_installed",
+                "mismatched_properties": live_mismatches,
+                "actual_live": live.to_json(),
+            }
+        backup_actual = recovery_entry_snapshot_bound(
+            backup,
+            rules_parent,
+            label="backup",
+        )
+        if backup_actual is None:
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "backup_missing",
+            }
+        backup_mismatches = property_mismatches(
+            backup_expected,
+            backup_actual,
+        )
+        if backup_mismatches:
+            return EXIT_RECOVERY_REFUSED, {
+                "status": "recovery_refused",
+                "reason": "backup_changed",
+                "mismatched_properties": backup_mismatches,
+            }
+
+        stage = PrivateStage(
+            rules.parent,
+            rules_parent_expected=rules_parent_expected,
+        )
+        retain_stage = False
+        pending_success_status: str | None = None
+        try:
+            rolled_back, rollback_result = rollback(
+                stage=stage,
+                rules=rules,
+                lock_binding=lock_binding,
+                backup=backup,
+                original=original,
+                installed=installed,
+                backup_expected=backup_expected,
+            )
+            if not rolled_back:
+                if rollback_result.get("rollback_status") == "recovery_required":
+                    retain_stage = True
+                    return EXIT_POST_REPLACE_FAILED, {
+                        "status": "recovery_required",
+                        "rollback": rollback_result,
+                    }
+                return EXIT_RECOVERY_REFUSED, {
+                    "status": "recovery_refused",
+                    "rollback": rollback_result,
+                }
+            restored = Snapshot.from_json(
+                rollback_result.get("restored"),
+                label="rollback.restored",
+                require_object_policy=True,
+            )
+            if terminal_path is None:
+                pending_success_status = "recovered"
+                revalidate_lock(lock_binding, rules_parent)
+                return 0, {
+                    "status": "recovered",
+                    "rules_path": str(rules),
+                    "rollback": rollback_result,
+                    "identity_evidence": "current-run-only-legacy-receipt",
+                }
+            try:
+                terminal_result = record_recovery_terminal(
+                    terminal_path,
+                    transaction_id=str(transaction_id),
+                    original=original,
+                    restored=restored,
+                    binding=terminal_binding,
+                    parent=receipt_parent,
+                    allow_unreserved_legacy=terminal_was_missing,
+                    expected_reservation=terminal_expected,
+                )
+                _restored_bytes, restored_live = read_bound_regular_child(
+                    rules,
+                    rules_parent,
+                    label="live_rules",
+                )
+                if property_mismatches(restored, restored_live):
+                    raise TransactionError(
+                        "recovery_terminal_live_mismatch",
+                        "restored live rules changed after terminal publication",
+                    )
+            except TransactionError as error:
+                retain_stage = True
+                return EXIT_POST_REPLACE_FAILED, {
+                    "status": "recovery_required",
+                    "rollback": rollback_result,
+                    "recovery_terminal_failure": {
+                        "status": error.status,
+                        "message": str(error),
+                        **error.details,
+                    },
+                }
+            pending_success_status = "recovered"
+            revalidate_lock(lock_binding, rules_parent)
+            return 0, {
+                "status": "recovered",
+                "rules_path": str(rules),
+                "rollback": rollback_result,
+                "recovery_terminal": terminal_result,
+            }
+        except BaseException as error:
+            if (
+                isinstance(error, TransactionError)
+                and error.status == "recovery_required"
+            ) or stage.mutation_uncertain:
+                retain_stage = True
+            raise
+        finally:
+            warnings = stage.cleanup(retain=retain_stage)
+            if warnings:
+                print(
+                    json.dumps(
+                        {"status": "cleanup_warning", "warnings": warnings},
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+            cleanup_refusals = [
+                warning
+                for warning in warnings
+                if warning.get("status") == "stage_cleanup_refused"
+            ]
+            if pending_success_status is not None and cleanup_refusals:
+                raise TransactionError(
+                    "recovery_required",
+                    ("cannot report success because fixed stage cleanup was refused"),
+                    exit_code=EXIT_POST_REPLACE_FAILED,
+                    details={
+                        "operation_status": pending_success_status,
+                        "cleanup_refusals": cleanup_refusals,
+                    },
+                )
+            try:
+                revalidate_lock(lock_binding, rules_parent)
+                validate_bound_directory(receipt_parent)
+            except TransactionError as error:
+                if pending_success_status is not None:
+                    raise TransactionError(
+                        "recovery_required",
+                        "bound recovery evidence changed before lock release",
+                        exit_code=EXIT_POST_REPLACE_FAILED,
+                        details={
+                            "reason": error.status,
+                            "message": str(error),
+                            **error.details,
+                        },
+                    ) from error
+                raise
+    except TransactionError as error:
+        if error.status == "recovery_required":
+            cleanup_refusals = error.details.get("cleanup_refusals")
+            cleanup_reason = (
+                cleanup_refusals[0].get("reason")
+                if isinstance(cleanup_refusals, list)
+                and cleanup_refusals
+                and isinstance(cleanup_refusals[0], dict)
+                else None
+            )
+            return EXIT_POST_REPLACE_FAILED, {
+                "status": "recovery_required",
+                "reason": (
+                    error.details.get("stage_status")
+                    or error.details.get("reason")
+                    or cleanup_reason
+                    or error.status
+                ),
+                "message": str(error),
+                **error.details,
+            }
+        return EXIT_RECOVERY_REFUSED, {
+            "status": "recovery_refused",
+            "reason": error.status,
+            "message": str(error),
+            **error.details,
+        }
+    finally:
+        if terminal_binding is not None:
+            os.close(terminal_binding.fd)
+        if rules_parent is not None and receipt_parent is not None:
+            try:
+                revalidate_lock(lock_binding, rules_parent)
+                validate_bound_directory(receipt_parent)
+            finally:
+                os.close(receipt_parent.fd)
+                os.close(rules_parent.fd)
+        elif rules_parent is not None:
+            os.close(rules_parent.fd)
+
+
 def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
     receipt_path = resolved_leaf(args.receipt, label="receipt")
-    receipt = read_receipt(receipt_path)
+    receipt, receipt_parent_expected = read_receipt_with_parent_snapshot(receipt_path)
     receipt_schema_version = receipt["schema_version"]
     assert isinstance(receipt_schema_version, int)
     require_object_policy = receipt_schema_version >= 2
@@ -5832,6 +7285,8 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
     )
     staged_backup: Path | None = None
     staged_parent_expected: Snapshot | None = None
+    prepared_candidate: Path | None = None
+    prepared_parent_expected: Snapshot | None = None
     if receipt_schema_version >= 3:
         backup_receipt_mismatches = property_mismatches(
             original,
@@ -5840,7 +7295,7 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
         if backup_receipt_mismatches:
             raise TransactionError(
                 "receipt_invalid",
-                "schema-v3 backup snapshot must exactly match original",
+                "schema-v3+ backup snapshot must exactly match original",
                 details={
                     "mismatched_properties": backup_receipt_mismatches,
                 },
@@ -5849,20 +7304,46 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
         if not isinstance(staged_backup_raw, str):
             raise TransactionError(
                 "receipt_invalid",
-                "schema-v3 receipt is missing staged_backup_path",
+                "schema-v3+ receipt is missing staged_backup_path",
             )
         staged_backup = Path(staged_backup_raw)
-        expected_staged_backup = (
-            rules.parent / PRIVATE_STAGE_NAME / "candidate"
-        )
+        expected_staged_backup = rules.parent / PRIVATE_STAGE_NAME / "candidate"
         if not staged_backup.is_absolute() or staged_backup != expected_staged_backup:
             raise TransactionError(
                 "receipt_invalid",
                 "staged backup path is not the fixed transaction-stage candidate",
             )
-        staged_parent_expected = Snapshot.from_json(
-            receipt.get("staged_backup_parent"),
-            label="staged_backup_parent",
+        if receipt_schema_version == 3:
+            staged_parent_expected = Snapshot.from_json(
+                receipt.get("staged_backup_parent"),
+                label="staged_backup_parent",
+                require_object_policy=True,
+            )
+        elif receipt.get("staged_backup_parent") is not None:
+            raise TransactionError(
+                "receipt_invalid",
+                "schema-v4 staged_backup_parent must be null before stage creation",
+            )
+    if receipt_schema_version >= 4:
+        prepared_candidate_raw = receipt.get("prepared_candidate_path")
+        if not isinstance(prepared_candidate_raw, str):
+            raise TransactionError(
+                "receipt_invalid",
+                "schema-v4 receipt is missing prepared_candidate_path",
+            )
+        prepared_candidate = Path(prepared_candidate_raw)
+        expected_prepared_candidate = prepared_candidate_path(receipt_path)
+        if (
+            not prepared_candidate.is_absolute()
+            or prepared_candidate != expected_prepared_candidate
+        ):
+            raise TransactionError(
+                "receipt_invalid",
+                "prepared candidate path is not the receipt-bound recovery locator",
+            )
+        prepared_parent_expected = Snapshot.from_json(
+            receipt.get("prepared_candidate_parent"),
+            label="prepared_candidate_parent",
             require_object_policy=True,
         )
     terminal_expected: Snapshot | None = None
@@ -5889,7 +7370,7 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
     ):
         raise TransactionError(
             "receipt_invalid",
-            "schema-v3 receipt requires a bound recovery terminal",
+            "schema-v3+ receipt requires a bound recovery terminal",
         )
     if require_object_policy:
         for label, snapshot in (
@@ -5902,20 +7383,29 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                     "receipt_invalid",
                     f"{label}.object_policy.nlink must be 1",
                 )
-    parent_mismatches = directory_property_mismatches(
-        parent_expected,
-        os.stat(rules.parent, follow_symlinks=False),
-    )
-    if parent_mismatches:
-        return EXIT_RECOVERY_REFUSED, {
-            "status": "recovery_refused",
-            "reason": "rules_parent_changed",
-            "mismatched_properties": parent_mismatches,
-        }
-
-    stage: PrivateStage | None = None
-    with shared_lock(lock, timeout_seconds=args.lock_timeout_seconds) as lock_expected:
-        if receipt_schema_version >= 3:
+    with shared_lock(lock, timeout_seconds=args.lock_timeout_seconds) as lock_binding:
+        if receipt_schema_version >= 4:
+            assert staged_backup is not None
+            assert prepared_candidate is not None
+            assert prepared_parent_expected is not None
+            assert terminal_path is not None
+            assert terminal_expected is not None
+            assert isinstance(transaction_id, str)
+            return recover_schema_v4_transaction(
+                rules=rules,
+                lock_binding=lock_binding,
+                backup=backup,
+                staged_backup=staged_backup,
+                prepared_candidate=prepared_candidate,
+                rules_parent_expected=parent_expected,
+                prepared_parent_expected=prepared_parent_expected,
+                original=original,
+                installed=installed,
+                terminal_path=terminal_path,
+                terminal_expected=terminal_expected,
+                transaction_id=transaction_id,
+            )
+        if receipt_schema_version == 3:
             assert staged_backup is not None
             assert staged_parent_expected is not None
             assert terminal_path is not None
@@ -5923,8 +7413,7 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
             assert isinstance(transaction_id, str)
             return recover_schema_v3_transaction(
                 rules=rules,
-                lock=lock,
-                lock_expected=lock_expected,
+                lock_binding=lock_binding,
                 backup=backup,
                 staged_backup=staged_backup,
                 rules_parent_expected=parent_expected,
@@ -5935,229 +7424,20 @@ def recover_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object
                 terminal_expected=terminal_expected,
                 transaction_id=transaction_id,
             )
-        try:
-            _live_bytes, live = read_stable(
-                rules,
-                label="live_rules",
-                require_modeled_metadata=True,
-            )
-        except TransactionError as error:
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
-                "reason": error.status,
-                "message": str(error),
-            }
-        if property_mismatches(original, live) == []:
-            return 0, {
-                "status": "already_original",
-                "rules_path": str(rules),
-                "live": live.to_json(),
-                "identity_evidence": "receipt_original_identity",
-            }
-        terminal_was_missing = False
-        if terminal_path is not None:
-            try:
-                terminal, terminal_actual = read_recovery_terminal_with_snapshot(
-                    terminal_path
-                )
-            except TransactionError as error:
-                if error.status == "recovery_terminal_missing":
-                    if terminal_expected is not None:
-                        return EXIT_RECOVERY_REFUSED, {
-                            "status": "recovery_refused",
-                            "reason": "recovery_terminal_missing",
-                        }
-                    terminal_was_missing = True
-                else:
-                    return EXIT_RECOVERY_REFUSED, {
-                        "status": "recovery_refused",
-                        "reason": error.status,
-                        "message": str(error),
-                        **error.details,
-                    }
-            else:
-                if terminal_expected is not None:
-                    if terminal.get("state") == RECOVERY_TERMINAL_RESERVED:
-                        terminal_binding_mismatches = property_mismatches(
-                            terminal_expected,
-                            terminal_actual,
-                        )
-                    else:
-                        terminal_binding_mismatches = (
-                            identity_access_and_object_policy_mismatches(
-                                terminal_expected,
-                                terminal_actual,
-                            )
-                        )
-                    if terminal_binding_mismatches:
-                        return EXIT_RECOVERY_REFUSED, {
-                            "status": "recovery_refused",
-                            "reason": "recovery_terminal_binding_changed",
-                            "mismatched_properties": terminal_binding_mismatches,
-                        }
-                if terminal.get("transaction_id") != transaction_id:
-                    return EXIT_RECOVERY_REFUSED, {
-                        "status": "recovery_refused",
-                        "reason": "recovery_terminal_transaction_mismatch",
-                    }
-                if terminal.get("state") == RECOVERY_TERMINAL_RESTORED:
-                    terminal_restored = Snapshot.from_json(
-                        terminal.get("restored"),
-                        label="recovery_terminal.restored",
-                        require_object_policy=True,
-                    )
-                    terminal_mismatches = property_mismatches(
-                        terminal_restored,
-                        live,
-                    )
-                    if (
-                        isinstance(transaction_id, str)
-                        and not terminal_mismatches
-                        and content_access_and_object_policy_match(original, live)
-                    ):
-                        return 0, {
-                            "status": "already_original",
-                            "rules_path": str(rules),
-                            "live": live.to_json(),
-                            "identity_evidence": "recovery_terminal",
-                        }
-                    return EXIT_RECOVERY_REFUSED, {
-                        "status": "recovery_refused",
-                        "reason": "recovery_terminal_live_mismatch",
-                        "mismatched_properties": terminal_mismatches,
-                        "actual_live": live.to_json(),
-                    }
-        if content_access_and_object_policy_match(original, live):
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
-                "reason": "original_identity_untrusted",
-                "mismatched_properties": ["object_identity"],
-                "actual_live": live.to_json(),
-            }
-        live_mismatches = property_mismatches(installed, live)
-        if live_mismatches:
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
-                "reason": "live_no_longer_installed",
-                "mismatched_properties": live_mismatches,
-                "actual_live": live.to_json(),
-            }
-        try:
-            os.stat(backup, follow_symlinks=False)
-            backup_missing = False
-        except FileNotFoundError:
-            backup_missing = True
-        except OSError as error:
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
-                "reason": "backup_unreadable",
-                "message": str(error),
-            }
-        if backup_missing:
-            return EXIT_RECOVERY_REFUSED, {
-                "status": "recovery_refused",
-                "reason": "backup_missing",
-            }
-        stage = PrivateStage(rules.parent)
-        retain_stage = False
-        pending_success_status: str | None = None
-        try:
-            rolled_back, rollback_result = rollback(
-                stage=stage,
-                rules=rules,
-                lock=lock,
-                lock_expected=lock_expected,
-                backup=backup,
-                original=original,
-                installed=installed,
-                backup_expected=backup_expected,
-            )
-            if not rolled_back:
-                if rollback_result.get("rollback_status") == "recovery_required":
-                    retain_stage = True
-                    return EXIT_POST_REPLACE_FAILED, {
-                        "status": "recovery_required",
-                        "rollback": rollback_result,
-                    }
-                return EXIT_RECOVERY_REFUSED, {
-                    "status": "recovery_refused",
-                    "rollback": rollback_result,
-                }
-            restored = Snapshot.from_json(
-                rollback_result.get("restored"),
-                label="rollback.restored",
-                require_object_policy=True,
-            )
-            if terminal_path is None:
-                pending_success_status = "recovered"
-                return 0, {
-                    "status": "recovered",
-                    "rules_path": str(rules),
-                    "rollback": rollback_result,
-                    "identity_evidence": "current-run-only-legacy-receipt",
-                }
-            try:
-                terminal = record_recovery_terminal(
-                    terminal_path,
-                    transaction_id=str(transaction_id),
-                    original=original,
-                    restored=restored,
-                    allow_unreserved_legacy=terminal_was_missing,
-                    expected_reservation=terminal_expected,
-                )
-                verify_restored_terminal(rules, restored)
-            except TransactionError as error:
-                retain_stage = True
-                return EXIT_POST_REPLACE_FAILED, {
-                    "status": "recovery_required",
-                    "rollback": rollback_result,
-                    "recovery_terminal_failure": {
-                        "status": error.status,
-                        "message": str(error),
-                        **error.details,
-                    },
-                }
-            pending_success_status = "recovered"
-            return 0, {
-                "status": "recovered",
-                "rules_path": str(rules),
-                "rollback": rollback_result,
-                "recovery_terminal": terminal,
-            }
-        except BaseException as error:
-            if (
-                isinstance(error, TransactionError)
-                and error.status == "recovery_required"
-            ) or stage.mutation_uncertain:
-                retain_stage = True
-            raise
-        finally:
-            warnings = stage.cleanup(retain=retain_stage)
-            if warnings:
-                print(
-                    json.dumps(
-                        {"status": "cleanup_warning", "warnings": warnings},
-                        sort_keys=True,
-                    ),
-                    file=sys.stderr,
-                )
-            cleanup_refusals = [
-                warning
-                for warning in warnings
-                if warning.get("status") == "stage_cleanup_refused"
-            ]
-            if pending_success_status is not None and cleanup_refusals:
-                raise TransactionError(
-                    "stage_cleanup_refused",
-                    (
-                        "cannot report success because fixed stage cleanup "
-                        "was refused"
-                    ),
-                    details={
-                        "operation_status": pending_success_status,
-                        "cleanup_refusals": cleanup_refusals,
-                    },
-                )
+        return recover_legacy_transaction(
+            rules=rules,
+            lock_binding=lock_binding,
+            backup=backup,
+            receipt_parent_path=receipt_path.parent,
+            receipt_parent_expected=receipt_parent_expected,
+            rules_parent_expected=parent_expected,
+            original=original,
+            installed=installed,
+            backup_expected=backup_expected,
+            terminal_path=terminal_path,
+            terminal_expected=terminal_expected,
+            transaction_id=transaction_id,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

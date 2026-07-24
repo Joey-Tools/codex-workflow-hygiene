@@ -288,6 +288,24 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self,
     ) -> tuple[object, object]:
         stage = TRANSACTION.PrivateStage(self.rules_dir)
+        lock_path = self.rules_dir / ".default.rules.apply.lock"
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o600)
+        lock_fd = os.open(
+            lock_path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        lock = TRANSACTION.BoundFile(
+            path=lock_path,
+            name=lock_path.name,
+            fd=lock_fd,
+            snapshot=TRANSACTION.lock_snapshot(lock_path, os.fstat(lock_fd)),
+        )
+        stage.extra_fds.append(lock_fd)
+        rules_parent = TRANSACTION.bind_directory(
+            self.rules_dir,
+            label="rules",
+        )
         receipt_parent = TRANSACTION.bind_directory(
             self.receipt.parent,
             label="receipt",
@@ -315,11 +333,15 @@ class RulesApplyTransactionTests(unittest.TestCase):
             receipt_parent,
         )
         evidence = TRANSACTION.ApplyEvidenceBindings(
+            lock=lock,
+            rules_parent=rules_parent,
             stage=stage,
             receipt_parent=receipt_parent,
             recovery_terminal=terminal,
+            prepared_candidate=backup,
             backup=backup,
             receipt=receipt,
+            candidate_in_stage=True,
         )
         evidence.validate()
         return stage, evidence
@@ -386,6 +408,25 @@ class RulesApplyTransactionTests(unittest.TestCase):
             timeout=15,
         )
 
+    def rewrite_receipt_as_legacy_v1(self) -> dict[str, object]:
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        receipt["schema_version"] = 1
+        for key in ("rules_parent", "original", "installed", "backup"):
+            receipt[key].pop("object_policy")
+        for key in (
+            "staged_backup_path",
+            "staged_backup_parent",
+            "prepared_candidate_path",
+            "prepared_candidate_parent",
+        ):
+            receipt.pop(key, None)
+        self.receipt.write_text(
+            json.dumps(receipt, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.receipt.chmod(0o600)
+        return receipt
+
     def test_apply_validates_private_stage_before_atomic_replace(self) -> None:
         validator_log = self.root / "validator.jsonl"
         self.write_validator(
@@ -445,7 +486,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(validator_rows[0]["content"].encode(), NEW_RULES)
         self.assertEqual(validator_rows[1]["file_mode"], 0o640)
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["schema_version"], 3)
+        self.assertEqual(receipt["schema_version"], 4)
         self.assertEqual(
             receipt["rules_parent"]["identity"],
             {
@@ -456,14 +497,26 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(receipt["installed"]["object_policy"], {"nlink": 1})
         self.assertEqual(receipt["backup"]["object_policy"], {"nlink": 1})
         self.assertEqual(receipt["backup"], receipt["original"])
+        self.assertIsNone(receipt["staged_backup_parent"])
         self.assertEqual(
             Path(receipt["staged_backup_path"]).resolve(),
-            (
-                self.rules_dir
-                / TRANSACTION.PRIVATE_STAGE_NAME
-                / "candidate"
-            ).resolve(),
+            (self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME / "candidate").resolve(),
         )
+        prepared_candidate = self.receipt.with_name(
+            f"{self.receipt.name}{TRANSACTION.PREPARED_CANDIDATE_SUFFIX}"
+        )
+        self.assertEqual(
+            Path(receipt["prepared_candidate_path"]).resolve(),
+            prepared_candidate.resolve(),
+        )
+        self.assertEqual(
+            receipt["prepared_candidate_parent"]["identity"],
+            {
+                "device": self.receipt.parent.stat().st_dev,
+                "inode": self.receipt.parent.stat().st_ino,
+            },
+        )
+        self.assertFalse(prepared_candidate.exists())
         self.assertEqual(
             receipt["recovery_terminal"]["object_policy"],
             {"nlink": 1},
@@ -912,6 +965,44 @@ class RulesApplyTransactionTests(unittest.TestCase):
             evidence.close()
             stage.cleanup()
 
+    def test_evidence_close_attempts_every_fd_after_baseexception(self) -> None:
+        stage, evidence = self.create_apply_evidence()
+        assert evidence.receipt is not None
+        receipt_fd = evidence.receipt.fd
+        expected_closed = (
+            evidence.recovery_terminal.fd,
+            evidence.receipt_parent.fd,
+            evidence.rules_parent.fd,
+        )
+        real_close = TRANSACTION.os.close
+        interrupted = False
+
+        def interrupt_first_close(fd: int) -> None:
+            nonlocal interrupted
+            if fd == receipt_fd and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt("fault-injected evidence close")
+            real_close(fd)
+
+        try:
+            with (
+                mock.patch.object(
+                    TRANSACTION.os,
+                    "close",
+                    side_effect=interrupt_first_close,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                evidence.close()
+
+            for fd in expected_closed:
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(fd)
+                self.assertEqual(closed.exception.errno, errno.EBADF)
+        finally:
+            real_close(receipt_fd)
+            stage.cleanup()
+
     def test_receipt_read_rejects_hardlink_and_metadata(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         applied = self.run_apply()
@@ -1354,13 +1445,11 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 side_effect=kill_group,
             ) as killpg,
         ):
-            cleanup_errors = (
-                TRANSACTION._emergency_stop_validator_process_group(
-                    FakeProcess(),
-                    None,
-                    {"stdout": bytearray(), "stderr": bytearray()},
-                    max_output_bytes=TRANSACTION.MAX_VALIDATOR_OUTPUT_BYTES,
-                )
+            cleanup_errors = TRANSACTION._emergency_stop_validator_process_group(
+                FakeProcess(),
+                None,
+                {"stdout": bytearray(), "stderr": bytearray()},
+                max_output_bytes=TRANSACTION.MAX_VALIDATOR_OUTPUT_BYTES,
             )
 
         self.assertEqual(cleanup_errors, [])
@@ -2237,10 +2326,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 destination_dir_fd,
                 destination_name,
             )
-            if (
-                source_name == self.backup.name
-                and destination_name == self.rules.name
-            ):
+            if source_name == self.backup.name and destination_name == self.rules.name:
                 rollback_parent_fd = source_dir_fd
                 rollback_exchange_completed = True
 
@@ -2274,9 +2360,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 side_effect=fail_rollback_parent_fsync,
             ),
         ):
-            exit_code, payload = TRANSACTION.apply_transaction(
-                self.apply_namespace()
-            )
+            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
 
         self.assertTrue(failure_injected)
         self.assertEqual(exit_code, 30)
@@ -2472,11 +2556,21 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
                 applied = self.run_apply()
                 self.assertEqual(applied.returncode, 0, applied.stderr)
-                staged = (
-                    self.rules_dir
-                    / TRANSACTION.PRIVATE_STAGE_NAME
-                    / "candidate"
+                receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+                stage_root = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+                receipt["schema_version"] = 3
+                receipt["staged_backup_parent"] = TRANSACTION.Snapshot.from_stat(
+                    stage_root.stat(follow_symlinks=False),
+                    b"",
+                ).to_json()
+                receipt.pop("prepared_candidate_path", None)
+                receipt.pop("prepared_candidate_parent", None)
+                self.receipt.write_text(
+                    json.dumps(receipt, sort_keys=True) + "\n",
+                    encoding="utf-8",
                 )
+                self.receipt.chmod(0o600)
+                staged = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME / "candidate"
                 if state in ("P", "X"):
                     os.rename(self.backup, staged)
                 if state == "P":
@@ -2558,19 +2652,13 @@ class RulesApplyTransactionTests(unittest.TestCase):
             ),
             redirect_stderr(stderr),
         ):
-            exit_code, payload = TRANSACTION.apply_transaction(
-                self.apply_namespace()
-            )
+            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
 
         self.assertEqual(exit_code, 30)
         self.assertEqual(payload["status"], "recovery_required")
         self.assertEqual(self.rules.read_bytes(), NEW_RULES)
         self.assertFalse(self.backup.exists())
-        staged = (
-            self.rules_dir
-            / TRANSACTION.PRIVATE_STAGE_NAME
-            / "candidate"
-        )
+        staged = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME / "candidate"
         self.assertEqual(staged.read_bytes(), OLD_RULES)
         cleanup = json.loads(stderr.getvalue().strip())
         self.assertTrue(
@@ -2593,11 +2681,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.write_validator("raise SystemExit(0)\n")
         applied = self.run_apply()
         self.assertEqual(applied.returncode, 0, applied.stderr)
-        staged = (
-            self.rules_dir
-            / TRANSACTION.PRIVATE_STAGE_NAME
-            / "candidate"
-        )
+        staged = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME / "candidate"
         os.rename(self.backup, staged)
 
         real_publish = TRANSACTION.PrivateStage.publish_backup
@@ -2715,9 +2799,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 side_effect=fail_first_stage_fsync,
             ),
         ):
-            exit_code, payload = TRANSACTION.apply_transaction(
-                self.apply_namespace()
-            )
+            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
 
         self.assertTrue(failure_injected)
         self.assertEqual(exit_code, 30)
@@ -2739,21 +2821,33 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.write_validator("raise SystemExit(0)\n")
         events: list[str] = []
         stage_fds: dict[str, int] = {}
-        real_create = TRANSACTION.PrivateStage.create
+        real_stage_init = TRANSACTION.PrivateStage.__init__
+        real_prepared_move = TRANSACTION.move_prepared_candidate_to_stage
         real_publish = TRANSACTION.PrivateStage.publish_backup
         real_write_receipt = TRANSACTION.write_receipt
         real_fsync = TRANSACTION.os.fsync
         real_fsync_live = TRANSACTION.fsync_file_and_parent
 
-        def observe_create(
+        def observe_stage_init(
             stage: object,
-            name: str,
-            payload: bytes,
-        ) -> tuple[Path, object]:
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            events.append("stage_init_begin")
+            real_stage_init(stage, *args, **kwargs)
             assert isinstance(stage, TRANSACTION.PrivateStage)
             stage_fds["stage"] = stage.stage_fd
             stage_fds["rules"] = stage.rules_parent_fd
-            return real_create(stage, name, payload)
+            events.append("stage_init_end")
+
+        def observe_prepared_move(
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[Path, object]:
+            events.append("prepared_move_begin")
+            result = real_prepared_move(*args, **kwargs)
+            events.append("prepared_move_end")
+            return result
 
         def observe_publish(
             stage: object,
@@ -2768,7 +2862,9 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         def observe_receipt(*args: object, **kwargs: object) -> object:
             events.append("receipt_begin")
-            return real_write_receipt(*args, **kwargs)
+            result = real_write_receipt(*args, **kwargs)
+            events.append("receipt_end")
+            return result
 
         def observe_fsync(fd: int) -> None:
             for label, expected_fd in stage_fds.items():
@@ -2787,9 +2883,14 @@ class RulesApplyTransactionTests(unittest.TestCase):
             ),
             mock.patch.object(
                 TRANSACTION.PrivateStage,
-                "create",
+                "__init__",
                 autospec=True,
-                side_effect=observe_create,
+                side_effect=observe_stage_init,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "move_prepared_candidate_to_stage",
+                side_effect=observe_prepared_move,
             ),
             mock.patch.object(
                 TRANSACTION.PrivateStage,
@@ -2813,34 +2914,404 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 side_effect=observe_live_fsync,
             ),
         ):
-            exit_code, payload = TRANSACTION.apply_transaction(
-                self.apply_namespace()
-            )
+            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["status"], "applied")
-        receipt_index = events.index("receipt_begin")
         self.assertLess(
-            max(
-                index
-                for index, event in enumerate(events)
-                if event == "fsync_stage" and index < receipt_index
-            ),
-            receipt_index,
+            events.index("receipt_end"),
+            events.index("stage_init_begin"),
         )
         self.assertLess(
-            max(
-                index
-                for index, event in enumerate(events)
-                if event == "fsync_rules" and index < receipt_index
-            ),
-            receipt_index,
+            events.index("stage_init_end"),
+            events.index("prepared_move_begin"),
         )
         publication_end = events.index("publish_end")
         live_fsync_begin = events.index("live_fsync_begin")
         publication_durability = events[publication_end + 1 : live_fsync_begin]
         self.assertIn("fsync_stage", publication_durability)
         self.assertIn("fsync_rules", publication_durability)
+
+    def assert_receipt_fault_precedes_private_stage(self, fault: str) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_write_receipt = TRANSACTION.write_receipt
+        real_write = TRANSACTION.os.write
+        real_fsync = TRANSACTION.os.fsync
+
+        def faulting_receipt(
+            path: Path,
+            payload: dict[str, object],
+            parent: object,
+        ) -> object:
+            assert isinstance(parent, TRANSACTION.BoundDirectory)
+            injected = False
+
+            def fail_write(fd: int, data: bytes) -> int:
+                nonlocal injected
+                if fault == "write" and not injected:
+                    injected = True
+                    raise OSError(errno.EIO, "fault-injected receipt write")
+                return real_write(fd, data)
+
+            def fail_fsync(fd: int) -> None:
+                nonlocal injected
+                is_parent = fd == parent.fd
+                if not injected and (
+                    (fault == "file_fsync" and not is_parent)
+                    or (fault == "parent_fsync" and is_parent)
+                ):
+                    injected = True
+                    raise OSError(errno.EIO, f"fault-injected receipt {fault}")
+                real_fsync(fd)
+
+            with (
+                mock.patch.object(
+                    TRANSACTION.os,
+                    "write",
+                    side_effect=fail_write,
+                ),
+                mock.patch.object(
+                    TRANSACTION.os,
+                    "fsync",
+                    side_effect=fail_fsync,
+                ),
+            ):
+                return real_write_receipt(path, payload, parent)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "write_receipt",
+                side_effect=faulting_receipt,
+            ),
+            self.assertRaises((OSError, TRANSACTION.TransactionError)),
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        prepared = TRANSACTION.prepared_candidate_path(self.receipt)
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertTrue(prepared.is_file())
+        self.assertEqual(prepared.read_bytes(), NEW_RULES)
+        self.assertTrue(terminal.is_file())
+        self.assertFalse((self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME).exists())
+
+    def test_receipt_write_failure_precedes_private_stage(self) -> None:
+        self.assert_receipt_fault_precedes_private_stage("write")
+
+    def test_receipt_file_fsync_failure_precedes_private_stage(self) -> None:
+        self.assert_receipt_fault_precedes_private_stage("file_fsync")
+
+    def test_receipt_parent_fsync_failure_precedes_private_stage(self) -> None:
+        self.assert_receipt_fault_precedes_private_stage("parent_fsync")
+
+    def test_schema_v4_q_recovery_is_idempotent_after_stage_creation_failure(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "__init__",
+                side_effect=TRANSACTION.TransactionError(
+                    "private_stage_unavailable",
+                    "fault-injected stage creation failure",
+                ),
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(raised.exception.status, "recovery_required")
+        self.assertEqual(raised.exception.exit_code, 30)
+        prepared = TRANSACTION.prepared_candidate_path(self.receipt)
+        self.assertTrue(self.receipt.is_file())
+        self.assertTrue(prepared.is_file())
+        self.assertFalse((self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME).exists())
+
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_HOME": str(self.codex_home)},
+        ):
+            first_code, first = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+            second_code, second = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertEqual(first_code, 0)
+        self.assertEqual(first["status"], "recovered")
+        self.assertEqual(first["transaction_state"], "Q")
+        self.assertEqual(second_code, 0)
+        self.assertEqual(second["status"], "already_original")
+        self.assertEqual(second["transaction_state"], "Q")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(prepared.read_bytes(), NEW_RULES)
+
+    def test_schema_v4_p_recovery_after_move_fsync_failure(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_move = TRANSACTION.move_prepared_candidate_to_stage
+        real_fsync = TRANSACTION.os.fsync
+        stage_fd: int | None = None
+        injected = False
+
+        def observe_move(*args: object, **kwargs: object) -> object:
+            nonlocal stage_fd
+            result = real_move(*args, **kwargs)
+            stage = kwargs["stage"]
+            assert isinstance(stage, TRANSACTION.PrivateStage)
+            stage_fd = stage.stage_fd
+            return result
+
+        def fail_stage_fsync(fd: int) -> None:
+            nonlocal injected
+            if stage_fd is not None and fd == stage_fd and not injected:
+                injected = True
+                raise OSError(errno.EIO, "fault-injected stage fsync")
+            real_fsync(fd)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "move_prepared_candidate_to_stage",
+                side_effect=observe_move,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "fsync",
+                side_effect=fail_stage_fsync,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(raised.exception.status, "recovery_required")
+        self.assertEqual(raised.exception.exit_code, 30)
+        staged = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME / "candidate"
+        self.assertTrue(staged.is_file())
+        self.assertFalse(TRANSACTION.prepared_candidate_path(self.receipt).exists())
+
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_HOME": str(self.codex_home)},
+        ):
+            code, recovered = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(recovered["status"], "recovered")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_apply_rejects_lock_replacement_after_durable_receipt(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_write_receipt = TRANSACTION.write_receipt
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        moved_lock = self.rules_dir / ".default.rules.apply.lock.bound"
+
+        def replace_lock_after_receipt(
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            result = real_write_receipt(*args, **kwargs)
+            os.rename(lock, moved_lock)
+            lock.write_bytes(b"")
+            lock.chmod(0o600)
+            return result
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "write_receipt",
+                side_effect=replace_lock_after_receipt,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(raised.exception.status, "recovery_required")
+        self.assertEqual(raised.exception.exit_code, 30)
+        self.assertEqual(raised.exception.details["reason"], "lock_changed")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertFalse(self.backup.exists())
+        self.assertTrue(self.receipt.is_file())
+        self.assertTrue(TRANSACTION.prepared_candidate_path(self.receipt).is_file())
+        self.assertFalse((self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME).exists())
+
+    def test_no_change_rejects_lock_replacement_before_return(self) -> None:
+        self.candidate.write_bytes(OLD_RULES)
+        real_validate_stage = TRANSACTION.validate_existing_fixed_stage_is_empty
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        moved_lock = self.rules_dir / ".default.rules.apply.lock.bound"
+
+        def replace_lock_after_stage_check(
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            real_validate_stage(*args, **kwargs)
+            os.rename(lock, moved_lock)
+            lock.write_bytes(b"")
+            lock.chmod(0o600)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "validate_existing_fixed_stage_is_empty",
+                side_effect=replace_lock_after_stage_check,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(
+                SimpleNamespace(
+                    **{
+                        **vars(self.apply_namespace()),
+                        "candidate_sha256": hashlib.sha256(OLD_RULES).hexdigest(),
+                    }
+                )
+            )
+
+        self.assertEqual(raised.exception.status, "lock_changed")
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(self.backup.exists())
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+
+    def test_receipt_parent_cannot_be_fixed_private_stage(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        stage.mkdir(mode=0o700)
+        self.receipt = stage / "recovery.json"
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(raised.exception.status, "path_invalid")
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(list(stage.iterdir()), [])
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+
+    def test_cross_device_prepared_publication_is_rejected_preflight(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_bind_directory = TRANSACTION.bind_directory
+
+        def report_other_receipt_device(
+            path: Path,
+            **kwargs: object,
+        ) -> object:
+            binding = real_bind_directory(path, **kwargs)
+            if kwargs.get("label") == "receipt":
+                snapshot = binding.snapshot
+                binding.snapshot = TRANSACTION.Snapshot(
+                    device=snapshot.device + 1,
+                    inode=snapshot.inode,
+                    size=snapshot.size,
+                    sha256=snapshot.sha256,
+                    mode=snapshot.mode,
+                    uid=snapshot.uid,
+                    gid=snapshot.gid,
+                    nlink=snapshot.nlink,
+                )
+            return binding
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "bind_directory",
+                side_effect=report_other_receipt_device,
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(
+            raised.exception.status,
+            "prepared_candidate_cross_device",
+        )
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(TRANSACTION.prepared_candidate_path(self.receipt).exists())
+        self.assertFalse((self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME).exists())
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+
+    def test_prepared_ownership_transfer_survives_baseexception(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_move = TRANSACTION.move_prepared_candidate_to_stage
+        moved_fd: int | None = None
+
+        def interrupt_after_move(*args: object, **kwargs: object) -> object:
+            nonlocal moved_fd
+            real_move(*args, **kwargs)
+            prepared = kwargs["prepared"]
+            assert isinstance(prepared, TRANSACTION.BoundFile)
+            moved_fd = prepared.fd
+            raise KeyboardInterrupt("fault-injected ownership interruption")
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "move_prepared_candidate_to_stage",
+                side_effect=interrupt_after_move,
+            ),
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        assert moved_fd is not None
+        with self.assertRaises(OSError) as closed:
+            os.fstat(moved_fd)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+        staged = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME / "candidate"
+        self.assertEqual(staged.read_bytes(), NEW_RULES)
+        self.assertTrue(self.receipt.is_file())
+        self.assertFalse(TRANSACTION.prepared_candidate_path(self.receipt).exists())
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
 
     def test_recover_refuses_same_original_bytes_on_untrusted_new_inode(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -2934,15 +3405,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.write_validator("raise SystemExit(0)\n")
         applied = self.run_apply()
         self.assertEqual(applied.returncode, 0, applied.stderr)
-        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        receipt["schema_version"] = 1
-        for key in ("rules_parent", "original", "installed", "backup"):
-            receipt[key].pop("object_policy")
-        self.receipt.write_text(
-            json.dumps(receipt, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        self.receipt.chmod(0o600)
+        self.rewrite_receipt_as_legacy_v1()
 
         recovered = self.run_recover()
 
@@ -2950,6 +3413,121 @@ class RulesApplyTransactionTests(unittest.TestCase):
         payload = json.loads(recovered.stdout)
         self.assertEqual(payload["status"], "recovered")
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+
+    def test_legacy_recovery_rejects_rules_parent_replacement(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.rewrite_receipt_as_legacy_v1()
+        real_bind_directory = TRANSACTION.bind_directory
+        moved_rules_parent = self.root / "rules.bound"
+        replaced = False
+
+        def replace_parent_before_bind(
+            path: Path,
+            **kwargs: object,
+        ) -> object:
+            nonlocal replaced
+            if (
+                not replaced
+                and path.resolve() == self.rules_dir.resolve()
+                and kwargs.get("label") == "rules"
+            ):
+                replaced = True
+                os.rename(self.rules_dir, moved_rules_parent)
+                self.rules_dir.mkdir()
+                for child in list(moved_rules_parent.iterdir()):
+                    os.rename(child, self.rules_dir / child.name)
+            return real_bind_directory(path, **kwargs)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "bind_directory",
+                side_effect=replace_parent_before_bind,
+            ),
+        ):
+            code, payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertTrue(replaced)
+        self.assertEqual(code, 40)
+        self.assertEqual(payload["status"], "recovery_refused")
+        self.assertEqual(payload["reason"], "rules_parent_changed")
+        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+
+    def test_legacy_already_original_retained_stage_requires_recovery(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        recovered = self.run_recover()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.rewrite_receipt_as_legacy_v1()
+        stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+        retained = stage / "unexpected"
+        retained.write_bytes(b"retained legacy evidence\n")
+
+        repeated = self.run_recover()
+
+        self.assertEqual(repeated.returncode, 30, repeated.stderr)
+        payload = json.loads(repeated.stdout)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["reason"], "private_stage_retained")
+        self.assertEqual(retained.read_bytes(), b"retained legacy evidence\n")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+
+    def test_legacy_recovery_cleanup_refusal_is_recovery_required(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.rewrite_receipt_as_legacy_v1()
+        real_cleanup = TRANSACTION.PrivateStage._cleanup_fixed_stage
+
+        def refuse_after_closing(stage: object) -> list[dict[str, object]]:
+            assert isinstance(stage, TRANSACTION.PrivateStage)
+            real_cleanup(stage)
+            return [
+                {
+                    "status": "stage_cleanup_refused",
+                    "reason": "fault_injected",
+                }
+            ]
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION.PrivateStage,
+                "_cleanup_fixed_stage",
+                autospec=True,
+                side_effect=refuse_after_closing,
+            ),
+        ):
+            code, payload = TRANSACTION.recover_transaction(
+                SimpleNamespace(
+                    receipt=str(self.receipt),
+                    lock_timeout_seconds=2.0,
+                )
+            )
+
+        self.assertEqual(code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["reason"], "fault_injected")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
 
     def test_recover_rejects_v2_receipt_with_non_single_link_policy(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -3018,7 +3596,12 @@ class RulesApplyTransactionTests(unittest.TestCase):
         ):
             TRANSACTION.apply_transaction(self.apply_namespace())
 
-        self.assertEqual(raised.exception.status, "atomic_rename_unsupported")
+        self.assertEqual(raised.exception.status, "recovery_required")
+        self.assertEqual(raised.exception.exit_code, 30)
+        self.assertEqual(
+            raised.exception.details["reason"],
+            "atomic_rename_unsupported",
+        )
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
         self.assertEqual((stage / "candidate").read_bytes(), NEW_RULES)
@@ -3133,9 +3716,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 side_effect=assert_lock_still_held,
             ),
         ):
-            exit_code, payload = TRANSACTION.apply_transaction(
-                self.apply_namespace()
-            )
+            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
 
         self.assertTrue(cleanup_observed)
         self.assertEqual(exit_code, 0)
@@ -3150,11 +3731,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 current = self.rules.read_bytes()
                 candidate = NEW_RULES if current == OLD_RULES else OLD_RULES
                 self.candidate.write_bytes(candidate)
-                self.receipt = (
-                    self.root
-                    / "task"
-                    / f"recovery-{attempt:02d}.json"
-                )
+                self.receipt = self.root / "task" / f"recovery-{attempt:02d}.json"
                 self.backup_name = f"default.rules.bak-repeat-{attempt:02d}"
                 self.backup = self.rules_dir / self.backup_name
                 result = self.run_apply(
@@ -3169,9 +3746,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 self.assertEqual(self.backup.read_bytes(), current)
                 self.assert_no_private_stage()
 
-        stage_roots = list(
-            self.rules_dir.glob(TRANSACTION.PRIVATE_STAGE_NAME)
-        )
+        stage_roots = list(self.rules_dir.glob(TRANSACTION.PRIVATE_STAGE_NAME))
         self.assertEqual(len(stage_roots), 1)
         self.assertEqual(list(stage_roots[0].iterdir()), [])
 
@@ -3231,6 +3806,132 @@ class RulesApplyPrimitiveRaceTests(unittest.TestCase):
             src_dir_fd=source_directory_fd,
             dst_dir_fd=destination_directory_fd,
         )
+
+    def test_private_stage_init_closes_parent_on_baseexception(self) -> None:
+        real_open = TRANSACTION.os.open
+        real_fstat = TRANSACTION.os.fstat
+        parent_fd: int | None = None
+        interrupted = False
+
+        def observe_open(
+            path: object,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            nonlocal parent_fd
+            fd = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == os.fspath(self.rules_dir):
+                parent_fd = fd
+            return fd
+
+        def interrupt_fstat(fd: int) -> os.stat_result:
+            nonlocal interrupted
+            if parent_fd is not None and fd == parent_fd and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt("fault-injected parent fstat")
+            return real_fstat(fd)
+
+        with (
+            mock.patch.object(
+                TRANSACTION.os,
+                "open",
+                side_effect=observe_open,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "fstat",
+                side_effect=interrupt_fstat,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            TRANSACTION.PrivateStage(self.rules_dir)
+
+        assert parent_fd is not None
+        with self.assertRaises(OSError) as closed:
+            os.fstat(parent_fd)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_move_to_ownership_transfer_closes_all_fds_on_baseexception(
+        self,
+    ) -> None:
+        class InterruptingList(list[int]):
+            def remove(self, value: int) -> None:
+                raise KeyboardInterrupt("fault-injected fd ownership transfer")
+
+        stage = TRANSACTION.PrivateStage(self.rules_dir)
+        candidate, candidate_snapshot = stage.create("candidate", NEW_RULES)
+        _live_payload, live = TRANSACTION.read_stable(
+            self.rules,
+            label="live_rules",
+        )
+        stage.set_policy(candidate, candidate_snapshot, live)
+        stage.extra_fds = InterruptingList(stage.extra_fds)
+        owned_fds: set[int] = set()
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                stage.move_to(candidate, self.rules, live)
+        finally:
+            owned_fds.update(binding.fd for binding in stage.files.values())
+            owned_fds.update(stage.extra_fds)
+            stage.cleanup(retain=True)
+
+        for fd in owned_fds:
+            with self.assertRaises(OSError) as closed:
+                os.fstat(fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_publish_backup_ownership_transfer_closes_duplicate_fd(
+        self,
+    ) -> None:
+        class InterruptingDict(dict[Path, object]):
+            def pop(
+                self,
+                key: Path,
+                default: object = None,
+            ) -> object:
+                raise KeyboardInterrupt("fault-injected backup ownership transfer")
+
+        stage = TRANSACTION.PrivateStage(self.rules_dir)
+        source, _source_snapshot = stage.create("backup", OLD_RULES)
+        stage.files = InterruptingDict(stage.files)
+        source_fd = stage.files[source].fd
+        backup = self.rules_dir / "default.rules.bak-interrupted"
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                stage.publish_backup(source, backup)
+        finally:
+            stage.cleanup(retain=True)
+
+        with self.assertRaises(OSError) as closed:
+            os.fstat(source_fd)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertEqual(backup.read_bytes(), OLD_RULES)
+
+    def test_retain_cleanup_closes_all_fds_on_baseexception(self) -> None:
+        stage = TRANSACTION.PrivateStage(self.rules_dir)
+        candidate, _candidate_snapshot = stage.create(
+            "candidate",
+            NEW_RULES,
+        )
+        candidate_fd = stage.files[candidate].fd
+        stage_fd = stage.stage_fd
+        parent_fd = stage.rules_parent_fd
+
+        with (
+            mock.patch.object(
+                stage,
+                "_locator_for_snapshot",
+                side_effect=KeyboardInterrupt("fault-injected retention inspection"),
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            stage.cleanup(retain=True)
+
+        for fd in (candidate_fd, stage_fd, parent_fd):
+            with self.assertRaises(OSError) as closed:
+                os.fstat(fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
 
     def test_write_failure_does_not_unlink_replacement_leaf(self) -> None:
         target = self.root / "exclusive.rules"
