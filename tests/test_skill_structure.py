@@ -253,6 +253,76 @@ class SessionLocatorTests(unittest.TestCase):
         self.assertEqual(len(source["matches"]), 2)
         self.assertTrue(source["matches_truncated"])
 
+    def test_index_limit_retains_newest_matches_with_stable_ties(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            rows = [
+                {
+                    "id": "old",
+                    "thread_name": "review helper",
+                    "updated_at": "2026-07-23T23:59:00Z",
+                },
+                {
+                    "id": "tie-earlier-line",
+                    "thread_name": "review helper",
+                    "updated_at": "2026-07-24T10:00:00+01:00",
+                },
+                {
+                    "id": "missing-timestamp",
+                    "thread_name": "review helper",
+                },
+                {
+                    "id": "tie-later-line",
+                    "thread_name": "review helper",
+                    "updated_at": "2026-07-24T09:00:00Z",
+                },
+                {
+                    "id": "newest",
+                    "thread_name": "review helper",
+                    "ts": 2_000_000_000,
+                },
+            ]
+            (codex_home / "session_index.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            source = self.scan_index(codex_home, limit=3)
+
+        self.assertEqual(source["status"], "checked")
+        self.assertEqual(source["match_count"], 5)
+        self.assertEqual(
+            [match["id"] for match in source["matches"]],
+            ["newest", "tie-later-line", "tie-earlier-line"],
+        )
+        self.assertEqual([match["line"] for match in source["matches"]], [5, 4, 2])
+        self.assertTrue(source["matches_truncated"])
+
+    def test_rollout_filename_requires_exact_terminal_uuid(self) -> None:
+        session_id = "019ef067-976b-7e41-928d-80361777330b"
+        self.assertTrue(
+            LOCATE._rollout_name_matches(
+                f"rollout-copy-{session_id}.jsonl",
+                session_id.upper(),
+            )
+        )
+        for name in (
+            f"rollout-copy-x{session_id}.jsonl",
+            f"rollout-copy-{session_id}x.jsonl",
+            f"rollout-copy-{session_id}-later.jsonl",
+            f"rollout-copy-{session_id}.jsonl.backup",
+            f"rollout-copy-{session_id}{session_id}.jsonl",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(LOCATE._rollout_name_matches(name, session_id))
+        self.assertFalse(
+            LOCATE._rollout_name_matches(
+                "rollout-copy-opaque-id.jsonl",
+                "opaque-id",
+            )
+        )
+
     def test_malformed_and_oversized_index_records_make_coverage_partial(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             codex_home = Path(directory).resolve() / ".codex"
@@ -588,6 +658,82 @@ class SessionLocatorTests(unittest.TestCase):
             "rollout-root-identity-or-access-policy-changed",
             source["reasons"],
         )
+
+    def test_rollout_depth_cap_stops_before_deep_ancestor_reopens(self) -> None:
+        session_id = "019ef067-976b-7e41-928d-80361777330b"
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            root = codex_home / "sessions"
+            cursor = root
+            for depth in range(20):
+                cursor /= f"depth-{depth:02d}"
+            cursor.mkdir(parents=True)
+
+            with mock.patch.object(LOCATE, "MAX_ROLLOUT_DIRECTORY_DEPTH", 3):
+                source = LOCATE._scan_rollout_root(
+                    codex_home,
+                    "sessions",
+                    session_id=session_id,
+                    limit=2,
+                )
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn(
+            "rollout-directory-depth-cap-exceeded",
+            source["reasons"],
+        )
+        self.assertLessEqual(source["directories_scanned"], 4)
+        self.assertEqual(source["max_directory_depth_scanned"], 3)
+
+    def test_rollout_aggregate_component_cap_is_partial(self) -> None:
+        session_id = "019ef067-976b-7e41-928d-80361777330b"
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            root = codex_home / "sessions"
+            for index in range(5):
+                (root / f"child-{index}").mkdir(parents=True)
+
+            with mock.patch.object(LOCATE, "MAX_ROLLOUT_PATH_COMPONENTS", 2):
+                source = LOCATE._scan_rollout_root(
+                    codex_home,
+                    "sessions",
+                    session_id=session_id,
+                    limit=2,
+                )
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn(
+            "rollout-path-component-cap-exceeded",
+            source["reasons"],
+        )
+        self.assertEqual(source["path_components_reserved"], 2)
+
+    def test_rollout_aggregate_component_byte_cap_is_partial(self) -> None:
+        session_id = "019ef067-976b-7e41-928d-80361777330b"
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            root = codex_home / "sessions"
+            (root / "first").mkdir(parents=True)
+            (root / "second").mkdir()
+
+            with mock.patch.object(
+                LOCATE,
+                "MAX_ROLLOUT_PATH_COMPONENT_BYTES",
+                len("first"),
+            ):
+                source = LOCATE._scan_rollout_root(
+                    codex_home,
+                    "sessions",
+                    session_id=session_id,
+                    limit=2,
+                )
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn(
+            "rollout-path-component-byte-cap-exceeded",
+            source["reasons"],
+        )
+        self.assertEqual(source["path_component_bytes_reserved"], len("first"))
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
     def test_many_rollout_errors_are_capped_during_collection(self) -> None:

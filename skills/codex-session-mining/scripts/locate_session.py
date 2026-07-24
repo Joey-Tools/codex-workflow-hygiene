@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import errno
 import hashlib
 import heapq
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -23,10 +25,18 @@ MAX_FIELD_CHARS = 320
 MAX_PATH_CHARS = 4096
 MAX_SELECTOR_CHARS = 512
 MAX_ROLLOUT_INVENTORY_ENTRIES = 100_000
-UUID_PATTERN = re.compile(
+MAX_ROLLOUT_DIRECTORY_DEPTH = 32
+MAX_ROLLOUT_PATH_COMPONENTS = 250_000
+MAX_ROLLOUT_PATH_COMPONENT_BYTES = 16 * 1024 * 1024
+UUID_TEXT = (
     r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
     r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
 )
+UUID_PATTERN = re.compile(UUID_TEXT)
+ROLLOUT_FILENAME_PATTERN = re.compile(
+    rf"^rollout-.+-(?P<session_id>{UUID_TEXT})\.jsonl$"
+)
+UTC_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class CoveragePartial(RuntimeError):
@@ -98,6 +108,52 @@ def _lexical_absolute(path: Path) -> Path:
 
 def _normalize_session_id(value: str) -> str:
     return value.lower() if UUID_PATTERN.fullmatch(value) else value
+
+
+def _normalize_index_timestamp(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value * 1_000_000
+    if isinstance(value, float):
+        scaled = value * 1_000_000
+        if not math.isfinite(scaled):
+            return None
+        return int(scaled)
+    if not isinstance(value, str):
+        return None
+
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if candidate.endswith("Z"):
+        candidate = f"{candidate[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    delta = parsed.astimezone(timezone.utc) - UTC_EPOCH
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _index_match_sort_key(
+    path: Path,
+    line_number: int,
+    row: dict[str, Any],
+) -> tuple[int, int, str, int]:
+    timestamp = None
+    for key in ("updated_at", "ts"):
+        timestamp = _normalize_index_timestamp(row.get(key))
+        if timestamp is not None:
+            break
+    return (
+        int(timestamp is not None),
+        timestamp if timestamp is not None else 0,
+        os.fspath(path),
+        line_number,
+    )
 
 
 def _binding(metadata: os.stat_result) -> ObjectBinding:
@@ -434,6 +490,7 @@ def _scan_index(
     source = _empty_source("index", path)
     source["append_after_boundary"] = False
     source["content_scope"] = "unverified"
+    retained_matches: list[tuple[tuple[int, int, str, int], dict[str, Any]]] = []
 
     try:
         chain = _open_absolute_directory_chain(codex_home)
@@ -496,10 +553,15 @@ def _scan_index(
                         ):
                             continue
                         source["match_count"] += 1
-                        if len(source["matches"]) < limit:
-                            source["matches"].append(
-                                _project_index_match(path, line_number, row)
-                            )
+                        projection = _project_index_match(path, line_number, row)
+                        retained = (
+                            _index_match_sort_key(path, line_number, row),
+                            projection,
+                        )
+                        if len(retained_matches) < limit:
+                            heapq.heappush(retained_matches, retained)
+                        elif retained[0] > retained_matches[0][0]:
+                            heapq.heapreplace(retained_matches, retained)
             except CoveragePartial as error:
                 _mark_partial(source, error.reason)
             except OSError as error:
@@ -532,6 +594,14 @@ def _scan_index(
         finally:
             os.close(descriptor)
 
+    source["matches"] = [
+        projection
+        for _, projection in sorted(
+            retained_matches,
+            key=lambda retained: retained[0],
+            reverse=True,
+        )
+    ]
     if source["malformed_records"] or source["oversized_records"]:
         _mark_partial(source, "malformed-or-oversized-records")
     source["matches_truncated"] = source["match_count"] > len(source["matches"])
@@ -539,11 +609,13 @@ def _scan_index(
 
 
 def _rollout_name_matches(name: str, session_id: str) -> bool:
-    if not name.startswith("rollout-") or not name.endswith(".jsonl"):
+    expected = UUID_PATTERN.fullmatch(session_id)
+    if expected is None:
         return False
-    expected = _normalize_session_id(session_id)
-    candidate = name.lower() if UUID_PATTERN.fullmatch(session_id) else name
-    return expected in candidate
+    match = ROLLOUT_FILENAME_PATTERN.fullmatch(name)
+    if match is None:
+        return False
+    return match.group("session_id").lower() == session_id.lower()
 
 
 def _open_relative_directory(
@@ -726,7 +798,13 @@ def _scan_rollout_root(
     source = _empty_source("rollout-root", root_path)
     source["directories_scanned"] = 0
     source["entries_scanned"] = 0
+    source["directory_depth_limit"] = MAX_ROLLOUT_DIRECTORY_DEPTH
     source["inventory_entry_limit"] = MAX_ROLLOUT_INVENTORY_ENTRIES
+    source["max_directory_depth_scanned"] = 0
+    source["path_component_byte_limit"] = MAX_ROLLOUT_PATH_COMPONENT_BYTES
+    source["path_component_bytes_reserved"] = 0
+    source["path_component_limit"] = MAX_ROLLOUT_PATH_COMPONENTS
+    source["path_components_reserved"] = 0
 
     try:
         home_chain = _open_absolute_directory_chain(codex_home)
@@ -763,6 +841,8 @@ def _scan_rollout_root(
         pending: list[tuple[str, ...]] = [()]
         inventory_entries = 0
         inventory_complete = True
+        path_component_bytes = 0
+        path_components = 0
         try:
             while pending:
                 relative_parts = heapq.heappop(pending)
@@ -796,6 +876,10 @@ def _scan_rollout_root(
                     directory_fd = os.dup(root_fd)
                 try:
                     source["directories_scanned"] += 1
+                    source["max_directory_depth_scanned"] = max(
+                        source["max_directory_depth_scanned"],
+                        len(relative_parts),
+                    )
                     remaining_budget = MAX_ROLLOUT_INVENTORY_ENTRIES - inventory_entries
                     entries, complete = _capture_directory_inventory(
                         directory_fd,
@@ -839,6 +923,57 @@ def _scan_rollout_root(
                             inventory_complete = False
                             continue
                         if entry.file_type == stat.S_IFDIR:
+                            child_parts = (*relative_parts, entry.name)
+                            child_depth = len(child_parts)
+                            child_component_count = len(child_parts)
+                            child_component_bytes = sum(
+                                len(os.fsencode(component)) for component in child_parts
+                            )
+                            if child_depth > MAX_ROLLOUT_DIRECTORY_DEPTH:
+                                _record_error(
+                                    source,
+                                    path=entry_path,
+                                    reason="rollout-directory-depth-cap-exceeded",
+                                    limit=limit,
+                                )
+                                _mark_partial(
+                                    source,
+                                    "rollout-directory-depth-cap-exceeded",
+                                )
+                                inventory_complete = False
+                                continue
+                            if (
+                                path_components + child_component_count
+                                > MAX_ROLLOUT_PATH_COMPONENTS
+                            ):
+                                _record_error(
+                                    source,
+                                    path=entry_path,
+                                    reason="rollout-path-component-cap-exceeded",
+                                    limit=limit,
+                                )
+                                _mark_partial(
+                                    source,
+                                    "rollout-path-component-cap-exceeded",
+                                )
+                                inventory_complete = False
+                                continue
+                            if (
+                                path_component_bytes + child_component_bytes
+                                > MAX_ROLLOUT_PATH_COMPONENT_BYTES
+                            ):
+                                _record_error(
+                                    source,
+                                    path=entry_path,
+                                    reason=("rollout-path-component-byte-cap-exceeded"),
+                                    limit=limit,
+                                )
+                                _mark_partial(
+                                    source,
+                                    "rollout-path-component-byte-cap-exceeded",
+                                )
+                                inventory_complete = False
+                                continue
                             try:
                                 child_fd, child_binding = _open_directory_at(
                                     directory_fd,
@@ -884,7 +1019,12 @@ def _scan_rollout_root(
                                     continue
                             finally:
                                 os.close(child_fd)
-                            child_parts = (*relative_parts, entry.name)
+                            path_components += child_component_count
+                            path_component_bytes += child_component_bytes
+                            source["path_components_reserved"] = path_components
+                            source["path_component_bytes_reserved"] = (
+                                path_component_bytes
+                            )
                             expected_directories[child_parts] = child_binding
                             heapq.heappush(pending, child_parts)
                             continue

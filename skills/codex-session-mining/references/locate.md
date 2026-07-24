@@ -28,7 +28,9 @@ The helper emits one bounded schema-v2 JSON document. It scans optional
 cap. Exact-ID mode also inventories filenames under both rollout roots. Each
 source reports `checked`, `unavailable`, or `partial`, total and retained
 matches/errors, and deterministic truncation fields. `--limit` is enforced
-during collection; it is not a final slice of an unbounded list.
+during collection; it is not a final slice of an unbounded list. Index matches
+retain the newest normalized `updated_at` / `ts` values in a bounded heap and
+use source path plus physical line as deterministic tie-breakers.
 
 Only `FileNotFoundError` classifies an optional index or root as
 `unavailable`. A broken symlink, permission or I/O error, wrong type, path
@@ -50,10 +52,17 @@ escape, or failed revalidation is `partial`.
 - Open every component from the filesystem root through `codex_home` and each
   rollout root with descriptor-relative no-follow directory opens. Enumerate
   from held directory descriptors and never traverse symlinks.
+- A rollout filename match requires the exact UUID in its terminal lifecycle
+  position immediately before `.jsonl`; substrings, adjacent characters, and
+  non-terminal UUIDs do not match.
 - Before `checked`, reopen the full chain and require stable directory identity
   and access policy plus an unchanged bounded inventory of entry names, types,
   devices, and inodes. Inventory is capped at 100,000 entries; exceeding the
   cap is `partial`.
+- Rollout traversal is additionally capped at depth 32, 250,000 aggregate
+  ancestor-component references, and 16 MiB of aggregate component bytes.
+  Exceeding any cap stops descent into that subtree and makes coverage
+  `partial`; these aggregate budgets also bound repeated ancestor reopening.
 
 ## Open A Selected Rollout
 

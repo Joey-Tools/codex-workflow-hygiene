@@ -40,6 +40,15 @@ superseded_by:
   and a 100,000-entry-bounded name/type/device/inode inventory.
 - Match and error retention is capped during collection while total and
   truncation counts remain explicit.
+- Index match retention now keeps the newest normalized `updated_at` / `ts`
+  records in a fixed-size heap, with source path and physical line as stable
+  tie-breakers.
+- Rollout filename lookup accepts only the exact terminal lifecycle UUID, not
+  UUID substrings, adjacent characters, or a non-terminal occurrence.
+- Rollout traversal stops with `partial` coverage at depth 32 or before its
+  aggregate ancestor state exceeds 250,000 component references or 16 MiB of
+  component bytes. These limits bound both retained path state and repeated
+  root-to-directory reopening.
 - `build_session_corpus.py` remains the authoritative current-host
   active-plus-archived, replay-aware corpus path.
 - Generic skill scaffolding, frontmatter design, `agents/openai.yaml`, and
@@ -55,21 +64,24 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -m unittest tests.test_skill_structure -v`: 20 tests passed,
+- `python3 -m unittest tests.test_skill_structure`: 25 tests passed,
   including append, prefix mutation, truncation, rotation, broken symlink,
   unreadable source/revalidation, directory replacement/escape, inventory
-  drift, access-policy drift, and 25-error retention-cap cases.
-- Full `python3 -m unittest discover -s tests`: 1,051 tests ran; only four
+  drift, access-policy drift, newest-match retention, exact terminal UUID
+  matching, depth/component budgets, and 25-error retention-cap cases.
+- Full `python3 -m unittest discover -s tests`: 1,056 tests ran; only four
   sandboxed temporary-Git signing fixtures failed because keyboxd was
   inaccessible.
 - The exact four signing fixtures were rerun outside the sandbox and all passed.
 - System `$skill-creator` quick validation passed for `codex-session-mining`
   through the documented isolated `uv` + PyYAML fallback.
-- Ruff check and format check, Python compilation, and `git diff --check`
-  passed.
+- Ruff check and format check for the changed Python files, Python compilation,
+  and `git diff --check` passed.
 - Project-journal frontmatter validation passed.
-- A real read-only thread-query invocation checked both local indexes, retained
-  at most two matches, and reported 27 total matches.
-- A real exact-ID invocation checked both indexes plus 176 active rollout
-  directories and 9,360 archived entries; every source completed descriptor
-  and inventory revalidation.
+- A follow-up real read-only thread-query invocation checked both local
+  indexes, reported 12 total matches, and retained the newest two in timestamp
+  order.
+- A follow-up exact-ID invocation checked both indexes plus 177 active rollout
+  directories, 8,667 active entries, and 9,360 archived entries; every source
+  completed descriptor and inventory revalidation within the new traversal
+  budgets.
