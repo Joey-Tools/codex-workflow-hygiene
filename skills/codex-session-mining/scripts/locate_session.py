@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import errno
 import hashlib
 import heapq
@@ -24,6 +24,7 @@ PREFIX_HASH_CHUNK_BYTES = 64 * 1024
 MAX_INDEX_RECORDS = 250_000
 MAX_INDEX_TOTAL_READ_BYTES = 192 * 1024 * 1024
 MAX_JSON_INTEGER_DIGITS = 32
+MAX_JSON_INTEGER_ABS = 10**MAX_JSON_INTEGER_DIGITS - 1
 MAX_FIELD_CHARS = 320
 MAX_PATH_CHARS = 4096
 MAX_SELECTOR_CHARS = 512
@@ -59,6 +60,11 @@ def _valid_utc_microseconds(value: int) -> int | None:
     if not UTC_MIN_MICROSECONDS <= value <= UTC_MAX_MICROSECONDS:
         return None
     return value
+
+
+def _format_utc_microseconds(value: int) -> str:
+    normalized = UTC_EPOCH + timedelta(microseconds=value)
+    return normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 class CoveragePartial(RuntimeError):
@@ -131,6 +137,21 @@ def _bounded_text(value: object, limit: int = MAX_FIELD_CHARS) -> str:
     return " ".join(value.split())[:limit]
 
 
+def _bounded_timestamp_scalar(value: object) -> str | int | float | None:
+    if isinstance(value, str):
+        bounded = _bounded_text(value)
+        return bounded or None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        if -MAX_JSON_INTEGER_ABS <= value <= MAX_JSON_INTEGER_ABS:
+            return value
+        return None
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
 def _bounded_path(path: Path) -> str:
     return os.fspath(path)[:MAX_PATH_CHARS]
 
@@ -174,16 +195,22 @@ def _normalize_index_timestamp(value: object) -> int | None:
     return _valid_utc_microseconds(_datetime_to_epoch_microseconds(normalized))
 
 
+def _index_ordering_timestamp(
+    row: dict[str, Any],
+) -> tuple[str | None, int | None]:
+    for key in ("updated_at", "ts"):
+        timestamp = _normalize_index_timestamp(row.get(key))
+        if timestamp is not None:
+            return key, timestamp
+    return None, None
+
+
 def _index_match_sort_key(
     path: Path,
     line_number: int,
     row: dict[str, Any],
 ) -> tuple[int, int, str, int]:
-    timestamp = None
-    for key in ("updated_at", "ts"):
-        timestamp = _normalize_index_timestamp(row.get(key))
-        if timestamp is not None:
-            break
+    _, timestamp = _index_ordering_timestamp(row)
     return (
         int(timestamp is not None),
         timestamp if timestamp is not None else 0,
@@ -483,7 +510,10 @@ def _index_matches(
     *,
     session_id: str | None,
     thread_query: str | None,
+    recent: bool,
 ) -> bool:
+    if recent:
+        return True
     if session_id is not None:
         expected = _normalize_session_id(session_id)
         for key in ("id", "session_id"):
@@ -532,14 +562,20 @@ def _project_index_match(
         "id",
         "session_id",
         "thread_name",
-        "updated_at",
-        "ts",
         "cwd",
         "text",
     ):
         value = _bounded_text(row.get(key))
         if value:
             projection[key] = value
+    for key in ("updated_at", "ts"):
+        value = _bounded_timestamp_scalar(row.get(key))
+        if value is not None:
+            projection[key] = value
+    timestamp_source, timestamp = _index_ordering_timestamp(row)
+    if timestamp_source is not None and timestamp is not None:
+        projection["ordering_timestamp_source"] = timestamp_source
+        projection["ordering_timestamp_utc"] = _format_utc_microseconds(timestamp)
     return projection
 
 
@@ -549,6 +585,7 @@ def _scan_index(
     *,
     session_id: str | None,
     thread_query: str | None,
+    recent: bool = False,
     limit: int,
 ) -> dict[str, Any]:
     codex_home = _lexical_absolute(codex_home)
@@ -628,6 +665,7 @@ def _scan_index(
                             row,
                             session_id=session_id,
                             thread_query=thread_query,
+                            recent=recent,
                         ):
                             continue
                         source["match_count"] += 1
@@ -1166,7 +1204,7 @@ def _scan_rollout_root(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Locate exact or narrowly indexed Codex sessions."
+        description="Locate exact, recent, or narrowly indexed Codex sessions."
     )
     parser.add_argument(
         "--codex-home",
@@ -1176,6 +1214,11 @@ def _parse_args() -> argparse.Namespace:
     selector = parser.add_mutually_exclusive_group(required=True)
     selector.add_argument("--session-id")
     selector.add_argument("--thread-query")
+    selector.add_argument(
+        "--recent",
+        action="store_true",
+        help="Retain newest rows from both indexes without scanning rollouts.",
+    )
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
     if not 1 <= args.limit <= 100:
@@ -1200,6 +1243,7 @@ def main() -> int:
             "session_index.jsonl",
             session_id=args.session_id,
             thread_query=args.thread_query,
+            recent=args.recent,
             limit=args.limit,
         ),
         _scan_index(
@@ -1207,6 +1251,7 @@ def main() -> int:
             "history.jsonl",
             session_id=args.session_id,
             thread_query=args.thread_query,
+            recent=args.recent,
             limit=args.limit,
         ),
     ]
@@ -1232,11 +1277,12 @@ def main() -> int:
     else:
         status = "checked"
 
-    selector = (
-        {"kind": "session-id", "value": args.session_id}
-        if args.session_id is not None
-        else {"kind": "thread-query", "value": args.thread_query}
-    )
+    if args.session_id is not None:
+        selector = {"kind": "session-id", "value": args.session_id}
+    elif args.thread_query is not None:
+        selector = {"kind": "thread-query", "value": args.thread_query}
+    else:
+        selector = {"kind": "recent"}
     document = {
         "codex_home": _bounded_path(codex_home),
         "retained_error_limit_per_source": args.limit,

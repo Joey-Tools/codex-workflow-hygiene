@@ -1,36 +1,29 @@
 # Locate Profile
 
-Use this profile for one exact session/thread lookup. It is not evidence that a
-date window or host corpus is complete.
+Use this profile for exact lookup or bounded recent index orientation. It is not
+evidence that a date window or host corpus is complete.
 
 ## Helper
 
-Exact session ID:
-
 ```bash
-python3 <loaded-skill-dir>/scripts/locate_session.py \
-  --codex-home "${CODEX_HOME:-$HOME/.codex}" \
-  --session-id <session-id> \
-  --limit 20
+python3 <loaded-skill-dir>/scripts/locate_session.py --session-id <session-id>
+python3 <loaded-skill-dir>/scripts/locate_session.py --thread-query <fragment>
+python3 <loaded-skill-dir>/scripts/locate_session.py --recent
 ```
 
-Thread-name or prompt-index fragment:
+Add `--codex-home <path>` or `--limit 1..100` when defaults do not fit.
 
-```bash
-python3 <loaded-skill-dir>/scripts/locate_session.py \
-  --codex-home "${CODEX_HOME:-$HOME/.codex}" \
-  --thread-query <literal-fragment> \
-  --limit 20
-```
+The bounded schema-v2 selector kind is `session-id`, `thread-query`, or `recent`.
+All modes scan both optional indexes with physical-record caps. Recent mode
+retains newest records per source and never scans rollouts; UUID exact mode may
+inventory both rollout roots, while opaque IDs remain index-only. Each source
+reports coverage, total/retained matches and errors, and truncation. `--limit`
+is enforced during collection, not applied after an unbounded list.
 
-The helper emits one bounded schema-v2 JSON document. It scans optional
-`session_index.jsonl` and `history.jsonl` records with a physical-record byte
-cap. UUID-shaped exact-ID mode also inventories both rollout roots; opaque IDs remain index-only. Each
-source reports `checked`, `unavailable`, or `partial`, total and retained
-matches/errors, and deterministic truncation fields. `--limit` is enforced
-during collection; it is not a final slice of an unbounded list. Index matches
-retain the newest normalized `updated_at` / `ts` values in a bounded heap and
-use source path plus physical line as deterministic tie-breakers.
+Index heaps normalize `updated_at` before `ts`, then use source path and physical
+line as deterministic ties. Retained matches expose the finite bounded raw
+timestamp scalar plus `ordering_timestamp_source` and `ordering_timestamp_utc`.
+Out-of-range values remain auditable raw scalars but are absent from ordering.
 
 Each index caps 250,000 records and 192 MiB of aggregate reads across the scan
 and both prefix hashes. It rejects a three-pass prefix beyond that budget before

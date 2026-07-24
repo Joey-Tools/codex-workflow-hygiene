@@ -13,8 +13,8 @@ lightest profile that can answer the question.
 Use `locate` for an exact session ID, thread-name fragment, or recent-thread
 orientation.
 
-1. Query `session_index.jsonl` and `history.jsonl` through
-   `scripts/locate_session.py`.
+1. Query both indexes through `scripts/locate_session.py` with an exact ID,
+   thread fragment, or `--recent`; recent mode never scans rollout roots.
 2. For an exact UUID-shaped session ID, also inspect rollout filenames under
    both roots; keep opaque exact IDs index-only.
 3. Require every `checked` source to retain its descriptor-bound identity,
@@ -22,8 +22,8 @@ orientation.
    revalidation.
 4. Open only the selected rollout files. Parse record shapes and selected fields;
    never print raw JSONL matches or whole retained tool outputs.
-5. Report source coverage, append-only index growth, and whether retained
-   matches or errors were truncated.
+5. Report source coverage, ordering timestamps, append-only index growth, and
+   whether retained matches or errors were truncated.
 
 Read [references/locate.md](references/locate.md) for the helper interface and
 safe extraction rules.

@@ -253,6 +253,100 @@ class SessionLocatorTests(unittest.TestCase):
         self.assertEqual(len(source["matches"]), 2)
         self.assertTrue(source["matches_truncated"])
 
+    def test_recent_mode_reads_both_indexes_without_rollout_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            (codex_home / "session_index.jsonl").write_text(
+                "".join(
+                    json.dumps(row) + "\n"
+                    for row in (
+                        {
+                            "id": "index-old",
+                            "updated_at": "2026-07-24T00:00:00Z",
+                        },
+                        {
+                            "id": "index-new",
+                            "updated_at": 2_000_000_000,
+                        },
+                    )
+                ),
+                encoding="utf-8",
+            )
+            (codex_home / "history.jsonl").write_text(
+                "".join(
+                    json.dumps(row) + "\n"
+                    for row in (
+                        {"session_id": "history-old", "ts": 1_900_000_000},
+                        {"session_id": "history-new", "ts": 2_000_000_000.25},
+                    )
+                ),
+                encoding="utf-8",
+            )
+            (codex_home / "sessions").write_text("not a directory", encoding="utf-8")
+            (codex_home / "archived_sessions").write_text(
+                "not a directory",
+                encoding="utf-8",
+            )
+
+            completed, payload = self.run_locator(
+                codex_home,
+                "--recent",
+                "--limit",
+                "1",
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["selector"], {"kind": "recent"})
+        self.assertEqual(payload["status"], "checked")
+        self.assertEqual(payload["total_matches"], 4)
+        sources = payload["sources"]
+        self.assertEqual(len(sources), 2)
+        self.assertTrue(all(source["kind"] == "index" for source in sources))
+        self.assertEqual([source["match_count"] for source in sources], [2, 2])
+        index_match = sources[0]["matches"][0]
+        self.assertEqual(index_match["id"], "index-new")
+        self.assertEqual(index_match["updated_at"], 2_000_000_000)
+        self.assertEqual(index_match["ordering_timestamp_source"], "updated_at")
+        self.assertEqual(
+            index_match["ordering_timestamp_utc"],
+            "2033-05-18T03:33:20.000000Z",
+        )
+        history_match = sources[1]["matches"][0]
+        self.assertEqual(history_match["session_id"], "history-new")
+        self.assertEqual(history_match["ts"], 2_000_000_000.25)
+        self.assertEqual(history_match["ordering_timestamp_source"], "ts")
+        self.assertEqual(
+            history_match["ordering_timestamp_utc"],
+            "2033-05-18T03:33:20.250000Z",
+        )
+
+    def test_recent_mode_preserves_index_byte_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            with (codex_home / "session_index.jsonl").open("wb") as handle:
+                handle.truncate(LOCATE.MAX_INDEX_TOTAL_READ_BYTES // 3 + 1)
+            (codex_home / "history.jsonl").write_text("", encoding="utf-8")
+            (codex_home / "sessions").write_text("not a directory", encoding="utf-8")
+            (codex_home / "archived_sessions").write_text(
+                "not a directory",
+                encoding="utf-8",
+            )
+
+            completed, payload = self.run_locator(codex_home, "--recent")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(payload["selector"], {"kind": "recent"})
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(len(payload["sources"]), 2)
+        source = payload["sources"][0]
+        self.assertEqual(source["status"], "partial")
+        self.assertEqual(source["reason"], "index-byte-cap-exceeded")
+        self.assertEqual(source["records_scanned"], 0)
+        self.assertEqual(source["index_bytes_processed"], 0)
+
     def test_index_limit_retains_newest_matches_with_stable_ties(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             codex_home = Path(directory).resolve() / ".codex"
@@ -351,6 +445,21 @@ class SessionLocatorTests(unittest.TestCase):
             [match["id"] for match in source["matches"]],
             ["real-newest"],
         )
+        match = source["matches"][0]
+        self.assertEqual(match["ts"], 2_000_000_000)
+        self.assertEqual(match["ordering_timestamp_source"], "ts")
+        self.assertEqual(
+            match["ordering_timestamp_utc"],
+            "2033-05-18T03:33:20.000000Z",
+        )
+        out_of_range = LOCATE._project_index_match(
+            Path("/bounded/session_index.jsonl"),
+            1,
+            {"id": "future", "ts": 10**31},
+        )
+        self.assertEqual(out_of_range["ts"], 10**31)
+        self.assertNotIn("ordering_timestamp_source", out_of_range)
+        self.assertNotIn("ordering_timestamp_utc", out_of_range)
 
     def test_index_byte_cap_is_schema_v2_partial_without_reading_sparse_body(
         self,

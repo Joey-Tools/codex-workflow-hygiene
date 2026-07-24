@@ -32,6 +32,9 @@ superseded_by:
   still does.
 - `locate_session.py` performs bounded exact-ID or thread-index lookup and
   reports per-source `checked`, `unavailable`, or `partial` coverage.
+- Explicit `--recent` orientation scans both indexes under the same per-source
+  record, byte, and three-pass prefix budgets, retains the latest bounded rows,
+  and never touches rollout roots.
 - Index scans bind one initial byte boundary, rehash that prefix through the
   same regular-file descriptor, and distinguish stable later appends from
   truncation, mutation, rotation, replacement, or unreadable revalidation.
@@ -42,7 +45,8 @@ superseded_by:
   truncation counts remain explicit.
 - Index match retention now keeps the newest normalized `updated_at` / `ts`
   records in a fixed-size heap, with source path and physical line as stable
-  tie-breakers.
+  tie-breakers. Retained rows preserve bounded numeric timestamp scalars and
+  identify the normalized UTC value and source field used for ordering.
 - Each index now has a 250,000-record cap and a 192 MiB aggregate content-read
   budget shared by the scan and both prefix-revalidation hashes. A three-pass
   prefix that cannot fit is rejected before body reads, and a record-budget
@@ -75,14 +79,14 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -m unittest tests.test_skill_structure`: 31 tests passed,
+- `python3 -m unittest tests.test_skill_structure`: 33 tests passed,
   including append, prefix mutation, truncation, rotation, broken symlink,
   unreadable source/revalidation, directory replacement/escape, inventory
   drift, access-policy drift, newest-match retention, exact terminal UUID
-  matching, opaque-ID rollout skipping, depth/component budgets, index
-  byte/record caps, oversized JSON integers, UTC numeric/ISO boundary handling,
-  and 25-error retention-cap cases.
-- Full buffered `python3 -m unittest discover -s tests -q -b`: 1,062 tests ran;
+  matching, opaque/recent rollout skipping, recent index byte budgets,
+  depth/component budgets, bounded numeric timestamp projection, UTC numeric/ISO
+  boundary handling, and 25-error retention-cap cases.
+- Full buffered `python3 -m unittest discover -s tests -q -b`: 1,064 tests ran;
   only four
   unrelated sandboxed temporary-Git merge-signing fixtures failed because
   keyboxd was inaccessible.
