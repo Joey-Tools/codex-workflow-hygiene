@@ -189,8 +189,9 @@ class SkillStructureTests(unittest.TestCase):
             "shared lock",
             "owner-private staging directory",
             "SHA-256 digest",
-            "object identity, content digest, and owner/group/mode",
-            "same-filesystem atomic replacement",
+            "identity, content, access policy, and link policy",
+            "atomic no-replace rename",
+            "exchanges the private candidate with live rules",
             "recovery_required",
             "refresh `default.rules.clean-baseline`",
             "necessary adopted-journal",
@@ -204,15 +205,22 @@ class SkillStructureTests(unittest.TestCase):
         )
         self.assertLess(
             transaction.index("acquires the shared lock"),
-            transaction.index("atomic replacement"),
+            transaction.index("atomic no-replace rename"),
         )
         self.assertIn("`audit` is read-only", cadence)
         self.assertIn("## Apply Checklist", cadence)
         self.assertIn("Remain read-only until apply mode is authorized", cadence)
         self.assertIn("## Transaction Safety Boundary", cadence)
         self.assertIn("scripts/apply_rules_transaction.py", cadence)
-        self.assertIn("owner-only, single-link regular file", cadence)
+        self.assertIn("owner-only regular file", cadence)
+        self.assertIn("`st_nlink == 1`", cadence)
         self.assertIn("object identity (`device`, `inode`)", cadence)
+        self.assertIn("object policy (`st_nlink == 1`)", cadence)
+        self.assertIn("schema-v2 receipt", cadence)
+        self.assertIn("retention_incomplete", cadence)
+        self.assertIn("never equates an open FD with durable retention", cadence)
+        self.assertIn("rules-parent FD is rebound", cadence)
+        self.assertIn("descriptor_only_or_unlocatable", cadence)
         self.assertIn("Modification times are not treated as policy mutation", cadence)
         self.assertIn("not a kernel compare-and-swap", cadence)
         self.assertIn("requires every legitimate writer to honor the same persistent lock", cadence)
@@ -248,12 +256,14 @@ class SkillStructureTests(unittest.TestCase):
         for phrase in (
             "fcntl.flock",
             "expected_sha256",
-            "os.replace",
+            "atomic_rename_no_replace",
+            "atomic_rename_exchange",
             "property_mismatches",
             "rollback",
             "recovery_required",
         ):
             self.assertIn(phrase, helper_text)
+        self.assertNotIn("os.replace", helper_text)
         self.assertIn("Audit Codex rules without changing files", interface)
         self.assertIn("run a read-only audit", interface)
         self.assertNotIn("audit or apply", interface.lower())
