@@ -1,6 +1,6 @@
 interface:
   display_name: "Bounded Command Output"
-  short_description: "Bound long-running or high-output commands."
-  default_prompt: "Use $bounded-command-output to keep this command scoped, time-bounded, pollable, and compact."
+  short_description: "Enforce hard runtime and retained-byte bounds."
+  default_prompt: "Use $bounded-command-output to supervise this genuinely broad, noisy, or long-running command with hard runtime and retained-byte bounds."
 policy:
   allow_implicit_invocation: true

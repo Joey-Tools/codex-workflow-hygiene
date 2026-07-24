@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Skill Authoring"
-  short_description: "Create concise concise Codex skills."
-  default_prompt: "Use $codex-skill-authoring to create or update a concise Codex skill for this workflow."
+  short_description: "Apply local conventions on top of $skill-creator."
+  default_prompt: "Use $skill-creator with $codex-skill-authoring to create or update this skill with the correct placement, layering, validation, and argv conventions."
