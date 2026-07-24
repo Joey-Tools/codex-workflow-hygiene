@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
+import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS = ROOT / "skills"
 LOCATOR = SKILLS / "codex-session-mining/scripts/locate_session.py"
+LOCATOR_SPEC = importlib.util.spec_from_file_location("codex_session_locator", LOCATOR)
+if LOCATOR_SPEC is None or LOCATOR_SPEC.loader is None:
+    raise RuntimeError(f"unable to load {LOCATOR}")
+LOCATE = importlib.util.module_from_spec(LOCATOR_SPEC)
+sys.modules[LOCATOR_SPEC.name] = LOCATE
+LOCATOR_SPEC.loader.exec_module(LOCATE)
 
 
 class SkillStructureTests(unittest.TestCase):
@@ -139,6 +148,7 @@ class SessionLocatorTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            timeout=10,
         )
         payload = json.loads(completed.stdout) if completed.stdout else {}
         return completed, payload
@@ -147,10 +157,25 @@ class SessionLocatorTests(unittest.TestCase):
         (codex_home / "sessions/2026/07/24").mkdir(parents=True)
         (codex_home / "archived_sessions").mkdir(parents=True)
 
+    def scan_index(
+        self,
+        codex_home: Path,
+        *,
+        query: str = "review helper",
+        limit: int = 2,
+    ) -> dict[str, object]:
+        return LOCATE._scan_index(
+            codex_home,
+            "session_index.jsonl",
+            session_id=None,
+            thread_query=query,
+            limit=limit,
+        )
+
     def test_exact_id_checks_indexes_and_both_rollout_roots(self) -> None:
         session_id = "019EF067-976B-7E41-928D-80361777330B"
         with tempfile.TemporaryDirectory() as directory:
-            codex_home = Path(directory) / ".codex"
+            codex_home = Path(directory).resolve() / ".codex"
             self.make_roots(codex_home)
             (codex_home / "session_index.jsonl").write_text(
                 json.dumps(
@@ -196,7 +221,7 @@ class SessionLocatorTests(unittest.TestCase):
 
     def test_thread_query_scans_only_bounded_public_index_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            codex_home = Path(directory) / ".codex"
+            codex_home = Path(directory).resolve() / ".codex"
             codex_home.mkdir()
             rows = [
                 {
@@ -230,7 +255,7 @@ class SessionLocatorTests(unittest.TestCase):
 
     def test_malformed_and_oversized_index_records_make_coverage_partial(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            codex_home = Path(directory) / ".codex"
+            codex_home = Path(directory).resolve() / ".codex"
             self.make_roots(codex_home)
             with (codex_home / "session_index.jsonl").open("wb") as handle:
                 handle.write(b"{not-json}\n")
@@ -251,16 +276,14 @@ class SessionLocatorTests(unittest.TestCase):
         self.assertEqual(source["oversized_records"], 1)
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
-    def test_symlinked_index_is_not_followed(self) -> None:
+    def test_broken_symlinked_index_is_partial_not_missing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            codex_home = Path(directory) / ".codex"
+            codex_home = Path(directory).resolve() / ".codex"
             codex_home.mkdir()
-            target = codex_home / "target.jsonl"
-            target.write_text(
-                json.dumps({"id": "secret", "thread_name": "do not follow"}) + "\n",
-                encoding="utf-8",
+            os.symlink(
+                codex_home / "missing-target.jsonl",
+                codex_home / "session_index.jsonl",
             )
-            os.symlink(target, codex_home / "session_index.jsonl")
             (codex_home / "history.jsonl").write_text("", encoding="utf-8")
 
             completed, payload = self.run_locator(
@@ -274,6 +297,321 @@ class SessionLocatorTests(unittest.TestCase):
         source = payload["sources"][0]
         self.assertEqual(source["status"], "partial")
         self.assertEqual(source["match_count"], 0)
+        self.assertNotEqual(source["reason"], "missing")
+
+    def test_append_after_captured_index_boundary_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            index = codex_home / "session_index.jsonl"
+            index.write_text(
+                json.dumps({"id": "first", "thread_name": "review helper"}) + "\n",
+                encoding="utf-8",
+            )
+            initial_size = index.stat().st_size
+            real_validate = LOCATE._validate_index_completion
+
+            def append_then_validate(*args: object, **kwargs: object) -> int:
+                with index.open("ab") as handle:
+                    handle.write(
+                        (
+                            json.dumps(
+                                {
+                                    "id": "later",
+                                    "thread_name": "review helper appended",
+                                }
+                            )
+                            + "\n"
+                        ).encode()
+                    )
+                return real_validate(*args, **kwargs)
+
+            with mock.patch.object(
+                LOCATE,
+                "_validate_index_completion",
+                side_effect=append_then_validate,
+            ):
+                source = self.scan_index(codex_home)
+
+        self.assertEqual(source["status"], "checked")
+        self.assertEqual(source["captured_prefix_bytes"], initial_size)
+        self.assertEqual(source["match_count"], 1)
+        self.assertTrue(source["append_after_boundary"])
+        self.assertEqual(
+            source["content_scope"],
+            "stable-captured-prefix-with-later-append",
+        )
+
+    def test_index_prefix_mutation_is_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            index = codex_home / "session_index.jsonl"
+            index.write_text(
+                json.dumps({"id": "first", "thread_name": "review helper"}) + "\n",
+                encoding="utf-8",
+            )
+            real_validate = LOCATE._validate_index_completion
+
+            def mutate_then_validate(*args: object, **kwargs: object) -> int:
+                with index.open("r+b") as handle:
+                    handle.write(b" ")
+                return real_validate(*args, **kwargs)
+
+            with mock.patch.object(
+                LOCATE,
+                "_validate_index_completion",
+                side_effect=mutate_then_validate,
+            ):
+                source = self.scan_index(codex_home)
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn("source-prefix-mutated", source["reasons"])
+
+    def test_index_truncation_is_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            index = codex_home / "session_index.jsonl"
+            index.write_text(
+                json.dumps({"id": "first", "thread_name": "review helper"}) + "\n",
+                encoding="utf-8",
+            )
+            real_validate = LOCATE._validate_index_completion
+
+            def truncate_then_validate(*args: object, **kwargs: object) -> int:
+                index.write_bytes(b"")
+                return real_validate(*args, **kwargs)
+
+            with mock.patch.object(
+                LOCATE,
+                "_validate_index_completion",
+                side_effect=truncate_then_validate,
+            ):
+                source = self.scan_index(codex_home)
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn(
+            "source-truncated-during-revalidation",
+            source["reasons"],
+        )
+
+    def test_index_rotation_is_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            index = codex_home / "session_index.jsonl"
+            row = json.dumps({"id": "first", "thread_name": "review helper"}) + "\n"
+            index.write_text(row, encoding="utf-8")
+            rotated = codex_home / "session_index.rotated"
+            real_validate = LOCATE._validate_index_completion
+
+            def rotate_then_validate(*args: object, **kwargs: object) -> int:
+                index.rename(rotated)
+                index.write_text(row, encoding="utf-8")
+                return real_validate(*args, **kwargs)
+
+            with mock.patch.object(
+                LOCATE,
+                "_validate_index_completion",
+                side_effect=rotate_then_validate,
+            ):
+                source = self.scan_index(codex_home)
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn("source-rotated-or-replaced", source["reasons"])
+
+    def test_index_access_policy_change_is_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            index = codex_home / "session_index.jsonl"
+            index.write_text(
+                json.dumps({"id": "first", "thread_name": "review helper"}) + "\n",
+                encoding="utf-8",
+            )
+            original_mode = stat.S_IMODE(index.stat().st_mode)
+            changed_mode = 0o600 if original_mode != 0o600 else 0o640
+            real_validate = LOCATE._validate_index_completion
+
+            def chmod_then_validate(*args: object, **kwargs: object) -> int:
+                index.chmod(changed_mode)
+                return real_validate(*args, **kwargs)
+
+            with mock.patch.object(
+                LOCATE,
+                "_validate_index_completion",
+                side_effect=chmod_then_validate,
+            ):
+                source = self.scan_index(codex_home)
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn(
+            "source-identity-or-access-policy-changed",
+            source["reasons"],
+        )
+
+    def test_unreadable_index_is_partial_not_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            index = codex_home / "session_index.jsonl"
+            index.write_text("{}\n", encoding="utf-8")
+            real_open = LOCATE.os.open
+
+            def deny_index(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                if path == "session_index.jsonl" and dir_fd is not None:
+                    raise PermissionError("blocked test source")
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch.object(LOCATE.os, "open", side_effect=deny_index):
+                source = self.scan_index(codex_home)
+
+        self.assertEqual(source["status"], "partial")
+        self.assertEqual(source["reason"], "open-failed:PermissionError")
+
+    def test_unreadable_index_revalidation_is_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            (codex_home / "session_index.jsonl").write_text(
+                json.dumps({"thread_name": "review helper"}) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                LOCATE,
+                "_hash_prefix",
+                side_effect=PermissionError("blocked revalidation"),
+            ):
+                source = self.scan_index(codex_home)
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn(
+            "source-revalidation-failed:PermissionError",
+            source["reasons"],
+        )
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_rollout_root_replacement_escape_is_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            codex_home = base / ".codex"
+            root = codex_home / "sessions"
+            root.mkdir(parents=True)
+            (root / "rollout-target.jsonl").write_text("{}\n", encoding="utf-8")
+            outside = base / "outside"
+            outside.mkdir()
+            original = base / "sessions-original"
+            real_revalidate = LOCATE._revalidate_rollout_tree
+
+            def replace_then_validate(*args: object, **kwargs: object) -> None:
+                root.rename(original)
+                os.symlink(outside, root)
+                real_revalidate(*args, **kwargs)
+
+            with mock.patch.object(
+                LOCATE,
+                "_revalidate_rollout_tree",
+                side_effect=replace_then_validate,
+            ):
+                source = LOCATE._scan_rollout_root(
+                    codex_home,
+                    "sessions",
+                    session_id="target",
+                    limit=2,
+                )
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn("rollout-root-replaced-or-escaped", source["reasons"])
+
+    def test_rollout_inventory_drift_is_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            root = codex_home / "sessions"
+            root.mkdir(parents=True)
+            (root / "rollout-target.jsonl").write_text("{}\n", encoding="utf-8")
+            real_revalidate = LOCATE._revalidate_rollout_tree
+
+            def drift_then_validate(*args: object, **kwargs: object) -> None:
+                (root / "late-entry").write_text("late", encoding="utf-8")
+                real_revalidate(*args, **kwargs)
+
+            with mock.patch.object(
+                LOCATE,
+                "_revalidate_rollout_tree",
+                side_effect=drift_then_validate,
+            ):
+                source = LOCATE._scan_rollout_root(
+                    codex_home,
+                    "sessions",
+                    session_id="target",
+                    limit=2,
+                )
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn("rollout-entry-inventory-changed", source["reasons"])
+
+    def test_rollout_directory_access_policy_change_is_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            root = codex_home / "sessions"
+            root.mkdir(parents=True)
+            (root / "rollout-target.jsonl").write_text("{}\n", encoding="utf-8")
+            original_mode = stat.S_IMODE(root.stat().st_mode)
+            changed_mode = 0o700 if original_mode != 0o700 else 0o750
+            real_revalidate = LOCATE._revalidate_rollout_tree
+
+            def chmod_then_validate(*args: object, **kwargs: object) -> None:
+                root.chmod(changed_mode)
+                real_revalidate(*args, **kwargs)
+
+            with mock.patch.object(
+                LOCATE,
+                "_revalidate_rollout_tree",
+                side_effect=chmod_then_validate,
+            ):
+                source = LOCATE._scan_rollout_root(
+                    codex_home,
+                    "sessions",
+                    session_id="target",
+                    limit=2,
+                )
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn(
+            "rollout-root-identity-or-access-policy-changed",
+            source["reasons"],
+        )
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_many_rollout_errors_are_capped_during_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            root = codex_home / "sessions"
+            root.mkdir(parents=True)
+            for index in range(25):
+                os.symlink(
+                    root / f"missing-{index:02d}",
+                    root / f"broken-{index:02d}",
+                )
+
+            source = LOCATE._scan_rollout_root(
+                codex_home,
+                "sessions",
+                session_id="target",
+                limit=3,
+            )
+
+        self.assertEqual(source["status"], "partial")
+        self.assertEqual(source["error_count"], 25)
+        self.assertEqual(len(source["errors"]), 3)
+        self.assertTrue(source["errors_truncated"])
 
 
 if __name__ == "__main__":

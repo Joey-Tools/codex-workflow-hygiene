@@ -18,6 +18,9 @@ superseded_by:
   retained-byte enforcement.
 - Split `codex-session-mining` into lightweight `locate` and complete `corpus`
   profiles.
+- Hardened the lightweight locator so `checked` means a descriptor-bound,
+  revalidated index prefix or rollout inventory rather than a path-level
+  best-effort scan.
 - Reduced `codex-skill-authoring` to the user's placement, layering,
   validation-wrapper, and approval-friendly argv overlay on system
   `$skill-creator`.
@@ -29,6 +32,14 @@ superseded_by:
   still does.
 - `locate_session.py` performs bounded exact-ID or thread-index lookup and
   reports per-source `checked`, `unavailable`, or `partial` coverage.
+- Index scans bind one initial byte boundary, rehash that prefix through the
+  same regular-file descriptor, and distinguish stable later appends from
+  truncation, mutation, rotation, replacement, or unreadable revalidation.
+- Rollout lookup binds the complete no-follow directory chain, inventories
+  through held descriptors, and revalidates directory identity, uid/gid/mode,
+  and a 100,000-entry-bounded name/type/device/inode inventory.
+- Match and error retention is capped during collection while total and
+  truncation counts remain explicit.
 - `build_session_corpus.py` remains the authoritative current-host
   active-plus-archived, replay-aware corpus path.
 - Generic skill scaffolding, frontmatter design, `agents/openai.yaml`, and
@@ -44,17 +55,21 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -m unittest discover -s tests -p 'test_skill_structure.py' -v`: 9
-  tests passed.
-- Full `python3 -m unittest discover -s tests`: 1,040 tests ran; only four
+- `python3 -m unittest tests.test_skill_structure -v`: 20 tests passed,
+  including append, prefix mutation, truncation, rotation, broken symlink,
+  unreadable source/revalidation, directory replacement/escape, inventory
+  drift, access-policy drift, and 25-error retention-cap cases.
+- Full `python3 -m unittest discover -s tests`: 1,051 tests ran; only four
   sandboxed temporary-Git signing fixtures failed because keyboxd was
   inaccessible.
 - The exact four signing fixtures were rerun outside the sandbox and all passed.
-- System `$skill-creator` quick validation through
-  `codex_skill_validate.py`: 3/3 skills valid.
+- System `$skill-creator` quick validation passed for `codex-session-mining`
+  through the documented isolated `uv` + PyYAML fallback.
 - Ruff check and format check, Python compilation, and `git diff --check`
   passed.
 - Project-journal frontmatter validation passed.
-- A real read-only thread-query invocation of `locate_session.py` checked both
-  local indexes, retained two bounded matches per source, and reported
-  truncation plus total match counts.
+- A real read-only thread-query invocation checked both local indexes, retained
+  at most two matches, and reported 27 total matches.
+- A real exact-ID invocation checked both indexes plus 176 active rollout
+  directories and 9,360 archived entries; every source completed descriptor
+  and inventory revalidation.

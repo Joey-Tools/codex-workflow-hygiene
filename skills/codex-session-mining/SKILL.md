@@ -17,9 +17,13 @@ orientation.
    `scripts/locate_session.py`.
 2. For an exact session ID, also inspect rollout filenames under both existing
    `sessions/` and `archived_sessions/` roots.
-3. Open only the selected rollout files. Parse record shapes and selected fields;
+3. Require every `checked` source to retain its descriptor-bound identity,
+   access policy, stable index prefix, or rollout entry inventory through final
+   revalidation.
+4. Open only the selected rollout files. Parse record shapes and selected fields;
    never print raw JSONL matches or whole retained tool outputs.
-4. Report source coverage and whether output matches were truncated.
+5. Report source coverage, append-only index growth, and whether retained
+   matches or errors were truncated.
 
 Read [references/locate.md](references/locate.md) for the helper interface and
 safe extraction rules.

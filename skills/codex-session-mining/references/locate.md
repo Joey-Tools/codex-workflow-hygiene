@@ -23,15 +23,37 @@ python3 <loaded-skill-dir>/scripts/locate_session.py \
   --limit 20
 ```
 
-The helper emits one bounded JSON document. It scans optional
+The helper emits one bounded schema-v2 JSON document. It scans optional
 `session_index.jsonl` and `history.jsonl` records with a physical-record byte
-cap. Exact-ID mode also inventories filenames under both existing rollout
-roots. Each source reports `checked`, `unavailable`, or `partial`, total matches,
-retained matches, and truncation.
+cap. Exact-ID mode also inventories filenames under both rollout roots. Each
+source reports `checked`, `unavailable`, or `partial`, total and retained
+matches/errors, and deterministic truncation fields. `--limit` is enforced
+during collection; it is not a final slice of an unbounded list.
 
-Missing optional roots are `unavailable`, not empty failures. Malformed,
-oversized, unreadable, or changing sources make the corresponding coverage
-`partial`; do not call the lookup complete without reporting that status.
+Only `FileNotFoundError` classifies an optional index or root as
+`unavailable`. A broken symlink, permission or I/O error, wrong type, path
+escape, or failed revalidation is `partial`.
+
+## Stability Contract
+
+- Open every index with no-follow and nonblocking flags relative to one held
+  `codex_home` directory descriptor. Capture its initial byte length and scan
+  exactly that prefix.
+- Rehash the same prefix from the original descriptor, reopen it relative to a
+  freshly validated directory chain, and require byte identity plus stable
+  device, inode, file type, owner, group, and permission bits.
+- Report `captured_prefix_bytes`, `final_size_bytes`, `content_scope`, and
+  `append_after_boundary`. A byte-identical prefix with a later append may stay
+  `checked` as `stable-captured-prefix-with-later-append`; the appended records
+  were not searched. Truncation, prefix mutation, rotation, replacement, or
+  unreadable validation is `partial`.
+- Open every component from the filesystem root through `codex_home` and each
+  rollout root with descriptor-relative no-follow directory opens. Enumerate
+  from held directory descriptors and never traverse symlinks.
+- Before `checked`, reopen the full chain and require stable directory identity
+  and access policy plus an unchanged bounded inventory of entry names, types,
+  devices, and inodes. Inventory is capped at 100,000 entries; exceeding the
+  cap is `partial`.
 
 ## Open A Selected Rollout
 
