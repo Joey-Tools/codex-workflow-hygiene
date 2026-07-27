@@ -111,6 +111,12 @@ superseded_by:
   of a `P` candidate or `R` backup.
 - Bound idempotent recovery to exact original or persisted recovery-terminal
   identity, and revalidated recovery copies after locator binding.
+- Scoped ext4's kernel-managed directory-index flag out of unmodeled metadata
+  only for descriptor-proved directories, while retaining immutable and other
+  user/security-relevant flags as access-policy failures.
+- Made Linux process-cleanup assertions accept `/proc` terminal states
+  `Z`/`X`/`x` without waiting for PID 1 to reap orphaned descendants, while
+  every live state remains a failed quiescence proof.
 - Reduced the Joey authoring overlay to placement and validation policy while
   respecting non-default `CODEX_HOME`.
 - Strengthened structural tests for the complete audit and cold-start paths.
@@ -281,6 +287,14 @@ superseded_by:
   inodes unless a transaction-bound recovery-terminal record names them.
 - `codex-skill-authoring` resolves the active skill root from `CODEX_HOME` or
   the loaded skill directory rather than assuming `$HOME/.codex`.
+- Linux file-flag admission ignores `FS_INDEX_FL` only for directories because
+  it changes ext4's lookup layout rather than object identity, directory-entry
+  content, or access policy. The same bit on a regular file and every
+  nonautomatic access/security flag remain unmodeled and rejected.
+- Linux cleanup assertions read bounded `/proc/<pid>/stat` state while `/proc`
+  is available. Missing PIDs and `Z`/`X`/`x` are terminal; malformed,
+  unreadable, and live states remain conservative failures. Other platforms
+  retain the portable signal-zero probe.
 - The active audit workflow remains read-only; apply behavior is isolated in
   the skill-relative transaction helper.
 
@@ -382,6 +396,15 @@ superseded_by:
 - The four new transaction methods passed on system Python 3.9.6, and both
   changed Python files byte-compiled on Python 3.13 and system Python 3.9.6
   with task-scoped caches removed afterward.
+- GitHub Actions run `30240557145`, job `89896679716`, and PR #63 all bound the
+  failure to head `97f55508418718d8ddbd3547b5cfeb0190a06e33`. Its sole error
+  was `unsupported_file_flags` while binding the rules parent after the large
+  sibling-inventory test caused ext4 to add `FS_INDEX_FL`.
+- The ext4 flag and Linux terminal-state regression methods, the large sibling
+  inventory reproduction, and both orphan-descendant cleanup scenarios passed
+  5/5 on Python 3.13 and system Python 3.9.6. The full Rules transaction suite
+  passed 211/211 and the full repository suite passed 1,273/1,273 on Python
+  3.13.
 - The newest static gates passed Ruff check/format, the official Rules skill
   validator, project-journal validation, and `git diff --check`.
 - Final static gates passed Ruff check/format, the official Rules skill

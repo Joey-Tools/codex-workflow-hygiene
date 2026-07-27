@@ -50,6 +50,30 @@ def load_helper_module():
 
 
 TRANSACTION = load_helper_module()
+LINUX_TERMINAL_PROCESS_STATES = frozenset((b"Z", b"X", b"x"))
+
+
+def process_has_exited(pid: int, *, proc_root: Path = Path("/proc")) -> bool:
+    if sys.platform.startswith("linux") and (proc_root / "self/stat").is_file():
+        try:
+            with (proc_root / str(pid) / "stat").open("rb", buffering=0) as handle:
+                raw = handle.read(4097)
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+        except OSError:
+            return False
+        if len(raw) > 4096:
+            return False
+        close_paren = raw.rfind(b")")
+        fields = raw[close_paren + 2 :].split() if close_paren >= 0 else []
+        return bool(fields) and fields[0] in LINUX_TERMINAL_PROCESS_STATES
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
 
 
 class RulesApplyTransactionTests(unittest.TestCase):
@@ -130,9 +154,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
     def assert_process_exited(self, pid: int) -> None:
         deadline = time.monotonic() + 2
         while True:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if process_has_exited(pid):
                 return
             if time.monotonic() >= deadline:
                 try:
@@ -141,6 +163,31 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     pass
                 self.fail(f"validator process {pid} remained alive")
             time.sleep(0.01)
+
+    def test_process_exit_probe_accepts_linux_terminal_states_only(self) -> None:
+        proc_root = self.root / "proc"
+        (proc_root / "self").mkdir(parents=True)
+        (proc_root / "self/stat").write_bytes(b"1 (test runner) R 0 1 1\n")
+        target_stat = proc_root / "123/stat"
+        target_stat.parent.mkdir()
+
+        with mock.patch.object(sys, "platform", "linux"):
+            for state in (b"Z", b"X", b"x"):
+                with self.subTest(state=state.decode("ascii")):
+                    target_stat.write_bytes(
+                        b"123 (validator child) " + state + b" 1 123 123\n"
+                    )
+                    self.assertTrue(process_has_exited(123, proc_root=proc_root))
+
+            for state in (b"R", b"S", b"D", b"T", b"I"):
+                with self.subTest(state=state.decode("ascii")):
+                    target_stat.write_bytes(
+                        b"123 (validator child) " + state + b" 1 123 123\n"
+                    )
+                    self.assertFalse(process_has_exited(123, proc_root=proc_root))
+
+            target_stat.unlink()
+            self.assertTrue(process_has_exited(123, proc_root=proc_root))
 
     def xattr_validator_source(self, *, live_only: bool = False) -> str:
         probe = self.root / "xattr-probe"
@@ -1515,6 +1562,84 @@ class RulesApplyTransactionTests(unittest.TestCase):
             self.assertEqual(raised.exception.details["st_flags"], 0x10)
         finally:
             stage.cleanup()
+
+    def test_linux_directory_index_flag_is_ignored_but_immutable_is_rejected(
+        self,
+    ) -> None:
+        directory_fd = os.open(self.rules_dir, os.O_RDONLY)
+
+        def inspect_flags(
+            raw_flags: int,
+            *,
+            file_mode: int = stat.S_IFDIR | 0o700,
+            require_directory: bool = True,
+        ) -> None:
+            def inject_flags(
+                _fd: int,
+                request: int,
+                buffer: object,
+                mutate: bool,
+            ) -> int:
+                self.assertEqual(request, TRANSACTION.LINUX_FS_IOC_GETFLAGS)
+                self.assertTrue(mutate)
+                buffer[0] = raw_flags  # type: ignore[index]
+                return 0
+
+            with (
+                mock.patch.object(
+                    TRANSACTION.os,
+                    "fstat",
+                    return_value=SimpleNamespace(
+                        st_flags=None,
+                        st_mode=file_mode,
+                    ),
+                ),
+                mock.patch.object(TRANSACTION.sys, "platform", "linux"),
+                mock.patch.object(
+                    TRANSACTION.fcntl,
+                    "ioctl",
+                    side_effect=inject_flags,
+                ),
+                mock.patch.object(
+                    TRANSACTION,
+                    "_list_bound_xattrs",
+                    return_value=(),
+                ),
+                mock.patch.object(
+                    TRANSACTION,
+                    "_bound_has_extended_acl",
+                    return_value=False,
+                ),
+            ):
+                TRANSACTION.reject_unmodeled_metadata_fd(
+                    directory_fd,
+                    label="rules_parent",
+                    require_directory=require_directory,
+                )
+
+        try:
+            inspect_flags(0x00001000)  # FS_INDEX_FL
+            with self.assertRaises(TRANSACTION.TransactionError) as raised:
+                inspect_flags(0x00001000 | 0x00000010)  # FS_IMMUTABLE_FL
+
+            self.assertEqual(raised.exception.status, "unsupported_file_flags")
+            self.assertEqual(raised.exception.details["st_flags"], 0x00000010)
+            with self.assertRaises(TRANSACTION.TransactionError) as regular_raised:
+                inspect_flags(
+                    0x00001000,
+                    file_mode=stat.S_IFREG | 0o600,
+                    require_directory=False,
+                )
+            self.assertEqual(
+                regular_raised.exception.status,
+                "unsupported_file_flags",
+            )
+            self.assertEqual(
+                regular_raised.exception.details["st_flags"],
+                0x00001000,
+            )
+        finally:
+            os.close(directory_fd)
 
     def test_bound_backup_replacement_is_detected(self) -> None:
         stage, evidence = self.create_apply_evidence()

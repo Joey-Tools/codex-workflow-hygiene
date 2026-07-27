@@ -70,6 +70,10 @@ LINUX_AUTOMATIC_FILE_FLAGS = (
     | 0x00400000  # FS_EOFBLOCKS_FL
     | 0x10000000  # FS_INLINE_DATA_FL
 )
+# ext4 sets FS_INDEX_FL as an internal lookup-layout detail when a directory
+# grows. It changes neither directory entries nor object identity or access
+# policy, so ignore it only after the descriptor has proved directory type.
+LINUX_AUTOMATIC_DIRECTORY_FLAGS = 0x00001000  # FS_INDEX_FL
 
 EXIT_VALIDATION_FAILED = 10
 EXIT_LIVE_CONFLICT = 20
@@ -1657,7 +1661,10 @@ def _bound_file_flags(fd: int, *, label: str) -> int:
             "FS_IOC_GETFLAGS failed",
             error=error,
         ) from error
-    return int(raw_flags[0]) & ~LINUX_AUTOMATIC_FILE_FLAGS
+    automatic_flags = LINUX_AUTOMATIC_FILE_FLAGS
+    if stat.S_ISDIR(file_stat.st_mode):
+        automatic_flags |= LINUX_AUTOMATIC_DIRECTORY_FLAGS
+    return int(raw_flags[0]) & ~automatic_flags
 
 
 def _list_bound_xattrs(fd: int, *, label: str) -> tuple[bytes, ...]:
