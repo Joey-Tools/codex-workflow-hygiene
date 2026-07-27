@@ -24,6 +24,11 @@ Index heaps normalize `updated_at` before `ts`, then use source path and physica
 line as deterministic ties. Retained matches expose the finite bounded raw
 timestamp scalar plus `ordering_timestamp_source` and `ordering_timestamp_utc`.
 Out-of-range values remain auditable raw scalars but are absent from ordering.
+Opaque `id` and `session_id` values remain exact through the 512-character
+selector bound. Every clipped string or path exposes `truncated_fields` with
+`limit_chars`, `pre_truncation_chars`, and `retained_chars`; a retained
+locating path that cannot fit also makes its source `partial` as
+`locating-path-projection-truncated`.
 
 Each index caps 250,000 records and 192 MiB of aggregate reads across the scan
 and both prefix hashes. It rejects a three-pass prefix beyond that budget before

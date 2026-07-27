@@ -255,6 +255,83 @@ class SessionLocatorTests(unittest.TestCase):
         self.assertEqual(len(source["matches"]), 2)
         self.assertTrue(source["matches_truncated"])
 
+    def test_opaque_exact_ids_through_selector_limit_are_preserved(self) -> None:
+        for field in ("id", "session_id"):
+            for identifier_length in (321, LOCATE.MAX_SELECTOR_CHARS):
+                with self.subTest(field=field, identifier_length=identifier_length):
+                    identifier = "opaque-" + "x" * (identifier_length - len("opaque-"))
+                    with tempfile.TemporaryDirectory() as directory:
+                        codex_home = Path(directory).resolve() / ".codex"
+                        codex_home.mkdir()
+                        (codex_home / "session_index.jsonl").write_text(
+                            json.dumps(
+                                {
+                                    field: identifier,
+                                    "thread_name": "Opaque exact identifier",
+                                }
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                        (codex_home / "history.jsonl").write_text(
+                            "",
+                            encoding="utf-8",
+                        )
+
+                        completed, payload = self.run_locator(
+                            codex_home,
+                            "--session-id",
+                            identifier,
+                        )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(payload["status"], "checked")
+                    self.assertEqual(payload["total_matches"], 1)
+                    match = payload["sources"][0]["matches"][0]
+                    self.assertEqual(match[field], identifier)
+                    self.assertNotIn(
+                        field,
+                        match.get("truncated_fields", {}),
+                    )
+
+    def test_thread_query_reports_decisive_display_text_truncation(self) -> None:
+        query = "decisive-tail"
+        text = "x" * (LOCATE.MAX_FIELD_CHARS + 17) + query
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            (codex_home / "session_index.jsonl").write_text(
+                json.dumps(
+                    {
+                        "id": "tail-match",
+                        "text": text,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (codex_home / "history.jsonl").write_text("", encoding="utf-8")
+
+            completed, payload = self.run_locator(
+                codex_home,
+                "--thread-query",
+                query,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(payload["status"], "checked")
+        match = payload["sources"][0]["matches"][0]
+        self.assertEqual(match["id"], "tail-match")
+        self.assertNotIn(query, match["text"])
+        self.assertEqual(
+            match["truncated_fields"]["text"],
+            {
+                "limit_chars": LOCATE.MAX_FIELD_CHARS,
+                "pre_truncation_chars": len(text),
+                "retained_chars": LOCATE.MAX_FIELD_CHARS,
+            },
+        )
+
     def test_recent_mode_reads_both_indexes_without_rollout_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             codex_home = Path(directory).resolve() / ".codex"
@@ -1124,6 +1201,42 @@ class SessionLocatorTests(unittest.TestCase):
             source["reasons"],
         )
         self.assertEqual(source["path_component_bytes_reserved"], len("first"))
+
+    def test_rollout_match_path_beyond_projection_limit_is_partial(self) -> None:
+        session_id = "019ef067-976b-7e41-928d-80361777330b"
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            root = codex_home / "sessions"
+            nested = root / "descriptor-traversed"
+            nested.mkdir(parents=True)
+            match_path = nested / f"rollout-copy-{session_id}.jsonl"
+            match_path.write_text("{}\n", encoding="utf-8")
+            projection_limit = len(os.fspath(root)) + 1
+
+            with mock.patch.object(LOCATE, "MAX_PATH_CHARS", projection_limit):
+                source = LOCATE._scan_rollout_root(
+                    codex_home,
+                    "sessions",
+                    session_id=session_id,
+                    limit=2,
+                )
+
+        self.assertEqual(source["status"], "partial")
+        self.assertIn(
+            "locating-path-projection-truncated",
+            source["reasons"],
+        )
+        self.assertEqual(source["match_count"], 1)
+        match = source["matches"][0]
+        self.assertEqual(len(match["path"]), projection_limit)
+        self.assertEqual(
+            match["truncated_fields"]["path"],
+            {
+                "limit_chars": projection_limit,
+                "pre_truncation_chars": len(os.fspath(match_path)),
+                "retained_chars": projection_limit,
+            },
+        )
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
     def test_many_rollout_errors_are_capped_during_collection(self) -> None:

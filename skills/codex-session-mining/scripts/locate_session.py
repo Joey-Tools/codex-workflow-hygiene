@@ -131,16 +131,47 @@ class DirectoryChain:
         self.close()
 
 
-def _bounded_text(value: object, limit: int = MAX_FIELD_CHARS) -> str:
+def _project_string(
+    projection: dict[str, Any],
+    key: str,
+    value: object,
+    *,
+    limit: int,
+    normalize_whitespace: bool,
+) -> None:
     if not isinstance(value, str):
-        return ""
-    return " ".join(value.split())[:limit]
+        return
+    candidate = " ".join(value.split()) if normalize_whitespace else value
+    if not candidate:
+        return
+    retained = candidate[:limit]
+    projection[key] = retained
+    if len(candidate) > limit:
+        projection.setdefault("truncated_fields", {})[key] = {
+            "limit_chars": limit,
+            "pre_truncation_chars": len(candidate),
+            "retained_chars": len(retained),
+        }
 
 
-def _bounded_timestamp_scalar(value: object) -> str | int | float | None:
-    if isinstance(value, str):
-        bounded = _bounded_text(value)
-        return bounded or None
+def _project_path(path: Path) -> dict[str, Any]:
+    projection: dict[str, Any] = {}
+    _project_string(
+        projection,
+        "path",
+        os.fspath(path),
+        limit=MAX_PATH_CHARS,
+        normalize_whitespace=False,
+    )
+    return projection
+
+
+def _has_truncated_field(projection: dict[str, Any], key: str) -> bool:
+    truncated_fields = projection.get("truncated_fields")
+    return isinstance(truncated_fields, dict) and key in truncated_fields
+
+
+def _bounded_timestamp_scalar(value: object) -> int | float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -150,10 +181,6 @@ def _bounded_timestamp_scalar(value: object) -> str | int | float | None:
     if isinstance(value, float) and math.isfinite(value):
         return value
     return None
-
-
-def _bounded_path(path: Path) -> str:
-    return os.fspath(path)[:MAX_PATH_CHARS]
 
 
 def _lexical_absolute(path: Path) -> Path:
@@ -463,7 +490,7 @@ def _validate_index_completion(
 
 
 def _empty_source(kind: str, path: Path) -> dict[str, Any]:
-    return {
+    source = {
         "error_count": 0,
         "errors": [],
         "errors_truncated": False,
@@ -473,10 +500,11 @@ def _empty_source(kind: str, path: Path) -> dict[str, Any]:
         "matches": [],
         "matches_truncated": False,
         "oversized_records": 0,
-        "path": _bounded_path(path),
         "records_scanned": 0,
         "status": "checked",
     }
+    source.update(_project_path(path))
+    return source
 
 
 def _mark_partial(source: dict[str, Any], reason: str) -> None:
@@ -496,12 +524,9 @@ def _record_error(
 ) -> None:
     source["error_count"] += 1
     if len(source["errors"]) < limit:
-        source["errors"].append(
-            {
-                "path": _bounded_path(path),
-                "reason": reason,
-            }
-        )
+        error_projection = {"reason": reason}
+        error_projection.update(_project_path(path))
+        source["errors"].append(error_projection)
     source["errors_truncated"] = source["error_count"] > len(source["errors"])
 
 
@@ -554,22 +579,36 @@ def _project_index_match(
     line_number: int,
     row: dict[str, Any],
 ) -> dict[str, Any]:
-    projection: dict[str, Any] = {
-        "line": line_number,
-        "path": _bounded_path(path),
-    }
-    for key in (
-        "id",
-        "session_id",
-        "thread_name",
-        "cwd",
-        "text",
-    ):
-        value = _bounded_text(row.get(key))
-        if value:
-            projection[key] = value
+    projection: dict[str, Any] = {"line": line_number}
+    projection.update(_project_path(path))
+    for key in ("id", "session_id"):
+        _project_string(
+            projection,
+            key,
+            row.get(key),
+            limit=MAX_SELECTOR_CHARS,
+            normalize_whitespace=False,
+        )
+    for key in ("thread_name", "cwd", "text"):
+        _project_string(
+            projection,
+            key,
+            row.get(key),
+            limit=MAX_FIELD_CHARS,
+            normalize_whitespace=True,
+        )
     for key in ("updated_at", "ts"):
-        value = _bounded_timestamp_scalar(row.get(key))
+        raw_value = row.get(key)
+        if isinstance(raw_value, str):
+            _project_string(
+                projection,
+                key,
+                raw_value,
+                limit=MAX_FIELD_CHARS,
+                normalize_whitespace=True,
+            )
+            continue
+        value = _bounded_timestamp_scalar(raw_value)
         if value is not None:
             projection[key] = value
     timestamp_source, timestamp = _index_ordering_timestamp(row)
@@ -726,6 +765,8 @@ def _scan_index(
     if source["malformed_records"] or source["oversized_records"]:
         _mark_partial(source, "malformed-or-oversized-records")
     source["matches_truncated"] = source["match_count"] > len(source["matches"])
+    if any(_has_truncated_field(match, "path") for match in source["matches"]):
+        _mark_partial(source, "locating-path-projection-truncated")
     return source
 
 
@@ -1172,9 +1213,7 @@ def _scan_rollout_root(
                             continue
                         source["match_count"] += 1
                         if len(source["matches"]) < limit:
-                            source["matches"].append(
-                                {"path": _bounded_path(entry_path)}
-                            )
+                            source["matches"].append(_project_path(entry_path))
                 except OSError as error:
                     _record_error(
                         source,
@@ -1209,6 +1248,8 @@ def _scan_rollout_root(
 
     source["matches_truncated"] = source["match_count"] > len(source["matches"])
     source["errors_truncated"] = source["error_count"] > len(source["errors"])
+    if any(_has_truncated_field(match, "path") for match in source["matches"]):
+        _mark_partial(source, "locating-path-projection-truncated")
     return source
 
 
@@ -1294,7 +1335,6 @@ def main() -> int:
     else:
         selector = {"kind": "recent"}
     document = {
-        "codex_home": _bounded_path(codex_home),
         "retained_error_limit_per_source": args.limit,
         "retained_match_limit_per_source": args.limit,
         "schema_version": 2,
@@ -1304,6 +1344,13 @@ def main() -> int:
         "total_errors": sum(source["error_count"] for source in sources),
         "total_matches": sum(source["match_count"] for source in sources),
     }
+    _project_string(
+        document,
+        "codex_home",
+        os.fspath(codex_home),
+        limit=MAX_PATH_CHARS,
+        normalize_whitespace=False,
+    )
     print(json.dumps(document, ensure_ascii=True, sort_keys=True))
     return 0
 

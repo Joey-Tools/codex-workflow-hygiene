@@ -43,6 +43,11 @@ superseded_by:
   and a 100,000-entry-bounded name/type/device/inode inventory.
 - Match and error retention is capped during collection while total and
   truncation counts remain explicit.
+- Schema-v2 index projections preserve exact opaque `id` and `session_id`
+  values through the 512-character selector bound. Bounded display fields and
+  every projected path now expose deterministic per-field character counts
+  when truncated; a retained locating path that cannot fit makes its source
+  `partial` instead of presenting a colliding `checked` locator.
 - Index match retention now keeps the newest normalized `updated_at` / `ts`
   records in a fixed-size heap, with source path and physical line as stable
   tie-breakers. Retained rows preserve bounded numeric timestamp scalars and
@@ -108,3 +113,14 @@ superseded_by:
 - The GitHub Codex follow-up finding for root `dup(2)` exhaustion is covered by
   a deterministic `EMFILE` regression, and the final full suite passed all
   1,065 tests.
+- The formal named-single projection-truthfulness finding at `dcc4f32` is
+  covered by deterministic 321/512-character exact `id` and `session_id`
+  cases, a thread-query match whose decisive text begins after character 320,
+  and a descriptor-traversed rollout match beyond the path projection limit.
+- Follow-up focused `SessionLocatorTests`: all 32 tests passed.
+- Follow-up full buffered suite: all 1,068 tests passed.
+- Ruff 0.13.2 check and format check passed for the changed Python files after
+  formatting the added tests; Python 3.13.0 compilation passed.
+- The installed Joey skill-validation wrapper accepted
+  `skills/codex-session-mining`.
+- Project-journal frontmatter validation passed.
