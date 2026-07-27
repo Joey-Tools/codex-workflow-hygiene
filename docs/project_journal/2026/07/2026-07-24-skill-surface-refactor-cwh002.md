@@ -80,6 +80,9 @@ superseded_by:
 - Unified validator finalization around one primary-error accumulator so raw
   wait/read errors and forwarded signals survive TERM/KILL, drain/reap,
   observer, selector, pipe, and signal-restoration failures.
+- Moved successful and failed validator exits through one managed-signal
+  block/capture boundary before every emergency, observer, selector, pipe,
+  handler, and mask finalizer.
 - Routed a managed signal from the post-replacement validator through the
   normal rollback/recovery state machine while retaining the signal-derived
   exit code and `interrupted` as the primary outcome.
@@ -244,6 +247,12 @@ superseded_by:
   traceback, and attaches each secondary failure in stable structured order.
   Cleanup-only uncertainty is `validator_cleanup_failed`; restored handler
   identities and the inherited signal mask are reread before success.
+- Successful and failed validator execution now share the same first
+  finalization step: block managed signals and close the armed gate, then
+  synchronously consume any pending `SIGINT`, `SIGTERM`, or `SIGHUP` while
+  cleanup remains non-interruptible. The latched signal supersedes an ordinary
+  execution failure without discarding it, every bounded finalizer and signal
+  restoration completes, and only then does `128 + signal` escape.
 - A managed signal during the second validator completes rollback or records
   operator recovery before it is re-raised. Its JSON result keeps the signal
   primary and includes exact receipt, backup, terminal, prepared, and staged
@@ -420,6 +429,20 @@ superseded_by:
   3.13.
 - The newest static gates passed Ruff check/format, the official Rules skill
   validator, project-journal validation, and `git diff --check`.
+- Rules transaction tests passed 219/219 and the full repository suite passed
+  1,281/1,281 on Python 3.13.0. Four new methods exercise 19 deterministic
+  signal injections: immediately before the common finalization boundary,
+  across every successful resource finalizer, across emergency plus every
+  failed-execution finalizer, and across every post-replacement finalizer.
+  The matrix rotates `SIGINT`, `SIGTERM`, and `SIGHUP`, proves every bounded
+  cleanup completes, retains displaced execution/finalizer errors as
+  secondary evidence, rolls live rules back after replacement, and preserves
+  exact `128 + signal` precedence. The same four methods plus five direct
+  Linux `Z`/`X`/`x` inventory regressions passed 9/9 on system Python 3.9.6.
+- Final repair static gates passed Ruff check/format, Python 3.13.0 and system
+  Python 3.9.6 byte compilation, the official Rules skill validator,
+  project-journal validation, and `git diff --check`; task-scoped pycache
+  directories were removed afterward.
 - Final static gates passed Ruff check/format, the official Rules skill
   validator, project-journal validation, and `git diff --check`.
 - Rules transaction tests: 209 passed on Python 3.13. Four new integration

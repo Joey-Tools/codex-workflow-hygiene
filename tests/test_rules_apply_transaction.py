@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import errno
 import fcntl
@@ -34,6 +35,13 @@ HELPER = (
 OLD_RULES = b'prefix_rule(pattern=["git", "status"], decision="allow")\n'
 NEW_RULES = b'prefix_rule(pattern=["git", "status", "--short"], decision="allow")\n'
 LATER_RULES = b'prefix_rule(pattern=["gh", "pr", "view"], decision="allow")\n'
+VALIDATOR_RESOURCE_FINALIZERS = (
+    "exit-observer-close",
+    "selector-close",
+    "stdout-pipe-close",
+    "stderr-pipe-close",
+    "signal-supervision-restore",
+)
 
 
 def load_helper_module():
@@ -138,11 +146,14 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
     def wait_for_pid_path(self, pid_path: Path) -> int:
         deadline = time.monotonic() + 2
-        while not pid_path.exists():
+        while True:
+            try:
+                return int(pid_path.read_text(encoding="ascii"))
+            except (FileNotFoundError, ValueError):
+                pass
             if time.monotonic() >= deadline:
                 self.fail(f"validator did not publish its PID: {pid_path}")
             time.sleep(0.01)
-        return int(pid_path.read_text(encoding="ascii"))
 
     def wait_for_path(self, path: Path, *, label: str) -> None:
         deadline = time.monotonic() + 3
@@ -163,6 +174,61 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     pass
                 self.fail(f"validator process {pid} remained alive")
             time.sleep(0.01)
+
+    @contextmanager
+    def inject_validator_finalizer_signal(
+        self,
+        target: str,
+        *,
+        active: Callable[[], bool] = lambda: True,
+        signum: int = signal.SIGTERM,
+    ):
+        real_attempt = TRANSACTION.ValidatorFailureAccumulator.attempt
+        state = SimpleNamespace(
+            completed=[],
+            injected=False,
+            observed=[],
+        )
+
+        def instrument_attempt(
+            accumulator: object,
+            descriptor: str,
+            operation: Callable[[], object],
+        ) -> object | None:
+            assert isinstance(
+                accumulator,
+                TRANSACTION.ValidatorFailureAccumulator,
+            )
+            if not active():
+                return real_attempt(accumulator, descriptor, operation)
+            state.observed.append(descriptor)
+
+            def instrument_operation() -> object:
+                if descriptor == target and not state.injected:
+                    state.injected = True
+                    os.kill(os.getpid(), signum)
+                result = operation()
+                state.completed.append(descriptor)
+                if descriptor == target:
+                    raise OSError(
+                        errno.EIO,
+                        f"fault-injected {descriptor} finalizer failure",
+                    )
+                return result
+
+            return real_attempt(
+                accumulator,
+                descriptor,
+                instrument_operation,
+            )
+
+        with mock.patch.object(
+            TRANSACTION.ValidatorFailureAccumulator,
+            "attempt",
+            autospec=True,
+            side_effect=instrument_attempt,
+        ):
+            yield state
 
     def test_process_exit_probe_accepts_linux_terminal_states_only(self) -> None:
         proc_root = self.root / "proc"
@@ -3606,6 +3672,296 @@ class RulesApplyTransactionTests(unittest.TestCase):
             signal.pthread_sigmask(signal.SIG_BLOCK, set()),
             previous_mask,
         )
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending")
+        and hasattr(signal, "sigwait"),
+        "validator finalization signal capture requires POSIX signal waits",
+    )
+    def test_signal_immediately_before_finalization_boundary_is_latched(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_quiesce = TRANSACTION._quiesce_validator_signal_supervision
+
+        for signum in TRANSACTION.MANAGED_VALIDATOR_SIGNALS:
+            with self.subTest(signal=signal.Signals(signum).name):
+                calls = 0
+
+                def signal_before_quiesce(gate: object) -> list[dict[str, object]]:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        os.kill(os.getpid(), signum)
+                    assert isinstance(gate, TRANSACTION.ValidatorSignalGate)
+                    return real_quiesce(gate)
+
+                with (
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_quiesce_validator_signal_supervision",
+                        side_effect=signal_before_quiesce,
+                    ),
+                    self.inject_validator_finalizer_signal(
+                        "not-a-finalizer",
+                    ) as state,
+                    self.assertRaises(TRANSACTION.ForwardedValidatorSignal) as raised,
+                ):
+                    TRANSACTION.run_validator(
+                        [sys.executable, str(self.validator), "{rules}"],
+                        self.candidate,
+                        timeout_seconds=2,
+                    )
+
+                self.assertEqual(calls, 2)
+                self.assertEqual(raised.exception.signum, signum)
+                self.assertEqual(raised.exception.cleanup_errors, [])
+                self.assertEqual(
+                    state.observed,
+                    list(VALIDATOR_RESOURCE_FINALIZERS),
+                )
+                self.assertEqual(
+                    state.completed,
+                    list(VALIDATOR_RESOURCE_FINALIZERS),
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending")
+        and hasattr(signal, "sigwait"),
+        "validator finalization signal capture requires POSIX signal waits",
+    )
+    def test_signal_at_each_success_finalizer_completes_cleanup_and_wins(
+        self,
+    ) -> None:
+        expected_attempts = VALIDATOR_RESOURCE_FINALIZERS
+        self.write_validator("raise SystemExit(0)\n")
+
+        for target_index, target in enumerate(VALIDATOR_RESOURCE_FINALIZERS):
+            with self.subTest(finalizer=target):
+                signum = TRANSACTION.MANAGED_VALIDATOR_SIGNALS[
+                    target_index % len(TRANSACTION.MANAGED_VALIDATOR_SIGNALS)
+                ]
+                previous_handlers = {
+                    signum: signal.getsignal(signum)
+                    for signum in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+                }
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+                with (
+                    self.inject_validator_finalizer_signal(
+                        target,
+                        signum=signum,
+                    ) as state,
+                    self.assertRaises(TRANSACTION.ForwardedValidatorSignal) as raised,
+                ):
+                    TRANSACTION.run_validator(
+                        [sys.executable, str(self.validator), "{rules}"],
+                        self.candidate,
+                        timeout_seconds=2,
+                    )
+
+                self.assertTrue(state.injected)
+                self.assertEqual(state.observed, list(expected_attempts))
+                self.assertEqual(state.completed, list(expected_attempts))
+                self.assertEqual(raised.exception.signum, signum)
+                self.assertEqual(
+                    [
+                        failure["descriptor"]
+                        for failure in raised.exception.cleanup_errors
+                    ],
+                    [target],
+                )
+                self.assertEqual(
+                    {
+                        signum: signal.getsignal(signum)
+                        for signum in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+                    },
+                    previous_handlers,
+                )
+                self.assertEqual(
+                    signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                    previous_mask,
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending")
+        and hasattr(signal, "sigwait"),
+        "validator finalization signal capture requires POSIX signal waits",
+    )
+    def test_signal_at_each_failure_finalizer_supersedes_raw_error(
+        self,
+    ) -> None:
+        finalizers = (
+            "emergency-process-group-cleanup",
+            *VALIDATOR_RESOURCE_FINALIZERS,
+        )
+        expected_attempts = finalizers
+
+        for target_index, target in enumerate(finalizers):
+            with self.subTest(finalizer=target):
+                signum = TRANSACTION.MANAGED_VALIDATOR_SIGNALS[
+                    target_index % len(TRANSACTION.MANAGED_VALIDATOR_SIGNALS)
+                ]
+                pid_path = self.root / f"validator-finalizer-{target}.pid"
+                self.write_sleeping_validator(pid_path)
+                primary = OSError(
+                    errno.EIO,
+                    "fault-injected validator observation failure",
+                )
+
+                def fail_after_validator_start(_observer: object) -> bool:
+                    self.wait_for_pid_path(pid_path)
+                    raise primary
+
+                with (
+                    mock.patch.object(
+                        TRANSACTION._ValidatorExitObserver,
+                        "child_exited",
+                        autospec=True,
+                        side_effect=fail_after_validator_start,
+                    ),
+                    self.inject_validator_finalizer_signal(
+                        target,
+                        signum=signum,
+                    ) as state,
+                    self.assertRaises(TRANSACTION.ForwardedValidatorSignal) as raised,
+                ):
+                    TRANSACTION.run_validator(
+                        [sys.executable, str(self.validator), "{rules}"],
+                        self.candidate,
+                        timeout_seconds=2,
+                    )
+
+                self.assert_process_exited(self.wait_for_pid_path(pid_path))
+                self.assertTrue(state.injected)
+                self.assertEqual(state.observed, list(expected_attempts))
+                self.assertEqual(state.completed, list(expected_attempts))
+                self.assertEqual(raised.exception.signum, signum)
+                cleanup_by_descriptor = {
+                    failure["descriptor"]: failure
+                    for failure in raised.exception.cleanup_errors
+                }
+                self.assertTrue(
+                    {target, "superseded-primary"}.issubset(cleanup_by_descriptor),
+                    cleanup_by_descriptor,
+                )
+                self.assertEqual(
+                    cleanup_by_descriptor[target]["errno"],
+                    errno.EIO,
+                )
+                self.assertEqual(
+                    cleanup_by_descriptor["superseded-primary"]["errno"],
+                    errno.EIO,
+                )
+                self.assertEqual(
+                    cleanup_by_descriptor["superseded-primary"]["operation"],
+                    "validator-execution",
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending")
+        and hasattr(signal, "sigwait"),
+        "validator finalization signal capture requires POSIX signal waits",
+    )
+    def test_signal_at_each_post_replace_finalizer_keeps_exit_precedence(
+        self,
+    ) -> None:
+        expected_attempts = VALIDATOR_RESOURCE_FINALIZERS
+
+        for target_index, target in enumerate(VALIDATOR_RESOURCE_FINALIZERS):
+            with (
+                self.subTest(finalizer=target),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-post-replace-{target}."
+                ) as isolated,
+            ):
+                signum = TRANSACTION.MANAGED_VALIDATOR_SIGNALS[
+                    target_index % len(TRANSACTION.MANAGED_VALIDATOR_SIGNALS)
+                ]
+                self.configure_isolated_case(Path(isolated))
+                self.write_validator("raise SystemExit(0)\n")
+                post_replace_phase = False
+                real_run_validator = TRANSACTION.run_validator
+
+                def track_validator_phase(
+                    command_template: list[str],
+                    rules_path: Path,
+                    *,
+                    timeout_seconds: float,
+                    pass_fds: tuple[int, ...] = (),
+                ) -> object:
+                    nonlocal post_replace_phase
+                    post_replace_phase = rules_path.resolve() == self.rules.resolve()
+                    try:
+                        return real_run_validator(
+                            command_template,
+                            rules_path,
+                            timeout_seconds=timeout_seconds,
+                            pass_fds=pass_fds,
+                        )
+                    finally:
+                        post_replace_phase = False
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "run_validator",
+                        side_effect=track_validator_phase,
+                    ),
+                    self.inject_validator_finalizer_signal(
+                        target,
+                        active=lambda: post_replace_phase,
+                        signum=signum,
+                    ) as state,
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    exit_code = TRANSACTION.main(self.apply_argv())
+
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(exit_code, 128 + signum, stderr.getvalue())
+                self.assertEqual(payload["status"], "interrupted")
+                self.assertEqual(payload["signal"], signum)
+                self.assertEqual(
+                    payload["interrupted_phase"],
+                    "post_replace_validation",
+                )
+                self.assertEqual(
+                    payload["post_replace_recovery"]["status"],
+                    "post_replace_failed_rolled_back",
+                )
+                self.assertEqual(
+                    payload["post_replace_recovery"]["rollback"]["rollback_status"],
+                    "rolled_back",
+                )
+                self.assertEqual(
+                    [
+                        failure["descriptor"]
+                        for failure in payload["validator_cleanup_errors"]
+                    ],
+                    [target],
+                )
+                self.assertTrue(state.injected)
+                self.assertEqual(state.observed, list(expected_attempts))
+                self.assertEqual(state.completed, list(expected_attempts))
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+                self.assertTrue(self.receipt.is_file())
+                self.assert_no_private_stage()
 
     def test_validator_descendant_is_terminated_after_leader_exit(self) -> None:
         pid_path = self.root / "validator-descendant.pid"

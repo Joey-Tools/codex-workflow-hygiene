@@ -115,9 +115,16 @@ class ValidatorSignalGate:
         self._pending: int | None = None
 
     def handle(self, signum: int, _frame: object) -> None:
+        self.latch(signum)
+        self._raise_pending_once()
+
+    def latch(self, signum: int) -> None:
         if self._pending is None:
             self._pending = signum
-        self._raise_pending_once()
+
+    @property
+    def pending_signum(self) -> int | None:
+        return self._pending
 
     def _raise_pending_once(self) -> None:
         if self._armed and not self._interrupt_raised and self._pending is not None:
@@ -613,6 +620,24 @@ class ValidatorFailureAccumulator:
             return
         self.record("additional-primary", error)
 
+    def capture_forwarded_signal(self, error: ForwardedValidatorSignal) -> None:
+        """Make a managed signal primary without discarding an earlier failure."""
+
+        if isinstance(self.primary_error, ForwardedValidatorSignal):
+            if self.primary_error.signum != error.signum:
+                self.record("additional-forwarded-signal", error)
+            return
+        if self.primary_error is not None:
+            self.secondary_failures.append(
+                structured_operation_failure(
+                    "validator-execution",
+                    "superseded-primary",
+                    self.primary_error,
+                )
+            )
+        self.primary_error = error
+        self.primary_traceback = error.__traceback__
+
     def record(self, descriptor: str, error: BaseException) -> None:
         self.secondary_failures.append(
             structured_operation_failure(
@@ -633,11 +658,8 @@ class ValidatorFailureAccumulator:
         try:
             return operation()
         except BaseException as error:
-            if (
-                isinstance(error, ForwardedValidatorSignal)
-                and self.primary_error is None
-            ):
-                self.capture_primary(error)
+            if isinstance(error, ForwardedValidatorSignal):
+                self.capture_forwarded_signal(error)
             else:
                 self.record(descriptor, error)
             return None
@@ -4691,16 +4713,20 @@ def _start_validator_signal_supervision() -> tuple[
     """Install a first-signal gate before any validator process can exist."""
 
     pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    sigpending = getattr(signal, "sigpending", None)
+    sigwait = getattr(signal, "sigwait", None)
     if (
         not callable(pthread_sigmask)
+        or not callable(sigpending)
+        or not callable(sigwait)
         or threading.current_thread() is not threading.main_thread()
         or threading.active_count() != 1
     ):
         raise TransactionError(
             "validator_supervision_unsupported",
             (
-                "validator signal supervision requires a standalone "
-                "single-threaded POSIX main thread"
+                "validator signal supervision requires POSIX signal masks "
+                "and waits in a standalone single-threaded main process"
             ),
         )
     sigchld = getattr(signal, "SIGCHLD", None)
@@ -4806,9 +4832,14 @@ def _arm_validator_signal_supervision(
 def _quiesce_validator_signal_supervision(
     gate: ValidatorSignalGate,
 ) -> list[dict[str, object]]:
-    """Prevent later managed signals from interrupting synchronous cleanup."""
+    """Enter the managed-signal block before any validator finalizer."""
 
     failures: list[dict[str, object]] = []
+    _block_managed_validator_signals(
+        gate,
+        failures,
+        descriptor="signal-finalization:block-managed",
+    )
     try:
         gate.close()
     except BaseException as error:
@@ -4819,18 +4850,89 @@ def _quiesce_validator_signal_supervision(
                 error,
             )
         )
-    for signum in MANAGED_VALIDATOR_SIGNALS:
+    return failures
+
+
+def _block_managed_validator_signals(
+    gate: ValidatorSignalGate,
+    failures: list[dict[str, object]],
+    *,
+    descriptor: str,
+) -> bool:
+    """Block managed signals, preserving one signal raised during the handoff."""
+
+    pthread_sigmask = signal.pthread_sigmask
+    for attempt_index in range(2):
+        captured_error: BaseException | None = None
         try:
-            signal.signal(signum, signal.SIG_IGN)
+            pthread_sigmask(signal.SIG_BLOCK, MANAGED_VALIDATOR_SIGNALS)
+            return True
+        except ForwardedValidatorSignal as event:
+            gate.latch(event.signum)
+            if attempt_index == 0:
+                continue
+            captured_error = RuntimeError(
+                "managed signal block was interrupted more than once"
+            )
+        except BaseException as error:
+            captured_error = error
+        assert captured_error is not None
+        failures.append(
+            structured_operation_failure(
+                "validator-finalization",
+                descriptor,
+                captured_error,
+            )
+        )
+        return False
+    raise AssertionError("managed signal block retry exhausted")
+
+
+def _capture_pending_managed_validator_signals(
+    gate: ValidatorSignalGate,
+    failures: list[dict[str, object]],
+    *,
+    descriptor: str,
+) -> None:
+    """Consume blocked managed signals into the validator's first-signal gate."""
+
+    try:
+        pending = set(signal.sigpending()).intersection(MANAGED_VALIDATOR_SIGNALS)
+    except BaseException as error:
+        failures.append(
+            structured_operation_failure(
+                "validator-finalization",
+                f"{descriptor}:read",
+                error,
+            )
+        )
+        return
+    for signum in MANAGED_VALIDATOR_SIGNALS:
+        if signum not in pending:
+            continue
+        gate.latch(signum)
+        try:
+            observed = signal.sigwait({signum})
         except BaseException as error:
             failures.append(
                 structured_operation_failure(
                     "validator-finalization",
-                    f"signal-quiesce:{signal.Signals(signum).name}",
+                    f"{descriptor}:consume:{signal.Signals(signum).name}",
                     error,
                 )
             )
-    return failures
+            continue
+        if observed != signum:
+            failures.append(
+                structured_operation_failure(
+                    "validator-finalization",
+                    f"{descriptor}:consume:{signal.Signals(signum).name}",
+                    RuntimeError(
+                        "synchronous signal wait returned an unexpected signal"
+                    ),
+                )
+            )
+            continue
 
 
 def _restore_validator_signal_supervision(
@@ -4856,11 +4958,18 @@ def _restore_validator_signal_supervision(
             return None
 
     pthread_sigmask = signal.pthread_sigmask
-    attempt(
-        "signal-restore:block-managed",
-        lambda: pthread_sigmask(signal.SIG_BLOCK, MANAGED_VALIDATOR_SIGNALS),
+    managed_blocked = _block_managed_validator_signals(
+        gate,
+        failures,
+        descriptor="signal-restore:block-managed",
     )
     attempt("signal-restore:gate-close", gate.close)
+    if managed_blocked:
+        _capture_pending_managed_validator_signals(
+            gate,
+            failures,
+            descriptor="signal-restore:pending-before-handlers",
+        )
     for signum, handler in previous_handlers.items():
         signal_name = signal.Signals(signum).name
         attempt(
@@ -4886,6 +4995,12 @@ def _restore_validator_signal_supervision(
         attempt(
             f"signal-restore:validate-handler:{signal_name}",
             validate_handler,
+        )
+    if managed_blocked:
+        _capture_pending_managed_validator_signals(
+            gate,
+            failures,
+            descriptor="signal-restore:pending-before-mask",
         )
     attempt(
         "signal-restore:set-inherited-mask",
@@ -5322,12 +5437,45 @@ def run_validator(
             descendants_terminated=descendants_terminated,
         )
 
+    execution_error: BaseException | None = None
     try:
         result = execute_validator()
     except BaseException as error:
-        failures.capture_primary(error)
-        failures.extend(_quiesce_validator_signal_supervision(signal_gate))
-        if process is not None:
+        execution_error = error
+    finally:
+        boundary_signal: ForwardedValidatorSignal | None = None
+        for boundary_attempt in range(2):
+            try:
+                failures.extend(_quiesce_validator_signal_supervision(signal_gate))
+                break
+            except ForwardedValidatorSignal as event:
+                if boundary_signal is None:
+                    boundary_signal = event
+                if boundary_attempt == 0:
+                    continue
+                failures.record(
+                    "signal-finalization-boundary",
+                    RuntimeError(
+                        "managed signal interrupted the finalization boundary "
+                        "more than once"
+                    ),
+                )
+                break
+            except BaseException as error:
+                failures.record("signal-finalization-boundary", error)
+                break
+        if execution_error is not None:
+            if isinstance(execution_error, ForwardedValidatorSignal):
+                failures.capture_forwarded_signal(execution_error)
+            else:
+                failures.capture_primary(execution_error)
+        if boundary_signal is not None:
+            failures.capture_forwarded_signal(boundary_signal)
+        if signal_gate.pending_signum in MANAGED_VALIDATOR_SIGNALS:
+            failures.capture_forwarded_signal(
+                ForwardedValidatorSignal(signal_gate.pending_signum)
+            )
+        if execution_error is not None and process is not None:
             emergency_result = failures.attempt(
                 "emergency-process-group-cleanup",
                 lambda: _emergency_stop_validator_process_group(
@@ -5339,7 +5487,6 @@ def run_validator(
             )
             if isinstance(emergency_result, list):
                 failures.extend(emergency_result)
-    finally:
         if exit_observer is not None:
             failures.attempt("exit-observer-close", exit_observer.close)
         if selector is not None:
@@ -5350,13 +5497,20 @@ def run_validator(
         ):
             if stream is not None:
                 failures.attempt(label, stream.close)
-        failures.extend(
-            _restore_validator_signal_supervision(
+        restore_result = failures.attempt(
+            "signal-supervision-restore",
+            lambda: _restore_validator_signal_supervision(
                 signal_gate,
                 previous_signal_handlers,
                 inherited_signal_mask,
-            )
+            ),
         )
+        if isinstance(restore_result, list):
+            failures.extend(restore_result)
+        if signal_gate.pending_signum in MANAGED_VALIDATOR_SIGNALS:
+            failures.capture_forwarded_signal(
+                ForwardedValidatorSignal(signal_gate.pending_signum)
+            )
     return failures.finish(result)
 
 
