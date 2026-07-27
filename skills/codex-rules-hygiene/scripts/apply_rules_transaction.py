@@ -303,13 +303,22 @@ class BoundDirectory:
 
 @dataclass(frozen=True)
 class TransactionDataRoles:
-    """Exact live and backup roles that must survive until lock release."""
+    """Exact terminal data roles that must survive until lock release.
+
+    A ``None`` role name means that the path is outside this terminal state's
+    proof. A named role with a ``None`` snapshot means that the path must be
+    missing.
+    """
 
     transaction_state: str
     live_role: str
     live: Snapshot
-    backup_role: str
+    backup_role: str | None
     backup: Snapshot | None
+    staged_backup_role: str | None = None
+    staged_backup: Snapshot | None = None
+    prepared_candidate_role: str | None = None
+    prepared_candidate: Snapshot | None = None
 
 
 @dataclass
@@ -7459,16 +7468,22 @@ def _apply_transaction_inner(
                 if stage is not None
                 else []
             )
-        if (
-            evidence_error is None
-            and evidence is not None
-            and final_data_roles is not None
-        ):
+        if evidence_error is None and final_data_roles is not None:
             try:
+                role_parent = (
+                    evidence.rules_parent
+                    if evidence is not None
+                    else rules_parent_binding
+                )
+                if role_parent is None:
+                    raise TransactionError(
+                        "transaction_data_role_configuration_invalid",
+                        "terminal data roles have no bound rules parent",
+                    )
                 validate_transaction_data_roles(
                     rules=rules,
                     backup=backup,
-                    rules_parent=evidence.rules_parent,
+                    rules_parent=role_parent,
                     expected=final_data_roles,
                 )
             except TransactionError as error:
@@ -7581,18 +7596,51 @@ def _apply_transaction_inner(
             label="live_rules",
         )
         if live_hint == candidate_bytes:
-            with shared_lock(
-                lock,
-                timeout_seconds=args.lock_timeout_seconds,
-            ) as lock_binding:
-                lock_acquired = True
-                no_change_parent_binding = bind_directory(
-                    rules.parent,
-                    label="rules",
-                )
-                no_change_outcome: tuple[int, dict[str, object]] | None = None
-                no_change_error: BaseException | None = None
+            no_change_parent_binding: BoundDirectory | None = None
+            no_change_data_roles: TransactionDataRoles | None = None
+            no_change_outcome: tuple[int, dict[str, object]] | None = None
+            no_change_error: BaseException | None = None
+
+            def finalize_fast_no_change() -> None:
+                if no_change_data_roles is None or no_change_parent_binding is None:
+                    return
                 try:
+                    validate_transaction_data_roles(
+                        rules=rules,
+                        backup=backup,
+                        rules_parent=no_change_parent_binding,
+                        expected=no_change_data_roles,
+                    )
+                except TransactionError as error:
+                    raise TransactionError(
+                        "recovery_required",
+                        (
+                            "unchanged live rules changed before transaction "
+                            "lock release"
+                        ),
+                        exit_code=EXIT_POST_REPLACE_FAILED,
+                        details={
+                            "operation_status": "no_change_after_lock",
+                            "reason": error.status,
+                            "message": str(error),
+                            "receipt_path": str(receipt),
+                            "backup_path": str(backup),
+                            "recovery_locators": apply_recovery_locators(),
+                            **error.details,
+                        },
+                    ) from error
+
+            try:
+                with shared_lock(
+                    lock,
+                    timeout_seconds=args.lock_timeout_seconds,
+                    before_release=finalize_fast_no_change,
+                ) as lock_binding:
+                    lock_acquired = True
+                    no_change_parent_binding = bind_directory(
+                        rules.parent,
+                        label="rules",
+                    )
                     revalidate_lock(lock_binding, no_change_parent_binding)
                     current_bytes, current = read_bound_regular_child(
                         rules,
@@ -7631,6 +7679,13 @@ def _apply_transaction_inner(
                             rules_parent_expected=no_change_parent_binding.snapshot,
                         )
                         revalidate_lock(lock_binding, no_change_parent_binding)
+                        no_change_data_roles = TransactionDataRoles(
+                            transaction_state="no_change",
+                            live_role="unchanged",
+                            live=current,
+                            backup_role=None,
+                            backup=None,
+                        )
                         no_change_outcome = (
                             0,
                             {
@@ -7641,10 +7696,11 @@ def _apply_transaction_inner(
                         )
                         return no_change_outcome
                     revalidate_lock(lock_binding, no_change_parent_binding)
-                except BaseException as error:
-                    no_change_error = error
-                    raise
-                finally:
+            except BaseException as error:
+                no_change_error = error
+                raise
+            finally:
+                if no_change_parent_binding is not None:
                     no_change_cleanup_failures = close_descriptors_best_effort(
                         [("rules_parent", no_change_parent_binding.fd)]
                     )
@@ -7734,6 +7790,13 @@ def _apply_transaction_inner(
                     rules_parent_expected=rules_parent_binding.snapshot,
                 )
                 revalidate_lock(lock_binding, rules_parent_binding)
+                final_data_roles = TransactionDataRoles(
+                    transaction_state="no_change",
+                    live_role="unchanged",
+                    live=current,
+                    backup_role=None,
+                    backup=None,
+                )
                 pending_success_status = "no_change_after_lock"
                 return 0, {
                     "status": "no_change_after_lock",
@@ -8565,8 +8628,10 @@ def validate_transaction_data_roles(
     backup: Path,
     rules_parent: BoundDirectory,
     expected: TransactionDataRoles,
+    prepared_candidate: Path | None = None,
+    prepared_parent_expected: Snapshot | None = None,
 ) -> None:
-    """Re-prove the terminal live/backup role tuple under its bound parent.
+    """Re-prove every selected terminal data role under bound parents.
 
     Object identity, exact content, access policy, and single-link policy are
     the selected protected properties. A missing or unexpectedly present role
@@ -8579,17 +8644,71 @@ def validate_transaction_data_roles(
         rules_parent,
         label="live_rules",
     )
-    backup_actual = recovery_entry_snapshot_bound(
-        backup,
-        rules_parent,
-        label="backup",
-    )
+    observed_roles: list[tuple[str, str, Snapshot | None, Snapshot | None]] = [
+        ("live", expected.live_role, expected.live, live_actual),
+    ]
+    if expected.backup_role is not None:
+        backup_actual = recovery_entry_snapshot_bound(
+            backup,
+            rules_parent,
+            label="backup",
+        )
+        observed_roles.append(
+            ("backup", expected.backup_role, expected.backup, backup_actual)
+        )
+    if expected.staged_backup_role is not None:
+        _stage_parent, staged_backup_actual = probe_fixed_stage_for_recovery(
+            rules_parent
+        )
+        observed_roles.append(
+            (
+                "staged_backup",
+                expected.staged_backup_role,
+                expected.staged_backup,
+                staged_backup_actual,
+            )
+        )
+    if expected.prepared_candidate_role is not None:
+        if prepared_candidate is None or prepared_parent_expected is None:
+            raise TransactionError(
+                "transaction_data_role_configuration_invalid",
+                "prepared-candidate terminal role is missing its bound locator",
+            )
+        prepared_parent: BoundDirectory | None = None
+        prepared_error: BaseException | None = None
+        try:
+            prepared_parent = bind_directory(
+                prepared_candidate.parent,
+                label="prepared_candidate",
+                require_owner_private=True,
+                expected=prepared_parent_expected,
+            )
+            prepared_actual = recovery_entry_snapshot_bound(
+                prepared_candidate,
+                prepared_parent,
+                label="prepared_candidate",
+            )
+            validate_bound_directory(prepared_parent)
+        except BaseException as error:
+            prepared_error = error
+            raise
+        finally:
+            if prepared_parent is not None:
+                finalize_descriptor_cleanup(
+                    [("final_data_roles_prepared_parent", prepared_parent.fd)],
+                    primary_error=prepared_error,
+                )
+        observed_roles.append(
+            (
+                "prepared_candidate",
+                expected.prepared_candidate_role,
+                expected.prepared_candidate,
+                prepared_actual,
+            )
+        )
     validate_bound_directory(rules_parent)
 
-    for data_role, expected_role, expected_snapshot, actual_snapshot in (
-        ("live", expected.live_role, expected.live, live_actual),
-        ("backup", expected.backup_role, expected.backup, backup_actual),
-    ):
+    for data_role, expected_role, expected_snapshot, actual_snapshot in observed_roles:
         if expected_snapshot is None:
             if actual_snapshot is not None:
                 raise TransactionError(
@@ -10533,6 +10652,10 @@ def _recover_transaction_bound(
                     live=original,
                     backup_role="missing",
                     backup=None,
+                    staged_backup_role="missing",
+                    staged_backup=None,
+                    prepared_candidate_role="installed",
+                    prepared_candidate=installed,
                 )
             elif receipt_schema_version >= 3 and status in (
                 "recovered",
@@ -10544,6 +10667,14 @@ def _recover_transaction_bound(
                     live=original,
                     backup_role="installed",
                     backup=installed,
+                )
+            elif receipt_schema_version < 3 and status == "already_original":
+                final_data_roles = TransactionDataRoles(
+                    transaction_state="legacy_original",
+                    live_role="original",
+                    live=original,
+                    backup_role=None,
+                    backup=None,
                 )
             else:
                 rollback_result = payload.get("rollback")
@@ -10581,6 +10712,8 @@ def _recover_transaction_bound(
                 backup=backup,
                 rules_parent=rules_parent,
                 expected=final_data_roles,
+                prepared_candidate=prepared_candidate,
+                prepared_parent_expected=prepared_parent_expected,
             )
         except BaseException as error:
             role_error = error
@@ -10604,7 +10737,8 @@ def _recover_transaction_bound(
                 raise TransactionError(
                     "recovery_required",
                     (
-                        "receipt-bound recovery evidence or terminal data roles "
+                        "receipt-bound recovery evidence or selected terminal "
+                        "data roles "
                         "changed before lock release"
                     ),
                     exit_code=EXIT_POST_REPLACE_FAILED,

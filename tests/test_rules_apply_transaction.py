@@ -357,9 +357,26 @@ class RulesApplyTransactionTests(unittest.TestCase):
         data_role: str,
         drift: str,
     ) -> tuple[str, str]:
-        target = self.rules if data_role == "live" else self.backup
-        if data_role not in ("live", "backup"):
+        if data_role == "staged_backup":
+            if drift != "appearance":
+                raise AssertionError(f"unknown staged-backup drift: {drift}")
+            stage = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME
+            stage.mkdir(mode=0o700, exist_ok=True)
+            staged = stage / "candidate"
+            staged.write_bytes(NEW_RULES)
+            staged.chmod(0o600)
+            return "transaction_data_role_unexpected", "presence"
+        targets = {
+            "live": self.rules,
+            "backup": self.backup,
+            "prepared_candidate": TRANSACTION.prepared_candidate_path(self.receipt),
+        }
+        target = targets.get(data_role)
+        if target is None:
             raise AssertionError(f"unknown data role: {data_role}")
+        if drift == "missing":
+            target.unlink()
+            return "transaction_data_role_missing", "missing"
         if drift == "identity":
             bound = target.with_name(f".{target.name}.{data_role}.bound")
             replacement = target.with_name(f".{target.name}.{data_role}.replacement")
@@ -677,6 +694,23 @@ class RulesApplyTransactionTests(unittest.TestCase):
         receipt["schema_version"] = 1
         for key in ("rules_parent", "original", "installed", "backup"):
             receipt[key].pop("object_policy")
+        for key in (
+            "staged_backup_path",
+            "staged_backup_parent",
+            "prepared_candidate_path",
+            "prepared_candidate_parent",
+        ):
+            receipt.pop(key, None)
+        self.receipt.write_text(
+            json.dumps(receipt, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.receipt.chmod(0o600)
+        return receipt
+
+    def rewrite_receipt_as_legacy_v2(self) -> dict[str, object]:
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        receipt["schema_version"] = 2
         for key in (
             "staged_backup_path",
             "staged_backup_parent",
@@ -3630,6 +3664,126 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertFalse(validator_marker.exists())
         self.assert_no_private_stage()
 
+    def test_fast_no_change_finalizer_revalidates_live_data_role(self) -> None:
+        for drift in ("identity", "content", "access", "link"):
+            with (
+                self.subTest(drift=drift),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-fast-no-change-{drift}."
+                ) as temp_dir,
+            ):
+                self.configure_isolated_case(Path(temp_dir))
+                self.candidate.write_bytes(OLD_RULES)
+                self.write_validator("raise SystemExit(9)\n")
+                argv = self.apply_argv()
+                digest_index = argv.index("--candidate-sha256") + 1
+                argv[digest_index] = hashlib.sha256(OLD_RULES).hexdigest()
+                stdout = io.StringIO()
+
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    self.drift_before_transaction_lock_release(
+                        "live",
+                        drift,
+                    ) as injected,
+                    redirect_stdout(stdout),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    code = TRANSACTION.main(argv)
+
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(injected["count"], 1)
+                self.assertEqual(code, 30)
+                self.assertEqual(payload["status"], "recovery_required")
+                self.assertEqual(
+                    payload["operation_status"],
+                    "no_change_after_lock",
+                )
+                self.assertEqual(
+                    payload["reason"],
+                    "transaction_data_role_changed",
+                )
+                self.assertEqual(payload["data_role"], "live")
+                self.assertEqual(payload["transaction_state"], "no_change")
+                self.assertIn(
+                    injected["mismatched_property"],
+                    payload["mismatched_properties"],
+                )
+
+    def test_converged_no_change_finalizer_revalidates_live_data_role(
+        self,
+    ) -> None:
+        for drift in ("identity", "content", "access", "link"):
+            with (
+                self.subTest(drift=drift),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-converged-no-change-{drift}."
+                ) as temp_dir,
+            ):
+                self.configure_isolated_case(Path(temp_dir))
+                self.write_validator("raise SystemExit(0)\n")
+
+                def install_candidate_as_live(
+                    _command: list[str],
+                    _path: Path,
+                    *,
+                    timeout_seconds: float,
+                    pass_fds: tuple[int, ...] = (),
+                ) -> object:
+                    del timeout_seconds, pass_fds
+                    replacement = self.rules_dir / ".converged-candidate-live"
+                    replacement.write_bytes(NEW_RULES)
+                    replacement.chmod(0o640)
+                    os.replace(replacement, self.rules)
+                    return TRANSACTION.ValidatorResult(0, "", "")
+
+                argv = self.apply_argv()
+                digest_index = argv.index("--expected-sha256") + 1
+                argv[digest_index] = hashlib.sha256(NEW_RULES).hexdigest()
+                stdout = io.StringIO()
+
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "run_validator",
+                        side_effect=install_candidate_as_live,
+                    ) as run_validator,
+                    self.drift_before_transaction_lock_release(
+                        "live",
+                        drift,
+                    ) as injected,
+                    redirect_stdout(stdout),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    code = TRANSACTION.main(argv)
+
+                payload = json.loads(stdout.getvalue())
+                run_validator.assert_called_once()
+                self.assertEqual(injected["count"], 1)
+                self.assertEqual(code, 30)
+                self.assertEqual(payload["status"], "recovery_required")
+                self.assertEqual(
+                    payload["operation_status"],
+                    "no_change_after_lock",
+                )
+                self.assertEqual(
+                    payload["reason"],
+                    "transaction_data_role_changed",
+                )
+                self.assertEqual(payload["data_role"], "live")
+                self.assertEqual(payload["transaction_state"], "no_change")
+                self.assertIn(
+                    injected["mismatched_property"],
+                    payload["mismatched_properties"],
+                )
+
     def test_no_change_final_rules_parent_close_failure_requires_recovery(
         self,
     ) -> None:
@@ -5464,6 +5618,124 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(second["transaction_state"], "Q")
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertEqual(prepared.read_bytes(), NEW_RULES)
+
+    def test_schema_v4_q_finalizer_revalidates_prepared_and_staged_roles(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "prepared_candidate",
+                "missing",
+                "transaction_data_role_missing",
+                None,
+            ),
+            (
+                "prepared_candidate",
+                "identity",
+                "transaction_data_role_changed",
+                "object_identity",
+            ),
+            (
+                "prepared_candidate",
+                "content",
+                "transaction_data_role_changed",
+                "content",
+            ),
+            (
+                "prepared_candidate",
+                "access",
+                "transaction_data_role_changed",
+                "access_policy",
+            ),
+            (
+                "prepared_candidate",
+                "link",
+                "transaction_data_role_changed",
+                "object_policy",
+            ),
+            (
+                "staged_backup",
+                "appearance",
+                "transaction_data_role_unexpected",
+                None,
+            ),
+        )
+        for operation_status in ("recovered", "already_original"):
+            for data_role, drift, reason, mismatched_property in cases:
+                with (
+                    self.subTest(
+                        operation_status=operation_status,
+                        data_role=data_role,
+                        drift=drift,
+                    ),
+                    tempfile.TemporaryDirectory(
+                        prefix=(f"rules-q-{operation_status}-{data_role}-{drift}.")
+                    ) as temp_dir,
+                ):
+                    self.configure_isolated_case(Path(temp_dir))
+                    self.write_validator("raise SystemExit(0)\n")
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {"CODEX_HOME": str(self.codex_home)},
+                        ),
+                        mock.patch.object(
+                            TRANSACTION.PrivateStage,
+                            "__init__",
+                            side_effect=TRANSACTION.TransactionError(
+                                "private_stage_unavailable",
+                                "fault-injected stage creation failure",
+                            ),
+                        ),
+                        self.assertRaises(TRANSACTION.TransactionError),
+                    ):
+                        TRANSACTION.apply_transaction(self.apply_namespace())
+
+                    if operation_status == "already_original":
+                        first = self.run_recover()
+                        self.assertEqual(first.returncode, 0, first.stderr)
+                        self.assertEqual(
+                            json.loads(first.stdout)["status"],
+                            "recovered",
+                        )
+
+                    stdout = io.StringIO()
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {"CODEX_HOME": str(self.codex_home)},
+                        ),
+                        self.drift_before_transaction_lock_release(
+                            data_role,
+                            drift,
+                        ) as injected,
+                        redirect_stdout(stdout),
+                        redirect_stderr(io.StringIO()),
+                    ):
+                        code = TRANSACTION.main(self.recover_argv())
+
+                    payload = json.loads(stdout.getvalue())
+                    self.assertEqual(injected["count"], 1)
+                    self.assertEqual(code, 30)
+                    self.assertEqual(payload["status"], "recovery_required")
+                    self.assertEqual(
+                        payload["operation_status"],
+                        operation_status,
+                    )
+                    self.assertEqual(payload["reason"], reason)
+                    self.assertEqual(payload["data_role"], data_role)
+                    self.assertEqual(payload["transaction_state"], "Q")
+                    if mismatched_property is not None:
+                        self.assertIn(
+                            mismatched_property,
+                            payload["mismatched_properties"],
+                        )
+                    self.assertEqual(
+                        Path(
+                            payload["recovery_locators"]["prepared_candidate"]
+                        ).resolve(),
+                        TRANSACTION.prepared_candidate_path(self.receipt).resolve(),
+                    )
 
     def test_schema_v4_q_result_with_replaced_prepared_requires_recovery_on_retry(
         self,
@@ -7498,6 +7770,67 @@ class RulesApplyTransactionTests(unittest.TestCase):
         payload = json.loads(repeated.stdout)
         self.assertEqual(payload["status"], "recovery_refused")
         self.assertIn("object_policy", payload["mismatched_properties"])
+
+    def test_legacy_already_original_finalizer_revalidates_live_data_role(
+        self,
+    ) -> None:
+        for schema_version in (1, 2):
+            for drift in ("identity", "content", "access", "link"):
+                with (
+                    self.subTest(schema_version=schema_version, drift=drift),
+                    tempfile.TemporaryDirectory(
+                        prefix=(
+                            f"rules-legacy-v{schema_version}-already-original-{drift}."
+                        )
+                    ) as temp_dir,
+                ):
+                    self.configure_isolated_case(Path(temp_dir))
+                    self.write_validator("raise SystemExit(0)\n")
+                    applied = self.run_apply()
+                    self.assertEqual(applied.returncode, 0, applied.stderr)
+                    if schema_version == 1:
+                        self.rewrite_receipt_as_legacy_v1()
+                    else:
+                        self.rewrite_receipt_as_legacy_v2()
+                    first = self.run_recover()
+                    self.assertEqual(first.returncode, 0, first.stderr)
+                    stdout = io.StringIO()
+
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {"CODEX_HOME": str(self.codex_home)},
+                        ),
+                        self.drift_before_transaction_lock_release(
+                            "live",
+                            drift,
+                        ) as injected,
+                        redirect_stdout(stdout),
+                        redirect_stderr(io.StringIO()),
+                    ):
+                        code = TRANSACTION.main(self.recover_argv())
+
+                    payload = json.loads(stdout.getvalue())
+                    self.assertEqual(injected["count"], 1)
+                    self.assertEqual(code, 30)
+                    self.assertEqual(payload["status"], "recovery_required")
+                    self.assertEqual(
+                        payload["operation_status"],
+                        "already_original",
+                    )
+                    self.assertEqual(
+                        payload["reason"],
+                        "transaction_data_role_changed",
+                    )
+                    self.assertEqual(payload["data_role"], "live")
+                    self.assertEqual(
+                        payload["transaction_state"],
+                        "legacy_original",
+                    )
+                    self.assertIn(
+                        injected["mismatched_property"],
+                        payload["mismatched_properties"],
+                    )
 
     def test_legacy_completed_exchange_then_parent_drift_requires_recovery(
         self,

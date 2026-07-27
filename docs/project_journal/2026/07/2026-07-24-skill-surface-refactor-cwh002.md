@@ -90,6 +90,12 @@ superseded_by:
 - Re-proved the terminal live/backup data-role tuple through the bound rules
   parent immediately before lock release for applied, ordinary rollback,
   managed-signal rollback, and successful recovery outcomes.
+- Added an exact live-only release proof to both apply no-change paths and
+  schema-v1/v2 `already_original`, so identity, content, access, or link drift
+  cannot escape as a stale success.
+- Expanded schema-v4 `Q` release validation from its live/backup projection to
+  the complete `(O,M,M,I)` tuple, rebinding prepared exact-installed and
+  staged-candidate missing after the inner recovery closes its descriptors.
 - Preserved the last complete schema-v4 `P` proof or conservative `Q_or_P`
   hint when a later stage/prepared probe fails; `Q` now requires a complete
   four-role observation.
@@ -236,6 +242,15 @@ superseded_by:
   rebound through the held rules parent before lock release. Present objects
   compare identity, content, access, and single-link policy; missing and
   unreadable roles remain distinct from property mismatch.
+- Fast and post-validator-converged no-change results retain the full live
+  snapshot until a `before_release` proof completes. Legacy schema-v1/v2
+  `already_original` selects the same live-only terminal role without
+  constraining an unrelated backup path.
+- Schema-v4 `Q` now carries all four terminal roles into the outer release
+  callback. The callback freshly binds the receipt-owned prepared parent,
+  proves prepared exact-installed, and rejects prepared disappearance or
+  identity/content/access/link drift plus staged-candidate appearance for
+  both `recovered` and retry `already_original`.
 - A managed signal stays primary when that final role proof fails; its nested
   rollback becomes `recovery_required` and carries the exact role, state,
   mismatched property, and recovery locators.
@@ -341,3 +356,15 @@ superseded_by:
   isolated `uv` PyYAML environment after the direct installed wrapper reported
   that local Python lacked `PyYAML`.
 - `git diff --check` passed after the last source update.
+- Rules transaction tests: 205 passed on Python 3.13. Four new integration
+  methods exercise 28 deterministic lock-release races: fast and converged
+  no-change across live identity/content/access/link drift; schema-v1/v2
+  `already_original` across the same four properties; and schema-v4 Q
+  `recovered` plus retry `already_original` across prepared
+  missing/identity/content/access/link and staged-candidate appearance.
+- Full repository suite covered all 1,267 tests on Python 3.13.
+- The four new transaction methods passed on system Python 3.9.6, and both
+  changed Python files byte-compiled on Python 3.13 and system Python 3.9.6
+  with task-scoped caches removed afterward.
+- Final static gates passed Ruff check/format, the official Rules skill
+  validator, project-journal validation, and `git diff --check`.
