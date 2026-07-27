@@ -42,6 +42,10 @@ VALIDATOR_RESOURCE_FINALIZERS = (
     "stderr-pipe-close",
     "signal-supervision-restore",
 )
+DEFERRED_VALIDATOR_RESOURCE_FINALIZERS = (
+    *VALIDATOR_RESOURCE_FINALIZERS[:-1],
+    "signal-ownership-mask-handoff",
+)
 
 
 def load_helper_module():
@@ -227,6 +231,89 @@ class RulesApplyTransactionTests(unittest.TestCase):
             "attempt",
             autospec=True,
             side_effect=instrument_attempt,
+        ):
+            yield state
+
+    @contextmanager
+    def inject_validator_finalizer_failure(
+        self,
+        target: str,
+        *,
+        active: Callable[[], bool] = lambda: True,
+    ):
+        real_attempt = TRANSACTION.ValidatorFailureAccumulator.attempt
+        state = SimpleNamespace(injected=False)
+
+        def instrument_attempt(
+            accumulator: object,
+            descriptor: str,
+            operation: Callable[[], object],
+        ) -> object | None:
+            assert isinstance(
+                accumulator,
+                TRANSACTION.ValidatorFailureAccumulator,
+            )
+            if not active() or descriptor != target or state.injected:
+                return real_attempt(accumulator, descriptor, operation)
+
+            def fail_after_operation() -> object:
+                operation()
+                state.injected = True
+                raise OSError(
+                    errno.EIO,
+                    f"fault-injected {descriptor} finalizer failure",
+                )
+
+            return real_attempt(
+                accumulator,
+                descriptor,
+                fail_after_operation,
+            )
+
+        with mock.patch.object(
+            TRANSACTION.ValidatorFailureAccumulator,
+            "attempt",
+            autospec=True,
+            side_effect=instrument_attempt,
+        ):
+            yield state
+
+    @contextmanager
+    def inject_signal_after_validator_final_pending_read(
+        self,
+        *,
+        active: Callable[[], bool],
+        signum: int,
+    ):
+        real_capture = TRANSACTION._capture_pending_managed_validator_signals
+        state = SimpleNamespace(injected=False, observed=[])
+
+        def capture_then_signal(
+            gate: object,
+            failures: list[dict[str, object]],
+            *,
+            descriptor: str,
+        ) -> None:
+            assert isinstance(gate, TRANSACTION.ValidatorSignalGate)
+            real_capture(
+                gate,
+                failures,
+                descriptor=descriptor,
+            )
+            if not active():
+                return
+            state.observed.append(descriptor)
+            if (
+                descriptor == "signal-handoff:final-pending-before-mask"
+                and not state.injected
+            ):
+                state.injected = True
+                os.kill(os.getpid(), signum)
+
+        with mock.patch.object(
+            TRANSACTION,
+            "_capture_pending_managed_validator_signals",
+            side_effect=capture_then_signal,
         ):
             yield state
 
@@ -2671,16 +2758,17 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
         for failure_kind in ("handler", "mask"):
             with self.subTest(postcondition=failure_kind):
-                gate = mock.Mock()
+                gate = TRANSACTION.ValidatorSignalGate()
                 restored_handler = (
                     signal.SIG_IGN if failure_kind == "handler" else previous_handler
                 )
-                restored_mask = inherited_mask if failure_kind == "handler" else set()
+                final_mask = inherited_mask if failure_kind == "handler" else set()
                 pthread_sigmask = mock.Mock(
                     side_effect=[
                         set(),
                         set(),
-                        restored_mask,
+                        inherited_mask,
+                        final_mask,
                     ]
                 )
                 with (
@@ -2696,8 +2784,16 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     mock.patch.object(
                         TRANSACTION.signal,
                         "getsignal",
-                        return_value=restored_handler,
+                        side_effect=[
+                            gate.handle,
+                            restored_handler,
+                        ],
                     ) as get_handler,
+                    mock.patch.object(
+                        TRANSACTION.signal,
+                        "sigpending",
+                        return_value=set(),
+                    ),
                 ):
                     failures = TRANSACTION._restore_validator_signal_supervision(
                         gate,
@@ -2711,9 +2807,9 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     accumulator.finish(TRANSACTION.ValidatorResult(0, "", ""))
 
                 expected_descriptor = (
-                    "signal-restore:validate-handler:SIGTERM"
+                    "signal-handoff:validate-restored-handler:SIGTERM"
                     if failure_kind == "handler"
-                    else "signal-restore:validate-mask"
+                    else "signal-handoff:validate-final-mask"
                 )
                 self.assertEqual(
                     [failure["descriptor"] for failure in failures],
@@ -2729,31 +2825,33 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     ],
                     expected_descriptor,
                 )
-                gate.close.assert_called_once_with()
                 install_handler.assert_called_once_with(
                     signal.SIGTERM,
                     previous_handler,
                 )
-                get_handler.assert_called_once_with(signal.SIGTERM)
-                self.assertEqual(pthread_sigmask.call_count, 3)
+                self.assertEqual(get_handler.call_count, 2)
+                self.assertEqual(pthread_sigmask.call_count, 4)
 
-        gate = mock.Mock()
-        gate.close.side_effect = OSError(
-            errno.EIO,
-            "fault-injected gate close failure",
-        )
-        pthread_sigmask = mock.Mock(
-            side_effect=[
-                OSError(errno.EIO, "fault-injected signal block failure"),
-                OSError(errno.EIO, "fault-injected mask restore failure"),
-                set(),
-            ]
+        gate = TRANSACTION.ValidatorSignalGate()
+        handoff = TRANSACTION.ValidatorSignalOwnershipHandoff(
+            gate,
+            {
+                signal.SIGINT: signal.SIG_DFL,
+                signal.SIGTERM: signal.SIG_DFL,
+            },
+            inherited_mask,
+            mask_released_to_gate=True,
         )
         with (
             mock.patch.object(
                 TRANSACTION.signal,
                 "pthread_sigmask",
-                pthread_sigmask,
+                return_value=set(),
+            ) as pthread_sigmask,
+            mock.patch.object(
+                TRANSACTION.signal,
+                "sigpending",
+                return_value=set(),
             ),
             mock.patch.object(
                 TRANSACTION.signal,
@@ -2772,28 +2870,18 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 ],
             ) as get_handler,
         ):
-            failures = TRANSACTION._restore_validator_signal_supervision(
-                gate,
-                {
-                    signal.SIGINT: signal.SIG_DFL,
-                    signal.SIGTERM: signal.SIG_DFL,
-                },
-                inherited_mask,
-            )
+            failures = TRANSACTION._complete_validator_signal_ownership_handoff(handoff)
 
         self.assertEqual(install_handler.call_count, 2)
         self.assertEqual(get_handler.call_count, 2)
-        self.assertEqual(pthread_sigmask.call_count, 3)
+        self.assertEqual(pthread_sigmask.call_count, 1)
         self.assertEqual(
             [failure["descriptor"] for failure in failures],
             [
-                "signal-restore:block-managed",
-                "signal-restore:gate-close",
-                "signal-restore:handler:SIGINT",
-                "signal-restore:validate-handler:SIGINT",
-                "signal-restore:validate-handler:SIGTERM",
-                "signal-restore:set-inherited-mask",
-                "signal-restore:validate-mask",
+                "signal-handoff:restore-handler:SIGINT",
+                "signal-handoff:validate-restored-handler:SIGINT",
+                "signal-handoff:validate-restored-handler:SIGTERM",
+                "signal-handoff:validate-final-mask",
             ],
         )
 
@@ -3874,9 +3962,9 @@ class RulesApplyTransactionTests(unittest.TestCase):
     def test_signal_at_each_post_replace_finalizer_keeps_exit_precedence(
         self,
     ) -> None:
-        expected_attempts = VALIDATOR_RESOURCE_FINALIZERS
+        expected_attempts = DEFERRED_VALIDATOR_RESOURCE_FINALIZERS
 
-        for target_index, target in enumerate(VALIDATOR_RESOURCE_FINALIZERS):
+        for target_index, target in enumerate(DEFERRED_VALIDATOR_RESOURCE_FINALIZERS):
             with (
                 self.subTest(finalizer=target),
                 tempfile.TemporaryDirectory(
@@ -3897,6 +3985,9 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     *,
                     timeout_seconds: float,
                     pass_fds: tuple[int, ...] = (),
+                    deferred_signal_handoffs: (
+                        list[TRANSACTION.ValidatorSignalOwnershipHandoff] | None
+                    ) = None,
                 ) -> object:
                     nonlocal post_replace_phase
                     post_replace_phase = rules_path.resolve() == self.rules.resolve()
@@ -3906,6 +3997,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
                             rules_path,
                             timeout_seconds=timeout_seconds,
                             pass_fds=pass_fds,
+                            deferred_signal_handoffs=deferred_signal_handoffs,
                         )
                     finally:
                         post_replace_phase = False
@@ -3962,6 +4054,209 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 self.assertEqual(self.backup.read_bytes(), NEW_RULES)
                 self.assertTrue(self.receipt.is_file())
                 self.assert_no_private_stage()
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending")
+        and hasattr(signal, "sigwait"),
+        "validator signal ownership handoff requires POSIX signal waits",
+    )
+    def test_signal_after_final_pending_read_preserves_failed_live_result(
+        self,
+    ) -> None:
+        signum = signal.SIGTERM
+        failed_marker = self.root / "live-validator-failed"
+        self.write_validator(
+            f"""\
+            from pathlib import Path
+            import sys
+
+            if Path(sys.argv[1]).name == "default.rules":
+                Path({str(failed_marker)!r}).write_text("failed", encoding="ascii")
+                raise SystemExit(9)
+            """
+        )
+        saved_handler = signal.getsignal(signum)
+        saved_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        escaped_signals: list[int] = []
+
+        def escaped_handler(observed: int, _frame: object) -> None:
+            escaped_signals.append(observed)
+
+        signal.signal(signum, escaped_handler)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signum})
+        inherited_test_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        post_replace_phase = False
+        deferred_handoff_ids: set[int] = set()
+        real_run_validator = TRANSACTION.run_validator
+        real_record_terminal = TRANSACTION.record_recovery_terminal
+        real_complete_handoff = TRANSACTION._complete_validator_signal_ownership_handoff
+        events: list[str] = []
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        terminal_result = TRANSACTION.recovery_terminal_result_path(terminal)
+
+        def track_validator_phase(
+            command_template: list[str],
+            rules_path: Path,
+            *,
+            timeout_seconds: float,
+            pass_fds: tuple[int, ...] = (),
+            deferred_signal_handoffs: (
+                list[TRANSACTION.ValidatorSignalOwnershipHandoff] | None
+            ) = None,
+        ) -> object:
+            nonlocal post_replace_phase
+            post_replace_phase = rules_path.resolve() == self.rules.resolve()
+            handoff_count = (
+                len(deferred_signal_handoffs)
+                if deferred_signal_handoffs is not None
+                else 0
+            )
+            try:
+                return real_run_validator(
+                    command_template,
+                    rules_path,
+                    timeout_seconds=timeout_seconds,
+                    pass_fds=pass_fds,
+                    deferred_signal_handoffs=deferred_signal_handoffs,
+                )
+            finally:
+                if deferred_signal_handoffs is not None:
+                    deferred_handoff_ids.update(
+                        id(handoff)
+                        for handoff in deferred_signal_handoffs[handoff_count:]
+                    )
+                post_replace_phase = False
+
+        def record_terminal_then_mark(*args: object, **kwargs: object) -> object:
+            result = real_record_terminal(*args, **kwargs)
+            events.append("terminal-published")
+            return result
+
+        def complete_after_terminal(
+            handoff: TRANSACTION.ValidatorSignalOwnershipHandoff,
+        ) -> list[dict[str, object]]:
+            if id(handoff) not in deferred_handoff_ids:
+                return real_complete_handoff(handoff)
+            self.assertTrue(terminal_result.is_file())
+            self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+            events.append("handoff-start")
+            failures = real_complete_handoff(handoff)
+            events.append("handoff-complete")
+            return failures
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"CODEX_HOME": str(self.codex_home)},
+                ),
+                mock.patch.object(
+                    TRANSACTION,
+                    "run_validator",
+                    side_effect=track_validator_phase,
+                ),
+                mock.patch.object(
+                    TRANSACTION,
+                    "record_recovery_terminal",
+                    side_effect=record_terminal_then_mark,
+                ),
+                mock.patch.object(
+                    TRANSACTION,
+                    "_complete_validator_signal_ownership_handoff",
+                    side_effect=complete_after_terminal,
+                ),
+                self.inject_signal_after_validator_final_pending_read(
+                    active=lambda: post_replace_phase,
+                    signum=signum,
+                ) as signal_state,
+                self.inject_validator_finalizer_failure(
+                    "signal-ownership-mask-handoff",
+                    active=lambda: post_replace_phase,
+                ) as failure_state,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                exit_code = TRANSACTION.main(self.apply_argv())
+            events.append("signal-forwarded")
+
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(
+                exit_code,
+                128 + signum,
+                json.dumps(payload, sort_keys=True),
+            )
+            self.assertTrue(failed_marker.is_file())
+            self.assertTrue(signal_state.injected)
+            self.assertEqual(
+                signal_state.observed,
+                ["signal-handoff:final-pending-before-mask"],
+            )
+            self.assertTrue(failure_state.injected)
+            self.assertEqual(escaped_signals, [])
+            self.assertEqual(
+                events,
+                [
+                    "terminal-published",
+                    "handoff-start",
+                    "handoff-complete",
+                    "signal-forwarded",
+                ],
+            )
+            self.assertEqual(payload["status"], "interrupted")
+            self.assertEqual(payload["signal"], signum)
+            self.assertEqual(
+                payload["interrupted_phase"],
+                "post_replace_validation",
+            )
+            recovery = payload["post_replace_recovery"]
+            self.assertEqual(
+                recovery["status"],
+                "post_replace_failed_rolled_back",
+            )
+            self.assertEqual(
+                recovery["rollback"]["rollback_status"],
+                "rolled_back",
+            )
+            self.assertEqual(
+                recovery["post_replace_failure"]["validator"]["returncode"],
+                9,
+            )
+            self.assertEqual(
+                [
+                    failure["descriptor"]
+                    for failure in payload["validator_cleanup_errors"]
+                ],
+                [
+                    "superseded-primary",
+                    "signal-ownership-mask-handoff",
+                ],
+            )
+            self.assertEqual(
+                payload["validator_cleanup_errors"][0]["details"]["validator"][
+                    "returncode"
+                ],
+                9,
+            )
+            self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+            self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+            self.assertTrue(self.receipt.is_file())
+            self.assertTrue(terminal_result.is_file())
+            self.assert_no_private_stage()
+            self.assertEqual(signal.getsignal(signum), escaped_handler)
+            self.assertEqual(
+                signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                inherited_test_mask,
+            )
+        finally:
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signum})
+            if signum in signal.sigpending():
+                signal.sigwait({signum})
+            signal.signal(signum, saved_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
 
     def test_validator_descendant_is_terminated_after_leader_exit(self) -> None:
         pid_path = self.root / "validator-descendant.pid"

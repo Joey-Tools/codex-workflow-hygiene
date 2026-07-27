@@ -139,6 +139,19 @@ class ValidatorSignalGate:
         self._armed = False
 
 
+@dataclass
+class ValidatorSignalOwnershipHandoff:
+    """Keep the gate authoritative until the caller publishes a safe outcome."""
+
+    gate: ValidatorSignalGate
+    previous_handlers: dict[int, signal.Handlers]
+    inherited_mask: set[signal.Signals]
+    mask_released_to_gate: bool = False
+    handlers_restored: bool = False
+    completion_attempted: bool = False
+    forwarded_signal: ForwardedValidatorSignal | None = None
+
+
 @dataclass(frozen=True)
 class Snapshot:
     device: int
@@ -628,15 +641,34 @@ class ValidatorFailureAccumulator:
                 self.record("additional-forwarded-signal", error)
             return
         if self.primary_error is not None:
-            self.secondary_failures.append(
+            self.secondary_failures.insert(
+                0,
                 structured_operation_failure(
                     "validator-execution",
                     "superseded-primary",
                     self.primary_error,
-                )
+                ),
             )
         self.primary_error = error
         self.primary_traceback = error.__traceback__
+
+    def capture_failed_result_before_signal(self, result: ValidatorResult) -> None:
+        """Retain a completed validator rejection before signal precedence."""
+
+        result_error = TransactionError(
+            "validator_failed_before_signal",
+            "validator had already rejected the rules before a managed signal",
+            exit_code=EXIT_VALIDATION_FAILED,
+            details={"validator": result.to_json()},
+        )
+        self.secondary_failures.insert(
+            0,
+            structured_operation_failure(
+                "validator-execution",
+                "superseded-primary",
+                result_error,
+            ),
+        )
 
     def record(self, descriptor: str, error: BaseException) -> None:
         self.secondary_failures.append(
@@ -664,12 +696,24 @@ class ValidatorFailureAccumulator:
                 self.record(descriptor, error)
             return None
 
-    def finish(self, result: ValidatorResult | None) -> ValidatorResult:
+    def finish(
+        self,
+        result: ValidatorResult | None,
+        *,
+        deferred_signal_handoff: ValidatorSignalOwnershipHandoff | None = None,
+    ) -> ValidatorResult:
         if self.primary_error is not None:
             attach_validator_failures_to_exception(
                 self.primary_error,
                 self.secondary_failures,
             )
+            if (
+                isinstance(self.primary_error, ForwardedValidatorSignal)
+                and deferred_signal_handoff is not None
+            ):
+                deferred_signal_handoff.forwarded_signal = self.primary_error
+                if result is not None:
+                    return result
             raise self.primary_error.with_traceback(self.primary_traceback)
         if self.secondary_failures:
             raise TransactionError(
@@ -4935,12 +4979,10 @@ def _capture_pending_managed_validator_signals(
             continue
 
 
-def _restore_validator_signal_supervision(
-    gate: ValidatorSignalGate,
-    previous_handlers: dict[int, signal.Handlers],
-    inherited_mask: set[signal.Signals],
+def _prepare_validator_signal_ownership_handoff(
+    handoff: ValidatorSignalOwnershipHandoff,
 ) -> list[dict[str, object]]:
-    """Best-effort restoration plus post-replacement identity validation."""
+    """Restore the inherited mask while the capture-only gate still owns signals."""
 
     failures: list[dict[str, object]] = []
 
@@ -4959,27 +5001,121 @@ def _restore_validator_signal_supervision(
 
     pthread_sigmask = signal.pthread_sigmask
     managed_blocked = _block_managed_validator_signals(
-        gate,
+        handoff.gate,
         failures,
-        descriptor="signal-restore:block-managed",
+        descriptor="signal-handoff:block-managed",
     )
-    attempt("signal-restore:gate-close", gate.close)
-    if managed_blocked:
-        _capture_pending_managed_validator_signals(
-            gate,
-            failures,
-            descriptor="signal-restore:pending-before-handlers",
-        )
-    for signum, handler in previous_handlers.items():
+    attempt("signal-handoff:gate-close", handoff.gate.close)
+
+    gate_handlers_effective = True
+    for signum in handoff.previous_handlers:
         signal_name = signal.Signals(signum).name
-        attempt(
-            f"signal-restore:handler:{signal_name}",
-            lambda signum=signum, handler=handler: signal.signal(
-                signum,
-                handler,
-            ),
+
+        def ensure_gate_handler(signum: int = signum) -> bool:
+            observed = signal.getsignal(signum)
+            if observed != handoff.gate.handle:
+                signal.signal(signum, handoff.gate.handle)
+                observed = signal.getsignal(signum)
+                if observed != handoff.gate.handle:
+                    raise RuntimeError(
+                        f"{signal.Signals(signum).name} gate handler is not effective"
+                    )
+            return True
+
+        if (
+            attempt(
+                f"signal-handoff:ensure-gate-handler:{signal_name}",
+                ensure_gate_handler,
+            )
+            is not True
+        ):
+            gate_handlers_effective = False
+
+    if managed_blocked and gate_handlers_effective:
+        _capture_pending_managed_validator_signals(
+            handoff.gate,
+            failures,
+            descriptor="signal-handoff:final-pending-before-mask",
         )
-    for signum, handler in previous_handlers.items():
+
+        def set_inherited_mask() -> bool:
+            pthread_sigmask(signal.SIG_SETMASK, handoff.inherited_mask)
+            return True
+
+        mask_released = attempt(
+            "signal-handoff:set-inherited-mask",
+            set_inherited_mask,
+        )
+
+        def validate_mask() -> bool:
+            observed = pthread_sigmask(signal.SIG_BLOCK, set())
+            if set(observed) != set(handoff.inherited_mask):
+                raise RuntimeError("inherited signal mask replacement did not persist")
+            return True
+
+        if mask_released is True:
+            handoff.mask_released_to_gate = (
+                attempt(
+                    "signal-handoff:validate-inherited-mask",
+                    validate_mask,
+                )
+                is True
+            )
+    return failures
+
+
+def _complete_validator_signal_ownership_handoff(
+    handoff: ValidatorSignalOwnershipHandoff,
+) -> list[dict[str, object]]:
+    """Transfer handlers only after the caller has published a safe terminal state."""
+
+    if handoff.completion_attempted:
+        return []
+    handoff.completion_attempted = True
+    failures: list[dict[str, object]] = []
+
+    def attempt(descriptor: str, operation: Callable[[], object]) -> object | None:
+        try:
+            return operation()
+        except BaseException as error:
+            failures.append(
+                structured_operation_failure(
+                    "validator-finalization",
+                    descriptor,
+                    error,
+                )
+            )
+            return None
+
+    if not handoff.mask_released_to_gate:
+        failures.extend(_prepare_validator_signal_ownership_handoff(handoff))
+
+    # Signals that the inherited mask intentionally keeps blocked may have
+    # arrived while rollback or terminal publication ran.  Consume them before
+    # transferring the corresponding handlers; unblocked signals have already
+    # reached the still-installed gate.
+    if handoff.mask_released_to_gate:
+        _capture_pending_managed_validator_signals(
+            handoff.gate,
+            failures,
+            descriptor="signal-handoff:pending-before-handlers",
+        )
+
+    handlers_restored = True
+    for signum, handler in handoff.previous_handlers.items():
+        signal_name = signal.Signals(signum).name
+        if (
+            attempt(
+                f"signal-handoff:restore-handler:{signal_name}",
+                lambda signum=signum, handler=handler: signal.signal(
+                    signum,
+                    handler,
+                ),
+            )
+            is None
+        ):
+            handlers_restored = False
+    for signum, handler in handoff.previous_handlers.items():
         signal_name = signal.Signals(signum).name
 
         def validate_handler(
@@ -4993,26 +5129,34 @@ def _restore_validator_signal_supervision(
                 )
 
         attempt(
-            f"signal-restore:validate-handler:{signal_name}",
+            f"signal-handoff:validate-restored-handler:{signal_name}",
             validate_handler,
         )
-    if managed_blocked:
-        _capture_pending_managed_validator_signals(
-            gate,
-            failures,
-            descriptor="signal-restore:pending-before-mask",
-        )
-    attempt(
-        "signal-restore:set-inherited-mask",
-        lambda: pthread_sigmask(signal.SIG_SETMASK, inherited_mask),
-    )
 
     def validate_mask() -> None:
-        observed = pthread_sigmask(signal.SIG_BLOCK, set())
-        if set(observed) != set(inherited_mask):
+        observed = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        if set(observed) != set(handoff.inherited_mask):
             raise RuntimeError("inherited signal mask replacement did not persist")
 
-    attempt("signal-restore:validate-mask", validate_mask)
+    attempt("signal-handoff:validate-final-mask", validate_mask)
+    handoff.handlers_restored = handlers_restored and not failures
+    return failures
+
+
+def _restore_validator_signal_supervision(
+    gate: ValidatorSignalGate,
+    previous_handlers: dict[int, signal.Handlers],
+    inherited_mask: set[signal.Signals],
+) -> list[dict[str, object]]:
+    """Complete an immediate ownership handoff after validator cleanup."""
+
+    handoff = ValidatorSignalOwnershipHandoff(
+        gate,
+        previous_handlers,
+        inherited_mask,
+    )
+    failures = _prepare_validator_signal_ownership_handoff(handoff)
+    failures.extend(_complete_validator_signal_ownership_handoff(handoff))
     return failures
 
 
@@ -5244,6 +5388,7 @@ def run_validator(
     *,
     timeout_seconds: float,
     pass_fds: tuple[int, ...] = (),
+    deferred_signal_handoffs: list[ValidatorSignalOwnershipHandoff] | None = None,
 ) -> ValidatorResult:
     if (
         not math.isfinite(timeout_seconds)
@@ -5282,6 +5427,15 @@ def run_validator(
     descendants_terminated = False
     failures = ValidatorFailureAccumulator()
     result: ValidatorResult | None = None
+    signal_handoff: ValidatorSignalOwnershipHandoff | None = None
+    failed_result_retained = False
+
+    def capture_forwarded_signal(event: ForwardedValidatorSignal) -> None:
+        nonlocal failed_result_retained
+        if result is not None and not result.valid and not failed_result_retained:
+            failures.capture_failed_result_before_signal(result)
+            failed_result_retained = True
+        failures.capture_forwarded_signal(event)
 
     def execute_validator() -> ValidatorResult:
         nonlocal process
@@ -5466,13 +5620,13 @@ def run_validator(
                 break
         if execution_error is not None:
             if isinstance(execution_error, ForwardedValidatorSignal):
-                failures.capture_forwarded_signal(execution_error)
+                capture_forwarded_signal(execution_error)
             else:
                 failures.capture_primary(execution_error)
         if boundary_signal is not None:
-            failures.capture_forwarded_signal(boundary_signal)
+            capture_forwarded_signal(boundary_signal)
         if signal_gate.pending_signum in MANAGED_VALIDATOR_SIGNALS:
-            failures.capture_forwarded_signal(
+            capture_forwarded_signal(
                 ForwardedValidatorSignal(signal_gate.pending_signum)
             )
         if execution_error is not None and process is not None:
@@ -5497,21 +5651,38 @@ def run_validator(
         ):
             if stream is not None:
                 failures.attempt(label, stream.close)
-        restore_result = failures.attempt(
-            "signal-supervision-restore",
-            lambda: _restore_validator_signal_supervision(
+        if deferred_signal_handoffs is None:
+            restore_result = failures.attempt(
+                "signal-supervision-restore",
+                lambda: _restore_validator_signal_supervision(
+                    signal_gate,
+                    previous_signal_handlers,
+                    inherited_signal_mask,
+                ),
+            )
+        else:
+            signal_handoff = ValidatorSignalOwnershipHandoff(
                 signal_gate,
                 previous_signal_handlers,
                 inherited_signal_mask,
-            ),
-        )
+            )
+            deferred_signal_handoffs.append(signal_handoff)
+            restore_result = failures.attempt(
+                "signal-ownership-mask-handoff",
+                lambda: _prepare_validator_signal_ownership_handoff(
+                    signal_handoff,
+                ),
+            )
         if isinstance(restore_result, list):
             failures.extend(restore_result)
         if signal_gate.pending_signum in MANAGED_VALIDATOR_SIGNALS:
-            failures.capture_forwarded_signal(
+            capture_forwarded_signal(
                 ForwardedValidatorSignal(signal_gate.pending_signum)
             )
-    return failures.finish(result)
+    return failures.finish(
+        result,
+        deferred_signal_handoff=signal_handoff,
+    )
 
 
 def fsync_file_and_parent(path: Path) -> None:
@@ -7456,6 +7627,7 @@ def rollback(
 def _apply_transaction_inner(
     args: argparse.Namespace,
     cleanup_callbacks: list[Callable[[], list[dict[str, object]]]],
+    deferred_signal_handoffs: list[ValidatorSignalOwnershipHandoff],
 ) -> tuple[int, dict[str, object]]:
     expected_sha256 = args.expected_sha256.lower()
     if not valid_sha256(expected_sha256):
@@ -8368,11 +8540,17 @@ def _apply_transaction_inner(
             post_validation: ValidatorResult | None = None
             if post_failure is None:
                 try:
+                    handoff_count = len(deferred_signal_handoffs)
                     post_validation = run_validator(
                         args.validator_command,
                         rules,
                         timeout_seconds=args.validator_timeout_seconds,
+                        deferred_signal_handoffs=deferred_signal_handoffs,
                     )
+                    if len(deferred_signal_handoffs) > handoff_count:
+                        signal_handoff = deferred_signal_handoffs[-1]
+                        if signal_handoff.forwarded_signal is not None:
+                            raise signal_handoff.forwarded_signal
                 except ForwardedValidatorSignal as event:
                     post_replace_signal = event
                     post_replace_signal_traceback = event.__traceback__
@@ -8380,6 +8558,11 @@ def _apply_transaction_inner(
                         "status": "post_replace_validation_interrupted",
                         "signal": event.signum,
                         "signal_name": signal.Signals(event.signum).name,
+                        **(
+                            {"validator": post_validation.to_json()}
+                            if post_validation is not None and not post_validation.valid
+                            else {}
+                        ),
                         **(
                             {"validator_cleanup_errors": list(event.cleanup_errors)}
                             if event.cleanup_errors
@@ -8701,43 +8884,180 @@ def _apply_transaction_inner(
 
 def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
     cleanup_callbacks: list[Callable[[], list[dict[str, object]]]] = []
+    deferred_signal_handoffs: list[ValidatorSignalOwnershipHandoff] = []
     outcome: tuple[int, dict[str, object]] | None = None
     primary_error: BaseException | None = None
+    primary_traceback: object | None = None
     try:
-        outcome = _apply_transaction_inner(args, cleanup_callbacks)
+        outcome = _apply_transaction_inner(
+            args,
+            cleanup_callbacks,
+            deferred_signal_handoffs,
+        )
     except BaseException as error:
         primary_error = error
-        raise
-    finally:
-        failures: list[dict[str, object]] = []
-        for callback in cleanup_callbacks:
-            try:
-                failures.extend(callback())
-            except BaseException as error:
-                failures.append(
+        primary_traceback = error.__traceback__
+
+    cleanup_failures: list[dict[str, object]] = []
+    for callback in cleanup_callbacks:
+        try:
+            cleanup_failures.extend(callback())
+        except BaseException as error:
+            cleanup_failures.append(
+                structured_operation_failure(
+                    "close",
+                    "apply_evidence_group",
+                    error,
+                )
+            )
+
+    signal_event = (
+        primary_error if isinstance(primary_error, ForwardedValidatorSignal) else None
+    )
+    handoff_failures: list[dict[str, object]] = []
+    for handoff in deferred_signal_handoffs:
+        handoff_failures.extend(_complete_validator_signal_ownership_handoff(handoff))
+        if (
+            handoff.forwarded_signal is None
+            and handoff.gate.pending_signum in MANAGED_VALIDATOR_SIGNALS
+        ):
+            handoff.forwarded_signal = ForwardedValidatorSignal(
+                handoff.gate.pending_signum
+            )
+        if handoff.forwarded_signal is not None:
+            if signal_event is None:
+                signal_event = handoff.forwarded_signal
+            elif signal_event.signum != handoff.forwarded_signal.signum:
+                signal_event.cleanup_errors.append(
                     structured_operation_failure(
-                        "close",
-                        "apply_evidence_group",
-                        error,
+                        "validator-finalization",
+                        "additional-forwarded-signal",
+                        handoff.forwarded_signal,
                     )
                 )
-        if failures:
-            if primary_error is not None:
-                attach_failures_to_exception(
+
+    if signal_event is not None:
+        if primary_error is not None and primary_error is not signal_event:
+            signal_event.cleanup_errors.insert(
+                0,
+                structured_operation_failure(
+                    "post-replace-transaction",
+                    "superseded-primary",
                     primary_error,
-                    "cleanup_failures",
-                    failures,
-                )
-            elif outcome is not None:
-                if outcome[0] == 0:
-                    outcome = final_evidence_cleanup_uncertain_outcome(
-                        outcome,
-                        failures,
+                ),
+            )
+        if handoff_failures:
+            attach_validator_failures_to_exception(
+                signal_event,
+                handoff_failures,
+            )
+            recovery = signal_event.recovery_details.get("post_replace_recovery")
+            if isinstance(recovery, dict):
+                post_failure = recovery.get("post_replace_failure")
+                if isinstance(post_failure, dict):
+                    post_failure["validator_cleanup_errors"] = list(
+                        signal_event.cleanup_errors
                     )
-                else:
-                    attach_cleanup_failures_to_payload(outcome[1], failures)
+        if cleanup_failures:
+            attach_failures_to_exception(
+                signal_event,
+                "cleanup_failures",
+                cleanup_failures,
+            )
+        if not signal_event.recovery_details and outcome is not None:
+            exit_code, payload = outcome
+            signal_event.recovery_details = {
+                "interrupted_phase": "post_replace_finalization",
+                **(
+                    {"receipt_path": payload["receipt_path"]}
+                    if isinstance(payload.get("receipt_path"), str)
+                    else {}
+                ),
+                **(
+                    {"backup_path": payload["backup_path"]}
+                    if isinstance(payload.get("backup_path"), str)
+                    else {}
+                ),
+                "post_replace_recovery": {
+                    "exit_code": exit_code,
+                    **payload,
+                },
+            }
+        raise signal_event.with_traceback(
+            signal_event.__traceback__
+            if signal_event.__traceback__ is not None
+            else primary_traceback
+        )
+
+    if handoff_failures:
+        if primary_error is not None:
+            attach_validator_failures_to_exception(
+                primary_error,
+                handoff_failures,
+            )
+        elif outcome is not None:
+            if outcome[0] == 0:
+                exit_code, payload = outcome
+                outcome = (
+                    EXIT_POST_REPLACE_FAILED,
+                    {
+                        "status": "recovery_required",
+                        "operation_status": payload.get("status"),
+                        "reason": "validator_signal_handoff_failed",
+                        "validator_cleanup_failures": list(handoff_failures),
+                        **(
+                            {"receipt_path": payload["receipt_path"]}
+                            if isinstance(payload.get("receipt_path"), str)
+                            else {}
+                        ),
+                        **(
+                            {"backup_path": payload["backup_path"]}
+                            if isinstance(payload.get("backup_path"), str)
+                            else {}
+                        ),
+                        "prior_exit_code": exit_code,
+                    },
+                )
             else:
-                raise descriptor_cleanup_error(failures)
+                existing = outcome[1].get("validator_cleanup_failures")
+                if isinstance(existing, list):
+                    existing.extend(handoff_failures)
+                else:
+                    outcome[1]["validator_cleanup_failures"] = list(handoff_failures)
+        else:
+            primary_error = TransactionError(
+                "validator_cleanup_failed",
+                "validator signal ownership handoff could not be verified",
+                details={
+                    "validator_cleanup_failures": list(handoff_failures),
+                },
+            )
+            primary_traceback = primary_error.__traceback__
+
+    if cleanup_failures:
+        if primary_error is not None:
+            attach_failures_to_exception(
+                primary_error,
+                "cleanup_failures",
+                cleanup_failures,
+            )
+        elif outcome is not None:
+            if outcome[0] == 0:
+                outcome = final_evidence_cleanup_uncertain_outcome(
+                    outcome,
+                    cleanup_failures,
+                )
+            else:
+                attach_cleanup_failures_to_payload(
+                    outcome[1],
+                    cleanup_failures,
+                )
+        else:
+            primary_error = descriptor_cleanup_error(cleanup_failures)
+            primary_traceback = primary_error.__traceback__
+
+    if primary_error is not None:
+        raise primary_error.with_traceback(primary_traceback)
     if outcome is None:
         raise TransactionError(
             "runtime_error",

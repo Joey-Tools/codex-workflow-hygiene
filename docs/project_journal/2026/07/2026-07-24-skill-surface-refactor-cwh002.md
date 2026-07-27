@@ -250,9 +250,18 @@ superseded_by:
 - Successful and failed validator execution now share the same first
   finalization step: block managed signals and close the armed gate, then
   synchronously consume any pending `SIGINT`, `SIGTERM`, or `SIGHUP` while
-  cleanup remains non-interruptible. The latched signal supersedes an ordinary
-  execution failure without discarding it, every bounded finalizer and signal
-  restoration completes, and only then does `128 + signal` escape.
+  cleanup remains non-interruptible. The inherited mask is restored only while
+  the closed capture gate remains the verified installed handler; caller
+  handlers are never restored before an unblock.
+- The live-path validator transfers that same gate to the transaction owner.
+  It remains effective through rollback or applied-state publication, shared
+  lock release, and evidence-descriptor cleanup. Caller handlers are restored
+  afterward without a second mask transition, and only then can
+  `128 + signal` escape.
+- A completed nonzero live-path validator result remains the first ordered
+  secondary item when a final-handoff signal wins primary precedence.
+  Finalizer failures follow in actual attempt order, while nested recovery
+  retains the rejected validator result.
 - A managed signal during the second validator completes rollback or records
   operator recovery before it is re-raised. Its JSON result keeps the signal
   primary and includes exact receipt, backup, terminal, prepared, and staged
@@ -453,3 +462,17 @@ superseded_by:
 - The four new transaction methods passed on system Python 3.9.6, and both
   changed Python files byte-compiled on Python 3.13 and system Python 3.9.6
   with task-scoped caches removed afterward.
+- Rules transaction tests passed 220/220 and the full repository suite passed
+  1,282/1,282 on Python 3.13.0. The newest regression sends a real `SIGTERM`
+  after the final pending read and before `SIG_SETMASK`, after the live-path
+  validator has already exited 9. It proves the gate still owns the unblock,
+  the inherited handler never runs, rollback and recovery-terminal
+  publication precede forwarding, and ordered secondary evidence retains the
+  rejected validator result before the injected mask-handoff failure.
+- Ten focused signal-handoff and Linux `Z`/`X`/`x` regressions passed on
+  system Python 3.9.6, including every prior finalizer matrix and the exact
+  pending-read/unblock race.
+- Final gates passed Ruff check/format, Python 3.13.0 and system Python 3.9.6
+  byte compilation, the official Rules skill validator, project-journal
+  validation, and `git diff --check`. Task-scoped validation caches and the
+  retained validator report were removed afterward.
