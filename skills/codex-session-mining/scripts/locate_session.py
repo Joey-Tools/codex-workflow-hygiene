@@ -32,6 +32,7 @@ MAX_ROLLOUT_INVENTORY_ENTRIES = 100_000
 MAX_ROLLOUT_DIRECTORY_DEPTH = 32
 MAX_ROLLOUT_PATH_COMPONENTS = 250_000
 MAX_ROLLOUT_PATH_COMPONENT_BYTES = 16 * 1024 * 1024
+LOCATING_PATH_PROJECTION_TRUNCATED = "locating-path-projection-truncated"
 UUID_TEXT = (
     r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
     r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
@@ -137,38 +138,47 @@ def _project_string(
     value: object,
     *,
     limit: int,
-    normalize_whitespace: bool,
 ) -> None:
     if not isinstance(value, str):
         return
-    candidate = " ".join(value.split()) if normalize_whitespace else value
-    if not candidate:
+    if not value:
         return
-    retained = candidate[:limit]
+    retained = value[:limit]
     projection[key] = retained
-    if len(candidate) > limit:
+    if len(value) > limit:
         projection.setdefault("truncated_fields", {})[key] = {
             "limit_chars": limit,
-            "pre_truncation_chars": len(candidate),
+            "pre_truncation_chars": len(value),
             "retained_chars": len(retained),
         }
 
 
-def _project_path(path: Path) -> dict[str, Any]:
-    projection: dict[str, Any] = {}
+def _project_path(
+    projection: dict[str, Any],
+    key: str,
+    path: Path,
+) -> None:
     _project_string(
         projection,
-        "path",
+        key,
         os.fspath(path),
         limit=MAX_PATH_CHARS,
-        normalize_whitespace=False,
     )
-    return projection
 
 
 def _has_truncated_field(projection: dict[str, Any], key: str) -> bool:
     truncated_fields = projection.get("truncated_fields")
     return isinstance(truncated_fields, dict) and key in truncated_fields
+
+
+def _project_locating_path(
+    projection: dict[str, Any],
+    key: str,
+    path: Path,
+) -> None:
+    _project_path(projection, key, path)
+    if _has_truncated_field(projection, key):
+        _mark_partial(projection, LOCATING_PATH_PROJECTION_TRUNCATED)
 
 
 def _bounded_timestamp_scalar(value: object) -> int | float | None:
@@ -503,7 +513,7 @@ def _empty_source(kind: str, path: Path) -> dict[str, Any]:
         "records_scanned": 0,
         "status": "checked",
     }
-    source.update(_project_path(path))
+    _project_locating_path(source, "path", path)
     return source
 
 
@@ -513,6 +523,14 @@ def _mark_partial(source: dict[str, Any], reason: str) -> None:
     if reason not in reasons:
         reasons.append(reason)
     source["reason"] = reasons[0]
+
+
+def _mark_unavailable(source: dict[str, Any], reason: str) -> None:
+    source["availability"] = "unavailable"
+    source["unavailable_reason"] = reason
+    if source["status"] != "partial":
+        source["status"] = "unavailable"
+        source["reason"] = reason
 
 
 def _record_error(
@@ -525,7 +543,7 @@ def _record_error(
     source["error_count"] += 1
     if len(source["errors"]) < limit:
         error_projection = {"reason": reason}
-        error_projection.update(_project_path(path))
+        _project_path(error_projection, "path", path)
         source["errors"].append(error_projection)
     source["errors_truncated"] = source["error_count"] > len(source["errors"])
 
@@ -580,14 +598,13 @@ def _project_index_match(
     row: dict[str, Any],
 ) -> dict[str, Any]:
     projection: dict[str, Any] = {"line": line_number}
-    projection.update(_project_path(path))
+    _project_path(projection, "path", path)
     for key in ("id", "session_id"):
         _project_string(
             projection,
             key,
             row.get(key),
             limit=MAX_SELECTOR_CHARS,
-            normalize_whitespace=False,
         )
     for key in ("thread_name", "cwd", "text"):
         _project_string(
@@ -595,7 +612,6 @@ def _project_index_match(
             key,
             row.get(key),
             limit=MAX_FIELD_CHARS,
-            normalize_whitespace=True,
         )
     for key in ("updated_at", "ts"):
         raw_value = row.get(key)
@@ -605,7 +621,6 @@ def _project_index_match(
                 key,
                 raw_value,
                 limit=MAX_FIELD_CHARS,
-                normalize_whitespace=True,
             )
             continue
         value = _bounded_timestamp_scalar(raw_value)
@@ -641,8 +656,7 @@ def _scan_index(
     try:
         chain = _open_absolute_directory_chain(codex_home)
     except FileNotFoundError:
-        source["status"] = "unavailable"
-        source["reason"] = "missing-parent"
+        _mark_unavailable(source, "missing-parent")
         return source
     except CoveragePartial as error:
         _mark_partial(source, error.reason)
@@ -655,8 +669,7 @@ def _scan_index(
         try:
             descriptor, initial_metadata = _open_regular_at(chain.descriptor, name)
         except FileNotFoundError:
-            source["status"] = "unavailable"
-            source["reason"] = "missing"
+            _mark_unavailable(source, "missing")
             return source
         except CoveragePartial as error:
             _mark_partial(source, error.reason)
@@ -766,7 +779,7 @@ def _scan_index(
         _mark_partial(source, "malformed-or-oversized-records")
     source["matches_truncated"] = source["match_count"] > len(source["matches"])
     if any(_has_truncated_field(match, "path") for match in source["matches"]):
-        _mark_partial(source, "locating-path-projection-truncated")
+        _mark_partial(source, LOCATING_PATH_PROJECTION_TRUNCATED)
     return source
 
 
@@ -971,8 +984,7 @@ def _scan_rollout_root(
     try:
         home_chain = _open_absolute_directory_chain(codex_home)
     except FileNotFoundError:
-        source["status"] = "unavailable"
-        source["reason"] = "missing-parent"
+        _mark_unavailable(source, "missing-parent")
         return source
     except CoveragePartial as error:
         _mark_partial(source, error.reason)
@@ -988,8 +1000,7 @@ def _scan_rollout_root(
                 root_name,
             )
         except FileNotFoundError:
-            source["status"] = "unavailable"
-            source["reason"] = "missing"
+            _mark_unavailable(source, "missing")
             return source
         except CoveragePartial as error:
             _mark_partial(source, error.reason)
@@ -1213,7 +1224,9 @@ def _scan_rollout_root(
                             continue
                         source["match_count"] += 1
                         if len(source["matches"]) < limit:
-                            source["matches"].append(_project_path(entry_path))
+                            match_projection: dict[str, Any] = {}
+                            _project_path(match_projection, "path", entry_path)
+                            source["matches"].append(match_projection)
                 except OSError as error:
                     _record_error(
                         source,
@@ -1249,7 +1262,7 @@ def _scan_rollout_root(
     source["matches_truncated"] = source["match_count"] > len(source["matches"])
     source["errors_truncated"] = source["error_count"] > len(source["errors"])
     if any(_has_truncated_field(match, "path") for match in source["matches"]):
-        _mark_partial(source, "locating-path-projection-truncated")
+        _mark_partial(source, LOCATING_PATH_PROJECTION_TRUNCATED)
     return source
 
 
@@ -1344,13 +1357,12 @@ def main() -> int:
         "total_errors": sum(source["error_count"] for source in sources),
         "total_matches": sum(source["match_count"] for source in sources),
     }
-    _project_string(
-        document,
-        "codex_home",
-        os.fspath(codex_home),
-        limit=MAX_PATH_CHARS,
-        normalize_whitespace=False,
-    )
+    if any(
+        LOCATING_PATH_PROJECTION_TRUNCATED in source.get("reasons", ())
+        for source in sources
+    ):
+        _mark_partial(document, LOCATING_PATH_PROJECTION_TRUNCATED)
+    _project_locating_path(document, "codex_home", codex_home)
     print(json.dumps(document, ensure_ascii=True, sort_keys=True))
     return 0
 

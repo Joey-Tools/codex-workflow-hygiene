@@ -25,18 +25,20 @@ line as deterministic ties. Retained matches expose the finite bounded raw
 timestamp scalar plus `ordering_timestamp_source` and `ordering_timestamp_utc`.
 Out-of-range values remain auditable raw scalars but are absent from ordering.
 Opaque `id` and `session_id` values remain exact through the 512-character
-selector bound. Every clipped string or path exposes `truncated_fields` with
-`limit_chars`, `pre_truncation_chars`, and `retained_chars`; a retained
-locating path that cannot fit also makes its source `partial` as
-`locating-path-projection-truncated`.
+selector bound. Projected strings preserve original whitespace through their
+field bound. Every clipped string or path exposes `truncated_fields` with
+`limit_chars`, `pre_truncation_chars`, and `retained_chars`. A clipped
+`codex_home`, source path, or retained match path makes its owning document or
+source `partial` as `locating-path-projection-truncated`, including missing or
+zero-match sources.
 
 Each index caps 250,000 records and 192 MiB of aggregate reads across the scan
 and both prefix hashes. It rejects a three-pass prefix beyond that budget before
 body reads and reports `index-byte-cap-exceeded` or
 `index-record-cap-exceeded` as schema-v2 `partial`, never `checked`. Integers
 beyond 32 digits, invalid constants, and other parse failures are malformed; later records remain eligible.
-Only `FileNotFoundError` classifies an optional index or root as
-`unavailable`. A broken symlink, permission or I/O error, wrong type, path
+Only `FileNotFoundError` makes an optional source unavailable; if path truncation
+forces `partial`, `availability` and `unavailable_reason` retain it. A broken symlink, permission or I/O error, wrong type, path
 escape, or failed revalidation is `partial`.
 
 ## Stability Contract

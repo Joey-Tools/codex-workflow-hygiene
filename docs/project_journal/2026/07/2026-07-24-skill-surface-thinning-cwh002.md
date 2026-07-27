@@ -44,10 +44,12 @@ superseded_by:
 - Match and error retention is capped during collection while total and
   truncation counts remain explicit.
 - Schema-v2 index projections preserve exact opaque `id` and `session_id`
-  values through the 512-character selector bound. Bounded display fields and
-  every projected path now expose deterministic per-field character counts
-  when truncated; a retained locating path that cannot fit makes its source
-  `partial` instead of presenting a colliding `checked` locator.
+  values through the 512-character selector bound and preserve original
+  whitespace in every bounded string field. Bounded strings and every
+  projected path expose deterministic per-field character counts when
+  truncated; an unrepresentable `codex_home`, source path, or retained match
+  path makes its document/source `partial`, including zero-match and missing
+  sources.
 - Index match retention now keeps the newest normalized `updated_at` / `ts`
   records in a fixed-size heap, with source path and physical line as stable
   tie-breakers. Retained rows preserve bounded numeric timestamp scalars and
@@ -124,3 +126,12 @@ superseded_by:
 - The installed Joey skill-validation wrapper accepted
   `skills/codex-session-mining`.
 - Project-journal frontmatter validation passed.
+- The second formal named-single projection rereview is covered by real
+  descriptor-openable `codex_home` paths beyond 4,096 characters with both
+  empty indexes and missing-source early returns, plus decisive repeated-space
+  `thread_name` and newline `text` queries.
+- Final focused `SessionLocatorTests`: all 36 tests passed; the complete
+  `test_skill_structure` module passed all 41 tests.
+- Final full buffered suite: all 1,072 tests passed.
+- Final Ruff 0.13.2 check/format check, Python 3.13.0 compilation, skill and
+  project-journal validation, and `git diff --check` passed.

@@ -159,6 +159,38 @@ class SessionLocatorTests(unittest.TestCase):
         (codex_home / "sessions/2026/07/24").mkdir(parents=True)
         (codex_home / "archived_sessions").mkdir(parents=True)
 
+    def make_descriptor_deep_directory(self, base: Path) -> tuple[Path, int]:
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        descriptor = os.open(base, flags)
+        parts: list[str] = []
+        try:
+            while len(os.fspath(base.joinpath(*parts))) <= LOCATE.MAX_PATH_CHARS + 64:
+                component = f"segment-{len(parts):03d}-" + "x" * 84
+                os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                child_descriptor = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child_descriptor
+                parts.append(component)
+            return base.joinpath(*parts), descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def create_empty_file_at(
+        self,
+        directory_descriptor: int,
+        name: str,
+    ) -> None:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        os.close(descriptor)
+
     def scan_index(
         self,
         codex_home: Path,
@@ -254,6 +286,145 @@ class SessionLocatorTests(unittest.TestCase):
         self.assertEqual(source["match_count"], 5)
         self.assertEqual(len(source["matches"]), 2)
         self.assertTrue(source["matches_truncated"])
+
+    def test_deep_codex_home_empty_indexes_make_paths_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home, descriptor = self.make_descriptor_deep_directory(
+                Path(directory).resolve()
+            )
+            try:
+                self.create_empty_file_at(descriptor, "session_index.jsonl")
+                self.create_empty_file_at(descriptor, "history.jsonl")
+                completed, payload = self.run_locator(
+                    codex_home,
+                    "--thread-query",
+                    "no match",
+                )
+            finally:
+                os.close(descriptor)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertGreater(len(os.fspath(codex_home)), LOCATE.MAX_PATH_CHARS)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(
+            payload["reason"],
+            "locating-path-projection-truncated",
+        )
+        self.assertIn("codex_home", payload["truncated_fields"])
+        for source in payload["sources"]:
+            self.assertEqual(source["status"], "partial")
+            self.assertEqual(
+                source["reason"],
+                "locating-path-projection-truncated",
+            )
+            self.assertIn("path", source["truncated_fields"])
+            self.assertEqual(source["records_scanned"], 0)
+            self.assertEqual(source["match_count"], 0)
+
+    def test_deep_codex_home_missing_indexes_remain_aggregate_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home, descriptor = self.make_descriptor_deep_directory(
+                Path(directory).resolve()
+            )
+            try:
+                completed, payload = self.run_locator(
+                    codex_home,
+                    "--thread-query",
+                    "missing source",
+                )
+            finally:
+                os.close(descriptor)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(
+            payload["reason"],
+            "locating-path-projection-truncated",
+        )
+        for source in payload["sources"]:
+            self.assertEqual(source["status"], "partial")
+            self.assertEqual(
+                source["reason"],
+                "locating-path-projection-truncated",
+            )
+            self.assertEqual(source["availability"], "unavailable")
+            self.assertEqual(source["unavailable_reason"], "missing")
+
+    def test_source_path_truncation_alone_marks_aggregate_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            codex_home.mkdir()
+            (codex_home / "session_index.jsonl").write_text("", encoding="utf-8")
+            (codex_home / "history.jsonl").write_text("", encoding="utf-8")
+            projection_limit = len(os.fspath(codex_home)) + 1
+            output = io.StringIO()
+
+            with (
+                mock.patch.object(LOCATE, "MAX_PATH_CHARS", projection_limit),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        os.fspath(LOCATOR),
+                        "--codex-home",
+                        os.fspath(codex_home),
+                        "--thread-query",
+                        "no match",
+                    ],
+                ),
+                mock.patch.object(sys, "stdout", output),
+            ):
+                returncode = LOCATE.main()
+
+        self.assertEqual(returncode, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(
+            payload["reason"],
+            "locating-path-projection-truncated",
+        )
+        self.assertNotIn(
+            "codex_home",
+            payload.get("truncated_fields", {}),
+        )
+        self.assertTrue(
+            all(
+                source["reason"] == "locating-path-projection-truncated"
+                for source in payload["sources"]
+            )
+        )
+
+    def test_thread_query_preserves_decisive_whitespace(self) -> None:
+        cases = (
+            ("thread_name", "review  helper"),
+            ("text", "review\nhelper"),
+        )
+        for field, query in cases:
+            with self.subTest(field=field):
+                with tempfile.TemporaryDirectory() as directory:
+                    codex_home = Path(directory).resolve() / ".codex"
+                    codex_home.mkdir()
+                    (codex_home / "session_index.jsonl").write_text(
+                        json.dumps({"id": field, field: query}) + "\n",
+                        encoding="utf-8",
+                    )
+                    (codex_home / "history.jsonl").write_text("", encoding="utf-8")
+
+                    completed, payload = self.run_locator(
+                        codex_home,
+                        "--thread-query",
+                        query,
+                    )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(payload["status"], "checked")
+                match = payload["sources"][0]["matches"][0]
+                self.assertEqual(match[field], query)
+                self.assertIn(query, match[field])
+                self.assertNotIn(
+                    field,
+                    match.get("truncated_fields", {}),
+                )
 
     def test_opaque_exact_ids_through_selector_limit_are_preserved(self) -> None:
         for field in ("id", "session_id"):

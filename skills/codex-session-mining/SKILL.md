@@ -22,8 +22,9 @@ orientation.
    revalidation.
 4. Open only the selected rollout files. Parse record shapes and selected fields;
    never print raw JSONL matches or whole retained tool outputs.
-5. Report source coverage, ordering timestamps, append-only index growth, and
-   whether retained rows, fields, paths, matches, or errors were truncated.
+5. Report source coverage, ordering timestamps, append-only index growth,
+   preserved field whitespace, and whether retained rows, fields, paths,
+   matches, or errors were truncated.
 
 Read [references/locate.md](references/locate.md) for the helper interface and
 safe extraction rules.
