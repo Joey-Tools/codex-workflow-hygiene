@@ -374,6 +374,10 @@ class RulesApplyTransactionTests(unittest.TestCase):
         target = targets.get(data_role)
         if target is None:
             raise AssertionError(f"unknown data role: {data_role}")
+        if drift == "appearance":
+            target.write_bytes(NEW_RULES)
+            target.chmod(0o600)
+            return "transaction_data_role_unexpected", "presence"
         if drift == "missing":
             target.unlink()
             return "transaction_data_role_missing", "missing"
@@ -4424,6 +4428,148 @@ class RulesApplyTransactionTests(unittest.TestCase):
                         )
                     )
 
+    def test_applied_finalizer_revalidates_missing_auxiliary_roles(
+        self,
+    ) -> None:
+        for data_role in ("prepared_candidate", "staged_backup"):
+            with (
+                self.subTest(data_role=data_role),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-applied-missing-role-{data_role}."
+                ) as temp_dir,
+            ):
+                self.configure_isolated_case(Path(temp_dir))
+                self.write_validator("raise SystemExit(0)\n")
+                stdout = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "run_validator",
+                        return_value=TRANSACTION.ValidatorResult(0, "", ""),
+                    ),
+                    self.drift_before_transaction_lock_release(
+                        data_role,
+                        "appearance",
+                    ) as injected,
+                    redirect_stdout(stdout),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    code = TRANSACTION.main(self.apply_argv())
+
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(injected["count"], 1)
+                self.assertEqual(code, 30)
+                self.assertEqual(payload["status"], "recovery_required")
+                self.assertEqual(payload["operation_status"], "applied")
+                self.assertEqual(
+                    payload["reason"],
+                    "transaction_data_role_unexpected",
+                )
+                self.assertEqual(payload["data_role"], data_role)
+                self.assertEqual(payload["transaction_state"], "C")
+
+    def test_rollback_finalizer_revalidates_missing_auxiliary_roles(
+        self,
+    ) -> None:
+        for data_role in ("prepared_candidate", "staged_backup"):
+            with (
+                self.subTest(data_role=data_role),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-rollback-missing-role-{data_role}."
+                ) as temp_dir,
+            ):
+                self.configure_isolated_case(Path(temp_dir))
+                self.write_validator("raise SystemExit(0)\n")
+                stdout = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "run_validator",
+                        side_effect=[
+                            TRANSACTION.ValidatorResult(0, "", ""),
+                            TRANSACTION.ValidatorResult(9, "", ""),
+                        ],
+                    ),
+                    self.drift_before_transaction_lock_release(
+                        data_role,
+                        "appearance",
+                    ) as injected,
+                    redirect_stdout(stdout),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    code = TRANSACTION.main(self.apply_argv())
+
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(injected["count"], 1)
+                self.assertEqual(code, 30)
+                self.assertEqual(payload["status"], "recovery_required")
+                self.assertEqual(
+                    payload["operation_status"],
+                    "post_replace_failed_rolled_back",
+                )
+                self.assertEqual(
+                    payload["reason"],
+                    "transaction_data_role_unexpected",
+                )
+                self.assertEqual(payload["data_role"], data_role)
+                self.assertEqual(payload["transaction_state"], "R")
+
+    def test_schema_v4_c_to_r_finalizer_revalidates_missing_auxiliary_roles(
+        self,
+    ) -> None:
+        for data_role in ("prepared_candidate", "staged_backup"):
+            with (
+                self.subTest(data_role=data_role),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-recovery-missing-role-{data_role}."
+                ) as temp_dir,
+            ):
+                self.configure_isolated_case(Path(temp_dir))
+                self.write_validator("raise SystemExit(0)\n")
+                applied = self.run_apply()
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+                stdout = io.StringIO()
+
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    self.drift_before_transaction_lock_release(
+                        data_role,
+                        "appearance",
+                    ) as injected,
+                    redirect_stdout(stdout),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    code = TRANSACTION.main(self.recover_argv())
+
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(injected["count"], 1)
+                self.assertEqual(code, 30)
+                self.assertEqual(payload["status"], "recovery_required")
+                self.assertEqual(payload["operation_status"], "recovered")
+                self.assertEqual(
+                    payload["reason"],
+                    "transaction_data_role_unexpected",
+                )
+                self.assertEqual(payload["data_role"], data_role)
+                self.assertEqual(payload["transaction_state"], "R")
+                self.assertTrue(
+                    any(
+                        event["operation"] == "terminal_publish"
+                        for event in payload["mutation_journal"]
+                    )
+                )
+
     def test_rollback_finalizer_propagates_persistent_evidence_drift(
         self,
     ) -> None:
@@ -6378,6 +6524,104 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(recovered["status"], "recovered")
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+    def test_live_change_after_staged_publication_requires_recovery(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_validate = TRANSACTION.ApplyEvidenceBindings.validate
+        injected = False
+
+        def validate_then_change_live(
+            evidence: object,
+        ) -> None:
+            nonlocal injected
+            assert isinstance(evidence, TRANSACTION.ApplyEvidenceBindings)
+            real_validate(evidence)
+            if evidence.candidate_in_stage and not injected:
+                self.rules.write_bytes(LATER_RULES)
+                injected = True
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "run_validator",
+                return_value=TRANSACTION.ValidatorResult(0, "", ""),
+            ),
+            mock.patch.object(
+                TRANSACTION.ApplyEvidenceBindings,
+                "validate",
+                autospec=True,
+                side_effect=validate_then_change_live,
+            ),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            code = TRANSACTION.main(self.apply_argv())
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(injected)
+        self.assertEqual(code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(
+            payload["operation_status"],
+            "live_changed_before_replace",
+        )
+        self.assertEqual(payload["reason"], "live_changed_before_replace")
+        self.assertEqual(payload["mismatched_properties"], ["content"])
+        self.assertEqual(
+            payload["pre_replace_failure"]["mismatched_properties"],
+            ["content"],
+        )
+        locators = payload["recovery_locators"]
+        self.assertEqual(
+            set(locators),
+            {
+                "receipt",
+                "live",
+                "backup",
+                "staged_backup",
+                "prepared_candidate",
+                "recovery_terminal",
+                "recovery_terminal_result",
+            },
+        )
+        self.assertEqual(Path(locators["receipt"]).resolve(), self.receipt.resolve())
+        self.assertEqual(Path(locators["live"]).resolve(), self.rules.resolve())
+        self.assertEqual(Path(locators["backup"]).resolve(), self.backup.resolve())
+        staged = self.rules_dir / TRANSACTION.PRIVATE_STAGE_NAME / "candidate"
+        self.assertEqual(
+            Path(locators["staged_backup"]).resolve(),
+            staged.resolve(),
+        )
+        prepared = TRANSACTION.prepared_candidate_path(self.receipt)
+        self.assertEqual(
+            Path(locators["prepared_candidate"]).resolve(),
+            prepared.resolve(),
+        )
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        self.assertEqual(
+            Path(locators["recovery_terminal"]).resolve(),
+            terminal.resolve(),
+        )
+        self.assertEqual(
+            Path(locators["recovery_terminal_result"]).resolve(),
+            TRANSACTION.recovery_terminal_result_path(terminal).resolve(),
+        )
+        self.assertEqual(self.rules.read_bytes(), LATER_RULES)
+        self.assertTrue(self.receipt.is_file())
+        self.assertTrue(terminal.is_file())
+        self.assertFalse(TRANSACTION.recovery_terminal_result_path(terminal).exists())
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(prepared.exists())
+        self.assertEqual(staged.read_bytes(), NEW_RULES)
+        self.assertIn('"status": "cleanup_warning"', stderr.getvalue())
 
     def test_apply_rejects_lock_replacement_after_durable_receipt(self) -> None:
         self.write_validator("raise SystemExit(0)\n")

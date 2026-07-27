@@ -7446,30 +7446,16 @@ def _apply_transaction_inner(
         evidence_error: TransactionError | None = None
         try:
             if evidence is not None:
-                try:
-                    (
-                        evidence.validate_controls()
-                        if (
-                            final_data_roles is not None
-                            or retain_stage
-                            or evidence.restored
-                        )
-                        else evidence.validate()
+                (
+                    evidence.validate_controls()
+                    if (
+                        final_data_roles is not None
+                        or retain_stage
+                        or evidence.restored
                     )
-                except TransactionError as error:
-                    retain_stage = True
-                    evidence_error = error
-        finally:
-            effective_retain_stage = retain_stage or (
-                stage is not None and stage.mutation_uncertain
-            )
-            warnings = (
-                stage.cleanup(retain=effective_retain_stage)
-                if stage is not None
-                else []
-            )
-        if evidence_error is None and final_data_roles is not None:
-            try:
+                    else evidence.validate()
+                )
+            if final_data_roles is not None:
                 role_parent = (
                     evidence.rules_parent
                     if evidence is not None
@@ -7485,10 +7471,25 @@ def _apply_transaction_inner(
                     backup=backup,
                     rules_parent=role_parent,
                     expected=final_data_roles,
+                    prepared_candidate=prepared_recovery_candidate,
+                    prepared_parent_expected=(
+                        evidence.receipt_parent.snapshot
+                        if evidence is not None
+                        else None
+                    ),
                 )
-            except TransactionError as error:
-                retain_stage = True
-                evidence_error = error
+        except TransactionError as error:
+            retain_stage = True
+            evidence_error = error
+        finally:
+            effective_retain_stage = retain_stage or (
+                stage is not None and stage.mutation_uncertain
+            )
+            warnings = (
+                stage.cleanup(retain=effective_retain_stage)
+                if stage is not None
+                else []
+            )
         if warnings:
             print(
                 json.dumps(
@@ -8013,11 +8014,23 @@ def _apply_transaction_inner(
             )
             final_mismatches = property_mismatches(current, final_live)
             if final_mismatches:
-                return EXIT_LIVE_CONFLICT, {
-                    "status": "live_changed_before_replace",
+                retain_stage = True
+                return EXIT_POST_REPLACE_FAILED, {
+                    "status": "recovery_required",
+                    "operation_status": "live_changed_before_replace",
+                    "reason": "live_changed_before_replace",
+                    "pre_replace_failure": {
+                        "status": "live_changed_before_replace",
+                        "mismatched_properties": final_mismatches,
+                        "expected_live": current.to_json(),
+                        "actual_live": final_live.to_json(),
+                    },
                     "mismatched_properties": final_mismatches,
                     "receipt_path": str(receipt),
                     "backup_path": str(backup),
+                    "staged_backup_path": str(candidate),
+                    "prepared_candidate_path": str(prepared_recovery_candidate),
+                    "recovery_locators": apply_recovery_locators(),
                 }
 
             def validate_pre_exchange_controls() -> None:
@@ -8338,6 +8351,10 @@ def _apply_transaction_inner(
                             live=restored,
                             backup_role="installed",
                             backup=installed_expected,
+                            staged_backup_role="missing",
+                            staged_backup=None,
+                            prepared_candidate_role="missing",
+                            prepared_candidate=None,
                         )
                         evidence.restored = True
                         terminal_result_bindings: list[BoundFile] = []
@@ -8418,6 +8435,10 @@ def _apply_transaction_inner(
                 live=installed_expected,
                 backup_role="original",
                 backup=current,
+                staged_backup_role="missing",
+                staged_backup=None,
+                prepared_candidate_role="missing",
+                prepared_candidate=None,
             )
             pending_success_status = "applied"
             return 0, {
@@ -10667,6 +10688,14 @@ def _recover_transaction_bound(
                     live=original,
                     backup_role="installed",
                     backup=installed,
+                    staged_backup_role=(
+                        "missing" if receipt_schema_version >= 4 else None
+                    ),
+                    staged_backup=None,
+                    prepared_candidate_role=(
+                        "missing" if receipt_schema_version >= 4 else None
+                    ),
+                    prepared_candidate=None,
                 )
             elif receipt_schema_version < 3 and status == "already_original":
                 final_data_roles = TransactionDataRoles(

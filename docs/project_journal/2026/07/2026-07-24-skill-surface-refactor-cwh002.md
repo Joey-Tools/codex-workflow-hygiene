@@ -96,6 +96,13 @@ superseded_by:
 - Expanded schema-v4 `Q` release validation from its live/backup projection to
   the complete `(O,M,M,I)` tuple, rebinding prepared exact-installed and
   staged-candidate missing after the inner recovery closes its descriptors.
+- Expanded schema-v4 applied `C` and restored `R` release validation to
+  `(I,O,M,M)` and `(O,I,M,M)`, proving both prepared and staged candidates
+  missing before apply stage cleanup closes its bindings.
+- Classified a live-role change after durable receipt and prepared-to-stage
+  publication as `recovery_required`, retaining the staged candidate and
+  emitting the complete recovery-locator set instead of an ordinary conflict
+  plus cleanup warning.
 - Preserved the last complete schema-v4 `P` proof or conservative `Q_or_P`
   hint when a later stage/prepared probe fails; `Q` now requires a complete
   four-role observation.
@@ -251,6 +258,15 @@ superseded_by:
   proves prepared exact-installed, and rejects prepared disappearance or
   identity/content/access/link drift plus staged-candidate appearance for
   both `recovered` and retry `already_original`.
+- Applied `C`, automatic or managed-signal rollback `R`, and recovery `C→R`
+  now carry the missing staged/prepared roles into the same outer proof. That
+  proof runs before stage cleanup, so candidate reappearance is reported as
+  `transaction_data_role_unexpected` with the exact state and role.
+- After receipt durability and prepared-to-stage publication, a live conflict
+  no longer permits ordinary exit 20. The transaction retains its exact staged
+  candidate, reports the property-scoped live mismatch, and returns every
+  receipt, live, backup, staged, prepared, terminal, and result locator for
+  operator recovery.
 - A managed signal stays primary when that final role proof fails; its nested
   rollback becomes `recovery_required` and carries the exact role, state,
   mismatched property, and recovery locators.
@@ -366,5 +382,15 @@ superseded_by:
 - The four new transaction methods passed on system Python 3.9.6, and both
   changed Python files byte-compiled on Python 3.13 and system Python 3.9.6
   with task-scoped caches removed afterward.
+- The newest static gates passed Ruff check/format, the official Rules skill
+  validator, project-journal validation, and `git diff --check`.
 - Final static gates passed Ruff check/format, the official Rules skill
   validator, project-journal validation, and `git diff --check`.
+- Rules transaction tests: 209 passed on Python 3.13. Four new integration
+  methods cover seven release/publication races: prepared and staged
+  reappearance for applied `C`, automatic rollback `R`, and recovery `C→R`,
+  plus a live content change after durable prepared-to-stage publication.
+- Full repository suite covered all 1,271 tests on Python 3.13.
+- The four new transaction methods passed on system Python 3.9.6, and both
+  changed Python files byte-compiled on Python 3.13 and system Python 3.9.6
+  with task-scoped caches removed afterward.

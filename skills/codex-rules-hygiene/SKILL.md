@@ -67,6 +67,22 @@ Always choose an explicit mode before inspecting or changing host state.
 
 Cleanup, lock-finalization, and pending-result retention failures remain structured evidence on Python 3.9 and 3.10. Python 3.11+ exception notes are best-effort diagnostics only; missing or faulty `add_note` support never replaces the primary transaction outcome.
 
+For schema-v4 lock release, the live/backup projections `C=(I,O)` and
+`R=(O,I)` are not complete terminal proofs. Apply success must prove
+`C=(I,O,M,M)`, and apply rollback or `C→R` recovery must prove
+`R=(O,I,M,M)`: the fixed staged candidate and receipt-sibling prepared
+candidate are both missing. These selected roles are rebound before private
+stage cleanup closes its descriptors, so either candidate's reappearance
+becomes `recovery_required` with the precise unexpected role.
+
+Once the schema-v4 receipt is durable and the prepared candidate has moved
+into the fixed stage, that staged object is recovery evidence even though live
+exchange has not started. If the exact live identity, content, access policy,
+or link policy then changes, apply retains the stage and returns structured
+`recovery_required` with receipt, live, backup, staged, prepared, terminal, and
+terminal-result locators; it must not return an ordinary live conflict plus a
+cleanup warning.
+
 ## Ownership And Guardrails
 
 - Rules govern reusable approval families; skills decide when to use them; helpers encode repeated fragile mechanics.
