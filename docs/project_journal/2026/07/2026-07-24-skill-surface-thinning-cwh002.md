@@ -3,9 +3,9 @@ id: 20260724-cwh002
 title: Skill Surface Thinning
 status: completed
 created: 2026-07-24
-updated: 2026-07-25
+updated: 2026-07-27
 branch: wip/thin-bounded-mining-authoring
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/65
 supersedes: []
 superseded_by:
 ---
@@ -64,6 +64,8 @@ superseded_by:
   aggregate ancestor state exceeds 250,000 component references or 16 MiB of
   component bytes. These limits bound both retained path state and repeated
   root-to-directory reopening.
+- Root-directory descriptor exhaustion is retained as a bounded rollout error
+  and schema-v2 `partial` result rather than escaping before JSON output.
 - `build_session_corpus.py` remains the authoritative current-host
   active-plus-archived, replay-aware corpus path.
 - Generic skill scaffolding, frontmatter design, `agents/openai.yaml`, and
@@ -103,3 +105,6 @@ superseded_by:
   directories, 8,667 active entries, and 9,360 archived entries; every source
   completed descriptor and inventory revalidation within the new traversal
   budgets.
+- The GitHub Codex follow-up finding for root `dup(2)` exhaustion is covered by
+  a deterministic `EMFILE` regression, and the final full suite passed all
+  1,065 tests.

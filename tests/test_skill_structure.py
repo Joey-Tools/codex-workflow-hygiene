@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -934,6 +936,59 @@ class SessionLocatorTests(unittest.TestCase):
 
         self.assertEqual(source["status"], "partial")
         self.assertIn("rollout-root-replaced-or-escaped", source["reasons"])
+
+    def test_rollout_root_dup_failure_is_schema_v2_partial(self) -> None:
+        session_id = "019ef067-976b-7e41-928d-80361777330b"
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory).resolve() / ".codex"
+            root = codex_home / "sessions"
+            root.mkdir(parents=True)
+            (root / f"rollout-{session_id}.jsonl").write_text(
+                "{}\n",
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    LOCATE.os,
+                    "dup",
+                    side_effect=OSError(errno.EMFILE, "too many open files"),
+                ),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        os.fspath(LOCATOR),
+                        "--codex-home",
+                        os.fspath(codex_home),
+                        "--session-id",
+                        session_id,
+                        "--limit",
+                        "2",
+                    ],
+                ),
+                mock.patch.object(sys, "stdout", output),
+            ):
+                returncode = LOCATE.main()
+
+        self.assertEqual(returncode, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["status"], "partial")
+        source = payload["sources"][2]
+        self.assertEqual(source["status"], "partial")
+        self.assertEqual(source["reason"], "rollout-inventory-incomplete")
+        self.assertEqual(source["error_count"], 1)
+        self.assertEqual(
+            source["errors"],
+            [
+                {
+                    "path": os.fspath(root),
+                    "reason": "directory-open-failed:OSError",
+                }
+            ],
+        )
 
     def test_rollout_inventory_drift_is_partial(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

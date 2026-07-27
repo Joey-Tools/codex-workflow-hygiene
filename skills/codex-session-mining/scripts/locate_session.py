@@ -994,7 +994,17 @@ def _scan_rollout_root(
                         inventory_complete = False
                         continue
                 else:
-                    directory_fd = os.dup(root_fd)
+                    try:
+                        directory_fd = os.dup(root_fd)
+                    except OSError as error:
+                        _record_error(
+                            source,
+                            path=display_path,
+                            reason=f"directory-open-failed:{type(error).__name__}",
+                            limit=limit,
+                        )
+                        inventory_complete = False
+                        continue
                 try:
                     source["directories_scanned"] += 1
                     source["max_directory_depth_scanned"] = max(
