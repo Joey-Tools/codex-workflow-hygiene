@@ -3,7 +3,7 @@ id: 20260724-cwh002
 title: Skill Surface Refactor
 status: active
 created: 2026-07-24
-updated: 2026-07-25
+updated: 2026-07-27
 branch: codex/skill-surface-refactor
 pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/63
 supersedes: []
@@ -87,6 +87,12 @@ superseded_by:
   after any replacement, including a verified ordinary or managed-signal
   rollback, instead of reporting a certain rollback after receipt, terminal,
   result, link, access, or parent evidence became uncertain.
+- Re-proved the terminal live/backup data-role tuple through the bound rules
+  parent immediately before lock release for applied, ordinary rollback,
+  managed-signal rollback, and successful recovery outcomes.
+- Preserved the last complete schema-v4 `P` proof or conservative `Q_or_P`
+  hint when a later stage/prepared probe fails; `Q` now requires a complete
+  four-role observation.
 - Promoted deferred schema-v4 possible-prior-state evidence whenever a
   reserved terminal does not accompany exact `Q`, including state-none loss
   of a `P` candidate or `R` backup.
@@ -226,6 +232,13 @@ superseded_by:
   signal remains the primary `interrupted` result while its nested recovery
   and structured `lock_finalization_failures` record the same property
   mismatch and exact recovery locators.
+- Terminal `C=(I,O)`, `R=(O,I)`, and `Q=(O,M)` live/backup roles are freshly
+  rebound through the held rules parent before lock release. Present objects
+  compare identity, content, access, and single-link policy; missing and
+  unreadable roles remain distinct from property mismatch.
+- A managed signal stays primary when that final role proof fails; its nested
+  rollback becomes `recovery_required` and carries the exact role, state,
+  mismatched property, and recovery locators.
 - An apparent apply or no-change result cannot remain successful after final
   evidence or rules-parent close uncertainty. It reports
   `final_evidence_descriptor_close_failed`, retains the original
@@ -305,6 +318,20 @@ superseded_by:
   across the compatibility reruns, including both new methods, hardlink
   finalization, ordinary and managed-signal rollback, and secondary evidence
   attachment without `add_note`.
+- Rules transaction tests: 201 passed on Python 3.13. Four new integration
+  methods exercise all 32 combinations of applied/rollback/signal/recovery,
+  live/backup role, and identity/content/access/link drift. Two schema-v4
+  cases prove that a completed first `P` observation survives a failed second
+  auxiliary probe and that an incomplete `O/M` probe remains `Q_or_P`.
+- Full repository suite covered all 1,263 tests on Python 3.13.
+- The six new transaction methods passed on system Python 3.9.6. A broader
+  3.9.6 transaction run passed 200 cases and stopped only because the existing
+  `test_validator_waitid_failure_still_terminates_and_reaps` mock requires
+  `os.waitid`, which that runtime does not expose; the error occurs before the
+  transaction helper is entered.
+- Final static gates passed Ruff check/format, Python 3.13 and system Python
+  3.9.6 byte compilation, the official Rules skill validator, project-journal
+  validation, and `git diff --check`.
 - Full repository suite covered all 1,257 tests. The sandboxed run passed
   1,253 and failed only four unrelated temporary merge-commit fixtures because
   sandbox GPG could not reach `~/.gnupg/keyboxd`; those exact four tests passed

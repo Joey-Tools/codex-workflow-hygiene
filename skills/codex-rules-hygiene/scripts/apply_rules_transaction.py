@@ -301,6 +301,17 @@ class BoundDirectory:
     require_owner_private: bool = False
 
 
+@dataclass(frozen=True)
+class TransactionDataRoles:
+    """Exact live and backup roles that must survive until lock release."""
+
+    transaction_state: str
+    live_role: str
+    live: Snapshot
+    backup_role: str
+    backup: Snapshot | None
+
+
 @dataclass
 class RecoveryMutationTracker:
     """Record when recovery may have changed receipt-bound transaction state."""
@@ -7358,6 +7369,7 @@ def _apply_transaction_inner(
     finalized = False
     rules_parent_binding: BoundDirectory | None = None
     stage_cleanup_failures: list[dict[str, object]] = []
+    final_data_roles: TransactionDataRoles | None = None
 
     def apply_recovery_locators() -> dict[str, str]:
         return {
@@ -7428,7 +7440,11 @@ def _apply_transaction_inner(
                 try:
                     (
                         evidence.validate_controls()
-                        if retain_stage or evidence.restored
+                        if (
+                            final_data_roles is not None
+                            or retain_stage
+                            or evidence.restored
+                        )
                         else evidence.validate()
                     )
                 except TransactionError as error:
@@ -7443,6 +7459,21 @@ def _apply_transaction_inner(
                 if stage is not None
                 else []
             )
+        if (
+            evidence_error is None
+            and evidence is not None
+            and final_data_roles is not None
+        ):
+            try:
+                validate_transaction_data_roles(
+                    rules=rules,
+                    backup=backup,
+                    rules_parent=evidence.rules_parent,
+                    expected=final_data_roles,
+                )
+            except TransactionError as error:
+                retain_stage = True
+                evidence_error = error
         if warnings:
             print(
                 json.dumps(
@@ -7500,7 +7531,10 @@ def _apply_transaction_inner(
             bind_post_replace_final_evidence_failure(evidence_error)
             raise TransactionError(
                 "recovery_required",
-                "bound transaction evidence changed before lock release",
+                (
+                    "bound transaction evidence or terminal data roles changed "
+                    "before lock release"
+                ),
                 exit_code=EXIT_POST_REPLACE_FAILED,
                 details={
                     "operation_status": operation_status,
@@ -8235,6 +8269,14 @@ def _apply_transaction_inner(
                             label="rollback.restored",
                             require_object_policy=True,
                         )
+                        final_data_roles = TransactionDataRoles(
+                            transaction_state="R",
+                            live_role="original",
+                            live=restored,
+                            backup_role="installed",
+                            backup=installed_expected,
+                        )
+                        evidence.restored = True
                         terminal_result_bindings: list[BoundFile] = []
                         recovery_terminal_result = record_recovery_terminal(
                             recovery_terminal,
@@ -8255,7 +8297,6 @@ def _apply_transaction_inner(
                                 terminal_result_bindings[0]
                             )
                         verify_restored_terminal(rules, restored)
-                        evidence.restored = True
                     except TransactionError as error:
                         retain_stage = True
                         return finish_post_replace_outcome(
@@ -8308,6 +8349,13 @@ def _apply_transaction_inner(
                     "receipt_path": str(receipt),
                     "backup_path": str(backup),
                 }
+            final_data_roles = TransactionDataRoles(
+                transaction_state="C",
+                live_role="installed",
+                live=installed_expected,
+                backup_role="original",
+                backup=current,
+            )
             pending_success_status = "applied"
             return 0, {
                 "status": "applied",
@@ -8509,6 +8557,75 @@ def recovery_entry_snapshot_bound(
             return None
         raise
     return snapshot
+
+
+def validate_transaction_data_roles(
+    *,
+    rules: Path,
+    backup: Path,
+    rules_parent: BoundDirectory,
+    expected: TransactionDataRoles,
+) -> None:
+    """Re-prove the terminal live/backup role tuple under its bound parent.
+
+    Object identity, exact content, access policy, and single-link policy are
+    the selected protected properties. A missing or unexpectedly present role
+    is reported separately from a property mismatch.
+    """
+
+    validate_bound_directory(rules_parent)
+    live_actual = recovery_entry_snapshot_bound(
+        rules,
+        rules_parent,
+        label="live_rules",
+    )
+    backup_actual = recovery_entry_snapshot_bound(
+        backup,
+        rules_parent,
+        label="backup",
+    )
+    validate_bound_directory(rules_parent)
+
+    for data_role, expected_role, expected_snapshot, actual_snapshot in (
+        ("live", expected.live_role, expected.live, live_actual),
+        ("backup", expected.backup_role, expected.backup, backup_actual),
+    ):
+        if expected_snapshot is None:
+            if actual_snapshot is not None:
+                raise TransactionError(
+                    "transaction_data_role_unexpected",
+                    f"{data_role} transaction role unexpectedly exists",
+                    details={
+                        "transaction_state": expected.transaction_state,
+                        "data_role": data_role,
+                        "expected_role": expected_role,
+                        "actual": actual_snapshot.to_json(),
+                    },
+                )
+            continue
+        if actual_snapshot is None:
+            raise TransactionError(
+                "transaction_data_role_missing",
+                f"{data_role} transaction role is missing",
+                details={
+                    "transaction_state": expected.transaction_state,
+                    "data_role": data_role,
+                    "expected_role": expected_role,
+                },
+            )
+        mismatches = property_mismatches(expected_snapshot, actual_snapshot)
+        if mismatches:
+            raise TransactionError(
+                "transaction_data_role_changed",
+                f"{data_role} transaction role changed before lock release",
+                details={
+                    "transaction_state": expected.transaction_state,
+                    "data_role": data_role,
+                    "expected_role": expected_role,
+                    "mismatched_properties": mismatches,
+                    "actual": actual_snapshot.to_json(),
+                },
+            )
 
 
 def probe_fixed_stage_for_recovery(
@@ -9387,25 +9504,6 @@ def recover_schema_v4_transaction(
             ("O", "I"): "R",
         }.get((live_role, backup_role))
         terminal = terminal_evidence.validate()
-        primary_observation: dict[str, object] = {
-            "transaction_state_hint": primary_state_hint,
-            "roles": {
-                "live": live_role,
-                "backup": backup_role,
-                "staged_backup": "unprobed",
-                "prepared_candidate": "unprobed",
-            },
-            "snapshots": {
-                "live": live_actual.to_json() if live_actual is not None else None,
-                "backup": (
-                    backup_actual.to_json() if backup_actual is not None else None
-                ),
-                "staged_backup": "unprobed",
-                "prepared_candidate": "unprobed",
-            },
-            "terminal_state": terminal.get("state"),
-        }
-        mutation_tracker.observe(primary_observation)
         if terminal.get("state") == RECOVERY_TERMINAL_RESTORED:
             mutation_tracker.observe_prior_mutation(
                 "terminal_publish",
@@ -9718,30 +9816,22 @@ def recover_schema_v4_transaction(
             or error_status == "recovery_required"
             or error_status in stage_recovery_statuses
         ):
-            live_role = (
-                recovery_snapshot_role(
-                    live_actual,
-                    original=original,
-                    installed=installed,
-                )
-                if "live_actual" in locals()
-                else "?"
+            observed_state = mutation_tracker.last_observed or {}
+            observed_transaction_state = observed_state.get("transaction_state")
+            observed_transaction_hint = observed_state.get("transaction_state_hint")
+            state_hint = next(
+                (
+                    candidate
+                    for candidate in (
+                        observed_transaction_state,
+                        observed_transaction_hint,
+                        primary_state_hint,
+                        "unknown",
+                    )
+                    if isinstance(candidate, str) and candidate
+                ),
+                "unknown",
             )
-            backup_role = (
-                recovery_snapshot_role(
-                    backup_actual,
-                    original=original,
-                    installed=installed,
-                )
-                if "backup_actual" in locals()
-                else "?"
-            )
-            state_hint = {
-                ("O", "I"): "R",
-                ("I", "O"): "C",
-                ("I", "M"): "X",
-                ("O", "M"): "Q",
-            }.get((live_role, backup_role), "Q")
             return EXIT_POST_REPLACE_FAILED, {
                 "status": "recovery_required",
                 "transaction_state": state_hint,
@@ -10426,12 +10516,48 @@ def _recover_transaction_bound(
     lock_acquired = False
     outcome: tuple[int, dict[str, object]] | None = None
     primary_error: BaseException | None = None
+    final_data_roles: TransactionDataRoles | None = None
 
     def record_outcome(
         value: tuple[int, dict[str, object]],
     ) -> tuple[int, dict[str, object]]:
-        nonlocal outcome
+        nonlocal final_data_roles, outcome
         outcome = value
+        exit_code, payload = value
+        if exit_code == 0:
+            status = payload.get("status")
+            if receipt_schema_version >= 4 and payload.get("transaction_state") == "Q":
+                final_data_roles = TransactionDataRoles(
+                    transaction_state="Q",
+                    live_role="original",
+                    live=original,
+                    backup_role="missing",
+                    backup=None,
+                )
+            elif receipt_schema_version >= 3 and status in (
+                "recovered",
+                "already_original",
+            ):
+                final_data_roles = TransactionDataRoles(
+                    transaction_state="R",
+                    live_role="original",
+                    live=original,
+                    backup_role="installed",
+                    backup=installed,
+                )
+            else:
+                rollback_result = payload.get("rollback")
+                if (
+                    isinstance(rollback_result, dict)
+                    and rollback_result.get("rollback_status") == "rolled_back"
+                ):
+                    final_data_roles = TransactionDataRoles(
+                        transaction_state="legacy_original",
+                        live_role="original",
+                        live=original,
+                        backup_role="installed",
+                        backup=installed,
+                    )
         return value
 
     def validate_controls() -> None:
@@ -10439,16 +10565,55 @@ def _recover_transaction_bound(
         if terminal_evidence is not None:
             terminal_evidence.validate()
 
+    def validate_final_recovery_data_roles() -> None:
+        if final_data_roles is None:
+            return
+        rules_parent: BoundDirectory | None = None
+        role_error: BaseException | None = None
+        try:
+            rules_parent = bind_directory(
+                rules.parent,
+                label="rules",
+                expected=parent_expected,
+            )
+            validate_transaction_data_roles(
+                rules=rules,
+                backup=backup,
+                rules_parent=rules_parent,
+                expected=final_data_roles,
+            )
+        except BaseException as error:
+            role_error = error
+            raise
+        finally:
+            if rules_parent is not None:
+                finalize_descriptor_cleanup(
+                    [("final_data_roles_parent", rules_parent.fd)],
+                    primary_error=role_error,
+                )
+
     def before_lock_release() -> None:
         try:
             validate_controls()
+            validate_final_recovery_data_roles()
         except TransactionError as error:
-            if mutation_tracker.mutation_started:
+            if mutation_tracker.mutation_started or final_data_roles is not None:
+                operation_status = (
+                    outcome[1].get("status") if outcome is not None else None
+                )
                 raise TransactionError(
                     "recovery_required",
-                    "receipt-bound recovery evidence changed before lock release",
+                    (
+                        "receipt-bound recovery evidence or terminal data roles "
+                        "changed before lock release"
+                    ),
                     exit_code=EXIT_POST_REPLACE_FAILED,
                     details={
+                        **(
+                            {"operation_status": operation_status}
+                            if isinstance(operation_status, str)
+                            else {}
+                        ),
                         "reason": error.status,
                         "message": str(error),
                         **mutation_tracker.details(),
