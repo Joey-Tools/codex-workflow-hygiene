@@ -117,6 +117,9 @@ superseded_by:
 - Made Linux process-cleanup assertions accept `/proc` terminal states
   `Z`/`X`/`x` without waiting for PID 1 to reap orphaned descendants, while
   every live state remains a failed quiescence proof.
+- Unified the production Linux process-group inventory and test exit probe on
+  that terminal-state set, with direct malformed and unreadable fail-closed
+  coverage.
 - Reduced the Joey authoring overlay to placement and validation policy while
   respecting non-default `CODEX_HOME`.
 - Strengthened structural tests for the complete audit and cold-start paths.
@@ -396,6 +399,16 @@ superseded_by:
 - The four new transaction methods passed on system Python 3.9.6, and both
   changed Python files byte-compiled on Python 3.13 and system Python 3.9.6
   with task-scoped caches removed afterward.
+- A fresh-context whole-range review of
+  `212212db3eacf2a9e23a2ce4fa5575a6dd9e930a..bfcb6fb8e3f0d897995315aced26249825cf5726`
+  found that the test exit probe treated `Z`/`X`/`x` as terminal while the
+  production Linux process-group inventory excluded only `Z`. The production
+  parser now uses the same exact terminal-state set.
+- Four direct Linux inventory regressions passed on Python 3.13.0 and system
+  Python 3.9.6, covering terminal, live, malformed, and unreadable process
+  metadata. The full repository suite passed 1,277/1,277 on Python 3.13.0;
+  Ruff check/format, byte compilation, and `git diff --check` passed for the
+  final files.
 - GitHub Actions run `30240557145`, job `89896679716`, and PR #63 all bound the
   failure to head `97f55508418718d8ddbd3547b5cfeb0190a06e33`. Its sole error
   was `unsupported_file_flags` while binding the rules parent after the large

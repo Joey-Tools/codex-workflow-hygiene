@@ -189,6 +189,93 @@ class RulesApplyTransactionTests(unittest.TestCase):
             target_stat.unlink()
             self.assertTrue(process_has_exited(123, proc_root=proc_root))
 
+    def test_linux_process_group_inventory_excludes_all_terminal_states(self) -> None:
+        entry = SimpleNamespace(name="123")
+        scandir = mock.MagicMock()
+        scandir.return_value.__iter__.return_value = [entry]
+
+        for state in TRANSACTION.LINUX_TERMINAL_PROCESS_STATES:
+            with self.subTest(state=state.decode("ascii")):
+                process_stat = b"123 (validator child) " + state + b" 1 456 456\n"
+                with (
+                    mock.patch.object(TRANSACTION.os, "scandir", scandir),
+                    mock.patch(
+                        "builtins.open",
+                        mock.mock_open(read_data=process_stat),
+                    ),
+                ):
+                    self.assertEqual(
+                        TRANSACTION._linux_live_process_group_members(
+                            456,
+                            leader_pid=999,
+                        ),
+                        (),
+                    )
+
+    def test_linux_process_group_inventory_retains_live_members(self) -> None:
+        entry = SimpleNamespace(name="123")
+        scandir = mock.MagicMock()
+        scandir.return_value.__iter__.return_value = [entry]
+
+        with (
+            mock.patch.object(TRANSACTION.os, "scandir", scandir),
+            mock.patch(
+                "builtins.open",
+                mock.mock_open(
+                    read_data=b"123 (validator child) S 1 456 456\n",
+                ),
+            ),
+        ):
+            self.assertEqual(
+                TRANSACTION._linux_live_process_group_members(
+                    456,
+                    leader_pid=999,
+                ),
+                (123,),
+            )
+
+    def test_linux_process_group_inventory_rejects_malformed_state(self) -> None:
+        entry = SimpleNamespace(name="123")
+        scandir = mock.MagicMock()
+        scandir.return_value.__iter__.return_value = [entry]
+
+        with (
+            mock.patch.object(TRANSACTION.os, "scandir", scandir),
+            mock.patch(
+                "builtins.open",
+                mock.mock_open(read_data=b"123 (validator child) broken\n"),
+            ),
+            self.assertRaisesRegex(
+                TRANSACTION.TransactionError,
+                "metadata for 123 is malformed",
+            ),
+        ):
+            TRANSACTION._linux_live_process_group_members(
+                456,
+                leader_pid=999,
+            )
+
+    def test_linux_process_group_inventory_rejects_unreadable_state(self) -> None:
+        entry = SimpleNamespace(name="123")
+        scandir = mock.MagicMock()
+        scandir.return_value.__iter__.return_value = [entry]
+
+        with (
+            mock.patch.object(TRANSACTION.os, "scandir", scandir),
+            mock.patch(
+                "builtins.open",
+                side_effect=PermissionError(errno.EACCES, "denied"),
+            ),
+            self.assertRaisesRegex(
+                TRANSACTION.TransactionError,
+                "cannot inspect validator process-group candidate 123",
+            ),
+        ):
+            TRANSACTION._linux_live_process_group_members(
+                456,
+                leader_pid=999,
+            )
+
     def xattr_validator_source(self, *, live_only: bool = False) -> str:
         probe = self.root / "xattr-probe"
         probe.write_bytes(b"probe\n")

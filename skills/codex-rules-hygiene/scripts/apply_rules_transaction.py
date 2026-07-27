@@ -59,6 +59,7 @@ MANAGED_VALIDATOR_SIGNALS = tuple(
     for name in ("SIGINT", "SIGTERM", "SIGHUP")
     if hasattr(signal, name)
 )
+LINUX_TERMINAL_PROCESS_STATES = frozenset((b"Z", b"X", b"x"))
 
 LINUX_FS_IOC_GETFLAGS = 0x80086601
 LINUX_AUTOMATIC_FILE_FLAGS = (
@@ -4236,7 +4237,10 @@ def _linux_live_process_group_members(
                     "validator_cleanup_failed",
                     f"validator process group for {pid} is malformed",
                 ) from error
-            if member_group == process_group_id and fields[0] != b"Z":
+            if (
+                member_group == process_group_id
+                and fields[0] not in LINUX_TERMINAL_PROCESS_STATES
+            ):
                 live.append(pid)
     return tuple(sorted(live))
 
