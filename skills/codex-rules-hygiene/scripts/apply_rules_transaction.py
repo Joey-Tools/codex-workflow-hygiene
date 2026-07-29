@@ -4385,6 +4385,7 @@ def shared_lock(
     *,
     timeout_seconds: float,
     before_release: Callable[[], None] | None = None,
+    acquisition_signal_gate: ValidatorSignalGate | None = None,
 ):
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise TransactionError(
@@ -4401,6 +4402,7 @@ def shared_lock(
     locked = False
     binding: BoundFile | None = None
     lock_created = False
+    acquisition_signal_gate_active = False
     primary_error: BaseException | None = None
     primary_traceback: object | None = None
     try:
@@ -4425,11 +4427,12 @@ def shared_lock(
             opened_lock = os.fstat(fd)
             lock_snapshot(path, opened_lock)
         deadline = time.monotonic() + timeout_seconds
+        if acquisition_signal_gate is not None:
+            acquisition_signal_gate_active = True
+            acquisition_signal_gate.arm()
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
-                break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise TransactionError(
@@ -4438,6 +4441,12 @@ def shared_lock(
                         exit_code=EXIT_LIVE_CONFLICT,
                     )
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+            locked = True
+            break
+        if acquisition_signal_gate is not None:
+            acquisition_signal_gate.close()
+            acquisition_signal_gate_active = False
         binding = BoundFile(
             path=path,
             name=path.name,
@@ -4451,6 +4460,12 @@ def shared_lock(
         primary_traceback = error.__traceback__
     finally:
         finalization_errors: list[tuple[str, BaseException]] = []
+        if acquisition_signal_gate_active:
+            assert acquisition_signal_gate is not None
+            try:
+                acquisition_signal_gate.close()
+            except BaseException as error:
+                finalization_errors.append(("acquisition-signal-gate-close", error))
         if locked and binding is not None:
             finalizers: list[tuple[str, Callable[[], None]]] = [
                 ("pre-release-revalidation", lambda: revalidate_lock(binding)),
@@ -8645,6 +8660,20 @@ def _apply_transaction_inner(
             )
         return failures
 
+    def raise_pre_receipt_signal_if_pending() -> None:
+        if pre_receipt_signal_handoff is None:
+            return
+        if (
+            pre_receipt_signal_handoff.forwarded_signal is None
+            and pre_receipt_signal_handoff.gate.pending_signum
+            in MANAGED_VALIDATOR_SIGNALS
+        ):
+            pre_receipt_signal_handoff.forwarded_signal = ForwardedValidatorSignal(
+                pre_receipt_signal_handoff.gate.pending_signum
+            )
+        if pre_receipt_signal_handoff.forwarded_signal is not None:
+            raise pre_receipt_signal_handoff.forwarded_signal
+
     def bind_post_replace_signal_recovery(
         recovery: dict[str, object],
     ) -> None:
@@ -9027,8 +9056,7 @@ def _apply_transaction_inner(
                         "managed-signal handoff"
                     ),
                 )
-            if pre_receipt_signal_handoff.forwarded_signal is not None:
-                raise pre_receipt_signal_handoff.forwarded_signal
+            raise_pre_receipt_signal_if_pending()
             validation_input.validate()
             revalidate_candidate_source(
                 candidate_source,
@@ -9046,8 +9074,10 @@ def _apply_transaction_inner(
             lock,
             timeout_seconds=args.lock_timeout_seconds,
             before_release=finalize_apply_state,
+            acquisition_signal_gate=pre_receipt_signal_handoff.gate,
         ) as lock_binding:
             lock_acquired = True
+            raise_pre_receipt_signal_if_pending()
             rules_parent_binding = bind_directory(
                 rules.parent,
                 label="rules",

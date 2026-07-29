@@ -580,3 +580,22 @@ superseded_by:
   3.9.6 byte compilation, the official Rules skill validator, and
   project-journal validation. The task-scoped system-Python bytecode cache was
   inspected and removed.
+- The first validator's managed-signal gate now becomes interruptible only
+  while the post-validation shared lock is being acquired. It returns to
+  capture-only before the lock body begins, so `SIGINT`, `SIGTERM`, and
+  `SIGHUP` interrupt a contended lock immediately without extending
+  asynchronous exceptions into transaction publication. The first signal
+  remains authoritative, the lock descriptor closes before handler
+  restoration, and no receipt, prepared candidate, recovery terminal, backup,
+  or private-stage object is created.
+- The final Rules transaction module passed 254/254 on Python 3.13.0, including
+  real contended-lock subprocess coverage for all three managed signals,
+  deterministic first-signal/duplicate-signal cleanup coverage, and the
+  unchanged `lock_busy` timeout outcome. The same three focused methods passed
+  on system Python 3.9.6, and the final Python 3.13.0 repository suite passed
+  1,316/1,316.
+- Final lock-wait gates passed Ruff check/format, Python 3.13.0 and system
+  Python 3.9.6 byte compilation, the official Rules skill validator,
+  project-journal validation, and `git diff --check`. Repository
+  `__pycache__` directories and both task-scoped system-Python bytecode caches
+  were inspected and removed.

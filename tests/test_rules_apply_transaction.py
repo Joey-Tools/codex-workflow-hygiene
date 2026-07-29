@@ -707,6 +707,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
             *,
             timeout_seconds: float,
             before_release: object = None,
+            acquisition_signal_gate: object = None,
         ):
             finalizer = before_release
 
@@ -729,6 +730,14 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 path,
                 timeout_seconds=timeout_seconds,
                 before_release=(drift_then_release if finalizer is not None else None),
+                acquisition_signal_gate=(
+                    acquisition_signal_gate
+                    if isinstance(
+                        acquisition_signal_gate,
+                        TRANSACTION.ValidatorSignalGate,
+                    )
+                    else None
+                ),
             ) as binding:
                 yield binding
 
@@ -8414,6 +8423,260 @@ class RulesApplyTransactionTests(unittest.TestCase):
         )
         return result
 
+    def run_lock_contention_signal_child(
+        self,
+        signum: int,
+    ) -> dict[str, object]:
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+        lock_identity = {
+            "device": lock.stat().st_dev,
+            "inode": lock.stat().st_ino,
+        }
+        result_path = self.root / (
+            f"lock-contention-{signal.Signals(signum).name}.json"
+        )
+        ready_path = self.root / (
+            f"lock-contention-{signal.Signals(signum).name}.ready"
+        )
+        owner_fd = os.open(lock, os.O_RDWR | os.O_CLOEXEC)
+        fcntl.flock(owner_fd, fcntl.LOCK_EX)
+        child_pid = os.fork()
+        if child_pid == 0:
+            os.close(owner_fd)
+            try:
+                previous_handlers = {
+                    managed: signal.getsignal(managed)
+                    for managed in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+                }
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                real_flock = TRANSACTION.fcntl.flock
+                real_close = TRANSACTION.close_descriptors_best_effort
+                real_complete = TRANSACTION._complete_validator_signal_ownership_handoff
+                contended = False
+                lifecycle: list[str] = []
+
+                def instrument_flock(fd: int, operation: int) -> None:
+                    nonlocal contended
+                    try:
+                        real_flock(fd, operation)
+                    except BlockingIOError:
+                        if operation & fcntl.LOCK_NB and not contended:
+                            contended = True
+                            ready_path.write_text("ready\n", encoding="ascii")
+                        raise
+
+                def instrument_close(
+                    descriptors: list[tuple[str, int]],
+                    *,
+                    release_uncertain: bool = False,
+                ) -> list[dict[str, object]]:
+                    if any(
+                        descriptor == "transaction_lock"
+                        for descriptor, _fd in descriptors
+                    ):
+                        lifecycle.append("lock_descriptor_cleanup")
+                    return real_close(
+                        descriptors,
+                        release_uncertain=release_uncertain,
+                    )
+
+                def instrument_complete(
+                    handoff: object,
+                ) -> list[dict[str, object]]:
+                    lifecycle.append("handler_restore")
+                    return real_complete(handoff)
+
+                argv = self.apply_argv()
+                timeout_index = argv.index("--lock-timeout-seconds") + 1
+                argv[timeout_index] = "5.0"
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION.fcntl,
+                        "flock",
+                        side_effect=instrument_flock,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "close_descriptors_best_effort",
+                        side_effect=instrument_close,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_complete_validator_signal_ownership_handoff",
+                        side_effect=instrument_complete,
+                    ),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    code = TRANSACTION.main(argv)
+
+                handlers_restored = all(
+                    signal.getsignal(managed) == previous_handlers[managed]
+                    for managed in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+                )
+                mask_restored = (
+                    signal.pthread_sigmask(signal.SIG_BLOCK, set()) == previous_mask
+                )
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "code": code,
+                            "payload": json.loads(stdout.getvalue()),
+                            "stderr": stderr.getvalue(),
+                            "contended": contended,
+                            "handlers_restored": handlers_restored,
+                            "mask_restored": mask_restored,
+                            "lifecycle": lifecycle,
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                os._exit(0)
+            except BaseException as error:
+                try:
+                    result_path.write_text(
+                        json.dumps(
+                            {
+                                "child_error": type(error).__name__,
+                                "message": str(error),
+                            },
+                            sort_keys=True,
+                        ),
+                        encoding="utf-8",
+                    )
+                finally:
+                    os._exit(97)
+
+        child_status: int | None = None
+        signal_sent_at: float | None = None
+        signal_latency_seconds: float | None = None
+        try:
+            ready_deadline = time.monotonic() + 3
+            while time.monotonic() < ready_deadline and not ready_path.exists():
+                waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if waited_pid == child_pid:
+                    child_status = status
+                    break
+                time.sleep(0.01)
+            if not ready_path.exists():
+                if child_status is None:
+                    os.kill(child_pid, signal.SIGKILL)
+                    _waited_pid, child_status = os.waitpid(child_pid, 0)
+                result = (
+                    json.loads(result_path.read_text(encoding="utf-8"))
+                    if result_path.exists()
+                    else {}
+                )
+                self.fail(
+                    f"lock-contention child did not reach the busy-lock poll: {result}"
+                )
+
+            signal_sent_at = time.monotonic()
+            os.kill(child_pid, signum)
+            signal_deadline = signal_sent_at + 2
+            while time.monotonic() < signal_deadline:
+                waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if waited_pid == child_pid:
+                    child_status = status
+                    signal_latency_seconds = time.monotonic() - signal_sent_at
+                    break
+                time.sleep(0.01)
+            if child_status is None:
+                os.kill(child_pid, signal.SIGKILL)
+                _waited_pid, child_status = os.waitpid(child_pid, 0)
+                self.fail(
+                    "managed signal did not interrupt lock contention before "
+                    "the five-second lock timeout"
+                )
+        finally:
+            fcntl.flock(owner_fd, fcntl.LOCK_UN)
+            os.close(owner_fd)
+
+        result = (
+            json.loads(result_path.read_text(encoding="utf-8"))
+            if result_path.exists()
+            else {}
+        )
+        self.assertTrue(
+            os.WIFEXITED(child_status),
+            {"status": child_status, "result": result},
+        )
+        self.assertEqual(
+            os.WEXITSTATUS(child_status),
+            0,
+            {"result": result},
+        )
+        assert signal_sent_at is not None
+        assert signal_latency_seconds is not None
+        result["signal_latency_seconds"] = signal_latency_seconds
+        lock_stat = lock.stat()
+        self.assertEqual(
+            lock_identity,
+            {"device": lock_stat.st_dev, "inode": lock_stat.st_ino},
+        )
+        self.assertEqual(lock.read_bytes(), b"")
+        self.assertEqual(stat.S_IMODE(lock_stat.st_mode), 0o600)
+        return result
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(os, "fork")
+        and hasattr(signal, "pthread_sigmask"),
+        "lock-wait signal capture requires POSIX fork and signal masks",
+    )
+    def test_managed_signals_interrupt_contended_lock_before_timeout(
+        self,
+    ) -> None:
+        for signum in TRANSACTION.MANAGED_VALIDATOR_SIGNALS:
+            with (
+                self.subTest(signal=signal.Signals(signum).name),
+                tempfile.TemporaryDirectory(
+                    prefix="rules-lock-contention-signal."
+                ) as isolated,
+            ):
+                self.configure_isolated_case(Path(isolated))
+                self.write_validator("raise SystemExit(0)\n")
+                result = self.run_lock_contention_signal_child(signum)
+
+                self.assertTrue(result["contended"], result)
+                self.assertLess(result["signal_latency_seconds"], 2.0, result)
+                self.assertEqual(result["code"], 128 + signum)
+                self.assertEqual(result["stderr"], "")
+                self.assertTrue(result["handlers_restored"])
+                self.assertTrue(result["mask_restored"])
+                payload = result["payload"]
+                self.assertEqual(payload["status"], "interrupted")
+                self.assertEqual(payload["signal"], signum)
+                self.assertNotIn("pre_receipt_recovery", payload)
+                lifecycle = result["lifecycle"]
+                self.assertIn("lock_descriptor_cleanup", lifecycle)
+                self.assertIn("handler_restore", lifecycle)
+                self.assertLess(
+                    lifecycle.index("lock_descriptor_cleanup"),
+                    lifecycle.index("handler_restore"),
+                )
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertFalse(self.backup.exists())
+                self.assertFalse(self.receipt.exists())
+                self.assertFalse(
+                    TRANSACTION.prepared_candidate_path(self.receipt).exists()
+                )
+                terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+                self.assertFalse(terminal.exists())
+                self.assertFalse(
+                    TRANSACTION.recovery_terminal_result_path(terminal).exists()
+                )
+                self.assert_no_private_stage()
+
     @unittest.skipUnless(
         os.name == "posix"
         and hasattr(os, "fork")
@@ -11915,6 +12178,89 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertTrue(
             raised.exception.details["cleanup_failures"][0]["release_uncertain"]
         )
+
+    def test_acquisition_signal_gate_preserves_first_signal_and_closes(self) -> None:
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+        real_open = TRANSACTION.open_untrusted_regular_file
+        opened_fd: int | None = None
+        primary_signum = TRANSACTION.MANAGED_VALIDATOR_SIGNALS[0]
+        secondary_signum = TRANSACTION.MANAGED_VALIDATOR_SIGNALS[-1]
+        gate = TRANSACTION.ValidatorSignalGate()
+
+        def capture_open(*args: object, **kwargs: object) -> int:
+            nonlocal opened_fd
+            opened_fd = real_open(*args, **kwargs)
+            return opened_fd
+
+        def interrupt_flock(_fd: int, _operation: int) -> None:
+            gate.handle(primary_signum, None)
+            self.fail("armed acquisition gate did not interrupt flock")
+
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "open_untrusted_regular_file",
+                side_effect=capture_open,
+            ),
+            mock.patch.object(
+                TRANSACTION.fcntl,
+                "flock",
+                side_effect=interrupt_flock,
+            ),
+            self.assertRaises(TRANSACTION.ForwardedValidatorSignal) as raised,
+        ):
+            with TRANSACTION.shared_lock(
+                lock,
+                timeout_seconds=5.0,
+                acquisition_signal_gate=gate,
+            ):
+                self.fail("interrupted acquisition unexpectedly entered its body")
+
+        self.assertEqual(raised.exception.signum, primary_signum)
+        gate.handle(primary_signum, None)
+        gate.handle(secondary_signum, None)
+        self.assertEqual(gate.pending_signum, primary_signum)
+        assert opened_fd is not None
+        with self.assertRaises(OSError) as closed:
+            os.fstat(opened_fd)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_acquisition_signal_gate_closes_after_lock_timeout(self) -> None:
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+        gate = TRANSACTION.ValidatorSignalGate()
+
+        with (
+            mock.patch.object(
+                TRANSACTION.fcntl,
+                "flock",
+                side_effect=BlockingIOError(
+                    errno.EWOULDBLOCK,
+                    "fault-injected busy lock",
+                ),
+            ),
+            mock.patch.object(
+                TRANSACTION.time,
+                "monotonic",
+                side_effect=[10.0, 11.0],
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            with TRANSACTION.shared_lock(
+                lock,
+                timeout_seconds=1.0,
+                acquisition_signal_gate=gate,
+            ):
+                self.fail("busy lock unexpectedly entered its body")
+
+        self.assertEqual(raised.exception.status, "lock_busy")
+        self.assertEqual(raised.exception.exit_code, 20)
+        signum = TRANSACTION.MANAGED_VALIDATOR_SIGNALS[0]
+        gate.handle(signum, None)
+        self.assertEqual(gate.pending_signum, signum)
 
     def test_apply_keeps_evidence_bound_until_lock_close_fault_is_classified(
         self,
