@@ -1990,15 +1990,82 @@ def reject_unmodeled_metadata(path: Path, *, label: str = "live_rules") -> None:
         ) from error
 
 
-def validate_bound_directory(binding: BoundDirectory) -> Snapshot:
+def _bound_directory_probe_error(
+    binding: BoundDirectory,
+    *,
+    probe_stage: str,
+    failure_scope: str,
+    io_operation: str,
+    failed_check: str,
+    error: OSError,
+    missing_is_change: bool = False,
+) -> TransactionError:
+    missing = missing_is_change and error.errno in {errno.ENOENT, errno.ENOTDIR}
+    return TransactionError(
+        (
+            f"{binding.label}_parent_changed"
+            if missing
+            else f"{binding.label}_parent_unreadable"
+        ),
+        (
+            f"{binding.label} parent binding is missing during {probe_stage} "
+            f"{io_operation}: {error}"
+            if missing
+            else (
+                f"{binding.label} parent {failure_scope} is unreadable during "
+                f"{probe_stage} {io_operation}: {error}"
+            )
+        ),
+        details={
+            "failure_classification": "missing" if missing else "unreadable",
+            "failure_scope": failure_scope,
+            "io_operation": io_operation,
+            "parent_probe_stage": probe_stage,
+            "failed_check": failed_check,
+            "io_error": {
+                "errno": error.errno,
+                "message": str(error),
+            },
+        },
+    )
+
+
+def _probe_bound_directory(
+    binding: BoundDirectory,
+    *,
+    probe_stage: str,
+) -> tuple[os.stat_result, os.stat_result]:
     try:
         descriptor_actual = os.fstat(binding.fd)
+    except OSError as error:
+        raise _bound_directory_probe_error(
+            binding,
+            probe_stage=probe_stage,
+            failure_scope="bound_parent_descriptor",
+            io_operation="fstat_bound_parent",
+            failed_check="parent_descriptor_readability",
+            error=error,
+        ) from error
+    try:
         path_actual = os.stat(binding.path, follow_symlinks=False)
     except OSError as error:
-        raise TransactionError(
-            f"{binding.label}_parent_changed",
-            f"{binding.label} parent binding is unavailable: {error}",
+        raise _bound_directory_probe_error(
+            binding,
+            probe_stage=probe_stage,
+            failure_scope="parent_path_binding",
+            io_operation="stat_parent_path",
+            failed_check="parent_path_readability",
+            error=error,
+            missing_is_change=True,
         ) from error
+    return descriptor_actual, path_actual
+
+
+def validate_bound_directory(binding: BoundDirectory) -> Snapshot:
+    descriptor_actual, path_actual = _probe_bound_directory(
+        binding,
+        probe_stage="initial",
+    )
     if not stat.S_ISDIR(descriptor_actual.st_mode) or not stat.S_ISDIR(
         path_actual.st_mode
     ):
@@ -2037,14 +2104,10 @@ def validate_bound_directory(binding: BoundDirectory) -> Snapshot:
         label=f"{binding.label}_parent",
         require_directory=True,
     )
-    try:
-        descriptor_final = os.fstat(binding.fd)
-        path_final = os.stat(binding.path, follow_symlinks=False)
-    except OSError as error:
-        raise TransactionError(
-            f"{binding.label}_parent_changed",
-            f"{binding.label} parent binding changed during metadata admission: {error}",
-        ) from error
+    descriptor_final, path_final = _probe_bound_directory(
+        binding,
+        probe_stage="final",
+    )
     final_mismatches = directory_property_mismatches(
         binding.snapshot,
         descriptor_final,
@@ -2311,6 +2374,7 @@ def _original_live_durability_failure_details(
             "failure_scope",
             "io_operation",
             "io_error",
+            "parent_probe_stage",
         ):
             if field in cause.details:
                 details[field] = cause.details[field]
@@ -2431,6 +2495,34 @@ def fsync_and_revalidate_original_live(
         raise TransactionError(
             "original_live_fsync_failed",
             "original live rules could not be made durable",
+            exit_code=EXIT_LIVE_CONFLICT,
+            details=details,
+        ) from error
+
+    try:
+        os.fsync(parent.fd)
+    except OSError as error:
+        details = _original_live_durability_failure_details(
+            binding,
+            parent,
+            expected,
+            phase="parent_fsync",
+            actual=before,
+            failed_check="parent_dirent_durability",
+        )
+        details.update(
+            {
+                "failure_scope": "parent_dirent_durability",
+                "io_operation": "fsync_bound_parent",
+                "io_error": {
+                    "errno": error.errno,
+                    "message": str(error),
+                },
+            }
+        )
+        raise TransactionError(
+            "original_live_parent_fsync_failed",
+            "original live rules parent dirent could not be made durable",
             exit_code=EXIT_LIVE_CONFLICT,
             details=details,
         ) from error
@@ -6376,7 +6468,21 @@ def write_receipt(
                 "receipt_invalid",
                 "recovery receipt is not owner-only and single-link",
             )
-        os.fsync(parent.fd)
+        try:
+            os.fsync(parent.fd)
+        except OSError as error:
+            raise TransactionError(
+                "receipt_parent_fsync_failed",
+                "recovery receipt parent directory could not be made durable",
+                details={
+                    "failure_scope": "receipt_parent_durability",
+                    "io_operation": "fsync_bound_parent",
+                    "io_error": {
+                        "errno": error.errno,
+                        "message": str(error),
+                    },
+                },
+            ) from error
         validate_bound_regular_file(
             binding,
             parent,
@@ -8069,6 +8175,8 @@ def _apply_transaction_inner(
     original_live_binding: BoundFile | None = None
     stage_cleanup_failures: list[dict[str, object]] = []
     final_data_roles: TransactionDataRoles | None = None
+    receipt_publication_state = "not_reserved"
+    transaction_id: str | None = None
 
     def apply_recovery_locators() -> dict[str, str]:
         return {
@@ -8082,6 +8190,75 @@ def _apply_transaction_inner(
                 recovery_terminal_result_path(recovery_terminal)
             ),
         }
+
+    def pre_receipt_reserved_recovery_error(
+        error: OSError | TransactionError,
+    ) -> TransactionError:
+        if evidence is None:
+            raise AssertionError("pre-receipt reservation requires bound evidence")
+        receipt_observation = observe_directory_entry(
+            evidence.receipt_parent.fd,
+            receipt.name,
+        )
+        prepared_observation = observe_directory_entry(
+            evidence.receipt_parent.fd,
+            evidence.prepared_candidate.name,
+            expected=evidence.prepared_candidate.snapshot,
+        )
+        terminal_observation = observe_directory_entry(
+            evidence.receipt_parent.fd,
+            evidence.recovery_terminal.name,
+            expected=evidence.recovery_terminal.snapshot,
+        )
+        failure = {
+            "status": (
+                error.status
+                if isinstance(error, TransactionError)
+                else "receipt_io_failed"
+            ),
+            "message": str(error),
+            **(error.details if isinstance(error, TransactionError) else {}),
+            **structured_secondary_failure_evidence(error),
+        }
+        return TransactionError(
+            "recovery_required",
+            (
+                "prepared candidate and recovery terminal were reserved before "
+                "receipt publication reached a bound terminal state"
+            ),
+            exit_code=EXIT_POST_REPLACE_FAILED,
+            details={
+                "operation_status": "pre_receipt_reserved",
+                "reason": "receipt_publication_incomplete",
+                "transaction_id": transaction_id,
+                "pre_receipt_reserved_state": {
+                    "state": "prepared_and_terminal_reserved_receipt_unbound",
+                    "terminal_disposition": "retained_for_explicit_recovery",
+                    "receipt_binding_returned": False,
+                    "receipt_observation": receipt_observation,
+                    "prepared_candidate": {
+                        "path": str(evidence.prepared_candidate.path),
+                        "expected": evidence.prepared_candidate.snapshot.to_json(),
+                        "observation": prepared_observation,
+                    },
+                    "recovery_terminal": {
+                        "path": str(evidence.recovery_terminal.path),
+                        "expected": evidence.recovery_terminal.snapshot.to_json(),
+                        "observation": terminal_observation,
+                    },
+                },
+                "receipt_failure": failure,
+                "publication_state": {
+                    "receipt_binding_returned": False,
+                    "exchange_started": False,
+                },
+                "receipt_path": str(receipt),
+                "backup_path": str(backup),
+                "prepared_candidate_path": str(prepared_recovery_candidate),
+                "recovery_terminal_path": str(recovery_terminal),
+                "recovery_locators": apply_recovery_locators(),
+            },
+        )
 
     def bind_post_replace_signal_recovery(
         recovery: dict[str, object],
@@ -8650,6 +8827,7 @@ def _apply_transaction_inner(
                 recovery_terminal=terminal_binding,
                 prepared_candidate=prepared_binding,
             )
+            receipt_publication_state = "pre_receipt_reserved"
             evidence.validate()
 
             parent_expected = rules_parent_binding.snapshot
@@ -8678,6 +8856,7 @@ def _apply_transaction_inner(
                 transaction_receipt,
                 evidence.receipt_parent,
             )
+            receipt_publication_state = "receipt_bound"
             evidence.validate()
 
             stage = PrivateStage(
@@ -9209,6 +9388,13 @@ def _apply_transaction_inner(
             isinstance(error, TransactionError) and error.status == "recovery_required"
         ) or (stage is not None and stage.mutation_uncertain):
             retain_stage = True
+        if (
+            receipt_publication_state == "pre_receipt_reserved"
+            and evidence is not None
+            and evidence.receipt is None
+            and isinstance(error, (OSError, TransactionError))
+        ):
+            raise pre_receipt_reserved_recovery_error(error) from error
         if (
             evidence is not None
             and evidence.receipt is not None

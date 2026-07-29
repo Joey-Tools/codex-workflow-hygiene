@@ -131,23 +131,40 @@ superseded_by:
   of that fsync as structured unreadability, preserving exact operation,
   errno, phase, reason, and zero-publication evidence without conflating
   missing entries or proved property drift.
+- Extended the original-live durability boundary through the descriptor-bound
+  rules parent: file fsync now precedes parent-directory fsync and complete
+  file/parent/dirent revalidation, while initial/final parent descriptor/path
+  EIO retains unreadable scope, operation, errno, and probe stage.
+- Classified the durable prepared-candidate plus terminal-reservation window
+  before receipt binding. Receipt write or either fsync failure now returns
+  dedicated `recovery_required` evidence with the exact reserved objects,
+  receipt observation, transaction ID, publication state, and every recovery
+  locator instead of escaping as an arbitrary exception.
 - Reduced the Joey authoring overlay to placement and validation policy while
   respecting non-default `CODEX_HOME`.
 - Strengthened structural tests for the complete audit and cold-start paths.
 
 ## Current State
 
-- A real-change apply keeps the initially admitted live descriptor open and
-  fsyncs it before creating transaction ID, prepared/terminal evidence,
-  receipt, stage, backup, or exchange state. Fsync errors and post-fsync
+- A real-change apply keeps the initially admitted live descriptor open,
+  fsyncs it, fsyncs the descriptor-bound rules parent, and then completely
+  revalidates the file, parent, and exact child dirent before creating
+  transaction ID, prepared/terminal evidence, receipt, stage, backup, or
+  exchange state. File/parent fsync errors and post-fsync
   replacement/content/access/link/dirent drift report structured
   pre-publication evidence with `receipt_written: false` and
   `exchange_started: false`; directory size/link churn remains benign while
   parent object identity/access policy and the exact child dirent stay
-  protected. Raw FD-read and dirent-stat errors are separately reported as
-  `original_live_unreadable_before_fsync` or
+  protected. Raw FD-read, dirent-stat, and initial/final parent probe errors
+  are separately reported as `original_live_unreadable_before_fsync` or
   `original_live_unreadable_after_fsync`; missing and mismatch statuses remain
   distinct.
+- Once the prepared candidate and recovery-terminal reservation are durable,
+  apply records an explicit pre-receipt reserved state until `write_receipt`
+  returns a bound descriptor. Receipt write, file-fsync, or parent-fsync
+  failure in that window retains both exact objects and reports nonzero
+  `recovery_required` with receipt observation/failure, zero-exchange
+  publication state, and the complete recovery-locator set.
 - Rules apply stages and validates a descriptor-bound private candidate before
   taking a shared lock, then revalidates the expected live digest, object
   identity, content, access policy, and `st_nlink == 1` object policy before a
@@ -541,3 +558,21 @@ superseded_by:
 - Final gates passed Ruff check/format, Python 3.13.0 and system Python 3.9.6
   byte compilation, the official Rules skill validator through isolated
   `uv --with pyyaml`, project-journal validation, and `git diff --check`.
+- The new original-live parent and pre-receipt matrix passed 10/10 on both
+  Python 3.13.0 and system Python 3.9.6. It proves file-fsync →
+  parent-fsync → complete revalidation order, structured parent-fsync
+  failure, initial/final descriptor/path EIO classification on both sides of
+  the boundary, and exact retained `recovery_required` state for receipt
+  write, file-fsync, and parent-fsync failures.
+- The complete Rules transaction module passed 237/237 on Python 3.13.0.
+  System Python 3.9.6 passed 236 exercised cases and reached one unrelated
+  pre-existing capability error because that runtime exposes no `os.waitid`;
+  all ten task-specific methods passed there.
+- The Python 3.13.0 repository run exercised all 1,299 tests. Its only four
+  errors were the unchanged temporary merge-commit fixtures blocked from
+  `~/.gnupg/keyboxd` by the sandbox; those exact four passed 4/4 in the
+  approved narrow GPG-capable rerun.
+- Ruff check/format, Python 3.13.0 and system Python 3.9.6 byte compilation,
+  the official Rules skill validator through isolated `uv --with pyyaml`, and
+  project-journal validation plus `git diff --check` passed for the final
+  source shape.
