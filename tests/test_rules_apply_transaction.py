@@ -7565,6 +7565,538 @@ class RulesApplyTransactionTests(unittest.TestCase):
     def test_receipt_parent_fsync_failure_precedes_private_stage(self) -> None:
         self.assert_receipt_fault_precedes_private_stage("parent_fsync")
 
+    def assert_pre_receipt_creation_fault_is_recoverable(
+        self,
+        fault: str,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_write_prepared = TRANSACTION.write_prepared_candidate
+        real_reserve_terminal = TRANSACTION.reserve_recovery_terminal
+        real_validate = TRANSACTION.validate_bound_regular_file
+        real_fsync = TRANSACTION.os.fsync
+        real_write = TRANSACTION.os.write
+        fault_injected = False
+        prepared_validation_count = 0
+        terminal_validation_count = 0
+        conflicting_terminal: dict[str, object] | None = None
+
+        def faulting_prepared(
+            path: Path,
+            payload: bytes,
+            *,
+            parent: object,
+            policy: object,
+            on_created: Callable[[int], None] | None = None,
+        ) -> object:
+            nonlocal fault_injected
+            nonlocal prepared_validation_count
+            assert isinstance(parent, TRANSACTION.BoundDirectory)
+            assert isinstance(policy, TRANSACTION.Snapshot)
+
+            def fail_prepared_write(fd: int, payload_part: bytes) -> int:
+                nonlocal fault_injected
+                if fault == "prepared_write" and not fault_injected:
+                    fault_injected = True
+                    raise OSError(
+                        errno.EIO,
+                        "fault-injected prepared write",
+                    )
+                return real_write(fd, payload_part)
+
+            def fail_parent_fsync(fd: int) -> None:
+                nonlocal fault_injected
+                if (
+                    fault == "prepared_parent_fsync"
+                    and fd == parent.fd
+                    and not fault_injected
+                ):
+                    fault_injected = True
+                    raise OSError(
+                        errno.EIO,
+                        "fault-injected prepared parent fsync",
+                    )
+                if (
+                    fault == "prepared_file_fsync"
+                    and fd != parent.fd
+                    and not fault_injected
+                ):
+                    fault_injected = True
+                    raise OSError(
+                        errno.EIO,
+                        "fault-injected prepared file fsync",
+                    )
+                real_fsync(fd)
+
+            def fail_prepared_validation(
+                binding: object,
+                bound_parent: object,
+                *,
+                label: str,
+                max_bytes: int = TRANSACTION.MAX_RULES_BYTES,
+            ) -> object:
+                nonlocal fault_injected
+                nonlocal prepared_validation_count
+                value = real_validate(
+                    binding,
+                    bound_parent,
+                    label=label,
+                    max_bytes=max_bytes,
+                )
+                if label == "prepared_candidate":
+                    prepared_validation_count += 1
+                    requested_count = {
+                        "prepared_initial_validation": 1,
+                        "prepared_postvalidation": 2,
+                    }.get(fault)
+                    if (
+                        requested_count == prepared_validation_count
+                        and not fault_injected
+                    ):
+                        fault_injected = True
+                        raise TRANSACTION.TransactionError(
+                            f"{fault}_failed",
+                            f"fault-injected {fault.replace('_', ' ')} failure",
+                        )
+                return value
+
+            with (
+                mock.patch.object(
+                    TRANSACTION.os,
+                    "write",
+                    side_effect=fail_prepared_write,
+                ),
+                mock.patch.object(
+                    TRANSACTION.os,
+                    "fsync",
+                    side_effect=fail_parent_fsync,
+                ),
+                mock.patch.object(
+                    TRANSACTION,
+                    "validate_bound_regular_file",
+                    side_effect=fail_prepared_validation,
+                ),
+            ):
+                return real_write_prepared(
+                    path,
+                    payload,
+                    parent=parent,
+                    policy=policy,
+                    on_created=on_created,
+                )
+
+        def faulting_terminal(
+            path: Path,
+            *,
+            transaction_id: str,
+            parent: object,
+            on_created: Callable[[int], None] | None = None,
+        ) -> object:
+            nonlocal conflicting_terminal
+            nonlocal fault_injected
+            nonlocal terminal_validation_count
+            assert isinstance(parent, TRANSACTION.BoundDirectory)
+            if fault == "terminal_create_conflict":
+                conflict_payload = b"preexisting terminal race\n"
+                path.write_bytes(conflict_payload)
+                path.chmod(0o600)
+                conflict_stat = path.stat()
+                conflicting_terminal = {
+                    "identity": {
+                        "device": conflict_stat.st_dev,
+                        "inode": conflict_stat.st_ino,
+                    },
+                    "payload": conflict_payload,
+                    "mode": stat.S_IMODE(conflict_stat.st_mode),
+                }
+                fault_injected = True
+                return real_reserve_terminal(
+                    path,
+                    transaction_id=transaction_id,
+                    parent=parent,
+                    on_created=on_created,
+                )
+
+            def fail_terminal_write(fd: int, payload_part: bytes) -> int:
+                nonlocal fault_injected
+                if fault == "terminal_write" and not fault_injected:
+                    fault_injected = True
+                    raise OSError(
+                        errno.EIO,
+                        "fault-injected terminal write",
+                    )
+                return real_write(fd, payload_part)
+
+            def fail_terminal_parent_fsync(fd: int) -> None:
+                nonlocal fault_injected
+                if (
+                    fault == "terminal_parent_fsync"
+                    and fd == parent.fd
+                    and not fault_injected
+                ):
+                    fault_injected = True
+                    raise OSError(
+                        errno.EIO,
+                        "fault-injected terminal parent fsync",
+                    )
+                if (
+                    fault == "terminal_file_fsync"
+                    and fd != parent.fd
+                    and not fault_injected
+                ):
+                    fault_injected = True
+                    raise OSError(
+                        errno.EIO,
+                        "fault-injected terminal file fsync",
+                    )
+                real_fsync(fd)
+
+            def fail_terminal_postvalidation(
+                binding: object,
+                bound_parent: object,
+                *,
+                label: str,
+                max_bytes: int = TRANSACTION.MAX_RULES_BYTES,
+            ) -> object:
+                nonlocal fault_injected
+                nonlocal terminal_validation_count
+                value = real_validate(
+                    binding,
+                    bound_parent,
+                    label=label,
+                    max_bytes=max_bytes,
+                )
+                if label == "recovery_terminal":
+                    terminal_validation_count += 1
+                    requested_count = {
+                        "terminal_initial_validation": 1,
+                        "terminal_postvalidation": 2,
+                    }.get(fault)
+                    if requested_count == terminal_validation_count:
+                        fault_injected = True
+                        raise TRANSACTION.TransactionError(
+                            f"{fault}_failed",
+                            f"fault-injected {fault.replace('_', ' ')} failure",
+                        )
+                return value
+
+            with (
+                mock.patch.object(
+                    TRANSACTION.os,
+                    "write",
+                    side_effect=fail_terminal_write,
+                ),
+                mock.patch.object(
+                    TRANSACTION.os,
+                    "fsync",
+                    side_effect=fail_terminal_parent_fsync,
+                ),
+                mock.patch.object(
+                    TRANSACTION,
+                    "validate_bound_regular_file",
+                    side_effect=fail_terminal_postvalidation,
+                ),
+            ):
+                return real_reserve_terminal(
+                    path,
+                    transaction_id=transaction_id,
+                    parent=parent,
+                    on_created=on_created,
+                )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "write_prepared_candidate",
+                side_effect=faulting_prepared,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "reserve_recovery_terminal",
+                side_effect=faulting_terminal,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_exchange",
+                wraps=TRANSACTION.atomic_rename_exchange,
+            ) as exchange_mock,
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertTrue(fault_injected)
+        self.assertEqual(raised.exception.status, "recovery_required")
+        self.assertEqual(raised.exception.exit_code, 30)
+        details = raised.exception.details
+        self.assertEqual(details["operation_status"], "pre_receipt_created")
+        self.assertEqual(
+            details["reason"],
+            "pre_receipt_publication_incomplete",
+        )
+        expected_failure = {
+            "prepared_write": "write_failed",
+            "prepared_file_fsync": "write_failed",
+            "prepared_initial_validation": "prepared_initial_validation_failed",
+            "prepared_parent_fsync": "prepared_candidate_parent_fsync_failed",
+            "prepared_postvalidation": "prepared_postvalidation_failed",
+            "terminal_create_conflict": "recovery_terminal_exists",
+            "terminal_write": "write_failed",
+            "terminal_file_fsync": "write_failed",
+            "terminal_initial_validation": "terminal_initial_validation_failed",
+            "terminal_parent_fsync": "recovery_terminal_parent_fsync_failed",
+            "terminal_postvalidation": "terminal_postvalidation_failed",
+        }[fault]
+        failure = details["pre_receipt_failure"]
+        self.assertEqual(failure["status"], expected_failure)
+        if fault.endswith("parent_fsync"):
+            self.assertEqual(failure["io_operation"], "fsync_bound_parent")
+            self.assertEqual(failure["io_error"]["errno"], errno.EIO)
+
+        prepared = TRANSACTION.prepared_candidate_path(self.receipt)
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        terminal_result = TRANSACTION.recovery_terminal_result_path(terminal)
+        created_state = details["pre_receipt_created_state"]
+        expected_roles = (
+            ["prepared_candidate"]
+            if fault
+            in (
+                "prepared_write",
+                "prepared_file_fsync",
+                "prepared_initial_validation",
+                "prepared_parent_fsync",
+                "prepared_postvalidation",
+                "terminal_create_conflict",
+            )
+            else ["prepared_candidate", "recovery_terminal"]
+        )
+        self.assertEqual(created_state["created_roles"], expected_roles)
+        self.assertEqual(
+            created_state["created_object_disposition"],
+            "retained_for_explicit_recovery",
+        )
+        self.assertFalse(created_state["receipt_binding_returned"])
+        self.assertEqual(
+            created_state["namespace_observations"]["receipt"]["state"],
+            "missing",
+        )
+        self.assertEqual(
+            created_state["namespace_observations"]["prepared_candidate"]["state"],
+            "present",
+        )
+        self.assertEqual(
+            created_state["namespace_observations"]["recovery_terminal"]["state"],
+            ("present" if fault.startswith("terminal") else "missing"),
+        )
+        self.assertEqual(
+            created_state["namespace_observations"]["recovery_terminal_result"][
+                "state"
+            ],
+            "missing",
+        )
+
+        resolved_receipt = TRANSACTION.resolved_leaf(
+            str(self.receipt),
+            label="receipt",
+        )
+        resolved_rules = self.rules.parent.resolve(strict=True) / self.rules.name
+        resolved_backup = resolved_rules.parent / self.backup.name
+        resolved_prepared = TRANSACTION.prepared_candidate_path(resolved_receipt)
+        resolved_terminal = TRANSACTION.recovery_terminal_path(resolved_receipt)
+        resolved_terminal_result = TRANSACTION.recovery_terminal_result_path(
+            resolved_terminal
+        )
+        self.assertEqual(
+            details["recovery_locators"],
+            {
+                "receipt": str(resolved_receipt),
+                "live": str(resolved_rules),
+                "backup": str(resolved_backup),
+                "staged_backup": str(
+                    resolved_rules.parent / TRANSACTION.PRIVATE_STAGE_NAME / "candidate"
+                ),
+                "prepared_candidate": str(resolved_prepared),
+                "recovery_terminal": str(resolved_terminal),
+                "recovery_terminal_result": str(resolved_terminal_result),
+            },
+        )
+
+        created_objects = created_state["created_objects"]
+        created_paths = {
+            "prepared_candidate": resolved_prepared,
+            "recovery_terminal": resolved_terminal,
+        }
+        retained_identities: dict[str, dict[str, int]] = {}
+        for role in expected_roles:
+            retained = created_objects[role]
+            path = created_paths[role]
+            identity = retained["creation_evidence"]["created_object"]["identity"]
+            retained_identities[role] = identity
+            self.assertEqual(retained["ownership"], "created_by_transaction")
+            self.assertEqual(retained["creation_capture"], "complete")
+            self.assertEqual(
+                retained["current_observation"]["identity"],
+                identity,
+            )
+            self.assertEqual(retained["recovery_locator"], str(path))
+            self.assertEqual(
+                retained["cleanup_policy"],
+                "retained_no_pathname_unlink",
+            )
+            actual = path.stat()
+            self.assertEqual(
+                identity,
+                {"device": actual.st_dev, "inode": actual.st_ino},
+            )
+
+        if fault == "terminal_create_conflict":
+            assert conflicting_terminal is not None
+            conflict = failure["conflicting_object"]
+            self.assertEqual(
+                created_state["state"],
+                "prepared_created_terminal_conflict",
+            )
+            self.assertEqual(
+                created_state["conflicting_object_disposition"],
+                "preserved_not_owned_by_transaction",
+            )
+            self.assertEqual(
+                conflict["ownership"],
+                "not_created_by_transaction",
+            )
+            self.assertEqual(
+                conflict["cleanup_policy"],
+                "preserved_no_pathname_unlink",
+            )
+            self.assertEqual(
+                conflict["observation"]["identity"],
+                conflicting_terminal["identity"],
+            )
+            self.assertEqual(
+                terminal.read_bytes(),
+                conflicting_terminal["payload"],
+            )
+            self.assertEqual(
+                stat.S_IMODE(terminal.stat().st_mode),
+                conflicting_terminal["mode"],
+            )
+        elif fault.startswith("prepared"):
+            self.assertEqual(
+                created_state["state"],
+                "prepared_created_terminal_not_created",
+            )
+            self.assertFalse(terminal.exists())
+        else:
+            self.assertEqual(
+                created_state["state"],
+                "prepared_and_terminal_created_receipt_unbound",
+            )
+            if fault == "terminal_write":
+                self.assertEqual(terminal.read_bytes(), b"")
+            else:
+                terminal_payload = json.loads(terminal.read_text(encoding="utf-8"))
+                self.assertEqual(terminal_payload["state"], "reserved")
+                self.assertEqual(
+                    terminal_payload["transaction_id"],
+                    details["transaction_id"],
+                )
+
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(
+            prepared.read_bytes(),
+            b"" if fault == "prepared_write" else NEW_RULES,
+        )
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(terminal_result.exists())
+        self.assert_no_private_stage()
+        exchange_mock.assert_not_called()
+
+        retry = self.run_apply()
+        self.assertEqual(retry.returncode, 20, retry.stderr)
+        retry_payload = json.loads(retry.stdout)
+        self.assertEqual(retry_payload["status"], "prepared_candidate_exists")
+
+        recovered = self.run_recover()
+        self.assertEqual(recovered.returncode, 50, recovered.stderr)
+        recovered_payload = json.loads(recovered.stdout)
+        self.assertEqual(recovered_payload["status"], "receipt_missing")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(
+            prepared.read_bytes(),
+            b"" if fault == "prepared_write" else NEW_RULES,
+        )
+        for role, identity in retained_identities.items():
+            actual = created_paths[role].stat()
+            self.assertEqual(
+                identity,
+                {"device": actual.st_dev, "inode": actual.st_ino},
+            )
+        if conflicting_terminal is not None:
+            terminal_stat = terminal.stat()
+            self.assertEqual(
+                conflicting_terminal["identity"],
+                {
+                    "device": terminal_stat.st_dev,
+                    "inode": terminal_stat.st_ino,
+                },
+            )
+            self.assertEqual(
+                terminal.read_bytes(),
+                conflicting_terminal["payload"],
+            )
+
+    def test_prepared_parent_fsync_failure_retains_recovery_locator(self) -> None:
+        self.assert_pre_receipt_creation_fault_is_recoverable("prepared_parent_fsync")
+
+    def test_prepared_write_failure_retains_recovery_locator(self) -> None:
+        self.assert_pre_receipt_creation_fault_is_recoverable("prepared_write")
+
+    def test_prepared_file_fsync_failure_retains_recovery_locator(self) -> None:
+        self.assert_pre_receipt_creation_fault_is_recoverable("prepared_file_fsync")
+
+    def test_prepared_initial_validation_failure_retains_recovery_locator(
+        self,
+    ) -> None:
+        self.assert_pre_receipt_creation_fault_is_recoverable(
+            "prepared_initial_validation"
+        )
+
+    def test_prepared_postvalidation_failure_retains_recovery_locator(
+        self,
+    ) -> None:
+        self.assert_pre_receipt_creation_fault_is_recoverable("prepared_postvalidation")
+
+    def test_terminal_create_conflict_preserves_preexisting_object(self) -> None:
+        self.assert_pre_receipt_creation_fault_is_recoverable(
+            "terminal_create_conflict"
+        )
+
+    def test_terminal_write_failure_retains_recovery_locators(self) -> None:
+        self.assert_pre_receipt_creation_fault_is_recoverable("terminal_write")
+
+    def test_terminal_file_fsync_failure_retains_recovery_locators(
+        self,
+    ) -> None:
+        self.assert_pre_receipt_creation_fault_is_recoverable("terminal_file_fsync")
+
+    def test_terminal_initial_validation_failure_retains_recovery_locators(
+        self,
+    ) -> None:
+        self.assert_pre_receipt_creation_fault_is_recoverable(
+            "terminal_initial_validation"
+        )
+
+    def test_terminal_parent_fsync_failure_retains_recovery_locators(self) -> None:
+        self.assert_pre_receipt_creation_fault_is_recoverable("terminal_parent_fsync")
+
+    def test_terminal_postvalidation_failure_retains_recovery_locators(
+        self,
+    ) -> None:
+        self.assert_pre_receipt_creation_fault_is_recoverable("terminal_postvalidation")
+
     def test_schema_v4_q_recovery_is_idempotent_after_stage_creation_failure(
         self,
     ) -> None:

@@ -2720,6 +2720,20 @@ def retained_created_object(
     }
 
 
+def preexisting_conflict_evidence(
+    path: Path,
+    parent: BoundDirectory,
+) -> dict[str, object]:
+    """Describe an O_EXCL conflict without claiming or mutating its object."""
+
+    return {
+        "path": str(path),
+        "ownership": "not_created_by_transaction",
+        "observation": observe_directory_entry(parent.fd, path.name),
+        "cleanup_policy": "preserved_no_pathname_unlink",
+    }
+
+
 def _write_exclusive_bound(
     path: Path,
     payload: bytes,
@@ -2729,6 +2743,7 @@ def _write_exclusive_bound(
     gid: int | None = None,
     directory_fd: int | None = None,
     name: str | None = None,
+    on_created: Callable[[int], None] | None = None,
 ) -> tuple[int, Snapshot]:
     flags = (
         os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
@@ -2749,6 +2764,8 @@ def _write_exclusive_bound(
             f"refusing to replace existing path: {path}",
         ) from error
     try:
+        if on_created is not None:
+            on_created(fd)
         offset = 0
         while offset < len(payload):
             written = os.write(fd, payload[offset:])
@@ -6196,6 +6213,7 @@ def write_prepared_candidate(
     *,
     parent: BoundDirectory,
     policy: Snapshot,
+    on_created: Callable[[int], None] | None = None,
 ) -> BoundFile:
     if path.parent != parent.path or Path(path.name).name != path.name:
         raise TransactionError(
@@ -6208,15 +6226,31 @@ def write_prepared_candidate(
             "prepared candidate requires current-user, single-link live policy",
         )
     validate_bound_directory(parent)
-    fd, snapshot = _write_exclusive_bound(
-        path,
-        payload,
-        mode=policy.mode,
-        uid=policy.uid,
-        gid=policy.gid,
-        directory_fd=parent.fd,
-        name=path.name,
-    )
+    try:
+        fd, snapshot = _write_exclusive_bound(
+            path,
+            payload,
+            mode=policy.mode,
+            uid=policy.uid,
+            gid=policy.gid,
+            directory_fd=parent.fd,
+            name=path.name,
+            on_created=on_created,
+        )
+    except TransactionError as error:
+        if error.status == "path_exists":
+            raise TransactionError(
+                "prepared_candidate_exists",
+                "prepared recovery candidate appeared before exclusive creation",
+                exit_code=EXIT_LIVE_CONFLICT,
+                details={
+                    "conflicting_object": preexisting_conflict_evidence(
+                        path,
+                        parent,
+                    )
+                },
+            ) from error
+        raise
     binding = BoundFile(
         path=path,
         name=path.name,
@@ -6229,7 +6263,21 @@ def write_prepared_candidate(
             parent,
             label="prepared_candidate",
         )
-        os.fsync(parent.fd)
+        try:
+            os.fsync(parent.fd)
+        except OSError as error:
+            raise TransactionError(
+                "prepared_candidate_parent_fsync_failed",
+                "prepared candidate parent directory could not be made durable",
+                details={
+                    "failure_scope": "prepared_candidate_parent_durability",
+                    "io_operation": "fsync_bound_parent",
+                    "io_error": {
+                        "errno": error.errno,
+                        "message": str(error),
+                    },
+                },
+            ) from error
         _persisted, actual = validate_bound_regular_file(
             binding,
             parent,
@@ -6952,6 +7000,7 @@ def reserve_recovery_terminal(
     *,
     transaction_id: str,
     parent: BoundDirectory,
+    on_created: Callable[[int], None] | None = None,
 ) -> BoundFile:
     if path.parent != parent.path or Path(path.name).name != path.name:
         raise TransactionError(
@@ -6974,6 +7023,7 @@ def reserve_recovery_terminal(
             encoded,
             directory_fd=parent.fd,
             name=path.name,
+            on_created=on_created,
         )
     except TransactionError as error:
         if error.status == "path_exists":
@@ -6981,6 +7031,12 @@ def reserve_recovery_terminal(
                 "recovery_terminal_exists",
                 "recovery terminal path already exists before this transaction",
                 exit_code=EXIT_LIVE_CONFLICT,
+                details={
+                    "conflicting_object": preexisting_conflict_evidence(
+                        path,
+                        parent,
+                    )
+                },
             ) from error
         raise
     binding = BoundFile(
@@ -7005,7 +7061,21 @@ def reserve_recovery_terminal(
             label="recovery_terminal",
             max_bytes=MAX_RECEIPT_BYTES,
         )
-        os.fsync(parent.fd)
+        try:
+            os.fsync(parent.fd)
+        except OSError as error:
+            raise TransactionError(
+                "recovery_terminal_parent_fsync_failed",
+                "recovery terminal parent directory could not be made durable",
+                details={
+                    "failure_scope": "recovery_terminal_parent_durability",
+                    "io_operation": "fsync_bound_parent",
+                    "io_error": {
+                        "errno": error.errno,
+                        "message": str(error),
+                    },
+                },
+            ) from error
         persisted, _actual = validate_bound_regular_file(
             binding,
             parent,
@@ -8172,11 +8242,15 @@ def _apply_transaction_inner(
     post_replace_signal_traceback: object | None = None
     finalized = False
     rules_parent_binding: BoundDirectory | None = None
+    receipt_parent_binding: BoundDirectory | None = None
     original_live_binding: BoundFile | None = None
+    prepared_binding: BoundFile | None = None
+    terminal_binding: BoundFile | None = None
     stage_cleanup_failures: list[dict[str, object]] = []
     final_data_roles: TransactionDataRoles | None = None
     receipt_publication_state = "not_reserved"
     transaction_id: str | None = None
+    pre_receipt_created_objects: dict[str, dict[str, object]] = {}
 
     def apply_recovery_locators() -> dict[str, str]:
         return {
@@ -8191,64 +8265,233 @@ def _apply_transaction_inner(
             ),
         }
 
-    def pre_receipt_reserved_recovery_error(
+    def latch_pre_receipt_created_object(
+        role: str,
+        path: Path,
+        parent: BoundDirectory,
+    ) -> Callable[[int], None]:
+        def latch(fd: int) -> None:
+            nonlocal receipt_publication_state
+            receipt_publication_state = "pre_receipt_created"
+            latched: dict[str, object] = {
+                "path": str(path),
+                "name": path.name,
+                "creation_capture": "pending",
+            }
+            pre_receipt_created_objects[role] = latched
+            try:
+                latched["creation_evidence"] = retained_created_object(
+                    fd,
+                    path,
+                    directory_fd=parent.fd,
+                    name=path.name,
+                )
+                latched["creation_capture"] = "complete"
+            except OSError as error:
+                latched["creation_capture"] = "inspection_failed"
+                latched["inspection_error"] = {
+                    "errno": error.errno,
+                    "message": str(error),
+                }
+
+        return latch
+
+    def current_created_object_evidence(
+        latched: dict[str, object],
+        parent: BoundDirectory,
+    ) -> dict[str, object]:
+        name = latched["name"]
+        path = latched["path"]
+        assert isinstance(name, str)
+        assert isinstance(path, str)
+        observation = observe_directory_entry(parent.fd, name)
+        creation_evidence = latched.get("creation_evidence")
+        created_identity: object = None
+        if isinstance(creation_evidence, dict):
+            created_object = creation_evidence.get("created_object")
+            if isinstance(created_object, dict):
+                created_identity = created_object.get("identity")
+        object_policy = observation.get("object_policy")
+        current_nlink = (
+            object_policy.get("nlink") if isinstance(object_policy, dict) else None
+        )
+        path_matches = (
+            isinstance(created_identity, dict)
+            and observation.get("state") == "present"
+            and observation.get("identity") == created_identity
+            and isinstance(current_nlink, int)
+            and current_nlink > 0
+        )
+        return {
+            "path": path,
+            "ownership": "created_by_transaction",
+            "creation_capture": latched["creation_capture"],
+            **(
+                {"creation_evidence": creation_evidence}
+                if isinstance(creation_evidence, dict)
+                else {}
+            ),
+            **(
+                {"inspection_error": latched["inspection_error"]}
+                if "inspection_error" in latched
+                else {}
+            ),
+            "current_observation": observation,
+            "recovery_locator": path if path_matches else None,
+            "retention_status": (
+                "verified_namespace_link"
+                if path_matches
+                else "unlocatable_or_identity_mismatched"
+            ),
+            "cleanup_policy": (
+                "retained_no_pathname_unlink"
+                if path_matches
+                else "no_false_retention_claim"
+            ),
+        }
+
+    def pre_receipt_publication_recovery_error(
         error: OSError | TransactionError,
     ) -> TransactionError:
-        if evidence is None:
-            raise AssertionError("pre-receipt reservation requires bound evidence")
+        parent = (
+            evidence.receipt_parent if evidence is not None else receipt_parent_binding
+        )
+        if parent is None:
+            raise AssertionError("created pre-receipt object requires a bound parent")
         receipt_observation = observe_directory_entry(
-            evidence.receipt_parent.fd,
+            parent.fd,
             receipt.name,
         )
-        prepared_observation = observe_directory_entry(
-            evidence.receipt_parent.fd,
-            evidence.prepared_candidate.name,
-            expected=evidence.prepared_candidate.snapshot,
-        )
-        terminal_observation = observe_directory_entry(
-            evidence.receipt_parent.fd,
-            evidence.recovery_terminal.name,
-            expected=evidence.recovery_terminal.snapshot,
-        )
+        namespace_observations = {
+            "receipt": receipt_observation,
+            "prepared_candidate": observe_directory_entry(
+                parent.fd,
+                prepared_recovery_candidate.name,
+            ),
+            "recovery_terminal": observe_directory_entry(
+                parent.fd,
+                recovery_terminal.name,
+            ),
+            "recovery_terminal_result": observe_directory_entry(
+                parent.fd,
+                recovery_terminal_result.name,
+            ),
+        }
+        created_objects = {
+            role: current_created_object_evidence(latched, parent)
+            for role, latched in sorted(pre_receipt_created_objects.items())
+        }
         failure = {
             "status": (
                 error.status
                 if isinstance(error, TransactionError)
-                else "receipt_io_failed"
+                else "pre_receipt_io_failed"
             ),
             "message": str(error),
             **(error.details if isinstance(error, TransactionError) else {}),
             **structured_secondary_failure_evidence(error),
         }
+        if receipt_publication_state == "pre_receipt_reserved":
+            if evidence is None:
+                raise AssertionError("pre-receipt reservation requires bound evidence")
+            prepared_observation = observe_directory_entry(
+                parent.fd,
+                evidence.prepared_candidate.name,
+                expected=evidence.prepared_candidate.snapshot,
+            )
+            terminal_observation = observe_directory_entry(
+                parent.fd,
+                evidence.recovery_terminal.name,
+                expected=evidence.recovery_terminal.snapshot,
+            )
+            return TransactionError(
+                "recovery_required",
+                (
+                    "prepared candidate and recovery terminal were reserved before "
+                    "receipt publication reached a bound terminal state"
+                ),
+                exit_code=EXIT_POST_REPLACE_FAILED,
+                details={
+                    "operation_status": "pre_receipt_reserved",
+                    "reason": "receipt_publication_incomplete",
+                    "transaction_id": transaction_id,
+                    "pre_receipt_reserved_state": {
+                        "state": "prepared_and_terminal_reserved_receipt_unbound",
+                        "terminal_disposition": "retained_for_explicit_recovery",
+                        "receipt_binding_returned": False,
+                        "receipt_observation": receipt_observation,
+                        "prepared_candidate": {
+                            "path": str(evidence.prepared_candidate.path),
+                            "expected": (
+                                evidence.prepared_candidate.snapshot.to_json()
+                            ),
+                            "observation": prepared_observation,
+                        },
+                        "recovery_terminal": {
+                            "path": str(evidence.recovery_terminal.path),
+                            "expected": (evidence.recovery_terminal.snapshot.to_json()),
+                            "observation": terminal_observation,
+                        },
+                        "created_objects": created_objects,
+                        "namespace_observations": namespace_observations,
+                    },
+                    "receipt_failure": failure,
+                    "publication_state": {
+                        "receipt_binding_returned": False,
+                        "exchange_started": False,
+                    },
+                    "receipt_path": str(receipt),
+                    "backup_path": str(backup),
+                    "prepared_candidate_path": str(prepared_recovery_candidate),
+                    "recovery_terminal_path": str(recovery_terminal),
+                    "recovery_locators": apply_recovery_locators(),
+                },
+            )
+        created_roles = sorted(created_objects)
+        failure_status = failure["status"]
+        if (
+            created_roles == ["prepared_candidate"]
+            and failure_status == "recovery_terminal_exists"
+        ):
+            state = "prepared_created_terminal_conflict"
+        elif created_roles == ["prepared_candidate"]:
+            state = "prepared_created_terminal_not_created"
+        elif created_roles == ["prepared_candidate", "recovery_terminal"]:
+            state = "prepared_and_terminal_created_receipt_unbound"
+        else:
+            state = "created_objects_receipt_unbound"
         return TransactionError(
             "recovery_required",
             (
-                "prepared candidate and recovery terminal were reserved before "
-                "receipt publication reached a bound terminal state"
+                "one or more transaction objects were created before receipt "
+                "publication reached a bound terminal state"
             ),
             exit_code=EXIT_POST_REPLACE_FAILED,
             details={
-                "operation_status": "pre_receipt_reserved",
-                "reason": "receipt_publication_incomplete",
+                "operation_status": "pre_receipt_created",
+                "reason": "pre_receipt_publication_incomplete",
                 "transaction_id": transaction_id,
-                "pre_receipt_reserved_state": {
-                    "state": "prepared_and_terminal_reserved_receipt_unbound",
-                    "terminal_disposition": "retained_for_explicit_recovery",
+                "pre_receipt_created_state": {
+                    "state": state,
+                    "created_object_disposition": ("retained_for_explicit_recovery"),
+                    **(
+                        {
+                            "conflicting_object_disposition": (
+                                "preserved_not_owned_by_transaction"
+                            )
+                        }
+                        if failure_status == "recovery_terminal_exists"
+                        else {}
+                    ),
                     "receipt_binding_returned": False,
                     "receipt_observation": receipt_observation,
-                    "prepared_candidate": {
-                        "path": str(evidence.prepared_candidate.path),
-                        "expected": evidence.prepared_candidate.snapshot.to_json(),
-                        "observation": prepared_observation,
-                    },
-                    "recovery_terminal": {
-                        "path": str(evidence.recovery_terminal.path),
-                        "expected": evidence.recovery_terminal.snapshot.to_json(),
-                        "observation": terminal_observation,
-                    },
+                    "created_roles": created_roles,
+                    "created_objects": created_objects,
+                    "namespace_observations": namespace_observations,
                 },
-                "receipt_failure": failure,
+                "pre_receipt_failure": failure,
                 "publication_state": {
+                    "created_roles": created_roles,
                     "receipt_binding_returned": False,
                     "exchange_started": False,
                 },
@@ -8435,12 +8678,28 @@ def _apply_transaction_inner(
         try:
             if evidence is not None:
                 failures.extend(evidence.close())
-            elif rules_parent_binding is not None:
-                failures.extend(
-                    close_descriptors_best_effort(
-                        [("rules_parent", rules_parent_binding.fd)]
+            else:
+                partial_descriptors: list[tuple[str, int]] = []
+                if terminal_binding is not None:
+                    partial_descriptors.append(
+                        (
+                            "recovery_terminal_reservation",
+                            terminal_binding.fd,
+                        )
                     )
-                )
+                if prepared_binding is not None:
+                    partial_descriptors.append(
+                        ("prepared_candidate", prepared_binding.fd)
+                    )
+                if receipt_parent_binding is not None:
+                    partial_descriptors.append(
+                        ("receipt_parent", receipt_parent_binding.fd)
+                    )
+                if rules_parent_binding is not None:
+                    partial_descriptors.append(
+                        ("rules_parent", rules_parent_binding.fd)
+                    )
+                failures.extend(close_descriptors_best_effort(partial_descriptors))
         except BaseException as error:
             failures.append(
                 structured_operation_failure(
@@ -8687,139 +8946,129 @@ def _apply_transaction_inner(
                 current,
             )
             transaction_id = secrets.token_hex(16)
-            receipt_parent = bind_directory(
+            receipt_parent_binding = bind_directory(
                 receipt.parent,
                 label="receipt",
                 require_owner_private=True,
             )
-            try:
-                if receipt_parent.path == rules.parent / PRIVATE_STAGE_NAME:
-                    raise TransactionError(
-                        "path_invalid",
-                        "receipt parent cannot be the fixed transaction stage",
-                    )
-                if (
-                    receipt_parent.snapshot.device
-                    != rules_parent_binding.snapshot.device
-                ):
-                    raise TransactionError(
-                        "prepared_candidate_cross_device",
-                        (
-                            "receipt and rules parents must share one filesystem "
-                            "for atomic prepared-candidate publication"
-                        ),
-                        exit_code=EXIT_LIVE_CONFLICT,
-                    )
-                if (
-                    observe_directory_entry(
-                        receipt_parent.fd,
-                        receipt.name,
-                    ).get("state")
-                    != "missing"
-                ):
-                    raise TransactionError(
-                        "receipt_exists",
-                        f"recovery receipt already exists: {receipt}",
-                        exit_code=EXIT_LIVE_CONFLICT,
-                    )
-                if (
-                    observe_directory_entry(
-                        receipt_parent.fd,
-                        prepared_recovery_candidate.name,
-                    ).get("state")
-                    != "missing"
-                ):
-                    raise TransactionError(
-                        "prepared_candidate_exists",
-                        (
-                            "prepared recovery candidate already exists: "
-                            f"{prepared_recovery_candidate}"
-                        ),
-                        exit_code=EXIT_LIVE_CONFLICT,
-                    )
-                if (
-                    observe_directory_entry(
-                        receipt_parent.fd,
-                        recovery_terminal.name,
-                    ).get("state")
-                    != "missing"
-                ):
-                    raise TransactionError(
-                        "recovery_terminal_exists",
-                        (
-                            "recovery terminal path already exists before this "
-                            "transaction"
-                        ),
-                        exit_code=EXIT_LIVE_CONFLICT,
-                    )
-                if (
-                    observe_directory_entry(
-                        receipt_parent.fd,
-                        recovery_terminal_result.name,
-                    ).get("state")
-                    != "missing"
-                ):
-                    raise TransactionError(
-                        "recovery_terminal_result_exists",
-                        (
-                            "recovery terminal result path already exists before "
-                            "this transaction"
-                        ),
-                        exit_code=EXIT_LIVE_CONFLICT,
-                    )
-                if (
-                    observe_directory_entry(
-                        rules_parent_binding.fd,
-                        backup.name,
-                    ).get("state")
-                    != "missing"
-                ):
-                    raise TransactionError(
-                        "backup_exists",
-                        f"backup already exists: {backup}",
-                        exit_code=EXIT_LIVE_CONFLICT,
-                    )
-                revalidate_candidate_source(
-                    candidate_source,
-                    source_snapshot,
-                    candidate_sha256=candidate_sha256,
+            receipt_parent = receipt_parent_binding
+            if receipt_parent.path == rules.parent / PRIVATE_STAGE_NAME:
+                raise TransactionError(
+                    "path_invalid",
+                    "receipt parent cannot be the fixed transaction stage",
                 )
-                validate_existing_fixed_stage_is_empty(
-                    rules.parent,
-                    rules_parent_expected=rules_parent_binding.snapshot,
+            if receipt_parent.snapshot.device != rules_parent_binding.snapshot.device:
+                raise TransactionError(
+                    "prepared_candidate_cross_device",
+                    (
+                        "receipt and rules parents must share one filesystem "
+                        "for atomic prepared-candidate publication"
+                    ),
+                    exit_code=EXIT_LIVE_CONFLICT,
                 )
-                revalidate_lock(lock_binding, rules_parent_binding)
-                validate_bound_directory(receipt_parent)
-                revalidate_candidate_source(
-                    candidate_source,
-                    source_snapshot,
-                    candidate_sha256=candidate_sha256,
+            if (
+                observe_directory_entry(
+                    receipt_parent.fd,
+                    receipt.name,
+                ).get("state")
+                != "missing"
+            ):
+                raise TransactionError(
+                    "receipt_exists",
+                    f"recovery receipt already exists: {receipt}",
+                    exit_code=EXIT_LIVE_CONFLICT,
                 )
-                prepared_binding = write_prepared_candidate(
+            if (
+                observe_directory_entry(
+                    receipt_parent.fd,
+                    prepared_recovery_candidate.name,
+                ).get("state")
+                != "missing"
+            ):
+                raise TransactionError(
+                    "prepared_candidate_exists",
+                    (
+                        "prepared recovery candidate already exists: "
+                        f"{prepared_recovery_candidate}"
+                    ),
+                    exit_code=EXIT_LIVE_CONFLICT,
+                )
+            if (
+                observe_directory_entry(
+                    receipt_parent.fd,
+                    recovery_terminal.name,
+                ).get("state")
+                != "missing"
+            ):
+                raise TransactionError(
+                    "recovery_terminal_exists",
+                    ("recovery terminal path already exists before this transaction"),
+                    exit_code=EXIT_LIVE_CONFLICT,
+                )
+            if (
+                observe_directory_entry(
+                    receipt_parent.fd,
+                    recovery_terminal_result.name,
+                ).get("state")
+                != "missing"
+            ):
+                raise TransactionError(
+                    "recovery_terminal_result_exists",
+                    (
+                        "recovery terminal result path already exists before "
+                        "this transaction"
+                    ),
+                    exit_code=EXIT_LIVE_CONFLICT,
+                )
+            if (
+                observe_directory_entry(
+                    rules_parent_binding.fd,
+                    backup.name,
+                ).get("state")
+                != "missing"
+            ):
+                raise TransactionError(
+                    "backup_exists",
+                    f"backup already exists: {backup}",
+                    exit_code=EXIT_LIVE_CONFLICT,
+                )
+            revalidate_candidate_source(
+                candidate_source,
+                source_snapshot,
+                candidate_sha256=candidate_sha256,
+            )
+            validate_existing_fixed_stage_is_empty(
+                rules.parent,
+                rules_parent_expected=rules_parent_binding.snapshot,
+            )
+            revalidate_lock(lock_binding, rules_parent_binding)
+            validate_bound_directory(receipt_parent)
+            revalidate_candidate_source(
+                candidate_source,
+                source_snapshot,
+                candidate_sha256=candidate_sha256,
+            )
+            prepared_binding = write_prepared_candidate(
+                prepared_recovery_candidate,
+                candidate_bytes,
+                parent=receipt_parent,
+                policy=current,
+                on_created=latch_pre_receipt_created_object(
+                    "prepared_candidate",
                     prepared_recovery_candidate,
-                    candidate_bytes,
-                    parent=receipt_parent,
-                    policy=current,
-                )
-                terminal_binding: BoundFile | None = None
-                try:
-                    terminal_binding = reserve_recovery_terminal(
-                        recovery_terminal,
-                        transaction_id=transaction_id,
-                        parent=receipt_parent,
-                    )
-                except BaseException as error:
-                    finalize_descriptor_cleanup(
-                        [("prepared_candidate", prepared_binding.fd)],
-                        primary_error=error,
-                    )
-                    raise
-            except BaseException as error:
-                finalize_descriptor_cleanup(
-                    [("receipt_parent", receipt_parent.fd)],
-                    primary_error=error,
-                )
-                raise
+                    receipt_parent,
+                ),
+            )
+            terminal_binding = reserve_recovery_terminal(
+                recovery_terminal,
+                transaction_id=transaction_id,
+                parent=receipt_parent,
+                on_created=latch_pre_receipt_created_object(
+                    "recovery_terminal",
+                    recovery_terminal,
+                    receipt_parent,
+                ),
+            )
             evidence = ApplyEvidenceBindings(
                 lock=lock_binding,
                 rules_parent=rules_parent_binding,
@@ -9389,12 +9638,12 @@ def _apply_transaction_inner(
         ) or (stage is not None and stage.mutation_uncertain):
             retain_stage = True
         if (
-            receipt_publication_state == "pre_receipt_reserved"
-            and evidence is not None
-            and evidence.receipt is None
+            receipt_publication_state in ("pre_receipt_created", "pre_receipt_reserved")
+            and pre_receipt_created_objects
+            and (evidence is None or evidence.receipt is None)
             and isinstance(error, (OSError, TransactionError))
         ):
-            raise pre_receipt_reserved_recovery_error(error) from error
+            raise pre_receipt_publication_recovery_error(error) from error
         if (
             evidence is not None
             and evidence.receipt is not None
