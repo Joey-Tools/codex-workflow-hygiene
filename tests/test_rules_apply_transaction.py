@@ -5667,6 +5667,175 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertTrue(self.receipt.is_file())
         self.assert_no_private_stage()
 
+    def test_post_replace_primary_preserves_all_lock_finalization_evidence(
+        self,
+    ) -> None:
+        expected_property = {
+            "identity": "object_identity",
+            "content": "content",
+            "access": "access_policy",
+        }
+        for primary_kind in ("validator_io", "transaction"):
+            for drift in ("identity", "content", "access"):
+                with (
+                    self.subTest(primary_kind=primary_kind, drift=drift),
+                    tempfile.TemporaryDirectory(
+                        prefix=f"rules-primary-lock-{primary_kind}-{drift}."
+                    ) as temp_dir,
+                ):
+                    self.configure_isolated_case(Path(temp_dir))
+                    self.write_validator("raise SystemExit(0)\n")
+                    primary: BaseException
+                    expected_reason: str
+                    if primary_kind == "validator_io":
+                        primary = OSError(
+                            errno.EIO,
+                            "fault-injected post-replacement validator failure",
+                        )
+                        expected_reason = "apply_io_failed"
+                    else:
+                        primary = TRANSACTION.TransactionError(
+                            "validator_runtime_failed",
+                            "fault-injected post-replacement transaction failure",
+                            details={"primary_marker": primary_kind},
+                        )
+                        expected_reason = "validator_runtime_failed"
+
+                    validator_failures = [
+                        TRANSACTION.structured_operation_failure(
+                            "validator-emergency-cleanup",
+                            descriptor,
+                            OSError(
+                                errno.EIO,
+                                f"fault-injected {descriptor} failure",
+                            ),
+                        )
+                        for descriptor in ("term", "reap")
+                    ]
+                    descriptor_failures = [
+                        TRANSACTION.structured_operation_failure(
+                            "close",
+                            descriptor,
+                            OSError(
+                                errno.EIO,
+                                f"fault-injected {descriptor} failure",
+                            ),
+                        )
+                        for descriptor in ("stdout-pipe", "stderr-pipe")
+                    ]
+                    TRANSACTION.attach_validator_failures_to_exception(
+                        primary,
+                        validator_failures,
+                    )
+                    TRANSACTION.attach_failures_to_exception(
+                        primary,
+                        "cleanup_failures",
+                        descriptor_failures,
+                    )
+
+                    # Fail while the applied result is assembled, after its
+                    # release-time data roles have been recorded.
+                    class FailingValidatorResult:
+                        valid = True
+
+                        def to_json(self) -> dict[str, object]:
+                            raise primary
+
+                    stdout = io.StringIO()
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {"CODEX_HOME": str(self.codex_home)},
+                        ),
+                        mock.patch.object(
+                            TRANSACTION,
+                            "run_validator",
+                            side_effect=[
+                                TRANSACTION.ValidatorResult(0, "", ""),
+                                FailingValidatorResult(),
+                            ],
+                        ) as run_validator,
+                        self.drift_before_transaction_lock_release(
+                            "live",
+                            drift,
+                        ) as injected,
+                        redirect_stdout(stdout),
+                        redirect_stderr(io.StringIO()),
+                    ):
+                        code = TRANSACTION.main(self.apply_argv())
+
+                    payload = json.loads(stdout.getvalue())
+                    self.assertEqual(run_validator.call_count, 2)
+                    self.assertEqual(injected["count"], 1)
+                    self.assertEqual(code, 30)
+                    self.assertEqual(payload["status"], "recovery_required")
+                    self.assertEqual(payload["reason"], expected_reason)
+                    self.assertEqual(payload["message"], str(primary))
+                    if primary_kind == "transaction":
+                        self.assertEqual(
+                            payload["primary_marker"],
+                            primary_kind,
+                        )
+                    self.assertEqual(
+                        [
+                            failure["descriptor"]
+                            for failure in payload["validator_cleanup_failures"]
+                        ],
+                        ["term", "reap"],
+                    )
+                    self.assertEqual(
+                        [
+                            failure["descriptor"]
+                            for failure in payload["cleanup_failures"]
+                        ],
+                        ["stdout-pipe", "stderr-pipe"],
+                    )
+                    self.assertIn(
+                        "lock_finalization_failures",
+                        payload,
+                        json.dumps(
+                            {
+                                "payload": payload,
+                                "primary_attributes": vars(primary),
+                            },
+                            sort_keys=True,
+                            default=str,
+                        ),
+                    )
+                    finalization = payload["lock_finalization_failures"]
+                    self.assertEqual(
+                        [failure["descriptor"] for failure in finalization],
+                        ["before-release"],
+                    )
+                    self.assertEqual(
+                        finalization[0]["status"],
+                        "recovery_required",
+                    )
+                    self.assertEqual(
+                        finalization[0]["details"]["reason"],
+                        "transaction_data_role_changed",
+                    )
+                    self.assertEqual(
+                        finalization[0]["details"]["data_role"],
+                        "live",
+                    )
+                    self.assertIn(
+                        expected_property[drift],
+                        finalization[0]["details"]["mismatched_properties"],
+                    )
+                    self.assertEqual(
+                        list(
+                            TRANSACTION.structured_secondary_failure_evidence(primary)
+                        ),
+                        [
+                            "validator_cleanup_failures",
+                            "lock_finalization_failures",
+                            "cleanup_failures",
+                        ],
+                    )
+                    self.assertTrue(self.receipt.is_file())
+                    self.assert_no_private_stage()
+
     def test_rollback_post_exchange_fsync_failure_requires_recovery(self) -> None:
         self.write_validator(
             """\

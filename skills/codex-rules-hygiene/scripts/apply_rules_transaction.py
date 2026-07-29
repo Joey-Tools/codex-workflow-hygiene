@@ -82,6 +82,13 @@ EXIT_POST_REPLACE_FAILED = 30
 EXIT_RECOVERY_REFUSED = 40
 EXIT_RUNTIME_ERROR = 50
 
+STRUCTURED_SECONDARY_FAILURE_FIELDS = (
+    "validator_cleanup_failures",
+    "post_replace_recovery_failures",
+    "lock_finalization_failures",
+    "cleanup_failures",
+)
+
 
 class TransactionError(RuntimeError):
     def __init__(
@@ -578,6 +585,53 @@ def attach_failures_to_exception(
             for failure in failures
         ),
     )
+
+
+def structured_secondary_failure_evidence(
+    error: BaseException,
+) -> dict[str, list[dict[str, object]]]:
+    """Copy every structured secondary-failure list in deterministic order."""
+
+    sources: list[dict[str, object]] = []
+    if isinstance(error, TransactionError):
+        sources.append(error.details)
+    try:
+        attributes = vars(error)
+    except BaseException:
+        attributes = {}
+    if isinstance(attributes, dict):
+        sources.append(attributes)
+
+    known_fields = frozenset(STRUCTURED_SECONDARY_FAILURE_FIELDS)
+    discovered_fields = {
+        key
+        for source in sources
+        for key, value in source.items()
+        if isinstance(key, str)
+        and key.endswith("_failures")
+        and isinstance(value, list)
+    }
+    ordered_fields = (
+        *STRUCTURED_SECONDARY_FAILURE_FIELDS,
+        *sorted(discovered_fields - known_fields),
+    )
+    evidence: dict[str, list[dict[str, object]]] = {}
+    for field_name in ordered_fields:
+        ordered_failures: list[dict[str, object]] = []
+        seen_lists: set[int] = set()
+        for source in sources:
+            value = source.get(field_name)
+            if (
+                not isinstance(value, list)
+                or id(value) in seen_lists
+                or not all(isinstance(failure, dict) for failure in value)
+            ):
+                continue
+            seen_lists.add(id(value))
+            ordered_failures.extend(value)
+        if ordered_failures:
+            evidence[field_name] = list(ordered_failures)
+    return evidence
 
 
 def attach_validator_failures_to_exception(
@@ -8851,11 +8905,6 @@ def _apply_transaction_inner(
                 and error.status == "recovery_required"
             )
         ):
-            validator_cleanup_failures = getattr(
-                error,
-                "validator_cleanup_failures",
-                None,
-            )
             raise TransactionError(
                 "recovery_required",
                 "durable prepared transaction evidence requires explicit recovery",
@@ -8868,11 +8917,7 @@ def _apply_transaction_inner(
                     ),
                     "message": str(error),
                     **(error.details if isinstance(error, TransactionError) else {}),
-                    **(
-                        {"validator_cleanup_failures": list(validator_cleanup_failures)}
-                        if isinstance(validator_cleanup_failures, list)
-                        else {}
-                    ),
+                    **structured_secondary_failure_evidence(error),
                     "receipt_path": str(receipt),
                     "prepared_candidate_path": str(prepared_recovery_candidate),
                 },
@@ -11555,42 +11600,31 @@ def main(argv: list[str] | None = None) -> int:
             exit_code, payload = recover_transaction(args)
     except ForwardedValidatorSignal as event:
         exit_code = min(255, 128 + event.signum)
+        secondary_failures = structured_secondary_failure_evidence(event)
         payload = {
             "status": "interrupted",
             "signal": event.signum,
             "signal_name": signal.Signals(event.signum).name,
             **event.recovery_details,
+            **secondary_failures,
         }
         if event.cleanup_errors:
-            payload["validator_cleanup_errors"] = event.cleanup_errors
-        for attribute, key in (
-            ("post_replace_recovery_failures", "post_replace_recovery_failures"),
-            ("lock_finalization_failures", "lock_finalization_failures"),
-            ("cleanup_failures", "cleanup_failures"),
-        ):
-            failures = getattr(event, attribute, None)
-            if isinstance(failures, list):
-                payload[key] = failures
+            payload["validator_cleanup_errors"] = list(event.cleanup_errors)
     except TransactionError as error:
         exit_code = error.exit_code
         payload = {
             "status": error.status,
             "message": str(error),
             **error.details,
+            **structured_secondary_failure_evidence(error),
         }
     except OSError as error:
         exit_code = EXIT_RUNTIME_ERROR
-        payload = {"status": "runtime_error", "message": str(error)}
-        cleanup_failures = getattr(error, "cleanup_failures", None)
-        if isinstance(cleanup_failures, list):
-            payload["cleanup_failures"] = cleanup_failures
-        validator_cleanup_failures = getattr(
-            error,
-            "validator_cleanup_failures",
-            None,
-        )
-        if isinstance(validator_cleanup_failures, list):
-            payload["validator_cleanup_failures"] = validator_cleanup_failures
+        payload = {
+            "status": "runtime_error",
+            "message": str(error),
+            **structured_secondary_failure_evidence(error),
+        }
     emit(payload)
     return exit_code
 

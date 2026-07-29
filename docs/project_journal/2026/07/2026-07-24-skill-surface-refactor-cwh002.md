@@ -3,7 +3,7 @@ id: 20260724-cwh002
 title: Skill Surface Refactor
 status: active
 created: 2026-07-24
-updated: 2026-07-27
+updated: 2026-07-29
 branch: codex/skill-surface-refactor
 pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/63
 supersedes: []
@@ -171,6 +171,12 @@ superseded_by:
   their structured evidence on Python 3.9 and 3.10. Python 3.11+ exception
   notes are supplemental best-effort diagnostics; missing or faulty
   `add_note` support cannot replace the primary status, exception, or locator.
+- Durable-evidence `recovery_required` wrapping now copies every structured
+  `*_failures` list from both `TransactionError.details` and raw exception
+  attributes. Fixed phase ordering preserves validator cleanup,
+  post-replacement recovery, lock-finalization revalidation, and descriptor
+  cleanup beside the original reason and message; extra structured fields are
+  ordered lexically without changing any field's attempt order.
 - Legacy schema-v1 receipts treat absent historical `nlink` as unknown history,
   ignore an explicit valid historical `nlink: 1`, and reject any explicit
   non-single value as receipt tampering, while every current regular
@@ -476,3 +482,17 @@ superseded_by:
   byte compilation, the official Rules skill validator, project-journal
   validation, and `git diff --check`. Task-scoped validation caches and the
   retained validator report were removed afterward.
+- The structured-secondary-evidence regression passed its six combinations on
+  Python 3.13.0 and system Python 3.9.6. Raw validator `OSError` and
+  `TransactionError` primaries each combine with applied-live
+  identity/content/access-policy drift at lock release; final JSON retains the
+  original reason/message plus validator cleanup, lock-finalization
+  revalidation, and descriptor cleanup in deterministic order.
+- The final Python 3.13.0 repository suite passed 1,283/1,283 tests. Five
+  focused Python 3.9.6 methods covered the new matrix, prior raw-validator
+  cleanup propagation, lock-evidence lifetime, exception-note fallback, and
+  the exact signal pending-read/unblock race.
+- Final static gates passed Ruff check/format, Python 3.13.0 and system Python
+  3.9.6 byte compilation, the official Rules skill validator,
+  project-journal validation, and `git diff --check`; task-scoped validation
+  caches and the skill-validation report were removed afterward.
