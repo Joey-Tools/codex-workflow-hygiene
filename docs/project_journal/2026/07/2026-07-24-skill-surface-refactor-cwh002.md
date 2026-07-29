@@ -123,12 +123,24 @@ superseded_by:
 - Unified the production Linux process-group inventory and test exit probe on
   that terminal-state set, with direct malformed and unreadable fail-closed
   coverage.
+- Added an original-live durability boundary before transaction identity or
+  persistent publication: apply fsyncs the held `default.rules` descriptor,
+  then revalidates identity, exact content, access policy, single-link policy,
+  its bound-parent dirent, and parent identity/access policy.
 - Reduced the Joey authoring overlay to placement and validation policy while
   respecting non-default `CODEX_HOME`.
 - Strengthened structural tests for the complete audit and cold-start paths.
 
 ## Current State
 
+- A real-change apply keeps the initially admitted live descriptor open and
+  fsyncs it before creating transaction ID, prepared/terminal evidence,
+  receipt, stage, backup, or exchange state. Fsync errors and post-fsync
+  replacement/content/access/link/dirent drift report structured
+  pre-publication evidence with `receipt_written: false` and
+  `exchange_started: false`; directory size/link churn remains benign while
+  parent object identity/access policy and the exact child dirent stay
+  protected.
 - Rules apply stages and validates a descriptor-bound private candidate before
   taking a shared lock, then revalidates the expected live digest, object
   identity, content, access policy, and `st_nlink == 1` object policy before a
@@ -496,3 +508,16 @@ superseded_by:
   3.9.6 byte compilation, the official Rules skill validator,
   project-journal validation, and `git diff --check`; task-scoped validation
   caches and the skill-validation report were removed afterward.
+- The original-live durability boundary passed 7/7 focused cases on both
+  Python 3.13.0 and system Python 3.9.6: exact fsync/revalidation ordering,
+  fsync error, and post-fsync replacement, content, access, link, and missing
+  dirent drift. Every failure proved that receipt, prepared/terminal evidence,
+  backup, private stage, and exchange publication had not started.
+- The Python 3.13.0 repository run exercised all 1,290 tests. Its only four
+  errors were unrelated temporary merge-commit fixtures blocked from
+  `~/.gnupg/keyboxd` by the sandbox; those exact four passed 4/4 in the
+  approved narrow GPG-capable rerun.
+- Final gates passed Ruff check/format, Python 3.13.0 and system Python 3.9.6
+  byte compilation, project-journal validation, the official Rules skill
+  validator in an isolated `uv --with PyYAML` environment after direct Python
+  reported missing `yaml`, and `git diff --check`.

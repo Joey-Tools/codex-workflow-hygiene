@@ -2168,6 +2168,180 @@ def validate_bound_regular_file(
     return final_payload, final
 
 
+def _original_live_durability_failure_details(
+    binding: BoundFile,
+    parent: BoundDirectory,
+    expected: Snapshot,
+    *,
+    phase: str,
+    actual: Snapshot | None = None,
+    cause: TransactionError | None = None,
+    failed_check: str | None = None,
+) -> dict[str, object]:
+    entry_observation = observe_directory_entry(
+        parent.fd,
+        binding.name,
+        expected=expected,
+    )
+    mismatched_properties: list[str] = []
+    if actual is not None:
+        mismatched_properties.extend(property_mismatches(expected, actual))
+    if cause is not None:
+        cause_mismatches = cause.details.get("mismatched_properties")
+        if isinstance(cause_mismatches, list):
+            mismatched_properties.extend(
+                mismatch for mismatch in cause_mismatches if isinstance(mismatch, str)
+            )
+    entry_mismatches = entry_observation.get("mismatched_properties")
+    if isinstance(entry_mismatches, list):
+        mismatched_properties.extend(
+            mismatch for mismatch in entry_mismatches if isinstance(mismatch, str)
+        )
+    mismatched_properties = list(dict.fromkeys(mismatched_properties))
+
+    failed_checks = list(mismatched_properties)
+    if failed_check is not None:
+        failed_checks.append(failed_check)
+    if entry_observation.get("state") != "present" or (
+        isinstance(entry_mismatches, list) and entry_mismatches
+    ):
+        failed_checks.append("parent_dirent_binding")
+
+    details: dict[str, object] = {
+        "phase": phase,
+        "protected_properties": [
+            "object_identity",
+            "content",
+            "access_policy",
+            "object_policy",
+            "parent_dirent_binding",
+        ],
+        "failed_checks": list(dict.fromkeys(failed_checks)),
+        "expected_live": expected.to_json(),
+        "entry_observation": entry_observation,
+        "publication_state": {
+            "receipt_written": False,
+            "exchange_started": False,
+        },
+    }
+    if actual is not None:
+        details["actual_live"] = actual.to_json()
+    if mismatched_properties:
+        details["mismatched_properties"] = mismatched_properties
+    if cause is not None:
+        details["cause"] = {
+            "status": cause.status,
+            "message": str(cause),
+            **cause.details,
+        }
+    return details
+
+
+def fsync_and_revalidate_original_live(
+    binding: BoundFile,
+    parent: BoundDirectory,
+    expected: Snapshot,
+) -> tuple[bytes, Snapshot]:
+    """Durably bind the original live bytes before publication can begin.
+
+    The protected property is the original object's identity, content digest,
+    access policy, single-link policy, and its exact dirent binding through the
+    already-bound rules parent. Directory size and link-count churn are not
+    compared because child-entry activity does not change that property.
+    """
+
+    try:
+        _before_payload, before = validate_bound_regular_file(
+            binding,
+            parent,
+            label="live_rules",
+        )
+    except TransactionError as error:
+        raise TransactionError(
+            "original_live_changed_before_fsync",
+            "original live rules changed before their durability boundary",
+            exit_code=EXIT_LIVE_CONFLICT,
+            details=_original_live_durability_failure_details(
+                binding,
+                parent,
+                expected,
+                phase="pre_fsync_revalidation",
+                cause=error,
+            ),
+        ) from error
+    before_mismatches = property_mismatches(expected, before)
+    if before_mismatches:
+        raise TransactionError(
+            "original_live_changed_before_fsync",
+            "original live rules changed before their durability boundary",
+            exit_code=EXIT_LIVE_CONFLICT,
+            details=_original_live_durability_failure_details(
+                binding,
+                parent,
+                expected,
+                phase="pre_fsync_revalidation",
+                actual=before,
+            ),
+        )
+
+    try:
+        os.fsync(binding.fd)
+    except OSError as error:
+        details = _original_live_durability_failure_details(
+            binding,
+            parent,
+            expected,
+            phase="fsync",
+            actual=before,
+            failed_check="fsync",
+        )
+        details["fsync_error"] = {
+            "errno": error.errno,
+            "message": str(error),
+        }
+        raise TransactionError(
+            "original_live_fsync_failed",
+            "original live rules could not be made durable",
+            exit_code=EXIT_LIVE_CONFLICT,
+            details=details,
+        ) from error
+
+    try:
+        payload, after = validate_bound_regular_file(
+            binding,
+            parent,
+            label="live_rules",
+        )
+    except TransactionError as error:
+        raise TransactionError(
+            "original_live_changed_after_fsync",
+            "original live rules changed after fsync",
+            exit_code=EXIT_LIVE_CONFLICT,
+            details=_original_live_durability_failure_details(
+                binding,
+                parent,
+                expected,
+                phase="post_fsync_revalidation",
+                cause=error,
+            ),
+        ) from error
+    after_mismatches = property_mismatches(expected, after)
+    if after_mismatches:
+        raise TransactionError(
+            "original_live_changed_after_fsync",
+            "original live rules changed after fsync",
+            exit_code=EXIT_LIVE_CONFLICT,
+            details=_original_live_durability_failure_details(
+                binding,
+                parent,
+                expected,
+                phase="post_fsync_revalidation",
+                actual=after,
+            ),
+        )
+    return payload, after
+
+
 def bind_regular_file(
     path: Path,
     parent: BoundDirectory,
@@ -7768,6 +7942,7 @@ def _apply_transaction_inner(
     post_replace_signal_traceback: object | None = None
     finalized = False
     rules_parent_binding: BoundDirectory | None = None
+    original_live_binding: BoundFile | None = None
     stage_cleanup_failures: list[dict[str, object]] = []
     final_data_roles: TransactionDataRoles | None = None
 
@@ -7959,20 +8134,24 @@ def _apply_transaction_inner(
         try:
             if evidence is not None:
                 failures.extend(evidence.close())
-                return failures
-            if rules_parent_binding is not None:
+            elif rules_parent_binding is not None:
                 failures.extend(
                     close_descriptors_best_effort(
                         [("rules_parent", rules_parent_binding.fd)]
                     )
                 )
-                return failures
         except BaseException as error:
             failures.append(
                 structured_operation_failure(
                     "close",
                     "apply_evidence_group",
                     error,
+                )
+            )
+        if original_live_binding is not None:
+            failures.extend(
+                close_descriptors_best_effort(
+                    [("original_live_rules", original_live_binding.fd)]
                 )
             )
         return failures
@@ -8153,8 +8332,13 @@ def _apply_transaction_inner(
                 label="rules",
             )
             revalidate_lock(lock_binding, rules_parent_binding)
-            current_bytes, current = read_bound_regular_child(
+            original_live_binding = bind_regular_file(
                 rules,
+                rules_parent_binding,
+                label="live_rules",
+            )
+            current_bytes, current = validate_bound_regular_file(
+                original_live_binding,
                 rules_parent_binding,
                 label="live_rules",
             )
@@ -8196,6 +8380,11 @@ def _apply_transaction_inner(
                     "sha256": current.sha256,
                 }
 
+            current_bytes, current = fsync_and_revalidate_original_live(
+                original_live_binding,
+                rules_parent_binding,
+                current,
+            )
             transaction_id = secrets.token_hex(16)
             receipt_parent = bind_directory(
                 receipt.parent,

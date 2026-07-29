@@ -6550,6 +6550,291 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(self.rules.read_bytes(), OLD_RULES)
         self.assertEqual(self.backup.read_bytes(), NEW_RULES)
 
+    def test_original_live_fsync_and_revalidation_precede_receipt_and_exchange(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        events: list[str] = []
+        real_durability = TRANSACTION.fsync_and_revalidate_original_live
+        real_write_receipt = TRANSACTION.write_receipt
+        real_exchange = TRANSACTION.atomic_rename_exchange
+        real_fsync = TRANSACTION.os.fsync
+
+        def observe_durability(
+            binding: object,
+            parent: object,
+            expected: object,
+        ) -> object:
+            assert isinstance(binding, TRANSACTION.BoundFile)
+
+            def observe_fsync(fd: int) -> None:
+                if fd == binding.fd:
+                    events.append("original_live_fsync")
+                real_fsync(fd)
+
+            with mock.patch.object(
+                TRANSACTION.os,
+                "fsync",
+                side_effect=observe_fsync,
+            ):
+                result = real_durability(binding, parent, expected)
+            events.append("original_live_revalidated")
+            return result
+
+        def observe_receipt(*args: object, **kwargs: object) -> object:
+            events.append("receipt_begin")
+            result = real_write_receipt(*args, **kwargs)
+            events.append("receipt_end")
+            return result
+
+        def observe_exchange(*args: object, **kwargs: object) -> None:
+            events.append("exchange")
+            real_exchange(*args, **kwargs)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "fsync_and_revalidate_original_live",
+                side_effect=observe_durability,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "write_receipt",
+                side_effect=observe_receipt,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_exchange",
+                side_effect=observe_exchange,
+            ),
+        ):
+            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["status"], "applied")
+        self.assertLess(
+            events.index("original_live_fsync"),
+            events.index("original_live_revalidated"),
+        )
+        self.assertLess(
+            events.index("original_live_revalidated"),
+            events.index("receipt_begin"),
+        )
+        self.assertLess(events.index("receipt_end"), events.index("exchange"))
+
+    def test_original_live_fsync_error_fails_before_receipt_and_exchange(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_durability = TRANSACTION.fsync_and_revalidate_original_live
+        real_fsync = TRANSACTION.os.fsync
+        injected = False
+
+        def fail_durability_fsync(
+            binding: object,
+            parent: object,
+            expected: object,
+        ) -> object:
+            assert isinstance(binding, TRANSACTION.BoundFile)
+
+            def fail_fsync(fd: int) -> None:
+                nonlocal injected
+                if fd == binding.fd and not injected:
+                    injected = True
+                    raise OSError(errno.EIO, "fault-injected original live fsync")
+                real_fsync(fd)
+
+            with mock.patch.object(
+                TRANSACTION.os,
+                "fsync",
+                side_effect=fail_fsync,
+            ):
+                return real_durability(binding, parent, expected)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "fsync_and_revalidate_original_live",
+                side_effect=fail_durability_fsync,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "write_receipt",
+                wraps=TRANSACTION.write_receipt,
+            ) as receipt_mock,
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_exchange",
+                wraps=TRANSACTION.atomic_rename_exchange,
+            ) as exchange_mock,
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertTrue(injected)
+        self.assertEqual(raised.exception.status, "original_live_fsync_failed")
+        self.assertEqual(raised.exception.exit_code, 20)
+        self.assertEqual(raised.exception.details["phase"], "fsync")
+        self.assertEqual(
+            raised.exception.details["fsync_error"]["errno"],
+            errno.EIO,
+        )
+        self.assertIn("fsync", raised.exception.details["failed_checks"])
+        self.assertEqual(
+            raised.exception.details["publication_state"],
+            {
+                "receipt_written": False,
+                "exchange_started": False,
+            },
+        )
+        receipt_mock.assert_not_called()
+        exchange_mock.assert_not_called()
+        self.assert_original_live_durability_failure_left_no_evidence()
+
+    def assert_original_live_post_fsync_drift(
+        self,
+        mutation: Callable[[], None],
+        *,
+        expected_mismatch: str | None,
+        expected_entry_state: str = "present",
+        expected_failed_check: str | None = None,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_durability = TRANSACTION.fsync_and_revalidate_original_live
+        real_fsync = TRANSACTION.os.fsync
+        injected = False
+
+        def mutate_after_fsync(
+            binding: object,
+            parent: object,
+            expected: object,
+        ) -> object:
+            assert isinstance(binding, TRANSACTION.BoundFile)
+
+            def fsync_then_mutate(fd: int) -> None:
+                nonlocal injected
+                real_fsync(fd)
+                if fd == binding.fd and not injected:
+                    injected = True
+                    mutation()
+
+            with mock.patch.object(
+                TRANSACTION.os,
+                "fsync",
+                side_effect=fsync_then_mutate,
+            ):
+                return real_durability(binding, parent, expected)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "fsync_and_revalidate_original_live",
+                side_effect=mutate_after_fsync,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "write_receipt",
+                wraps=TRANSACTION.write_receipt,
+            ) as receipt_mock,
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_exchange",
+                wraps=TRANSACTION.atomic_rename_exchange,
+            ) as exchange_mock,
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertTrue(injected)
+        self.assertEqual(
+            raised.exception.status,
+            "original_live_changed_after_fsync",
+        )
+        self.assertEqual(raised.exception.exit_code, 20)
+        details = raised.exception.details
+        self.assertEqual(details["phase"], "post_fsync_revalidation")
+        self.assertEqual(
+            details["publication_state"],
+            {
+                "receipt_written": False,
+                "exchange_started": False,
+            },
+        )
+        self.assertEqual(
+            details["entry_observation"]["state"],
+            expected_entry_state,
+        )
+        if expected_mismatch is not None:
+            self.assertIn(expected_mismatch, details["mismatched_properties"])
+        if expected_failed_check is not None:
+            self.assertIn(expected_failed_check, details["failed_checks"])
+        receipt_mock.assert_not_called()
+        exchange_mock.assert_not_called()
+        self.assert_original_live_durability_failure_left_no_evidence()
+
+    def assert_original_live_durability_failure_left_no_evidence(self) -> None:
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(TRANSACTION.prepared_candidate_path(self.receipt).exists())
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        self.assertFalse(terminal.exists())
+        self.assertFalse(TRANSACTION.recovery_terminal_result_path(terminal).exists())
+        self.assert_no_private_stage()
+
+    def test_original_live_replacement_after_fsync_fails_closed(self) -> None:
+        replacement = self.rules_dir / "default.rules.replacement"
+
+        def replace_live() -> None:
+            replacement.write_bytes(OLD_RULES)
+            replacement.chmod(0o640)
+            os.replace(replacement, self.rules)
+
+        self.assert_original_live_post_fsync_drift(
+            replace_live,
+            expected_mismatch="object_identity",
+            expected_failed_check="parent_dirent_binding",
+        )
+
+    def test_original_live_content_drift_after_fsync_fails_closed(self) -> None:
+        self.assert_original_live_post_fsync_drift(
+            lambda: self.rules.write_bytes(LATER_RULES),
+            expected_mismatch="content",
+        )
+
+    def test_original_live_access_drift_after_fsync_fails_closed(self) -> None:
+        self.assert_original_live_post_fsync_drift(
+            lambda: self.rules.chmod(0o600),
+            expected_mismatch="access_policy",
+        )
+
+    def test_original_live_link_drift_after_fsync_fails_closed(self) -> None:
+        alias = self.rules_dir / "default.rules.alias"
+        self.assert_original_live_post_fsync_drift(
+            lambda: os.link(self.rules, alias),
+            expected_mismatch="object_policy",
+        )
+
+    def test_original_live_dirent_drift_after_fsync_fails_closed(self) -> None:
+        moved = self.rules_dir / "default.rules.moved"
+        self.assert_original_live_post_fsync_drift(
+            lambda: os.rename(self.rules, moved),
+            expected_mismatch=None,
+            expected_entry_state="missing",
+            expected_failed_check="parent_dirent_binding",
+        )
+
     def test_receipt_and_backup_publication_fsync_both_directories(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
         events: list[str] = []
