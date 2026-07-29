@@ -16,8 +16,7 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = (
-    REPO_ROOT
-    / "skills/bounded-command-output/scripts/run_process_group_deadline.py"
+    REPO_ROOT / "skills/bounded-command-output/scripts/run_process_group_deadline.py"
 )
 POSIX = os.name == "posix"
 SAME_SESSION_PROCESS_GROUPS = POSIX
@@ -281,7 +280,7 @@ class ProcessGroupDeadlineTests(unittest.TestCase):
                     sys.executable,
                     "-c",
                     "import os, signal; os.kill(os.getpid(), int(__import__('sys').argv[1]))",
-                    str(signum),
+                    str(int(signum)),
                 )
                 self.assertEqual(result.returncode, 128 + signum, result.stderr)
 

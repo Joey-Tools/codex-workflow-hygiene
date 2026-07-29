@@ -360,6 +360,16 @@ superseded_by:
   retain the portable signal-zero probe.
 - The active audit workflow remains read-only; apply behavior is isolated in
   the skill-relative transaction helper.
+- Lock acquisition now derives an exact supervisor-mask window from the
+  launcher's inherited mask: it unblocks only managed signals while polling,
+  preserves every other signal bit, then re-blocks, captures the first pending
+  managed signal, closes the gate, and restores the exact inherited mask
+  before the lock body or capture-only transaction phase can continue.
+- Python 3.9 compatibility now preserves slotted frozen session-corpus records
+  on Python 3.10+ while omitting the unavailable dataclass option on 3.9,
+  serializes `Signals` test arguments as integers, and skips only the
+  `waitid`-specific fault injection when that capability is absent; the
+  production observer already uses the Darwin `kqueue` fallback.
 
 ## Next Steps
 
@@ -599,3 +609,22 @@ superseded_by:
   project-journal validation, and `git diff --check`. Repository
   `__pycache__` directories and both task-scoped system-Python bytecode caches
   were inspected and removed.
+- The inherited-mask lock-wait matrix passed 5/5 focused cases on Python
+  3.13.0 and system Python 3.9.6. Real contended-lock children pre-block each
+  of `SIGINT`, `SIGTERM`, and `SIGHUP`, preserve an unrelated blocked signal,
+  exit within the interrupt bound, keep the first signal authoritative across
+  a distinct second signal, restore the exact inherited mask, close the lock
+  descriptor before handler restoration, and create no receipt, backup,
+  prepared candidate, terminal, result, or private stage.
+- The complete Rules transaction module passed 256/256 on Python 3.13.0 and
+  255 passed plus one capability skip across 256 tests on system Python 3.9.6.
+  The skip covers only injected `os.waitid` failure because that interpreter
+  does not expose `waitid`; production uses the independently tested Darwin
+  `kqueue` exit observer and waitid-independent emergency cleanup.
+- Session-corpus and bounded-deadline compatibility modules passed 93/93 on
+  both Python 3.13.0 and system Python 3.9.6. The final unfiltered repository
+  suites passed 1,318/1,318 on Python 3.13.0 and 1,317 passed plus the same
+  one capability skip across 1,318 tests on system Python 3.9.6.
+- Final source gates passed Ruff check and format-check for all changed Python
+  files, Python 3.13.0 and system Python 3.9.6 byte compilation, both affected
+  skill validators, project-journal validation, and `git diff --check`.

@@ -67,13 +67,14 @@ CALL_REFERENCE_TYPES = frozenset(
         "function_call_output",
     }
 )
+DATACLASS_SLOT_OPTIONS = {"slots": True} if sys.version_info >= (3, 10) else {}
 
 
 class CorpusError(RuntimeError):
     """A corpus cannot be trusted because an input or inventory step failed."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOT_OPTIONS)
 class Record:
     line_no: int
     fingerprint: str
@@ -81,7 +82,7 @@ class Record:
     replay_evidence: bool
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOT_OPTIONS)
 class RolloutCandidate:
     path: Path
     root: Path
@@ -93,7 +94,7 @@ class RolloutCandidate:
     file_size: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOT_OPTIONS)
 class InventoryEntry:
     name: str
     device: int
@@ -101,7 +102,7 @@ class InventoryEntry:
     file_type: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOT_OPTIONS)
 class InventoryDirectory:
     device: int
     inode: int
@@ -120,7 +121,7 @@ def capture_inventory_entry(
     )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOT_OPTIONS)
 class RolloutMetadata:
     candidate: RolloutCandidate
     source: str
@@ -165,7 +166,7 @@ class RolloutMetadata:
         return bool(self.lifecycle_ids) and self.owner_id is None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOT_OPTIONS)
 class Rollout:
     path: Path
     source: str
@@ -1154,9 +1155,7 @@ def rollout_sort_key(
 ]:
     missing_timestamp = dt.datetime.max.replace(tzinfo=UTC)
     record_timestamps = tuple(
-        record.timestamp
-        for record in rollout.records
-        if record.timestamp is not None
+        record.timestamp for record in rollout.records if record.timestamp is not None
     )
     has_record_timestamp = bool(record_timestamps)
     if record_timestamps:
@@ -1549,10 +1548,7 @@ def build_corpus(
         write_lines(
             directory_fd,
             "corpus.jsonl",
-            (
-                json.dumps(entry, ensure_ascii=True, sort_keys=True)
-                for entry in entries
-            ),
+            (json.dumps(entry, ensure_ascii=True, sort_keys=True) for entry in entries),
         )
         write_json(directory_fd, "manifest.json", manifest)
     except OSError as error:

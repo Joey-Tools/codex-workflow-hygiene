@@ -4402,7 +4402,6 @@ def shared_lock(
     locked = False
     binding: BoundFile | None = None
     lock_created = False
-    acquisition_signal_gate_active = False
     primary_error: BaseException | None = None
     primary_traceback: object | None = None
     try:
@@ -4427,26 +4426,29 @@ def shared_lock(
             opened_lock = os.fstat(fd)
             lock_snapshot(path, opened_lock)
         deadline = time.monotonic() + timeout_seconds
-        if acquisition_signal_gate is not None:
-            acquisition_signal_gate_active = True
-            acquisition_signal_gate.arm()
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TransactionError(
-                        "lock_busy",
-                        "transaction lock remained busy",
-                        exit_code=EXIT_LIVE_CONFLICT,
-                    )
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-                continue
-            locked = True
-            break
-        if acquisition_signal_gate is not None:
-            acquisition_signal_gate.close()
-            acquisition_signal_gate_active = False
+
+        def acquire() -> None:
+            nonlocal locked
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TransactionError(
+                            "lock_busy",
+                            "transaction lock remained busy",
+                            exit_code=EXIT_LIVE_CONFLICT,
+                        )
+                    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                    continue
+                locked = True
+                return
+
+        if acquisition_signal_gate is None:
+            acquire()
+        else:
+            with _validator_signal_gate_window(acquisition_signal_gate):
+                acquire()
         binding = BoundFile(
             path=path,
             name=path.name,
@@ -4460,12 +4462,6 @@ def shared_lock(
         primary_traceback = error.__traceback__
     finally:
         finalization_errors: list[tuple[str, BaseException]] = []
-        if acquisition_signal_gate_active:
-            assert acquisition_signal_gate is not None
-            try:
-                acquisition_signal_gate.close()
-            except BaseException as error:
-                finalization_errors.append(("acquisition-signal-gate-close", error))
         if locked and binding is not None:
             finalizers: list[tuple[str, Callable[[], None]]] = [
                 ("pre-release-revalidation", lambda: revalidate_lock(binding)),
@@ -5348,6 +5344,121 @@ def _arm_validator_signal_supervision(
         )
     if primary_error is not None:
         raise primary_error.with_traceback(primary_traceback)
+
+
+@contextmanager
+def _validator_signal_gate_window(
+    gate: ValidatorSignalGate,
+):
+    """Temporarily make a capture-only gate interrupt one lock wait."""
+
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    sigpending = getattr(signal, "sigpending", None)
+    sigwait = getattr(signal, "sigwait", None)
+    if (
+        not callable(pthread_sigmask)
+        or not callable(sigpending)
+        or not callable(sigwait)
+    ):
+        raise TransactionError(
+            "validator_supervision_unsupported",
+            "lock-wait signal supervision requires POSIX signal masks and waits",
+        )
+
+    inherited_mask = set(
+        pthread_sigmask(
+            signal.SIG_BLOCK,
+            MANAGED_VALIDATOR_SIGNALS,
+        )
+    )
+    supervisor_mask = inherited_mask.difference(MANAGED_VALIDATOR_SIGNALS)
+    primary_error: BaseException | None = None
+    primary_traceback: object | None = None
+    finalization_failures: list[dict[str, object]] = []
+    try:
+        gate.arm()
+        # Preserve every non-managed bit from the atomically captured mask.
+        # A launcher-blocked managed signal becomes deliverable only after the
+        # gate is armed, so it interrupts the lock poll without leaking into
+        # the transaction body.
+        pthread_sigmask(signal.SIG_SETMASK, supervisor_mask)
+        yield
+    except BaseException as error:
+        primary_error = error
+        primary_traceback = error.__traceback__
+    finally:
+        managed_blocked = _block_managed_validator_signals(
+            gate,
+            finalization_failures,
+            descriptor="lock-signal-window:block-managed",
+        )
+        try:
+            gate.close()
+        except BaseException as error:
+            finalization_failures.append(
+                structured_operation_failure(
+                    "validator-finalization",
+                    "lock-signal-window:gate-close",
+                    error,
+                )
+            )
+        if managed_blocked:
+            _capture_pending_managed_validator_signals(
+                gate,
+                finalization_failures,
+                descriptor="lock-signal-window:pending-before-mask",
+            )
+        try:
+            pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
+        except BaseException as error:
+            finalization_failures.append(
+                structured_operation_failure(
+                    "validator-finalization",
+                    "lock-signal-window:restore-inherited-mask",
+                    error,
+                )
+            )
+        try:
+            observed_mask = set(pthread_sigmask(signal.SIG_BLOCK, set()))
+            if observed_mask != inherited_mask:
+                raise RuntimeError("inherited signal mask replacement did not persist")
+        except BaseException as error:
+            finalization_failures.append(
+                structured_operation_failure(
+                    "validator-finalization",
+                    "lock-signal-window:validate-inherited-mask",
+                    error,
+                )
+            )
+
+        pending_signum = gate.pending_signum
+        if pending_signum in MANAGED_VALIDATOR_SIGNALS:
+            if not isinstance(primary_error, ForwardedValidatorSignal):
+                signal_error = ForwardedValidatorSignal(pending_signum)
+                if primary_error is not None:
+                    signal_error.cleanup_errors.append(
+                        structured_operation_failure(
+                            "lock-acquisition",
+                            "superseded-primary",
+                            primary_error,
+                        )
+                    )
+                primary_error = signal_error
+                primary_traceback = signal_error.__traceback__
+        if primary_error is not None:
+            attach_validator_failures_to_exception(
+                primary_error,
+                finalization_failures,
+            )
+            raise primary_error.with_traceback(primary_traceback)
+        if finalization_failures:
+            raise TransactionError(
+                "lock_signal_supervision_failed",
+                "lock-wait signal supervision could not be finalized",
+                details={
+                    "validator_cleanup_failures": finalization_failures,
+                },
+            )
 
 
 def _quiesce_validator_signal_supervision(

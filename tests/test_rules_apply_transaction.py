@@ -2446,6 +2446,10 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124)
         self.assertLess(time.monotonic() - started, 3)
 
+    @unittest.skipUnless(
+        hasattr(TRANSACTION.os, "waitid"),
+        "requires os.waitid",
+    )
     def test_validator_waitid_failure_still_terminates_and_reaps(self) -> None:
         pid_path = self.root / "validator-waitid-failure.pid"
         self.write_sleeping_validator(pid_path)
@@ -8426,6 +8430,9 @@ class RulesApplyTransactionTests(unittest.TestCase):
     def run_lock_contention_signal_child(
         self,
         signum: int,
+        *,
+        preblock_signum: bool = False,
+        secondary_signum: int | None = None,
     ) -> dict[str, object]:
         lock = self.rules_dir / ".default.rules.apply.lock"
         lock.write_bytes(b"")
@@ -8440,30 +8447,52 @@ class RulesApplyTransactionTests(unittest.TestCase):
         ready_path = self.root / (
             f"lock-contention-{signal.Signals(signum).name}.ready"
         )
+        secondary_ready_path = self.root / (
+            f"lock-contention-{signal.Signals(signum).name}.secondary-ready"
+        )
+        secondary_sent_path = self.root / (
+            f"lock-contention-{signal.Signals(signum).name}.secondary-sent"
+        )
         owner_fd = os.open(lock, os.O_RDWR | os.O_CLOEXEC)
         fcntl.flock(owner_fd, fcntl.LOCK_EX)
         child_pid = os.fork()
         if child_pid == 0:
             os.close(owner_fd)
             try:
+                saved_mask = set(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+                expected_mask = set(saved_mask)
+                if preblock_signum:
+                    expected_mask.difference_update(
+                        TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+                    )
+                    expected_mask.add(signum)
+                    if hasattr(signal, "SIGUSR1"):
+                        expected_mask.add(signal.SIGUSR1)
+                    signal.pthread_sigmask(signal.SIG_SETMASK, expected_mask)
                 previous_handlers = {
                     managed: signal.getsignal(managed)
                     for managed in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
                 }
-                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                previous_mask = set(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
                 real_flock = TRANSACTION.fcntl.flock
                 real_close = TRANSACTION.close_descriptors_best_effort
                 real_complete = TRANSACTION._complete_validator_signal_ownership_handoff
+                real_latch = TRANSACTION.ValidatorSignalGate.latch
                 contended = False
                 lifecycle: list[str] = []
+                latched_signals: list[int] = []
+                lock_wait_mask: set[signal.Signals] | None = None
 
                 def instrument_flock(fd: int, operation: int) -> None:
-                    nonlocal contended
+                    nonlocal contended, lock_wait_mask
                     try:
                         real_flock(fd, operation)
                     except BlockingIOError:
                         if operation & fcntl.LOCK_NB and not contended:
                             contended = True
+                            lock_wait_mask = set(
+                                signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                            )
                             ready_path.write_text("ready\n", encoding="ascii")
                         raise
 
@@ -8477,10 +8506,30 @@ class RulesApplyTransactionTests(unittest.TestCase):
                         for descriptor, _fd in descriptors
                     ):
                         lifecycle.append("lock_descriptor_cleanup")
+                        if secondary_signum is not None:
+                            secondary_ready_path.write_text(
+                                "ready\n",
+                                encoding="ascii",
+                            )
+                            secondary_deadline = time.monotonic() + 2
+                            while not secondary_sent_path.exists():
+                                if time.monotonic() >= secondary_deadline:
+                                    raise RuntimeError(
+                                        "secondary managed signal was not sent"
+                                    )
+                                time.sleep(0.01)
                     return real_close(
                         descriptors,
                         release_uncertain=release_uncertain,
                     )
+
+                def instrument_latch(
+                    gate: object,
+                    observed_signum: int,
+                ) -> None:
+                    assert isinstance(gate, TRANSACTION.ValidatorSignalGate)
+                    latched_signals.append(observed_signum)
+                    real_latch(gate, observed_signum)
 
                 def instrument_complete(
                     handoff: object,
@@ -8509,6 +8558,11 @@ class RulesApplyTransactionTests(unittest.TestCase):
                         side_effect=instrument_close,
                     ),
                     mock.patch.object(
+                        TRANSACTION.ValidatorSignalGate,
+                        "latch",
+                        new=instrument_latch,
+                    ),
+                    mock.patch.object(
                         TRANSACTION,
                         "_complete_validator_signal_ownership_handoff",
                         side_effect=instrument_complete,
@@ -8522,9 +8576,8 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     signal.getsignal(managed) == previous_handlers[managed]
                     for managed in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
                 )
-                mask_restored = (
-                    signal.pthread_sigmask(signal.SIG_BLOCK, set()) == previous_mask
-                )
+                observed_mask = set(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+                mask_restored = observed_mask == previous_mask
                 result_path.write_text(
                     json.dumps(
                         {
@@ -8534,6 +8587,14 @@ class RulesApplyTransactionTests(unittest.TestCase):
                             "contended": contended,
                             "handlers_restored": handlers_restored,
                             "mask_restored": mask_restored,
+                            "previous_mask": sorted(previous_mask),
+                            "observed_mask": sorted(observed_mask),
+                            "lock_wait_mask": (
+                                sorted(lock_wait_mask)
+                                if lock_wait_mask is not None
+                                else None
+                            ),
+                            "latched_signals": latched_signals,
                             "lifecycle": lifecycle,
                         },
                         sort_keys=True,
@@ -8582,6 +8643,32 @@ class RulesApplyTransactionTests(unittest.TestCase):
 
             signal_sent_at = time.monotonic()
             os.kill(child_pid, signum)
+            if secondary_signum is not None:
+                secondary_deadline = signal_sent_at + 2
+                while (
+                    time.monotonic() < secondary_deadline
+                    and not secondary_ready_path.exists()
+                ):
+                    waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                    if waited_pid == child_pid:
+                        child_status = status
+                        break
+                    time.sleep(0.01)
+                if not secondary_ready_path.exists():
+                    if child_status is None:
+                        os.kill(child_pid, signal.SIGKILL)
+                        _waited_pid, child_status = os.waitpid(child_pid, 0)
+                    result = (
+                        json.loads(result_path.read_text(encoding="utf-8"))
+                        if result_path.exists()
+                        else {}
+                    )
+                    self.fail(
+                        "lock-contention child did not preserve the first-signal "
+                        f"cleanup window: {result}"
+                    )
+                os.kill(child_pid, secondary_signum)
+                secondary_sent_path.write_text("sent\n", encoding="ascii")
             signal_deadline = signal_sent_at + 2
             while time.monotonic() < signal_deadline:
                 waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
@@ -8653,6 +8740,74 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 self.assertEqual(result["stderr"], "")
                 self.assertTrue(result["handlers_restored"])
                 self.assertTrue(result["mask_restored"])
+                payload = result["payload"]
+                self.assertEqual(payload["status"], "interrupted")
+                self.assertEqual(payload["signal"], signum)
+                self.assertNotIn("pre_receipt_recovery", payload)
+                lifecycle = result["lifecycle"]
+                self.assertIn("lock_descriptor_cleanup", lifecycle)
+                self.assertIn("handler_restore", lifecycle)
+                self.assertLess(
+                    lifecycle.index("lock_descriptor_cleanup"),
+                    lifecycle.index("handler_restore"),
+                )
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertFalse(self.backup.exists())
+                self.assertFalse(self.receipt.exists())
+                self.assertFalse(
+                    TRANSACTION.prepared_candidate_path(self.receipt).exists()
+                )
+                terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+                self.assertFalse(terminal.exists())
+                self.assertFalse(
+                    TRANSACTION.recovery_terminal_result_path(terminal).exists()
+                )
+                self.assert_no_private_stage()
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(os, "fork")
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending")
+        and hasattr(signal, "sigwait"),
+        "preblocked lock-wait signal capture requires POSIX signal waits",
+    )
+    def test_preblocked_managed_signals_interrupt_contended_lock_and_restore_mask(
+        self,
+    ) -> None:
+        managed_signals = TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+        for index, signum in enumerate(managed_signals):
+            secondary_signum = managed_signals[(index + 1) % len(managed_signals)]
+            with (
+                self.subTest(signal=signal.Signals(signum).name),
+                tempfile.TemporaryDirectory(
+                    prefix="rules-preblocked-lock-contention-signal."
+                ) as isolated,
+            ):
+                self.configure_isolated_case(Path(isolated))
+                self.write_validator("raise SystemExit(0)\n")
+                result = self.run_lock_contention_signal_child(
+                    signum,
+                    preblock_signum=True,
+                    secondary_signum=secondary_signum,
+                )
+
+                self.assertTrue(result["contended"], result)
+                self.assertLess(result["signal_latency_seconds"], 2.0, result)
+                self.assertEqual(result["code"], 128 + signum)
+                self.assertEqual(result["stderr"], "")
+                self.assertTrue(result["handlers_restored"])
+                self.assertTrue(result["mask_restored"])
+                self.assertEqual(
+                    result["observed_mask"],
+                    result["previous_mask"],
+                )
+                self.assertEqual(
+                    result["lock_wait_mask"],
+                    sorted(set(result["previous_mask"]).difference(managed_signals)),
+                )
+                self.assertEqual(result["latched_signals"][0], signum)
+                self.assertIn(secondary_signum, result["latched_signals"])
                 payload = result["payload"]
                 self.assertEqual(payload["status"], "interrupted")
                 self.assertEqual(payload["signal"], signum)
@@ -12227,37 +12382,101 @@ class RulesApplyTransactionTests(unittest.TestCase):
             os.fstat(opened_fd)
         self.assertEqual(closed.exception.errno, errno.EBADF)
 
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "SIGUSR1"),
+        "lock-wait mask restoration requires POSIX signal masks",
+    )
+    def test_acquisition_signal_window_restores_mask_before_lock_body(self) -> None:
+        lock = self.rules_dir / ".default.rules.apply.lock"
+        gate = TRANSACTION.ValidatorSignalGate()
+        primary_signum = TRANSACTION.MANAGED_VALIDATOR_SIGNALS[0]
+        secondary_signum = TRANSACTION.MANAGED_VALIDATOR_SIGNALS[-1]
+        saved_mask = set(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+        inherited_mask = saved_mask.difference(TRANSACTION.MANAGED_VALIDATOR_SIGNALS)
+        inherited_mask.update((primary_signum, signal.SIGUSR1))
+        close_masks: list[set[signal.Signals]] = []
+        body_mask: set[signal.Signals] | None = None
+        restored_mask: set[signal.Signals] | None = None
+        real_close = gate.close
+
+        def observe_close() -> None:
+            close_masks.append(set(signal.pthread_sigmask(signal.SIG_BLOCK, set())))
+            real_close()
+
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
+            with (
+                mock.patch.object(
+                    gate,
+                    "close",
+                    side_effect=observe_close,
+                ),
+                TRANSACTION.shared_lock(
+                    lock,
+                    timeout_seconds=2.0,
+                    acquisition_signal_gate=gate,
+                ),
+            ):
+                body_mask = set(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+                gate.handle(secondary_signum, None)
+            restored_mask = set(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
+
+        self.assertEqual(
+            close_masks,
+            [inherited_mask.union(TRANSACTION.MANAGED_VALIDATOR_SIGNALS)],
+        )
+        self.assertEqual(body_mask, inherited_mask)
+        self.assertEqual(restored_mask, inherited_mask)
+        self.assertEqual(gate.pending_signum, secondary_signum)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "lock-wait mask restoration requires POSIX signal masks",
+    )
     def test_acquisition_signal_gate_closes_after_lock_timeout(self) -> None:
         lock = self.rules_dir / ".default.rules.apply.lock"
         lock.write_bytes(b"")
         lock.chmod(0o600)
         gate = TRANSACTION.ValidatorSignalGate()
+        saved_mask = set(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+        inherited_mask = saved_mask.difference(TRANSACTION.MANAGED_VALIDATOR_SIGNALS)
+        inherited_mask.add(TRANSACTION.MANAGED_VALIDATOR_SIGNALS[0])
 
-        with (
-            mock.patch.object(
-                TRANSACTION.fcntl,
-                "flock",
-                side_effect=BlockingIOError(
-                    errno.EWOULDBLOCK,
-                    "fault-injected busy lock",
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
+            with (
+                mock.patch.object(
+                    TRANSACTION.fcntl,
+                    "flock",
+                    side_effect=BlockingIOError(
+                        errno.EWOULDBLOCK,
+                        "fault-injected busy lock",
+                    ),
                 ),
-            ),
-            mock.patch.object(
-                TRANSACTION.time,
-                "monotonic",
-                side_effect=[10.0, 11.0],
-            ),
-            self.assertRaises(TRANSACTION.TransactionError) as raised,
-        ):
-            with TRANSACTION.shared_lock(
-                lock,
-                timeout_seconds=1.0,
-                acquisition_signal_gate=gate,
+                mock.patch.object(
+                    TRANSACTION.time,
+                    "monotonic",
+                    side_effect=[10.0, 11.0],
+                ),
+                self.assertRaises(TRANSACTION.TransactionError) as raised,
             ):
-                self.fail("busy lock unexpectedly entered its body")
+                with TRANSACTION.shared_lock(
+                    lock,
+                    timeout_seconds=1.0,
+                    acquisition_signal_gate=gate,
+                ):
+                    self.fail("busy lock unexpectedly entered its body")
+            restored_mask = set(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
 
         self.assertEqual(raised.exception.status, "lock_busy")
         self.assertEqual(raised.exception.exit_code, 20)
+        self.assertEqual(restored_mask, inherited_mask)
         signum = TRANSACTION.MANAGED_VALIDATOR_SIGNALS[0]
         gate.handle(signum, None)
         self.assertEqual(gate.pending_signum, signum)
