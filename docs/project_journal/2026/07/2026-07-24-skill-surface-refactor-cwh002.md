@@ -127,6 +127,10 @@ superseded_by:
   persistent publication: apply fsyncs the held `default.rules` descriptor,
   then revalidates identity, exact content, access policy, single-link policy,
   its bound-parent dirent, and parent identity/access policy.
+- Classified raw bound-descriptor and parent-dirent I/O failures on both sides
+  of that fsync as structured unreadability, preserving exact operation,
+  errno, phase, reason, and zero-publication evidence without conflating
+  missing entries or proved property drift.
 - Reduced the Joey authoring overlay to placement and validation policy while
   respecting non-default `CODEX_HOME`.
 - Strengthened structural tests for the complete audit and cold-start paths.
@@ -140,7 +144,10 @@ superseded_by:
   pre-publication evidence with `receipt_written: false` and
   `exchange_started: false`; directory size/link churn remains benign while
   parent object identity/access policy and the exact child dirent stay
-  protected.
+  protected. Raw FD-read and dirent-stat errors are separately reported as
+  `original_live_unreadable_before_fsync` or
+  `original_live_unreadable_after_fsync`; missing and mismatch statuses remain
+  distinct.
 - Rules apply stages and validates a descriptor-bound private candidate before
   taking a shared lock, then revalidates the expected live digest, object
   identity, content, access policy, and `st_nlink == 1` object policy before a
@@ -521,3 +528,16 @@ superseded_by:
   byte compilation, project-journal validation, the official Rules skill
   validator in an isolated `uv --with PyYAML` environment after direct Python
   reported missing `yaml`, and `git diff --check`.
+- The complete original-live matrix passed 11/11 on both Python 3.13.0 and
+  system Python 3.9.6. Four new syscall-level cases inject raw `EIO` from the
+  bound FD read and parent-dirent stat before and after fsync; every result
+  retains phase, scope, operation, errno, nested reason, and exact
+  `receipt_written: false` / `exchange_started: false` evidence while the
+  existing missing-dirent case remains `live_rules_missing`.
+- The final Python 3.13.0 repository run exercised all 1,294 tests. Its only
+  four errors were the unchanged temporary merge-commit fixtures blocked from
+  `~/.gnupg/keyboxd` by the sandbox; those exact four passed 4/4 in the
+  approved narrow GPG-capable rerun.
+- Final gates passed Ruff check/format, Python 3.13.0 and system Python 3.9.6
+  byte compilation, the official Rules skill validator through isolated
+  `uv --with pyyaml`, project-journal validation, and `git diff --check`.

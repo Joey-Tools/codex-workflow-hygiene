@@ -2117,6 +2117,80 @@ def bind_directory(
         raise
 
 
+def _bound_regular_validation_io_error(
+    label: str,
+    *,
+    failure_scope: str,
+    io_operation: str,
+    failed_check: str,
+    error: OSError,
+) -> TransactionError:
+    scope_status = {
+        "bound_descriptor": "descriptor",
+        "parent_dirent_binding": "dirent",
+        "durability_revalidation": "revalidation",
+    }.get(failure_scope, "validation")
+    return TransactionError(
+        f"{label}_{scope_status}_unreadable",
+        f"{label} {failure_scope} is unreadable during {io_operation}: {error}",
+        details={
+            "failure_classification": "unreadable",
+            "failure_scope": failure_scope,
+            "io_operation": io_operation,
+            "failed_check": failed_check,
+            "io_error": {
+                "errno": error.errno,
+                "message": str(error),
+            },
+        },
+    )
+
+
+def _read_bound_fd_for_validation(
+    binding: BoundFile,
+    *,
+    label: str,
+    max_bytes: int,
+) -> tuple[bytes, Snapshot]:
+    try:
+        return read_bound_fd(
+            binding.fd,
+            label=label,
+            max_bytes=max_bytes,
+        )
+    except OSError as error:
+        raise _bound_regular_validation_io_error(
+            label,
+            failure_scope="bound_descriptor",
+            io_operation="read_bound_fd",
+            failed_check="bound_descriptor_readability",
+            error=error,
+        ) from error
+
+
+def _verify_bound_entry_for_validation(
+    binding: BoundFile,
+    parent: BoundDirectory,
+    *,
+    label: str,
+) -> None:
+    try:
+        verify_entry_binding(
+            parent.fd,
+            binding.name,
+            binding.snapshot,
+            label=label,
+        )
+    except OSError as error:
+        raise _bound_regular_validation_io_error(
+            label,
+            failure_scope="parent_dirent_binding",
+            io_operation="verify_entry_binding",
+            failed_check="parent_dirent_readability",
+            error=error,
+        ) from error
+
+
 def validate_bound_regular_file(
     binding: BoundFile,
     parent: BoundDirectory,
@@ -2125,8 +2199,8 @@ def validate_bound_regular_file(
     max_bytes: int = MAX_RULES_BYTES,
 ) -> tuple[bytes, Snapshot]:
     validate_bound_directory(parent)
-    _payload, actual = read_bound_fd(
-        binding.fd,
+    _payload, actual = _read_bound_fd_for_validation(
+        binding,
         label=label,
         max_bytes=max_bytes,
     )
@@ -2138,15 +2212,14 @@ def validate_bound_regular_file(
             f"{label} protected properties changed",
             details={"mismatched_properties": mismatches},
         )
-    verify_entry_binding(
-        parent.fd,
-        binding.name,
-        binding.snapshot,
+    _verify_bound_entry_for_validation(
+        binding,
+        parent,
         label=label,
     )
     reject_unmodeled_metadata_fd(binding.fd, label=label)
-    final_payload, final = read_bound_fd(
-        binding.fd,
+    final_payload, final = _read_bound_fd_for_validation(
+        binding,
         label=label,
         max_bytes=max_bytes,
     )
@@ -2158,10 +2231,9 @@ def validate_bound_regular_file(
             f"{label} protected properties changed during final admission",
             details={"mismatched_properties": final_mismatches},
         )
-    verify_entry_binding(
-        parent.fd,
-        binding.name,
-        binding.snapshot,
+    _verify_bound_entry_for_validation(
+        binding,
+        parent,
         label=label,
     )
     validate_bound_directory(parent)
@@ -2202,6 +2274,10 @@ def _original_live_durability_failure_details(
     failed_checks = list(mismatched_properties)
     if failed_check is not None:
         failed_checks.append(failed_check)
+    if cause is not None:
+        cause_failed_check = cause.details.get("failed_check")
+        if isinstance(cause_failed_check, str):
+            failed_checks.append(cause_failed_check)
     if entry_observation.get("state") != "present" or (
         isinstance(entry_mismatches, list) and entry_mismatches
     ):
@@ -2229,12 +2305,70 @@ def _original_live_durability_failure_details(
     if mismatched_properties:
         details["mismatched_properties"] = mismatched_properties
     if cause is not None:
+        details["reason"] = cause.status
+        for field in (
+            "failure_classification",
+            "failure_scope",
+            "io_operation",
+            "io_error",
+        ):
+            if field in cause.details:
+                details[field] = cause.details[field]
         details["cause"] = {
             "status": cause.status,
             "message": str(cause),
             **cause.details,
         }
     return details
+
+
+def _original_live_revalidation_error(
+    binding: BoundFile,
+    parent: BoundDirectory,
+    expected: Snapshot,
+    *,
+    phase: str,
+    error: OSError | TransactionError,
+) -> TransactionError:
+    cause = (
+        error
+        if isinstance(error, TransactionError)
+        else _bound_regular_validation_io_error(
+            "live_rules",
+            failure_scope="durability_revalidation",
+            io_operation="validate_bound_regular_file",
+            failed_check="durability_revalidation",
+            error=error,
+        )
+    )
+    unreadable = cause.details.get("failure_classification") == "unreadable"
+    before_fsync = phase == "pre_fsync_revalidation"
+    temporal_scope = "before_fsync" if before_fsync else "after_fsync"
+    return TransactionError(
+        (
+            f"original_live_unreadable_{temporal_scope}"
+            if unreadable
+            else f"original_live_changed_{temporal_scope}"
+        ),
+        (
+            "original live rules could not be revalidated "
+            f"{'before' if before_fsync else 'after'} fsync"
+            if unreadable
+            else (
+                "original live rules changed before their durability boundary"
+                if before_fsync
+                else "original live rules changed after fsync"
+            )
+        ),
+        exit_code=EXIT_LIVE_CONFLICT,
+        details=_original_live_durability_failure_details(
+            binding,
+            parent,
+            expected,
+            phase=phase,
+            cause=cause,
+        ),
+    )
 
 
 def fsync_and_revalidate_original_live(
@@ -2256,18 +2390,13 @@ def fsync_and_revalidate_original_live(
             parent,
             label="live_rules",
         )
-    except TransactionError as error:
-        raise TransactionError(
-            "original_live_changed_before_fsync",
-            "original live rules changed before their durability boundary",
-            exit_code=EXIT_LIVE_CONFLICT,
-            details=_original_live_durability_failure_details(
-                binding,
-                parent,
-                expected,
-                phase="pre_fsync_revalidation",
-                cause=error,
-            ),
+    except (OSError, TransactionError) as error:
+        raise _original_live_revalidation_error(
+            binding,
+            parent,
+            expected,
+            phase="pre_fsync_revalidation",
+            error=error,
         ) from error
     before_mismatches = property_mismatches(expected, before)
     if before_mismatches:
@@ -2312,18 +2441,13 @@ def fsync_and_revalidate_original_live(
             parent,
             label="live_rules",
         )
-    except TransactionError as error:
-        raise TransactionError(
-            "original_live_changed_after_fsync",
-            "original live rules changed after fsync",
-            exit_code=EXIT_LIVE_CONFLICT,
-            details=_original_live_durability_failure_details(
-                binding,
-                parent,
-                expected,
-                phase="post_fsync_revalidation",
-                cause=error,
-            ),
+    except (OSError, TransactionError) as error:
+        raise _original_live_revalidation_error(
+            binding,
+            parent,
+            expected,
+            phase="post_fsync_revalidation",
+            error=error,
         ) from error
     after_mismatches = property_mismatches(expected, after)
     if after_mismatches:

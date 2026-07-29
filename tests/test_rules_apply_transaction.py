@@ -6699,6 +6699,170 @@ class RulesApplyTransactionTests(unittest.TestCase):
         exchange_mock.assert_not_called()
         self.assert_original_live_durability_failure_left_no_evidence()
 
+    def assert_original_live_raw_revalidation_failure(
+        self,
+        *,
+        phase: str,
+        failure_scope: str,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_durability = TRANSACTION.fsync_and_revalidate_original_live
+        real_fsync = TRANSACTION.os.fsync
+        io_operation = (
+            "read_bound_fd"
+            if failure_scope == "bound_descriptor"
+            else "verify_entry_binding"
+        )
+        syscall_name = "read" if failure_scope == "bound_descriptor" else "stat"
+        real_syscall = getattr(TRANSACTION.os, syscall_name)
+        expected_reason = (
+            "live_rules_descriptor_unreadable"
+            if failure_scope == "bound_descriptor"
+            else "live_rules_dirent_unreadable"
+        )
+        expected_failed_check = (
+            "bound_descriptor_readability"
+            if failure_scope == "bound_descriptor"
+            else "parent_dirent_readability"
+        )
+        fsync_completed = False
+        fsync_calls = 0
+        injected = False
+
+        def inject_raw_error(
+            binding: object,
+            parent: object,
+            expected: object,
+        ) -> object:
+            assert isinstance(binding, TRANSACTION.BoundFile)
+
+            def observe_fsync(fd: int) -> None:
+                nonlocal fsync_calls, fsync_completed
+                real_fsync(fd)
+                if fd == binding.fd:
+                    fsync_calls += 1
+                    fsync_completed = True
+
+            def fail_syscall(*args: object, **kwargs: object) -> object:
+                nonlocal injected
+                should_fail = (
+                    not fsync_completed
+                    if phase == "pre_fsync_revalidation"
+                    else fsync_completed
+                )
+                target_call = (
+                    bool(args) and args[0] == binding.fd
+                    if failure_scope == "bound_descriptor"
+                    else (
+                        bool(args)
+                        and args[0] == binding.name
+                        and kwargs.get("dir_fd") == parent.fd
+                    )
+                )
+                if target_call and should_fail and not injected:
+                    injected = True
+                    raise OSError(
+                        errno.EIO,
+                        f"fault-injected {syscall_name} {phase}",
+                    )
+                return real_syscall(*args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    TRANSACTION.os,
+                    "fsync",
+                    side_effect=observe_fsync,
+                ),
+                mock.patch.object(
+                    TRANSACTION.os,
+                    syscall_name,
+                    side_effect=fail_syscall,
+                ),
+            ):
+                return real_durability(binding, parent, expected)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "fsync_and_revalidate_original_live",
+                side_effect=inject_raw_error,
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "write_receipt",
+                wraps=TRANSACTION.write_receipt,
+            ) as receipt_mock,
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_exchange",
+                wraps=TRANSACTION.atomic_rename_exchange,
+            ) as exchange_mock,
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertTrue(injected)
+        self.assertEqual(
+            fsync_calls,
+            0 if phase == "pre_fsync_revalidation" else 1,
+        )
+        temporal_scope = (
+            "before_fsync" if phase == "pre_fsync_revalidation" else "after_fsync"
+        )
+        self.assertEqual(
+            raised.exception.status,
+            f"original_live_unreadable_{temporal_scope}",
+        )
+        self.assertEqual(raised.exception.exit_code, 20)
+        details = raised.exception.details
+        self.assertEqual(details["phase"], phase)
+        self.assertEqual(details["reason"], expected_reason)
+        self.assertEqual(details["failure_classification"], "unreadable")
+        self.assertEqual(details["failure_scope"], failure_scope)
+        self.assertEqual(details["io_operation"], io_operation)
+        self.assertEqual(details["io_error"]["errno"], errno.EIO)
+        self.assertIn(expected_failed_check, details["failed_checks"])
+        self.assertNotIn("mismatched_properties", details)
+        self.assertEqual(details["cause"]["status"], expected_reason)
+        self.assertEqual(
+            details["publication_state"],
+            {
+                "receipt_written": False,
+                "exchange_started": False,
+            },
+        )
+        receipt_mock.assert_not_called()
+        exchange_mock.assert_not_called()
+        self.assert_original_live_durability_failure_left_no_evidence()
+
+    def test_original_live_bound_fd_error_before_fsync_is_structured(self) -> None:
+        self.assert_original_live_raw_revalidation_failure(
+            phase="pre_fsync_revalidation",
+            failure_scope="bound_descriptor",
+        )
+
+    def test_original_live_bound_fd_error_after_fsync_is_structured(self) -> None:
+        self.assert_original_live_raw_revalidation_failure(
+            phase="post_fsync_revalidation",
+            failure_scope="bound_descriptor",
+        )
+
+    def test_original_live_dirent_error_before_fsync_is_structured(self) -> None:
+        self.assert_original_live_raw_revalidation_failure(
+            phase="pre_fsync_revalidation",
+            failure_scope="parent_dirent_binding",
+        )
+
+    def test_original_live_dirent_error_after_fsync_is_structured(self) -> None:
+        self.assert_original_live_raw_revalidation_failure(
+            phase="post_fsync_revalidation",
+            failure_scope="parent_dirent_binding",
+        )
+
     def assert_original_live_post_fsync_drift(
         self,
         mutation: Callable[[], None],
@@ -6706,6 +6870,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
         expected_mismatch: str | None,
         expected_entry_state: str = "present",
         expected_failed_check: str | None = None,
+        expected_reason: str | None = None,
     ) -> None:
         self.write_validator("raise SystemExit(0)\n")
         real_durability = TRANSACTION.fsync_and_revalidate_original_live
@@ -6780,6 +6945,10 @@ class RulesApplyTransactionTests(unittest.TestCase):
             self.assertIn(expected_mismatch, details["mismatched_properties"])
         if expected_failed_check is not None:
             self.assertIn(expected_failed_check, details["failed_checks"])
+        if expected_reason is not None:
+            self.assertEqual(details["reason"], expected_reason)
+            self.assertEqual(details["cause"]["status"], expected_reason)
+            self.assertNotIn("failure_classification", details)
         receipt_mock.assert_not_called()
         exchange_mock.assert_not_called()
         self.assert_original_live_durability_failure_left_no_evidence()
@@ -6833,6 +7002,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
             expected_mismatch=None,
             expected_entry_state="missing",
             expected_failed_check="parent_dirent_binding",
+            expected_reason="live_rules_missing",
         )
 
     def test_receipt_and_backup_publication_fsync_both_directories(self) -> None:
