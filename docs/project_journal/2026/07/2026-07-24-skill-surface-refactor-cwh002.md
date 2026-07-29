@@ -564,15 +564,19 @@ superseded_by:
   failure, initial/final descriptor/path EIO classification on both sides of
   the boundary, and exact retained `recovery_required` state for receipt
   write, file-fsync, and parent-fsync failures.
-- The complete Rules transaction module passed 237/237 on Python 3.13.0.
-  System Python 3.9.6 passed 236 exercised cases and reached one unrelated
-  pre-existing capability error because that runtime exposes no `os.waitid`;
-  all ten task-specific methods passed there.
-- The Python 3.13.0 repository run exercised all 1,299 tests. Its only four
-  errors were the unchanged temporary merge-commit fixtures blocked from
-  `~/.gnupg/keyboxd` by the sandbox; those exact four passed 4/4 in the
-  approved narrow GPG-capable rerun.
-- Ruff check/format, Python 3.13.0 and system Python 3.9.6 byte compilation,
-  the official Rules skill validator through isolated `uv --with pyyaml`, and
-  project-journal validation plus `git diff --check` passed for the final
-  source shape.
+- The first validator now hands its managed-signal gate to pre-receipt
+  publication. `SIGINT`, `SIGTERM`, and `SIGHUP` remain capture-only across
+  prepared-candidate, recovery-terminal, and receipt create/write/fsync/full
+  validation/binding boundaries. A signal is forwarded only after the exact
+  recovery state is constructed and the transaction-owned descriptors close;
+  an ordinary publication failure followed by a late signal inherits the same
+  top-level recovery envelope instead of burying locators in cleanup evidence.
+- The complete Rules transaction module passed 251/251 on Python 3.13.0. The
+  three new integration methods exercise 69 real-signal subcases: 21
+  publication boundaries for each managed signal, conflict preservation for
+  each signal, and late-signal recovery-envelope inheritance for each signal.
+  The Python 3.13.0 repository suite passed 1,313/1,313.
+- Final source gates passed Ruff check/format, Python 3.13.0 and system Python
+  3.9.6 byte compilation, the official Rules skill validator, and
+  project-journal validation. The task-scoped system-Python bytecode cache was
+  inspected and removed.

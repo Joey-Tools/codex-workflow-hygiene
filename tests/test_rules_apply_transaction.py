@@ -4122,7 +4122,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     deferred_signal_handoffs=deferred_signal_handoffs,
                 )
             finally:
-                if deferred_signal_handoffs is not None:
+                if post_replace_phase and deferred_signal_handoffs is not None:
                     deferred_handoff_ids.update(
                         id(handoff)
                         for handoff in deferred_signal_handoffs[handoff_count:]
@@ -4599,8 +4599,11 @@ class RulesApplyTransactionTests(unittest.TestCase):
                     *,
                     timeout_seconds: float,
                     pass_fds: tuple[int, ...] = (),
+                    deferred_signal_handoffs: (
+                        list[TRANSACTION.ValidatorSignalOwnershipHandoff] | None
+                    ) = None,
                 ) -> object:
-                    del timeout_seconds, pass_fds
+                    del timeout_seconds, pass_fds, deferred_signal_handoffs
                     replacement = self.rules_dir / ".converged-candidate-live"
                     replacement.write_bytes(NEW_RULES)
                     replacement.chmod(0o640)
@@ -4849,8 +4852,11 @@ class RulesApplyTransactionTests(unittest.TestCase):
             *,
             timeout_seconds: float,
             pass_fds: tuple[int, ...] = (),
+            deferred_signal_handoffs: (
+                list[TRANSACTION.ValidatorSignalOwnershipHandoff] | None
+            ) = None,
         ) -> object:
-            del timeout_seconds, pass_fds
+            del timeout_seconds, pass_fds, deferred_signal_handoffs
             replacement = self.rules_dir / ".concurrent-candidate-live"
             replacement.write_bytes(NEW_RULES)
             replacement.chmod(0o640)
@@ -4915,8 +4921,11 @@ class RulesApplyTransactionTests(unittest.TestCase):
             *,
             timeout_seconds: float,
             pass_fds: tuple[int, ...] = (),
+            deferred_signal_handoffs: (
+                list[TRANSACTION.ValidatorSignalOwnershipHandoff] | None
+            ) = None,
         ) -> object:
-            del timeout_seconds, pass_fds
+            del timeout_seconds, pass_fds, deferred_signal_handoffs
             replacement = self.rules_dir / ".concurrent-expected-live"
             replacement.write_bytes(NEW_RULES)
             replacement.chmod(0o640)
@@ -8047,6 +8056,620 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 terminal.read_bytes(),
                 conflicting_terminal["payload"],
             )
+
+    def run_pre_receipt_signal_boundary_child(
+        self,
+        boundary: str,
+        signum: int,
+    ) -> dict[str, object]:
+        result_path = self.root / (
+            f"pre-receipt-{boundary}-{signal.Signals(signum).name}.json"
+        )
+        child_pid = os.fork()
+        if child_pid == 0:
+            try:
+                previous_handlers = {
+                    managed: signal.getsignal(managed)
+                    for managed in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+                }
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                active_role: str | None = None
+                active_parent_fd: int | None = None
+                validation_counts: dict[str, int] = {}
+                injected = False
+                lifecycle: list[str] = []
+                conflict_identity: dict[str, int] | None = None
+                created_fds: dict[int, str] = {}
+                real_write_prepared = TRANSACTION.write_prepared_candidate
+                real_reserve_terminal = TRANSACTION.reserve_recovery_terminal
+                real_write_receipt = TRANSACTION.write_receipt
+                real_write_exclusive = TRANSACTION._write_exclusive_bound
+                real_write = TRANSACTION.os.write
+                real_fsync = TRANSACTION.os.fsync
+                real_validate = TRANSACTION.validate_bound_regular_file
+                real_close = TRANSACTION.close_descriptors_best_effort
+                real_complete = TRANSACTION._complete_validator_signal_ownership_handoff
+
+                def inject(target: str) -> None:
+                    nonlocal injected
+                    if boundary == target and not injected:
+                        injected = True
+                        os.kill(os.getpid(), signum)
+
+                def instrument_write(fd: int, payload: bytes) -> int:
+                    written = real_write(fd, payload)
+                    if active_role is not None:
+                        inject(f"{active_role}_write")
+                    return written
+
+                def instrument_fsync(fd: int) -> None:
+                    real_fsync(fd)
+                    if active_role is None or active_parent_fd is None:
+                        return
+                    inject(
+                        f"{active_role}_"
+                        + ("parent_fsync" if fd == active_parent_fd else "file_fsync")
+                    )
+
+                def instrument_validate(
+                    binding: object,
+                    parent: object,
+                    *,
+                    label: str,
+                    max_bytes: int = TRANSACTION.MAX_RULES_BYTES,
+                ) -> object:
+                    value = real_validate(
+                        binding,
+                        parent,
+                        label=label,
+                        max_bytes=max_bytes,
+                    )
+                    if label != active_role:
+                        return value
+                    count = validation_counts.get(label, 0) + 1
+                    validation_counts[label] = count
+                    inject(
+                        f"{active_role}_"
+                        + ("initial_validation" if count == 1 else "postvalidation")
+                    )
+                    return value
+
+                def instrument_exclusive(
+                    path: Path,
+                    payload: bytes,
+                    *,
+                    mode: int = 0o600,
+                    uid: int | None = None,
+                    gid: int | None = None,
+                    directory_fd: int | None = None,
+                    name: str | None = None,
+                    on_created: Callable[[int], None] | None = None,
+                ) -> tuple[int, object]:
+                    callback = on_created
+                    if active_role == "receipt":
+                        original_callback = callback
+
+                        def receipt_created(fd: int) -> None:
+                            if original_callback is not None:
+                                original_callback(fd)
+                            created_fds[fd] = "receipt"
+                            inject("receipt_create")
+
+                        callback = receipt_created
+                    return real_write_exclusive(
+                        path,
+                        payload,
+                        mode=mode,
+                        uid=uid,
+                        gid=gid,
+                        directory_fd=directory_fd,
+                        name=name,
+                        on_created=callback,
+                    )
+
+                def instrument_prepared(
+                    path: Path,
+                    payload: bytes,
+                    *,
+                    parent: object,
+                    policy: object,
+                    on_created: Callable[[int], None] | None = None,
+                ) -> object:
+                    nonlocal active_parent_fd
+                    nonlocal active_role
+                    assert isinstance(parent, TRANSACTION.BoundDirectory)
+
+                    def prepared_created(fd: int) -> None:
+                        if on_created is not None:
+                            on_created(fd)
+                        created_fds[fd] = "prepared_candidate"
+                        inject("prepared_candidate_create")
+
+                    active_role = "prepared_candidate"
+                    active_parent_fd = parent.fd
+                    try:
+                        value = real_write_prepared(
+                            path,
+                            payload,
+                            parent=parent,
+                            policy=policy,
+                            on_created=prepared_created,
+                        )
+                        inject("prepared_candidate_binding")
+                        return value
+                    finally:
+                        active_role = None
+                        active_parent_fd = None
+
+                def instrument_terminal(
+                    path: Path,
+                    *,
+                    transaction_id: str,
+                    parent: object,
+                    on_created: Callable[[int], None] | None = None,
+                ) -> object:
+                    nonlocal active_parent_fd
+                    nonlocal active_role
+                    nonlocal conflict_identity
+                    assert isinstance(parent, TRANSACTION.BoundDirectory)
+                    if boundary in (
+                        "recovery_terminal_conflict",
+                        "late_signal_after_recovery",
+                    ):
+                        if boundary == "recovery_terminal_conflict":
+                            inject(boundary)
+                        conflict_payload = b"signal-conflict-terminal\n"
+                        path.write_bytes(conflict_payload)
+                        path.chmod(0o600)
+                        conflict_stat = path.stat()
+                        conflict_identity = {
+                            "device": conflict_stat.st_dev,
+                            "inode": conflict_stat.st_ino,
+                        }
+
+                    def terminal_created(fd: int) -> None:
+                        if on_created is not None:
+                            on_created(fd)
+                        created_fds[fd] = "recovery_terminal"
+                        inject("recovery_terminal_create")
+
+                    active_role = "recovery_terminal"
+                    active_parent_fd = parent.fd
+                    try:
+                        value = real_reserve_terminal(
+                            path,
+                            transaction_id=transaction_id,
+                            parent=parent,
+                            on_created=terminal_created,
+                        )
+                        inject("recovery_terminal_binding")
+                        return value
+                    finally:
+                        active_role = None
+                        active_parent_fd = None
+
+                def instrument_receipt(
+                    path: Path,
+                    payload: dict[str, object],
+                    parent: object,
+                ) -> object:
+                    nonlocal active_parent_fd
+                    nonlocal active_role
+                    assert isinstance(parent, TRANSACTION.BoundDirectory)
+                    active_role = "receipt"
+                    active_parent_fd = parent.fd
+                    try:
+                        value = real_write_receipt(path, payload, parent)
+                        inject("receipt_binding")
+                        return value
+                    finally:
+                        active_role = None
+                        active_parent_fd = None
+
+                def instrument_close(
+                    descriptors: list[tuple[str, int]],
+                    *,
+                    release_uncertain: bool = False,
+                ) -> list[dict[str, object]]:
+                    lifecycle.append("descriptor_cleanup")
+                    lifecycle.extend(
+                        f"created_descriptor_cleanup:{created_fds[fd]}"
+                        for _descriptor, fd in descriptors
+                        if fd in created_fds
+                    )
+                    return real_close(
+                        descriptors,
+                        release_uncertain=release_uncertain,
+                    )
+
+                def instrument_complete(
+                    handoff: object,
+                ) -> list[dict[str, object]]:
+                    lifecycle.append("handler_restore")
+                    if boundary == "late_signal_after_recovery":
+                        inject(boundary)
+                    return real_complete(handoff)
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "write_prepared_candidate",
+                        side_effect=instrument_prepared,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "reserve_recovery_terminal",
+                        side_effect=instrument_terminal,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "write_receipt",
+                        side_effect=instrument_receipt,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_write_exclusive_bound",
+                        side_effect=instrument_exclusive,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION.os,
+                        "write",
+                        side_effect=instrument_write,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION.os,
+                        "fsync",
+                        side_effect=instrument_fsync,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "validate_bound_regular_file",
+                        side_effect=instrument_validate,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "close_descriptors_best_effort",
+                        side_effect=instrument_close,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "_complete_validator_signal_ownership_handoff",
+                        side_effect=instrument_complete,
+                    ),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    code = TRANSACTION.main(self.apply_argv())
+
+                handlers_restored = all(
+                    signal.getsignal(managed) == previous_handlers[managed]
+                    for managed in TRANSACTION.MANAGED_VALIDATOR_SIGNALS
+                )
+                mask_restored = (
+                    signal.pthread_sigmask(signal.SIG_BLOCK, set()) == previous_mask
+                )
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "code": code,
+                            "payload": json.loads(stdout.getvalue()),
+                            "stderr": stderr.getvalue(),
+                            "injected": injected,
+                            "handlers_restored": handlers_restored,
+                            "mask_restored": mask_restored,
+                            "lifecycle": lifecycle,
+                            "conflict_identity": conflict_identity,
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                os._exit(0)
+            except BaseException as error:
+                try:
+                    result_path.write_text(
+                        json.dumps(
+                            {
+                                "child_error": type(error).__name__,
+                                "message": str(error),
+                            },
+                            sort_keys=True,
+                        ),
+                        encoding="utf-8",
+                    )
+                finally:
+                    os._exit(97)
+
+        deadline = time.monotonic() + 8
+        child_status: int | None = None
+        while time.monotonic() < deadline:
+            waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if waited_pid == child_pid:
+                child_status = status
+                break
+            time.sleep(0.01)
+        if child_status is None:
+            os.kill(child_pid, signal.SIGKILL)
+            _waited_pid, child_status = os.waitpid(child_pid, 0)
+            self.fail(f"signal boundary child timed out: {boundary}")
+        result = (
+            json.loads(result_path.read_text(encoding="utf-8"))
+            if result_path.exists()
+            else {}
+        )
+        self.assertTrue(
+            os.WIFEXITED(child_status),
+            {"boundary": boundary, "status": child_status, "result": result},
+        )
+        self.assertEqual(
+            os.WEXITSTATUS(child_status),
+            0,
+            {"boundary": boundary, "result": result},
+        )
+        return result
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(os, "fork")
+        and hasattr(signal, "pthread_sigmask"),
+        "pre-receipt signal capture requires POSIX fork and signal masks",
+    )
+    def test_managed_signals_at_each_pre_receipt_boundary_publish_recovery(
+        self,
+    ) -> None:
+        boundaries = (
+            "prepared_candidate_create",
+            "prepared_candidate_write",
+            "prepared_candidate_file_fsync",
+            "prepared_candidate_initial_validation",
+            "prepared_candidate_parent_fsync",
+            "prepared_candidate_postvalidation",
+            "prepared_candidate_binding",
+            "recovery_terminal_create",
+            "recovery_terminal_write",
+            "recovery_terminal_file_fsync",
+            "recovery_terminal_initial_validation",
+            "recovery_terminal_parent_fsync",
+            "recovery_terminal_postvalidation",
+            "recovery_terminal_binding",
+            "receipt_create",
+            "receipt_write",
+            "receipt_file_fsync",
+            "receipt_initial_validation",
+            "receipt_parent_fsync",
+            "receipt_postvalidation",
+            "receipt_binding",
+        )
+        for signum in TRANSACTION.MANAGED_VALIDATOR_SIGNALS:
+            for boundary in boundaries:
+                with (
+                    self.subTest(
+                        signal=signal.Signals(signum).name,
+                        boundary=boundary,
+                    ),
+                    tempfile.TemporaryDirectory(
+                        prefix=f"rules-pre-receipt-{boundary}."
+                    ) as isolated,
+                ):
+                    self.configure_isolated_case(Path(isolated))
+                    self.write_validator("raise SystemExit(0)\n")
+                    result = self.run_pre_receipt_signal_boundary_child(
+                        boundary,
+                        signum,
+                    )
+
+                    self.assertTrue(result["injected"], result)
+                    self.assertEqual(result["code"], 128 + signum)
+                    self.assertEqual(result["stderr"], "")
+                    self.assertTrue(result["handlers_restored"])
+                    self.assertTrue(result["mask_restored"])
+                    payload = result["payload"]
+                    self.assertEqual(payload["status"], "interrupted")
+                    self.assertEqual(payload["signal"], signum)
+                    self.assertEqual(
+                        payload["interrupted_phase"],
+                        "pre_receipt_publication",
+                    )
+                    recovery = payload["pre_receipt_recovery"]
+                    self.assertEqual(recovery["status"], "recovery_required")
+                    self.assertEqual(
+                        recovery["operation_status"],
+                        "receipt_bound",
+                        result,
+                    )
+                    self.assertEqual(
+                        recovery["receipt_bound_state"]["state"],
+                        "receipt_bound_pre_exchange",
+                    )
+                    self.assertTrue(
+                        recovery["publication_state"]["receipt_binding_returned"]
+                    )
+                    self.assertFalse(recovery["publication_state"]["exchange_started"])
+                    self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                    self.assertFalse(self.backup.exists())
+                    self.assertTrue(self.receipt.is_file())
+                    self.assertEqual(
+                        TRANSACTION.prepared_candidate_path(self.receipt).read_bytes(),
+                        NEW_RULES,
+                    )
+                    terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+                    self.assertTrue(terminal.is_file())
+                    self.assertFalse(
+                        TRANSACTION.recovery_terminal_result_path(terminal).exists()
+                    )
+                    self.assert_no_private_stage()
+                    lifecycle = result["lifecycle"]
+                    self.assertIn("handler_restore", lifecycle)
+                    handler_restore_index = lifecycle.index("handler_restore")
+                    for role in (
+                        "prepared_candidate",
+                        "recovery_terminal",
+                        "receipt",
+                    ):
+                        cleanup_event = f"created_descriptor_cleanup:{role}"
+                        self.assertIn(cleanup_event, lifecycle)
+                        self.assertLess(
+                            lifecycle.index(cleanup_event),
+                            handler_restore_index,
+                        )
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(os, "fork")
+        and hasattr(signal, "pthread_sigmask"),
+        "pre-receipt signal capture requires POSIX fork and signal masks",
+    )
+    def test_pre_receipt_signal_preserves_terminal_create_conflict(
+        self,
+    ) -> None:
+        for signum in TRANSACTION.MANAGED_VALIDATOR_SIGNALS:
+            with (
+                self.subTest(signal=signal.Signals(signum).name),
+                tempfile.TemporaryDirectory(
+                    prefix="rules-pre-receipt-terminal-conflict."
+                ) as isolated,
+            ):
+                self.configure_isolated_case(Path(isolated))
+                self.write_validator("raise SystemExit(0)\n")
+                result = self.run_pre_receipt_signal_boundary_child(
+                    "recovery_terminal_conflict",
+                    signum,
+                )
+
+                self.assertTrue(result["injected"])
+                self.assertEqual(result["code"], 128 + signum)
+                self.assertTrue(result["handlers_restored"])
+                self.assertTrue(result["mask_restored"])
+                payload = result["payload"]
+                self.assertEqual(payload["status"], "interrupted")
+                recovery = payload["pre_receipt_recovery"]
+                self.assertEqual(
+                    recovery["operation_status"],
+                    "pre_receipt_created",
+                )
+                self.assertEqual(
+                    recovery["pre_receipt_created_state"]["state"],
+                    "prepared_created_terminal_conflict",
+                )
+                failure = recovery["pre_receipt_failure"]
+                self.assertEqual(failure["status"], "recovery_terminal_exists")
+                self.assertEqual(
+                    failure["conflicting_object"]["ownership"],
+                    "not_created_by_transaction",
+                )
+                terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+                terminal_stat = terminal.stat()
+                self.assertEqual(
+                    result["conflict_identity"],
+                    {
+                        "device": terminal_stat.st_dev,
+                        "inode": terminal_stat.st_ino,
+                    },
+                )
+                self.assertEqual(
+                    terminal.read_bytes(),
+                    b"signal-conflict-terminal\n",
+                )
+                self.assertEqual(
+                    stat.S_IMODE(terminal_stat.st_mode),
+                    0o600,
+                )
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertFalse(self.backup.exists())
+                self.assertFalse(self.receipt.exists())
+                self.assert_no_private_stage()
+                lifecycle = result["lifecycle"]
+                prepared_cleanup = "created_descriptor_cleanup:prepared_candidate"
+                self.assertIn(prepared_cleanup, lifecycle)
+                self.assertIn("handler_restore", lifecycle)
+                self.assertLess(
+                    lifecycle.index(prepared_cleanup),
+                    lifecycle.index("handler_restore"),
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(os, "fork")
+        and hasattr(signal, "pthread_sigmask"),
+        "pre-receipt signal capture requires POSIX fork and signal masks",
+    )
+    def test_late_pre_receipt_signal_inherits_exact_recovery_evidence(
+        self,
+    ) -> None:
+        for signum in TRANSACTION.MANAGED_VALIDATOR_SIGNALS:
+            with (
+                self.subTest(signal=signal.Signals(signum).name),
+                tempfile.TemporaryDirectory(
+                    prefix="rules-late-pre-receipt-signal."
+                ) as isolated,
+            ):
+                self.configure_isolated_case(Path(isolated))
+                self.write_validator("raise SystemExit(0)\n")
+                result = self.run_pre_receipt_signal_boundary_child(
+                    "late_signal_after_recovery",
+                    signum,
+                )
+
+                self.assertTrue(result["injected"], result)
+                self.assertEqual(result["code"], 128 + signum)
+                self.assertTrue(result["handlers_restored"])
+                self.assertTrue(result["mask_restored"])
+                payload = result["payload"]
+                self.assertEqual(payload["status"], "interrupted")
+                self.assertEqual(
+                    payload["interrupted_phase"],
+                    "pre_receipt_publication",
+                )
+                recovery = payload["pre_receipt_recovery"]
+                self.assertEqual(recovery["status"], "recovery_required")
+                self.assertEqual(
+                    recovery["operation_status"],
+                    "pre_receipt_created",
+                )
+                self.assertEqual(
+                    recovery["pre_receipt_failure"]["status"],
+                    "recovery_terminal_exists",
+                )
+                self.assertEqual(
+                    payload["recovery_locators"],
+                    recovery["recovery_locators"],
+                )
+                self.assertEqual(
+                    Path(payload["receipt_path"]).resolve(strict=False),
+                    self.receipt.resolve(strict=False),
+                )
+                terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+                terminal_stat = terminal.stat()
+                self.assertEqual(
+                    result["conflict_identity"],
+                    {
+                        "device": terminal_stat.st_dev,
+                        "inode": terminal_stat.st_ino,
+                    },
+                )
+                self.assertEqual(
+                    terminal.read_bytes(),
+                    b"signal-conflict-terminal\n",
+                )
+                self.assertEqual(stat.S_IMODE(terminal_stat.st_mode), 0o600)
+                self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+                self.assertFalse(self.backup.exists())
+                self.assertFalse(self.receipt.exists())
+                self.assert_no_private_stage()
+                lifecycle = result["lifecycle"]
+                prepared_cleanup = "created_descriptor_cleanup:prepared_candidate"
+                self.assertIn(prepared_cleanup, lifecycle)
+                self.assertIn("handler_restore", lifecycle)
+                self.assertLess(
+                    lifecycle.index(prepared_cleanup),
+                    lifecycle.index("handler_restore"),
+                )
 
     def test_prepared_parent_fsync_failure_retains_recovery_locator(self) -> None:
         self.assert_pre_receipt_creation_fault_is_recoverable("prepared_parent_fsync")

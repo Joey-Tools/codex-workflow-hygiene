@@ -103,6 +103,7 @@ class TransactionError(RuntimeError):
         self.status = status
         self.exit_code = exit_code
         self.details = details or {}
+        self.managed_signal_recovery_details: dict[str, object] = {}
 
 
 class ForwardedValidatorSignal(Exception):
@@ -5621,6 +5622,37 @@ def _restore_validator_signal_supervision(
     return failures
 
 
+def _start_deferred_managed_signal_capture(
+    deferred_signal_handoffs: list[ValidatorSignalOwnershipHandoff],
+    *,
+    phase: str,
+) -> ValidatorSignalOwnershipHandoff:
+    """Install a capture-only handoff when no validator handoff is available."""
+
+    (
+        gate,
+        previous_handlers,
+        inherited_mask,
+        _supervisor_mask,
+    ) = _start_validator_signal_supervision()
+    handoff = ValidatorSignalOwnershipHandoff(
+        gate,
+        previous_handlers,
+        inherited_mask,
+    )
+    deferred_signal_handoffs.append(handoff)
+    failures = _prepare_validator_signal_ownership_handoff(handoff)
+    if failures:
+        raise TransactionError(
+            f"{phase}_signal_supervision_failed",
+            f"managed-signal capture could not be established for {phase}",
+            details={"validator_cleanup_failures": failures},
+        )
+    if gate.pending_signum in MANAGED_VALIDATOR_SIGNALS:
+        handoff.forwarded_signal = ForwardedValidatorSignal(gate.pending_signum)
+    return handoff
+
+
 class AnonymousValidatorInput:
     """Descriptor-backed, unnamed copy used only by the first validator."""
 
@@ -8251,6 +8283,8 @@ def _apply_transaction_inner(
     receipt_publication_state = "not_reserved"
     transaction_id: str | None = None
     pre_receipt_created_objects: dict[str, dict[str, object]] = {}
+    pre_receipt_signal_handoff: ValidatorSignalOwnershipHandoff | None = None
+    pre_receipt_publication_active = False
 
     def apply_recovery_locators() -> dict[str, str]:
         return {
@@ -8350,8 +8384,25 @@ def _apply_transaction_inner(
             ),
         }
 
+    def mark_pre_receipt_signal_recovery(
+        recovery_error: TransactionError,
+    ) -> TransactionError:
+        recovery_error.managed_signal_recovery_details = {
+            "interrupted_phase": "pre_receipt_publication",
+            "receipt_path": str(receipt),
+            "backup_path": str(backup),
+            "recovery_locators": apply_recovery_locators(),
+            "pre_receipt_recovery": {
+                "exit_code": recovery_error.exit_code,
+                "status": recovery_error.status,
+                "message": str(recovery_error),
+                **recovery_error.details,
+            },
+        }
+        return recovery_error
+
     def pre_receipt_publication_recovery_error(
-        error: OSError | TransactionError,
+        error: BaseException,
     ) -> TransactionError:
         parent = (
             evidence.receipt_parent if evidence is not None else receipt_parent_binding
@@ -8385,12 +8436,71 @@ def _apply_transaction_inner(
             "status": (
                 error.status
                 if isinstance(error, TransactionError)
-                else "pre_receipt_io_failed"
+                else (
+                    "pre_receipt_io_failed"
+                    if isinstance(error, OSError)
+                    else "pre_receipt_interrupted"
+                )
             ),
             "message": str(error),
+            "error_type": type(error).__name__,
             **(error.details if isinstance(error, TransactionError) else {}),
             **structured_secondary_failure_evidence(error),
         }
+        if evidence is not None and evidence.receipt is not None:
+            receipt_observation = observe_directory_entry(
+                parent.fd,
+                evidence.receipt.name,
+                expected=evidence.receipt.snapshot,
+            )
+            return mark_pre_receipt_signal_recovery(
+                TransactionError(
+                    "recovery_required",
+                    (
+                        "recovery receipt was created before pre-receipt "
+                        "publication reached a signal-safe terminal state"
+                    ),
+                    exit_code=EXIT_POST_REPLACE_FAILED,
+                    details={
+                        "operation_status": "receipt_bound",
+                        "reason": (
+                            "pre_receipt_publication_interrupted"
+                            if isinstance(
+                                error,
+                                (ForwardedValidatorSignal, KeyboardInterrupt),
+                            )
+                            else (
+                                error.status
+                                if isinstance(error, TransactionError)
+                                else "receipt_postpublication_incomplete"
+                            )
+                        ),
+                        "transaction_id": transaction_id,
+                        "receipt_bound_state": {
+                            "state": "receipt_bound_pre_exchange",
+                            "receipt_binding_returned": True,
+                            "receipt": {
+                                "path": str(evidence.receipt.path),
+                                "expected": evidence.receipt.snapshot.to_json(),
+                                "observation": receipt_observation,
+                            },
+                            "created_objects": created_objects,
+                            "namespace_observations": namespace_observations,
+                        },
+                        "pre_receipt_failure": failure,
+                        "publication_state": {
+                            "created_roles": sorted(created_objects),
+                            "receipt_binding_returned": True,
+                            "exchange_started": False,
+                        },
+                        "receipt_path": str(receipt),
+                        "backup_path": str(backup),
+                        "prepared_candidate_path": str(prepared_recovery_candidate),
+                        "recovery_terminal_path": str(recovery_terminal),
+                        "recovery_locators": apply_recovery_locators(),
+                    },
+                )
+            )
         if receipt_publication_state == "pre_receipt_reserved":
             if evidence is None:
                 raise AssertionError("pre-receipt reservation requires bound evidence")
@@ -8404,48 +8514,52 @@ def _apply_transaction_inner(
                 evidence.recovery_terminal.name,
                 expected=evidence.recovery_terminal.snapshot,
             )
-            return TransactionError(
-                "recovery_required",
-                (
-                    "prepared candidate and recovery terminal were reserved before "
-                    "receipt publication reached a bound terminal state"
-                ),
-                exit_code=EXIT_POST_REPLACE_FAILED,
-                details={
-                    "operation_status": "pre_receipt_reserved",
-                    "reason": "receipt_publication_incomplete",
-                    "transaction_id": transaction_id,
-                    "pre_receipt_reserved_state": {
-                        "state": "prepared_and_terminal_reserved_receipt_unbound",
-                        "terminal_disposition": "retained_for_explicit_recovery",
-                        "receipt_binding_returned": False,
-                        "receipt_observation": receipt_observation,
-                        "prepared_candidate": {
-                            "path": str(evidence.prepared_candidate.path),
-                            "expected": (
-                                evidence.prepared_candidate.snapshot.to_json()
-                            ),
-                            "observation": prepared_observation,
+            return mark_pre_receipt_signal_recovery(
+                TransactionError(
+                    "recovery_required",
+                    (
+                        "prepared candidate and recovery terminal were reserved before "
+                        "receipt publication reached a bound terminal state"
+                    ),
+                    exit_code=EXIT_POST_REPLACE_FAILED,
+                    details={
+                        "operation_status": "pre_receipt_reserved",
+                        "reason": "receipt_publication_incomplete",
+                        "transaction_id": transaction_id,
+                        "pre_receipt_reserved_state": {
+                            "state": "prepared_and_terminal_reserved_receipt_unbound",
+                            "terminal_disposition": "retained_for_explicit_recovery",
+                            "receipt_binding_returned": False,
+                            "receipt_observation": receipt_observation,
+                            "prepared_candidate": {
+                                "path": str(evidence.prepared_candidate.path),
+                                "expected": (
+                                    evidence.prepared_candidate.snapshot.to_json()
+                                ),
+                                "observation": prepared_observation,
+                            },
+                            "recovery_terminal": {
+                                "path": str(evidence.recovery_terminal.path),
+                                "expected": (
+                                    evidence.recovery_terminal.snapshot.to_json()
+                                ),
+                                "observation": terminal_observation,
+                            },
+                            "created_objects": created_objects,
+                            "namespace_observations": namespace_observations,
                         },
-                        "recovery_terminal": {
-                            "path": str(evidence.recovery_terminal.path),
-                            "expected": (evidence.recovery_terminal.snapshot.to_json()),
-                            "observation": terminal_observation,
+                        "receipt_failure": failure,
+                        "publication_state": {
+                            "receipt_binding_returned": False,
+                            "exchange_started": False,
                         },
-                        "created_objects": created_objects,
-                        "namespace_observations": namespace_observations,
+                        "receipt_path": str(receipt),
+                        "backup_path": str(backup),
+                        "prepared_candidate_path": str(prepared_recovery_candidate),
+                        "recovery_terminal_path": str(recovery_terminal),
+                        "recovery_locators": apply_recovery_locators(),
                     },
-                    "receipt_failure": failure,
-                    "publication_state": {
-                        "receipt_binding_returned": False,
-                        "exchange_started": False,
-                    },
-                    "receipt_path": str(receipt),
-                    "backup_path": str(backup),
-                    "prepared_candidate_path": str(prepared_recovery_candidate),
-                    "recovery_terminal_path": str(recovery_terminal),
-                    "recovery_locators": apply_recovery_locators(),
-                },
+                )
             )
         created_roles = sorted(created_objects)
         failure_status = failure["status"]
@@ -8460,48 +8574,76 @@ def _apply_transaction_inner(
             state = "prepared_and_terminal_created_receipt_unbound"
         else:
             state = "created_objects_receipt_unbound"
-        return TransactionError(
-            "recovery_required",
-            (
-                "one or more transaction objects were created before receipt "
-                "publication reached a bound terminal state"
-            ),
-            exit_code=EXIT_POST_REPLACE_FAILED,
-            details={
-                "operation_status": "pre_receipt_created",
-                "reason": "pre_receipt_publication_incomplete",
-                "transaction_id": transaction_id,
-                "pre_receipt_created_state": {
-                    "state": state,
-                    "created_object_disposition": ("retained_for_explicit_recovery"),
-                    **(
-                        {
-                            "conflicting_object_disposition": (
-                                "preserved_not_owned_by_transaction"
-                            )
-                        }
-                        if failure_status == "recovery_terminal_exists"
-                        else {}
-                    ),
-                    "receipt_binding_returned": False,
-                    "receipt_observation": receipt_observation,
-                    "created_roles": created_roles,
-                    "created_objects": created_objects,
-                    "namespace_observations": namespace_observations,
+        return mark_pre_receipt_signal_recovery(
+            TransactionError(
+                "recovery_required",
+                (
+                    "one or more transaction objects were created before receipt "
+                    "publication reached a bound terminal state"
+                ),
+                exit_code=EXIT_POST_REPLACE_FAILED,
+                details={
+                    "operation_status": "pre_receipt_created",
+                    "reason": "pre_receipt_publication_incomplete",
+                    "transaction_id": transaction_id,
+                    "pre_receipt_created_state": {
+                        "state": state,
+                        "created_object_disposition": (
+                            "retained_for_explicit_recovery"
+                        ),
+                        **(
+                            {
+                                "conflicting_object_disposition": (
+                                    "preserved_not_owned_by_transaction"
+                                )
+                            }
+                            if failure_status == "recovery_terminal_exists"
+                            else {}
+                        ),
+                        "receipt_binding_returned": False,
+                        "receipt_observation": receipt_observation,
+                        "created_roles": created_roles,
+                        "created_objects": created_objects,
+                        "namespace_observations": namespace_observations,
+                    },
+                    "pre_receipt_failure": failure,
+                    "publication_state": {
+                        "created_roles": created_roles,
+                        "receipt_binding_returned": False,
+                        "exchange_started": False,
+                    },
+                    "receipt_path": str(receipt),
+                    "backup_path": str(backup),
+                    "prepared_candidate_path": str(prepared_recovery_candidate),
+                    "recovery_terminal_path": str(recovery_terminal),
+                    "recovery_locators": apply_recovery_locators(),
                 },
-                "pre_receipt_failure": failure,
-                "publication_state": {
-                    "created_roles": created_roles,
-                    "receipt_binding_returned": False,
-                    "exchange_started": False,
-                },
-                "receipt_path": str(receipt),
-                "backup_path": str(backup),
-                "prepared_candidate_path": str(prepared_recovery_candidate),
-                "recovery_terminal_path": str(recovery_terminal),
-                "recovery_locators": apply_recovery_locators(),
-            },
+            )
         )
+
+    def bind_pre_receipt_signal_recovery(
+        event: ForwardedValidatorSignal,
+        recovery_error: TransactionError,
+    ) -> None:
+        if not recovery_error.managed_signal_recovery_details:
+            mark_pre_receipt_signal_recovery(recovery_error)
+        event.recovery_details = dict(recovery_error.managed_signal_recovery_details)
+
+    def refresh_pre_receipt_signal_capture() -> list[dict[str, object]]:
+        if pre_receipt_signal_handoff is None:
+            return []
+        failures = _prepare_validator_signal_ownership_handoff(
+            pre_receipt_signal_handoff
+        )
+        if (
+            pre_receipt_signal_handoff.forwarded_signal is None
+            and pre_receipt_signal_handoff.gate.pending_signum
+            in MANAGED_VALIDATOR_SIGNALS
+        ):
+            pre_receipt_signal_handoff.forwarded_signal = ForwardedValidatorSignal(
+                pre_receipt_signal_handoff.gate.pending_signum
+            )
+        return failures
 
     def bind_post_replace_signal_recovery(
         recovery: dict[str, object],
@@ -8862,12 +9004,31 @@ def _apply_transaction_inner(
         # rules-parent stage exists until the copy and the caller-owned audited
         # source have both survived full protected-property revalidation.
         with AnonymousValidatorInput(candidate_bytes) as validation_input:
+            handoff_count = len(deferred_signal_handoffs)
             pre_validation = run_validator(
                 args.validator_command,
                 validation_input.path,
                 timeout_seconds=args.validator_timeout_seconds,
                 pass_fds=(validation_input.fd,),
+                deferred_signal_handoffs=deferred_signal_handoffs,
             )
+            if len(deferred_signal_handoffs) == handoff_count:
+                pre_receipt_signal_handoff = _start_deferred_managed_signal_capture(
+                    deferred_signal_handoffs,
+                    phase="pre_receipt_publication",
+                )
+            elif len(deferred_signal_handoffs) == handoff_count + 1:
+                pre_receipt_signal_handoff = deferred_signal_handoffs[-1]
+            else:
+                raise TransactionError(
+                    "pre_receipt_signal_handoff_ambiguous",
+                    (
+                        "candidate validation returned more than one new "
+                        "managed-signal handoff"
+                    ),
+                )
+            if pre_receipt_signal_handoff.forwarded_signal is not None:
+                raise pre_receipt_signal_handoff.forwarded_signal
             validation_input.validate()
             revalidate_candidate_source(
                 candidate_source,
@@ -9048,6 +9209,24 @@ def _apply_transaction_inner(
                 source_snapshot,
                 candidate_sha256=candidate_sha256,
             )
+            signal_capture_failures = refresh_pre_receipt_signal_capture()
+            if signal_capture_failures:
+                raise TransactionError(
+                    "pre_receipt_publication_signal_handoff_failed",
+                    (
+                        "managed-signal capture could not be revalidated "
+                        "before prepared-candidate publication"
+                    ),
+                    details={
+                        "validator_cleanup_failures": signal_capture_failures,
+                    },
+                )
+            if (
+                pre_receipt_signal_handoff is not None
+                and pre_receipt_signal_handoff.forwarded_signal is not None
+            ):
+                raise pre_receipt_signal_handoff.forwarded_signal
+            pre_receipt_publication_active = True
             prepared_binding = write_prepared_candidate(
                 prepared_recovery_candidate,
                 candidate_bytes,
@@ -9107,6 +9286,61 @@ def _apply_transaction_inner(
             )
             receipt_publication_state = "receipt_bound"
             evidence.validate()
+            signal_capture_failures = refresh_pre_receipt_signal_capture()
+            if signal_capture_failures:
+                raise TransactionError(
+                    "pre_receipt_publication_signal_handoff_failed",
+                    (
+                        "managed-signal capture could not be revalidated after "
+                        "receipt publication"
+                    ),
+                    details={
+                        "validator_cleanup_failures": signal_capture_failures,
+                    },
+                )
+            if (
+                pre_receipt_signal_handoff is not None
+                and pre_receipt_signal_handoff.forwarded_signal is not None
+            ):
+                signal_event = pre_receipt_signal_handoff.forwarded_signal
+                recovery_error = pre_receipt_publication_recovery_error(signal_event)
+                bind_pre_receipt_signal_recovery(
+                    signal_event,
+                    recovery_error,
+                )
+                raise recovery_error from signal_event
+            assert pre_receipt_signal_handoff is not None
+            signal_capture_failures = _complete_validator_signal_ownership_handoff(
+                pre_receipt_signal_handoff
+            )
+            if (
+                pre_receipt_signal_handoff.forwarded_signal is None
+                and pre_receipt_signal_handoff.gate.pending_signum
+                in MANAGED_VALIDATOR_SIGNALS
+            ):
+                pre_receipt_signal_handoff.forwarded_signal = ForwardedValidatorSignal(
+                    pre_receipt_signal_handoff.gate.pending_signum
+                )
+            if signal_capture_failures:
+                raise TransactionError(
+                    "pre_receipt_publication_signal_handoff_failed",
+                    (
+                        "managed-signal handlers or mask could not be restored "
+                        "after receipt publication"
+                    ),
+                    details={
+                        "validator_cleanup_failures": signal_capture_failures,
+                    },
+                )
+            if pre_receipt_signal_handoff.forwarded_signal is not None:
+                signal_event = pre_receipt_signal_handoff.forwarded_signal
+                recovery_error = pre_receipt_publication_recovery_error(signal_event)
+                bind_pre_receipt_signal_recovery(
+                    signal_event,
+                    recovery_error,
+                )
+                raise recovery_error from signal_event
+            pre_receipt_publication_active = False
 
             stage = PrivateStage(
                 rules.parent,
@@ -9638,12 +9872,34 @@ def _apply_transaction_inner(
         ) or (stage is not None and stage.mutation_uncertain):
             retain_stage = True
         if (
-            receipt_publication_state in ("pre_receipt_created", "pre_receipt_reserved")
+            receipt_publication_state
+            in ("pre_receipt_created", "pre_receipt_reserved", "receipt_bound")
             and pre_receipt_created_objects
-            and (evidence is None or evidence.receipt is None)
-            and isinstance(error, (OSError, TransactionError))
+            and pre_receipt_publication_active
         ):
-            raise pre_receipt_publication_recovery_error(error) from error
+            signal_capture_failures = refresh_pre_receipt_signal_capture()
+            if signal_capture_failures:
+                attach_failures_to_exception(
+                    error,
+                    "validator_cleanup_failures",
+                    signal_capture_failures,
+                )
+            recovery_error = pre_receipt_publication_recovery_error(error)
+            signal_event: ForwardedValidatorSignal | None = None
+            if isinstance(error, ForwardedValidatorSignal):
+                signal_event = error
+            elif isinstance(error, KeyboardInterrupt):
+                signal_event = ForwardedValidatorSignal(signal.SIGINT)
+            elif pre_receipt_signal_handoff is not None:
+                signal_event = pre_receipt_signal_handoff.forwarded_signal
+            if signal_event is not None:
+                assert pre_receipt_signal_handoff is not None
+                pre_receipt_signal_handoff.forwarded_signal = signal_event
+                bind_pre_receipt_signal_recovery(
+                    signal_event,
+                    recovery_error,
+                )
+            raise recovery_error from error
         if (
             evidence is not None
             and evidence.receipt is not None
@@ -9730,6 +9986,14 @@ def apply_transaction(args: argparse.Namespace) -> tuple[int, dict[str, object]]
                 )
 
     if signal_event is not None:
+        if (
+            not signal_event.recovery_details
+            and isinstance(primary_error, TransactionError)
+            and primary_error.managed_signal_recovery_details
+        ):
+            signal_event.recovery_details = dict(
+                primary_error.managed_signal_recovery_details
+            )
         if primary_error is not None and primary_error is not signal_event:
             signal_event.cleanup_errors.insert(
                 0,
