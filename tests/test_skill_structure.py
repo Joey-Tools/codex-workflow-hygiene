@@ -239,6 +239,40 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("Remain read-only until apply mode is authorized", cadence)
         self.assertIn("## Transaction Safety Boundary", cadence)
         self.assertIn("scripts/apply_rules_transaction.py", cadence)
+        self.assertIn(
+            "fresh recovery directory inside that parent with a restrictive umask",
+            cadence,
+        )
+        self.assertIn(
+            "same filesystem as live rules and gives it an owner-private parent",
+            cadence,
+        )
+        apply_checklist = cadence.split("## Apply Checklist", 1)[1].split(
+            "### Transaction Safety Boundary", 1
+        )[0]
+        self.assertIn("set -euo pipefail", apply_checklist)
+        self.assertIn(
+            'RECOVERY_DIR="$(umask 077; mktemp -d '
+            '"$RULES_DIR/.rules-apply-recovery.XXXXXX")"',
+            cadence,
+        )
+        self.assertIn(
+            '--receipt "$RECOVERY_DIR/rules-apply-recovery.json"',
+            cadence,
+        )
+        self.assertNotIn(
+            '--receipt "$TASK_DIR/rules-apply-recovery.json"',
+            cadence,
+        )
+        self.assertIn(
+            "do not put the receipt in an arbitrary task or `/tmp` directory",
+            transaction,
+        )
+        self.assertIn(
+            "recovery parent with the wrong owner, non-private mode, ACL, "
+            "unsupported metadata, or a different filesystem",
+            transaction,
+        )
         self.assertIn("owner-only regular file", cadence)
         self.assertIn("`st_nlink == 1`", cadence)
         self.assertIn("object identity (`device`, `inode`)", cadence)

@@ -663,3 +663,11 @@ superseded_by:
   explicit `CODEX_HOME` precedence, and resolved-source fallback. The
   Python 3.13.0 repository suite passed 1,331 tests with one capability skip,
   and the default isolated-`uv` wrapper smoke reported `Skill is valid!`.
+- Fresh whole-range Codex review of
+  `c69a0b1a92a349179ed41b0a378c08fe70e8160f..9cec773b7b07d6197d6236ef2e3e3b7103d1624d`
+  found that the apply example placed its receipt under an arbitrary task
+  directory even though the transaction requires an owner-private receipt
+  parent on the rules filesystem. The checklist now creates a fresh
+  restrictive recovery directory inside the active rules parent, keeps the
+  candidate source task-scoped, and reuses the exact receipt locator for
+  recovery.

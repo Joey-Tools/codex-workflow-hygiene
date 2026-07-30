@@ -47,16 +47,21 @@
 2. Carry forward the exact audited `default.rules` SHA-256 digest, an independent SHA-256 digest of the exact candidate bytes, the candidate bytes, selected comparison anchor, and existing policy validator. Stop before backup or replacement if any input is missing.
 3. If no content change remains, report a no-op and create nothing.
 4. Require all legitimate writers to share the transaction lock. If a rules writer cannot honor that advisory-lock protocol, prove it quiescent for the complete compare/replace/post-validation window or stop.
-5. Put the reviewed bytes in a task-scoped candidate source and run the skill-relative helper. Before reading the candidate or creating the persistent lock, the helper rejects the receipt plus every derived terminal, result, prepared-candidate, and lock path when its lexical/canonical namespace, descriptor-bound existing-directory identity, or conservative NFKC/casefold component sequence under the same bound rules parent aliases the fixed stage leaf, an ancestor, or a descendant. It also holds every relevant parent descriptor while pairwise rejecting NFKC-plus-casefold leaf collisions among rules, backup, lock, receipt, terminal, result, and prepared paths:
+5. Put the reviewed bytes in a task-scoped candidate source. Derive the active rules parent from `CODEX_HOME`, then create a fresh recovery directory inside that parent with a restrictive umask. This keeps the receipt on the same filesystem as live rules and gives it an owner-private parent; an arbitrary task directory or separately mounted `/tmp` directory does not satisfy the transaction contract. Preserve the recovery directory through every post-replace check and recovery decision. The helper still independently verifies exact owner, `0700` mode, ACL and metadata admission, parent identity, and same-filesystem placement. Before reading the candidate or creating the persistent lock, it rejects the receipt plus every derived terminal, result, prepared-candidate, and lock path when its lexical/canonical namespace, descriptor-bound existing-directory identity, or conservative NFKC/casefold component sequence under the same bound rules parent aliases the fixed stage leaf, an ancestor, or a descendant. It also holds every relevant parent descriptor while pairwise rejecting NFKC-plus-casefold leaf collisions among rules, backup, lock, receipt, terminal, result, and prepared paths:
 
 ```bash
+set -euo pipefail
+
 RULES_HYGIENE_SKILL="<loaded-codex-rules-hygiene-dir>"
+CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
+RULES_DIR="$CODEX_ROOT/rules"
+RECOVERY_DIR="$(umask 077; mktemp -d "$RULES_DIR/.rules-apply-recovery.XXXXXX")"
 python3 "$RULES_HYGIENE_SKILL/scripts/apply_rules_transaction.py" apply \
   --candidate "$TASK_DIR/default.rules.candidate" \
   --candidate-sha256 "$CANDIDATE_RULES_SHA256" \
   --expected-sha256 "$EXPECTED_RULES_SHA256" \
   --backup-name "default.rules.bak-$TIMESTAMP" \
-  --receipt "$TASK_DIR/rules-apply-recovery.json" \
+  --receipt "$RECOVERY_DIR/rules-apply-recovery.json" \
   -- <validator-argv> '{rules}'
 ```
 
@@ -66,7 +71,7 @@ python3 "$RULES_HYGIENE_SKILL/scripts/apply_rules_transaction.py" apply \
 
 ```bash
 python3 "$RULES_HYGIENE_SKILL/scripts/apply_rules_transaction.py" recover \
-  --receipt "$TASK_DIR/rules-apply-recovery.json"
+  --receipt "$RECOVERY_DIR/rules-apply-recovery.json"
 ```
 
 9. Refresh `default.rules.clean-baseline` only after a successful full cleanup with no intentionally retained drift debt.
