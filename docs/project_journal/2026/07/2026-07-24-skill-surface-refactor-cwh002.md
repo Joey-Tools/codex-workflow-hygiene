@@ -370,6 +370,15 @@ superseded_by:
   serializes `Signals` test arguments as integers, and skips only the
   `waitid`-specific fault injection when that capability is absent; the
   production observer already uses the Darwin `kqueue` fallback.
+- Validator launch failures now bind whether a child started: only a clean
+  post-exchange `Popen` failure with exact `child_started: false` enters
+  automatic rollback. Observer setup after a child starts records `true`, and
+  missing, conflicting, or cleanup-uncertain proof remains
+  `recovery_required`.
+- Receipt and recovery-terminal JSON decoders now structure recursion-depth
+  and bounded-integer `ValueError` failures alongside the existing Unicode and
+  syntax errors. Post-mutation terminal parse failures retain the
+  mutation-aware `recovery_required` envelope.
 
 ## Next Steps
 
@@ -631,3 +640,13 @@ superseded_by:
 - Final source gates passed Ruff check and format-check for all changed Python
   files, Python 3.13.0 and system Python 3.9.6 byte compilation, both affected
   skill validators, project-journal validation, and `git diff --check`.
+- The reviewer-fix matrix passed 11 methods plus the waitid-selected kqueue
+  capability skip on Python 3.13.0 and all 12 methods on system Python 3.9.6.
+  It covers clean/no-child launch rollback, missing/true/non-boolean/cleanup
+  launch proof rejection, rollback uncertainty, bare and cleanup-bearing raw
+  failures, receipt/terminal parser bounds, and post-rollback terminal parse
+  failure. The final Python 3.13.0 Rules transaction module passed 264 methods
+  plus the same single capability skip across 265 tests.
+- Final reviewer-fix gates passed Ruff check/format, Python 3.13.0 and system
+  Python 3.9.6 byte compilation, the official Rules skill validator,
+  project-journal validation, and `git diff --check`.

@@ -97,6 +97,22 @@ or link policy then changes, apply retains the stage and returns structured
 terminal-result locators; it must not return an ordinary live conflict plus a
 cleanup warning.
 
+### Validator Launch And JSON Parse Boundaries
+
+Only a `Popen` failure before a validator binding exists records
+`validator_launch_failed` with exact `child_started: false`. Exit-observer
+setup after `Popen` records the same primary status with `child_started: true`.
+The live-path call may enter automatic rollback only for exact false proof with
+no structured supervisor or cleanup uncertainty; missing, true, non-boolean,
+or conflicting proof remains fail-closed as `recovery_required`.
+
+Receipt and recovery-terminal decoders translate Unicode, JSON syntax,
+recursion-depth, and bounded-integer `json.loads` failures at the decoder
+boundary into `receipt_invalid` or `recovery_terminal_invalid`. A terminal
+decode failure after proved or possible mutation still passes through the
+mutation-aware `recovery_required` envelope rather than escaping as a raw
+traceback.
+
 ## Ownership And Guardrails
 
 - Rules govern reusable approval families; skills decide when to use them; helpers encode repeated fragile mechanics.

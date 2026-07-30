@@ -124,6 +124,27 @@ class RulesApplyTransactionTests(unittest.TestCase):
         environment.update(updates)
         return environment
 
+    @contextmanager
+    def fail_second_validator_launch(self):
+        real_popen = TRANSACTION.subprocess.Popen
+        state = SimpleNamespace(calls=0)
+
+        def launch_or_fail(*args: object, **kwargs: object) -> object:
+            state.calls += 1
+            if state.calls == 2:
+                raise FileNotFoundError(
+                    errno.ENOENT,
+                    "fault-injected post-replacement validator launch failure",
+                )
+            return real_popen(*args, **kwargs)
+
+        with mock.patch.object(
+            TRANSACTION.subprocess,
+            "Popen",
+            side_effect=launch_or_fail,
+        ):
+            yield state
+
     def assert_no_private_stage(self) -> None:
         self.assertEqual(list(self.rules_dir.glob(".rules-apply-*")), [])
         self.assertEqual(
@@ -970,7 +991,12 @@ class RulesApplyTransactionTests(unittest.TestCase):
             timeout=timeout,
         )
 
-    def run_recover(self, *, timeout: float = 15) -> subprocess.CompletedProcess[str]:
+    def run_recover(
+        self,
+        *,
+        environment: dict[str, str] | None = None,
+        timeout: float = 15,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 sys.executable,
@@ -982,7 +1008,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 "2",
             ],
             check=False,
-            env=self.helper_environment(),
+            env=environment or self.helper_environment(),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2224,6 +2250,105 @@ class RulesApplyTransactionTests(unittest.TestCase):
             with self.assertRaises(OSError) as closed:
                 os.fstat(fd)
             self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_json_decoders_structure_recursion_errors(self) -> None:
+        cases = (
+            (
+                "receipt",
+                TRANSACTION.decode_receipt,
+                "receipt_invalid",
+                "cannot parse recovery receipt",
+            ),
+            (
+                "terminal",
+                TRANSACTION.decode_recovery_terminal,
+                "recovery_terminal_invalid",
+                "cannot parse recovery terminal evidence",
+            ),
+        )
+
+        for label, decoder, expected_status, expected_message in cases:
+            with self.subTest(decoder=label):
+                recursion_error = RecursionError("fault-injected deeply nested JSON")
+                with (
+                    mock.patch.object(
+                        TRANSACTION.json,
+                        "loads",
+                        side_effect=recursion_error,
+                    ),
+                    self.assertRaises(TRANSACTION.TransactionError) as raised,
+                ):
+                    decoder(b"{}")
+
+                self.assertEqual(raised.exception.status, expected_status)
+                self.assertIn(expected_message, str(raised.exception))
+                self.assertIs(raised.exception.__cause__, recursion_error)
+
+    def test_json_decoders_preserve_unicode_and_syntax_failures(self) -> None:
+        cases = (
+            ("receipt", TRANSACTION.decode_receipt, "receipt_invalid"),
+            (
+                "terminal",
+                TRANSACTION.decode_recovery_terminal,
+                "recovery_terminal_invalid",
+            ),
+        )
+
+        for label, decoder, expected_status in cases:
+            for payload, expected_cause in (
+                (b"\xff", UnicodeDecodeError),
+                (b"{", json.JSONDecodeError),
+            ):
+                with (
+                    self.subTest(decoder=label, cause=expected_cause.__name__),
+                    self.assertRaises(TRANSACTION.TransactionError) as raised,
+                ):
+                    decoder(payload)
+
+                self.assertEqual(raised.exception.status, expected_status)
+                self.assertIsInstance(
+                    raised.exception.__cause__,
+                    expected_cause,
+                )
+
+    def test_receipt_overlong_integer_is_one_structured_cli_result(self) -> None:
+        self.receipt.write_bytes(b'{"schema_version": ' + (b"9" * 5_000) + b"}\n")
+        self.receipt.chmod(0o600)
+
+        recovered = self.run_recover(
+            environment=self.helper_environment(
+                PYTHONINTMAXSTRDIGITS="4300",
+            )
+        )
+
+        self.assertEqual(recovered.returncode, 50, recovered.stderr)
+        self.assertEqual(len(recovered.stdout.splitlines()), 1)
+        self.assertEqual(
+            json.loads(recovered.stdout)["status"],
+            "receipt_invalid",
+        )
+        self.assertNotIn("Traceback", recovered.stderr)
+
+    def test_terminal_overlong_integer_is_one_structured_cli_result(self) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        applied = self.run_apply()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        terminal = TRANSACTION.recovery_terminal_path(self.receipt)
+        terminal.write_bytes(b'{"schema_version": ' + (b"9" * 5_000) + b"}\n")
+        terminal.chmod(0o600)
+
+        recovered = self.run_recover(
+            environment=self.helper_environment(
+                PYTHONINTMAXSTRDIGITS="4300",
+            )
+        )
+
+        self.assertEqual(recovered.returncode, 30, recovered.stderr)
+        self.assertEqual(len(recovered.stdout.splitlines()), 1)
+        payload = json.loads(recovered.stdout)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(payload["reason"], "recovery_terminal_invalid")
+        self.assertNotIn("Traceback", recovered.stderr)
 
     def test_receipt_read_rejects_hardlink_and_metadata(self) -> None:
         self.write_validator("raise SystemExit(0)\n")
@@ -3762,6 +3887,7 @@ class RulesApplyTransactionTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.status, "validator_launch_failed")
+        self.assertIs(raised.exception.details["child_started"], False)
         self.assertEqual(
             {
                 signum: signal.getsignal(signum)
@@ -3773,6 +3899,29 @@ class RulesApplyTransactionTests(unittest.TestCase):
             signal.pthread_sigmask(signal.SIG_BLOCK, set()),
             previous_mask,
         )
+
+    @unittest.skipIf(
+        hasattr(TRANSACTION.os, "waitid"),
+        "kqueue observer setup is not used when waitid is available",
+    )
+    def test_validator_observer_setup_failure_records_started_child(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                TRANSACTION.select,
+                "kqueue",
+                side_effect=OSError(
+                    errno.EIO,
+                    "fault-injected kqueue setup failure",
+                ),
+            ),
+            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        ):
+            TRANSACTION._ValidatorExitObserver(SimpleNamespace(pid=os.getpid()))
+
+        self.assertEqual(raised.exception.status, "validator_launch_failed")
+        self.assertIs(raised.exception.details["child_started"], True)
 
     @unittest.skipUnless(
         os.name == "posix"
@@ -5083,6 +5232,70 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertTrue(self.receipt.is_file())
         self.assert_no_private_stage()
 
+    def test_post_rollback_terminal_parse_failure_requires_recovery(
+        self,
+    ) -> None:
+        self.write_validator(
+            """\
+            from pathlib import Path
+            import sys
+
+            if Path(sys.argv[1]).name == "default.rules":
+                raise SystemExit(9)
+            """
+        )
+        real_record_terminal = TRANSACTION.record_recovery_terminal
+
+        def record_with_parse_failure(
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            with mock.patch.object(
+                TRANSACTION.json,
+                "loads",
+                side_effect=ValueError("fault-injected overlong terminal integer"),
+            ):
+                return real_record_terminal(*args, **kwargs)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            mock.patch.object(
+                TRANSACTION,
+                "record_recovery_terminal",
+                side_effect=record_with_parse_failure,
+            ),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            exit_code = TRANSACTION.main(self.apply_argv())
+
+        self.assertEqual(exit_code, 30, stderr.getvalue())
+        self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(
+            payload["post_replace_failure"]["status"],
+            "post_replace_validation_failed",
+        )
+        self.assertEqual(
+            payload["rollback"]["rollback_status"],
+            "rolled_back",
+        )
+        self.assertEqual(
+            payload["recovery_terminal_failure"]["status"],
+            "recovery_terminal_invalid",
+        )
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+        self.assertTrue(self.receipt.is_file())
+        self.assert_no_private_stage()
+
     def test_applied_finalizer_revalidates_live_and_backup_data_roles(
         self,
     ) -> None:
@@ -5631,15 +5844,125 @@ class RulesApplyTransactionTests(unittest.TestCase):
                 self.assertEqual(self.rules.read_bytes(), OLD_RULES)
                 self.assertEqual(self.backup.read_bytes(), NEW_RULES)
 
-    def test_post_replace_validator_raw_failure_preserves_cleanup_evidence(
+    def test_post_replace_validator_launch_failure_rolls_back(
         self,
     ) -> None:
         self.write_validator("raise SystemExit(0)\n")
-        primary = OSError(
-            errno.EIO,
-            "fault-injected post-replacement validator read failure",
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            self.fail_second_validator_launch() as launch,
+        ):
+            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(launch.calls, 2)
+        self.assertEqual(exit_code, 30)
+        self.assertEqual(payload["status"], "post_replace_failed_rolled_back")
+        self.assertEqual(
+            payload["post_replace_failure"]["status"],
+            "validator_launch_failed",
         )
-        primary.validator_cleanup_failures = [
+        self.assertIs(
+            payload["post_replace_failure"]["child_started"],
+            False,
+        )
+        self.assertIn(
+            "fault-injected post-replacement validator launch failure",
+            payload["post_replace_failure"]["message"],
+        )
+        self.assertEqual(
+            payload["rollback"]["rollback_status"],
+            "rolled_back",
+        )
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+        self.assertTrue(self.receipt.is_file())
+        self.assert_no_private_stage()
+
+    def test_post_replace_validator_launch_without_clean_false_proof_fails_closed(
+        self,
+    ) -> None:
+        cleanup_failure = TRANSACTION.structured_operation_failure(
+            "validator-finalization",
+            "signal-supervision-restore",
+            OSError(
+                errno.EIO,
+                "fault-injected signal restoration failure",
+            ),
+        )
+        cases = (
+            ("missing", {}),
+            ("started", {"child_started": True}),
+            ("invalid", {"child_started": "false"}),
+            (
+                "cleanup-uncertain",
+                {
+                    "child_started": False,
+                    "validator_cleanup_failures": [cleanup_failure],
+                },
+            ),
+        )
+
+        for label, details in cases:
+            with (
+                self.subTest(proof=label),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-launch-proof-{label}."
+                ) as temp_dir,
+            ):
+                self.configure_isolated_case(Path(temp_dir))
+                self.write_validator("raise SystemExit(0)\n")
+                launch_error = TRANSACTION.TransactionError(
+                    "validator_launch_failed",
+                    f"fault-injected {label} launch proof",
+                    details=details,
+                )
+
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "run_validator",
+                        side_effect=[
+                            TRANSACTION.ValidatorResult(0, "", ""),
+                            launch_error,
+                        ],
+                    ) as run_validator,
+                    self.assertRaises(TRANSACTION.TransactionError) as raised,
+                ):
+                    TRANSACTION.apply_transaction(self.apply_namespace())
+
+                self.assertEqual(run_validator.call_count, 2)
+                self.assertEqual(raised.exception.status, "recovery_required")
+                self.assertEqual(
+                    raised.exception.details["reason"],
+                    "validator_launch_failed",
+                )
+                if label == "cleanup-uncertain":
+                    self.assertEqual(
+                        [
+                            failure["descriptor"]
+                            for failure in raised.exception.details[
+                                "validator_cleanup_failures"
+                            ]
+                        ],
+                        ["signal-supervision-restore"],
+                    )
+                self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+                self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+                self.assertTrue(self.receipt.is_file())
+                self.assert_no_private_stage()
+
+    def test_post_replace_validator_raw_failure_fails_closed(
+        self,
+    ) -> None:
+        cleanup_failures = [
             TRANSACTION.structured_operation_failure(
                 "validator-emergency-cleanup",
                 descriptor,
@@ -5650,44 +5973,73 @@ class RulesApplyTransactionTests(unittest.TestCase):
             )
             for descriptor in ("term", "drain", "kill", "reap")
         ]
-
-        with (
-            mock.patch.dict(
-                os.environ,
-                {"CODEX_HOME": str(self.codex_home)},
-            ),
-            mock.patch.object(
-                TRANSACTION,
-                "run_validator",
-                side_effect=[
-                    TRANSACTION.ValidatorResult(0, "", ""),
-                    primary,
-                ],
-            ) as run_validator,
-            self.assertRaises(TRANSACTION.TransactionError) as raised,
+        for label, failures in (
+            ("bare", None),
+            ("with-cleanup", cleanup_failures),
         ):
-            TRANSACTION.apply_transaction(self.apply_namespace())
+            with (
+                self.subTest(raw_failure=label),
+                tempfile.TemporaryDirectory(
+                    prefix=f"rules-raw-validator-{label}."
+                ) as temp_dir,
+            ):
+                self.configure_isolated_case(Path(temp_dir))
+                self.write_validator("raise SystemExit(0)\n")
+                primary = OSError(
+                    errno.EIO,
+                    "fault-injected post-replacement validator read failure",
+                )
+                if failures is not None:
+                    primary.validator_cleanup_failures = list(failures)
 
-        self.assertEqual(run_validator.call_count, 2)
-        self.assertEqual(
-            run_validator.call_args_list[1].args[1].resolve(),
-            self.rules.resolve(),
-        )
-        self.assertEqual(raised.exception.status, "recovery_required")
-        self.assertEqual(raised.exception.exit_code, 30)
-        self.assertEqual(raised.exception.details["reason"], "apply_io_failed")
-        self.assertIs(raised.exception.__cause__, primary)
-        self.assertEqual(
-            [
-                failure["descriptor"]
-                for failure in raised.exception.details["validator_cleanup_failures"]
-            ],
-            ["term", "drain", "kill", "reap"],
-        )
-        self.assertEqual(self.rules.read_bytes(), NEW_RULES)
-        self.assertEqual(self.backup.read_bytes(), OLD_RULES)
-        self.assertTrue(self.receipt.is_file())
-        self.assert_no_private_stage()
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"CODEX_HOME": str(self.codex_home)},
+                    ),
+                    mock.patch.object(
+                        TRANSACTION,
+                        "run_validator",
+                        side_effect=[
+                            TRANSACTION.ValidatorResult(0, "", ""),
+                            primary,
+                        ],
+                    ) as run_validator,
+                    self.assertRaises(TRANSACTION.TransactionError) as raised,
+                ):
+                    TRANSACTION.apply_transaction(self.apply_namespace())
+
+                self.assertEqual(run_validator.call_count, 2)
+                self.assertEqual(
+                    run_validator.call_args_list[1].args[1].resolve(),
+                    self.rules.resolve(),
+                )
+                self.assertEqual(raised.exception.status, "recovery_required")
+                self.assertEqual(raised.exception.exit_code, 30)
+                self.assertEqual(
+                    raised.exception.details["reason"],
+                    "apply_io_failed",
+                )
+                self.assertIs(raised.exception.__cause__, primary)
+                if failures is None:
+                    self.assertNotIn(
+                        "validator_cleanup_failures",
+                        raised.exception.details,
+                    )
+                else:
+                    self.assertEqual(
+                        [
+                            failure["descriptor"]
+                            for failure in raised.exception.details[
+                                "validator_cleanup_failures"
+                            ]
+                        ],
+                        ["term", "drain", "kill", "reap"],
+                    )
+                self.assertEqual(self.rules.read_bytes(), NEW_RULES)
+                self.assertEqual(self.backup.read_bytes(), OLD_RULES)
+                self.assertTrue(self.receipt.is_file())
+                self.assert_no_private_stage()
 
     def test_post_replace_primary_preserves_all_lock_finalization_evidence(
         self,
@@ -5926,6 +6278,96 @@ class RulesApplyTransactionTests(unittest.TestCase):
         self.assertTrue(failure_injected)
         self.assertEqual(exit_code, 30)
         self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(
+            payload["rollback"]["rollback_status"],
+            "recovery_required",
+        )
+        self.assertEqual(
+            payload["rollback"]["recovery_reason"],
+            "rollback_failed",
+        )
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+
+        recovered = self.run_recover()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(json.loads(recovered.stdout)["status"], "recovered")
+        self.assertEqual(self.rules.read_bytes(), OLD_RULES)
+        self.assertEqual(self.backup.read_bytes(), NEW_RULES)
+        self.assert_no_private_stage()
+
+    def test_validator_launch_failure_with_uncertain_rollback_requires_recovery(
+        self,
+    ) -> None:
+        self.write_validator("raise SystemExit(0)\n")
+        real_exchange = TRANSACTION.atomic_rename_exchange
+        real_fsync = TRANSACTION.os.fsync
+        rollback_parent_fd: int | None = None
+        rollback_exchange_completed = False
+        failure_injected = False
+
+        def observe_exchange(
+            source_dir_fd: int,
+            source_name: str,
+            destination_dir_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal rollback_exchange_completed, rollback_parent_fd
+            real_exchange(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
+            if source_name == self.backup.name and destination_name == self.rules.name:
+                rollback_parent_fd = source_dir_fd
+                rollback_exchange_completed = True
+
+        def fail_rollback_parent_fsync(fd: int) -> None:
+            nonlocal failure_injected
+            if (
+                rollback_exchange_completed
+                and fd == rollback_parent_fd
+                and not failure_injected
+            ):
+                failure_injected = True
+                raise OSError(
+                    errno.EIO,
+                    "fault-injected rollback parent fsync failure",
+                )
+            real_fsync(fd)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(self.codex_home)},
+            ),
+            self.fail_second_validator_launch() as launch,
+            mock.patch.object(
+                TRANSACTION,
+                "atomic_rename_exchange",
+                side_effect=observe_exchange,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "fsync",
+                side_effect=fail_rollback_parent_fsync,
+            ),
+        ):
+            exit_code, payload = TRANSACTION.apply_transaction(self.apply_namespace())
+
+        self.assertEqual(launch.calls, 2)
+        self.assertTrue(failure_injected)
+        self.assertEqual(exit_code, 30)
+        self.assertEqual(payload["status"], "recovery_required")
+        self.assertEqual(
+            payload["post_replace_failure"]["status"],
+            "validator_launch_failed",
+        )
+        self.assertIs(
+            payload["post_replace_failure"]["child_started"],
+            False,
+        )
         self.assertEqual(
             payload["rollback"]["rollback_status"],
             "recovery_required",

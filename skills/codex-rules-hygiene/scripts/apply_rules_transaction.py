@@ -4870,6 +4870,7 @@ class _ValidatorExitObserver:
             raise TransactionError(
                 "validator_launch_failed",
                 f"cannot bind validator exit observer: {error}",
+                details={"child_started": True},
             ) from error
 
     def child_exited(self) -> bool:
@@ -6079,6 +6080,7 @@ def run_validator(
             launch_error = TransactionError(
                 "validator_launch_failed",
                 f"cannot launch validator: {error}",
+                details={"child_started": False},
             )
             try:
                 _arm_validator_signal_supervision(
@@ -6707,7 +6709,12 @@ def write_receipt(
 def decode_receipt(payload: bytes) -> dict[str, object]:
     try:
         value = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as error:
         raise TransactionError(
             "receipt_invalid",
             f"cannot parse recovery receipt: {error}",
@@ -6855,7 +6862,12 @@ def read_receipt(path: Path) -> dict[str, object]:
 def decode_recovery_terminal(payload: bytes) -> dict[str, object]:
     try:
         value = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as error:
         raise TransactionError(
             "recovery_terminal_invalid",
             f"cannot parse recovery terminal evidence: {error}",
@@ -9738,6 +9750,22 @@ def _apply_transaction_inner(
                             if event.cleanup_errors
                             else {}
                         ),
+                    }
+                except TransactionError as error:
+                    # Only Popen failure records the exact false proof before
+                    # a child binding exists. Any conflicting/missing proof,
+                    # finalization uncertainty, or other supervisor failure
+                    # remains fail-closed.
+                    if (
+                        error.status != "validator_launch_failed"
+                        or error.details.get("child_started") is not False
+                        or structured_secondary_failure_evidence(error)
+                    ):
+                        raise
+                    post_failure = {
+                        "status": error.status,
+                        "message": str(error),
+                        **error.details,
                     }
                 else:
                     if not post_validation.valid:
