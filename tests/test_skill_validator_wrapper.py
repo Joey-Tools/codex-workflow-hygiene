@@ -86,6 +86,56 @@ class SkillValidatorWrapperTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
 
+    def make_symlinked_install(self) -> tuple[Path, Path, Path]:
+        source_skills_root = self.root / "source-checkout" / "skills"
+        source_skill = source_skills_root / "codex-skill-authoring"
+        source_wrapper = source_skill / "scripts" / "codex_skill_validate.py"
+        source_wrapper.parent.mkdir(parents=True)
+        source_wrapper.write_text(WRAPPER.read_text(encoding="utf-8"), encoding="utf-8")
+
+        loaded_skills_root = self.root / "loaded-install" / "skills"
+        loaded_skills_root.mkdir(parents=True)
+        loaded_skill = loaded_skills_root / "codex-skill-authoring"
+        loaded_skill.symlink_to(source_skill, target_is_directory=True)
+        invoked_wrapper = loaded_skill / "scripts" / "codex_skill_validate.py"
+        return invoked_wrapper, loaded_skills_root, source_skills_root
+
+    def write_success_validator(self, skills_root: Path, message: str) -> None:
+        validator = skills_root / ".system/skill-creator/scripts/quick_validate.py"
+        validator.parent.mkdir(parents=True)
+        validator.write_text(
+            f"print({message!r})\n",
+            encoding="utf-8",
+        )
+
+    def default_validator_environment(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env.pop("CODEX_HOME", None)
+        env.pop("CODEX_SKILL_VALIDATOR", None)
+        env["HOME"] = str(self.root / "isolated-home")
+        return env
+
+    def run_default_wrapper(
+        self,
+        wrapper: Path,
+        *,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(wrapper),
+                "--no-uv",
+                str(self.valid_skill),
+            ],
+            check=False,
+            cwd=self.root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def test_single_skill_preserves_installed_validator_message(self) -> None:
         result = self.run_wrapper(str(self.valid_skill))
 
@@ -123,7 +173,9 @@ class SkillValidatorWrapperTests(unittest.TestCase):
                 codex_home = self.root / f"codex-home-{index}"
                 validator = codex_home / relative_path
                 validator.parent.mkdir(parents=True)
-                validator.write_text(self.validator.read_text(encoding="utf-8"), encoding="utf-8")
+                validator.write_text(
+                    self.validator.read_text(encoding="utf-8"), encoding="utf-8"
+                )
                 validator.chmod(0o755)
                 env = os.environ.copy()
                 env["CODEX_HOME"] = str(codex_home)
@@ -157,11 +209,7 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         wrapper.parent.mkdir(parents=True)
         wrapper.write_text(WRAPPER.read_text(encoding="utf-8"), encoding="utf-8")
         validator = (
-            skills_root
-            / ".system"
-            / "skill-creator"
-            / "scripts"
-            / "quick_validate.py"
+            skills_root / ".system" / "skill-creator" / "scripts" / "quick_validate.py"
         )
         validator.parent.mkdir(parents=True)
         validator.write_text(
@@ -189,6 +237,57 @@ class SkillValidatorWrapperTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "Skill is valid!")
+
+    def test_symlinked_loaded_skill_root_works_without_codex_home(self) -> None:
+        wrapper, loaded_skills_root, _ = self.make_symlinked_install()
+        self.write_success_validator(loaded_skills_root, "loaded validator")
+
+        result = self.run_default_wrapper(
+            wrapper,
+            env=self.default_validator_environment(),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "loaded validator")
+
+    def test_symlinked_loaded_root_precedes_resolved_source_root(self) -> None:
+        wrapper, loaded_skills_root, source_skills_root = self.make_symlinked_install()
+        self.write_success_validator(loaded_skills_root, "loaded validator")
+        self.write_success_validator(source_skills_root, "source validator")
+
+        result = self.run_default_wrapper(
+            wrapper,
+            env=self.default_validator_environment(),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "loaded validator")
+
+    def test_codex_home_precedes_loaded_and_resolved_source_roots(self) -> None:
+        wrapper, loaded_skills_root, source_skills_root = self.make_symlinked_install()
+        self.write_success_validator(loaded_skills_root, "loaded validator")
+        self.write_success_validator(source_skills_root, "source validator")
+        codex_home = self.root / "explicit-codex-home"
+        self.write_success_validator(codex_home / "skills", "CODEX_HOME validator")
+        env = self.default_validator_environment()
+        env["CODEX_HOME"] = str(codex_home)
+
+        result = self.run_default_wrapper(wrapper, env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "CODEX_HOME validator")
+
+    def test_resolved_source_root_remains_symlinked_install_fallback(self) -> None:
+        wrapper, _, source_skills_root = self.make_symlinked_install()
+        self.write_success_validator(source_skills_root, "source validator")
+
+        result = self.run_default_wrapper(
+            wrapper,
+            env=self.default_validator_environment(),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "source validator")
 
     def test_multiple_skill_stdout_uses_compact_messages(self) -> None:
         report = self.root / "report.json"
@@ -219,11 +318,15 @@ class SkillValidatorWrapperTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("ERROR\t", result.stdout)
-        self.assertIn("Summary: 1/2 skills valid; 0 failed; 1 runtime errors.", result.stdout)
+        self.assertIn(
+            "Summary: 1/2 skills valid; 0 failed; 1 runtime errors.", result.stdout
+        )
         payload = json.loads(report.read_text(encoding="utf-8"))
         self.assertEqual(payload["summary"]["runtime_errors"], 1)
         self.assertTrue(payload["results"][1]["runtime_error"])
-        self.assertIn("Traceback (most recent call last):", payload["results"][1]["stderr"])
+        self.assertIn(
+            "Traceback (most recent call last):", payload["results"][1]["stderr"]
+        )
 
     def test_validator_syntax_error_is_runtime_error(self) -> None:
         report = self.root / "report.json"
@@ -329,7 +432,10 @@ class SkillValidatorWrapperTests(unittest.TestCase):
 
         expected_cache = self.root / ".codex-tmp/skill-validator-wrapper/uv-cache"
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(Path(capture.read_text(encoding="utf-8")).resolve(), expected_cache.resolve())
+        self.assertEqual(
+            Path(capture.read_text(encoding="utf-8")).resolve(),
+            expected_cache.resolve(),
+        )
         self.assertTrue(expected_cache.is_dir())
 
     def test_uv_setup_failure_falls_back_to_direct_python(self) -> None:
@@ -419,7 +525,9 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         payload = json.loads(report.read_text(encoding="utf-8"))
         self.assertEqual(payload["summary"]["failed"], 1)
-        self.assertEqual([attempt["mode"] for attempt in payload["results"][0]["attempts"]], ["uv"])
+        self.assertEqual(
+            [attempt["mode"] for attempt in payload["results"][0]["attempts"]], ["uv"]
+        )
 
 
 if __name__ == "__main__":

@@ -365,7 +365,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("SKILL_CREATOR_DIR", skill)
         self.assertIn('CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"', skill)
         self.assertNotIn('"$HOME/.codex/skills', skill)
-        self.assertIn("Path(__file__).resolve().parents[2]", wrapper)
+        self.assertIn("lexical_absolute_path(Path(__file__))", wrapper)
+        self.assertIn("invoked_script.resolve(strict=False).parents[2]", wrapper)
         self.assertIn('os.environ.get("CODEX_HOME")', wrapper)
         self.assertIn(
             'Path(".system/skill-creator/scripts/quick_validate.py")',

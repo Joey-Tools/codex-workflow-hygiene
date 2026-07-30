@@ -36,21 +36,34 @@ UV_SETUP_FAILURE_PATTERNS = (
 )
 
 
+def lexical_absolute_path(path: Path) -> Path:
+    """Make a path absolute without resolving symlinks."""
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
 def default_validator_candidates() -> list[Path]:
     candidates: list[Path] = []
     codex_home = os.environ.get("CODEX_HOME")
     if codex_home:
-        base = Path(codex_home).expanduser()
-        candidates.extend([base / "skills" / VALIDATOR_RELATIVE_PATH, base / VALIDATOR_RELATIVE_PATH])
-    loaded_skills_root = Path(__file__).resolve().parents[2]
+        base = lexical_absolute_path(Path(codex_home))
+        candidates.extend(
+            [base / "skills" / VALIDATOR_RELATIVE_PATH, base / VALIDATOR_RELATIVE_PATH]
+        )
+
+    invoked_script = lexical_absolute_path(Path(__file__))
+    loaded_skills_root = invoked_script.parents[2]
     candidates.append(loaded_skills_root / VALIDATOR_RELATIVE_PATH)
+    resolved_source_root = invoked_script.resolve(strict=False).parents[2]
+    candidates.append(resolved_source_root / VALIDATOR_RELATIVE_PATH)
+
     if not codex_home:
         candidates.append(Path.home() / ".codex" / "skills" / VALIDATOR_RELATIVE_PATH)
 
     deduped: list[Path] = []
     seen: set[str] = set()
     for candidate in candidates:
-        key = str(candidate)
+        candidate = lexical_absolute_path(candidate)
+        key = os.path.normcase(os.fspath(candidate))
         if key not in seen:
             deduped.append(candidate)
             seen.add(key)
@@ -62,7 +75,9 @@ def default_validator_path() -> Path:
     if raw:
         return Path(raw).expanduser()
     candidates = default_validator_candidates()
-    return next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+    return next(
+        (candidate for candidate in candidates if candidate.is_file()), candidates[0]
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -114,7 +129,9 @@ def default_uv_cache_dir() -> Path:
         candidate.mkdir(parents=True, exist_ok=True)
         return candidate
     except OSError:
-        fallback = Path(tempfile.gettempdir()) / "codex-skill-validator-wrapper-uv-cache"
+        fallback = (
+            Path(tempfile.gettempdir()) / "codex-skill-validator-wrapper-uv-cache"
+        )
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
 
@@ -127,7 +144,9 @@ def validator_environment(*, use_uv: bool) -> dict[str, str] | None:
     return env
 
 
-def run_validator(validator: Path, skill_path: Path, *, use_uv: bool) -> dict[str, object]:
+def run_validator(
+    validator: Path, skill_path: Path, *, use_uv: bool
+) -> dict[str, object]:
     result = run_validator_process(validator, skill_path, use_uv=use_uv)
     attempts = [attempt_payload(result, use_uv=use_uv)]
     if use_uv and uv_setup_failed(result):
@@ -135,8 +154,14 @@ def run_validator(validator: Path, skill_path: Path, *, use_uv: bool) -> dict[st
         attempts.append(attempt_payload(fallback, use_uv=False))
         result = fallback
 
-    message = result.stdout.strip() or result.stderr.strip() or f"validator exited {result.returncode}"
-    runtime_error = validator_runtime_error(result.returncode, result.stdout, result.stderr)
+    message = (
+        result.stdout.strip()
+        or result.stderr.strip()
+        or f"validator exited {result.returncode}"
+    )
+    runtime_error = validator_runtime_error(
+        result.returncode, result.stdout, result.stderr
+    )
     return {
         "path": str(skill_path),
         "resolved_path": str(skill_path.resolve(strict=False)),
@@ -150,7 +175,9 @@ def run_validator(validator: Path, skill_path: Path, *, use_uv: bool) -> dict[st
     }
 
 
-def run_validator_process(validator: Path, skill_path: Path, *, use_uv: bool) -> subprocess.CompletedProcess[str]:
+def run_validator_process(
+    validator: Path, skill_path: Path, *, use_uv: bool
+) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         validator_command(validator, skill_path, use_uv=use_uv),
         check=False,
@@ -162,7 +189,9 @@ def run_validator_process(validator: Path, skill_path: Path, *, use_uv: bool) ->
     return result
 
 
-def attempt_payload(result: subprocess.CompletedProcess[str], *, use_uv: bool) -> dict[str, object]:
+def attempt_payload(
+    result: subprocess.CompletedProcess[str], *, use_uv: bool
+) -> dict[str, object]:
     return {
         "mode": "uv" if use_uv else "python",
         "returncode": result.returncode,
@@ -172,13 +201,17 @@ def attempt_payload(result: subprocess.CompletedProcess[str], *, use_uv: bool) -
 
 
 def uv_setup_failed(result: subprocess.CompletedProcess[str]) -> bool:
-    return result.returncode != 0 and any(pattern in result.stderr for pattern in UV_SETUP_FAILURE_PATTERNS)
+    return result.returncode != 0 and any(
+        pattern in result.stderr for pattern in UV_SETUP_FAILURE_PATTERNS
+    )
 
 
 def validator_runtime_error(returncode: int, stdout: str, stderr: str) -> bool:
     if returncode not in (0, 1):
         return True
-    return returncode == 1 and any(pattern in stderr for pattern in PYTHON_RUNTIME_ERROR_PATTERNS)
+    return returncode == 1 and any(
+        pattern in stderr for pattern in PYTHON_RUNTIME_ERROR_PATTERNS
+    )
 
 
 def summarize(results: list[dict[str, object]]) -> dict[str, int]:
@@ -186,7 +219,12 @@ def summarize(results: list[dict[str, object]]) -> dict[str, int]:
     passed = sum(1 for result in results if result["valid"])
     runtime_errors = sum(1 for result in results if result["runtime_error"])
     failed = total - passed - runtime_errors
-    return {"total": total, "passed": passed, "failed": failed, "runtime_errors": runtime_errors}
+    return {
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "runtime_errors": runtime_errors,
+    }
 
 
 def compact_message(result: dict[str, object]) -> str:
@@ -203,7 +241,13 @@ def print_summary(results: list[dict[str, object]]) -> None:
         print(results[0]["message"])
         return
     for result in results:
-        status = "ERROR" if result["runtime_error"] else "PASS" if result["valid"] else "FAIL"
+        status = (
+            "ERROR"
+            if result["runtime_error"]
+            else "PASS"
+            if result["valid"]
+            else "FAIL"
+        )
         print(f"{status}\t{result['path']}\t{compact_message(result)}")
     summary = summarize(results)
     details = f"{summary['passed']}/{summary['total']} skills valid; {summary['failed']} failed"
@@ -216,17 +260,26 @@ def write_report(report_path: str, results: list[dict[str, object]]) -> None:
     path = Path(report_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"summary": summarize(results), "results": results}
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    validator = Path(args.validator).expanduser() if args.validator else default_validator_path()
+    validator = (
+        Path(args.validator).expanduser()
+        if args.validator
+        else default_validator_path()
+    )
     if not validator.exists():
         print(f"Installed skill validator not found: {validator}", file=sys.stderr)
         if not args.validator:
             print(
-                "Checked: " + ", ".join(str(candidate) for candidate in default_validator_candidates()),
+                "Checked: "
+                + ", ".join(
+                    str(candidate) for candidate in default_validator_candidates()
+                ),
                 file=sys.stderr,
             )
         return EXIT_RUNTIME_ERROR

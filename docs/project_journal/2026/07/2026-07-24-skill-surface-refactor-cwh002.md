@@ -650,3 +650,16 @@ superseded_by:
 - Final reviewer-fix gates passed Ruff check/format, Python 3.13.0 and system
   Python 3.9.6 byte compilation, the official Rules skill validator,
   project-journal validation, and `git diff --check`.
+- GitHub Codex review of signed head
+  `afe2ee68fc8f84478ea33190ef5bb5cba6929da2` found that resolving the
+  authoring wrapper's own path before deriving the loaded skills root bypassed
+  a symlinked installation and could miss the sibling system `skill-creator`.
+  The wrapper now preserves the lexical invoked path for the loaded-root
+  candidate, keeps the resolved source root as a later fallback, and
+  de-duplicates candidates without resolving symlinks.
+- The symlinked-install regression matrix passed all 46 focused tests on both
+  Python 3.13.0 and system Python 3.9.6. It covers an isolated home with
+  `CODEX_HOME` unset, loaded-root precedence over the source checkout,
+  explicit `CODEX_HOME` precedence, and resolved-source fallback. The
+  Python 3.13.0 repository suite passed 1,331 tests with one capability skip,
+  and the default isolated-`uv` wrapper smoke reported `Skill is valid!`.
