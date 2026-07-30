@@ -1,9 +1,9 @@
 ---
 id: 20260724-cwh002
 title: Skill Surface Refactor
-status: active
+status: completed
 created: 2026-07-24
-updated: 2026-07-29
+updated: 2026-07-30
 branch: codex/skill-surface-refactor
 pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/63
 supersedes: []
@@ -373,9 +373,12 @@ superseded_by:
 
 ## Next Steps
 
-- Run the parent-owned fresh whole-range review against the next signed
-  checkpoint.
-- Update PR #63 only after that review evidence is clean.
+- Treat the rules-hygiene workstream as implementation-complete at this
+  checkpoint. Current-head review and hosted evidence remain in PR #63 because
+  they are PR lifecycle state rather than durable project state.
+- Merge remains a separate user-controlled action. After PR #63 lands, merge
+  the updated `master` into the separate skill-surface-thinning branch with an
+  ordinary merge commit; do not rewrite either published history.
 
 ## Evidence
 
