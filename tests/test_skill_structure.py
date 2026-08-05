@@ -1048,6 +1048,25 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("session-metadata record crosses its byte budget", skill)
         self.assertIn("complete normalized signal", skill)
 
+    def test_session_retrospective_requires_explicit_invocation(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill_root = root / "skills/codex-session-retrospective"
+        skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
+        frontmatter = skill.split("---", 2)[1]
+
+        self.assertIn(
+            "Use only when the user explicitly invokes $codex-session-retrospective.",
+            frontmatter,
+        )
+        self.assertIn(
+            "Use this skill only when the user explicitly invokes "
+            "`$codex-session-retrospective`",
+            skill,
+        )
+        self.assertIn("policy:\n  allow_implicit_invocation: false\n", interface)
+        self.assertNotIn("allow_implicit_invocation: true", interface)
+
     def test_session_mining_recent_turn_recipe_reads_both_indexes(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / "skills/codex-session-mining/references/workflow.md").read_text(encoding="utf-8")
