@@ -1,13 +1,13 @@
 ---
 name: codex-session-retrospective
-description: Run read-only retrospective analysis across local and remote Codex session history, using bounded map-reduce extraction, redaction, episode/topic aggregation, turn-level prompt improvement flags, and private history-ready reports.
+description: Run a read-only, redacted retrospective across local and remote Codex session history. Use only when the user explicitly invokes $codex-session-retrospective.
 ---
 
 # Codex Session Retrospective
 
 ## Overview
 
-Use this skill when Joey wants to review how Codex collaboration went across one session, a daily/weekly window, or historical 90-day windows.
+Use this skill only when the user explicitly invokes `$codex-session-retrospective` to review how Codex collaboration went across one session, a daily/weekly window, or historical 90-day windows.
 The workflow is read-only against Codex history and remote hosts. It produces redacted retrospective artifacts that can be committed to a private history repository.
 
 ## Evidence Scope
