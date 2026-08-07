@@ -81,6 +81,11 @@ superseded_by:
   depending on `/home/runner` machine state.
 - Retained path detection now recognizes absolute POSIX paths independently of
   the first directory component, including `/root`, `/usr`, and `/workspace`.
+- Retained path detection also rejects relative POSIX and Windows-style paths
+  across extractor results, episode reviews, retained artifacts, and reports.
+- Session-shards transport limits each record to 1,024 data frames and binds
+  that limit through producer metadata, relay validation, adapter output, and
+  orchestrator ingestion so compact-frame fanout cannot bypass output budgets.
 - Run creation derives `run_ref` from the frozen specification and rejects a
   caller-supplied mismatch. The trusted clock owns `created_at`; an optional
   caller value is only an equality assertion and cannot extend raw retention.
@@ -112,6 +117,9 @@ superseded_by:
 - `tests/test_retrospective_v2_*.py`
 - `tests/test_session_retrospective_v2_cli.py`
 - Final Python 3.13 full suite: 1,455 tests in 522.599 seconds, `OK`.
+- Review-fix Python 3.13 full suite: 1,460 tests in 676.825 seconds, `OK`.
+- Privacy, transport, and module-boundary review-fix suite: 148 tests in 9.323
+  seconds, `OK`; orchestrator suite: 58 tests in 92.084 seconds, `OK`.
 - V2 runtime/test suite: 370 tests in 466.302 seconds, `OK`.
 - V1 zero-difference retrospective suite: 891 tests in 40.549 seconds, `OK`.
 - Publication transaction suite: 30 tests in 298.021 seconds, `OK`.

@@ -6,7 +6,9 @@ import os  # noqa: F401
 import pathlib
 
 from .session_shards_relay import (  # noqa: F401
+    MAX_SESSION_SHARDS_RECORD_DATA_FRAMES,
     RemoteSessionShardsFilter,
+    remote_output_limit as _session_shards_remote_output_limit,
 )
 from .transport_auth import (  # noqa: F401
     issue_transport_lease,

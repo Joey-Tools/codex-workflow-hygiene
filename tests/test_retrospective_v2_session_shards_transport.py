@@ -1100,11 +1100,77 @@ class RemoteSessionShardsRelayTests(unittest.TestCase):
             returncode = MODULE.cmd_session_shards(args)
 
         self.assertEqual(0, returncode)
-        self.assertLess(relay.call_args.kwargs["max_output_bytes"], 128 * 1024)
+        self.assertLess(relay.call_args.kwargs["max_output_bytes"], 256 * 1024)
         self.assertIsInstance(
             relay.call_args.kwargs["stream_filter"],
             MODULE.RemoteSessionShardsFilter,
         )
+
+    def test_compact_record_fanout_fits_the_remote_wire_budget(self) -> None:
+        data = b"{}\n" * MODULE.MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
+        with tempfile.TemporaryDirectory() as raw:
+            rollout, args, records = self.record_stream(Path(raw) / ".codex", data)
+        wire = self.wire(records)
+        output_limit = MODULE._session_shards_remote_output_limit(
+            mode="records",
+            byte_start=0,
+            byte_end=len(data),
+            max_shards=args.max_shards,
+            frame_metadata_bytes=MODULE.SESSION_SHARDS_FRAME_METADATA_CHARS,
+        )
+        stream_filter = self.relay_filter(rollout, args)
+        output = b"".join(
+            stream_filter.feed(wire[index : index + 4096])
+            for index in range(0, len(wire), 4096)
+        )
+        output += stream_filter.finish()
+
+        self.assertLessEqual(len(output), output_limit)
+        self.assertEqual(
+            MODULE.MAX_SESSION_SHARDS_RECORD_DATA_FRAMES + 2,
+            len(output.splitlines()),
+        )
+
+    def test_descriptor_and_record_modes_enforce_the_data_frame_limit(self) -> None:
+        data = b"{}\n" * (MODULE.MAX_SESSION_SHARDS_RECORD_DATA_FRAMES + 1)
+        with tempfile.TemporaryDirectory() as raw:
+            codex_root = Path(raw) / ".codex"
+            rollout = write_rollout(codex_root, data)
+            descriptors = list(
+                MODULE._iter_local_session_shard_frames(
+                    codex_root=codex_root,
+                    rollout_relative_path=MODULE.pathlib.PurePosixPath(rollout),
+                    emit="descriptors",
+                    byte_start=0,
+                    byte_end=None,
+                    shard_bytes=MODULE.MAX_SESSION_SHARD_BYTES,
+                    max_shards=64,
+                    source_token=None,
+                    resume_cursor=None,
+                )
+            )
+            source_token = str(
+                frame_of_kind(descriptors, "stream_meta")["source_token"]
+            )
+            shards = [frame for frame in descriptors if frame["kind"] == "shard"]
+            records = MODULE._iter_local_session_shard_frames(
+                codex_root=codex_root,
+                rollout_relative_path=MODULE.pathlib.PurePosixPath(rollout),
+                emit="records",
+                byte_start=0,
+                byte_end=len(data),
+                shard_bytes=MODULE.MAX_SESSION_SHARD_BYTES,
+                max_shards=64,
+                source_token=source_token,
+                resume_cursor=None,
+            )
+
+            self.assertEqual(
+                [MODULE.MAX_SESSION_SHARDS_RECORD_DATA_FRAMES, 1],
+                [frame["record_count"] for frame in shards],
+            )
+            with self.assertRaisesRegex(RuntimeError, "data-frame limit"):
+                list(records)
 
 
 class TransportArchitectureAuditTests(unittest.TestCase):

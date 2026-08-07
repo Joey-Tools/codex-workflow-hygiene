@@ -216,10 +216,15 @@ _OPAQUE_REF_RE = re.compile(
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
 _URL_RE = re.compile(r"(?i)(?:https?|ssh|file|vscode)://|git@")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
-_ABSOLUTE_PATH_RE = re.compile(
+_LOCAL_PATH_RE = re.compile(
     r"(?:(?<![A-Za-z0-9_])/(?!/)"
     r"[A-Za-z0-9._~+@%=-]+(?:/[A-Za-z0-9._~+@%=-]+)*|"
-    r"(?:^|[\s'\"`])(?:~[/\\]|[A-Za-z]:\\))"
+    r"(?:^|[\s'\"`])(?:~[/\\]|[A-Za-z]:\\)|"
+    r"(?<![-A-Za-z0-9_.~+@%=/\\])"
+    r"(?:\.{1,2}[/\\])?"
+    r"(?:[A-Za-z0-9_.~+@%=-]+[/\\])+"
+    r"[A-Za-z0-9_.~+@%=-]+"
+    r"(?![A-Za-z0-9_.~+@%=-]))"
 )
 _SECRET_RE = re.compile(
     r"(?i)(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:AKIA|ASIA)[A-Z0-9]{12,}\b|"
@@ -653,10 +658,8 @@ def _validate_safe_string(value: str, *, path: str) -> None:
         raise RetainedPrivacyError(f"{path} exceeds the retained scalar length limit")
     if "\n" in value or "\r" in value or "\t" in value:
         raise RetainedPrivacyError(f"{path} contains multiline or tab-delimited text")
-    if (
-        _URL_RE.search(value)
-        or _EMAIL_RE.search(value)
-        or _ABSOLUTE_PATH_RE.search(value)
+    if any(
+        (_URL_RE.search(value), _EMAIL_RE.search(value), _LOCAL_PATH_RE.search(value))
     ):
         raise RetainedPrivacyError(
             f"{path} contains a URL, email address, or local path"
@@ -678,10 +681,8 @@ def _validate_reviewed_prose(value: Any, *, path: str) -> None:
         raise RetainedPrivacyError(f"{path} exceeds the reviewed text limit")
     if any(character in value for character in "\r\n\t"):
         raise RetainedPrivacyError(f"{path} contains multiline reviewed text")
-    if (
-        _URL_RE.search(value)
-        or _EMAIL_RE.search(value)
-        or _ABSOLUTE_PATH_RE.search(value)
+    if any(
+        (_URL_RE.search(value), _EMAIL_RE.search(value), _LOCAL_PATH_RE.search(value))
     ):
         raise RetainedPrivacyError(
             f"{path} contains a URL, email address, or local path"
@@ -3586,11 +3587,13 @@ def _validate_report_bytes(
         text = data.decode("ascii")
     except UnicodeDecodeError as exc:
         raise RetainedPrivacyError("report.md must be deterministic ASCII") from exc
-    if (
-        _URL_RE.search(text)
-        or _EMAIL_RE.search(text)
-        or _ABSOLUTE_PATH_RE.search(text)
-        or _SECRET_RE.search(text)
+    if any(
+        (
+            _URL_RE.search(text),
+            _EMAIL_RE.search(text),
+            _LOCAL_PATH_RE.search(text),
+            _SECRET_RE.search(text),
+        )
     ):
         raise RetainedPrivacyError(
             "report.md contains a forbidden locator or credential-shaped value"

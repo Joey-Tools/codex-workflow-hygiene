@@ -64,6 +64,7 @@ from .orchestrator_core import (  # noqa: F401
     _safe_reason,
 )
 from .orchestrator_transport import (  # noqa: F401
+    MAX_SESSION_SHARDS_RECORD_DATA_FRAMES,
     SESSION_SHARDS_CONSERVATION_SCHEMA,
     SESSION_SHARDS_FIXED_MEMORY_ENVELOPE_BYTES,
     SESSION_SHARDS_MAX_FRAME_CHARS,

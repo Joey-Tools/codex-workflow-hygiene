@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Mapping
 
 from .contracts import SESSION_SHARDS_SCHEMA, SessionShardsRequest
+from .session_shards_relay import MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
 
 
 class SessionShardsAdapterError(ValueError):
@@ -19,6 +20,7 @@ _META_FIELDS = frozenset(
         "json_nesting_depth_limit",
         "kind",
         "max_remote_frame_chars",
+        "max_record_data_frames",
         "max_shards",
         "mode",
         "protocol_features",
@@ -173,6 +175,7 @@ def descriptor_plan_from_frames(
         or first.get("schema") != SESSION_SHARDS_SCHEMA
         or first.get("mode") != "descriptors"
         or first.get("byte_end") is not None
+        or first.get("max_record_data_frames") != MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
     ):
         raise SessionShardsAdapterError(
             "session-shards descriptor stream_meta is unsupported"
@@ -272,6 +275,7 @@ def descriptor_plan_from_frames(
             or byte_start != next_byte
             or record_start != next_record
             or record_count != record_end - record_start
+            or record_count > MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
             or not isinstance(cursor, str)
         ):
             raise SessionShardsAdapterError(

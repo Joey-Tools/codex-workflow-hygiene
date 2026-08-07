@@ -406,6 +406,22 @@ class SessionShardsAdapterCliTests(unittest.TestCase):
                 expected_host="local",
             )
 
+    def test_adapter_rejects_a_different_record_data_frame_limit(self) -> None:
+        descriptors, _records = self.shard_streams()
+        changed = copy.deepcopy(descriptors)
+        changed[0]["max_record_data_frames"] = (
+            transport.MAX_SESSION_SHARDS_RECORD_DATA_FRAMES + 1
+        )
+
+        with self.assertRaisesRegex(
+            session_shards_adapter.SessionShardsAdapterError,
+            "unsupported",
+        ):
+            session_shards_adapter.descriptor_plan_from_frames(
+                changed,
+                expected_host="local",
+            )
+
     def test_host_bound_adapter_rejects_cross_host_replay(self) -> None:
         descriptors, _records = self.shard_streams()
         replayed = copy.deepcopy(descriptors)

@@ -21,6 +21,7 @@ from .contracts import (
     SourceKind,
 )
 from .orchestrator_core import EXTRACTOR_SHARD_MAX_BYTES, InvalidInputError
+from .session_shards_relay import MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
 
 SESSION_SHARDS_CONSERVATION_SCHEMA = "session-shards-conservation-v1"
 SESSION_SHARDS_RECORD_FRAGMENT_BYTES = 256 * 1024
@@ -35,6 +36,7 @@ SESSION_SHARDS_PROTOCOL_FEATURES = (
     "terminal_conservation_v1",
     "request_binding_v1",
     "resume_cursor_v1",
+    "record_data_frame_limit_v1",
 )
 SOURCE_TRANSPORT_MAX_RECORDS = 100_000
 SOURCE_TRANSPORT_MAX_SOURCE_BYTES = 256 * 1024 * 1024
@@ -258,6 +260,7 @@ class _SessionShardStreamConsumer:
         "record_fragment_bytes",
         "json_nesting_depth_limit",
         "max_remote_frame_chars",
+        "max_record_data_frames",
         "protocol_features",
     }
     _RECORD_FIELDS = {
@@ -517,6 +520,7 @@ class _SessionShardStreamConsumer:
         fragment_bytes = _frame_integer(frame, "record_fragment_bytes", minimum=1)
         nesting_limit = _frame_integer(frame, "json_nesting_depth_limit", minimum=1)
         frame_limit = _frame_integer(frame, "max_remote_frame_chars", minimum=1)
+        data_frame_limit = _frame_integer(frame, "max_record_data_frames", minimum=1)
         if (
             source_bytes < byte_end
             or source_token != self.request.source_token
@@ -535,6 +539,7 @@ class _SessionShardStreamConsumer:
             or fragment_bytes != SESSION_SHARDS_RECORD_FRAGMENT_BYTES
             or nesting_limit != SESSION_SHARDS_MAX_JSON_NESTING_DEPTH
             or frame_limit != SESSION_SHARDS_MAX_FRAME_CHARS
+            or data_frame_limit != MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
             or frame.get("protocol_features") != list(SESSION_SHARDS_PROTOCOL_FEATURES)
             or byte_start != self.records[0].coordinate.byte_start
             or byte_end != self.records[-1].coordinate.byte_end

@@ -478,6 +478,20 @@ class ResultValidationTests(unittest.TestCase):
                 self.assertEqual(text, "Read [REDACTED_PATH] before continuing.")
                 self.assertEqual(scan_for_leaks(result), ())
 
+    def test_post_redaction_covers_relative_source_paths(self) -> None:
+        for source_path in ("src/a.py", "./src/a.py", "../src/a.py", r"src\a.py"):
+            with self.subTest(source_path=source_path):
+                value = extractor_result()
+                value["turns"][0]["generalized_working_text"] = (
+                    f"Read {source_path} before continuing."
+                )
+
+                result = validate_extractor_result(value, ALL_REFS)
+
+                text = result["turns"][0]["generalized_working_text"]
+                self.assertEqual(text, "Read [REDACTED_PATH] before continuing.")
+                self.assertEqual(scan_for_leaks(result), ())
+
     def test_leak_scan_reports_locations_without_secret_values(self) -> None:
         secret = "s" + "k-abcdefghijklmnopqrstuvwxyz123456"
         findings = scan_for_leaks({"safe": f"credential {secret}"})
@@ -586,6 +600,32 @@ class ResultValidationTests(unittest.TestCase):
             result["high_impact_turns"][0]["rewritten_prompt"],
             "[REDACTED_ORIGINAL_PROMPT]",
         )
+
+    def test_episode_review_redacts_relative_paths_from_all_rewrite_fields(
+        self,
+    ) -> None:
+        for field in (
+            "problem_statement",
+            "cause",
+            "rewritten_prompt",
+            "expected_effect",
+        ):
+            with self.subTest(field=field):
+                value = episode_review(high_impact_turns=[high_impact()])
+                value["high_impact_turns"][0][field] = "Inspect src/a.py first."
+
+                result = validate_episode_review_result(
+                    value,
+                    ALL_REFS,
+                    allowed_turn_refs={TURN_A},
+                    original_prompts=["Please edit src/a.py."],
+                )
+
+                self.assertEqual(
+                    result["high_impact_turns"][0][field],
+                    "Inspect [REDACTED_PATH] first.",
+                )
+                self.assertEqual(scan_for_leaks(result), ())
 
     def test_hierarchical_episode_review_rejects_omitted_child_risk(self) -> None:
         child = episode_review(

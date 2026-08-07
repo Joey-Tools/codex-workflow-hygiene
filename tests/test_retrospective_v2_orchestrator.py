@@ -60,6 +60,7 @@ from retrospective_v2.export import export_retained_bundle  # noqa: E402
 import retrospective_v2.orchestrator as orchestrator_module  # noqa: E402
 from retrospective_v2.orchestrator import (  # noqa: E402
     DEFAULT_HOSTS,
+    MAX_SESSION_SHARDS_RECORD_DATA_FRAMES,
     PUBLISHER_FINGERPRINT,
     PUBLISHER_UID,
     SESSION_SHARDS_FIXED_MEMORY_ENVELOPE_BYTES,
@@ -468,6 +469,7 @@ def record_stream_frames(
         "record_fragment_bytes": SESSION_SHARDS_RECORD_FRAGMENT_BYTES,
         "json_nesting_depth_limit": SESSION_SHARDS_MAX_JSON_NESTING_DEPTH,
         "max_remote_frame_chars": SESSION_SHARDS_MAX_FRAME_CHARS,
+        "max_record_data_frames": MAX_SESSION_SHARDS_RECORD_DATA_FRAMES,
         "protocol_features": list(SESSION_SHARDS_PROTOCOL_FEATURES),
     }
     frames: list[dict[str, object]] = [meta]
@@ -1794,6 +1796,19 @@ class OrchestratorTests(unittest.TestCase):
                 manifest,
                 source_ref,
                 broken,
+                request=request,
+                limits=limits,
+            )
+
+        wrong_frame_limit = copy.deepcopy(frames)
+        wrong_frame_limit[0]["max_record_data_frames"] = (
+            MAX_SESSION_SHARDS_RECORD_DATA_FRAMES + 1
+        )
+        with self.assertRaisesRegex(InvalidInputError, "not bound to the run"):
+            consume_session_shard_frames(
+                manifest,
+                source_ref,
+                wrong_frame_limit,
                 request=request,
                 limits=limits,
             )

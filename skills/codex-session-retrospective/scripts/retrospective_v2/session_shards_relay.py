@@ -14,6 +14,7 @@ from .contracts import SESSION_SHARDS_SCHEMA, strict_json_loads
 REMOTE_RECORD_METADATA_BASE_BYTES = 64 * 1024
 REMOTE_RECORD_METADATA_MAX_BYTES = 16 * 1024 * 1024
 REMOTE_WRAPPER_ALLOWANCE_BYTES = 512
+MAX_SESSION_SHARDS_RECORD_DATA_FRAMES = 1024
 
 
 def remote_output_limit(
@@ -33,10 +34,12 @@ def remote_output_limit(
     if byte_end is None or byte_end <= byte_start:
         raise ValueError("record relay range is invalid")
     source_bytes = byte_end - byte_start
-    encoded_bytes = 4 * ((source_bytes + 2) // 3)
+    encoded_bytes = 4 * source_bytes
+    max_data_frames = min(MAX_SESSION_SHARDS_RECORD_DATA_FRAMES, source_bytes)
     metadata_bytes = min(
         REMOTE_RECORD_METADATA_MAX_BYTES,
-        REMOTE_RECORD_METADATA_BASE_BYTES + 2 * source_bytes,
+        (max_data_frames + 2)
+        * (frame_metadata_bytes + REMOTE_WRAPPER_ALLOWANCE_BYTES + 1),
     )
     return encoded_bytes + metadata_bytes
 
@@ -166,6 +169,7 @@ class RemoteSessionShardsFilter:
         self.records = 0
         self.gaps = 0
         self.fragments = 0
+        self.data_frames = 0
         self.record_bytes = 0
         self.gap_bytes = 0
         self.fragment_bytes = 0
@@ -265,6 +269,8 @@ class RemoteSessionShardsFilter:
             or frame.get("max_shards") != self.max_shards
             or frame.get("record_processing_budget_bytes")
             != self.record_processing_budget_bytes
+            or frame.get("max_record_data_frames")
+            != MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
         ):
             raise ValueError("session-shards stream_meta is not request-bound")
         source_token = frame.get("source_token")
@@ -298,6 +304,7 @@ class RemoteSessionShardsFilter:
             or record_start != self.next_record
             or record_end <= record_start
             or frame.get("record_count") != record_end - record_start
+            or record_end - record_start > MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
             or frame.get("page_shard_index") != self.shards
         ):
             raise ValueError("session-shards descriptors are not contiguous")
@@ -306,6 +313,9 @@ class RemoteSessionShardsFilter:
         self.shards += 1
 
     def _accept_record_frame(self, frame: Mapping[str, Any]) -> None:
+        if self.data_frames >= MAX_SESSION_SHARDS_RECORD_DATA_FRAMES:
+            raise ValueError("session-shards record data-frame limit exceeded")
+        self.data_frames += 1
         kind = frame.get("kind")
         if kind == "record_fragment":
             self._accept_fragment(frame)

@@ -24,6 +24,7 @@ from .contracts import (
     session_shards_resume_cursor,
 )
 from .session_shards_relay import (
+    MAX_SESSION_SHARDS_RECORD_DATA_FRAMES,
     RemoteSessionShardsFilter,
     accounting_bytes as _session_shards_accounting_bytes,
     remote_output_limit as _session_shards_remote_output_limit,
@@ -89,6 +90,7 @@ SESSION_SHARDS_PROTOCOL_FEATURES = (
     "terminal_conservation_v1",
     "request_binding_v1",
     "resume_cursor_v1",
+    "record_data_frame_limit_v1",
 )
 
 
@@ -819,12 +821,16 @@ def _iter_session_shard_descriptors(
             continue
 
         item_bytes = item.byte_end - item.byte_start
-        if (
-            current is not None
-            and current["byte_end"] - current["byte_start"] + item_bytes > shard_bytes
-        ):
-            yield current
-            current = None
+        if current is not None:
+            remaining_bytes = shard_bytes - (
+                current["byte_end"] - current["byte_start"]
+            )
+            remaining_frames = (
+                MAX_SESSION_SHARDS_RECORD_DATA_FRAMES - current["record_count"]
+            )
+            if min(remaining_bytes - item_bytes, remaining_frames - 1) < 0:
+                yield current
+                current = None
         if current is None:
             current = {
                 "kind": "shard",
@@ -1051,6 +1057,7 @@ def _iter_local_session_shard_frames(
             "record_fragment_bytes": SESSION_SHARDS_RECORD_FRAGMENT_BYTES,
             "json_nesting_depth_limit": SESSION_SHARDS_MAX_JSON_NESTING_DEPTH,
             "max_remote_frame_chars": MAX_SESSION_SHARDS_FRAME_CHARS,
+            "max_record_data_frames": MAX_SESSION_SHARDS_RECORD_DATA_FRAMES,
             "protocol_features": list(SESSION_SHARDS_PROTOCOL_FEATURES),
         }
 
@@ -1128,6 +1135,7 @@ def _iter_local_session_shard_frames(
             emitted_record_bytes = 0
             emitted_gap_bytes = 0
             emitted_fragment_bytes = 0
+            emitted_data_frames = 0
             accounting_hasher = hashlib.sha256()
             last_record_end = record_start
             for item in records:
@@ -1148,6 +1156,11 @@ def _iter_local_session_shard_frames(
                         source_token=current_token,
                         request_binding=request_binding,
                     ):
+                        if emitted_data_frames >= MAX_SESSION_SHARDS_RECORD_DATA_FRAMES:
+                            raise RuntimeError(
+                                "session-shards record data-frame limit exceeded"
+                            )
+                        emitted_data_frames += 1
                         accounting_hasher.update(
                             _session_shards_accounting_bytes(frame)
                         )
@@ -1158,6 +1171,11 @@ def _iter_local_session_shard_frames(
                     emitted_records += 1
                     emitted_record_bytes += item.byte_end - item.byte_start
                 else:
+                    if emitted_data_frames >= MAX_SESSION_SHARDS_RECORD_DATA_FRAMES:
+                        raise RuntimeError(
+                            "session-shards record data-frame limit exceeded"
+                        )
+                    emitted_data_frames += 1
                     frame = {
                         "kind": "gap",
                         **common,

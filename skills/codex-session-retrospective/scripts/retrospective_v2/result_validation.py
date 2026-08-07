@@ -302,6 +302,11 @@ _UNIX_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_])/(?!/)"
     r"[A-Za-z0-9._~+@%=-]+(?:/[A-Za-z0-9._~+@%=-]+)*"
 )
+_RELATIVE_PATH_RE = re.compile(
+    r"(?<![-A-Za-z0-9_.~+@%=/\\])(?:\.{1,2}[/\\])?"
+    r"(?:[A-Za-z0-9_.~+@%=-]+[/\\])+[A-Za-z0-9_.~+@%=-]+"
+    r"(?![A-Za-z0-9_.~+@%=-])"
+)
 _WINDOWS_PATH_RE = re.compile(
     r"(?i)\b[A-Z]:\\(?:[^\\\s\"'<>:|?*]+\\)*[^\\\s\"'<>:|?*]+"
 )
@@ -557,7 +562,12 @@ def scan_for_leaks(
                 findings.add(
                     LeakFinding("personal_identifier", path, match.start(), match.end())
                 )
-        for pattern in (_UNIX_PATH_RE, _WINDOWS_PATH_RE, _UNC_PATH_RE):
+        for pattern in (
+            _RELATIVE_PATH_RE,
+            _UNIX_PATH_RE,
+            _WINDOWS_PATH_RE,
+            _UNC_PATH_RE,
+        ):
             for match in pattern.finditer(text):
                 findings.add(LeakFinding("path", path, match.start(), match.end()))
         if not reference_field:
@@ -628,7 +638,12 @@ def _post_redact_text(
         ),
         redacted,
     )
-    for pattern in (_UNIX_PATH_RE, _WINDOWS_PATH_RE, _UNC_PATH_RE):
+    for pattern in (
+        _RELATIVE_PATH_RE,
+        _UNIX_PATH_RE,
+        _WINDOWS_PATH_RE,
+        _UNC_PATH_RE,
+    ):
         redacted = pattern.sub("[REDACTED_PATH]", redacted)
     if not reference_field:
         for pattern in (_UUID_RE, _LONG_HEX_RE, _RAW_ID_LABEL_RE):

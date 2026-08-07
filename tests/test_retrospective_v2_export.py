@@ -1202,6 +1202,37 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
         with self.assertRaisesRegex(RetainedPrivacyError, "local path"):
             assemble_retained_artifacts(run_state(), path_review)
 
+        for field in (
+            "problem_statement",
+            "cause",
+            "rewritten_prompt",
+            "expected_effect",
+        ):
+            with self.subTest(relative_path_field=field):
+                relative_path_review = review_data()
+                relative_path_review["turn_findings"][1][field] = (
+                    "Inspect src/a.py before continuing."
+                )
+                with self.assertRaisesRegex(RetainedPrivacyError, "local path"):
+                    assemble_retained_artifacts(run_state(), relative_path_review)
+
+                artifacts = assemble_retained_artifacts(run_state(), review_data())
+                tampered = dict(artifacts)
+                rows = [
+                    json.loads(line)
+                    for line in tampered["turn_findings.jsonl"].splitlines()
+                ]
+                high_impact = next(
+                    row for row in rows if row["disposition"] == "high_impact"
+                )
+                high_impact[field] = "Inspect src/a.py before continuing."
+                tampered["turn_findings.jsonl"] = b"".join(
+                    canonical_json_bytes(row) for row in rows
+                )
+                refresh_bundle_digest(tampered)
+                with self.assertRaisesRegex(RetainedPrivacyError, "local path"):
+                    validate_retained_artifacts(tampered)
+
         untyped_review = review_data()
         untyped_review["turn_findings"][0]["note"] = "source_literal"
         with self.assertRaises(RetainedPrivacyError):

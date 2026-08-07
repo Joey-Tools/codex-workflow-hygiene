@@ -29,6 +29,7 @@ from .orchestrator_support import (
     EXTRACTOR_SHARD_MAX_BYTES,
     InvalidInputError,
     InvalidTransitionError,
+    MAX_SESSION_SHARDS_RECORD_DATA_FRAMES,
     MAX_AGENT_ENVELOPE_BYTES,
     MIN_AGENT_CLAIM_TTL_SECONDS,
     OrchestratorError,
