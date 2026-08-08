@@ -1,0 +1,715 @@
+from __future__ import annotations
+
+import base64
+from collections.abc import Callable
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+SCRIPTS = (
+    Path(__file__).resolve().parents[1]
+    / "skills"
+    / "codex-session-retrospective"
+    / "scripts"
+)
+sys.path.insert(0, str(SCRIPTS))
+
+from retrospective_v2.contracts import (  # noqa: E402
+    JobKind,
+    MIN_SESSION_RECORD_PROCESSING_BUDGET_BYTES,
+    RefType,
+    RunMode,
+    RunStage,
+    SESSION_SHARDS_RESUME_CURSOR_PREFIX,
+    SESSION_SHARDS_SOURCE_TOKEN_PREFIX,
+    SessionShardsRequest,
+    SourceKind,
+    TypedRef,
+    canonical_json,
+    canonical_json_bytes,
+    canonical_sha256,
+    parse_typed_ref,
+    session_shards_resume_cursor,
+    session_shards_resume_cursor_value,
+)
+from retrospective_v2.identity import (  # noqa: E402
+    IDENTITY_KEY_ID_PREFIX,
+    IdentityKey,
+    IdentityKeyFormatError,
+    IdentityKeyMismatchError,
+    IdentityKeyMissingError,
+)
+from retrospective_v2 import safe_io  # noqa: E402
+from retrospective_v2.safe_io import (  # noqa: E402
+    InvalidJsonError,
+    ReadLimitExceeded,
+    UnsafePathError,
+    atomic_create_bytes,
+    atomic_write_bytes,
+    atomic_write_json,
+    read_bounded_bytes,
+    read_bounded_json,
+    read_bounded_jsonl,
+    require_secure_io_capabilities,
+    secure_io_capability_issues,
+)
+
+
+class ContractTests(unittest.TestCase):
+    def test_canonical_json_and_hash_are_deterministic(self) -> None:
+        first = {"z": [True, None, 3], "a": "caf\N{LATIN SMALL LETTER E WITH ACUTE}"}
+        second = {"a": "caf\N{LATIN SMALL LETTER E WITH ACUTE}", "z": [True, None, 3]}
+
+        expected = '{"a":"caf\N{LATIN SMALL LETTER E WITH ACUTE}","z":[true,null,3]}'
+        self.assertEqual(expected, canonical_json(first))
+        self.assertEqual(canonical_json_bytes(first), canonical_json_bytes(second))
+        self.assertEqual(
+            hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+            canonical_sha256(first),
+        )
+
+    def test_canonical_json_rejects_non_finite_numbers(self) -> None:
+        with self.assertRaises(ValueError):
+            canonical_json({"not_json": float("nan")})
+        with self.assertRaises(TypeError):
+            canonical_json({1: "non-string key"})  # type: ignore[dict-item]
+
+    def test_contract_enums_are_closed(self) -> None:
+        self.assertIs(RunMode("weekly"), RunMode.WEEKLY)
+        self.assertIs(RunStage("extraction"), RunStage.EXTRACTION)
+        self.assertIs(JobKind("episode_reviewer"), JobKind.EPISODE_REVIEWER)
+        self.assertIs(SourceKind("archived_rollout"), SourceKind.ARCHIVED_ROLLOUT)
+        for enum_type in (RunMode, RunStage, JobKind, SourceKind):
+            with self.assertRaises(ValueError):
+                enum_type("future_unreviewed_value")
+
+    def test_typed_refs_require_a_closed_type_and_full_sha256(self) -> None:
+        reference = TypedRef(RefType.TURN, "a" * 64)
+
+        self.assertEqual(f"turn_ref_v2:{'a' * 64}", str(reference))
+        self.assertEqual(reference, TypedRef.parse(str(reference)))
+        self.assertEqual(
+            reference, parse_typed_ref(str(reference), expected=RefType.TURN)
+        )
+        with self.assertRaises(ValueError):
+            parse_typed_ref(str(reference), expected=RefType.SESSION)
+        with self.assertRaises(ValueError):
+            TypedRef(RefType.TURN, "a" * 63)
+        with self.assertRaises(ValueError):
+            TypedRef(RefType.TURN, "A" * 64)
+        with self.assertRaises(ValueError):
+            TypedRef.parse(f"unknown_ref_v2:{'a' * 64}")
+
+    def test_resume_cursor_signature_binds_token_and_coordinates(self) -> None:
+        source_token = SESSION_SHARDS_SOURCE_TOKEN_PREFIX + "a" * 64
+        prefix_commitment = "sha256:" + hashlib.sha256(b"frozen-prefix").hexdigest()
+        cursor = session_shards_resume_cursor(
+            source_token,
+            cursor_kind="records",
+            frozen_byte_end=256,
+            byte_offset=128,
+            next_record_index=7,
+            prefix_commitment=prefix_commitment,
+        )
+        request = SessionShardsRequest(
+            rollout="sessions/rollout.jsonl",
+            mode="records",
+            source_token=source_token,
+            byte_start=128,
+            byte_end=256,
+            shard_bytes=128,
+            max_shards=1,
+            record_processing_budget_bytes=(MIN_SESSION_RECORD_PROCESSING_BUDGET_BYTES),
+            resume_cursor=cursor,
+        )
+
+        self.assertEqual(7, request.record_start)
+        page_request = SessionShardsRequest(
+            rollout="sessions/rollout.jsonl",
+            mode="records",
+            source_token=source_token,
+            byte_start=128,
+            byte_end=192,
+            shard_bytes=128,
+            max_shards=1,
+            record_processing_budget_bytes=(MIN_SESSION_RECORD_PROCESSING_BUDGET_BYTES),
+            resume_cursor=cursor,
+        )
+        self.assertEqual(192, page_request.byte_end)
+        with self.assertRaisesRegex(ValueError, "frozen byte end"):
+            SessionShardsRequest(
+                rollout="sessions/rollout.jsonl",
+                mode="records",
+                source_token=source_token,
+                byte_start=128,
+                byte_end=257,
+                shard_bytes=128,
+                max_shards=1,
+                record_processing_budget_bytes=(
+                    MIN_SESSION_RECORD_PROCESSING_BUDGET_BYTES
+                ),
+                resume_cursor=cursor,
+            )
+        self.assertTrue(cursor.startswith(SESSION_SHARDS_RESUME_CURSOR_PREFIX))
+        self.assertEqual(
+            {
+                "byte_offset": 128,
+                "cursor_kind": "records",
+                "frozen_byte_end": 256,
+                "next_record_index": 7,
+                "prefix_commitment": prefix_commitment,
+                "source_token": source_token,
+            },
+            session_shards_resume_cursor_value(cursor),
+        )
+
+        encoded, signature = cursor.removeprefix(
+            SESSION_SHARDS_RESUME_CURSOR_PREFIX
+        ).split(".", 1)
+        payload = json.loads(
+            base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        )
+        payload["next_record_index"] = 70_000
+        forged_payload = (
+            base64.urlsafe_b64encode(canonical_json_bytes(payload))
+            .decode("ascii")
+            .rstrip("=")
+        )
+        for forged in (
+            cursor[:-1] + ("0" if cursor[-1] != "0" else "1"),
+            SESSION_SHARDS_RESUME_CURSOR_PREFIX + forged_payload + "." + signature,
+        ):
+            with self.subTest(forged=forged[-64:]):
+                with self.assertRaisesRegex(ValueError, "signature"):
+                    SessionShardsRequest(
+                        rollout="sessions/rollout.jsonl",
+                        mode="records",
+                        source_token=source_token,
+                        byte_start=128,
+                        byte_end=256,
+                        shard_bytes=128,
+                        max_shards=1,
+                        record_processing_budget_bytes=(
+                            MIN_SESSION_RECORD_PROCESSING_BUDGET_BYTES
+                        ),
+                        resume_cursor=forged,
+                    )
+
+
+class SafeIoTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        os.chmod(self.root, 0o700)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_capability_probe_uses_real_dir_fd_operations_and_fails_closed(
+        self,
+    ) -> None:
+        safe_io._cached_dir_fd_capability_issues.cache_clear()
+        try:
+            with mock.patch.object(os, "supports_dir_fd", set()):
+                self.assertEqual((), secure_io_capability_issues())
+
+            safe_io._cached_dir_fd_capability_issues.cache_clear()
+            with mock.patch.object(
+                safe_io,
+                "_run_dir_fd_smoke_probe",
+                return_value=("simulated_probe_failure",),
+            ):
+                with self.assertRaisesRegex(UnsafePathError, "simulated_probe_failure"):
+                    require_secure_io_capabilities()
+        finally:
+            safe_io._cached_dir_fd_capability_issues.cache_clear()
+            require_secure_io_capabilities()
+
+    def test_atomic_json_write_creates_owner_only_paths_and_replaces(self) -> None:
+        target = self.root / "state" / "checkpoint.json"
+
+        atomic_write_json(target, {"generation": 1, "status": "created"})
+        atomic_write_json(target, {"generation": 2, "status": "complete"})
+
+        self.assertEqual(
+            {"generation": 2, "status": "complete"},
+            read_bounded_json(target, max_bytes=1024),
+        )
+        self.assertEqual(0o700, stat.S_IMODE(target.parent.stat().st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(target.stat().st_mode))
+        self.assertEqual([], list(target.parent.glob(".*.tmp")))
+
+    def test_atomic_create_never_replaces_an_existing_file(self) -> None:
+        target = self.root / "identity.key"
+        atomic_create_bytes(target, b"first\n")
+
+        with self.assertRaises(FileExistsError):
+            atomic_create_bytes(target, b"second\n")
+
+        self.assertEqual(b"first\n", target.read_bytes())
+
+    def test_failed_atomic_write_removes_its_temporary_file(self) -> None:
+        target = self.root / "failed.json"
+        with mock.patch(
+            "retrospective_v2.safe_io.os.write",
+            side_effect=OSError("simulated write failure"),
+        ):
+            with self.assertRaises(OSError):
+                atomic_write_bytes(target, b"payload")
+
+        self.assertFalse(target.exists())
+        self.assertEqual([], list(self.root.glob(".*.tmp")))
+
+    def test_ancestor_substitution_cannot_redirect_an_openat_chain(self) -> None:
+        require_secure_io_capabilities()
+        trusted = self.root / "trusted"
+        pinned = self.root / "trusted-pinned"
+        attacker = self.root / "attacker"
+        trusted.mkdir(mode=0o700)
+        attacker.mkdir(mode=0o700)
+        real_open = os.open
+        swapped = False
+
+        def racing_open(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal swapped
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if path == "trusted" and dir_fd is not None and not swapped:
+                trusted.rename(pinned)
+                trusted.symlink_to(attacker, target_is_directory=True)
+                swapped = True
+            return descriptor
+
+        target = trusted / "nested" / "state.json"
+        with mock.patch("retrospective_v2.safe_io.os.open", side_effect=racing_open):
+            atomic_write_bytes(target, b'{"safe":true}\n')
+
+        self.assertTrue(swapped)
+        self.assertFalse((attacker / "nested" / "state.json").exists())
+        self.assertEqual(
+            b'{"safe":true}\n',
+            (pinned / "nested" / "state.json").read_bytes(),
+        )
+
+    def test_write_rejects_insecure_parent_and_symlink_target(self) -> None:
+        insecure_parent = self.root / "insecure"
+        insecure_parent.mkdir(mode=0o700)
+        os.chmod(insecure_parent, 0o755)
+        with self.assertRaises(UnsafePathError):
+            atomic_write_bytes(insecure_parent / "state.json", b"{}\n")
+
+        real_target = self.root / "real.json"
+        atomic_write_bytes(real_target, b"{}\n")
+        symlink_target = self.root / "link.json"
+        symlink_target.symlink_to(real_target)
+        with self.assertRaises(UnsafePathError):
+            atomic_write_bytes(symlink_target, b'{"changed":true}\n')
+        self.assertEqual(b"{}\n", real_target.read_bytes())
+
+    def test_reads_reject_insecure_files_and_symlinks(self) -> None:
+        target = self.root / "state.json"
+        atomic_write_bytes(target, b"{}\n")
+        os.chmod(target, 0o644)
+        with self.assertRaises(UnsafePathError):
+            read_bounded_json(target)
+
+        os.chmod(target, 0o600)
+        symlink = self.root / "state-link.json"
+        symlink.symlink_to(target)
+        with self.assertRaises(UnsafePathError):
+            read_bounded_json(symlink)
+
+        hard_link = self.root / "state-hard-link.json"
+        os.link(target, hard_link)
+        with self.assertRaises(UnsafePathError):
+            read_bounded_json(target)
+
+    def test_json_and_jsonl_reads_enforce_all_limits(self) -> None:
+        document = self.root / "document.json"
+        atomic_write_bytes(document, b'{"value":"bounded"}\n')
+        with self.assertRaises(ReadLimitExceeded):
+            read_bounded_json(document, max_bytes=8)
+
+        records = self.root / "records.jsonl"
+        atomic_write_bytes(records, b'{"n":1}\n{"n":2}\n{"n":3}\n')
+        self.assertEqual(
+            [{"n": 1}, {"n": 2}, {"n": 3}],
+            read_bounded_jsonl(
+                records,
+                max_bytes=128,
+                max_lines=3,
+                max_line_bytes=16,
+            ),
+        )
+        with self.assertRaises(ReadLimitExceeded):
+            read_bounded_jsonl(records, max_bytes=128, max_lines=2)
+        with self.assertRaises(ReadLimitExceeded):
+            read_bounded_jsonl(records, max_bytes=128, max_line_bytes=4)
+
+    def test_jsonl_rejects_blank_and_malformed_records(self) -> None:
+        blank = self.root / "blank.jsonl"
+        atomic_write_bytes(blank, b"{}\n\n{}\n")
+        with self.assertRaises(InvalidJsonError):
+            read_bounded_jsonl(blank)
+
+        malformed = self.root / "malformed.jsonl"
+        atomic_write_bytes(malformed, b"{}\nnot-json\n")
+        with self.assertRaises(InvalidJsonError):
+            read_bounded_jsonl(malformed)
+
+    def test_json_reads_reject_duplicate_keys_and_nonfinite_numbers(self) -> None:
+        duplicate = self.root / "duplicate.json"
+        atomic_write_bytes(duplicate, b'{"same":1,"same":2}\n')
+        with self.assertRaises(InvalidJsonError):
+            read_bounded_json(duplicate)
+
+        for index, payload in enumerate(
+            (b'{"n":NaN}\n', b'{"n":Infinity}\n', b'{"n":1e999}\n')
+        ):
+            target = self.root / f"nonfinite-{index}.json"
+            atomic_write_bytes(target, payload)
+            with self.assertRaises(InvalidJsonError):
+                read_bounded_json(target)
+
+        records = self.root / "strict.jsonl"
+        atomic_write_bytes(records, b'{"same":1,"same":2}\n')
+        with self.assertRaises(InvalidJsonError):
+            read_bounded_jsonl(records)
+
+    def test_bounded_read_rejects_concurrent_metadata_and_content_changes(
+        self,
+    ) -> None:
+        target = self.root / "racing.bin"
+        original = b"a" * (64 * 1024 + 32)
+        replacement = b"b" * len(original)
+        atomic_write_bytes(target, original)
+        real_read = os.read
+
+        appended = False
+
+        def read_and_grow(descriptor: int, size: int) -> bytes:
+            nonlocal appended
+            chunk = real_read(descriptor, size)
+            if chunk and not appended:
+                appended = True
+                with target.open("ab") as stream:
+                    stream.write(b"x")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            return chunk
+
+        with mock.patch(
+            "retrospective_v2.safe_io.os.read",
+            side_effect=read_and_grow,
+        ):
+            with self.assertRaisesRegex(UnsafePathError, "changed while reading"):
+                read_bounded_bytes(target, max_bytes=len(original) + 1)
+
+        def racing_reader() -> Callable[[int, int], bytes]:
+            changed = False
+
+            def read_and_replace(descriptor: int, size: int) -> bytes:
+                nonlocal changed
+                chunk = real_read(descriptor, size)
+                if chunk and not changed:
+                    changed = True
+                    with target.open("r+b") as stream:
+                        stream.seek(0)
+                        stream.write(replacement)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                return chunk
+
+            return read_and_replace
+
+        atomic_write_bytes(target, original)
+        with mock.patch(
+            "retrospective_v2.safe_io.os.read",
+            side_effect=racing_reader(),
+        ):
+            with self.assertRaisesRegex(UnsafePathError, "changed while reading"):
+                read_bounded_bytes(target, max_bytes=len(original))
+
+        atomic_write_bytes(target, original)
+        with (
+            mock.patch(
+                "retrospective_v2.safe_io.os.read",
+                side_effect=racing_reader(),
+            ),
+            mock.patch(
+                "retrospective_v2.safe_io._bounded_read_identity",
+                return_value=(1,),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                UnsafePathError, "content changed while reading"
+            ):
+                read_bounded_bytes(target, max_bytes=len(original))
+
+    def test_bounded_read_distinguishes_benign_timestamps_from_policy(self) -> None:
+        target = self.root / "metadata.bin"
+        original = b"a" * (64 * 1024 + 32)
+        atomic_write_bytes(target, original)
+        real_read = os.read
+        touched = False
+
+        def read_and_touch(descriptor: int, size: int) -> bytes:
+            nonlocal touched
+            chunk = real_read(descriptor, size)
+            if chunk and not touched:
+                touched = True
+                metadata = target.stat()
+                os.utime(
+                    target,
+                    ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
+                )
+            return chunk
+
+        with mock.patch(
+            "retrospective_v2.safe_io.os.read",
+            side_effect=read_and_touch,
+        ):
+            self.assertEqual(
+                original,
+                read_bounded_bytes(target, max_bytes=len(original)),
+            )
+
+        policy_changed = False
+
+        def read_and_widen_mode(descriptor: int, size: int) -> bytes:
+            nonlocal policy_changed
+            chunk = real_read(descriptor, size)
+            if chunk and not policy_changed:
+                policy_changed = True
+                os.chmod(target, 0o640)
+            return chunk
+
+        try:
+            with (
+                mock.patch(
+                    "retrospective_v2.safe_io.os.read",
+                    side_effect=read_and_widen_mode,
+                ),
+                self.assertRaisesRegex(UnsafePathError, "file mode must be 0o600"),
+            ):
+                read_bounded_bytes(target, max_bytes=len(original))
+        finally:
+            os.chmod(target, 0o600)
+
+
+class IdentityKeyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        os.chmod(self.root, 0o700)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_load_or_create_persists_key_and_non_sensitive_key_id(self) -> None:
+        target = self.root / ".codex" / "session-retrospective" / "identity-v2.key"
+
+        created = IdentityKey.load_or_create(target)
+        loaded = IdentityKey.load_or_create(target, expected_key_id=created.key_id)
+
+        self.assertEqual(created.key_id, loaded.key_id)
+        self.assertEqual(created.secret, loaded.secret)
+        self.assertRegex(
+            created.key_id,
+            rf"^{IDENTITY_KEY_ID_PREFIX}:[0-9a-f]{{64}}$",
+        )
+        self.assertNotIn(
+            base64.b64encode(created.secret).decode("ascii"), created.key_id
+        )
+        self.assertNotIn(
+            base64.b64encode(created.secret).decode("ascii"), repr(created)
+        )
+        self.assertEqual(0o700, stat.S_IMODE(target.parent.stat().st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(target.stat().st_mode))
+
+    def test_default_path_is_resolved_at_call_time(self) -> None:
+        home = self.root / "home"
+        home.mkdir(mode=0o700)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            identity = IdentityKey.load_or_create()
+
+        expected = home / ".codex" / "session-retrospective" / "identity-v2.key"
+        self.assertEqual(expected, identity.path)
+        self.assertTrue(expected.is_file())
+
+    def test_expected_key_id_mismatch_and_missing_key_block(self) -> None:
+        target = self.root / "identity" / "identity-v2.key"
+        created = IdentityKey.load_or_create(target)
+        other_key_id = f"{IDENTITY_KEY_ID_PREFIX}:{'0' * 64}"
+        self.assertNotEqual(created.key_id, other_key_id)
+
+        with self.assertRaises(IdentityKeyMismatchError):
+            IdentityKey.load_or_create(target, expected_key_id=other_key_id)
+        with self.assertRaises(IdentityKeyMismatchError):
+            IdentityKey.load_or_create(target, expected_key_id="not-a-key-id")
+        with self.assertRaises(IdentityKeyMismatchError):
+            IdentityKey.load_or_create(
+                target, expected_key_id="identity_key_v2:\N{SNOWMAN}"
+            )
+
+        missing = self.root / "missing" / "identity-v2.key"
+        with self.assertRaises(IdentityKeyMissingError):
+            IdentityKey.load_or_create(missing, expected_key_id=created.key_id)
+        self.assertFalse(missing.exists())
+
+    def test_stored_key_id_tampering_blocks_without_replacement(self) -> None:
+        target = self.root / "identity" / "identity-v2.key"
+        created = IdentityKey.load_or_create(target)
+        original_secret = created.secret
+        record = json.loads(target.read_text(encoding="utf-8"))
+        record["key_id"] = f"{IDENTITY_KEY_ID_PREFIX}:{'f' * 64}"
+        atomic_write_json(target, record)
+
+        with self.assertRaises(IdentityKeyMismatchError):
+            IdentityKey.load_or_create(target)
+
+        stored = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(
+            base64.b64encode(original_secret).decode("ascii"),
+            stored["secret_b64"],
+        )
+
+    def test_identity_schema_version_rejects_float_alias(self) -> None:
+        target = self.root / "identity" / "identity-v2.key"
+        IdentityKey.load_or_create(target)
+        record = json.loads(target.read_text(encoding="utf-8"))
+        record["schema_version"] = 2.0
+        atomic_write_json(target, record)
+
+        with self.assertRaises(IdentityKeyFormatError):
+            IdentityKey.load(target)
+
+    def test_missing_target_recovers_a_fully_prepared_identity_key(self) -> None:
+        require_secure_io_capabilities()
+        target = self.root / "identity" / "identity-v2.key"
+        expected = IdentityKey(b"r" * 32)
+
+        with mock.patch(
+            "retrospective_v2.safe_io.os.link",
+            side_effect=OSError("simulated crash before exclusive link"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated crash"):
+                IdentityKey.create(target, secret=expected.secret)
+
+        self.assertFalse(target.exists())
+        self.assertEqual(1, len(list(target.parent.glob(".atomic-create-*.tmp"))))
+
+        recovered = IdentityKey.load_or_create(
+            target,
+            expected_key_id=expected.key_id,
+        )
+        self.assertEqual(expected.key_id, recovered.key_id)
+        self.assertEqual(expected.secret, recovered.secret)
+        self.assertEqual([], list(target.parent.glob(".atomic-create-*.tmp")))
+
+    def test_link_commit_crash_recovers_from_two_links(self) -> None:
+        require_secure_io_capabilities()
+        target = self.root / "identity" / "identity-v2.key"
+        expected = IdentityKey(b"s" * 32)
+        real_unlink = os.unlink
+        injected = False
+
+        def fail_pending_unlink(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal injected
+            if (
+                isinstance(path, str)
+                and path.startswith(".atomic-create-")
+                and path.endswith(".tmp")
+                and not injected
+            ):
+                injected = True
+                raise OSError("simulated crash after exclusive link")
+            real_unlink(path, dir_fd=dir_fd)
+
+        with mock.patch(
+            "retrospective_v2.safe_io.os.unlink",
+            side_effect=fail_pending_unlink,
+        ):
+            with self.assertRaisesRegex(OSError, "simulated crash"):
+                IdentityKey.create(target, secret=expected.secret)
+
+        self.assertTrue(injected)
+        self.assertEqual(2, target.stat().st_nlink)
+        recovered = IdentityKey.load_or_create(
+            target,
+            expected_key_id=expected.key_id,
+        )
+        self.assertEqual(expected.secret, recovered.secret)
+        self.assertEqual(1, target.stat().st_nlink)
+
+    def test_recovered_pending_key_still_enforces_expected_key_id(self) -> None:
+        require_secure_io_capabilities()
+        target = self.root / "identity" / "identity-v2.key"
+        prepared = IdentityKey(b"t" * 32)
+        expected = IdentityKey(b"u" * 32)
+
+        with mock.patch(
+            "retrospective_v2.safe_io.os.link",
+            side_effect=OSError("simulated crash before exclusive link"),
+        ):
+            with self.assertRaises(OSError):
+                IdentityKey.create(target, secret=prepared.secret)
+
+        with self.assertRaises(IdentityKeyMismatchError):
+            IdentityKey.load_or_create(target, expected_key_id=expected.key_id)
+        loaded = IdentityKey.load(target, expected_key_id=prepared.key_id)
+        self.assertEqual(prepared.secret, loaded.secret)
+
+    def test_stable_refs_ignore_cwd_and_separate_hmac_domains(self) -> None:
+        identity = IdentityKey(b"k" * 32)
+        payload = {
+            "issuer": "trusted-test-issuer",
+            "session": "upstream-session",
+            "timestamp": "2026-07-14T00:00:00Z",
+        }
+        first_directory = self.root / "first-worktree"
+        second_directory = self.root / "second-worktree"
+        first_directory.mkdir()
+        second_directory.mkdir()
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(first_directory)
+            first = identity.derive_ref(RefType.SESSION, payload)
+            os.chdir(second_directory)
+            second = identity.derive_ref("session", payload)
+        finally:
+            os.chdir(original_cwd)
+
+        self.assertEqual(first, second)
+        self.assertEqual(64, len(first.digest))
+        self.assertNotEqual(
+            first.digest, identity.derive_ref(RefType.TURN, payload).digest
+        )
+        self.assertNotEqual(
+            identity.derive_digest("source/content", payload),
+            identity.derive_digest("source/unit", payload),
+        )
+        self.assertNotEqual(
+            identity.derive_ref(RefType.JOB, ["left", "right"]),
+            identity.derive_ref(RefType.JOB, "left", "right"),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

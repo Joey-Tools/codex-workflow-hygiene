@@ -123,7 +123,9 @@ class SkillValidatorWrapperTests(unittest.TestCase):
                 codex_home = self.root / f"codex-home-{index}"
                 validator = codex_home / relative_path
                 validator.parent.mkdir(parents=True)
-                validator.write_text(self.validator.read_text(encoding="utf-8"), encoding="utf-8")
+                validator.write_text(
+                    self.validator.read_text(encoding="utf-8"), encoding="utf-8"
+                )
                 validator.chmod(0o755)
                 env = os.environ.copy()
                 env["CODEX_HOME"] = str(codex_home)
@@ -175,11 +177,15 @@ class SkillValidatorWrapperTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("ERROR\t", result.stdout)
-        self.assertIn("Summary: 1/2 skills valid; 0 failed; 1 runtime errors.", result.stdout)
+        self.assertIn(
+            "Summary: 1/2 skills valid; 0 failed; 1 runtime errors.", result.stdout
+        )
         payload = json.loads(report.read_text(encoding="utf-8"))
         self.assertEqual(payload["summary"]["runtime_errors"], 1)
         self.assertTrue(payload["results"][1]["runtime_error"])
-        self.assertIn("Traceback (most recent call last):", payload["results"][1]["stderr"])
+        self.assertIn(
+            "Traceback (most recent call last):", payload["results"][1]["stderr"]
+        )
 
     def test_validator_syntax_error_is_runtime_error(self) -> None:
         report = self.root / "report.json"
@@ -285,7 +291,10 @@ class SkillValidatorWrapperTests(unittest.TestCase):
 
         expected_cache = self.root / ".codex-tmp/skill-validator-wrapper/uv-cache"
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(Path(capture.read_text(encoding="utf-8")).resolve(), expected_cache.resolve())
+        self.assertEqual(
+            Path(capture.read_text(encoding="utf-8")).resolve(),
+            expected_cache.resolve(),
+        )
         self.assertTrue(expected_cache.is_dir())
 
     def test_uv_setup_failure_falls_back_to_direct_python(self) -> None:
@@ -375,7 +384,9 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         payload = json.loads(report.read_text(encoding="utf-8"))
         self.assertEqual(payload["summary"]["failed"], 1)
-        self.assertEqual([attempt["mode"] for attempt in payload["results"][0]["attempts"]], ["uv"])
+        self.assertEqual(
+            [attempt["mode"] for attempt in payload["results"][0]["attempts"]], ["uv"]
+        )
 
 
 if __name__ == "__main__":
