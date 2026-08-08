@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import argparse
 import base64
-import binascii
 import datetime as dt
 from dataclasses import dataclass
 import errno
 import hashlib
-import hmac
 import json
 import os
 import pathlib
@@ -17,7 +15,6 @@ import re
 import stat
 import sys
 from typing import Any, Callable, Mapping, Sequence
-import zlib
 
 try:
     from . import catalog
@@ -26,26 +23,25 @@ try:
         RefType,
         SourceCellStatus,
         SourceKind,
-        canonical_json_bytes,
         parse_typed_ref,
-        strict_json_loads,
     )
     from .transport_capture import _validate_source_transport_relay
     from .transport_contracts import (
         SOURCE_TRANSPORT_ACTIVE_LOOKBACK_DAYS,
-        SOURCE_TRANSPORT_BOUNDARY_PROBE_BYTES,
         SOURCE_TRANSPORT_MAX_RECORD_BYTES,
-        SOURCE_TRANSPORT_RESUME_SCHEMA,
-        SOURCE_TRANSPORT_SCAN_CHUNK_BYTES,
+        SOURCE_TRANSPORT_RESUME_PROBE_BUDGET_BYTES,
+        SOURCE_TRANSPORT_RESUME_PROBE_BYTES,
         SOURCE_TRANSPORT_STREAM_SCHEMA,
         TransportValidationError,
         _REASON_RE,
         _TOKEN_RE,
         _canonical_commitment,
+        _derive_source_resume_position,
         _normalize_source_resume_position,
         _read_bounded_line,
         _sha256,
         _source_transport_inventory_commitment,
+        _source_transport_resume_probe,
         _stream_frame,
     )
     from .transport_paths import (
@@ -57,6 +53,15 @@ try:
         _relay_remote_host_context_command,
         _remote_host_context_command,
     )
+    from .transport_resume import (
+        _SourceTransportResumeProbeBudget,
+        _SourceTransportResumeProbeBudgetExhausted,
+        _source_transport_candidate_token,
+        _source_transport_file_identity,
+        _source_transport_range_digest,
+        decode_source_resume_position,
+        encode_source_resume_position,
+    )
 except (ImportError, ModuleNotFoundError):
     import catalog  # type: ignore[no-redef]
     from contracts import (  # type: ignore[no-redef]
@@ -64,28 +69,27 @@ except (ImportError, ModuleNotFoundError):
         RefType,
         SourceCellStatus,
         SourceKind,
-        canonical_json_bytes,
         parse_typed_ref,
-        strict_json_loads,
     )
     from transport_capture import (  # type: ignore[no-redef]
         _validate_source_transport_relay,
     )
     from transport_contracts import (  # type: ignore[no-redef]
         SOURCE_TRANSPORT_ACTIVE_LOOKBACK_DAYS,
-        SOURCE_TRANSPORT_BOUNDARY_PROBE_BYTES,
         SOURCE_TRANSPORT_MAX_RECORD_BYTES,
-        SOURCE_TRANSPORT_RESUME_SCHEMA,
-        SOURCE_TRANSPORT_SCAN_CHUNK_BYTES,
+        SOURCE_TRANSPORT_RESUME_PROBE_BUDGET_BYTES,
+        SOURCE_TRANSPORT_RESUME_PROBE_BYTES,
         SOURCE_TRANSPORT_STREAM_SCHEMA,
         TransportValidationError,
         _REASON_RE,
         _TOKEN_RE,
         _canonical_commitment,
+        _derive_source_resume_position,
         _normalize_source_resume_position,
         _read_bounded_line,
         _sha256,
         _source_transport_inventory_commitment,
+        _source_transport_resume_probe,
         _stream_frame,
     )
     from transport_paths import (  # type: ignore[no-redef]
@@ -96,6 +100,15 @@ except (ImportError, ModuleNotFoundError):
     from transport_remote import (  # type: ignore[no-redef]
         _relay_remote_host_context_command,
         _remote_host_context_command,
+    )
+    from transport_resume import (  # type: ignore[no-redef]
+        _SourceTransportResumeProbeBudget,
+        _SourceTransportResumeProbeBudgetExhausted,
+        _source_transport_candidate_token,
+        _source_transport_file_identity,
+        _source_transport_range_digest,
+        decode_source_resume_position,
+        encode_source_resume_position,
     )
 
 SOURCE_TRANSPORT_MIN_FRAME_BYTES = 4096
@@ -413,54 +426,33 @@ def _window_dates(start: dt.datetime, end: dt.datetime) -> tuple[dt.date, ...]:
     return tuple(start.date() + dt.timedelta(days=index) for index in range(count))
 
 
-def _source_transport_candidate_token(metadata: os.stat_result) -> str:
-    return _canonical_commitment(
-        {
-            "device": metadata.st_dev,
-            "inode": metadata.st_ino,
-            "mode": metadata.st_mode,
-            "schema": "source_transport_candidate_v2",
-        }
-    )
-
-
-def _source_transport_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    fields = (
-        "st_dev",
-        "st_ino",
-        "st_mode",
-        "st_nlink",
-        "st_size",
-        "st_mtime_ns",
-        "st_ctime_ns",
-    )
-    return tuple(int(getattr(metadata, field)) for field in fields)
-
-
-def _source_transport_range_digest(descriptor: int, start: int, end: int) -> str:
-    digest = hashlib.sha256()
-    scanned = start
-    while scanned < end:
-        chunk = os.pread(
-            descriptor,
-            min(SOURCE_TRANSPORT_SCAN_CHUNK_BYTES, end - scanned),
-            scanned,
-        )
-        if not chunk:
-            raise ValueError("source transport committed range is truncated")
-        digest.update(chunk)
-        scanned += len(chunk)
-    return "sha256:" + digest.hexdigest()
-
-
-def _source_transport_boundary_probe(
-    descriptor: int,
+def _emit_source_transport_resume_probe(
+    payload: bytes,
+    *,
     byte_offset: int,
-) -> tuple[int, str]:
-    probe_start = max(0, byte_offset - SOURCE_TRANSPORT_BOUNDARY_PROBE_BYTES)
-    return probe_start, _source_transport_range_digest(
-        descriptor, probe_start, byte_offset
-    )
+    max_frame_bytes: int,
+    source_locator: str,
+) -> None:
+    probe = _source_transport_resume_probe(payload, byte_offset=byte_offset)
+    fragment_bytes = max(1, ((max_frame_bytes - 1024) * 3) // 4)
+    fragment_count = max(1, (len(payload) + fragment_bytes - 1) // fragment_bytes)
+    for fragment_index in range(fragment_count):
+        fragment = payload[
+            fragment_index * fragment_bytes : (fragment_index + 1) * fragment_bytes
+        ]
+        _emit_source_transport_frame(
+            {
+                "byte_end": probe["byte_end"],
+                "byte_start": probe["byte_start"],
+                "fragment_count": fragment_count,
+                "fragment_index": fragment_index,
+                "frame": "resume_probe_fragment",
+                "payload_b64": base64.b64encode(fragment).decode("ascii"),
+                "schema": SOURCE_TRANSPORT_STREAM_SCHEMA,
+                "source_locator": source_locator,
+            },
+            max_frame_bytes=max_frame_bytes,
+        )
 
 
 def _source_transport_candidate_paths(
@@ -634,6 +626,8 @@ def _source_transport_candidate_paths(
 
 def _source_inventory_row(
     *,
+    candidate_index: int,
+    discovery_commitment: str,
     source_locator: str,
     record_index: int,
     byte_start: int,
@@ -644,14 +638,18 @@ def _source_inventory_row(
     event_time: str | None,
     session_commitment: str | None,
     source_occurrence: str,
+    source_size: int,
+    source_token: str,
 ) -> dict[str, JsonValue]:
     return {
         "accounting_class": accounting_class,
         "byte_end": byte_end,
         "byte_start": byte_start,
+        "candidate_index": candidate_index,
         "content_commitment": (
             None if payload is None else "sha256:" + hashlib.sha256(payload).hexdigest()
         ),
+        "discovery_commitment": discovery_commitment,
         "event_time": event_time,
         "frame": "inventory",
         "reason": reason,
@@ -660,6 +658,8 @@ def _source_inventory_row(
         "session_commitment": session_commitment,
         "source_occurrence": source_occurrence,
         "source_locator": source_locator,
+        "source_size": source_size,
+        "source_token": source_token,
     }
 
 
@@ -811,178 +811,22 @@ def _source_transport_discovery_commitment(
     )
 
 
-_SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP_SOURCE = "\n".join(
-    (
-        "import base64,hashlib,importlib.abc,importlib.util,json,os,sys,zlib",
-        "marker,digest,snapshot_path=sys.argv[1:4]\nwith open(snapshot_path,'rb') as handle: payload=handle.read(4194305)",
-        "if marker!='source_transport_worker_snapshot_v1' or 'sha256:'+hashlib.sha256(payload).hexdigest()!=digest: raise SystemExit('source transport snapshot authentication failed')\nif len(payload)>4194304: raise SystemExit('source transport snapshot exceeds its bound')",
-        "snapshot=json.loads(zlib.decompress(payload))\nruntime=snapshot['python_runtime']",
-        "path=os.path.realpath(sys.executable)\nwith open(path,'rb') as handle: executable=handle.read(67108865)",
-        "component={'content_commitment':'sha256:'+hashlib.sha256(executable).hexdigest(),'path':path,'role':'python_interpreter','state':'present'}\nactual={'component':component,'executable':sys.executable,'implementation':sys.implementation.name,'schema':'source_transport_python_runtime_v1','version':list(sys.version_info)}",
-        "if len(executable)>67108864 or actual!=runtime: raise SystemExit('source transport Python authority changed')",
-        "sources={name.removesuffix('.py'):base64.b64decode(content,validate=True) for name,content in snapshot['modules'].items()}\npaths={name.removesuffix('.py'):snapshot['package_dir']+'/'+name for name in snapshot['modules']}",
-        "class _Loader(importlib.abc.Loader):\n def __init__(self,name): self.name=name\n def create_module(self,spec): return None\n def exec_module(self,module): module.__file__=paths[self.name]; exec(compile(sources[self.name],paths[self.name],'exec'),module.__dict__)",
-        "class _Finder(importlib.abc.MetaPathFinder):\n def find_spec(self,fullname,path=None,target=None): return importlib.util.spec_from_loader(fullname,_Loader(fullname)) if fullname in sources else None",
-        "sys.meta_path.insert(0,_Finder())\nsys.argv=[sys.argv[4],*sys.argv[5:]]",
-        "sys._retrospective_v2_transport_snapshot=digest\nglobals()['__file__']=paths['transport_worker']\nexec(compile(sources['transport_worker'],paths['transport_worker'],'exec'),globals())",
-    )
-)
-_SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP_B64 = base64.b64encode(
-    _SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP_SOURCE.encode("utf-8")
-).decode("ascii")
-SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP = (
-    "import base64;exec(compile(base64.b64decode("
-    + repr(_SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP_B64)
-    + "),'<source-transport-snapshot>','exec'))"
-)
+@dataclass(frozen=True, slots=True)
+class _SourceTransportScanSetup:
+    window_start: dt.datetime
+    window_end: dt.datetime
+    cursor_time: dt.datetime | None
+    discovery: _SourceCandidateDiscovery
+    discovery_commitment: str
+    start_candidate_index: int
+    normalized_resume: dict[str, JsonValue] | None
+    terminal_status: str | None
+    terminal_reason: str
 
 
-def _source_transport_snapshot_path(cache: pathlib.Path, digest: str) -> pathlib.Path:
-    value = digest.removeprefix("sha256:")
-    if len(value) != 64 or any(
-        character not in "0123456789abcdef" for character in value
-    ):
-        raise TransportValidationError("source transport snapshot digest is invalid")
-    return cache / f"{value}.snapshot"
-
-
-def _source_transport_snapshot_flags(
-    *,
-    package_dir: pathlib.Path,
-    components: Sequence[Mapping[str, JsonValue]],
-    module_manifest: Sequence[str],
-    python_runtime: Mapping[str, JsonValue],
-    base_flags: Sequence[str],
-    schema: str,
-    cache: pathlib.Path,
-    maximum_bytes: int,
-) -> tuple[str, ...]:
-    try:
-        from . import safe_io as snapshot_io
-    except ImportError:
-        import safe_io as snapshot_io  # type: ignore[no-redef]
-
-    snapshot = {
-        "modules": {
-            name: str(component["content_b64"])
-            for name, component in zip(module_manifest, components, strict=True)
-        },
-        "package_dir": str(package_dir),
-        "python_runtime": dict(python_runtime),
-        "schema": schema,
-    }
-    payload = zlib.compress(canonical_json_bytes(snapshot), level=9)
-    if not payload or len(payload) > maximum_bytes:
-        raise TransportValidationError("source transport program snapshot is too large")
-    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
-    snapshot_path = _source_transport_snapshot_path(cache, digest)
-    snapshot_io.ensure_owner_only_directory(snapshot_path.parent)
-    try:
-        snapshot_io.atomic_create_bytes(
-            snapshot_path,
-            payload,
-            create_parents=False,
-        )
-    except FileExistsError:
-        try:
-            existing = snapshot_io.read_bounded_bytes(
-                snapshot_path,
-                max_bytes=maximum_bytes,
-                require_owner_only=True,
-            )
-        except (OSError, snapshot_io.UnsafePathError) as exc:
-            raise TransportValidationError(
-                "source transport program snapshot is invalid"
-            ) from exc
-        if not hmac.compare_digest(existing, payload):
-            raise TransportValidationError(
-                "source transport program snapshot digest changed"
-            )
-    return (
-        *base_flags,
-        "-c",
-        SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP,
-        schema,
-        digest,
-        str(snapshot_path),
-    )
-
-
-def _source_transport_decode_snapshot(
-    argv: tuple[str, ...],
-    *,
-    prefix: tuple[str, ...],
-    cache: pathlib.Path,
-    maximum_bytes: int,
-    component_reader: Callable[..., Mapping[str, JsonValue]],
-) -> tuple[dict[str, JsonValue], int, str]:
-    try:
-        from . import safe_io as snapshot_io
-    except ImportError:
-        import safe_io as snapshot_io  # type: ignore[no-redef]
-
-    if argv[: len(prefix)] != prefix or len(argv) < len(prefix) + 4:
-        raise TransportValidationError("source transport command is incomplete")
-    digest = argv[len(prefix)]
-    snapshot_path = pathlib.Path(argv[len(prefix) + 1])
-    if snapshot_path != _source_transport_snapshot_path(cache, digest):
-        raise TransportValidationError("source transport snapshot path is invalid")
-    try:
-        snapshot_io.recover_atomic_create(snapshot_path)
-        component = component_reader(
-            snapshot_path,
-            role="program_snapshot",
-            allow_missing=False,
-            maximum_bytes=maximum_bytes,
-            include_content=True,
-        )
-        payload = base64.b64decode(str(component["content_b64"]), validate=True)
-        snapshot = strict_json_loads(zlib.decompress(payload))
-    except (OSError, ValueError, zlib.error, snapshot_io.UnsafePathError) as exc:
-        raise TransportValidationError("source transport snapshot is invalid") from exc
-    if digest != "sha256:" + hashlib.sha256(payload).hexdigest() or not isinstance(
-        snapshot, dict
-    ):
-        raise TransportValidationError("source transport snapshot digest changed")
-    return snapshot, len(prefix) + 2, digest
-
-
-def encode_source_resume_position(value: Mapping[str, object]) -> str:
-    normalized = _normalize_source_resume_position(value)
-    if normalized is None:
-        raise TransportValidationError("source transport resume position is missing")
-    return (
-        base64.urlsafe_b64encode(canonical_json_bytes(normalized))
-        .decode("ascii")
-        .rstrip("=")
-    )
-
-
-def decode_source_resume_position(value: str) -> dict[str, JsonValue]:
-    if not isinstance(value, str) or not value or len(value) > 4096:
-        raise TransportValidationError("source transport resume position is invalid")
-    try:
-        payload = base64.b64decode(
-            value + "=" * (-len(value) % 4),
-            altchars=b"-_",
-            validate=True,
-        )
-        decoded = strict_json_loads(payload)
-    except (binascii.Error, ValueError) as exc:
-        raise TransportValidationError(
-            "source transport resume position is invalid"
-        ) from exc
-    if not isinstance(decoded, Mapping):
-        raise TransportValidationError("source transport resume position is invalid")
-    normalized = _normalize_source_resume_position(decoded)
-    if normalized is None or canonical_json_bytes(normalized) != payload:
-        raise TransportValidationError(
-            "source transport resume position is not canonical"
-        )
-    return normalized
-
-
-def _source_transport_scan(args: argparse.Namespace) -> int:
+def _prepare_source_transport_scan(
+    args: argparse.Namespace,
+) -> _SourceTransportScanSetup:
     if args.max_source_bytes < 1:
         raise ValueError("--max-source-bytes must be positive")
     if args.max_records < 1:
@@ -1012,15 +856,6 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
             label="source transport cursor time",
         )
     )
-    inventory: list[dict[str, Any]] = []
-    emitted_bytes = 0
-    emitted_records = 0
-    transport_scan_bytes = 0
-    oversized_record_count = 0
-    oversized_byte_count = 0
-    terminal_reason = "authoritative_eof"
-    terminal_status: str | None = None
-    resume_position: dict[str, JsonValue] | None = None
     root = (
         pathlib.Path(args.direct_root)
         if args.direct_root is not None
@@ -1043,27 +878,122 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
             "source_enumeration_failed",
         )
     candidates = discovery.candidates
+    candidate_tokens = dict(discovery.candidate_tokens)
+    discovery_commitment = _source_transport_discovery_commitment(discovery)
+    start_candidate_index = 0
+    normalized_resume: dict[str, JsonValue] | None = None
+    terminal_status: str | None = None
+    terminal_reason = "authoritative_eof"
+    try:
+        if args.resume_position is not None:
+            normalized_resume = _normalize_source_resume_position(args.resume_position)
+            assert normalized_resume is not None
+            start_candidate_index = int(normalized_resume["candidate_index"])
+            if (
+                normalized_resume["discovery_commitment"] != discovery_commitment
+                or start_candidate_index >= len(candidates)
+                or candidates[start_candidate_index][1]
+                != normalized_resume["source_locator"]
+                or candidate_tokens.get(str(normalized_resume["source_locator"]))
+                != normalized_resume["source_token"]
+            ):
+                terminal_status = "gap"
+                terminal_reason = "source_resume_invalid"
+    except BaseException:
+        discovery.close()
+        raise
+    return _SourceTransportScanSetup(
+        window_start=window_start,
+        window_end=window_end,
+        cursor_time=cursor_time,
+        discovery=discovery,
+        discovery_commitment=discovery_commitment,
+        start_candidate_index=start_candidate_index,
+        normalized_resume=normalized_resume,
+        terminal_status=terminal_status,
+        terminal_reason=terminal_reason,
+    )
+
+
+def _emit_source_transport_terminal(
+    args: argparse.Namespace,
+    *,
+    inventory: Sequence[Mapping[str, Any]],
+    terminal_status: str | None,
+    terminal_reason: str,
+    discovery_gap_reason: str | None,
+    source_exists: bool,
+    emitted_records: int,
+    emitted_bytes: int,
+    transport_scan_bytes: int,
+    oversized_record_count: int,
+    oversized_byte_count: int,
+    resume_position: Mapping[str, JsonValue] | None,
+) -> None:
+    if terminal_status is None and discovery_gap_reason is not None:
+        terminal_status = "gap"
+        terminal_reason = discovery_gap_reason
+    if terminal_status is None:
+        if not source_exists:
+            terminal_status = "verified_absent"
+            terminal_reason = "source_verified_absent"
+        elif emitted_records == 0:
+            terminal_status = "no_activity"
+            terminal_reason = "authoritative_empty_snapshot"
+        else:
+            terminal_status = "complete"
+    inventory_accounting = {
+        value.value: sum(item["accounting_class"] == value.value for item in inventory)
+        for value in catalog.AccountingClass
+    }
+    _emit_source_transport_frame(
+        {
+            "complete": terminal_status
+            in {"complete", "no_activity", "verified_absent"},
+            "emitted_byte_count": emitted_bytes,
+            "emitted_record_count": emitted_records,
+            "frame": "terminal",
+            "inventory_commitment": _source_transport_inventory_commitment(inventory),
+            "inventory_accounting": inventory_accounting,
+            "inventory_count": len(inventory),
+            "oversized_byte_count": oversized_byte_count,
+            "oversized_record_count": oversized_record_count,
+            "reason": terminal_reason,
+            "resume_position": resume_position,
+            "scan_byte_count": transport_scan_bytes,
+            "schema": SOURCE_TRANSPORT_STREAM_SCHEMA,
+            "status": terminal_status,
+        },
+        max_frame_bytes=args.max_frame_bytes,
+    )
+
+
+def _source_transport_scan(args: argparse.Namespace) -> int:
+    setup = _prepare_source_transport_scan(args)
+    window_start = setup.window_start
+    window_end = setup.window_end
+    cursor_time = setup.cursor_time
+    discovery = setup.discovery
+    discovery_commitment = setup.discovery_commitment
+    start_candidate_index = setup.start_candidate_index
+    normalized_resume = setup.normalized_resume
+    terminal_status = setup.terminal_status
+    terminal_reason = setup.terminal_reason
+    candidates = discovery.candidates
     candidate_identities = dict(discovery.candidate_identities)
     candidate_tokens = dict(discovery.candidate_tokens)
     source_exists = discovery.source_exists
     discovery_gap_reason = discovery.gap_reason
-    discovery_commitment = _source_transport_discovery_commitment(discovery)
-    start_candidate_index = 0
-    normalized_resume: dict[str, JsonValue] | None = None
-    if args.resume_position is not None:
-        normalized_resume = _normalize_source_resume_position(args.resume_position)
-        assert normalized_resume is not None
-        start_candidate_index = int(normalized_resume["candidate_index"])
-        if (
-            normalized_resume["discovery_commitment"] != discovery_commitment
-            or start_candidate_index >= len(candidates)
-            or candidates[start_candidate_index][1]
-            != normalized_resume["source_locator"]
-            or candidate_tokens.get(str(normalized_resume["source_locator"]))
-            != normalized_resume["source_token"]
-        ):
-            terminal_status = "gap"
-            terminal_reason = "source_resume_invalid"
+    inventory: list[dict[str, Any]] = []
+    emitted_bytes = 0
+    emitted_records = 0
+    transport_scan_bytes = 0
+    oversized_record_count = 0
+    oversized_byte_count = 0
+    resume_position: dict[str, JsonValue] | None = None
+    resume_probe_budget = _SourceTransportResumeProbeBudget(
+        SOURCE_TRANSPORT_RESUME_PROBE_BUDGET_BYTES
+    )
 
     raw_fragment_bytes = min(
         256 * 1024,
@@ -1137,14 +1067,39 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                 terminal_reason = "source_resume_invalid"
                 stop = True
                 continue
+            accepted_prefix_tail = bytearray()
+            incoming_probe = b""
             if is_resume_candidate and normalized_resume is not None:
-                frozen_prefix = _source_transport_range_digest(descriptor, 0, scanned)
-                if frozen_prefix != normalized_resume["frozen_prefix_commitment"]:
+                raw_probe = normalized_resume["resume_probe"]
+                assert isinstance(raw_probe, Mapping)
+                try:
+                    incoming_probe = resume_probe_budget.read(
+                        descriptor,
+                        start=int(raw_probe["byte_start"]),
+                        end=int(raw_probe["byte_end"]),
+                    )
+                except _SourceTransportResumeProbeBudgetExhausted:
+                    terminal_status = "gap"
+                    terminal_reason = "source_resume_probe_budget_exhausted"
+                    stop = True
+                    continue
+                except (OSError, ValueError):
                     terminal_status = "gap"
                     terminal_reason = "source_resume_invalid"
                     stop = True
                     continue
-            boundary_probe = _source_transport_boundary_probe(descriptor, source_size)
+                if (
+                    _source_transport_resume_probe(
+                        incoming_probe,
+                        byte_offset=scanned,
+                    )
+                    != raw_probe
+                ):
+                    terminal_status = "gap"
+                    terminal_reason = "source_resume_invalid"
+                    stop = True
+                    continue
+                accepted_prefix_tail.extend(incoming_probe)
             locator_session_ids: set[str] = set()
             source_kind = SourceKind(args.source_kind)
             with os.fdopen(descriptor, "rb", closefd=False) as handle:
@@ -1159,20 +1114,6 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                         transport_scan_bytes > 0
                         and remaining_source_bytes <= reserve_bytes
                     ):
-                        frozen_prefix = _source_transport_range_digest(
-                            descriptor, 0, scanned
-                        )
-                        resume_position = {
-                            "byte_offset": scanned,
-                            "candidate_index": candidate_index,
-                            "discovery_commitment": discovery_commitment,
-                            "frozen_prefix_commitment": frozen_prefix,
-                            "record_index": file_record_index,
-                            "schema": SOURCE_TRANSPORT_RESUME_SCHEMA,
-                            "source_locator": relative,
-                            "source_size": source_size,
-                            "source_token": source_token,
-                        }
                         terminal_status = "gap"
                         terminal_reason = (
                             "source_record_limit_reached"
@@ -1201,6 +1142,15 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                     scanned += line.byte_count
                     transport_scan_bytes += line.byte_count
                     payload = line.payload
+                    if payload is not None:
+                        accepted_prefix_tail.extend(payload)
+                        if (
+                            len(accepted_prefix_tail)
+                            > SOURCE_TRANSPORT_RESUME_PROBE_BYTES
+                        ):
+                            del accepted_prefix_tail[
+                                :-SOURCE_TRANSPORT_RESUME_PROBE_BYTES
+                            ]
                     event_time: str | None = None
                     record_session_commitment: str | None = None
                     accounting_class = catalog.AccountingClass.EXPLICIT_GAP.value
@@ -1315,6 +1265,8 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                                 )
                                 reason = "inside_window"
                     inventory_row = _source_inventory_row(
+                        candidate_index=candidate_index,
+                        discovery_commitment=discovery_commitment,
                         source_locator=relative,
                         record_index=file_record_index,
                         byte_start=byte_start,
@@ -1325,6 +1277,8 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                         event_time=event_time,
                         session_commitment=record_session_commitment,
                         source_occurrence=source_occurrence,
+                        source_size=source_size,
+                        source_token=source_token,
                     )
                     inventory.append(inventory_row)
                     _emit_source_transport_frame(
@@ -1367,26 +1321,54 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                     file_record_index += 1
                     if stop:
                         break
-            proof_before = os.fstat(descriptor)
-            if proof_before.st_size < max(source_size, scanned):
-                after_boundary_probe = None
-                scanned_range_commitment = None
-                resumed_prefix_commitment = None
-            else:
-                after_boundary_probe = _source_transport_boundary_probe(
-                    descriptor,
-                    source_size,
+            remaining_source_bytes = args.max_source_bytes - transport_scan_bytes
+            if (
+                not stop
+                and scanned == source_size
+                and candidate_index + 1 < len(candidates)
+                and (
+                    len(inventory) >= args.max_records
+                    or (
+                        transport_scan_bytes > 0
+                        and remaining_source_bytes <= reserve_bytes
+                    )
                 )
+            ):
+                terminal_status = "gap"
+                terminal_reason = (
+                    "source_record_limit_reached"
+                    if len(inventory) >= args.max_records
+                    else "source_byte_limit_reached"
+                )
+                stop = True
+            proof_before = os.fstat(descriptor)
+            resume_probe_stable = True
+            probe_failure_reason: str | None = None
+            if proof_before.st_size < max(source_size, scanned):
+                scanned_range_commitment = None
+            else:
                 scanned_range_commitment = _source_transport_range_digest(
                     descriptor,
                     scan_start,
                     scanned,
                 )
-                resumed_prefix_commitment = (
-                    _source_transport_range_digest(descriptor, 0, scan_start)
-                    if is_resume_candidate
-                    else None
-                )
+                if is_resume_candidate and normalized_resume is not None:
+                    raw_probe = normalized_resume["resume_probe"]
+                    assert isinstance(raw_probe, Mapping)
+                    try:
+                        resume_probe_stable = (
+                            resume_probe_budget.read(
+                                descriptor,
+                                start=int(raw_probe["byte_start"]),
+                                end=int(raw_probe["byte_end"]),
+                            )
+                            == incoming_probe
+                        )
+                    except _SourceTransportResumeProbeBudgetExhausted:
+                        resume_probe_stable = False
+                        probe_failure_reason = "source_resume_probe_budget_exhausted"
+                    except (OSError, ValueError):
+                        resume_probe_stable = False
             after = os.fstat(descriptor)
             read_range_commitment = "sha256:" + digest.hexdigest()
             stable = (
@@ -1396,13 +1378,8 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                 and _source_transport_file_identity(proof_before)
                 == _source_transport_file_identity(after)
                 and after.st_size >= source_size
-                and boundary_probe == after_boundary_probe
                 and scanned_range_commitment == read_range_commitment
-                and (
-                    not is_resume_candidate
-                    or resumed_prefix_commitment
-                    == normalized_resume["frozen_prefix_commitment"]
-                )
+                and resume_probe_stable
                 and (
                     after.st_size > before.st_size
                     or (
@@ -1414,56 +1391,69 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                 and (
                     scanned == source_size
                     or (
-                        resume_position is not None
-                        and resume_position["candidate_index"] == candidate_index
-                        and resume_position["byte_offset"] == scanned
+                        terminal_status == "gap"
+                        and terminal_reason
+                        in {
+                            "source_byte_limit_reached",
+                            "source_record_limit_reached",
+                        }
                     )
                 )
             )
             if not stable:
                 terminal_status = "gap"
-                terminal_reason = "source_changed_during_scan"
+                terminal_reason = probe_failure_reason or "source_changed_during_scan"
                 resume_position = None
                 stop = True
+            elif terminal_reason in {
+                "source_byte_limit_reached",
+                "source_record_limit_reached",
+            }:
+                outgoing_probe = bytes(accepted_prefix_tail)
+                expected_probe_size = min(
+                    SOURCE_TRANSPORT_RESUME_PROBE_BYTES,
+                    scanned,
+                )
+                if len(outgoing_probe) != expected_probe_size:
+                    terminal_status = "gap"
+                    terminal_reason = "source_resume_probe_unavailable"
+                    resume_position = None
+                    stop = True
+                else:
+                    resume_probe = _source_transport_resume_probe(
+                        outgoing_probe,
+                        byte_offset=scanned,
+                    )
+                    resume_position = _derive_source_resume_position(
+                        prior_position=normalized_resume,
+                        inventory=inventory,
+                        resume_probe=resume_probe,
+                    )
+                    _emit_source_transport_resume_probe(
+                        outgoing_probe,
+                        byte_offset=scanned,
+                        max_frame_bytes=args.max_frame_bytes,
+                        source_locator=relative,
+                    )
         finally:
             os.close(descriptor)
 
     discovery.close()
 
-    if terminal_status is None and discovery_gap_reason is not None:
-        terminal_status = "gap"
-        terminal_reason = discovery_gap_reason
-    if terminal_status is None:
-        if not source_exists:
-            terminal_status = "verified_absent"
-            terminal_reason = "source_verified_absent"
-        elif emitted_records == 0:
-            terminal_status = "no_activity"
-            terminal_reason = "authoritative_empty_snapshot"
-        else:
-            terminal_status = "complete"
-    inventory_commitment = _source_transport_inventory_commitment(inventory)
-    inventory_accounting = {
-        value.value: sum(item["accounting_class"] == value.value for item in inventory)
-        for value in catalog.AccountingClass
-    }
-    terminal = {
-        "complete": terminal_status in {"complete", "no_activity", "verified_absent"},
-        "emitted_byte_count": emitted_bytes,
-        "emitted_record_count": emitted_records,
-        "frame": "terminal",
-        "inventory_commitment": inventory_commitment,
-        "inventory_accounting": inventory_accounting,
-        "inventory_count": len(inventory),
-        "oversized_byte_count": oversized_byte_count,
-        "oversized_record_count": oversized_record_count,
-        "reason": terminal_reason,
-        "resume_position": resume_position,
-        "scan_byte_count": transport_scan_bytes,
-        "schema": SOURCE_TRANSPORT_STREAM_SCHEMA,
-        "status": terminal_status,
-    }
-    _emit_source_transport_frame(terminal, max_frame_bytes=args.max_frame_bytes)
+    _emit_source_transport_terminal(
+        args,
+        inventory=inventory,
+        terminal_status=terminal_status,
+        terminal_reason=terminal_reason,
+        discovery_gap_reason=discovery_gap_reason,
+        source_exists=source_exists,
+        emitted_records=emitted_records,
+        emitted_bytes=emitted_bytes,
+        transport_scan_bytes=transport_scan_bytes,
+        oversized_record_count=oversized_record_count,
+        oversized_byte_count=oversized_byte_count,
+        resume_position=resume_position,
+    )
     return 0
 
 
@@ -1632,7 +1622,10 @@ def _run_private_transport_worker(argv: Sequence[str] | None = None) -> int:
         _source_transport_remote_arguments(args),
     )
     wire_limit = (
-        args.max_source_bytes * 2 + args.max_records * 4096 + args.max_frame_bytes * 2
+        args.max_source_bytes * 2
+        + args.max_records * 4096
+        + args.max_frame_bytes * 2
+        + SOURCE_TRANSPORT_RESUME_PROBE_BYTES * 2
     )
     try:
         _relay_remote_host_context_command(

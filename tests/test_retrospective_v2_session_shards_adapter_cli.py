@@ -25,7 +25,10 @@ from retrospective_v2 import (  # noqa: E402
     session_shards_adapter,
     transport,
 )
-from retrospective_v2.contracts import canonical_json  # noqa: E402
+from retrospective_v2.contracts import (  # noqa: E402
+    SessionShardsRequest,
+    canonical_json,
+)
 from retrospective_v2.identity import IdentityKey  # noqa: E402
 from retrospective_v2.orchestrator import (  # noqa: E402
     RetrospectiveOrchestrator,
@@ -364,10 +367,13 @@ class SessionShardsAdapterCliTests(unittest.TestCase):
             "_iter_transport_frames",
             side_effect=tracked_frames,
         ):
-            normalized, request = cli._session_shard_transcript(
-                Path("unused-session-shards.jsonl"),
-                expected_host="local",
+            segments = iter(
+                cli._session_shard_transcript(
+                    Path("unused-session-shards.jsonl"),
+                    expected_host="local",
+                )
             )
+            normalized, request = next(segments)
             self.assertEqual(0, active_streams)
             self.assertEqual(1, opened_streams)
             self.assertEqual("records", request.mode)
@@ -382,9 +388,157 @@ class SessionShardsAdapterCliTests(unittest.TestCase):
                 ],
                 list(normalized),
             )
+            with self.assertRaises(StopIteration):
+                next(segments)
 
         self.assertEqual(0, active_streams)
         self.assertEqual(2, opened_streams)
+
+    def test_adapter_binds_continuation_meta_to_the_request_cursor(self) -> None:
+        data = (self.codex_root / self.rollout).read_bytes()
+        first_line = data.splitlines(keepends=True)[0]
+        first_page = list(
+            transport._iter_local_session_shard_frames(
+                codex_root=self.codex_root,
+                rollout_relative_path=PurePosixPath(self.rollout),
+                emit="descriptors",
+                byte_start=0,
+                byte_end=None,
+                shard_bytes=len(first_line),
+                max_shards=1,
+                source_token=None,
+                resume_cursor=None,
+            )
+        )
+        first_plan = session_shards_adapter.descriptor_plan_from_frames(
+            self.wrapped(first_page, rollout=self.rollout),
+            expected_host="local",
+        )
+        assert first_plan.next_descriptor_request is not None
+        request = first_plan.next_descriptor_request
+        second_page = self.wrapped(
+            list(
+                transport._iter_local_session_shard_frames(
+                    codex_root=self.codex_root,
+                    rollout_relative_path=PurePosixPath(self.rollout),
+                    emit="descriptors",
+                    byte_start=request.byte_start,
+                    byte_end=None,
+                    shard_bytes=request.shard_bytes,
+                    max_shards=request.max_shards,
+                    source_token=request.source_token,
+                    resume_cursor=request.resume_cursor,
+                    record_processing_budget_bytes=(
+                        request.record_processing_budget_bytes
+                    ),
+                )
+            ),
+            rollout=self.rollout,
+        )
+        meta = second_page[0]
+        mutations = {
+            "source_token": "session_shards_source_v2:" + "f" * 64,
+            "source_bytes": int(meta["source_bytes"]) + 1,
+            "record_start": int(meta["record_start"]) + 1,
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                changed = copy.deepcopy(second_page)
+                changed[0][field] = value
+                with self.assertRaisesRegex(
+                    session_shards_adapter.SessionShardsAdapterError,
+                    "request cursor coordinates",
+                ):
+                    session_shards_adapter.descriptor_plan_from_frames(
+                        changed,
+                        expected_host="local",
+                    )
+
+    def test_transcript_pages_records_by_the_data_frame_limit(self) -> None:
+        data = b"{}\n" * (transport.MAX_SESSION_SHARDS_RECORD_DATA_FRAMES + 1)
+        (self.codex_root / self.rollout).write_bytes(data)
+        descriptor_pages: list[list[dict[str, object]]] = []
+        plans: list[session_shards_adapter.SessionShardsDescriptorPlan] = []
+        request: SessionShardsRequest | None = None
+        while True:
+            descriptors = list(
+                transport._iter_local_session_shard_frames(
+                    codex_root=self.codex_root,
+                    rollout_relative_path=PurePosixPath(self.rollout),
+                    emit="descriptors",
+                    byte_start=0 if request is None else request.byte_start,
+                    byte_end=None,
+                    shard_bytes=orchestrator_module.EXTRACTOR_SHARD_MAX_BYTES,
+                    max_shards=transport.DEFAULT_SESSION_SHARDS_PER_PAGE,
+                    source_token=None if request is None else request.source_token,
+                    resume_cursor=None if request is None else request.resume_cursor,
+                    record_processing_budget_bytes=(
+                        transport.DEFAULT_SESSION_RECORD_PROCESSING_BUDGET_BYTES
+                    ),
+                )
+            )
+            wrapped = self.wrapped(descriptors, rollout=self.rollout)
+            plan = session_shards_adapter.descriptor_plan_from_frames(
+                wrapped,
+                expected_host="local",
+            )
+            descriptor_pages.append(wrapped)
+            plans.append(plan)
+            if plan.complete:
+                break
+            assert plan.next_descriptor_request is not None
+            request = plan.next_descriptor_request
+
+        record_streams: list[list[dict[str, object]]] = []
+        for plan in plans:
+            assert plan.records_request is not None
+            record_request = plan.records_request
+            record_streams.append(
+                self.wrapped(
+                    list(
+                        transport._iter_local_session_shard_frames(
+                            codex_root=self.codex_root,
+                            rollout_relative_path=PurePosixPath(self.rollout),
+                            emit="records",
+                            byte_start=record_request.byte_start,
+                            byte_end=record_request.byte_end,
+                            shard_bytes=record_request.shard_bytes,
+                            max_shards=record_request.max_shards,
+                            source_token=record_request.source_token,
+                            resume_cursor=record_request.resume_cursor,
+                            record_processing_budget_bytes=(
+                                record_request.record_processing_budget_bytes
+                            ),
+                        )
+                    ),
+                    rollout=self.rollout,
+                )
+            )
+        transcript = [
+            frame for stream in (*descriptor_pages, *record_streams) for frame in stream
+        ]
+
+        with mock.patch.object(
+            cli,
+            "_iter_transport_frames",
+            side_effect=lambda _path: iter(copy.deepcopy(transcript)),
+        ):
+            segments = iter(
+                cli._session_shard_transcript(
+                    Path("unused-paged-session-shards.jsonl"),
+                    expected_host="local",
+                )
+            )
+            record_counts = []
+            for frames, _request in segments:
+                record_counts.append(
+                    len([frame for frame in frames if frame["kind"] == "record"])
+                )
+
+        self.assertEqual(
+            [transport.MAX_SESSION_SHARDS_RECORD_DATA_FRAMES, 1],
+            record_counts,
+        )
 
     def test_host_bound_adapter_rejects_missing_wrapper(self) -> None:
         descriptors, _records = self.shard_streams()
@@ -416,6 +570,36 @@ class SessionShardsAdapterCliTests(unittest.TestCase):
         with self.assertRaisesRegex(
             session_shards_adapter.SessionShardsAdapterError,
             "unsupported",
+        ):
+            session_shards_adapter.descriptor_plan_from_frames(
+                changed,
+                expected_host="local",
+            )
+
+    def test_adapter_uses_only_terminal_frozen_cursor_for_records(self) -> None:
+        descriptors, _records = self.shard_streams()
+        plan = session_shards_adapter.descriptor_plan_from_frames(
+            descriptors,
+            expected_host="local",
+        )
+        terminal = next(
+            frame for frame in descriptors if frame.get("kind") == "stream_end"
+        )
+        assert plan.records_request is not None
+        self.assertEqual(
+            plan.records_request.resume_cursor,
+            terminal["records_resume_cursor"],
+        )
+
+        changed = copy.deepcopy(descriptors)
+        changed_terminal = next(
+            frame for frame in changed if frame.get("kind") == "stream_end"
+        )
+        first_shard = next(frame for frame in changed if frame.get("kind") == "shard")
+        changed_terminal["records_resume_cursor"] = first_shard["resume_cursor"]
+        with self.assertRaisesRegex(
+            session_shards_adapter.SessionShardsAdapterError,
+            "records cursor",
         ):
             session_shards_adapter.descriptor_plan_from_frames(
                 changed,

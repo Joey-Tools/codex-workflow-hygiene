@@ -48,6 +48,7 @@ class ResultHistoryOperations(OrchestratorComponent):
         if kind == JobKind.EXTRACTOR_REDACTOR.value:
             original_prompts, tool_outputs = self._extractor_overlap_inputs(state, task)
             metadata = task["metadata"]["turn_metadata"]
+            result_validation.validate_result_envelope(result)
             overlap_findings = result_validation.scan_for_leaks(
                 result,
                 original_prompts=original_prompts,

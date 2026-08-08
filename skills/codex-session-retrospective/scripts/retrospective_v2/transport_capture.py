@@ -14,6 +14,7 @@ try:
     from .contracts import JsonValue, SourceCellStatus
     from .transport_contracts import (
         SOURCE_TRANSPORT_MAX_RECORD_BYTES,
+        SOURCE_TRANSPORT_RESUME_PROBE_BYTES,
         SOURCE_TRANSPORT_STREAM_SCHEMA,
         TRANSPORT_LEASE_AUTH_PREFIX,
         CapturedSourceRecord,
@@ -23,12 +24,14 @@ try:
         _LOCATOR_RE,
         _REASON_RE,
         _canonical_commitment,
+        _derive_source_resume_position,
         _exact_keys,
         _non_negative_int,
         _normalize_source_resume_position,
         _positive_int,
         _sha256,
         _source_transport_inventory_commitment,
+        _source_transport_resume_probe,
         _stream_frame,
     )
 except (ImportError, ModuleNotFoundError):
@@ -36,6 +39,7 @@ except (ImportError, ModuleNotFoundError):
     from contracts import JsonValue, SourceCellStatus  # type: ignore[no-redef]
     from transport_contracts import (  # type: ignore[no-redef]
         SOURCE_TRANSPORT_MAX_RECORD_BYTES,
+        SOURCE_TRANSPORT_RESUME_PROBE_BYTES,
         SOURCE_TRANSPORT_STREAM_SCHEMA,
         TRANSPORT_LEASE_AUTH_PREFIX,
         CapturedSourceRecord,
@@ -45,12 +49,14 @@ except (ImportError, ModuleNotFoundError):
         _LOCATOR_RE,
         _REASON_RE,
         _canonical_commitment,
+        _derive_source_resume_position,
         _exact_keys,
         _non_negative_int,
         _normalize_source_resume_position,
         _positive_int,
         _sha256,
         _source_transport_inventory_commitment,
+        _source_transport_resume_probe,
         _stream_frame,
     )
 
@@ -96,6 +102,10 @@ class _SourceTransportCaptureValidator:
         self.header_seen = False
         self.terminal: Mapping[str, object] | None = None
         self.pending: dict[str, object] | None = None
+        self.resume_probe_pending: dict[str, object] | None = None
+        self.resume_probe_payload: bytes | None = None
+        self.resume_probe_locator: str | None = None
+        self.resume_probe_range: tuple[int, int] | None = None
         self.wire_bytes = 0
         self.payload_bytes = 0
         self.prior_locator = (
@@ -113,10 +123,31 @@ class _SourceTransportCaptureValidator:
             if lease.resume_position is None
             else int(lease.resume_position["byte_offset"])
         )
+        self.prior_candidate_index = (
+            -1
+            if lease.resume_position is None
+            else int(lease.resume_position["candidate_index"])
+        )
+        self.prior_source_size = (
+            None
+            if lease.resume_position is None
+            else int(lease.resume_position["source_size"])
+        )
+        self.prior_source_token = (
+            None
+            if lease.resume_position is None
+            else str(lease.resume_position["source_token"])
+        )
+        self.discovery_commitment = (
+            None
+            if lease.resume_position is None
+            else str(lease.resume_position["discovery_commitment"])
+        )
         self.wire_limit = (
             lease.source_byte_limit * 2
             + lease.record_limit * 4096
             + lease.frame_byte_limit * 2
+            + SOURCE_TRANSPORT_RESUME_PROBE_BYTES * 2
         )
 
     def _finish_pending(self) -> None:
@@ -185,7 +216,9 @@ class _SourceTransportCaptureValidator:
                 "accounting_class",
                 "byte_end",
                 "byte_start",
+                "candidate_index",
                 "content_commitment",
+                "discovery_commitment",
                 "event_time",
                 "frame",
                 "reason",
@@ -194,6 +227,8 @@ class _SourceTransportCaptureValidator:
                 "session_commitment",
                 "source_occurrence",
                 "source_locator",
+                "source_size",
+                "source_token",
             },
             "source transport inventory item",
         )
@@ -219,6 +254,32 @@ class _SourceTransportCaptureValidator:
         if byte_end <= byte_start:
             raise TransportValidationError(
                 "source transport inventory coordinates are invalid"
+            )
+        candidate_index = _non_negative_int(
+            frame["candidate_index"],
+            "source transport inventory candidate_index",
+        )
+        discovery_commitment = _sha256(
+            frame["discovery_commitment"],
+            "source transport inventory discovery_commitment",
+        )
+        source_size = _non_negative_int(
+            frame["source_size"],
+            "source transport inventory source_size",
+        )
+        source_token = _sha256(
+            frame["source_token"],
+            "source transport inventory source_token",
+        )
+        if byte_end > source_size:
+            raise TransportValidationError(
+                "source transport inventory exceeds its frozen source"
+            )
+        if self.discovery_commitment is None:
+            self.discovery_commitment = discovery_commitment
+        elif self.discovery_commitment != discovery_commitment:
+            raise TransportValidationError(
+                "source transport inventory discovery changed"
             )
         try:
             accounting_class = catalog.AccountingClass(frame["accounting_class"])
@@ -247,14 +308,19 @@ class _SourceTransportCaptureValidator:
             )
         self._validate_inventory_coordinate(
             locator,
+            candidate_index=candidate_index,
             record_index=record_index,
             byte_start=byte_start,
+            source_size=source_size,
+            source_token=source_token,
         )
         normalized: dict[str, JsonValue] = {
             "accounting_class": accounting_class.value,
             "byte_end": byte_end,
             "byte_start": byte_start,
+            "candidate_index": candidate_index,
             "content_commitment": commitment,  # type: ignore[dict-item]
+            "discovery_commitment": discovery_commitment,
             "event_time": event_time,
             "frame": "inventory",
             "reason": reason,
@@ -263,6 +329,8 @@ class _SourceTransportCaptureValidator:
             "session_commitment": session_commitment,  # type: ignore[dict-item]
             "source_occurrence": source_occurrence,
             "source_locator": locator,
+            "source_size": source_size,
+            "source_token": source_token,
         }
         coordinate = (locator, record_index)
         if coordinate in self.inventory_by_coordinate:
@@ -272,8 +340,11 @@ class _SourceTransportCaptureValidator:
         self.inventory.append(normalized)
         self.inventory_by_coordinate[coordinate] = normalized
         self.prior_locator = locator
+        self.prior_candidate_index = candidate_index
         self.prior_record_index = record_index
         self.prior_byte_end = byte_end
+        self.prior_source_size = source_size
+        self.prior_source_token = source_token
 
     @staticmethod
     def _normalized_event_time(value: object) -> str | None:
@@ -297,8 +368,11 @@ class _SourceTransportCaptureValidator:
         self,
         locator: str,
         *,
+        candidate_index: int,
         record_index: int,
         byte_start: int,
+        source_size: int,
+        source_token: str,
     ) -> None:
         if self.prior_locator is not None:
             if locator.encode("utf-8") < self.prior_locator.encode("utf-8"):
@@ -307,17 +381,24 @@ class _SourceTransportCaptureValidator:
                 )
             if locator == self.prior_locator:
                 if (
-                    record_index != self.prior_record_index + 1
+                    candidate_index != self.prior_candidate_index
+                    or record_index != self.prior_record_index + 1
                     or byte_start != self.prior_byte_end
+                    or source_size != self.prior_source_size
+                    or source_token != self.prior_source_token
                 ):
                     raise TransportValidationError(
                         "source transport inventory is not contiguous"
                     )
-            elif record_index != 0 or byte_start != 0:
+            elif (
+                candidate_index <= self.prior_candidate_index
+                or record_index != 0
+                or byte_start != 0
+            ):
                 raise TransportValidationError(
                     "source transport inventory locator does not start at zero"
                 )
-        elif record_index != 0 or byte_start != 0:
+        elif record_index != 0 or byte_start != 0 or candidate_index < 0:
             raise TransportValidationError(
                 "source transport first inventory locator does not start at zero"
             )
@@ -420,6 +501,116 @@ class _SourceTransportCaptureValidator:
             "source_locator": locator,
         }
 
+    def _accept_resume_probe_fragment(self, frame: Mapping[str, object]) -> None:
+        self._finish_pending()
+        _exact_keys(
+            frame,
+            {
+                "byte_end",
+                "byte_start",
+                "fragment_count",
+                "fragment_index",
+                "frame",
+                "payload_b64",
+                "schema",
+                "source_locator",
+            },
+            "source transport resume probe fragment",
+        )
+        if frame["schema"] != SOURCE_TRANSPORT_STREAM_SCHEMA:
+            raise TransportValidationError(
+                "source transport resume probe schema changed"
+            )
+        if self.resume_probe_payload is not None:
+            raise TransportValidationError(
+                "source transport contains more than one resume probe"
+            )
+        locator = frame["source_locator"]
+        if not isinstance(locator, str) or _LOCATOR_RE.fullmatch(locator) is None:
+            raise TransportValidationError(
+                "source transport resume probe locator is invalid"
+            )
+        byte_start = _non_negative_int(
+            frame["byte_start"],
+            "source transport resume probe byte_start",
+        )
+        byte_end = _non_negative_int(
+            frame["byte_end"],
+            "source transport resume probe byte_end",
+        )
+        fragment_index = _non_negative_int(
+            frame["fragment_index"],
+            "source transport resume probe fragment_index",
+        )
+        fragment_count = _positive_int(
+            frame["fragment_count"],
+            "source transport resume probe fragment_count",
+        )
+        if (
+            byte_end <= byte_start
+            or byte_end - byte_start > SOURCE_TRANSPORT_RESUME_PROBE_BYTES
+            or fragment_index >= fragment_count
+        ):
+            raise TransportValidationError(
+                "source transport resume probe coordinates are invalid"
+            )
+        identity = (locator, byte_start, byte_end, fragment_count)
+        if self.resume_probe_pending is None:
+            if fragment_index != 0:
+                raise TransportValidationError(
+                    "source transport resume probe fragments are missing or reordered"
+                )
+            self.resume_probe_pending = {
+                "byte_end": byte_end,
+                "byte_start": byte_start,
+                "fragment_count": fragment_count,
+                "fragments": [],
+                "identity": identity,
+                "source_locator": locator,
+            }
+        elif self.resume_probe_pending["identity"] != identity:
+            raise TransportValidationError(
+                "source transport resume probe identity changed"
+            )
+        fragments = self.resume_probe_pending["fragments"]
+        assert isinstance(fragments, list)
+        if fragment_index != len(fragments):
+            raise TransportValidationError(
+                "source transport resume probe fragments are missing or reordered"
+            )
+        payload_b64 = frame["payload_b64"]
+        if not isinstance(payload_b64, str):
+            raise TransportValidationError(
+                "source transport resume probe payload must be base64 text"
+            )
+        try:
+            fragments.append(base64.b64decode(payload_b64, validate=True))
+        except (binascii.Error, ValueError) as exc:
+            raise TransportValidationError(
+                "source transport resume probe payload is not canonical base64"
+            ) from exc
+
+    def _finish_resume_probe(self) -> None:
+        if self.resume_probe_pending is None:
+            return
+        fragments = self.resume_probe_pending["fragments"]
+        assert isinstance(fragments, list)
+        if len(fragments) != int(self.resume_probe_pending["fragment_count"]):
+            raise TransportValidationError(
+                "source transport resume probe fragments are incomplete"
+            )
+        payload = b"".join(fragments)
+        byte_start = int(self.resume_probe_pending["byte_start"])
+        byte_end = int(self.resume_probe_pending["byte_end"])
+        if len(payload) != byte_end - byte_start:
+            raise TransportValidationError(
+                "source transport resume probe payload has the wrong length"
+            )
+        self.resume_probe_payload = payload
+        self.resume_probe_locator = str(self.resume_probe_pending["source_locator"])
+        self.resume_probe_range = (byte_start, byte_end)
+        self.resume_probe_pending = None
+
     def accept(self, raw_line: bytes | str) -> None:
         encoded = raw_line.encode("utf-8") if isinstance(raw_line, str) else raw_line
         self.wire_bytes += len(encoded)
@@ -446,16 +637,34 @@ class _SourceTransportCaptureValidator:
             )
         frame_kind = frame.get("frame")
         if frame_kind == "inventory":
+            if (
+                self.resume_probe_pending is not None
+                or self.resume_probe_payload is not None
+            ):
+                raise TransportValidationError(
+                    "source transport inventory follows its resume probe"
+                )
             self._accept_inventory(frame)
             return
         if frame_kind == "record_fragment":
+            if (
+                self.resume_probe_pending is not None
+                or self.resume_probe_payload is not None
+            ):
+                raise TransportValidationError(
+                    "source transport record follows its resume probe"
+                )
             self._accept_record_fragment(frame)
+            return
+        if frame_kind == "resume_probe_fragment":
+            self._accept_resume_probe_fragment(frame)
             return
         if frame_kind != "terminal":
             raise TransportValidationError(
                 "source transport contains an unknown frame kind"
             )
         self._finish_pending()
+        self._finish_resume_probe()
         _exact_keys(
             frame,
             {
@@ -480,6 +689,7 @@ class _SourceTransportCaptureValidator:
 
     def finish(self) -> SourceTransportCapture:
         self._finish_pending()
+        self._finish_resume_probe()
         if not self.header_seen or self.terminal is None:
             raise TransportValidationError(
                 "source transport ended without its header and terminal proof"
@@ -487,12 +697,25 @@ class _SourceTransportCaptureValidator:
         evidence = self._terminal_evidence(self.terminal)
         explicit_gap_count = self._validate_accounting(evidence, self.terminal)
         self._validate_terminal_semantics(evidence, explicit_gap_count, self.terminal)
+        validated_resume_position = self._validated_outgoing_resume_position(evidence)
+        probe_proof: dict[str, JsonValue] | None = None
+        if self.resume_probe_payload is not None:
+            assert self.resume_probe_locator is not None
+            assert self.resume_probe_range is not None
+            probe_proof = {
+                "resume_probe": _source_transport_resume_probe(
+                    self.resume_probe_payload,
+                    byte_offset=self.resume_probe_range[1],
+                ),
+                "source_locator": self.resume_probe_locator,
+            }
         proof = _canonical_commitment(
             {
                 "header": self.expected_header,
                 "lease_binding": self.lease.binding,
                 "inventory": self.inventory,
                 "records": self.proof_rows,
+                "resume_probe": probe_proof,
                 "schema": "source_transport_terminal_proof_v2",
                 "terminal": dict(self.terminal),
             }
@@ -507,9 +730,55 @@ class _SourceTransportCaptureValidator:
             oversized_record_count=evidence.oversized_record_count,
             oversized_byte_count=evidence.oversized_byte_count,
             terminal_proof_commitment=proof,
-            resume_position=evidence.resume_position,
+            resume_position=validated_resume_position,
             inventory=tuple(self.inventory),
         )
+
+    def _validated_outgoing_resume_position(
+        self,
+        evidence: _TerminalEvidence,
+    ) -> dict[str, JsonValue] | None:
+        if evidence.resume_position is None:
+            if self.resume_probe_payload is not None:
+                raise TransportValidationError(
+                    "source transport emitted an unbound resume probe"
+                )
+            return None
+        if (
+            self.resume_probe_payload is None
+            or self.resume_probe_locator is None
+            or self.resume_probe_range is None
+            or not self.inventory
+        ):
+            raise TransportValidationError(
+                "source transport continuation lacks independently captured probe evidence"
+            )
+        last = self.inventory[-1]
+        byte_offset = int(last["byte_end"])
+        expected_range = (
+            max(0, byte_offset - SOURCE_TRANSPORT_RESUME_PROBE_BYTES),
+            byte_offset,
+        )
+        if (
+            self.resume_probe_locator != last["source_locator"]
+            or self.resume_probe_range != expected_range
+        ):
+            raise TransportValidationError(
+                "source transport continuation probe does not match accepted inventory"
+            )
+        expected = _derive_source_resume_position(
+            prior_position=self.lease.resume_position,
+            inventory=self.inventory,
+            resume_probe=_source_transport_resume_probe(
+                self.resume_probe_payload,
+                byte_offset=byte_offset,
+            ),
+        )
+        if expected != evidence.resume_position:
+            raise TransportValidationError(
+                "source transport terminal resume position was not independently derived"
+            )
+        return expected
 
     @staticmethod
     def _terminal_evidence(terminal: Mapping[str, object]) -> _TerminalEvidence:

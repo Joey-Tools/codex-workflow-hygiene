@@ -221,6 +221,8 @@ def _run_bounded_subprocess(
     input_view = memoryview(input_bytes or b"")
     input_offset = 0
     deadline = time.monotonic() + float(timeout_seconds)
+    process_group_id = process.pid if os.name == "posix" else None
+    process_group_cleanup_attempted = False
 
     def close_stream(stream: Any) -> None:
         try:
@@ -233,12 +235,25 @@ def _run_bounded_subprocess(
             pass
 
     def kill_process() -> None:
-        if process.poll() is None:
+        nonlocal process_group_cleanup_attempted
+        if process_group_cleanup_attempted:
+            return
+        process_group_cleanup_attempted = True
+        if process_group_id is not None:
             try:
-                if os.name == "posix":
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
+                os.killpg(process_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+        elif process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        if process_group_id is not None:
+            try:
+                process.kill()
             except OSError:
                 pass
         try:
@@ -306,6 +321,9 @@ def _run_bounded_subprocess(
         if remaining <= 0:
             kill_process()
             raise LocalGitPublicationError("subprocess exceeded its deadline")
+        # Close the task-owned group while the unreaped leader still pins its
+        # PID/PGID. Reaping first would open a process-group reuse race.
+        kill_process()
         try:
             return_code = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired as exc:
@@ -322,8 +340,7 @@ def _run_bounded_subprocess(
             if stream is not None:
                 close_stream(stream)
         selector.close()
-        if process.poll() is None:
-            kill_process()
+        kill_process()
 
 
 def validate_publisher_keyring(

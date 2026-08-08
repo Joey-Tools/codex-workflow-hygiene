@@ -955,6 +955,39 @@ class RunLifecycleOperations(OrchestratorComponent):
             raise InvalidTransitionError("retention deadline expired")
         return _format_timestamp(deadline)
 
+    def _validate_export_retention_deadline(
+        self,
+        state: Mapping[str, Any],
+        retention_deadline: str,
+    ) -> str:
+        normalized = _normalize_timestamp(
+            retention_deadline,
+            label="export retention deadline",
+        )
+        existing = state["publication"].get("retention_deadline")
+        if existing is not None and existing != normalized:
+            raise RunConflictError("export retention deadline changed")
+        now = _parse_timestamp(self._state._now(), label="clock")
+        deadline = _parse_timestamp(normalized, label="export retention deadline")
+        maximum = min(
+            _parse_timestamp(state["deadlines"]["raw"], label="raw deadline"),
+            _parse_timestamp(state["deadlines"]["working"], label="working deadline"),
+            now + dt.timedelta(hours=MAX_EXPORT_RETENTION_HOURS),
+        )
+        if deadline <= now or deadline > maximum:
+            raise InvalidInputError("export retention deadline is outside policy")
+        return normalized
+
+    def validate_export_retention_deadline(self, retention_deadline: str) -> str:
+        """Validate a proposed deadline without mutating export state."""
+
+        state = self._state.load_state()
+        self._state._assert_state_identity(state)
+        self._state._require_stage(state, RunStage.EXPORT)
+        if self._state._retention_expired(state):
+            raise InvalidTransitionError("retention deadline expired")
+        return self._validate_export_retention_deadline(state, retention_deadline)
+
     def publication_host_cursor_vector(self) -> dict[str, dict[str, Any]]:
         state = self._state.load_state()
         self._state._require_stage(state, RunStage.EXPORT)
@@ -1646,9 +1679,6 @@ class RunLifecycleOperations(OrchestratorComponent):
         ):
             raise InvalidInputError("bundle_digest must be a lowercase SHA-256 digest")
         deadline_value = retention_deadline or self.export_retention_deadline()
-        normalized_deadline = _normalize_timestamp(
-            deadline_value, label="export retention deadline"
-        )
 
         def mutate(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             self._state._assert_state_identity(state)
@@ -1663,25 +1693,10 @@ class RunLifecycleOperations(OrchestratorComponent):
             existing = publication.get("bundle_digest")
             if existing is not None and existing != bundle_digest:
                 raise RunConflictError("export bundle digest changed")
-            existing_deadline = publication.get("retention_deadline")
-            if (
-                existing_deadline is not None
-                and existing_deadline != normalized_deadline
-            ):
-                raise RunConflictError("export retention deadline changed")
-            now = _parse_timestamp(self._state._now(), label="clock")
-            deadline = _parse_timestamp(
-                normalized_deadline, label="export retention deadline"
+            normalized_deadline = self._validate_export_retention_deadline(
+                state,
+                deadline_value,
             )
-            maximum = min(
-                _parse_timestamp(state["deadlines"]["raw"], label="raw deadline"),
-                _parse_timestamp(
-                    state["deadlines"]["working"], label="working deadline"
-                ),
-                now + dt.timedelta(hours=MAX_EXPORT_RETENTION_HOURS),
-            )
-            if deadline <= now or deadline > maximum:
-                raise InvalidInputError("export retention deadline is outside policy")
             if existing is None:
                 publication.pop("expired_cleanup_claim", None)
                 publication.update(

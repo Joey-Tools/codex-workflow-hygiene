@@ -8,7 +8,12 @@ import hashlib
 import json
 from typing import Any, Mapping
 
-from .contracts import SESSION_SHARDS_SCHEMA, strict_json_loads
+from .contracts import (
+    SESSION_SHARDS_EMPTY_PREFIX_COMMITMENT,
+    SESSION_SHARDS_SCHEMA,
+    session_shards_resume_cursor_value,
+    strict_json_loads,
+)
 
 
 REMOTE_RECORD_METADATA_BASE_BYTES = 64 * 1024
@@ -105,6 +110,25 @@ def accounting_bytes(frame: Mapping[str, Any]) -> bytes:
     )
 
 
+def descriptor_data_frames(frame: Mapping[str, Any]) -> int:
+    """Return the exact records-mode data-frame cost of one descriptor."""
+
+    if frame.get("status") == "gap":
+        return 1
+    if frame.get("oversized_record") is True:
+        byte_start = _integer(frame.get("byte_start"), "descriptor byte_start")
+        byte_end = _integer(
+            frame.get("byte_end"), "descriptor byte_end", minimum=byte_start + 1
+        )
+        fragment_bytes = _integer(
+            frame.get("record_fragment_bytes"),
+            "descriptor fragment bytes",
+            minimum=1,
+        )
+        return (byte_end - byte_start + fragment_bytes - 1) // fragment_bytes
+    return _integer(frame.get("record_count"), "descriptor record count", minimum=1)
+
+
 def _integer(value: object, label: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"session-shards {label} is invalid")
@@ -163,9 +187,11 @@ class RemoteSessionShardsFilter:
         self.next_byte: int | None = None
         self.next_record: int | None = None
         self.initial_record: int | None = None
+        self.initial_prefix_commitment: str | None = None
         self.meta_seen = False
         self.terminal_seen = False
         self.shards = 0
+        self.descriptor_data_frames = 0
         self.records = 0
         self.gaps = 0
         self.fragments = 0
@@ -282,13 +308,35 @@ class RemoteSessionShardsFilter:
         source_bytes = _integer(frame.get("source_bytes"), "source_bytes")
         if expected_end is not None and source_bytes < expected_end:
             raise ValueError(
-                "session-shards source is shorter than the requested range"
+                "session-shards source is shorter than the frozen requested range"
             )
+        if self.resume_cursor is None:
+            if self.mode == "records" or self.byte_start != 0:
+                raise ValueError("session-shards stream is missing its resume cursor")
+            initial_prefix_commitment = None
+        else:
+            try:
+                cursor = session_shards_resume_cursor_value(self.resume_cursor)
+            except ValueError as exc:
+                raise ValueError("session-shards request cursor is invalid") from exc
+            expected_kind = (
+                "descriptor_continue" if self.mode == "descriptors" else "records"
+            )
+            if (
+                cursor["cursor_kind"] != expected_kind
+                or cursor["source_token"] != source_token
+                or cursor["frozen_byte_end"] != source_bytes
+                or cursor["byte_offset"] != self.byte_start
+                or cursor["next_record_index"] != frame.get("record_start")
+            ):
+                raise ValueError("session-shards request cursor binding is invalid")
+            initial_prefix_commitment = str(cursor["prefix_commitment"])
         self.source_token = source_token
         self.source_bytes = source_bytes
         self.next_byte = self.byte_start
         self.next_record = _integer(frame.get("record_start"), "record_start")
         self.initial_record = self.next_record
+        self.initial_prefix_commitment = initial_prefix_commitment
         self.meta_seen = True
 
     def _accept_descriptor(self, frame: Mapping[str, Any]) -> None:
@@ -308,9 +356,36 @@ class RemoteSessionShardsFilter:
             or frame.get("page_shard_index") != self.shards
         ):
             raise ValueError("session-shards descriptors are not contiguous")
+        data_frames = descriptor_data_frames(frame)
+        if (
+            self.descriptor_data_frames + data_frames
+            > MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
+        ):
+            raise ValueError(
+                "session-shards descriptor page exceeds its data-frame limit"
+            )
+        try:
+            cursor = session_shards_resume_cursor_value(frame.get("resume_cursor"))
+        except ValueError as exc:
+            raise ValueError("session-shards descriptor cursor is invalid") from exc
+        if (
+            cursor["cursor_kind"] != "descriptor_continue"
+            or cursor["source_token"] != self.source_token
+            or cursor["frozen_byte_end"] != self.source_bytes
+            or cursor["byte_offset"] != byte_start
+            or cursor["next_record_index"] != record_start
+            or (
+                self.initial_prefix_commitment is not None
+                and cursor["prefix_commitment"] != self.initial_prefix_commitment
+            )
+        ):
+            raise ValueError("session-shards descriptor cursor binding is invalid")
+        if self.initial_prefix_commitment is None:
+            self.initial_prefix_commitment = str(cursor["prefix_commitment"])
         self.next_byte = byte_end
         self.next_record = record_end
         self.shards += 1
+        self.descriptor_data_frames += data_frames
 
     def _accept_record_frame(self, frame: Mapping[str, Any]) -> None:
         if self.data_frames >= MAX_SESSION_SHARDS_RECORD_DATA_FRAMES:
@@ -378,15 +453,21 @@ class RemoteSessionShardsFilter:
                 or record_start != self.next_record
                 or record_end != record_start + 1
                 or frame.get("record_byte_count") != record_byte_count
+                or frame.get("delimiter_bytes") not in (0, 1, 2)
+                or frame.get("record_encoding") != "base64"
             ):
                 raise ValueError("session-shards fragmented record binding is invalid")
             self.fragment_state = {
                 "count": count,
+                "delimiter_bytes": frame.get("delimiter_bytes"),
                 "index": 0,
                 "next_byte": record_byte_start,
+                "record_byte_start": record_byte_start,
                 "record_byte_end": record_byte_end,
                 "record_byte_count": record_byte_count,
                 "record_commitment": frame.get("record_commitment"),
+                "record_encoding": frame.get("record_encoding"),
+                "record_start": record_start,
                 "record_end": record_end,
                 "hasher": hashlib.sha256(),
             }
@@ -400,7 +481,13 @@ class RemoteSessionShardsFilter:
             or byte_end <= byte_start
             or len(payload) != byte_end - byte_start
             or frame.get("byte_count") != len(payload)
+            or record_byte_start != state["record_byte_start"]
             or record_byte_end != state["record_byte_end"]
+            or frame.get("record_byte_count") != state["record_byte_count"]
+            or record_start != state["record_start"]
+            or record_end != state["record_end"]
+            or frame.get("delimiter_bytes") != state["delimiter_bytes"]
+            or frame.get("record_encoding") != state["record_encoding"]
             or frame.get("record_commitment") != state["record_commitment"]
         ):
             raise ValueError("session-shards fragments do not conserve")
@@ -445,6 +532,26 @@ class RemoteSessionShardsFilter:
             != self.next_record - self.initial_record
         ):
             raise ValueError("session-shards descriptor terminal does not conserve")
+        if self.initial_prefix_commitment is None:
+            if self.source_bytes != self.byte_start:
+                raise ValueError(
+                    "session-shards descriptor stream omitted its frozen commitment"
+                )
+            self.initial_prefix_commitment = SESSION_SHARDS_EMPTY_PREFIX_COMMITMENT
+        try:
+            records_cursor = session_shards_resume_cursor_value(
+                frame.get("records_resume_cursor")
+            )
+        except ValueError as exc:
+            raise ValueError("session-shards records resume cursor is invalid") from exc
+        records_cursor_valid = (
+            records_cursor["cursor_kind"] == "records"
+            and records_cursor["source_token"] == self.source_token
+            and records_cursor["frozen_byte_end"] == self.source_bytes
+            and records_cursor["byte_offset"] == self.byte_start
+            and records_cursor["next_record_index"] == self.initial_record
+            and records_cursor["prefix_commitment"] == self.initial_prefix_commitment
+        )
         if complete:
             valid = (
                 frame.get("reason") == "eof"
@@ -452,14 +559,39 @@ class RemoteSessionShardsFilter:
                 and frame.get("next_byte_start") is None
                 and frame.get("next_record_start") is None
                 and frame.get("next_resume_cursor") is None
+                and records_cursor_valid
             )
         else:
+            try:
+                next_cursor = session_shards_resume_cursor_value(
+                    frame.get("next_resume_cursor")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "session-shards continuation cursor is invalid"
+                ) from exc
             valid = (
-                frame.get("reason") == "max_shards"
-                and self.shards == self.max_shards
+                (
+                    (
+                        frame.get("reason") == "max_shards"
+                        and self.shards == self.max_shards
+                    )
+                    or (
+                        frame.get("reason") == "max_record_data_frames"
+                        and 0
+                        < self.descriptor_data_frames
+                        <= MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
+                    )
+                )
                 and frame.get("next_byte_start") == self.next_byte
                 and frame.get("next_record_start") == self.next_record
-                and isinstance(frame.get("next_resume_cursor"), str)
+                and records_cursor_valid
+                and next_cursor["cursor_kind"] == "descriptor_continue"
+                and next_cursor["source_token"] == self.source_token
+                and next_cursor["frozen_byte_end"] == self.source_bytes
+                and next_cursor["byte_offset"] == self.next_byte
+                and next_cursor["next_record_index"] == self.next_record
+                and next_cursor["prefix_commitment"] == self.initial_prefix_commitment
             )
         if not valid:
             raise ValueError("session-shards descriptor terminal is invalid")

@@ -89,6 +89,13 @@ from .transport_remote import (  # noqa: F401
     remote_host_context_helper_commitment,
     remote_host_context_helper_path,
 )
+from .transport_resume import (  # noqa: F401
+    _source_transport_boundary_probe,
+    _source_transport_candidate_token,
+    _source_transport_range_digest,
+    decode_source_resume_position,
+    encode_source_resume_position,
+)
 from .transport_session_shards import (  # noqa: F401
     DEFAULT_SESSION_RECORD_PROCESSING_BUDGET_BYTES,
     DEFAULT_SESSION_SHARD_BYTES,
@@ -152,20 +159,15 @@ from .transport_source import (  # noqa: F401
     _source_inventory_row,
     _source_record_session_identifiers,
     _source_structural_exclusion,
-    _source_transport_boundary_probe,
     _source_transport_candidate_paths,
-    _source_transport_candidate_token,
     _source_transport_discovery_commitment,
     _source_transport_header,
     _source_transport_instant,
     _source_transport_json_bytes,
-    _source_transport_range_digest,
     _source_transport_remote_arguments,
     _source_transport_scan,
     _SourceCandidateDiscovery,
     _window_dates,
-    decode_source_resume_position,
-    encode_source_resume_position,
     session_selector_commitment,
 )
 

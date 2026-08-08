@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import argparse
 import base64
-import binascii
 import codecs
+import contextlib
 from dataclasses import dataclass
 import hashlib
-import hmac
 import json
 import math
 import os
 import pathlib
-import re
 import stat
 import sys
 import tempfile
@@ -21,12 +19,15 @@ from typing import Any, Callable, Iterable
 
 from .contracts import (
     MAX_JSON_INTEGER,
+    SESSION_SHARDS_PREFIX_COMMITMENT_DOMAIN,
     session_shards_resume_cursor,
+    session_shards_resume_cursor_value,
 )
 from .session_shards_relay import (
     MAX_SESSION_SHARDS_RECORD_DATA_FRAMES,
     RemoteSessionShardsFilter,
     accounting_bytes as _session_shards_accounting_bytes,
+    descriptor_data_frames as _session_shards_descriptor_data_frames,
     remote_output_limit as _session_shards_remote_output_limit,
 )
 from .transport_contracts import (
@@ -79,11 +80,13 @@ MAX_SESSION_SHARDS_FRAME_CHARS = (
 
 SESSION_SHARDS_SCHEMA = "session-shards-v1"
 
-SESSION_SHARDS_SOURCE_TOKEN_PREFIX = "session_shards_source_v1:"
+SESSION_SHARDS_SOURCE_TOKEN_PREFIX = "session_shards_source_v2:"
 
 SESSION_SHARDS_RESUME_CURSOR_PREFIX = "session_shards_resume_v1:"
 
 SESSION_SHARDS_REQUEST_BINDING_PREFIX = "session_shards_request_v1:"
+
+SESSION_SHARDS_SOURCE_TOKEN_DOMAIN = b"session-shards-source-token-v2\0"
 
 SESSION_SHARDS_PROTOCOL_FEATURES = (
     "oversized_record_fragments_v1",
@@ -91,6 +94,7 @@ SESSION_SHARDS_PROTOCOL_FEATURES = (
     "request_binding_v1",
     "resume_cursor_v1",
     "record_data_frame_limit_v1",
+    "descriptor_page_frame_limit_v1",
 )
 
 
@@ -449,13 +453,20 @@ def _validate_session_shards_json_storage(storage: Any) -> None:
 
 
 def _session_shards_source_identity(stat_result: os.stat_result) -> tuple[int, ...]:
+    birthtime_ns = getattr(stat_result, "st_birthtime_ns", None)
+    if birthtime_ns is None:
+        birthtime = getattr(stat_result, "st_birthtime", None)
+        birthtime_ns = (
+            -1 if birthtime is None else int(round(float(birthtime) * 1_000_000_000))
+        )
     return (
         int(stat_result.st_dev),
         int(stat_result.st_ino),
         int(stat_result.st_mode),
-        int(stat_result.st_size),
-        int(stat_result.st_mtime_ns),
-        int(stat_result.st_ctime_ns),
+        int(stat_result.st_uid),
+        int(stat_result.st_gid),
+        int(getattr(stat_result, "st_gen", -1)),
+        int(birthtime_ns),
     )
 
 
@@ -464,95 +475,58 @@ def _session_shards_source_identity_bytes(identity: tuple[int, ...]) -> bytes:
 
 
 def _session_shards_source_token(identity: tuple[int, ...]) -> str:
-    encoded = _session_shards_source_identity_bytes(identity)
+    encoded = (
+        SESSION_SHARDS_SOURCE_TOKEN_DOMAIN
+        + _session_shards_source_identity_bytes(identity)
+    )
     return SESSION_SHARDS_SOURCE_TOKEN_PREFIX + hashlib.sha256(encoded).hexdigest()
 
 
 def _session_shards_resume_cursor(
     source_token: str,
     *,
+    cursor_kind: str,
+    frozen_byte_end: int,
     byte_offset: int,
     next_record_index: int,
+    prefix_commitment: str,
 ) -> str:
     return session_shards_resume_cursor(
         source_token,
+        cursor_kind=cursor_kind,
+        frozen_byte_end=frozen_byte_end,
         byte_offset=byte_offset,
         next_record_index=next_record_index,
+        prefix_commitment=prefix_commitment,
     )
 
 
 def _session_shards_decode_resume_cursor(
     cursor: str,
 ) -> tuple[bytes, str, dict[str, Any]]:
-    if not isinstance(cursor, str) or not cursor.startswith(
-        SESSION_SHARDS_RESUME_CURSOR_PREFIX
-    ):
-        raise ValueError("invalid session-shards resume cursor")
-    encoded = cursor.removeprefix(SESSION_SHARDS_RESUME_CURSOR_PREFIX)
-    if len(encoded) > 2048 or encoded.count(".") != 1:
-        raise ValueError("invalid session-shards resume cursor")
-    payload_text, signature = encoded.split(".", 1)
     try:
-        payload = base64.b64decode(
-            payload_text + "=" * (-len(payload_text) % 4),
-            altchars=b"-_",
-            validate=True,
-        )
-        value = json.loads(payload)
-    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        value = session_shards_resume_cursor_value(cursor)
+    except ValueError as exc:
         raise ValueError("invalid session-shards resume cursor") from exc
-    if not isinstance(value, dict) or set(value) != {
-        "byte_offset",
-        "next_record_index",
-        "source_token",
-    }:
-        raise ValueError("invalid session-shards resume cursor")
-    byte_offset = value.get("byte_offset")
-    next_record_index = value.get("next_record_index")
-    source_token = value.get("source_token")
-    if (
-        isinstance(byte_offset, bool)
-        or not isinstance(byte_offset, int)
-        or byte_offset < 0
-        or isinstance(next_record_index, bool)
-        or not isinstance(next_record_index, int)
-        or next_record_index < 0
-        or not isinstance(source_token, str)
-        or re.fullmatch(
-            re.escape(SESSION_SHARDS_SOURCE_TOKEN_PREFIX) + r"[0-9a-f]{64}",
-            source_token,
-        )
-        is None
-        or re.fullmatch(r"[0-9a-f]{64}", signature) is None
-    ):
-        raise ValueError("invalid session-shards resume cursor")
-    canonical_payload = json.dumps(
+    payload = json.dumps(
         value,
         ensure_ascii=True,
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("ascii")
-    if canonical_payload != payload:
-        raise ValueError("invalid session-shards resume cursor")
+    signature = cursor.rsplit(".", 1)[1]
     return payload, signature, value
 
 
 def _session_shards_parse_resume_cursor(
     cursor: str,
     expected_source_token: str,
-) -> tuple[int, int]:
+) -> dict[str, Any]:
     _payload, _signature, value = _session_shards_decode_resume_cursor(cursor)
-    if value["source_token"] != expected_source_token:
+    if value.get("source_token") != expected_source_token:
         raise ValueError("invalid session-shards resume cursor")
-    expected_cursor = session_shards_resume_cursor(
-        expected_source_token,
-        byte_offset=int(value["byte_offset"]),
-        next_record_index=int(value["next_record_index"]),
-    )
-    if not hmac.compare_digest(cursor, expected_cursor):
-        raise ValueError("invalid session-shards resume cursor")
-    return int(value["byte_offset"]), int(value["next_record_index"])
+    return value
 
 
 def _session_shards_request_binding(
@@ -632,6 +606,103 @@ def _validate_session_shards_boundary(
         raise ValueError(f"{option} must be on a JSONL record boundary")
 
 
+def _session_shards_prefix_hasher() -> Any:
+    hasher = hashlib.sha256()
+    hasher.update(SESSION_SHARDS_PREFIX_COMMITMENT_DOMAIN)
+    hasher.update(b"bytes\0")
+    return hasher
+
+
+def _session_shards_frozen_prefix_commitment(
+    handle: Any,
+    *,
+    frozen_byte_end: int,
+) -> str:
+    hasher = _session_shards_prefix_hasher()
+    handle.seek(0)
+    remaining = frozen_byte_end
+    while remaining:
+        chunk = handle.read(min(SESSION_SHARDS_RECORD_SCAN_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise ValueError("rollout ended before its frozen prefix was committed")
+        hasher.update(chunk)
+        remaining -= len(chunk)
+    return "sha256:" + hasher.hexdigest()
+
+
+def _spool_verified_session_shards_range(
+    handle: Any,
+    *,
+    frozen_byte_end: int,
+    records_byte_start: int,
+    records_byte_end: int,
+    expected_record_start: int,
+    expected_prefix_commitment: str,
+) -> Any:
+    storage = tempfile.TemporaryFile(mode="w+b")
+    try:
+        os.fchmod(storage.fileno(), stat.S_IRUSR | stat.S_IWUSR)
+        if stat.S_IMODE(os.fstat(storage.fileno()).st_mode) & 0o077:
+            raise RuntimeError("session-shards verified spool is not owner-only")
+        handle.seek(0)
+        byte_offset = 0
+        record_index = 0
+        prefix_hasher = _session_shards_prefix_hasher()
+        observed_record_start: int | None = None
+        while byte_offset < frozen_byte_end:
+            if byte_offset == records_byte_start:
+                observed_record_start = record_index
+            total_bytes = 0
+            final_segment = b""
+            while byte_offset + total_bytes < frozen_byte_end:
+                remaining = frozen_byte_end - byte_offset - total_bytes
+                segment = handle.readline(
+                    min(SESSION_SHARDS_RECORD_SCAN_CHUNK_BYTES, remaining)
+                )
+                if not segment:
+                    raise ValueError(
+                        "rollout ended before the frozen prefix was verified"
+                    )
+                segment_start = byte_offset + total_bytes
+                segment_end = segment_start + len(segment)
+                spool_start = max(segment_start, records_byte_start)
+                spool_end = min(segment_end, records_byte_end)
+                if spool_start < spool_end:
+                    storage.write(
+                        segment[spool_start - segment_start : spool_end - segment_start]
+                    )
+                prefix_hasher.update(segment)
+                total_bytes += len(segment)
+                final_segment = segment
+                if segment.endswith(b"\n"):
+                    break
+            if (
+                not final_segment.endswith(b"\n")
+                and byte_offset + total_bytes < frozen_byte_end
+            ):
+                raise ValueError("frozen byte end is inside a JSONL record")
+            byte_offset += total_bytes
+            record_index += 1
+        if byte_offset != frozen_byte_end:
+            raise ValueError("frozen session-shards prefix did not conserve bytes")
+        if records_byte_start == frozen_byte_end:
+            observed_record_start = record_index
+        if observed_record_start != expected_record_start:
+            raise ValueError(
+                "records cursor does not match the frozen JSONL record boundary"
+            )
+        if "sha256:" + prefix_hasher.hexdigest() != expected_prefix_commitment:
+            raise ValueError("frozen rollout prefix commitment mismatch")
+        if storage.tell() != records_byte_end - records_byte_start:
+            raise RuntimeError("session-shards verified range spool lost source bytes")
+        storage.flush()
+        storage.seek(0)
+        return storage
+    except BaseException:
+        storage.close()
+        raise
+
+
 def _iter_session_shard_records(
     handle: Any,
     *,
@@ -639,6 +710,7 @@ def _iter_session_shard_records(
     byte_end: int,
     record_start: int,
     record_processing_budget_bytes: int,
+    coordinate_offset: int = 0,
 ) -> Iterable[SessionShardRecord]:
     handle.seek(byte_start)
     byte_offset = byte_start
@@ -730,8 +802,8 @@ def _iter_session_shard_records(
                     record_commitment = "sha256:" + record_hasher.hexdigest()
 
             yield SessionShardRecord(
-                byte_start=byte_offset,
-                byte_end=byte_offset + total_bytes,
+                byte_start=coordinate_offset + byte_offset,
+                byte_end=coordinate_offset + byte_offset + total_bytes,
                 record_index=record_index,
                 record_storage=storage,
                 record_commitment=record_commitment,
@@ -952,15 +1024,18 @@ def _iter_local_session_shard_frames(
     ),
     source_opener: Callable[..., Any] = _open_session_shard_source,
 ) -> Iterable[dict[str, Any]]:
-    with source_opener(
-        codex_root,
-        rollout_relative_path,
-        component_hook=component_hook,
-    ) as handle:
+    with contextlib.ExitStack() as cleanup:
+        handle = cleanup.enter_context(
+            source_opener(
+                codex_root,
+                rollout_relative_path,
+                component_hook=component_hook,
+            )
+        )
         source_stat = os.fstat(handle.fileno())
         source_identity = source_identity_reader(source_stat)
         current_token = _session_shards_source_token(source_identity)
-        source_bytes = int(source_stat.st_size)
+        current_source_bytes = int(source_stat.st_size)
         if (
             record_processing_budget_bytes
             < max(shard_bytes, MIN_SESSION_RECORD_PROCESSING_BUDGET_BYTES)
@@ -978,9 +1053,24 @@ def _iter_local_session_shard_frames(
         _validate_session_shards_boundary(
             handle,
             byte_offset=byte_start,
-            source_bytes=source_bytes,
+            source_bytes=current_source_bytes,
             option="--byte-start",
         )
+        cursor_value: dict[str, Any] | None = None
+        if resume_cursor is not None:
+            cursor_value = _session_shards_parse_resume_cursor(
+                resume_cursor,
+                current_token,
+            )
+            if int(cursor_value["byte_offset"]) != byte_start:
+                raise ValueError(
+                    "resume cursor byte offset does not match --byte-start"
+                )
+
+        records_handle = handle
+        records_scan_start = byte_start
+        records_scan_end = current_source_bytes
+        record_coordinate_offset = 0
         if emit == "descriptors":
             if byte_end is not None:
                 raise ValueError("--byte-end is only valid with --emit records")
@@ -988,41 +1078,108 @@ def _iter_local_session_shard_frames(
                 raise ValueError(
                     "--source-token is required when --byte-start is non-zero"
                 )
-            effective_end = source_bytes
+            if cursor_value is None:
+                if byte_start:
+                    raise ValueError(
+                        "--resume-cursor is required when --byte-start is non-zero"
+                    )
+                frozen_byte_end = current_source_bytes
+                record_start = 0
+                frozen_prefix_commitment = _session_shards_frozen_prefix_commitment(
+                    handle,
+                    frozen_byte_end=frozen_byte_end,
+                )
+            else:
+                if cursor_value["cursor_kind"] != "descriptor_continue":
+                    raise ValueError(
+                        "descriptor pagination requires a continuation cursor"
+                    )
+                frozen_byte_end = int(cursor_value["frozen_byte_end"])
+                record_start = int(cursor_value["next_record_index"])
+                frozen_prefix_commitment = str(cursor_value["prefix_commitment"])
+            if frozen_byte_end > current_source_bytes:
+                raise ValueError("rollout is shorter than its frozen byte end")
+            _validate_session_shards_boundary(
+                handle,
+                byte_offset=frozen_byte_end,
+                source_bytes=current_source_bytes,
+                option="--frozen-byte-end",
+            )
+            effective_end = frozen_byte_end
+            records_scan_end = effective_end
         else:
             if byte_end is None:
                 raise ValueError("--byte-end is required with --emit records")
             if source_token is None:
                 raise ValueError("--source-token is required with --emit records")
+            if cursor_value is None:
+                raise ValueError("--resume-cursor is required with --emit records")
             if byte_end <= byte_start:
                 raise ValueError("--byte-end must be greater than --byte-start")
             if byte_end - byte_start > MAX_SESSION_SHARDS_RANGE_BYTES:
                 raise ValueError(
                     f"record range too large: {byte_end - byte_start} bytes > {MAX_SESSION_SHARDS_RANGE_BYTES}"
                 )
+            if cursor_value["cursor_kind"] != "records":
+                raise ValueError("records mode requires a records resume cursor")
+            frozen_byte_end = int(cursor_value["frozen_byte_end"])
+            if byte_end > frozen_byte_end:
+                raise ValueError("--byte-end exceeds the frozen byte end")
+            if frozen_byte_end > current_source_bytes:
+                raise ValueError("rollout is shorter than its frozen byte end")
             _validate_session_shards_boundary(
                 handle,
                 byte_offset=byte_end,
-                source_bytes=source_bytes,
+                source_bytes=current_source_bytes,
                 option="--byte-end",
             )
-            effective_end = byte_end
-
-        if resume_cursor is None:
-            if byte_start:
-                raise ValueError(
-                    "--resume-cursor is required when --byte-start is non-zero"
-                )
-            record_start = 0
-        else:
-            cursor_byte_offset, record_start = _session_shards_parse_resume_cursor(
-                resume_cursor,
-                current_token,
+            _validate_session_shards_boundary(
+                handle,
+                byte_offset=frozen_byte_end,
+                source_bytes=current_source_bytes,
+                option="--frozen-byte-end",
             )
-            if cursor_byte_offset != byte_start:
-                raise ValueError(
-                    "resume cursor byte offset does not match --byte-start"
-                )
+            record_start = int(cursor_value["next_record_index"])
+            frozen_prefix_commitment = str(cursor_value["prefix_commitment"])
+            verified_storage = _spool_verified_session_shards_range(
+                handle,
+                frozen_byte_end=frozen_byte_end,
+                records_byte_start=byte_start,
+                records_byte_end=byte_end,
+                expected_record_start=record_start,
+                expected_prefix_commitment=frozen_prefix_commitment,
+            )
+            cleanup.callback(verified_storage.close)
+            final_stat = os.fstat(handle.fileno())
+            if (
+                source_identity_reader(final_stat) != source_identity
+                or int(final_stat.st_size) < frozen_byte_end
+            ):
+                raise RuntimeError("source changed before session-shards verification")
+            _validate_session_shards_boundary(
+                handle,
+                byte_offset=frozen_byte_end,
+                source_bytes=int(final_stat.st_size),
+                option="--frozen-byte-end",
+            )
+            with source_opener(
+                codex_root,
+                rollout_relative_path,
+                component_hook=component_hook,
+            ) as revalidated_handle:
+                revalidated_stat = os.fstat(revalidated_handle.fileno())
+                if (
+                    source_identity_reader(revalidated_stat) != source_identity
+                    or int(revalidated_stat.st_size) < frozen_byte_end
+                ):
+                    raise RuntimeError(
+                        "source object changed before session-shards emission"
+                    )
+            records_handle = verified_storage
+            records_scan_start = 0
+            records_scan_end = byte_end - byte_start
+            record_coordinate_offset = byte_start
+            effective_end = byte_end
         request_binding = _session_shards_request_binding(
             rollout=rollout_relative_path.as_posix(),
             mode=emit,
@@ -1043,7 +1200,7 @@ def _iter_local_session_shard_frames(
             "request_source_token": source_token,
             "request_resume_cursor": resume_cursor,
             "request_binding": request_binding,
-            "source_bytes": source_bytes,
+            "source_bytes": frozen_byte_end,
             "byte_start": byte_start,
             "byte_end": effective_end if emit == "records" else None,
             "record_start": record_start,
@@ -1062,11 +1219,12 @@ def _iter_local_session_shard_frames(
         }
 
         records = _iter_session_shard_records(
-            handle,
-            byte_start=byte_start,
-            byte_end=effective_end,
+            records_handle,
+            byte_start=records_scan_start,
+            byte_end=records_scan_end,
             record_start=record_start,
             record_processing_budget_bytes=record_processing_budget_bytes,
+            coordinate_offset=record_coordinate_offset,
         )
         if emit == "descriptors":
             descriptors = iter(
@@ -1077,12 +1235,27 @@ def _iter_local_session_shard_frames(
                 )
             )
             emitted = 0
+            emitted_data_frames = 0
+            page_limit_reason: str | None = None
             last_byte_end = byte_start
             last_record_end = record_start
             for page_index in range(max_shards):
                 try:
                     descriptor = next(descriptors)
                 except StopIteration:
+                    break
+                descriptor_data_frames = _session_shards_descriptor_data_frames(
+                    descriptor
+                )
+                if descriptor_data_frames > MAX_SESSION_SHARDS_RECORD_DATA_FRAMES:
+                    raise RuntimeError(
+                        "session-shards descriptor exceeds the data-frame limit"
+                    )
+                if (
+                    emitted_data_frames + descriptor_data_frames
+                    > MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
+                ):
+                    page_limit_reason = "max_record_data_frames"
                     break
                 descriptor["page_shard_index"] = page_index
                 descriptor["schema"] = SESSION_SHARDS_SCHEMA
@@ -1091,15 +1264,19 @@ def _iter_local_session_shard_frames(
                 descriptor["request_binding"] = request_binding
                 descriptor["resume_cursor"] = _session_shards_resume_cursor(
                     current_token,
+                    cursor_kind="descriptor_continue",
+                    frozen_byte_end=frozen_byte_end,
                     byte_offset=int(descriptor["byte_start"]),
                     next_record_index=int(descriptor["record_start"]),
+                    prefix_commitment=frozen_prefix_commitment,
                 )
                 yield descriptor
                 emitted += 1
+                emitted_data_frames += descriptor_data_frames
                 last_byte_end = int(descriptor["byte_end"])
                 last_record_end = int(descriptor["record_end"])
-            complete = last_byte_end == source_bytes
-            if emitted < max_shards and not complete:
+            complete = last_byte_end == frozen_byte_end
+            if emitted < max_shards and not complete and page_limit_reason is None:
                 raise RuntimeError(
                     "session-shards descriptors ended before the source was accounted"
                 )
@@ -1110,7 +1287,7 @@ def _iter_local_session_shard_frames(
                 "source_token": current_token,
                 "request_binding": request_binding,
                 "complete": complete,
-                "reason": "eof" if complete else "max_shards",
+                "reason": ("eof" if complete else page_limit_reason or "max_shards"),
                 "emitted_shards": emitted,
                 "byte_start": byte_start,
                 "byte_end": last_byte_end,
@@ -1122,8 +1299,19 @@ def _iter_local_session_shard_frames(
                 if complete
                 else _session_shards_resume_cursor(
                     current_token,
+                    cursor_kind="descriptor_continue",
+                    frozen_byte_end=frozen_byte_end,
                     byte_offset=last_byte_end,
                     next_record_index=last_record_end,
+                    prefix_commitment=frozen_prefix_commitment,
+                ),
+                "records_resume_cursor": _session_shards_resume_cursor(
+                    current_token,
+                    cursor_kind="records",
+                    frozen_byte_end=frozen_byte_end,
+                    byte_offset=byte_start,
+                    next_record_index=record_start,
+                    prefix_commitment=frozen_prefix_commitment,
                 ),
                 "accounted_byte_count": last_byte_end - byte_start,
                 "accounted_record_count": last_record_end - record_start,
@@ -1242,8 +1430,19 @@ def _iter_local_session_shard_frames(
                 },
             }
 
-        if source_identity_reader(os.fstat(handle.fileno())) != source_identity:
-            raise RuntimeError("source changed during session-shards read")
+        if emit == "descriptors":
+            final_stat = os.fstat(handle.fileno())
+            if (
+                source_identity_reader(final_stat) != source_identity
+                or int(final_stat.st_size) < frozen_byte_end
+            ):
+                raise RuntimeError("source changed during session-shards read")
+            _validate_session_shards_boundary(
+                handle,
+                byte_offset=frozen_byte_end,
+                source_bytes=int(final_stat.st_size),
+                option="--frozen-byte-end",
+            )
         yield terminal
 
 
@@ -1323,6 +1522,10 @@ def cmd_session_shards(
                 raise ValueError(
                     "--source-token is required when --byte-start is non-zero"
                 )
+            if args.byte_start and args.resume_cursor is None:
+                raise ValueError(
+                    "--resume-cursor is required when --byte-start is non-zero"
+                )
         else:
             if args.byte_end is None:
                 raise ValueError("--byte-end is required with --emit records")
@@ -1334,6 +1537,8 @@ def cmd_session_shards(
                 )
             if not args.source_token:
                 raise ValueError("--source-token is required with --emit records")
+            if args.resume_cursor is None:
+                raise ValueError("--resume-cursor is required with --emit records")
 
         if host != "local":
             command = _remote_host_context_command(

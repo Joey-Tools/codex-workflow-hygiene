@@ -201,7 +201,7 @@ def adjudication_item_decisions(
 
 
 def source_token(seed: str) -> str:
-    return "session_shards_source_v1:" + hashlib.sha256(seed.encode()).hexdigest()
+    return "session_shards_source_v2:" + hashlib.sha256(seed.encode()).hexdigest()
 
 
 def session_shards_argv(request: SessionShardsRequest) -> tuple[str, ...]:
@@ -429,10 +429,14 @@ def record_stream_frames(
     limits: sharding.ShardLimits,
     *,
     token_seed: str,
+    frozen_payloads: list[bytes] | None = None,
+    record_start: int = 0,
 ) -> tuple[SessionShardsRequest, list[dict[str, object]]]:
     token = source_token(token_seed)
     first = records[0].coordinate.byte_start
     last = records[-1].coordinate.byte_end
+    frozen_values = payloads if frozen_payloads is None else frozen_payloads
+    frozen_byte_end = sum(len(payload) for payload in frozen_values)
     request = SessionShardsRequest(
         rollout="sessions/2026/07/06/rollout-test.jsonl",
         mode="records",
@@ -444,8 +448,13 @@ def record_stream_frames(
         record_processing_budget_bytes=limits.record_processing_budget,
         resume_cursor=contracts.session_shards_resume_cursor(
             token,
+            cursor_kind="records",
+            frozen_byte_end=frozen_byte_end,
             byte_offset=first,
-            next_record_index=0,
+            next_record_index=record_start,
+            prefix_commitment=(
+                "sha256:" + hashlib.sha256(b"".join(frozen_values)).hexdigest()
+            ),
         ),
     )
     meta: dict[str, object] = {
@@ -457,10 +466,10 @@ def record_stream_frames(
         "request_source_token": token,
         "request_resume_cursor": request.resume_cursor,
         "request_binding": request.request_binding,
-        "source_bytes": last,
+        "source_bytes": frozen_byte_end,
         "byte_start": first,
         "byte_end": last,
-        "record_start": 0,
+        "record_start": record_start,
         "shard_bytes": limits.max_bytes,
         "max_shards": request.max_shards,
         "record_processing_budget_bytes": limits.record_processing_budget,
@@ -481,13 +490,14 @@ def record_stream_frames(
     emitted_gap_bytes = 0
     emitted_fragment_bytes = 0
     for index, (record, payload) in enumerate(zip(records, payloads)):
+        global_index = record_start + index
         common = {
             "schema": SESSION_SHARDS_SCHEMA,
             "mode": "records",
             "source_token": token,
             "request_binding": request.request_binding,
-            "record_start": index,
-            "record_end": index + 1,
+            "record_start": global_index,
+            "record_end": global_index + 1,
             "delimiter_bytes": 1 if payload.endswith(b"\n") else 0,
         }
         if record.accounting_class is catalog.AccountingClass.EXPLICIT_GAP:
@@ -574,8 +584,8 @@ def record_stream_frames(
         "byte_end": last,
         "byte_count": last - first,
         "accounted_byte_count": emitted_record_bytes + emitted_gap_bytes,
-        "record_start": 0,
-        "record_end": len(records),
+        "record_start": record_start,
+        "record_end": record_start + len(records),
         "record_count": len(records),
         "accounted_record_count": emitted_records + emitted_gaps,
         "accounting_commitment": "sha256:" + accounting.hexdigest(),
@@ -597,8 +607,8 @@ def record_stream_frames(
             "emitted_fragment_bytes": emitted_fragment_bytes,
             "byte_start": first,
             "byte_end": last,
-            "record_start": 0,
-            "record_end": len(records),
+            "record_start": record_start,
+            "record_end": record_start + len(records),
             "conservation_proof": proof,
         }
     )
@@ -1697,6 +1707,67 @@ class OrchestratorTests(unittest.TestCase):
                 limits=limits,
             )
 
+    def test_accept_source_consumes_a_frame_limited_segment_chain(self) -> None:
+        limits = sharding.ShardLimits(
+            max_bytes=orchestrator_module.EXTRACTOR_SHARD_MAX_BYTES
+        )
+        coordinator = self.start_daily("transport-segments")
+        coordinator.advance()
+        lease = next(
+            item
+            for item in coordinator.status()["active_source_leases"]
+            if item["host"] == "local"
+        )
+        payloads = [b"{}\n"] * (MAX_SESSION_SHARDS_RECORD_DATA_FRAMES + 1)
+        manifest, records, source_ref = activity_manifest(lease, payloads)
+        split = MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
+        first_request, first_frames = record_stream_frames(
+            records[:split],
+            payloads[:split],
+            limits,
+            token_seed="transport-segments",
+            frozen_payloads=payloads,
+        )
+        second_request, second_frames = record_stream_frames(
+            records[split:],
+            payloads[split:],
+            limits,
+            token_seed="transport-segments",
+            frozen_payloads=payloads,
+            record_start=split,
+        )
+        raw_records = {
+            record.unit_ref: payload
+            for record, payload in zip(records, payloads, strict=True)
+        }
+
+        result = coordinator.accept_source(
+            lease["lease_ref"],
+            manifest.to_dict(),
+            transport_receipt=authenticated_receipt(
+                coordinator,
+                lease,
+                manifest,
+                raw_records,
+            ),
+            transport_segments={
+                source_ref: (
+                    (first_frames, first_request),
+                    (second_frames, second_request),
+                )
+            },
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual("complete", result["outcome"])
+        cell = coordinator.load_state()["source"]["cells"][lease["host"]][
+            lease["source_kind"]
+        ]
+        self.assertEqual(
+            len(payloads),
+            cell["metrics"]["record_count"],
+        )
+
     def test_transport_replays_physical_offsets_not_record_identity_order(
         self,
     ) -> None:
@@ -1816,8 +1887,15 @@ class OrchestratorTests(unittest.TestCase):
         forged_request = request.to_dict()
         forged_request["resume_cursor"] = contracts.session_shards_resume_cursor(
             source_token("other-source"),
+            cursor_kind="records",
+            frozen_byte_end=request.byte_end,
             byte_offset=request.byte_start,
             next_record_index=0,
+            prefix_commitment=str(
+                contracts.session_shards_resume_cursor_value(request.resume_cursor)[
+                    "prefix_commitment"
+                ]
+            ),
         )
         with self.assertRaisesRegex(InvalidInputError, "closed contract"):
             consume_session_shard_frames(

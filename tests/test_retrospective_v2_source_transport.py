@@ -6,6 +6,7 @@ import json
 import io
 import os
 from pathlib import Path
+import pwd
 import py_compile
 import subprocess
 import sys
@@ -25,7 +26,12 @@ sys.path.insert(0, str(SCRIPTS))
 
 from retrospective_v2 import authority, catalog, safe_io, transport  # noqa: E402
 import retrospective_v2.orchestrator as orchestrator_module  # noqa: E402
-from retrospective_v2 import transport_program, transport_remote, transport_source  # noqa: E402
+from retrospective_v2 import (  # noqa: E402
+    transport_contracts,
+    transport_program,
+    transport_remote,
+    transport_source,
+)
 from retrospective_v2.contracts import (  # noqa: E402
     RefType,
     RunMode,
@@ -206,6 +212,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
         *,
         source_kind: str,
         max_records: int,
+        max_source_bytes: int = 16 * 1024 * 1024,
         resume_position: dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         output_path = self.root / f"{name}.jsonl"
@@ -225,7 +232,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
             "--process-nonce",
             name,
             "--max-source-bytes",
-            str(16 * 1024 * 1024),
+            str(max_source_bytes),
             "--max-records",
             str(max_records),
             "--max-frame-bytes",
@@ -252,6 +259,37 @@ class SourceTransportProtocolTests(unittest.TestCase):
             json.loads(line)
             for line in output_path.read_text(encoding="ascii").splitlines()
         ]
+
+    def _direct_source_lease(
+        self,
+        name: str,
+        *,
+        source_kind: str,
+        max_records: int,
+        max_source_bytes: int = 16 * 1024 * 1024,
+        resume_position: dict[str, object] | None = None,
+    ) -> transport.TransportLease:
+        return transport.issue_transport_lease(
+            self.identity,
+            lease_ref=str(self.identity.derive_ref(RefType.LEASE, {"case": name})),
+            run_ref=str(self.identity.derive_ref(RefType.RUN, {"case": name})),
+            job_ref=str(self.identity.derive_ref(RefType.JOB, {"case": name})),
+            host="local",
+            host_ref=str(self.identity.derive_ref(RefType.HOST, {"host": "local"})),
+            source_kind=source_kind,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            process_nonce=name,
+            command_argv=("python3.13", "transport_worker.py"),
+            transport_program_commitment="sha256:" + "0" * 64,
+            source_byte_limit=max_source_bytes,
+            record_limit=max_records,
+            frame_byte_limit=8192,
+            session_target=None,
+            source_cursor=None,
+            cursor_time=None,
+            resume_position=resume_position,
+        )
 
     def _complete_native_sources(
         self,
@@ -611,16 +649,26 @@ class SourceTransportProtocolTests(unittest.TestCase):
         )
         arguments = mock.Mock(remote_helper=str(helper), host="remote.example")
         command = transport._remote_host_context_command(arguments, "probe", ())
+        account = pwd.getpwuid(os.getuid())
+        ssh_auth_sock = str(self.root / "agent.sock")
 
         self.assertEqual("-I", command[1])
         with (
             mock.patch.dict(
                 os.environ,
                 {
+                    "BASH_ENV": str(poison / "bash-env"),
+                    "DYLD_INSERT_LIBRARIES": str(poison / "inject.dylib"),
+                    "GIT_CONFIG_GLOBAL": str(poison / "gitconfig"),
+                    "HOME": str(poison),
+                    "LD_PRELOAD": str(poison / "inject.so"),
                     "PYTHONHOME": str(poison),
                     "PYTHONPATH": str(poison),
                     "PYTHONSTARTUP": str(poison / "sitecustomize.py"),
+                    "SSH_ASKPASS": str(poison / "askpass"),
+                    "SSH_AUTH_SOCK": ssh_auth_sock,
                 },
+                clear=True,
             ),
             mock.patch.object(transport_remote, "_relay_valid_utf8"),
         ):
@@ -630,7 +678,30 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 max_output_bytes=1024,
             )
 
-        self.assertFalse(any(key.upper().startswith("PYTHON") for key in environment))
+        self.assertEqual(
+            {
+                "HOME": account.pw_dir,
+                "LANG": "C",
+                "LC_ALL": "C",
+                "LOGNAME": account.pw_name,
+                "PATH": transport_remote.REMOTE_HOST_CONTEXT_FIXED_PATH,
+                "SSH_AUTH_SOCK": ssh_auth_sock,
+                "USER": account.pw_name,
+            },
+            environment,
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"SSH_AUTH_SOCK": "relative-agent.sock"},
+                clear=True,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "authentication environment is invalid",
+            ),
+        ):
+            transport._remote_host_context_environment()
 
     def test_remote_helper_timeout_terminates_descendant_process_group(self) -> None:
         helper = self.root / "remote-helper-with-child.py"
@@ -656,6 +727,40 @@ class SourceTransportProtocolTests(unittest.TestCase):
             )
 
         self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_remote_helper_success_closes_detached_output_descendant(self) -> None:
+        helper = self.root / "remote-helper-detached-child.py"
+        child_pid_path = self.root / "remote-helper-detached-child.pid"
+        helper.write_text(
+            "import subprocess, sys\n"
+            "child = subprocess.Popen(\n"
+            "    [sys.executable, '-I', '-c', 'import time; time.sleep(60)'],\n"
+            "    stdin=subprocess.DEVNULL,\n"
+            "    stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL,\n"
+            ")\n"
+            "with open(sys.argv[1], 'w', encoding='ascii') as stream:\n"
+            "    stream.write(str(child.pid))\n"
+            "print('{}')\n",
+            encoding="ascii",
+        )
+
+        with mock.patch.object(transport_remote, "_relay_valid_utf8"):
+            transport._relay_remote_host_context_command(
+                (sys.executable, "-I", str(helper), str(child_pid_path)),
+                max_output_bytes=1024,
+            )
+
+        child_pid = int(child_pid_path.read_text(encoding="ascii"))
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail(f"remote helper descendant survived: {child_pid}")
 
     def test_line_reader_is_bounded_before_allocation(self) -> None:
         class GuardedStream(io.BytesIO):
@@ -1079,6 +1184,161 @@ class SourceTransportProtocolTests(unittest.TestCase):
             )
         self.assertIsNone(segments[-1]["source_snapshot"]["resume_position"])
 
+    def test_source_resume_v4_is_canonical_and_v3_fails_closed(self) -> None:
+        source = self.codex_root / "history.jsonl"
+        source.write_bytes(
+            b"".join(self._line(f"schema-{index}") for index in range(3))
+        )
+        frames = self._direct_source_frames(
+            "resume-v4-schema",
+            source_kind="history",
+            max_records=1,
+        )
+        resume = frames[-1]["resume_position"]
+        self.assertIsInstance(resume, dict)
+        assert isinstance(resume, dict)
+
+        self.assertEqual("source_transport_resume_v4", resume["schema"])
+        self.assertEqual(
+            {
+                "accepted_prefix_commitment",
+                "byte_offset",
+                "candidate_index",
+                "discovery_commitment",
+                "record_index",
+                "resume_probe",
+                "schema",
+                "source_locator",
+                "source_size",
+                "source_token",
+            },
+            set(resume),
+        )
+        self.assertEqual(
+            {"byte_end", "byte_start", "content_commitment"},
+            set(resume["resume_probe"]),
+        )
+        encoded = transport.encode_source_resume_position(resume)
+        self.assertEqual(resume, transport.decode_source_resume_position(encoded))
+
+        wrong_schema = json.loads(json.dumps(resume))
+        wrong_schema["schema"] = "source_transport_resume_v3"
+        with self.assertRaisesRegex(
+            transport.TransportValidationError,
+            "resume schema changed",
+        ):
+            transport.encode_source_resume_position(wrong_schema)
+
+        legacy_fields = json.loads(json.dumps(resume))
+        legacy_fields.pop("accepted_prefix_commitment")
+        legacy_fields.pop("resume_probe")
+        legacy_fields["frozen_prefix_commitment"] = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(
+            transport.TransportValidationError,
+            "closed field set",
+        ):
+            transport.encode_source_resume_position(legacy_fields)
+
+    def test_forged_incoming_resume_fails_probe_auth_and_header_chains(self) -> None:
+        source = self.codex_root / "history.jsonl"
+        source.write_bytes(
+            b"".join(self._line(f"incoming-{index}") for index in range(4))
+        )
+        first = self._direct_source_frames(
+            "incoming-resume-original",
+            source_kind="history",
+            max_records=1,
+        )
+        resume = first[-1]["resume_position"]
+        self.assertIsInstance(resume, dict)
+        assert isinstance(resume, dict)
+
+        forged_probe = json.loads(json.dumps(resume))
+        forged_probe["resume_probe"]["content_commitment"] = "sha256:" + "0" * 64
+        rejected = self._direct_source_frames(
+            "incoming-resume-forged-probe",
+            source_kind="history",
+            max_records=1,
+            resume_position=forged_probe,
+        )
+        self.assertEqual("source_resume_invalid", rejected[-1]["reason"])
+        self.assertIsNone(rejected[-1]["resume_position"])
+
+        signed_lease = self._direct_source_lease(
+            "incoming-resume-signed",
+            source_kind="history",
+            max_records=1,
+            resume_position=resume,
+        )
+        transport.verify_transport_lease(self.identity, signed_lease)
+        forged_commitment = json.loads(json.dumps(resume))
+        forged_commitment["accepted_prefix_commitment"] = "sha256:" + "0" * 64
+        forged_lease = replace(signed_lease, resume_position=forged_commitment)
+        with self.assertRaisesRegex(
+            transport.TransportValidationError,
+            "lease authentication failed",
+        ):
+            transport.verify_transport_lease(self.identity, forged_lease)
+
+        valid_frames = self._direct_source_frames(
+            "incoming-resume-signed",
+            source_kind="history",
+            max_records=1,
+            resume_position=resume,
+        )
+        forged_header = json.loads(json.dumps(valid_frames))
+        forged_header[0]["resume_position"] = forged_commitment
+        with self.assertRaisesRegex(
+            transport.TransportValidationError,
+            "header is not bound to its authenticated lease",
+        ):
+            transport.capture_source_transport(
+                (
+                    json.dumps(frame, separators=(",", ":"), sort_keys=True) + "\n"
+                    for frame in forged_header
+                ),
+                lease=signed_lease,
+            )
+
+    def test_capture_recomputes_and_rejects_forged_outgoing_resume(self) -> None:
+        source = self.codex_root / "history.jsonl"
+        source.write_bytes(
+            b"".join(self._line(f"outgoing-{index}") for index in range(3))
+        )
+        name = "outgoing-resume-forged"
+        frames = self._direct_source_frames(
+            name,
+            source_kind="history",
+            max_records=1,
+        )
+        lease = self._direct_source_lease(
+            name,
+            source_kind="history",
+            max_records=1,
+        )
+        lines = [
+            json.dumps(frame, separators=(",", ":"), sort_keys=True) + "\n"
+            for frame in frames
+        ]
+        capture = transport.capture_source_transport(lines, lease=lease)
+        self.assertIsNotNone(capture.resume_position)
+
+        forged = json.loads(json.dumps(frames))
+        forged[-1]["resume_position"]["accepted_prefix_commitment"] = (
+            "sha256:" + "0" * 64
+        )
+        with self.assertRaisesRegex(
+            transport.TransportValidationError,
+            "was not independently derived",
+        ):
+            transport.capture_source_transport(
+                (
+                    json.dumps(frame, separators=(",", ":"), sort_keys=True) + "\n"
+                    for frame in forged
+                ),
+                lease=lease,
+            )
+
     def test_source_resume_freezes_prefix_when_live_file_appends(self) -> None:
         source = self.codex_root / "history.jsonl"
         original = b"".join(self._line(f"resume-{index}") for index in range(3))
@@ -1150,7 +1410,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.assertEqual("source_resume_invalid", second[-1]["reason"])
         self.assertEqual(0, second[-1]["inventory_count"])
 
-    def test_source_resume_binds_early_bytes_outside_boundary_probe(self) -> None:
+    def test_source_resume_does_not_claim_unprobed_deep_history_detection(self) -> None:
         source = self.codex_root / "history.jsonl"
         rows = [self._line(f"bulk-{index}-" + "x" * 160) for index in range(705)]
         original = b"".join(rows)
@@ -1175,9 +1435,95 @@ class SourceTransportProtocolTests(unittest.TestCase):
             resume_position=resume,
         )
 
+        self.assertTrue(second[-1]["complete"])
+        self.assertNotEqual("source_resume_invalid", second[-1]["reason"])
+        self.assertEqual(5, second[-1]["inventory_count"])
+
+    def test_source_resume_pread_ranges_never_rescan_zero_to_offset(self) -> None:
+        source = self.codex_root / "history.jsonl"
+        rows = [self._line(f"pread-{index}-" + "x" * 160) for index in range(720)]
+        source.write_bytes(b"".join(rows))
+        first = self._direct_source_frames(
+            "resume-pread-first",
+            source_kind="history",
+            max_records=700,
+        )
+        resume = first[-1]["resume_position"]
+        self.assertIsInstance(resume, dict)
+        assert isinstance(resume, dict)
+        byte_offset = int(resume["byte_offset"])
+        probe_start = (
+            byte_offset - transport_contracts.SOURCE_TRANSPORT_RESUME_PROBE_BYTES
+        )
+        self.assertGreater(probe_start, 0)
+
+        real_pread = os.pread
+        pread_calls: list[tuple[int, int, int]] = []
+
+        def record_pread(descriptor: int, count: int, offset: int) -> bytes:
+            payload = real_pread(descriptor, count, offset)
+            pread_calls.append((offset, count, len(payload)))
+            return payload
+
+        with mock.patch.object(
+            transport_source.os,
+            "pread",
+            side_effect=record_pread,
+        ):
+            second = self._direct_source_frames(
+                "resume-pread-second",
+                source_kind="history",
+                max_records=3,
+                resume_position=resume,
+            )
+
+        self.assertEqual("source_record_limit_reached", second[-1]["reason"])
+        prior_prefix_reads = [call for call in pread_calls if call[0] < byte_offset]
+        self.assertTrue(prior_prefix_reads)
+        self.assertEqual(
+            {probe_start},
+            {offset for offset, _count, _actual in prior_prefix_reads},
+        )
+        self.assertLessEqual(
+            sum(actual for _offset, _count, actual in prior_prefix_reads),
+            transport_contracts.SOURCE_TRANSPORT_RESUME_PROBE_BUDGET_BYTES,
+        )
+        self.assertFalse(any(offset == 0 for offset, _count, _actual in pread_calls))
+        self.assertTrue(
+            any(offset == byte_offset for offset, _count, _actual in pread_calls)
+        )
+
+    def test_source_resume_probe_budget_exhaustion_is_an_explicit_gap(self) -> None:
+        source = self.codex_root / "history.jsonl"
+        rows = [self._line(f"budget-{index}-" + "x" * 160) for index in range(710)]
+        source.write_bytes(b"".join(rows))
+        first = self._direct_source_frames(
+            "resume-budget-first",
+            source_kind="history",
+            max_records=700,
+        )
+        resume = first[-1]["resume_position"]
+        self.assertIsInstance(resume, dict)
+        assert isinstance(resume, dict)
+
+        with mock.patch.object(
+            transport_source,
+            "SOURCE_TRANSPORT_RESUME_PROBE_BUDGET_BYTES",
+            transport_contracts.SOURCE_TRANSPORT_RESUME_PROBE_BYTES,
+        ):
+            second = self._direct_source_frames(
+                "resume-budget-second",
+                source_kind="history",
+                max_records=1,
+                resume_position=resume,
+            )
+
         self.assertEqual("gap", second[-1]["status"])
-        self.assertEqual("source_resume_invalid", second[-1]["reason"])
-        self.assertEqual(0, second[-1]["inventory_count"])
+        self.assertEqual(
+            "source_resume_probe_budget_exhausted",
+            second[-1]["reason"],
+        )
+        self.assertIsNone(second[-1]["resume_position"])
 
     def test_source_scan_rejects_overwritten_prefix_plus_append(self) -> None:
         source = self.codex_root / "history.jsonl"

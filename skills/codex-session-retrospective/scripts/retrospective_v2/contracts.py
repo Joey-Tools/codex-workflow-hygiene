@@ -24,10 +24,16 @@ _CONTENT_COMMITMENT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 RAW_RECORD_FILE_SET_SCHEMA = "raw_record_file_set_v2"
 AGENT_FAILURE_SCHEMA = "agent_failure_v2"
 SESSION_SHARDS_SCHEMA = "session-shards-v1"
-SESSION_SHARDS_SOURCE_TOKEN_PREFIX = "session_shards_source_v1:"
+SESSION_SHARDS_SOURCE_TOKEN_PREFIX = "session_shards_source_v2:"
 SESSION_SHARDS_RESUME_CURSOR_PREFIX = "session_shards_resume_v1:"
 SESSION_SHARDS_REQUEST_BINDING_PREFIX = "session_shards_request_v1:"
 SESSION_SHARDS_RESUME_SIGNATURE_DOMAIN = b"session-shards-resume-signature-v1\0"
+SESSION_SHARDS_PREFIX_COMMITMENT_DOMAIN = b"session-shards-prefix-commitment-v1\0"
+SESSION_SHARDS_CURSOR_KINDS = frozenset({"descriptor_continue", "records"})
+SESSION_SHARDS_EMPTY_PREFIX_COMMITMENT = (
+    "sha256:"
+    + hashlib.sha256(SESSION_SHARDS_PREFIX_COMMITMENT_DOMAIN + b"bytes\0").hexdigest()
+)
 MIN_SESSION_RECORD_PROCESSING_BUDGET_BYTES = 4 * 1024 * 1024
 MAX_SESSION_RECORD_PROCESSING_BUDGET_BYTES = 256 * 1024 * 1024
 MAX_SESSION_SHARD_BYTES = 512 * 1024
@@ -455,6 +461,12 @@ def _session_shards_source_token(value: object) -> str:
     return value
 
 
+def _session_shards_prefix_commitment(value: object) -> str:
+    if not isinstance(value, str) or _CONTENT_COMMITMENT_RE.fullmatch(value) is None:
+        raise ValueError("session-shards prefix commitment is invalid")
+    return value
+
+
 def _session_shards_resume_signature(source_token: str, payload: bytes) -> str:
     token = _session_shards_source_token(source_token)
     key = hashlib.sha256(
@@ -466,28 +478,113 @@ def _session_shards_resume_signature(source_token: str, payload: bytes) -> str:
 def session_shards_resume_cursor(
     source_token: str,
     *,
+    cursor_kind: str,
+    frozen_byte_end: int,
     byte_offset: int,
     next_record_index: int,
+    prefix_commitment: str,
 ) -> str:
-    """Build the canonical cursor authenticated by its exact source coordinates."""
+    """Build one canonical cursor bound to a frozen source prefix."""
 
     token = _session_shards_source_token(source_token)
+    if cursor_kind not in SESSION_SHARDS_CURSOR_KINDS:
+        raise ValueError("session-shards cursor kind is not closed")
     for value, label in (
+        (frozen_byte_end, "frozen_byte_end"),
         (byte_offset, "byte_offset"),
         (next_record_index, "next_record_index"),
     ):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= MAX_JSON_INTEGER
+        ):
             raise ValueError(f"session-shards {label} must be non-negative")
+    if byte_offset > frozen_byte_end:
+        raise ValueError("session-shards cursor exceeds its frozen byte end")
+    commitment = _session_shards_prefix_commitment(prefix_commitment)
     payload = canonical_json_bytes(
         {
             "byte_offset": byte_offset,
+            "cursor_kind": cursor_kind,
+            "frozen_byte_end": frozen_byte_end,
             "next_record_index": next_record_index,
+            "prefix_commitment": commitment,
             "source_token": token,
         }
     )
     encoded_payload = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
     signature = _session_shards_resume_signature(token, payload)
     return SESSION_SHARDS_RESUME_CURSOR_PREFIX + encoded_payload + "." + signature
+
+
+def session_shards_resume_cursor_value(cursor: object) -> dict[str, JsonValue]:
+    """Parse and authenticate one closed canonical session-shards cursor."""
+
+    if not isinstance(cursor, str) or not cursor.startswith(
+        SESSION_SHARDS_RESUME_CURSOR_PREFIX
+    ):
+        raise ValueError("session-shards resume cursor is invalid")
+    encoded = cursor.removeprefix(SESSION_SHARDS_RESUME_CURSOR_PREFIX)
+    if len(encoded) > 4096 or encoded.count(".") != 1:
+        raise ValueError("session-shards resume cursor is invalid")
+    payload_text, signature = encoded.split(".", 1)
+    try:
+        payload = base64.b64decode(
+            payload_text + "=" * (-len(payload_text) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+        value = strict_json_loads(payload)
+    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("session-shards resume cursor is invalid") from exc
+    expected_fields = {
+        "byte_offset",
+        "cursor_kind",
+        "frozen_byte_end",
+        "next_record_index",
+        "prefix_commitment",
+        "source_token",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_fields
+        or canonical_json_bytes(value) != payload
+        or base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=") != payload_text
+        or _SHA256_RE.fullmatch(signature) is None
+    ):
+        raise ValueError("session-shards resume cursor is invalid")
+    source_token = _session_shards_source_token(value["source_token"])
+    cursor_kind = value["cursor_kind"]
+    frozen_byte_end = value["frozen_byte_end"]
+    byte_offset = value["byte_offset"]
+    next_record_index = value["next_record_index"]
+    prefix_commitment = _session_shards_prefix_commitment(value["prefix_commitment"])
+    if (
+        not isinstance(cursor_kind, str)
+        or cursor_kind not in SESSION_SHARDS_CURSOR_KINDS
+    ):
+        raise ValueError("session-shards cursor kind is not closed")
+    for coordinate in (frozen_byte_end, byte_offset, next_record_index):
+        if (
+            isinstance(coordinate, bool)
+            or not isinstance(coordinate, int)
+            or not 0 <= coordinate <= MAX_JSON_INTEGER
+        ):
+            raise ValueError("session-shards resume cursor is invalid")
+    if byte_offset > frozen_byte_end:
+        raise ValueError("session-shards resume cursor exceeds its frozen byte end")
+    expected_signature = _session_shards_resume_signature(source_token, payload)
+    if not hmac.compare_digest(signature, expected_signature):
+        raise ValueError("session-shards resume cursor signature is invalid")
+    return {
+        "byte_offset": byte_offset,
+        "cursor_kind": cursor_kind,
+        "frozen_byte_end": frozen_byte_end,
+        "next_record_index": next_record_index,
+        "prefix_commitment": prefix_commitment,
+        "source_token": source_token,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,52 +601,12 @@ class SessionShardsRequest:
 
     @staticmethod
     def _resume_coordinates(cursor: str) -> tuple[str, int, int]:
-        if not cursor.startswith(SESSION_SHARDS_RESUME_CURSOR_PREFIX):
-            raise ValueError("session-shards resume cursor is invalid")
-        encoded = cursor.removeprefix(SESSION_SHARDS_RESUME_CURSOR_PREFIX)
-        if len(encoded) > 2048 or encoded.count(".") != 1:
-            raise ValueError("session-shards resume cursor is invalid")
-        payload_text, signature = encoded.split(".", 1)
-        try:
-            payload = base64.b64decode(
-                payload_text + "=" * (-len(payload_text) % 4),
-                altchars=b"-_",
-                validate=True,
-            )
-            value = strict_json_loads(payload)
-        except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
-            raise ValueError("session-shards resume cursor is invalid") from exc
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"byte_offset", "next_record_index", "source_token"}
-            or canonical_json_bytes(value) != payload
-            or base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
-            != payload_text
-            or _SHA256_RE.fullmatch(signature) is None
-        ):
-            raise ValueError("session-shards resume cursor is invalid")
-        source_token = value["source_token"]
-        byte_offset = value["byte_offset"]
-        next_record_index = value["next_record_index"]
-        if (
-            not isinstance(source_token, str)
-            or re.fullmatch(
-                re.escape(SESSION_SHARDS_SOURCE_TOKEN_PREFIX) + r"[0-9a-f]{64}\Z",
-                source_token,
-            )
-            is None
-            or isinstance(byte_offset, bool)
-            or not isinstance(byte_offset, int)
-            or byte_offset < 0
-            or isinstance(next_record_index, bool)
-            or not isinstance(next_record_index, int)
-            or next_record_index < 0
-        ):
-            raise ValueError("session-shards resume cursor is invalid")
-        expected_signature = _session_shards_resume_signature(source_token, payload)
-        if not hmac.compare_digest(signature, expected_signature):
-            raise ValueError("session-shards resume cursor signature is invalid")
-        return source_token, byte_offset, next_record_index
+        value = session_shards_resume_cursor_value(cursor)
+        return (
+            str(value["source_token"]),
+            int(value["byte_offset"]),
+            int(value["next_record_index"]),
+        )
 
     def __post_init__(self) -> None:
         path = PurePosixPath(self.rollout)
@@ -602,16 +659,16 @@ class SessionShardsRequest:
             )
         if self.source_token is not None:
             _session_shards_source_token(self.source_token)
-        resume_coordinates: tuple[str, int, int] | None = None
+        resume_value: dict[str, JsonValue] | None = None
         if self.resume_cursor is not None:
             if not isinstance(self.resume_cursor, str):
                 raise ValueError("session-shards resume cursor is invalid")
-            resume_coordinates = self._resume_coordinates(self.resume_cursor)
+            resume_value = session_shards_resume_cursor_value(self.resume_cursor)
         if self.resume_cursor is not None and self.source_token is None:
             raise ValueError("session-shards resume cursor requires a source token")
-        if resume_coordinates is not None and (
-            resume_coordinates[0] != self.source_token
-            or resume_coordinates[1] != self.byte_start
+        if resume_value is not None and (
+            resume_value["source_token"] != self.source_token
+            or resume_value["byte_offset"] != self.byte_start
         ):
             raise ValueError(
                 "session-shards resume cursor is not bound to token and byte_start"
@@ -625,8 +682,22 @@ class SessionShardsRequest:
                 raise ValueError(
                     "session-shards records request requires byte_end, token, and cursor"
                 )
+            assert resume_value is not None
+            if (
+                resume_value["cursor_kind"] != "records"
+                or int(resume_value["frozen_byte_end"]) < self.byte_end
+            ):
+                raise ValueError(
+                    "session-shards records range exceeds its frozen byte end"
+                )
         elif self.byte_end is not None:
             raise ValueError("descriptor request cannot bind byte_end")
+        elif self.resume_cursor is None and self.byte_start:
+            raise ValueError("descriptor continuation requires a resume cursor")
+        elif resume_value is not None and resume_value["cursor_kind"] != (
+            "descriptor_continue"
+        ):
+            raise ValueError("descriptor request requires a continuation cursor")
 
     @property
     def record_start(self) -> int:

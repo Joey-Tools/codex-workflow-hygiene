@@ -697,6 +697,29 @@ def _run_bounded(
     output = bytearray()
     errors = bytearray()
     deadline = time.monotonic() + timeout_seconds
+    process_group_id = process.pid
+    process_group_cleanup_attempted = False
+
+    def terminate_process_group() -> None:
+        nonlocal process_group_cleanup_attempted
+        if process_group_cleanup_attempted:
+            return
+        process_group_cleanup_attempted = True
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     try:
         for stream, target in ((process.stdout, output), (process.stderr, errors)):
             os.set_blocking(stream.fileno(), False)
@@ -721,17 +744,15 @@ def _run_bounded(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError
+        # Close the task-owned group while the unreaped leader still pins its
+        # PID/PGID. Reaping first would open a process-group reuse race.
+        terminate_process_group()
         return_code = process.wait(timeout=remaining)
         return subprocess.CompletedProcess(
             argv, return_code, bytes(output), bytes(errors)
         )
     except (BufferError, TimeoutError, subprocess.TimeoutExpired) as exc:
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            process.wait()
+        terminate_process_group()
         reason = "output limit" if isinstance(exc, BufferError) else "deadline"
         raise HistoryValidationError(f"history command exceeded its {reason}") from exc
     finally:
@@ -741,6 +762,7 @@ def _run_bounded(
                 stream.close()
             except OSError:
                 pass
+        terminate_process_group()
 
 
 class _GitRepository:
@@ -2345,7 +2367,10 @@ def _validate_installed_automation(
     expected_frequency = "FREQ=DAILY" if expected_mode == "daily" else "FREQ=WEEKLY"
     forbidden_prompt_tokens = (
         "--allow-partial",
+        "--backfill-of",
+        "--controlled-gap-receipt",
         "--holdout-host",
+        "--host",
         "--shadow",
         "reference_only",
         "session_retrospective.py",

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 
 SCRIPTS = (
@@ -16,6 +17,7 @@ SCRIPTS = (
 )
 sys.path.insert(0, str(SCRIPTS))
 
+import retrospective_v2.result_validation as result_validation_module  # noqa: E402
 from retrospective_v2.episode_review import (  # noqa: E402
     construct_episodes,
     create_episode_revision,
@@ -352,6 +354,51 @@ def synthesis_result() -> dict:
 
 
 class ResultValidationTests(unittest.TestCase):
+    def test_result_complexity_is_bounded_before_privacy_processing(self) -> None:
+        value = extractor_result()
+        value["turns"][0]["generalized_working_text"] = "x" * (
+            result_validation_module.MAX_RESULT_STRING_CHARS + 1
+        )
+
+        with (
+            mock.patch.object(
+                result_validation_module,
+                "_post_redact_text",
+                side_effect=AssertionError("privacy processing started"),
+            ),
+            self.assertRaisesRegex(ResultValidationError, "must be at most 4096"),
+        ):
+            validate_extractor_result(value, ALL_REFS)
+
+        with self.assertRaisesRegex(
+            ResultValidationError,
+            "source characters",
+        ):
+            scan_for_leaks(
+                {"safe": "bounded"},
+                original_prompts=[
+                    "x" * (result_validation_module.MAX_SOURCE_OVERLAP_CHARS + 1)
+                ],
+            )
+
+    def test_overlap_scan_preindexes_large_nonmatching_source(self) -> None:
+        source = "".join(
+            chr(0x400 + index % 1024)
+            for index in range(result_validation_module.MAX_SOURCE_OVERLAP_CHARS)
+        )
+        with mock.patch.object(
+            result_validation_module,
+            "_build_source_overlap_index",
+            wraps=result_validation_module._build_source_overlap_index,
+        ) as build_index:
+            findings = scan_for_leaks(
+                {"safe": "z" * result_validation_module.MAX_RESULT_STRING_CHARS},
+                original_prompts=[source],
+            )
+
+        self.assertEqual((), findings)
+        self.assertEqual(2, build_index.call_count)
+
     def test_extractor_accepts_closed_structured_result(self) -> None:
         result = validate_extractor_result(extractor_result(), ALL_REFS)
 

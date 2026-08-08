@@ -38,10 +38,12 @@ TRANSPORT_LEASE_AUTH_PREFIX = "source_transport_lease_auth_v2:"
 SOURCE_SNAPSHOT_REF_PREFIX = "source_snapshot_v2:"
 TRANSPORT_RECEIPT_REF_PREFIX = "source_transport_receipt_v2:"
 SOURCE_TRANSPORT_STREAM_SCHEMA = "source_transport_stream_v2"
-SOURCE_TRANSPORT_RESUME_SCHEMA = "source_transport_resume_v3"
+SOURCE_TRANSPORT_RESUME_SCHEMA = "source_transport_resume_v4"
 SOURCE_TRANSPORT_MAX_RECORD_BYTES = 8 * 1024 * 1024
 SOURCE_TRANSPORT_SCAN_CHUNK_BYTES = 64 * 1024
-SOURCE_TRANSPORT_BOUNDARY_PROBE_BYTES = 64 * 1024
+SOURCE_TRANSPORT_RESUME_PROBE_BYTES = 64 * 1024
+SOURCE_TRANSPORT_RESUME_PROBE_BUDGET_BYTES = 3 * SOURCE_TRANSPORT_RESUME_PROBE_BYTES
+SOURCE_TRANSPORT_BOUNDARY_PROBE_BYTES = SOURCE_TRANSPORT_RESUME_PROBE_BYTES
 SOURCE_TRANSPORT_ACTIVE_LOOKBACK_DAYS = 7
 SOURCE_TRANSPORT_WORKER_MODULE_MANIFEST = (
     "catalog.py",
@@ -52,6 +54,8 @@ SOURCE_TRANSPORT_WORKER_MODULE_MANIFEST = (
     "transport_paths.py",
     "transport_program.py",
     "transport_remote.py",
+    "transport_resume.py",
+    "transport_snapshot.py",
     "transport_source.py",
     "transport_worker.py",
 )
@@ -203,11 +207,12 @@ def _normalize_source_resume_position(
     _exact_keys(
         value,
         {
+            "accepted_prefix_commitment",
             "byte_offset",
             "candidate_index",
             "discovery_commitment",
-            "frozen_prefix_commitment",
             "record_index",
+            "resume_probe",
             "schema",
             "source_locator",
             "source_size",
@@ -220,7 +225,27 @@ def _normalize_source_resume_position(
     locator = value.get("source_locator")
     if not isinstance(locator, str) or _LOCATOR_RE.fullmatch(locator) is None:
         raise TransportValidationError("source transport resume locator is invalid")
+    raw_probe = value.get("resume_probe")
+    if not isinstance(raw_probe, Mapping):
+        raise TransportValidationError("source transport resume probe is invalid")
+    _exact_keys(
+        raw_probe,
+        {"byte_end", "byte_start", "content_commitment"},
+        "source transport resume probe",
+    )
+    probe_start = _non_negative_int(
+        raw_probe.get("byte_start"),
+        "source transport resume probe byte_start",
+    )
+    probe_end = _non_negative_int(
+        raw_probe.get("byte_end"),
+        "source transport resume probe byte_end",
+    )
     normalized: dict[str, JsonValue] = {
+        "accepted_prefix_commitment": _sha256(
+            value.get("accepted_prefix_commitment"),
+            "source transport resume accepted_prefix_commitment",
+        ),
         "byte_offset": _non_negative_int(
             value.get("byte_offset"),
             "source transport resume byte_offset",
@@ -233,14 +258,18 @@ def _normalize_source_resume_position(
             value.get("discovery_commitment"),
             "source transport resume discovery_commitment",
         ),
-        "frozen_prefix_commitment": _sha256(
-            value.get("frozen_prefix_commitment"),
-            "source transport resume frozen_prefix_commitment",
-        ),
         "record_index": _non_negative_int(
             value.get("record_index"),
             "source transport resume record_index",
         ),
+        "resume_probe": {
+            "byte_end": probe_end,
+            "byte_start": probe_start,
+            "content_commitment": _sha256(
+                raw_probe.get("content_commitment"),
+                "source transport resume probe content_commitment",
+            ),
+        },
         "schema": SOURCE_TRANSPORT_RESUME_SCHEMA,
         "source_locator": locator,
         "source_size": _non_negative_int(
@@ -257,6 +286,140 @@ def _normalize_source_resume_position(
         raise TransportValidationError(
             "source transport resume frozen prefix is invalid"
         )
+    expected_probe_start = max(
+        0,
+        byte_offset - SOURCE_TRANSPORT_RESUME_PROBE_BYTES,
+    )
+    if probe_end != byte_offset or probe_start != expected_probe_start:
+        raise TransportValidationError("source transport resume probe range is invalid")
+    return normalized
+
+
+def _source_transport_resume_probe(
+    payload: bytes,
+    *,
+    byte_offset: int,
+) -> dict[str, JsonValue]:
+    offset = _non_negative_int(
+        byte_offset,
+        "source transport resume probe byte_offset",
+    )
+    probe_start = max(0, offset - SOURCE_TRANSPORT_RESUME_PROBE_BYTES)
+    if len(payload) != offset - probe_start:
+        raise TransportValidationError(
+            "source transport resume probe payload has the wrong length"
+        )
+    return {
+        "byte_end": offset,
+        "byte_start": probe_start,
+        "content_commitment": "sha256:" + hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _derive_source_resume_position(
+    *,
+    prior_position: Mapping[str, object] | None,
+    inventory: Sequence[Mapping[str, Any]],
+    resume_probe: Mapping[str, object],
+) -> dict[str, JsonValue]:
+    """Derive one public continuation commitment from authenticated prior state."""
+
+    if not inventory:
+        raise TransportValidationError(
+            "source transport continuation requires accepted inventory"
+        )
+    prior = _normalize_source_resume_position(prior_position)
+    last = inventory[-1]
+    required = {
+        "byte_end",
+        "candidate_index",
+        "discovery_commitment",
+        "record_index",
+        "source_locator",
+        "source_size",
+        "source_token",
+    }
+    if not required.issubset(last):
+        raise TransportValidationError(
+            "source transport continuation inventory is incomplete"
+        )
+    locator = last["source_locator"]
+    if not isinstance(locator, str) or _LOCATOR_RE.fullmatch(locator) is None:
+        raise TransportValidationError(
+            "source transport continuation locator is invalid"
+        )
+    byte_offset = _non_negative_int(
+        last["byte_end"],
+        "source transport continuation byte_offset",
+    )
+    candidate_index = _non_negative_int(
+        last["candidate_index"],
+        "source transport continuation candidate_index",
+    )
+    record_index = (
+        _non_negative_int(
+            last["record_index"],
+            "source transport continuation record_index",
+        )
+        + 1
+    )
+    source_size = _non_negative_int(
+        last["source_size"],
+        "source transport continuation source_size",
+    )
+    if byte_offset > source_size:
+        raise TransportValidationError(
+            "source transport continuation exceeds its frozen source"
+        )
+    raw_probe = dict(resume_probe)
+    probe_cursor = {
+        "accepted_prefix_commitment": "sha256:" + "0" * 64,
+        "byte_offset": byte_offset,
+        "candidate_index": candidate_index,
+        "discovery_commitment": _sha256(
+            last["discovery_commitment"],
+            "source transport continuation discovery_commitment",
+        ),
+        "record_index": record_index,
+        "resume_probe": raw_probe,
+        "schema": SOURCE_TRANSPORT_RESUME_SCHEMA,
+        "source_locator": locator,
+        "source_size": source_size,
+        "source_token": _sha256(
+            last["source_token"],
+            "source transport continuation source_token",
+        ),
+    }
+    normalized = _normalize_source_resume_position(probe_cursor)
+    assert normalized is not None
+    if prior is not None:
+        if prior["discovery_commitment"] != normalized["discovery_commitment"]:
+            raise TransportValidationError(
+                "source transport continuation discovery changed"
+            )
+        prior_progress = (
+            int(prior["candidate_index"]),
+            int(prior["byte_offset"]),
+            int(prior["record_index"]),
+        )
+        next_progress = (candidate_index, byte_offset, record_index)
+        if next_progress <= prior_progress:
+            raise TransportValidationError(
+                "source transport continuation did not advance"
+            )
+    transition_body: dict[str, JsonValue] = {
+        "accepted_inventory_commitment": _source_transport_inventory_commitment(
+            inventory
+        ),
+        "prior_position": prior,
+        "resume_position": {
+            key: value
+            for key, value in normalized.items()
+            if key != "accepted_prefix_commitment"
+        },
+        "schema": "source_transport_accepted_prefix_transition_v1",
+    }
+    normalized["accepted_prefix_commitment"] = _canonical_commitment(transition_body)
     return normalized
 
 

@@ -1183,12 +1183,20 @@ def _bounded_read_identity(st: os.stat_result) -> tuple[int, ...]:
     return (
         int(st.st_dev),
         int(st.st_ino),
-        int(st.st_mode),
-        int(st.st_nlink),
-        int(st.st_size),
-        int(st.st_mtime_ns),
-        int(st.st_ctime_ns),
+        int(stat.S_IFMT(st.st_mode)),
     )
+
+
+def _validate_bounded_read_policy(
+    st: os.stat_result,
+    display_path: Path,
+    *,
+    require_owner_only: bool,
+) -> None:
+    if require_owner_only:
+        _validate_file_stat(st, display_path)
+    elif not stat.S_ISREG(st.st_mode):
+        raise UnsafePathError(f"expected a regular file: {display_path}")
 
 
 def _read_bounded_descriptor_pass(
@@ -1232,6 +1240,11 @@ def read_bounded_bytes_at(
     )
     try:
         before = os.fstat(descriptor)
+        _validate_bounded_read_policy(
+            before,
+            display_path,
+            require_owner_only=require_owner_only,
+        )
         if before.st_size > max_bytes:
             raise ReadLimitExceeded(
                 "file exceeds byte limit "
@@ -1245,9 +1258,15 @@ def read_bounded_bytes_at(
             consume=chunks.append,
         )
         after_first_read = os.fstat(descriptor)
+        _validate_bounded_read_policy(
+            after_first_read,
+            display_path,
+            require_owner_only=require_owner_only,
+        )
         if (
             _bounded_read_identity(before) != _bounded_read_identity(after_first_read)
             or total != before.st_size
+            or after_first_read.st_size != before.st_size
         ):
             raise UnsafePathError(f"file changed while reading: {display_path}")
 
@@ -1259,6 +1278,11 @@ def read_bounded_bytes_at(
             consume=lambda _chunk: None,
         )
         after_verification = os.fstat(descriptor)
+        _validate_bounded_read_policy(
+            after_verification,
+            display_path,
+            require_owner_only=require_owner_only,
+        )
         try:
             path_after_verification = os.stat(
                 name,
@@ -1269,11 +1293,18 @@ def read_bounded_bytes_at(
             raise UnsafePathError(
                 f"file identity changed while reading: {display_path}"
             ) from exc
+        _validate_bounded_read_policy(
+            path_after_verification,
+            display_path,
+            require_owner_only=require_owner_only,
+        )
         if (
             _bounded_read_identity(before) != _bounded_read_identity(after_verification)
             or _bounded_read_identity(before)
             != _bounded_read_identity(path_after_verification)
             or verified_total != before.st_size
+            or after_verification.st_size != before.st_size
+            or path_after_verification.st_size != before.st_size
             or not hmac.compare_digest(first_digest, verification_digest)
         ):
             raise UnsafePathError(f"file content changed while reading: {display_path}")

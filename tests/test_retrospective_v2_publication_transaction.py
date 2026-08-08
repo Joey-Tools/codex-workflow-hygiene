@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Mapping
 import unittest
 from unittest import mock
@@ -81,6 +82,110 @@ def run_command(
 
 
 class PublicationInvariantUnitTests(unittest.TestCase):
+    def test_bounded_subprocesses_close_group_after_leader_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            helper = root / "leader-exits.py"
+            helper.write_text(
+                "import subprocess, sys\n"
+                "child = subprocess.Popen(\n"
+                "    [sys.executable, '-I', '-c', "
+                "'import time; time.sleep(60)'],\n"
+                "    stdout=sys.stdout,\n"
+                "    stderr=sys.stderr,\n"
+                ")\n"
+                "with open(sys.argv[1], 'w', encoding='ascii') as stream:\n"
+                "    stream.write(str(child.pid))\n"
+                "    stream.flush()\n",
+                encoding="ascii",
+            )
+
+            def assert_child_closed(pid_path: Path) -> None:
+                child_pid = int(pid_path.read_text(encoding="ascii"))
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(child_pid, 0)
+                    except ProcessLookupError:
+                        return
+                    time.sleep(0.02)
+                self.fail(f"bounded subprocess descendant survived: {child_pid}")
+
+            publication_pid = root / "publication.pid"
+            started = time.monotonic()
+            with self.assertRaisesRegex(
+                publication_support.LocalGitPublicationError,
+                "subprocess exceeded its deadline",
+            ):
+                publication_support._run_bounded_subprocess(
+                    [sys.executable, "-I", str(helper), str(publication_pid)],
+                    environment=dict(os.environ),
+                    timeout_seconds=0.25,
+                    max_output_bytes=1024,
+                )
+            self.assertLess(time.monotonic() - started, 2)
+            assert_child_closed(publication_pid)
+
+            authority_pid = root / "authority.pid"
+            started = time.monotonic()
+            with self.assertRaisesRegex(
+                authority.HistoryValidationError,
+                "history command exceeded its deadline",
+            ):
+                authority._run_bounded(
+                    [sys.executable, "-I", str(helper), str(authority_pid)],
+                    env=dict(os.environ),
+                    timeout_seconds=0.25,
+                    max_output_bytes=1024,
+                )
+            self.assertLess(time.monotonic() - started, 2)
+            assert_child_closed(authority_pid)
+
+            detached_helper = root / "leader-exits-with-detached-output.py"
+            detached_helper.write_text(
+                "import subprocess, sys\n"
+                "child = subprocess.Popen(\n"
+                "    [sys.executable, '-I', '-c', "
+                "'import time; time.sleep(60)'],\n"
+                "    stdin=subprocess.DEVNULL,\n"
+                "    stdout=subprocess.DEVNULL,\n"
+                "    stderr=subprocess.DEVNULL,\n"
+                ")\n"
+                "with open(sys.argv[1], 'w', encoding='ascii') as stream:\n"
+                "    stream.write(str(child.pid))\n",
+                encoding="ascii",
+            )
+
+            publication_detached_pid = root / "publication-detached.pid"
+            publication_result = publication_support._run_bounded_subprocess(
+                [
+                    sys.executable,
+                    "-I",
+                    str(detached_helper),
+                    str(publication_detached_pid),
+                ],
+                environment=dict(os.environ),
+                timeout_seconds=2,
+                max_output_bytes=1024,
+            )
+            self.assertEqual(0, publication_result.returncode)
+            assert_child_closed(publication_detached_pid)
+
+            authority_detached_pid = root / "authority-detached.pid"
+            authority_result = authority._run_bounded(
+                [
+                    sys.executable,
+                    "-I",
+                    str(detached_helper),
+                    str(authority_detached_pid),
+                ],
+                env=dict(os.environ),
+                timeout_seconds=2,
+                max_output_bytes=1024,
+            )
+            self.assertEqual(0, authority_result.returncode)
+            assert_child_closed(authority_detached_pid)
+
     def test_retained_export_lifecycle_is_injected_through_narrow_protocol(
         self,
     ) -> None:

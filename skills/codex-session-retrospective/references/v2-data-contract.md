@@ -40,6 +40,29 @@ local shard packing. Transcript bindings cover exactly the `source_ref` values
 that contain consumed candidates. Excluded-only source refs stay in catalog
 accounting and require no raw transcript.
 
+Descriptor pagination binds one stable source object, frozen byte end, record
+coordinates, and domain-separated full-prefix commitment in every closed resume
+cursor. Later appends cannot extend that descriptor snapshot. Continuation pages
+must repeat the requested source token, frozen byte end, byte offset, and record
+index exactly. Each page stops before its derived records stream would exceed
+1,024 data frames, using the closed `max_record_data_frames` continuation reason.
+A retained transcript stores every descriptor page first, followed by one exact
+records stream per page. The adapter validates and closes the complete descriptor
+chain before lazily replaying those contiguous records requests into the
+coordinator. Descriptor pages alone are discovery metadata and never authorize
+retained raw evidence.
+
+The `session_shards_source_v2` token binds device, inode, mode, owner, group, and
+the platform generation and birth-time fields when they exist. On a filesystem
+that supplies neither generation nor birth time, a same-inode replacement with
+byte-identical frozen content cannot be distinguished from the prior object;
+this is an explicit platform non-guarantee, not an identity proof. Every
+records-mode request separately scans and hashes the complete frozen prefix into
+an owner-only temporary spool before emitting its first frame. Content mutation
+anywhere in that prefix therefore rejects the stream even on the fallback
+platform, while the spool retains only the requested byte range and closes on
+every terminal path.
+
 Remote descriptor and record streams are incrementally validated before spool.
 Every frame is either consistently wrapped and bound to the exact requested
 host and rollout, or consistently legacy-unwrapped and wrapped locally with
@@ -48,6 +71,9 @@ mode, and cross-host or cross-rollout replay fail closed. Record relay output is
 bounded from the requested byte range plus compact metadata allowance, with
 per-frame size, coordinates, fragments, hashes, counters, and terminal
 conservation checked before the complete output can be retained.
+Fragment continuation also repeats the logical record byte range, record-index
+range, delimiter width, encoding, and complete-record commitment; drift in any
+one field rejects the relay before retained output exists.
 
 ## Accounting, Shards, And Jobs
 
@@ -58,13 +84,27 @@ archived record is excluded only by the closed canonical-equivalence rule when
 there is exactly one equivalent active record; multiple active files never
 collapse. Source discovery opens only rollout date directories in the requested
 window, plus a fixed seven-day active-rollout lookback for cross-day sessions;
-filesystem mtimes never prefilter candidates. Resumed files bind stable inode
-identity, a frozen byte boundary, and a bounded prefix probe, so append-only
-growth cannot invalidate or extend the original snapshot while prefix changes
-fail closed. Every enumerated candidate is scanned or represented by an explicit
-bound/transport gap, and stable event time, cursor, and window classification
-happens only after the bounded read. Logical turn sequencing preserves each
-physical file's
+filesystem mtimes never prefilter candidates. Resume positions use the closed
+`source_transport_resume_v4` schema. They carry a public
+`accepted_prefix_commitment` transition chain plus the exact trailing probe
+range and content commitment; the chain is authoritative only because the
+incoming position is carried by the authenticated durable checkpoint, lease,
+and exact stream header and the outgoing position is independently reconstructed
+by capture before the receipt is issued. `source_token` and public stat fields
+never create or replace that authentication.
+
+Each invocation may spend at most three 64 KiB internal reads on resume probes;
+budget exhaustion is the explicit `source_resume_probe_budget_exhausted` gap.
+The worker rereads the current page separately to prove page stability, freezes
+the original source size so later appends are not admitted to that snapshot, and
+retains only the bounded trailing bytes needed to construct the next probe. It
+never rescans `0..byte_offset` to continue. Without an immutable source snapshot,
+this O(page) continuation detects only mutation intersecting the bounded
+prior-prefix probe; it does not detect or claim to detect arbitrary mutation deep
+in already accepted history. Every enumerated candidate is scanned or represented
+by an explicit bound/transport gap, and stable event time, cursor, and window
+classification happens only after the bounded read. Logical turn sequencing
+preserves each physical file's
 `byte_start` order before digest tie-breakers while deterministically merging
 different files. Session mode consumes only records matching `session_target`,
 records discovered for other sessions remain structurally accounted without

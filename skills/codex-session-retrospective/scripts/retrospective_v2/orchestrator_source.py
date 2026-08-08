@@ -33,6 +33,7 @@ from .orchestrator_protocols import (
     SourceProjectionPort,
     SourceStatePort,
 )
+from .orchestrator_source_segments import consume_session_shard_segments
 
 from .orchestrator_support import (
     DEFAULT_AGENT_CLAIM_TTL_SECONDS,
@@ -51,7 +52,6 @@ from .orchestrator_support import (
     _safe_reason,
     _source_session_identifiers,
     _strict_source_record,
-    consume_session_shard_frames,
 )
 
 
@@ -683,6 +683,16 @@ class SourceCoordinationOperations(OrchestratorComponent):
         transport_streams: Mapping[str, Iterable[Mapping[str, Any]]] | None = None,
         transport_requests: Mapping[str, SessionShardsRequest | Mapping[str, Any]]
         | None = None,
+        transport_segments: Mapping[
+            str,
+            Iterable[
+                tuple[
+                    Iterable[Mapping[str, Any]],
+                    SessionShardsRequest | Mapping[str, Any],
+                ]
+            ],
+        ]
+        | None = None,
     ) -> dict[str, Any]:
         self._state.ensure_retention_active()
         normalized_lease = self._state._validate_ref(
@@ -714,11 +724,18 @@ class SourceCoordinationOperations(OrchestratorComponent):
             raise InvalidInputError(
                 "source transport receipt violates the closed contract"
             ) from error
-        if raw_records is not None and (
-            transport_streams is not None or transport_requests is not None
+        if raw_records is not None and any(
+            value is not None
+            for value in (transport_streams, transport_requests, transport_segments)
         ):
             raise InvalidInputError(
                 "raw record files and session-shards streams are mutually exclusive"
+            )
+        if transport_segments is not None and (
+            transport_streams is not None or transport_requests is not None
+        ):
+            raise InvalidInputError(
+                "segmented and legacy session-shards inputs are mutually exclusive"
             )
         raw_values = {} if raw_records is None else dict(raw_records)
         if any(
@@ -763,54 +780,62 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 "source transport receipt was not issued by the execution boundary"
             )
         limits = self._projection._shard_limits_from_state(state)
-        accepted_requests: dict[str, SessionShardsRequest] = {}
-        if transport_streams is not None:
+        accepted_requests: dict[str, tuple[SessionShardsRequest, ...]] = {}
+        segments: (
+            dict[
+                str,
+                Iterable[
+                    tuple[
+                        Iterable[Mapping[str, Any]],
+                        SessionShardsRequest | Mapping[str, Any],
+                    ]
+                ],
+            ]
+            | None
+        ) = None
+        if transport_segments is not None:
+            segments = dict(transport_segments)
+        elif transport_streams is not None:
             streams = dict(transport_streams)
             if transport_requests is None:
                 raise InvalidInputError(
                     "session-shards streams require exact request manifests"
                 )
             request_values = dict(transport_requests)
+            if set(streams) != set(request_values):
+                raise InvalidInputError(
+                    "session-shards streams and requests must cover the same sources"
+                )
+            segments = {
+                source_ref: ((streams[source_ref], request_values[source_ref]),)
+                for source_ref in streams
+            }
+        if segments is not None:
             expected_source_refs = {
                 record.coordinate.source_ref
                 for record in transport.records
                 if record.accounting_class is catalog.AccountingClass.CONSUMED_CANDIDATE
             }
-            if (
-                set(streams) != expected_source_refs
-                or set(request_values) != expected_source_refs
-            ):
+            if set(segments) != expected_source_refs:
                 raise InvalidInputError(
                     "session-shards streams and requests must cover every source_ref"
                 )
             transported: dict[str, bytes] = {}
-            for source_ref in sorted(streams):
-                try:
-                    request = (
-                        request_values[source_ref]
-                        if isinstance(request_values[source_ref], SessionShardsRequest)
-                        else SessionShardsRequest.from_dict(
-                            request_values[source_ref]  # type: ignore[arg-type]
-                        )
-                    )
-                except (TypeError, ValueError) as error:
-                    raise InvalidInputError(
-                        "session-shards request violates its closed contract"
-                    ) from error
-                consumption = consume_session_shard_frames(
+            for source_ref in sorted(segments):
+                consumptions, requests = consume_session_shard_segments(
                     transport,
                     source_ref,
-                    streams[source_ref],
-                    request=request,
+                    segments[source_ref],
                     limits=limits,
                 )
-                accepted_requests[source_ref] = request
-                for raw_record in consumption.raw_records:
-                    if raw_record.unit_ref in transported:
-                        raise InvalidInputError(
-                            "session-shards streams duplicate a source unit"
-                        )
-                    transported[raw_record.unit_ref] = raw_record.payload
+                accepted_requests[source_ref] = requests
+                for consumption in consumptions:
+                    for raw_record in consumption.raw_records:
+                        if raw_record.unit_ref in transported:
+                            raise InvalidInputError(
+                                "session-shards streams duplicate a source unit"
+                            )
+                        transported[raw_record.unit_ref] = raw_record.payload
             raw_values = transported
         elif transport_requests is not None:
             raise InvalidInputError(
@@ -1886,7 +1911,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
         manifest: catalog.SourceTransportManifest,
         receipt: source_transport.TransportReceipt,
         raw_records: Mapping[str, bytes],
-        transport_requests: Mapping[str, SessionShardsRequest] | None = None,
+        transport_requests: Mapping[str, Sequence[SessionShardsRequest]] | None = None,
     ) -> str:
         payloads = {
             unit_ref: {
@@ -1896,8 +1921,10 @@ class SourceCoordinationOperations(OrchestratorComponent):
             for unit_ref, payload in sorted(raw_records.items())
         }
         requests = {
-            source_ref: request.to_dict()
-            for source_ref, request in sorted((transport_requests or {}).items())
+            source_ref: [request.to_dict() for request in source_requests]
+            for source_ref, source_requests in sorted(
+                (transport_requests or {}).items()
+            )
         }
         return content_digest(
             {

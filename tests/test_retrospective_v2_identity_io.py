@@ -37,6 +37,7 @@ from retrospective_v2.contracts import (  # noqa: E402
     canonical_sha256,
     parse_typed_ref,
     session_shards_resume_cursor,
+    session_shards_resume_cursor_value,
 )
 from retrospective_v2.identity import (  # noqa: E402
     IDENTITY_KEY_ID_PREFIX,
@@ -108,10 +109,14 @@ class ContractTests(unittest.TestCase):
 
     def test_resume_cursor_signature_binds_token_and_coordinates(self) -> None:
         source_token = SESSION_SHARDS_SOURCE_TOKEN_PREFIX + "a" * 64
+        prefix_commitment = "sha256:" + hashlib.sha256(b"frozen-prefix").hexdigest()
         cursor = session_shards_resume_cursor(
             source_token,
+            cursor_kind="records",
+            frozen_byte_end=256,
             byte_offset=128,
             next_record_index=7,
+            prefix_commitment=prefix_commitment,
         )
         request = SessionShardsRequest(
             rollout="sessions/rollout.jsonl",
@@ -126,7 +131,44 @@ class ContractTests(unittest.TestCase):
         )
 
         self.assertEqual(7, request.record_start)
+        page_request = SessionShardsRequest(
+            rollout="sessions/rollout.jsonl",
+            mode="records",
+            source_token=source_token,
+            byte_start=128,
+            byte_end=192,
+            shard_bytes=128,
+            max_shards=1,
+            record_processing_budget_bytes=(MIN_SESSION_RECORD_PROCESSING_BUDGET_BYTES),
+            resume_cursor=cursor,
+        )
+        self.assertEqual(192, page_request.byte_end)
+        with self.assertRaisesRegex(ValueError, "frozen byte end"):
+            SessionShardsRequest(
+                rollout="sessions/rollout.jsonl",
+                mode="records",
+                source_token=source_token,
+                byte_start=128,
+                byte_end=257,
+                shard_bytes=128,
+                max_shards=1,
+                record_processing_budget_bytes=(
+                    MIN_SESSION_RECORD_PROCESSING_BUDGET_BYTES
+                ),
+                resume_cursor=cursor,
+            )
         self.assertTrue(cursor.startswith(SESSION_SHARDS_RESUME_CURSOR_PREFIX))
+        self.assertEqual(
+            {
+                "byte_offset": 128,
+                "cursor_kind": "records",
+                "frozen_byte_end": 256,
+                "next_record_index": 7,
+                "prefix_commitment": prefix_commitment,
+                "source_token": source_token,
+            },
+            session_shards_resume_cursor_value(cursor),
+        )
 
         encoded, signature = cursor.removeprefix(
             SESSION_SHARDS_RESUME_CURSOR_PREFIX
@@ -415,6 +457,56 @@ class SafeIoTests(unittest.TestCase):
                 UnsafePathError, "content changed while reading"
             ):
                 read_bounded_bytes(target, max_bytes=len(original))
+
+    def test_bounded_read_distinguishes_benign_timestamps_from_policy(self) -> None:
+        target = self.root / "metadata.bin"
+        original = b"a" * (64 * 1024 + 32)
+        atomic_write_bytes(target, original)
+        real_read = os.read
+        touched = False
+
+        def read_and_touch(descriptor: int, size: int) -> bytes:
+            nonlocal touched
+            chunk = real_read(descriptor, size)
+            if chunk and not touched:
+                touched = True
+                metadata = target.stat()
+                os.utime(
+                    target,
+                    ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
+                )
+            return chunk
+
+        with mock.patch(
+            "retrospective_v2.safe_io.os.read",
+            side_effect=read_and_touch,
+        ):
+            self.assertEqual(
+                original,
+                read_bounded_bytes(target, max_bytes=len(original)),
+            )
+
+        policy_changed = False
+
+        def read_and_widen_mode(descriptor: int, size: int) -> bytes:
+            nonlocal policy_changed
+            chunk = real_read(descriptor, size)
+            if chunk and not policy_changed:
+                policy_changed = True
+                os.chmod(target, 0o640)
+            return chunk
+
+        try:
+            with (
+                mock.patch(
+                    "retrospective_v2.safe_io.os.read",
+                    side_effect=read_and_widen_mode,
+                ),
+                self.assertRaisesRegex(UnsafePathError, "file mode must be 0o600"),
+            ):
+                read_bounded_bytes(target, max_bytes=len(original))
+        finally:
+            os.chmod(target, 0o600)
 
 
 class IdentityKeyTests(unittest.TestCase):

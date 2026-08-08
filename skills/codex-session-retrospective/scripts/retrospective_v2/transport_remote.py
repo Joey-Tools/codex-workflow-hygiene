@@ -6,6 +6,7 @@ import argparse
 import codecs
 import os
 import pathlib
+import pwd
 import signal
 import subprocess
 import sys
@@ -27,6 +28,8 @@ REMOTE_HOST_CONTEXT_HELPER_RELATIVE_PATH = pathlib.PurePosixPath(
     ".codex/skills/remote-host-context/scripts/remote_codex_probe.py"
 )
 REMOTE_HOST_CONTEXT_COMMAND_TIMEOUT_SECONDS = 60
+REMOTE_HOST_CONTEXT_FIXED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+REMOTE_HOST_CONTEXT_AUTH_ENVIRONMENT_KEYS = ("SSH_AUTH_SOCK",)
 
 
 def remote_host_context_helper_path() -> pathlib.Path:
@@ -71,11 +74,40 @@ def _remote_host_context_command(
 
 
 def _remote_host_context_environment() -> dict[str, str]:
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if not key.upper().startswith("PYTHON")
+    try:
+        account = pwd.getpwuid(os.getuid())
+    except (KeyError, OSError) as exc:
+        raise RuntimeError("remote-host-context account identity unavailable") from exc
+    if not account.pw_name or not account.pw_dir:
+        raise RuntimeError("remote-host-context account identity unavailable")
+    account_home = pathlib.PurePath(account.pw_dir)
+    if not account_home.is_absolute() or "\x00" in account.pw_dir:
+        raise RuntimeError("remote-host-context account home is invalid")
+
+    environment = {
+        "HOME": account.pw_dir,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "LOGNAME": account.pw_name,
+        "PATH": REMOTE_HOST_CONTEXT_FIXED_PATH,
+        "USER": account.pw_name,
     }
+    for key in REMOTE_HOST_CONTEXT_AUTH_ENVIRONMENT_KEYS:
+        value = os.environ.get(key)
+        if value is None:
+            continue
+        if (
+            not value
+            or "\x00" in value
+            or "\n" in value
+            or "\r" in value
+            or not pathlib.PurePath(value).is_absolute()
+        ):
+            raise RuntimeError(
+                "remote-host-context authentication environment is invalid"
+            )
+        environment[key] = value
+    return environment
 
 
 def _relay_valid_utf8(output: Any) -> None:
@@ -123,15 +155,27 @@ def _relay_remote_host_context_command(
         raise RuntimeError("remote-host-context transport unavailable") from exc
 
     timed_out = False
+    process_group_cleanup_attempted = False
+    process_group_cleanup_lock = threading.Lock()
 
     def terminate_process_group() -> None:
+        nonlocal process_group_cleanup_attempted
+        with process_group_cleanup_lock:
+            if process_group_cleanup_attempted:
+                return
+            process_group_cleanup_attempted = True
         try:
             if os.name == "posix":
                 os.killpg(process.pid, signal.SIGKILL)
-            elif process.poll() is None:
+            else:
                 process.kill()
         except OSError:
             pass
+        if os.name == "posix":
+            try:
+                process.kill()
+            except OSError:
+                pass
 
     def terminate_on_timeout() -> None:
         nonlocal timed_out
@@ -201,6 +245,9 @@ def _relay_remote_host_context_command(
                         "remote-host-context transport exceeded its output envelope"
                     )
                 output.write(filtered)
+            # Close the task-owned group while the unreaped leader still pins
+            # its PID/PGID. Reaping first would open a reuse race.
+            terminate_process_group()
             try:
                 return_code = process.wait(timeout=5)
             except subprocess.TimeoutExpired as exc:
@@ -211,7 +258,6 @@ def _relay_remote_host_context_command(
                 ) from exc
             timer.cancel()
             timer.join(timeout=1)
-            terminate_process_group()
             if timed_out or return_code != 0:
                 raise RuntimeError("remote-host-context transport unavailable")
             if validator is not None:
@@ -230,8 +276,8 @@ def _relay_remote_host_context_command(
     finally:
         timer.cancel()
         timer.join(timeout=1)
-        if process.poll() is None:
-            terminate_process_group()
+        terminate_process_group()
+        if process.returncode is None:
             process.wait()
         if process.stdout is not None:
             process.stdout.close()

@@ -25,6 +25,14 @@ TOPIC_RESULT_SCHEMA = "topic_reduction_result_v2"
 SYNTHESIS_RESULT_SCHEMA = "global_synthesis_result_v2"
 
 MAX_RESULT_BYTES = 64 * 1024
+MAX_RESULT_DEPTH = 24
+MAX_RESULT_NODES = 4_096
+MAX_RESULT_CONTAINER_ITEMS = 256
+MAX_RESULT_KEY_CHARS = 128
+MAX_RESULT_STRING_CHARS = 4_096
+MAX_RESULT_TOTAL_STRING_CHARS = 64 * 1024
+MAX_SOURCE_OVERLAP_ITEMS = 256
+MAX_SOURCE_OVERLAP_CHARS = 512 * 1024
 MAX_GENERALIZED_TEXT_CHARS = 1_200
 MAX_REWRITE_TEXT_CHARS = 2_000
 MAX_TURNS_PER_RESULT = 20
@@ -456,33 +464,84 @@ def _normalized_overlap_text(value: str) -> str:
     return " ".join(value.split()).casefold()
 
 
-def _source_overlap(
-    text: str,
-    candidates: Sequence[str],
-) -> tuple[int, int] | None:
-    normalized_text = _normalized_overlap_text(text)
+_ROLLING_HASH_BASE = 257
+_ROLLING_HASH_MASK = (1 << 64) - 1
+
+
+def _rolling_window_hashes(value: str, width: int) -> Iterable[int]:
+    if len(value) < width:
+        return
+    factor = pow(_ROLLING_HASH_BASE, width - 1, 1 << 64)
+    digest = 0
+    for character in value[:width]:
+        digest = (digest * _ROLLING_HASH_BASE + ord(character)) & _ROLLING_HASH_MASK
+    yield digest
+    for index in range(width, len(value)):
+        digest = (
+            (digest - ord(value[index - width]) * factor) * _ROLLING_HASH_BASE
+            + ord(value[index])
+        ) & _ROLLING_HASH_MASK
+        yield digest
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceOverlapIndex:
+    candidates: tuple[str, ...]
+    six_word_excerpts: frozenset[str]
+    window_hashes: frozenset[int]
+
+
+def _build_source_overlap_index(candidates: Sequence[str]) -> _SourceOverlapIndex:
+    normalized: list[str] = []
+    six_word_excerpts: set[str] = set()
+    window_hashes: set[int] = set()
     for candidate in candidates:
         normalized_candidate = _normalized_overlap_text(candidate)
         if not normalized_candidate or _REDACTION_PLACEHOLDER_RE.fullmatch(
             candidate.strip()
         ):
             continue
+        normalized.append(normalized_candidate)
+        words = normalized_candidate.split()
+        for start in range(max(0, len(words) - 5)):
+            excerpt = " ".join(words[start : start + 6])
+            if len(excerpt) >= 24:
+                six_word_excerpts.add(excerpt)
+        window_hashes.update(_rolling_window_hashes(normalized_candidate, 32))
+    return _SourceOverlapIndex(
+        candidates=tuple(normalized),
+        six_word_excerpts=frozenset(six_word_excerpts),
+        window_hashes=frozenset(window_hashes),
+    )
+
+
+def _source_overlap(
+    text: str,
+    index: _SourceOverlapIndex,
+) -> tuple[int, int] | None:
+    normalized_text = _normalized_overlap_text(text)
+    for normalized_candidate in index.candidates:
         if normalized_candidate == normalized_text:
             return (0, len(text))
-        if len(normalized_candidate) >= 12 and normalized_candidate in normalized_text:
+        if (
+            12 <= len(normalized_candidate) <= len(normalized_text)
+            and normalized_candidate in normalized_text
+        ):
             return (0, len(text))
-        if len(normalized_text) >= 16 and normalized_text in normalized_candidate:
+        if (
+            16 <= len(normalized_text) <= len(normalized_candidate)
+            and normalized_text in normalized_candidate
+        ):
             return (0, len(text))
-        candidate_words = normalized_candidate.split()
-        if len(candidate_words) >= 6:
-            for start in range(len(candidate_words) - 5):
-                excerpt = " ".join(candidate_words[start : start + 6])
-                if len(excerpt) >= 24 and excerpt in normalized_text:
-                    return (0, len(text))
-        if len(normalized_text) >= 32 and len(normalized_candidate) >= 32:
-            for start in range(len(normalized_text) - 31):
-                if normalized_text[start : start + 32] in normalized_candidate:
-                    return (0, len(text))
+    words = normalized_text.split()
+    for start in range(max(0, len(words) - 5)):
+        if " ".join(words[start : start + 6]) in index.six_word_excerpts:
+            return (0, len(text))
+    if any(
+        digest in index.window_hashes
+        for digest in _rolling_window_hashes(normalized_text, 32)
+    ):
+        return (0, len(text))
     return None
 
 
@@ -491,7 +550,32 @@ def _validate_source_texts(values: Sequence[str], *, label: str) -> tuple[str, .
         not isinstance(value, str) for value in values
     ):
         raise _error(label, "must be an array of strings")
-    return tuple(values)
+    normalized = tuple(values)
+    if len(normalized) > MAX_SOURCE_OVERLAP_ITEMS:
+        raise _error(
+            label,
+            f"must contain at most {MAX_SOURCE_OVERLAP_ITEMS} source strings",
+        )
+    if sum(len(value) for value in normalized) > MAX_SOURCE_OVERLAP_CHARS:
+        raise _error(
+            label,
+            f"must contain at most {MAX_SOURCE_OVERLAP_CHARS} source characters",
+        )
+    return normalized
+
+
+def _validate_source_text_groups(
+    original_prompts: Sequence[str],
+    tool_outputs: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    prompts = _validate_source_texts(original_prompts, label="original_prompts")
+    outputs = _validate_source_texts(tool_outputs, label="tool_outputs")
+    if sum(map(len, prompts)) + sum(map(len, outputs)) > MAX_SOURCE_OVERLAP_CHARS:
+        raise _error(
+            "source_overlap",
+            f"must contain at most {MAX_SOURCE_OVERLAP_CHARS} source characters",
+        )
+    return prompts, outputs
 
 
 def _is_ipv6_token(value: str) -> bool:
@@ -531,10 +615,12 @@ def scan_for_leaks(
 ) -> tuple[LeakFinding, ...]:
     """Return deterministic, privacy-safe leak locations without matched text."""
 
-    original_prompts = _validate_source_texts(
-        original_prompts, label="original_prompts"
+    original_prompts, tool_outputs = _validate_source_text_groups(
+        original_prompts,
+        tool_outputs,
     )
-    tool_outputs = _validate_source_texts(tool_outputs, label="tool_outputs")
+    prompt_index = _build_source_overlap_index(original_prompts)
+    tool_index = _build_source_overlap_index(tool_outputs)
     findings: set[LeakFinding] = set()
     for parts, text in _walk_strings(value):
         if not text or _REDACTION_PLACEHOLDER_RE.fullmatch(text.strip()):
@@ -582,10 +668,10 @@ def scan_for_leaks(
             findings.add(
                 LeakFinding("unredactable_secret", path, match.start(), match.end())
             )
-        prompt_overlap = _source_overlap(text, original_prompts)
+        prompt_overlap = _source_overlap(text, prompt_index)
         if prompt_overlap is not None:
             findings.add(LeakFinding("original_prompt", path, *prompt_overlap))
-        tool_overlap = _source_overlap(text, tool_outputs)
+        tool_overlap = _source_overlap(text, tool_index)
         if tool_overlap is not None:
             findings.add(LeakFinding("tool_output", path, *tool_overlap))
     return tuple(sorted(findings))
@@ -602,19 +688,15 @@ def _literal_redaction_pattern(value: str) -> re.Pattern[str] | None:
 def _post_redact_text(
     text: str,
     *,
-    original_prompts: Sequence[str],
-    tool_outputs: Sequence[str],
+    original_prompt_patterns: Sequence[re.Pattern[str]],
+    tool_output_patterns: Sequence[re.Pattern[str]],
     reference_field: bool,
 ) -> str:
     redacted = text
-    for candidate in original_prompts:
-        pattern = _literal_redaction_pattern(candidate)
-        if pattern is not None:
-            redacted = pattern.sub("[REDACTED_ORIGINAL_PROMPT]", redacted)
-    for candidate in tool_outputs:
-        pattern = _literal_redaction_pattern(candidate)
-        if pattern is not None:
-            redacted = pattern.sub("[REDACTED_TOOL_OUTPUT]", redacted)
+    for pattern in original_prompt_patterns:
+        redacted = pattern.sub("[REDACTED_ORIGINAL_PROMPT]", redacted)
+    for pattern in tool_output_patterns:
+        redacted = pattern.sub("[REDACTED_TOOL_OUTPUT]", redacted)
     for _category, pattern, replacement in _SECRET_PATTERNS:
         redacted = pattern.sub(replacement, redacted)
     for pattern in (_EMAIL_RE, _PHONE_RE, _LABELED_PERSONAL_ID_RE):
@@ -660,17 +742,27 @@ def post_redact(
 ) -> Any:
     """Return a deep redacted copy while preserving opaque reference fields."""
 
-    original_prompts = _validate_source_texts(
-        original_prompts, label="original_prompts"
+    original_prompts, tool_outputs = _validate_source_text_groups(
+        original_prompts,
+        tool_outputs,
     )
-    tool_outputs = _validate_source_texts(tool_outputs, label="tool_outputs")
+    original_prompt_patterns = tuple(
+        pattern
+        for value in original_prompts
+        if (pattern := _literal_redaction_pattern(value)) is not None
+    )
+    tool_output_patterns = tuple(
+        pattern
+        for value in tool_outputs
+        if (pattern := _literal_redaction_pattern(value)) is not None
+    )
 
     def redact(child: Any, path: tuple[str | int, ...]) -> Any:
         if isinstance(child, str):
             return _post_redact_text(
                 child,
-                original_prompts=original_prompts,
-                tool_outputs=tool_outputs,
+                original_prompt_patterns=original_prompt_patterns,
+                tool_output_patterns=tool_output_patterns,
                 reference_field=_is_reference_path(path),
             )
         if isinstance(child, Mapping):
@@ -845,6 +937,60 @@ def _require_json_size(
         raise _error(path, f"canonical JSON exceeds {maximum} bytes")
 
 
+def validate_result_envelope(value: Any) -> None:
+    """Reject structurally expensive result trees before privacy processing."""
+
+    stack: list[tuple[Any, int, str]] = [(value, 0, "$")]
+    nodes = 0
+    total_string_chars = 0
+    while stack:
+        child, depth, path = stack.pop()
+        nodes += 1
+        if nodes > MAX_RESULT_NODES:
+            raise _error("$", f"must contain at most {MAX_RESULT_NODES} JSON nodes")
+        if depth > MAX_RESULT_DEPTH:
+            raise _error(path, f"must be at most {MAX_RESULT_DEPTH} levels deep")
+        if isinstance(child, Mapping):
+            if len(child) > MAX_RESULT_CONTAINER_ITEMS:
+                raise _error(
+                    path,
+                    f"must contain at most {MAX_RESULT_CONTAINER_ITEMS} fields",
+                )
+            for key, item in child.items():
+                if not isinstance(key, str) or len(key) > MAX_RESULT_KEY_CHARS:
+                    raise _error(path, "contains an invalid field name")
+                total_string_chars += len(key)
+                stack.append((item, depth + 1, _path(path, key)))
+        elif isinstance(child, list):
+            if len(child) > MAX_RESULT_CONTAINER_ITEMS:
+                raise _error(
+                    path,
+                    f"must contain at most {MAX_RESULT_CONTAINER_ITEMS} items",
+                )
+            for index, item in enumerate(child):
+                stack.append((item, depth + 1, _path(path, index)))
+        elif isinstance(child, str):
+            if len(child) > MAX_RESULT_STRING_CHARS:
+                raise _error(
+                    path,
+                    f"must be at most {MAX_RESULT_STRING_CHARS} characters",
+                )
+            total_string_chars += len(child)
+        elif child is None or isinstance(child, (bool, int)):
+            pass
+        elif isinstance(child, float):
+            if child != child or child in {float("inf"), float("-inf")}:
+                raise _error(path, "must be a finite JSON number")
+        else:
+            raise _error(path, "must contain only JSON values")
+        if total_string_chars > MAX_RESULT_TOTAL_STRING_CHARS:
+            raise _error(
+                "$",
+                f"must contain at most {MAX_RESULT_TOTAL_STRING_CHARS} string characters",
+            )
+    _require_json_size(value, path="$")
+
+
 def canonical_result_hash(value: Mapping[str, Any]) -> str:
     """Return the canonical SHA-256 commitment for one validated result."""
 
@@ -973,6 +1119,7 @@ def _privacy_prepare(
     original_prompts: Sequence[str],
     tool_outputs: Sequence[str],
 ) -> dict[str, Any]:
+    validate_result_envelope(result)
     source = _require_mapping(result, path="$")
     _reject_forbidden_keys(source)
     sanitized = post_redact(
@@ -985,7 +1132,6 @@ def _privacy_prepare(
         first = leaks[0]
         categories = ", ".join(sorted({finding.category for finding in leaks}))
         raise _error(first.path, f"post-redaction leak scan failed ({categories})")
-    _require_json_size(sanitized, path="$")
     return sanitized
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import hashlib
 import io
 import json
 import os
@@ -10,6 +11,8 @@ import stat
 import sys
 import tempfile
 import tracemalloc
+from types import SimpleNamespace
+from typing import Any
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -23,7 +26,12 @@ SCRIPT_PATH = SCRIPTS / "retrospective_v2/transport.py"
 MIGRATION_PROBE_PATH = SCRIPTS / "remote_codex_probe.py"
 
 from retrospective_v2 import transport as MODULE  # noqa: E402
-from retrospective_v2.contracts import session_shards_resume_cursor  # noqa: E402
+from retrospective_v2 import transport_session_shards as SHARDS_MODULE  # noqa: E402
+from retrospective_v2.contracts import (  # noqa: E402
+    SESSION_SHARDS_PREFIX_COMMITMENT_DOMAIN,
+    session_shards_resume_cursor,
+    session_shards_resume_cursor_value,
+)
 
 
 def write_rollout(codex_root: Path, data: bytes) -> str:
@@ -79,6 +87,27 @@ def run_local(
     return returncode, frames, stderr.getvalue()
 
 
+def records_command_args(
+    rollout: str,
+    descriptors: list[dict[str, object]],
+    **overrides: Any,
+) -> argparse.Namespace:
+    meta = frame_of_kind(descriptors, "stream_meta")
+    terminal = frame_of_kind(descriptors, "stream_end")
+    values: dict[str, Any] = {
+        "emit": "records",
+        "byte_start": terminal["byte_start"],
+        "byte_end": terminal["byte_end"],
+        "shard_bytes": meta["shard_bytes"],
+        "max_shards": meta["max_shards"],
+        "source_token": meta["source_token"],
+        "resume_cursor": terminal["records_resume_cursor"],
+        "record_processing_budget_bytes": meta["record_processing_budget_bytes"],
+    }
+    values.update(overrides)
+    return command_args(rollout, **values)
+
+
 def frame_of_kind(frames: list[dict[str, object]], kind: str) -> dict[str, object]:
     return next(frame for frame in frames if frame["kind"] == kind)
 
@@ -112,15 +141,12 @@ class SessionShardsLocalTests(unittest.TestCase):
                 codex_root,
                 command_args(rollout, shard_bytes=len(first)),
             )
-            token = frame_of_kind(descriptors, "stream_meta")["source_token"]
             rc_records, records, records_error = run_local(
                 codex_root,
-                command_args(
+                records_command_args(
                     rollout,
-                    emit="records",
-                    byte_end=len(data),
+                    descriptors,
                     shard_bytes=len(first),
-                    source_token=str(token),
                 ),
             )
 
@@ -141,14 +167,11 @@ class SessionShardsLocalTests(unittest.TestCase):
             codex_root = Path(raw) / ".codex"
             rollout = write_rollout(codex_root, data)
             rc, descriptors, error = run_local(codex_root, command_args(rollout))
-            token = frame_of_kind(descriptors, "stream_meta")["source_token"]
             rc_records, records, records_error = run_local(
                 codex_root,
-                command_args(
+                records_command_args(
                     rollout,
-                    emit="records",
-                    byte_end=len(data),
-                    source_token=str(token),
+                    descriptors,
                 ),
             )
 
@@ -179,15 +202,12 @@ class SessionShardsLocalTests(unittest.TestCase):
             rc, descriptors, error = run_local(
                 codex_root, command_args(rollout, shard_bytes=512)
             )
-            token = frame_of_kind(descriptors, "stream_meta")["source_token"]
             rc_records, records, records_error = run_local(
                 codex_root,
-                command_args(
+                records_command_args(
                     rollout,
-                    emit="records",
-                    byte_end=len(data),
+                    descriptors,
                     shard_bytes=512,
-                    source_token=str(token),
                 ),
             )
 
@@ -233,13 +253,33 @@ class SessionShardsLocalTests(unittest.TestCase):
         self.assertEqual(first_terminal["accounted_record_count"], 2)
         self.assertEqual(first_terminal["next_byte_start"], first_terminal["byte_end"])
         self.assertIsInstance(resume_cursor, str)
+        cursor_value = session_shards_resume_cursor_value(resume_cursor)
         self.assertEqual(
-            session_shards_resume_cursor(
-                str(token),
-                byte_offset=int(first_terminal["next_byte_start"]),
-                next_record_index=int(first_terminal["next_record_start"]),
-            ),
-            resume_cursor,
+            {
+                "cursor_kind": "descriptor_continue",
+                "frozen_byte_end": len(data),
+                "byte_offset": first_terminal["next_byte_start"],
+                "next_record_index": first_terminal["next_record_start"],
+                "source_token": token,
+            },
+            {
+                key: cursor_value[key]
+                for key in (
+                    "cursor_kind",
+                    "frozen_byte_end",
+                    "byte_offset",
+                    "next_record_index",
+                    "source_token",
+                )
+            },
+        )
+        self.assertRegex(str(cursor_value["prefix_commitment"]), r"sha256:[0-9a-f]{64}")
+        self.assertEqual(
+            cursor_value["prefix_commitment"],
+            "sha256:"
+            + hashlib.sha256(
+                SESSION_SHARDS_PREFIX_COMMITMENT_DOMAIN + b"bytes\0" + data
+            ).hexdigest(),
         )
         self.assertEqual(
             first_terminal["next_record_start"], first_terminal["record_end"]
@@ -264,13 +304,152 @@ class SessionShardsLocalTests(unittest.TestCase):
             [(0, 1), (1, 2), (2, 3)],
         )
 
-    def test_max_shards_boundary_does_not_read_the_next_descriptor(self) -> None:
-        first = b"not-json\n"
-        second = (
-            b'{"text":"'
-            + b"x" * (2 * MODULE.SESSION_SHARDS_RECORD_SCAN_CHUNK_BYTES)
-            + b'"}\n'
+    def test_descriptor_pagination_freezes_end_across_append(self) -> None:
+        lines = [b'{"n":1}\n', b'{"n":2}\n', b'{"n":3}\n']
+        frozen = b"".join(lines)
+        appended = b'{"n":4}\n'
+        with tempfile.TemporaryDirectory() as raw:
+            codex_root = Path(raw) / ".codex"
+            rollout = write_rollout(codex_root, frozen)
+            first_rc, first_page, first_error = run_local(
+                codex_root,
+                command_args(rollout, shard_bytes=len(lines[0]), max_shards=1),
+            )
+            first_terminal = frame_of_kind(first_page, "stream_end")
+            token = str(frame_of_kind(first_page, "stream_meta")["source_token"])
+            with (codex_root / rollout).open("ab") as stream:
+                stream.write(appended)
+            records_rc, records, records_error = run_local(
+                codex_root,
+                records_command_args(rollout, first_page),
+            )
+            second_rc, second_page, second_error = run_local(
+                codex_root,
+                command_args(
+                    rollout,
+                    byte_start=int(first_terminal["next_byte_start"]),
+                    shard_bytes=len(lines[0]),
+                    max_shards=8,
+                    source_token=token,
+                    resume_cursor=str(first_terminal["next_resume_cursor"]),
+                ),
+            )
+
+        self.assertEqual((first_rc, first_error), (0, ""))
+        self.assertEqual((records_rc, records_error), (0, ""))
+        self.assertEqual(
+            base64.b64decode(frame_of_kind(records, "record")["record_b64"]),
+            lines[0],
         )
+        self.assertEqual(
+            frame_of_kind(records, "stream_meta")["source_bytes"], len(frozen)
+        )
+        self.assertEqual(
+            frame_of_kind(records, "stream_end")["byte_end"], len(lines[0])
+        )
+        self.assertEqual((second_rc, second_error), (0, ""))
+        self.assertEqual(
+            frame_of_kind(second_page, "stream_meta")["source_bytes"], len(frozen)
+        )
+        terminal = frame_of_kind(second_page, "stream_end")
+        self.assertTrue(terminal["complete"])
+        self.assertEqual(terminal["byte_end"], len(frozen))
+        self.assertEqual(terminal["record_end"], len(lines))
+
+    def test_records_reject_mutation_of_unread_frozen_suffix_between_pages(
+        self,
+    ) -> None:
+        lines = [b'{"n":1}\n', b'{"n":2}\n', b'{"n":3}\n']
+        mutated = b'{"n":9}\n'
+        with tempfile.TemporaryDirectory() as raw:
+            codex_root = Path(raw) / ".codex"
+            rollout = write_rollout(codex_root, b"".join(lines))
+            first_rc, first_page, first_error = run_local(
+                codex_root,
+                command_args(rollout, shard_bytes=len(lines[0]), max_shards=1),
+            )
+            first_terminal = frame_of_kind(first_page, "stream_end")
+            token = str(frame_of_kind(first_page, "stream_meta")["source_token"])
+            with (codex_root / rollout).open("r+b") as stream:
+                stream.seek(len(lines[0]) + len(lines[1]))
+                stream.write(mutated)
+            second_rc, second_page, second_error = run_local(
+                codex_root,
+                command_args(
+                    rollout,
+                    byte_start=int(first_terminal["next_byte_start"]),
+                    shard_bytes=len(lines[0]),
+                    max_shards=8,
+                    source_token=token,
+                    resume_cursor=str(first_terminal["next_resume_cursor"]),
+                ),
+            )
+            records_rc, records, records_error = run_local(
+                codex_root,
+                records_command_args(rollout, second_page),
+            )
+
+        self.assertEqual((first_rc, first_error), (0, ""))
+        self.assertEqual((second_rc, second_error), (0, ""))
+        self.assertEqual((records_rc, records), (1, []))
+        self.assertIn("frozen rollout prefix commitment mismatch", records_error)
+
+    def test_records_verified_spool_contains_only_the_requested_page(self) -> None:
+        lines = [f'{{"n":{index}}}\n'.encode() for index in range(20)]
+        real_temporary_file = SHARDS_MODULE.tempfile.TemporaryFile
+
+        class TrackingFile:
+            def __init__(self, handle: object) -> None:
+                self.handle: Any = handle
+                self.written = 0
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.handle, name)
+
+            def write(self, value: bytes) -> int:
+                self.written += len(value)
+                return self.handle.write(value)
+
+        tracked_spools: list[TrackingFile] = []
+
+        def tracked_temporary_file(*args: object, **kwargs: object) -> TrackingFile:
+            tracked = TrackingFile(real_temporary_file(*args, **kwargs))
+            tracked_spools.append(tracked)
+            return tracked
+
+        with tempfile.TemporaryDirectory() as raw:
+            codex_root = Path(raw) / ".codex"
+            rollout = write_rollout(codex_root, b"".join(lines))
+            descriptor_rc, descriptors, descriptor_error = run_local(
+                codex_root,
+                command_args(
+                    rollout,
+                    shard_bytes=len(lines[0]),
+                    max_shards=1,
+                ),
+            )
+            with mock.patch.object(
+                SHARDS_MODULE.tempfile,
+                "TemporaryFile",
+                side_effect=tracked_temporary_file,
+            ):
+                records_rc, records, records_error = run_local(
+                    codex_root,
+                    records_command_args(rollout, descriptors),
+                )
+
+        self.assertEqual((descriptor_rc, descriptor_error), (0, ""))
+        self.assertEqual((records_rc, records_error), (0, ""))
+        self.assertEqual(len(tracked_spools), 1)
+        self.assertEqual(tracked_spools[0].written, len(lines[0]))
+        self.assertEqual(
+            base64.b64decode(frame_of_kind(records, "record")["record_b64"]),
+            lines[0],
+        )
+
+    def test_descriptor_pagination_has_linear_read_budget(self) -> None:
+        lines = [f'{{"n":"{index:03d}"}}\n'.encode() for index in range(80)]
+        data = b"".join(lines)
         bytes_read = 0
         real_open = MODULE._open_session_shard_source
 
@@ -305,6 +484,86 @@ class SessionShardsLocalTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as raw:
             codex_root = Path(raw) / ".codex"
+            rollout = write_rollout(codex_root, data)
+            byte_start = 0
+            source_token = None
+            resume_cursor = None
+            with mock.patch.object(
+                MODULE,
+                "_open_session_shard_source",
+                side_effect=counted_open,
+            ):
+                for page_number in range(len(lines)):
+                    rc, page, error = run_local(
+                        codex_root,
+                        command_args(
+                            rollout,
+                            byte_start=byte_start,
+                            shard_bytes=len(lines[0]),
+                            max_shards=1,
+                            source_token=source_token,
+                            resume_cursor=resume_cursor,
+                        ),
+                    )
+                    self.assertEqual((rc, error), (0, ""))
+                    terminal = frame_of_kind(page, "stream_end")
+                    if page_number == 0:
+                        source_token = str(
+                            frame_of_kind(page, "stream_meta")["source_token"]
+                        )
+                    if terminal["complete"]:
+                        break
+                    byte_start = int(terminal["next_byte_start"])
+                    resume_cursor = str(terminal["next_resume_cursor"])
+                else:
+                    self.fail("descriptor pagination did not reach its frozen end")
+
+        self.assertEqual(terminal["byte_end"], len(data))
+        self.assertLessEqual(bytes_read, 3 * len(data) + len(lines))
+
+    def test_max_shards_boundary_does_not_read_the_next_descriptor(self) -> None:
+        first = b"not-json\n"
+        second = (
+            b'{"text":"'
+            + b"x" * (2 * MODULE.SESSION_SHARDS_RECORD_SCAN_CHUNK_BYTES)
+            + b'"}\n'
+        )
+        bytes_read = 0
+        descriptor_bytes_read = 0
+        real_open = MODULE._open_session_shard_source
+
+        class CountingHandle:
+            def __init__(self, handle: object) -> None:
+                self.handle = handle
+
+            def __enter__(self) -> CountingHandle:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                del args
+                self.handle.close()
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.handle, name)
+
+            def read(self, size: int = -1) -> bytes:
+                nonlocal bytes_read
+                value = self.handle.read(size)
+                bytes_read += len(value)
+                return value
+
+            def readline(self, size: int = -1) -> bytes:
+                nonlocal bytes_read, descriptor_bytes_read
+                value = self.handle.readline(size)
+                bytes_read += len(value)
+                descriptor_bytes_read += len(value)
+                return value
+
+        def counted_open(*args: object, **kwargs: object) -> CountingHandle:
+            return CountingHandle(real_open(*args, **kwargs))
+
+        with tempfile.TemporaryDirectory() as raw:
+            codex_root = Path(raw) / ".codex"
             rollout = write_rollout(codex_root, first + second)
             with mock.patch.object(
                 MODULE,
@@ -324,7 +583,8 @@ class SessionShardsLocalTests(unittest.TestCase):
         terminal = frame_of_kind(frames, "stream_end")
         self.assertEqual(terminal["reason"], "max_shards")
         self.assertEqual(terminal["next_byte_start"], len(first))
-        self.assertEqual(bytes_read, len(first))
+        self.assertEqual(descriptor_bytes_read, len(first))
+        self.assertEqual(bytes_read, len(first + second) + len(first))
 
     def test_high_page_resume_cursor_does_not_rescan_the_prefix(self) -> None:
         lines = [f'{{"n":"{index:04d}"}}\n'.encode() for index in range(1_100)]
@@ -361,7 +621,7 @@ class SessionShardsLocalTests(unittest.TestCase):
         shard = frame_of_kind(second_page, "shard")
         self.assertEqual((shard["record_start"], shard["record_end"]), (1_024, 1_025))
 
-    def test_resume_cursor_rejects_forgery_offset_mismatch_and_stale_source(
+    def test_resume_cursor_rejects_forgery_offset_mismatch_and_replacement(
         self,
     ) -> None:
         lines = [b'{"n":1}\n', b'{"n":2}\n', b'{"n":3}\n']
@@ -396,7 +656,9 @@ class SessionShardsLocalTests(unittest.TestCase):
                     resume_cursor=cursor,
                 ),
             )
-            (codex_root / rollout).write_bytes(b"".join(lines) + b'{"n":4}\n')
+            replacement = codex_root / f"{rollout}.replacement"
+            replacement.write_bytes(b"".join(lines))
+            os.replace(replacement, codex_root / rollout)
             stale_rc, stale_frames, stale_error = run_local(
                 codex_root,
                 command_args(
@@ -416,28 +678,177 @@ class SessionShardsLocalTests(unittest.TestCase):
         self.assertEqual((stale_rc, stale_frames), (1, []))
         self.assertIn("source token does not match current rollout", stale_error)
 
-    def test_stale_source_token_is_rejected_before_any_frame(self) -> None:
+    def test_records_ignore_append_after_descriptor_freeze(self) -> None:
         data = b'{"n":1}\n'
         with tempfile.TemporaryDirectory() as raw:
             codex_root = Path(raw) / ".codex"
             rollout = write_rollout(codex_root, data)
             rc, descriptors, error = run_local(codex_root, command_args(rollout))
-            token = frame_of_kind(descriptors, "stream_meta")["source_token"]
-            (codex_root / rollout).write_bytes(data + b'{"n":2}\n')
-            stale_rc, stale_frames, stale_error = run_local(
+            with (codex_root / rollout).open("ab") as stream:
+                stream.write(b'{"n":2}\n')
+            records_rc, records, records_error = run_local(
                 codex_root,
-                command_args(
+                records_command_args(
                     rollout,
-                    emit="records",
-                    byte_end=len(data),
-                    source_token=str(token),
+                    descriptors,
                 ),
             )
 
         self.assertEqual((rc, error), (0, ""))
-        self.assertEqual(stale_rc, 1)
-        self.assertEqual(stale_frames, [])
-        self.assertIn("source token does not match current rollout", stale_error)
+        self.assertEqual((records_rc, records_error), (0, ""))
+        record = frame_of_kind(records, "record")
+        self.assertEqual(base64.b64decode(record["record_b64"]), data)
+        self.assertEqual(
+            frame_of_kind(records, "stream_meta")["source_bytes"], len(data)
+        )
+
+    def test_records_reject_same_length_gap_mutation_plus_append_before_any_frame(
+        self,
+    ) -> None:
+        valid = b'{"n":1}\n'
+        invalid = b"{bad-json}\n"
+        mutated = b"{bad-jsom}\n"
+        self.assertEqual(len(mutated), len(invalid))
+        data = valid + invalid
+        with tempfile.TemporaryDirectory() as raw:
+            codex_root = Path(raw) / ".codex"
+            rollout = write_rollout(codex_root, data)
+            rc, descriptors, error = run_local(codex_root, command_args(rollout))
+            with (codex_root / rollout).open("r+b") as stream:
+                stream.seek(len(valid))
+                stream.write(mutated)
+                stream.seek(0, os.SEEK_END)
+                stream.write(b'{"n":2}\n')
+            records_rc, records, records_error = run_local(
+                codex_root,
+                records_command_args(rollout, descriptors),
+            )
+
+        self.assertEqual((rc, error), (0, ""))
+        self.assertEqual((records_rc, records), (1, []))
+        self.assertIn("frozen rollout prefix commitment mismatch", records_error)
+
+    def test_records_reject_os_replace_with_identical_bytes_before_any_frame(
+        self,
+    ) -> None:
+        data = b'{"n":1}\n'
+        with tempfile.TemporaryDirectory() as raw:
+            codex_root = Path(raw) / ".codex"
+            rollout = write_rollout(codex_root, data)
+            rc, descriptors, error = run_local(codex_root, command_args(rollout))
+            replacement = codex_root / f"{rollout}.replacement"
+            replacement.write_bytes(data)
+            os.replace(replacement, codex_root / rollout)
+            records_rc, records, records_error = run_local(
+                codex_root,
+                records_command_args(rollout, descriptors),
+            )
+
+        self.assertEqual((rc, error), (0, ""))
+        self.assertEqual((records_rc, records), (1, []))
+        self.assertIn("source token does not match current rollout", records_error)
+
+    def test_source_identity_binds_policy_generation_and_birthtime(self) -> None:
+        baseline = SimpleNamespace(
+            st_dev=1,
+            st_ino=2,
+            st_mode=stat.S_IFREG | 0o600,
+            st_uid=501,
+            st_gid=20,
+            st_gen=7,
+            st_birthtime=1234.5,
+            st_size=10,
+            st_mtime_ns=11,
+        )
+        append_only = SimpleNamespace(**vars(baseline))
+        append_only.st_size = 20
+        append_only.st_mtime_ns = 12
+        replacement = SimpleNamespace(**vars(baseline))
+        replacement.st_gen = 8
+        replacement.st_birthtime = 1235.5
+        policy_change = SimpleNamespace(**vars(baseline))
+        policy_change.st_mode = stat.S_IFREG | 0o640
+
+        identity = MODULE._session_shards_source_identity(baseline)
+        self.assertEqual(
+            identity,
+            MODULE._session_shards_source_identity(append_only),
+        )
+        self.assertNotEqual(
+            identity,
+            MODULE._session_shards_source_identity(replacement),
+        )
+        self.assertNotEqual(
+            identity,
+            MODULE._session_shards_source_identity(policy_change),
+        )
+
+    def test_records_emit_verified_spool_after_live_source_mutation(self) -> None:
+        first = b'{"n":1}\n'
+        second = b'{"n":2}\n'
+        data = first + second
+        with tempfile.TemporaryDirectory() as raw:
+            codex_root = Path(raw) / ".codex"
+            rollout = write_rollout(codex_root, data)
+            descriptors = list(
+                MODULE._iter_local_session_shard_frames(
+                    codex_root=codex_root,
+                    rollout_relative_path=MODULE.pathlib.PurePosixPath(rollout),
+                    emit="descriptors",
+                    byte_start=0,
+                    byte_end=None,
+                    shard_bytes=512,
+                    max_shards=64,
+                    source_token=None,
+                )
+            )
+            request = records_command_args(rollout, descriptors)
+            stream = MODULE._iter_local_session_shard_frames(
+                codex_root=codex_root,
+                rollout_relative_path=MODULE.pathlib.PurePosixPath(rollout),
+                emit="records",
+                byte_start=request.byte_start,
+                byte_end=request.byte_end,
+                shard_bytes=request.shard_bytes,
+                max_shards=request.max_shards,
+                source_token=request.source_token,
+                resume_cursor=request.resume_cursor,
+                record_processing_budget_bytes=(request.record_processing_budget_bytes),
+            )
+            meta = next(stream)
+            with (codex_root / rollout).open("r+b") as source:
+                source.seek(0)
+                source.write(b'{"n":9}\n')
+                source.seek(0, os.SEEK_END)
+                source.write(b'{"n":3}\n')
+            remaining = list(stream)
+
+        records = [frame for frame in remaining if frame["kind"] == "record"]
+        self.assertEqual(meta["source_bytes"], len(data))
+        self.assertEqual(
+            [base64.b64decode(frame["record_b64"]) for frame in records],
+            [first, second],
+        )
+        self.assertEqual(frame_of_kind(remaining, "stream_end")["byte_end"], len(data))
+
+    def test_old_frozen_end_that_becomes_record_interior_fails_explicitly(
+        self,
+    ) -> None:
+        data = b'{"n":1}'
+        with tempfile.TemporaryDirectory() as raw:
+            codex_root = Path(raw) / ".codex"
+            rollout = write_rollout(codex_root, data)
+            rc, descriptors, error = run_local(codex_root, command_args(rollout))
+            with (codex_root / rollout).open("ab") as source:
+                source.write(b'{"n":2}\n')
+            records_rc, records, records_error = run_local(
+                codex_root,
+                records_command_args(rollout, descriptors),
+            )
+
+        self.assertEqual((rc, error), (0, ""))
+        self.assertEqual((records_rc, records), (1, []))
+        self.assertIn("JSONL record boundary", records_error)
 
     def test_invalid_json_is_a_content_free_gap(self) -> None:
         valid = b'{"n":1}\n'
@@ -449,14 +860,11 @@ class SessionShardsLocalTests(unittest.TestCase):
             codex_root = Path(raw) / ".codex"
             rollout = write_rollout(codex_root, data)
             rc, descriptors, error = run_local(codex_root, command_args(rollout))
-            token = frame_of_kind(descriptors, "stream_meta")["source_token"]
             rc_records, records, records_error = run_local(
                 codex_root,
-                command_args(
+                records_command_args(
                     rollout,
-                    emit="records",
-                    byte_end=len(data),
-                    source_token=str(token),
+                    descriptors,
                 ),
             )
 
@@ -493,12 +901,10 @@ class SessionShardsLocalTests(unittest.TestCase):
             token = frame_of_kind(descriptors, "stream_meta")["source_token"]
             rc_records, records, records_error = run_local(
                 codex_root,
-                command_args(
+                records_command_args(
                     rollout,
-                    emit="records",
-                    byte_end=len(data),
+                    descriptors,
                     shard_bytes=MODULE.MAX_SESSION_SHARD_BYTES,
-                    source_token=str(token),
                 ),
             )
 
@@ -600,14 +1006,20 @@ class SessionShardsLocalTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as raw:
                 codex_root = Path(raw) / ".codex"
                 rollout = write_rollout(codex_root, data)
-                with MODULE._open_session_shard_source(
-                    codex_root,
-                    MODULE.pathlib.PurePosixPath(rollout),
-                ) as handle:
-                    identity = MODULE._session_shards_source_identity(
-                        os.fstat(handle.fileno())
+                descriptors = list(
+                    MODULE._iter_local_session_shard_frames(
+                        codex_root=codex_root,
+                        rollout_relative_path=MODULE.pathlib.PurePosixPath(rollout),
+                        emit="descriptors",
+                        byte_start=0,
+                        byte_end=None,
+                        shard_bytes=MODULE.MAX_SESSION_SHARD_BYTES,
+                        max_shards=64,
+                        source_token=None,
                     )
-                token = MODULE._session_shards_source_token(identity)
+                )
+                meta = frame_of_kind(descriptors, "stream_meta")
+                descriptor_terminal = frame_of_kind(descriptors, "stream_end")
                 tracemalloc.start()
                 try:
                     for frame in MODULE._iter_local_session_shard_frames(
@@ -618,7 +1030,8 @@ class SessionShardsLocalTests(unittest.TestCase):
                         byte_end=len(data),
                         shard_bytes=MODULE.MAX_SESSION_SHARD_BYTES,
                         max_shards=64,
-                        source_token=token,
+                        source_token=str(meta["source_token"]),
+                        resume_cursor=str(descriptor_terminal["records_resume_cursor"]),
                         record_processing_budget_bytes=(
                             MODULE.MIN_SESSION_RECORD_PROCESSING_BUDGET_BYTES
                         ),
@@ -674,21 +1087,28 @@ class SessionShardsLocalTests(unittest.TestCase):
                     record_processing_budget_bytes=budget,
                 ),
             )
-            descriptor_terminal = frame_of_kind(descriptors, "stream_end")
-            token = frame_of_kind(descriptors, "stream_meta")["source_token"]
-            rc_records, records, records_error = run_local(
+            complete_rc, complete_descriptors, complete_error = run_local(
                 codex_root,
                 command_args(
                     rollout,
-                    emit="records",
-                    byte_end=len(data),
                     shard_bytes=32,
-                    source_token=str(token),
+                    max_shards=64,
+                    record_processing_budget_bytes=budget,
+                ),
+            )
+            descriptor_terminal = frame_of_kind(descriptors, "stream_end")
+            rc_records, records, records_error = run_local(
+                codex_root,
+                records_command_args(
+                    rollout,
+                    complete_descriptors,
+                    shard_bytes=32,
                     record_processing_budget_bytes=budget,
                 ),
             )
 
         self.assertEqual((rc, error), (0, ""))
+        self.assertEqual((complete_rc, complete_error), (0, ""))
         descriptor = frame_of_kind(descriptors, "shard")
         self.assertEqual(descriptor["status"], "gap")
         self.assertEqual(descriptor["gap_reason"], "record_processing_budget_exceeded")
@@ -741,14 +1161,11 @@ class SessionShardsLocalTests(unittest.TestCase):
             codex_root = Path(raw) / ".codex"
             rollout = write_rollout(codex_root, data)
             rc, descriptors, error = run_local(codex_root, command_args(rollout))
-            token = str(frame_of_kind(descriptors, "stream_meta")["source_token"])
             rc_records, records, records_error = run_local(
                 codex_root,
-                command_args(
+                records_command_args(
                     rollout,
-                    emit="records",
-                    byte_end=len(data),
-                    source_token=token,
+                    descriptors,
                 ),
             )
 
@@ -796,12 +1213,10 @@ class SessionShardsLocalTests(unittest.TestCase):
                 token = frame_of_kind(descriptors, "stream_meta")["source_token"]
                 exact_rc, exact_frames, exact_error = run_local(
                     codex_root,
-                    command_args(
+                    records_command_args(
                         rollout,
-                        emit="records",
-                        byte_end=len(data),
+                        descriptors,
                         shard_bytes=MODULE.MAX_SESSION_SHARD_BYTES,
-                        source_token=str(token),
                     ),
                 )
                 over_rc, over_frames, over_error = run_local(
@@ -815,13 +1230,11 @@ class SessionShardsLocalTests(unittest.TestCase):
                 )
                 unaligned_rc, unaligned_frames, unaligned_error = run_local(
                     codex_root,
-                    command_args(
+                    records_command_args(
                         rollout,
-                        emit="records",
+                        descriptors,
                         byte_start=1,
-                        byte_end=len(data),
                         shard_bytes=MODULE.MAX_SESSION_SHARD_BYTES,
-                        source_token=str(token),
                     ),
                 )
 
@@ -971,12 +1384,16 @@ class RemoteSessionShardsRelayTests(unittest.TestCase):
             )
         )
         source_token = str(frame_of_kind(descriptors, "stream_meta")["source_token"])
+        records_cursor = str(
+            frame_of_kind(descriptors, "stream_end")["records_resume_cursor"]
+        )
         args = command_args(
             rollout,
             host="remote-a",
             emit="records",
             byte_end=len(data),
             source_token=source_token,
+            resume_cursor=records_cursor,
         )
         records = list(
             MODULE._iter_local_session_shard_frames(
@@ -988,7 +1405,7 @@ class RemoteSessionShardsRelayTests(unittest.TestCase):
                 shard_bytes=args.shard_bytes,
                 max_shards=args.max_shards,
                 source_token=source_token,
-                resume_cursor=None,
+                resume_cursor=records_cursor,
                 record_processing_budget_bytes=(args.record_processing_budget_bytes),
             )
         )
@@ -1058,6 +1475,106 @@ class RemoteSessionShardsRelayTests(unittest.TestCase):
             frame_of_kind(relayed, "stream_end")["conservation_proof"],
         )
 
+    def test_remote_filter_rejects_fragment_record_binding_drift(self) -> None:
+        data = b'{"payload":"' + b"x" * (600 * 1024) + b'"}\n'
+        with tempfile.TemporaryDirectory() as raw:
+            rollout, args, records = self.record_stream(Path(raw) / ".codex", data)
+        fragment_indexes = [
+            index
+            for index, frame in enumerate(records)
+            if frame["kind"] == "record_fragment"
+        ]
+        self.assertGreaterEqual(len(fragment_indexes), 2)
+        second_index = fragment_indexes[1]
+        original = records[second_index]
+        mutations = {
+            "record_byte_start": int(original["record_byte_start"]) + 1,
+            "record_byte_count": int(original["record_byte_count"]) + 1,
+            "record_start": int(original["record_start"]) + 1,
+            "record_end": int(original["record_end"]) + 1,
+            "delimiter_bytes": 2 if original["delimiter_bytes"] != 2 else 1,
+            "record_encoding": "utf8",
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                changed = copy.deepcopy(records)
+                changed[second_index][field] = value
+                with self.assertRaisesRegex(ValueError, "fragments do not conserve"):
+                    self.relay_filter(rollout, args).feed(self.wire(changed))
+
+    def test_remote_filter_validates_descriptor_frozen_cursors(self) -> None:
+        data = b'{"n":1}\n{"n":2}\n'
+        with tempfile.TemporaryDirectory() as raw:
+            codex_root = Path(raw) / ".codex"
+            rollout = write_rollout(codex_root, data)
+            descriptors = list(
+                MODULE._iter_local_session_shard_frames(
+                    codex_root=codex_root,
+                    rollout_relative_path=MODULE.pathlib.PurePosixPath(rollout),
+                    emit="descriptors",
+                    byte_start=0,
+                    byte_end=None,
+                    shard_bytes=len(b'{"n":1}\n'),
+                    max_shards=64,
+                    source_token=None,
+                )
+            )
+        args = command_args(
+            rollout,
+            host="remote-a",
+            shard_bytes=len(b'{"n":1}\n'),
+            max_shards=64,
+        )
+        stream_filter = self.relay_filter(rollout, args)
+        wire = self.wire(descriptors)
+        output = stream_filter.feed(wire) + stream_filter.finish()
+        self.assertEqual(len(output.splitlines()), len(descriptors))
+
+        changed = copy.deepcopy(descriptors)
+        terminal = frame_of_kind(changed, "stream_end")
+        terminal["records_resume_cursor"] = frame_of_kind(changed, "shard")[
+            "resume_cursor"
+        ]
+        with self.assertRaisesRegex(ValueError, "descriptor terminal"):
+            self.relay_filter(rollout, args).feed(self.wire(changed))
+
+    def test_remote_filter_accepts_page_records_cursor_before_frozen_eof(
+        self,
+    ) -> None:
+        line = b'{"n":1}\n'
+        with tempfile.TemporaryDirectory() as raw:
+            codex_root = Path(raw) / ".codex"
+            rollout = write_rollout(codex_root, line + b'{"n":2}\n')
+            descriptors = list(
+                MODULE._iter_local_session_shard_frames(
+                    codex_root=codex_root,
+                    rollout_relative_path=MODULE.pathlib.PurePosixPath(rollout),
+                    emit="descriptors",
+                    byte_start=0,
+                    byte_end=None,
+                    shard_bytes=len(line),
+                    max_shards=1,
+                    source_token=None,
+                )
+            )
+        terminal = frame_of_kind(descriptors, "stream_end")
+        self.assertFalse(terminal["complete"])
+        self.assertEqual(
+            session_shards_resume_cursor_value(terminal["records_resume_cursor"])[
+                "cursor_kind"
+            ],
+            "records",
+        )
+        args = command_args(
+            rollout,
+            host="remote-a",
+            shard_bytes=len(line),
+            max_shards=1,
+        )
+        stream_filter = self.relay_filter(rollout, args)
+        output = stream_filter.feed(self.wire(descriptors)) + stream_filter.finish()
+        self.assertEqual(len(output.splitlines()), len(descriptors))
+
     def test_remote_filter_rejects_cross_host_and_mixed_wrappers(self) -> None:
         data = b'{"n":1}\n'
         with tempfile.TemporaryDirectory() as raw:
@@ -1086,12 +1603,22 @@ class RemoteSessionShardsRelayTests(unittest.TestCase):
 
     def test_remote_record_output_limit_is_derived_from_requested_range(self) -> None:
         rollout = "sessions/2026/07/14/rollout-2026-07-14T10-00-00-small.jsonl"
+        source_token = "session_shards_source_v2:" + "a" * 64
+        resume_cursor = session_shards_resume_cursor(
+            source_token,
+            cursor_kind="records",
+            frozen_byte_end=8,
+            byte_offset=0,
+            next_record_index=0,
+            prefix_commitment="sha256:" + hashlib.sha256(b"fixture").hexdigest(),
+        )
         args = command_args(
             rollout,
             host="remote-a",
             emit="records",
             byte_end=8,
-            source_token="session_shards_source_v1:" + "a" * 64,
+            source_token=source_token,
+            resume_cursor=resume_cursor,
         )
         with mock.patch.object(
             MODULE,
@@ -1149,28 +1676,75 @@ class RemoteSessionShardsRelayTests(unittest.TestCase):
                     resume_cursor=None,
                 )
             )
+            first_terminal = frame_of_kind(descriptors, "stream_end")
             source_token = str(
                 frame_of_kind(descriptors, "stream_meta")["source_token"]
             )
             shards = [frame for frame in descriptors if frame["kind"] == "shard"]
-            records = MODULE._iter_local_session_shard_frames(
-                codex_root=codex_root,
-                rollout_relative_path=MODULE.pathlib.PurePosixPath(rollout),
-                emit="records",
-                byte_start=0,
-                byte_end=len(data),
-                shard_bytes=MODULE.MAX_SESSION_SHARD_BYTES,
-                max_shards=64,
-                source_token=source_token,
-                resume_cursor=None,
+            records = list(
+                MODULE._iter_local_session_shard_frames(
+                    codex_root=codex_root,
+                    rollout_relative_path=MODULE.pathlib.PurePosixPath(rollout),
+                    emit="records",
+                    byte_start=0,
+                    byte_end=int(first_terminal["byte_end"]),
+                    shard_bytes=MODULE.MAX_SESSION_SHARD_BYTES,
+                    max_shards=64,
+                    source_token=source_token,
+                    resume_cursor=str(first_terminal["records_resume_cursor"]),
+                )
+            )
+            second_descriptors = list(
+                MODULE._iter_local_session_shard_frames(
+                    codex_root=codex_root,
+                    rollout_relative_path=MODULE.pathlib.PurePosixPath(rollout),
+                    emit="descriptors",
+                    byte_start=int(first_terminal["next_byte_start"]),
+                    byte_end=None,
+                    shard_bytes=MODULE.MAX_SESSION_SHARD_BYTES,
+                    max_shards=64,
+                    source_token=source_token,
+                    resume_cursor=str(first_terminal["next_resume_cursor"]),
+                )
+            )
+            second_terminal = frame_of_kind(second_descriptors, "stream_end")
+            second_records = list(
+                MODULE._iter_local_session_shard_frames(
+                    codex_root=codex_root,
+                    rollout_relative_path=MODULE.pathlib.PurePosixPath(rollout),
+                    emit="records",
+                    byte_start=int(second_terminal["byte_start"]),
+                    byte_end=int(second_terminal["byte_end"]),
+                    shard_bytes=MODULE.MAX_SESSION_SHARD_BYTES,
+                    max_shards=64,
+                    source_token=source_token,
+                    resume_cursor=str(second_terminal["records_resume_cursor"]),
+                )
             )
 
             self.assertEqual(
-                [MODULE.MAX_SESSION_SHARDS_RECORD_DATA_FRAMES, 1],
+                [MODULE.MAX_SESSION_SHARDS_RECORD_DATA_FRAMES],
                 [frame["record_count"] for frame in shards],
             )
-            with self.assertRaisesRegex(RuntimeError, "data-frame limit"):
-                list(records)
+            self.assertFalse(first_terminal["complete"])
+            self.assertEqual(first_terminal["reason"], "max_record_data_frames")
+            self.assertEqual(
+                MODULE.MAX_SESSION_SHARDS_RECORD_DATA_FRAMES,
+                len([frame for frame in records if frame["kind"] == "record"]),
+            )
+            self.assertTrue(second_terminal["complete"])
+            self.assertEqual(
+                [1],
+                [
+                    frame["record_count"]
+                    for frame in second_descriptors
+                    if frame["kind"] == "shard"
+                ],
+            )
+            self.assertEqual(
+                1,
+                len([frame for frame in second_records if frame["kind"] == "record"]),
+            )
 
 
 class TransportArchitectureAuditTests(unittest.TestCase):

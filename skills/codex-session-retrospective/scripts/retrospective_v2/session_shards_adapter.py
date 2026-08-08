@@ -3,8 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Mapping
 
-from .contracts import SESSION_SHARDS_SCHEMA, SessionShardsRequest
-from .session_shards_relay import MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
+from .contracts import (
+    SESSION_SHARDS_EMPTY_PREFIX_COMMITMENT,
+    SESSION_SHARDS_SCHEMA,
+    SessionShardsRequest,
+    session_shards_resume_cursor_value,
+)
+from .session_shards_relay import (
+    MAX_SESSION_SHARDS_RECORD_DATA_FRAMES,
+    descriptor_data_frames,
+)
 
 
 class SessionShardsAdapterError(ValueError):
@@ -88,6 +96,7 @@ _TERMINAL_FIELDS = frozenset(
         "reason",
         "record_end",
         "record_start",
+        "records_resume_cursor",
         "request_binding",
         "schema",
         "source_token",
@@ -99,10 +108,12 @@ _TERMINAL_FIELDS = frozenset(
 class SessionShardsDescriptorPlan:
     descriptor_request: SessionShardsRequest
     records_request: SessionShardsRequest | None
+    next_descriptor_request: SessionShardsRequest | None
     source_token: str
     source_bytes: int
     shard_count: int
     record_count: int
+    complete: bool
     host: str | None
 
 
@@ -117,6 +128,15 @@ def _exact(frame: Mapping[str, Any], fields: frozenset[str], label: str) -> None
         raise SessionShardsAdapterError(
             f"session-shards {label} violates its closed field schema"
         )
+
+
+def _cursor_value(cursor: object, label: str) -> dict[str, Any]:
+    try:
+        return session_shards_resume_cursor_value(cursor)
+    except ValueError as exc:
+        raise SessionShardsAdapterError(
+            f"session-shards {label} cursor is invalid"
+        ) from exc
 
 
 def _unwrap(
@@ -210,10 +230,33 @@ def descriptor_plan_from_frames(
             "session-shards descriptor stream_meta is not request-bound"
         )
     source_bytes = _integer(first.get("source_bytes"), "source_bytes")
+    stream_record_start = _integer(first.get("record_start"), "record_start")
     next_byte = descriptor_request.byte_start
-    next_record = descriptor_request.record_start
-    first_cursor: str | None = None
+    next_record = stream_record_start
+    if descriptor_request.resume_cursor is None:
+        if stream_record_start != 0:
+            raise SessionShardsAdapterError(
+                "session-shards initial descriptor record coordinate is invalid"
+            )
+        frozen_prefix_commitment: str | None = None
+    else:
+        request_cursor = _cursor_value(
+            descriptor_request.resume_cursor,
+            "descriptor request",
+        )
+        if (
+            request_cursor["cursor_kind"] != "descriptor_continue"
+            or request_cursor["source_token"] != source_token
+            or request_cursor["frozen_byte_end"] != source_bytes
+            or request_cursor["byte_offset"] != descriptor_request.byte_start
+            or request_cursor["next_record_index"] != stream_record_start
+        ):
+            raise SessionShardsAdapterError(
+                "session-shards descriptor request cursor coordinates are invalid"
+            )
+        frozen_prefix_commitment = str(request_cursor["prefix_commitment"])
     shard_count = 0
+    page_data_frames = 0
     terminal: dict[str, Any] | None = None
     for raw_frame in iterator:
         frame, observed_host = _unwrap(
@@ -265,6 +308,7 @@ def descriptor_plan_from_frames(
         record_count = _integer(
             frame.get("record_count"), "descriptor record_count", minimum=1
         )
+        frame_data_frames = descriptor_data_frames(frame)
         cursor = frame.get("resume_cursor")
         if (
             frame.get("schema") != SESSION_SHARDS_SCHEMA
@@ -276,27 +320,34 @@ def descriptor_plan_from_frames(
             or record_start != next_record
             or record_count != record_end - record_start
             or record_count > MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
+            or page_data_frames + frame_data_frames
+            > MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
             or not isinstance(cursor, str)
         ):
             raise SessionShardsAdapterError(
                 "session-shards descriptors are not contiguous and request-bound"
             )
-        cursor_token, cursor_byte, cursor_record = (
-            SessionShardsRequest._resume_coordinates(cursor)
-        )
+        cursor_value = _cursor_value(cursor, "descriptor continuation")
         if (
-            cursor_token != source_token
-            or cursor_byte != byte_start
-            or cursor_record != record_start
+            cursor_value["cursor_kind"] != "descriptor_continue"
+            or cursor_value["source_token"] != source_token
+            or cursor_value["frozen_byte_end"] != source_bytes
+            or cursor_value["byte_offset"] != byte_start
+            or cursor_value["next_record_index"] != record_start
+            or (
+                frozen_prefix_commitment is not None
+                and cursor_value["prefix_commitment"] != frozen_prefix_commitment
+            )
         ):
             raise SessionShardsAdapterError(
                 "session-shards descriptor cursor coordinates are invalid"
             )
-        if first_cursor is None:
-            first_cursor = cursor
+        if frozen_prefix_commitment is None:
+            frozen_prefix_commitment = str(cursor_value["prefix_commitment"])
         next_byte = byte_end
         next_record = record_end
         shard_count += 1
+        page_data_frames += frame_data_frames
     if terminal is None:
         raise SessionShardsAdapterError("session-shards descriptor stream is truncated")
     try:
@@ -307,33 +358,99 @@ def descriptor_plan_from_frames(
         raise SessionShardsAdapterError(
             "session-shards descriptor stream contains data after terminal"
         )
+    complete = terminal.get("complete")
+    if not isinstance(complete, bool):
+        raise SessionShardsAdapterError(
+            "session-shards descriptor terminal completion is invalid"
+        )
     if (
         terminal.get("schema") != SESSION_SHARDS_SCHEMA
         or terminal.get("mode") != "descriptors"
         or terminal.get("source_token") != source_token
         or terminal.get("request_binding") != descriptor_request.request_binding
-        or terminal.get("complete") is not True
-        or terminal.get("reason") != "eof"
         or terminal.get("emitted_shards") != shard_count
         or terminal.get("byte_start") != descriptor_request.byte_start
         or terminal.get("byte_end") != next_byte
         or terminal.get("record_start") != descriptor_request.record_start
         or terminal.get("record_end") != next_record
-        or terminal.get("next_byte_start") is not None
-        or terminal.get("next_record_start") is not None
-        or terminal.get("next_resume_cursor") is not None
         or terminal.get("accounted_byte_count")
         != next_byte - descriptor_request.byte_start
         or terminal.get("accounted_record_count")
         != next_record - descriptor_request.record_start
-        or next_byte != source_bytes
     ):
         raise SessionShardsAdapterError(
-            "session-shards descriptor terminal does not prove authoritative EOF"
+            "session-shards descriptor terminal does not conserve its page"
+        )
+    if frozen_prefix_commitment is None:
+        if source_bytes != descriptor_request.byte_start:
+            raise SessionShardsAdapterError(
+                "session-shards descriptor stream omitted its frozen commitment"
+            )
+        frozen_prefix_commitment = SESSION_SHARDS_EMPTY_PREFIX_COMMITMENT
+    records_cursor = _cursor_value(
+        terminal.get("records_resume_cursor"),
+        "records resume",
+    )
+    if (
+        records_cursor["cursor_kind"] != "records"
+        or records_cursor["source_token"] != source_token
+        or records_cursor["frozen_byte_end"] != source_bytes
+        or records_cursor["byte_offset"] != descriptor_request.byte_start
+        or records_cursor["next_record_index"] != descriptor_request.record_start
+        or records_cursor["prefix_commitment"] != frozen_prefix_commitment
+    ):
+        raise SessionShardsAdapterError(
+            "session-shards records cursor does not bind the frozen source"
+        )
+    next_descriptor_request = None
+    if complete:
+        if (
+            terminal.get("reason") != "eof"
+            or terminal.get("next_byte_start") is not None
+            or terminal.get("next_record_start") is not None
+            or terminal.get("next_resume_cursor") is not None
+            or next_byte != source_bytes
+        ):
+            raise SessionShardsAdapterError(
+                "session-shards descriptor terminal does not prove authoritative EOF"
+            )
+    else:
+        reason = terminal.get("reason")
+        next_cursor = _cursor_value(
+            terminal.get("next_resume_cursor"),
+            "descriptor continuation",
+        )
+        if (
+            reason not in {"max_shards", "max_record_data_frames"}
+            or (reason == "max_shards" and shard_count != descriptor_request.max_shards)
+            or not shard_count
+            or terminal.get("next_byte_start") != next_byte
+            or terminal.get("next_record_start") != next_record
+            or next_cursor["cursor_kind"] != "descriptor_continue"
+            or next_cursor["source_token"] != source_token
+            or next_cursor["frozen_byte_end"] != source_bytes
+            or next_cursor["byte_offset"] != next_byte
+            or next_cursor["next_record_index"] != next_record
+            or next_cursor["prefix_commitment"] != frozen_prefix_commitment
+        ):
+            raise SessionShardsAdapterError(
+                "session-shards descriptor continuation is invalid"
+            )
+        next_descriptor_request = SessionShardsRequest(
+            rollout=rollout,
+            mode="descriptors",
+            source_token=source_token,
+            byte_start=next_byte,
+            byte_end=None,
+            shard_bytes=descriptor_request.shard_bytes,
+            max_shards=descriptor_request.max_shards,
+            record_processing_budget_bytes=(
+                descriptor_request.record_processing_budget_bytes
+            ),
+            resume_cursor=str(terminal["next_resume_cursor"]),
         )
     records_request = None
     if shard_count:
-        assert first_cursor is not None
         records_request = SessionShardsRequest(
             rollout=rollout,
             mode="records",
@@ -345,15 +462,17 @@ def descriptor_plan_from_frames(
             record_processing_budget_bytes=(
                 descriptor_request.record_processing_budget_bytes
             ),
-            resume_cursor=first_cursor,
+            resume_cursor=str(terminal["records_resume_cursor"]),
         )
     return SessionShardsDescriptorPlan(
         descriptor_request=descriptor_request,
         records_request=records_request,
+        next_descriptor_request=next_descriptor_request,
         source_token=source_token,
         source_bytes=source_bytes,
         shard_count=shard_count,
         record_count=next_record - descriptor_request.record_start,
+        complete=complete,
         host=wrapper_host,
     )
 

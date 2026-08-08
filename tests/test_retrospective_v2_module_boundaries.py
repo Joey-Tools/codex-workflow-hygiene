@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "codex-session-retrospective" / "scripts"
 PACKAGE = SCRIPTS / "retrospective_v2"
 PUBLIC_CLI = SCRIPTS / "session_retrospective_v2.py"
+TRANSCRIPT_ADAPTER = SCRIPTS / "session_retrospective_v2_transcript.py"
 sys.path.insert(0, str(SCRIPTS))
 
 from retrospective_v2 import (  # noqa: E402
@@ -238,7 +239,13 @@ ORCHESTRATOR_FOUNDATION_MODULES = {
     "orchestrator_transport.py",
 }
 
-ORCHESTRATOR_MODULES = ORCHESTRATOR_OPERATION_MODULES | ORCHESTRATOR_FOUNDATION_MODULES
+ORCHESTRATOR_SOURCE_SUPPORT_MODULES = {"orchestrator_source_segments.py"}
+
+ORCHESTRATOR_MODULES = (
+    ORCHESTRATOR_OPERATION_MODULES
+    | ORCHESTRATOR_FOUNDATION_MODULES
+    | ORCHESTRATOR_SOURCE_SUPPORT_MODULES
+)
 
 PUBLICATION_MODULES = {
     "publication_contracts.py",
@@ -258,14 +265,16 @@ TRANSPORT_MODULES = {
     "transport_paths.py",
     "transport_program.py",
     "transport_remote.py",
+    "transport_resume.py",
     "transport_session_shards.py",
+    "transport_snapshot.py",
     "transport_source.py",
     "transport_worker.py",
 }
 
 BOUNDED_MODULE_LINES = {
     "finalize.py": 120,
-    "authority.py": 3_200,
+    "authority.py": 3_250,
     "orchestrator.py": 720,
     "orchestrator_components.py": 250,
     "orchestrator_context.py": 180,
@@ -276,6 +285,7 @@ BOUNDED_MODULE_LINES = {
     "orchestrator_reduction.py": 2_400,
     "orchestrator_scheduler.py": 1_000,
     "orchestrator_source.py": 2_100,
+    "orchestrator_source_segments.py": 150,
     "orchestrator_core.py": 250,
     "orchestrator_protocols.py": 450,
     "orchestrator_support.py": 600,
@@ -289,23 +299,25 @@ BOUNDED_MODULE_LINES = {
     "publication_support.py": 1_300,
     "publication_transaction.py": 2_100,
     "reporting.py": 4_500,
-    "result_validation.py": 3_000,
+    "result_validation.py": 3_200,
     "transport.py": 250,
     "transport_auth.py": 200,
-    "transport_capture.py": 800,
-    "transport_contracts.py": 900,
+    "transport_capture.py": 1_000,
+    "transport_contracts.py": 1_000,
     "transport_paths.py": 100,
     "transport_program.py": 400,
     "transport_remote.py": 300,
-    "transport_session_shards.py": 1_500,
-    "transport_source.py": 1_650,
+    "transport_resume.py": 200,
+    "transport_session_shards.py": 1_650,
+    "transport_snapshot.py": 200,
+    "transport_source.py": 1_700,
     "transport_worker.py": 40,
 }
 
 TARGETED_FUNCTION_LINES = {
     **{name: 300 for name in PUBLICATION_MODULES},
     **{name: 300 for name in TRANSPORT_MODULES},
-    "transport_session_shards.py": 320,
+    "transport_session_shards.py": 450,
     "transport_source.py": 500,
 }
 
@@ -892,7 +904,7 @@ spec.loader.exec_module(module)
                 len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
                 for name in TRANSPORT_MODULES
             ),
-            6_000,
+            6_700,
         )
         self.assertLessEqual(
             sum(
@@ -909,8 +921,22 @@ spec.loader.exec_module(module)
             2_300,
         )
         self.assertLessEqual(
+            sum(
+                len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
+                for name in {
+                    "orchestrator_source.py",
+                    *ORCHESTRATOR_SOURCE_SUPPORT_MODULES,
+                }
+            ),
+            2_250,
+        )
+        self.assertLessEqual(
             len((SCRIPTS / "session_retrospective_v2.py").read_text().splitlines()),
-            1_900,
+            1_950,
+        )
+        self.assertLessEqual(
+            len(TRANSCRIPT_ADAPTER.read_text(encoding="utf-8").splitlines()),
+            250,
         )
         for path in paths:
             with self.subTest(module=path.name):
@@ -972,7 +998,7 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertLessEqual(branch_total, 7_100)
+        self.assertLessEqual(branch_total, 7_350)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)
 
@@ -1012,7 +1038,7 @@ spec.loader.exec_module(module)
         manifest = tuple(transport.SOURCE_TRANSPORT_WORKER_MODULE_MANIFEST)
         self.assertEqual(manifest, transport.SOURCE_TRANSPORT_PROGRAM_MODULE_ALLOWLIST)
         self.assertEqual(len(manifest), len(set(manifest)))
-        self.assertLessEqual(len(manifest), 10)
+        self.assertLessEqual(len(manifest), 12)
         self.assertNotIn("reporting.py", manifest)
         self.assertFalse(set(manifest) & PUBLICATION_MODULES)
         self.assertFalse(set(manifest) & ORCHESTRATOR_MODULES)

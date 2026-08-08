@@ -230,10 +230,10 @@ def _python_runtime_authority() -> dict[str, JsonValue]:
 
 def _program_snapshot_protocol():
     try:
-        from . import transport_source
+        from . import transport_snapshot
     except ImportError:
-        import transport_source  # type: ignore[no-redef]
-    return transport_source
+        import transport_snapshot  # type: ignore[no-redef]
+    return transport_snapshot
 
 
 def _program_snapshot_python_flags() -> tuple[str, ...]:

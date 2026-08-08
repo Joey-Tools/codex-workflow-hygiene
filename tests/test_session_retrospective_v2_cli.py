@@ -28,6 +28,7 @@ from retrospective_v2.contracts import (  # noqa: E402
 )
 from retrospective_v2.identity import IdentityKey  # noqa: E402
 from retrospective_v2.orchestrator import RetrospectiveOrchestrator  # noqa: E402
+from retrospective_v2 import orchestrator_lifecycle  # noqa: E402
 from retrospective_v2 import reporting  # noqa: E402
 from retrospective_v2 import safe_io  # noqa: E402
 from tests.test_retrospective_v2_orchestrator import (  # noqa: E402
@@ -210,6 +211,8 @@ class CliContractTests(unittest.TestCase):
         run_dir: Path,
         *,
         activity: bool,
+        raw_retention_days: int = 7,
+        working_retention_days: int = 7,
     ) -> RetrospectiveOrchestrator:
         coordinator = RetrospectiveOrchestrator(
             run_dir,
@@ -225,6 +228,8 @@ class CliContractTests(unittest.TestCase):
             history_repo=self.history_repo,
             history_target_ref="refs/heads/main",
             created_at=self.created_at,
+            raw_retention_days=raw_retention_days,
+            working_retention_days=working_retention_days,
         )
         payload = b'{"timestamp":"2026-07-06T01:00:00Z","text":"work"}\n'
         for _ in range(32):
@@ -429,6 +434,29 @@ class CliContractTests(unittest.TestCase):
                 installed_commit="a" * 40,
                 automation_root=automation_root,
             )
+
+        daily_id = "daily-session-retrospective"
+        for token in (
+            "--host local",
+            "--backfill-of run_ref_v2:" + "a" * 64,
+            "--controlled-gap-receipt controlled_gap_ref_v2:" + "b" * 64,
+        ):
+            with self.subTest(token=token):
+                record = self.write_automation_record(
+                    daily_id,
+                    authority.STABLE_AUTOMATION_MODES[daily_id],
+                    prompt_suffix=f" Use {token}.",
+                )
+                with self.assertRaisesRegex(
+                    authority.AutomationCutoverBlocked,
+                    "not an active v2 production coordinator",
+                ):
+                    authority._validate_installed_automation(
+                        daily_id,
+                        automation_root=automation_root,
+                        cli_path=authority.installed_v2_cli_path(),
+                    )
+                self.assertTrue(record.is_file())
 
     def test_cutover_authority_rejects_opaque_or_tampered_controller_evidence(
         self,
@@ -1011,6 +1039,78 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual("standalone", descriptor["publication_role"])
         self.assertEqual(result.result["bundle_digest"], descriptor["bundle_digest"])
 
+    def test_export_rejects_run_policy_deadline_before_staging(self) -> None:
+        coordinator = self.real_coordinator(
+            self.run_dir,
+            activity=False,
+            raw_retention_days=1,
+            working_retention_days=1,
+        )
+        self.assertEqual(RunStage.EXPORT.value, coordinator.status()["stage"])
+        output = self.root / ".codex-local" / "exports" / "invalid-deadline"
+        requested = (
+            (
+                dt.datetime.fromisoformat(self.created_at.removesuffix("Z") + "+00:00")
+                + dt.timedelta(days=2)
+            )
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+        result = self.parse_dispatch(
+            "export",
+            "--identity-path",
+            str(self.identity_path),
+            "--require-existing-identity",
+            "--run-dir",
+            str(self.run_dir),
+            "--output",
+            str(output),
+            "--retention-deadline",
+            requested,
+        )
+
+        self.assertEqual(cli.ExitCode.INVALID_INPUT, result.exit_code)
+        self.assertFalse(output.exists())
+        self.assertFalse((self.run_dir / cli.EXPORT_DESCRIPTOR_NAME).exists())
+
+    def test_export_retry_reuses_staged_retention_deadline(self) -> None:
+        coordinator = self.real_coordinator(self.run_dir, activity=False)
+        self.assertEqual(RunStage.EXPORT.value, coordinator.status()["stage"])
+        output = self.root / ".codex-local" / "exports" / "retry-deadline"
+        arguments = (
+            "export",
+            "--identity-path",
+            str(self.identity_path),
+            "--require-existing-identity",
+            "--run-dir",
+            str(self.run_dir),
+            "--output",
+            str(output),
+        )
+
+        with mock.patch.object(
+            orchestrator_lifecycle.RunLifecycleOperations,
+            "mark_shadow_exported",
+            side_effect=cli.orchestrator_api.InvalidTransitionError(
+                "simulated post-staging interruption"
+            ),
+        ):
+            interrupted = self.parse_dispatch(*arguments)
+
+        self.assertEqual(cli.ExitCode.INVALID_STATE, interrupted.exit_code)
+        descriptor_path = self.run_dir / cli.EXPORT_DESCRIPTOR_NAME
+        first_descriptor = json.loads(descriptor_path.read_text(encoding="ascii"))
+        retried = self.parse_dispatch(*arguments)
+
+        self.assertTrue(retried.ok, retried)
+        second_descriptor = json.loads(descriptor_path.read_text(encoding="ascii"))
+        self.assertEqual(first_descriptor, second_descriptor)
+        self.assertEqual(
+            first_descriptor["retention_deadline"],
+            retried.result["retention_deadline"],
+        )
+
     def test_export_does_not_run_implicit_gc_before_run_validation(self) -> None:
         output_parent = self.root / "retained-exports"
         output_parent.mkdir(mode=0o700)
@@ -1123,6 +1223,82 @@ class CliContractTests(unittest.TestCase):
             trend["normalized_changes"]["reason"],
         )
 
+    def test_export_cli_anchors_now_after_retention_deadline_selection(self) -> None:
+        self.real_coordinator(self.run_dir, activity=False)
+        output = self.root / ".codex-local" / "exports" / "clock-boundary"
+        before_boundary = dt.datetime(
+            2026,
+            8,
+            8,
+            12,
+            0,
+            0,
+            999_000,
+            tzinfo=dt.timezone.utc,
+        )
+        after_boundary = dt.datetime(
+            2026,
+            8,
+            8,
+            12,
+            0,
+            1,
+            tzinfo=dt.timezone.utc,
+        )
+        deadline = after_boundary + dt.timedelta(hours=72)
+        deadline_text = deadline.isoformat().replace("+00:00", "Z")
+        deadline_selected = False
+
+        class BoundaryClock(dt.datetime):
+            @classmethod
+            def now(cls, tz: dt.tzinfo | None = None) -> dt.datetime:
+                instant = after_boundary if deadline_selected else before_boundary
+                return instant if tz is not None else instant.replace(tzinfo=None)
+
+        fake_dt = mock.Mock(wraps=dt)
+        fake_dt.datetime = BoundaryClock
+
+        def select_deadline(_orchestrator: object) -> str:
+            nonlocal deadline_selected
+            deadline_selected = True
+            return deadline_text
+
+        with (
+            mock.patch.object(cli, "dt", fake_dt),
+            mock.patch.object(
+                cli.orchestrator_api.RetrospectiveOrchestrator,
+                "export_retention_deadline",
+                select_deadline,
+            ),
+            mock.patch.object(
+                cli.orchestrator_api.RetrospectiveOrchestrator,
+                "validate_export_retention_deadline",
+                lambda _orchestrator, value: value,
+            ),
+        ):
+            result = self.parse_dispatch(
+                "export",
+                "--identity-path",
+                str(self.identity_path),
+                "--require-existing-identity",
+                "--run-dir",
+                str(self.run_dir),
+                "--output",
+                str(output),
+            )
+
+        self.assertTrue(result.ok, result)
+        retention = json.loads(
+            (output.parent / f".{output.name}.retention-v2.json").read_text(
+                encoding="ascii"
+            )
+        )
+        self.assertEqual(deadline_text, retention["retention_deadline"])
+        self.assertEqual(
+            after_boundary.isoformat().replace("+00:00", "Z"),
+            retention["exported_at"],
+        )
+
     def test_export_cli_loads_prior_period_from_authenticated_history(self) -> None:
         coordinator = self.real_coordinator(self.run_dir, activity=False)
         state = coordinator.load_state()
@@ -1200,6 +1376,13 @@ class CliContractTests(unittest.TestCase):
             ),
             ("invalid_root_type", "invalid_root_type", b"[]"),
             ("malformed_json", "malformed_json", b"{"),
+            (
+                "excessive_nesting",
+                "malformed_json",
+                b"[" * (cli.MAX_AGENT_RESULT_JSON_DEPTH + 1)
+                + b"0"
+                + b"]" * (cli.MAX_AGENT_RESULT_JSON_DEPTH + 1),
+            ),
             ("nonfinite_overflow", "malformed_json", b'{"value":1e999}'),
             (
                 "oversized_integer",

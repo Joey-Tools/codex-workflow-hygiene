@@ -37,6 +37,7 @@ SESSION_SHARDS_PROTOCOL_FEATURES = (
     "request_binding_v1",
     "resume_cursor_v1",
     "record_data_frame_limit_v1",
+    "descriptor_page_frame_limit_v1",
 )
 SOURCE_TRANSPORT_MAX_RECORDS = 100_000
 SOURCE_TRANSPORT_MAX_SOURCE_BYTES = 256 * 1024 * 1024
@@ -390,7 +391,7 @@ class _SessionShardStreamConsumer:
         self.source_ref = source_ref
         self.request = restored_request
         self.limits = limits
-        self.records = tuple(
+        all_records = tuple(
             sorted(
                 (
                     record
@@ -405,14 +406,22 @@ class _SessionShardStreamConsumer:
                 ),
             )
         )
-        if not self.records:
+        if not all_records:
             raise InvalidInputError("session-shards stream has no catalog records")
+        assert restored_request.byte_end is not None
+        self.records = tuple(
+            record
+            for record in all_records
+            if record.coordinate.byte_start >= restored_request.byte_start
+            and record.coordinate.byte_end <= restored_request.byte_end
+        )
         if (
-            restored_request.byte_start != self.records[0].coordinate.byte_start
+            not self.records
+            or restored_request.byte_start != self.records[0].coordinate.byte_start
             or restored_request.byte_end != self.records[-1].coordinate.byte_end
         ):
             raise InvalidInputError(
-                "session-shards request does not match catalog coordinates"
+                "session-shards request does not match a closed catalog range"
             )
         for previous, current in zip(self.records, self.records[1:]):
             if previous.coordinate.byte_end != current.coordinate.byte_start:
@@ -433,6 +442,7 @@ class _SessionShardStreamConsumer:
         self.emitted_record_bytes = 0
         self.emitted_gap_bytes = 0
         self.emitted_fragment_bytes = 0
+        self.data_frames = 0
         self.accounting_hasher = hashlib.sha256()
 
     def _check_frame_bound(self, frame: Mapping[str, Any]) -> None:
@@ -469,15 +479,23 @@ class _SessionShardStreamConsumer:
         if self.terminal_seen:
             raise InvalidInputError("session-shards data follows stream_end")
         if kind == "record":
+            self._accept_data_frame()
             self._accept_record(frame)
         elif kind == "record_fragment":
+            self._accept_data_frame()
             self._accept_fragment(frame)
         elif kind == "gap":
+            self._accept_data_frame()
             self._accept_gap(frame)
         elif kind == "stream_end":
             self._accept_terminal(frame)
         else:
             raise InvalidInputError("session-shards frame kind is not supported")
+
+    def _accept_data_frame(self) -> None:
+        if self.data_frames >= MAX_SESSION_SHARDS_RECORD_DATA_FRAMES:
+            raise InvalidInputError("session-shards record data-frame limit exceeded")
+        self.data_frames += 1
 
     def _accept_meta(self, frame: Mapping[str, Any]) -> None:
         if self.meta is not None or self.terminal_seen:

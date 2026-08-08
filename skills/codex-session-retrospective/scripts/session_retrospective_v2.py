@@ -32,15 +32,17 @@ from retrospective_v2 import finalize as finalize_api  # noqa: E402
 from retrospective_v2 import identity as identity_api  # noqa: E402
 from retrospective_v2 import orchestrator as orchestrator_api  # noqa: E402
 from retrospective_v2 import reporting as reporting_api  # noqa: E402
+from retrospective_v2 import result_validation as result_validation_api  # noqa: E402
 from retrospective_v2 import safe_io  # noqa: E402
-from retrospective_v2 import session_shards_adapter as shards_adapter  # noqa: E402
+import session_retrospective_v2_transcript as transcript_api  # noqa: E402
 
 
 CLI_SCHEMA = "cli_result_v2"
 EXPORT_DESCRIPTOR_SCHEMA = "cli_export_descriptor_v2"
 EXPORT_DESCRIPTOR_NAME = "cli-export-v2.json"
 PUBLICATION_JOURNAL_NAME = "publication-transaction-v2.json"
-MAX_AGENT_RESULT_BYTES = 8 * 1024 * 1024
+MAX_AGENT_RESULT_BYTES = result_validation_api.MAX_RESULT_BYTES
+MAX_AGENT_RESULT_JSON_DEPTH = result_validation_api.MAX_RESULT_DEPTH
 MAX_DESCRIPTOR_BYTES = 64 * 1024
 MAX_DIAGNOSTIC_BYTES = 256
 MAX_SESSION_SHARDS_STREAM_BYTES = 384 * 1024 * 1024
@@ -500,6 +502,29 @@ class _BoundAgentResultDecodeError(ValueError):
         self.reason = reason
 
 
+def _validate_bound_agent_result_nesting(data: bytes) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in data:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in {0x5B, 0x7B}:
+            depth += 1
+            if depth > MAX_AGENT_RESULT_JSON_DEPTH:
+                raise _BoundAgentResultDecodeError("malformed_json")
+        elif byte in {0x5D, 0x7D}:
+            depth -= 1
+
+
 def _decode_bound_agent_result(data: bytes) -> dict[str, Any]:
     def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -529,6 +554,7 @@ def _decode_bound_agent_result(data: bytes) -> dict[str, Any]:
             raise _BoundAgentResultDecodeError("malformed_json")
         return parsed
 
+    _validate_bound_agent_result_nesting(data)
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -1001,77 +1027,63 @@ def _session_shard_transcript(
     path: Path,
     *,
     expected_host: str,
-) -> tuple[Iterable[Mapping[str, Any]], contract_api.SessionShardsRequest]:
-    def descriptor_plan(
-        frames: Iterable[Mapping[str, Any]],
-    ) -> shards_adapter.SessionShardsDescriptorPlan:
-        descriptors: list[dict[str, Any]] = []
-        for frame in frames:
-            descriptors.append(dict(frame))
-            if frame.get("kind") == "stream_end":
-                break
-        return shards_adapter.descriptor_plan_from_frames(
-            descriptors,
+) -> Iterable[tuple[Iterable[Mapping[str, Any]], contract_api.SessionShardsRequest]]:
+    try:
+        segments = transcript_api.session_shard_transcript(
+            lambda: _iter_transport_frames(str(path)),
             expected_host=expected_host,
         )
+    except transcript_api.SessionShardsTranscriptError as error:
+        raise _session_shards_transcript_cli_error(error) from error
 
-    frames = iter(_iter_transport_frames(str(path)))
-    try:
-        plan = descriptor_plan(frames)
-    except shards_adapter.SessionShardsAdapterError as error:
-        raise CliContractError(
+    def translated_segments() -> Iterable[
+        tuple[Iterable[Mapping[str, Any]], contract_api.SessionShardsRequest]
+    ]:
+        try:
+            for frames, request in segments:
+
+                def translated_frames(
+                    source: Iterable[Mapping[str, Any]] = frames,
+                ) -> Iterable[Mapping[str, Any]]:
+                    try:
+                        yield from source
+                    except transcript_api.SessionShardsTranscriptError as error:
+                        close = getattr(segments, "close", None)
+                        if callable(close):
+                            close()
+                        raise _session_shards_transcript_cli_error(error) from error
+
+                yield translated_frames(), request
+        except transcript_api.SessionShardsTranscriptError as error:
+            raise _session_shards_transcript_cli_error(error) from error
+        finally:
+            close = getattr(segments, "close", None)
+            if callable(close):
+                close()
+
+    return translated_segments()
+
+
+def _session_shards_transcript_cli_error(
+    error: transcript_api.SessionShardsTranscriptError,
+) -> CliContractError:
+    if error.stage == "descriptors":
+        return CliContractError(
             exit_code=ExitCode.INVALID_INPUT,
             code="invalid_session_shards_descriptors",
             message="session-shards descriptors do not prove a complete source",
-        ) from error
-    finally:
-        close = getattr(frames, "close", None)
-        if callable(close):
-            close()
-    if plan.records_request is None:
-        raise CliContractError(
+        )
+    if error.stage == "empty":
+        return CliContractError(
             exit_code=ExitCode.INVALID_INPUT,
             code="empty_session_shards_materialization",
             message="session-shards input has no materialized records",
         )
-
-    def record_frames() -> Iterable[Mapping[str, Any]]:
-        replay_frames = iter(_iter_transport_frames(str(path)))
-        try:
-            try:
-                replay_plan = descriptor_plan(replay_frames)
-            except shards_adapter.SessionShardsAdapterError as error:
-                raise CliContractError(
-                    exit_code=ExitCode.CONFLICT,
-                    code="session_shards_transcript_changed",
-                    message="session-shards transcript changed after validation",
-                    retryable=True,
-                ) from error
-            if replay_plan != plan:
-                raise CliContractError(
-                    exit_code=ExitCode.CONFLICT,
-                    code="session_shards_transcript_changed",
-                    message="session-shards transcript changed after validation",
-                    retryable=True,
-                )
-            try:
-                yield from shards_adapter.normalize_record_frames(
-                    replay_frames,
-                    expected_host=expected_host,
-                    expected_rollout=plan.records_request.rollout,
-                )
-            except shards_adapter.SessionShardsAdapterError as error:
-                raise CliContractError(
-                    exit_code=ExitCode.INVALID_INPUT,
-                    code="invalid_session_shards_records",
-                    message="session-shards records violate their transport binding",
-                ) from error
-        finally:
-            close = getattr(replay_frames, "close", None)
-            if callable(close):
-                close()
-
-    return record_frames(), plan.records_request
+    return CliContractError(
+        exit_code=ExitCode.INVALID_INPUT,
+        code="invalid_session_shards_records",
+        message="session-shards records violate their transport binding",
+    )
 
 
 def command_accept_source(args: argparse.Namespace) -> CommandResult:
@@ -1088,8 +1100,15 @@ def command_accept_source(args: argparse.Namespace) -> CommandResult:
         args.transport_stream,
         label="session-shards transcripts",
     )
-    streams: dict[str, Iterable[Mapping[str, Any]]] | None = None
-    requests: dict[str, contract_api.SessionShardsRequest] | None = None
+    segments: (
+        dict[
+            str,
+            Iterable[
+                tuple[Iterable[Mapping[str, Any]], contract_api.SessionShardsRequest]
+            ],
+        ]
+        | None
+    ) = None
     raw_records: Mapping[str, bytes] | None = preparation.raw_records
     if named_streams:
         manifest = catalog_api.SourceTransportManifest.from_dict(preparation.manifest)
@@ -1106,15 +1125,12 @@ def command_accept_source(args: argparse.Namespace) -> CommandResult:
                     "session-shards transcripts must cover exactly consumed sources"
                 ),
             )
-        streams = {}
-        requests = {}
+        segments = {}
         for source_ref in sorted(named_streams):
-            frames, request = _session_shard_transcript(
+            segments[source_ref] = _session_shard_transcript(
                 _run_raw_input_path(run_dir, named_streams[source_ref]),
                 expected_host=preparation.host,
             )
-            streams[source_ref] = frames
-            requests[source_ref] = request
         raw_records = None
     result = orchestrator_api.accept_source(
         run_dir,
@@ -1122,8 +1138,7 @@ def command_accept_source(args: argparse.Namespace) -> CommandResult:
         preparation.manifest,
         transport_receipt=preparation.receipt,
         raw_records=raw_records,
-        transport_streams=streams,
-        transport_requests=requests,
+        transport_segments=segments,
         identity_path=_command_identity_path(args),
         require_existing_identity=True,
     )
@@ -1336,7 +1351,6 @@ def _persist_export_descriptor(
 def command_export(args: argparse.Namespace) -> CommandResult:
     run_dir = _absolute_path(args.run_dir)
     output = _absolute_path(args.output)
-    now = dt.datetime.now(dt.timezone.utc)
     orchestrator = orchestrator_api.RetrospectiveOrchestrator(
         run_dir,
         identity_path=_command_identity_path(args),
@@ -1358,11 +1372,16 @@ def command_export(args: argparse.Namespace) -> CommandResult:
         prior_period = _load_prior_period(args.prior_period)
     run_state["durable_state"] = orchestrator.publication_durable_state()
     run_state["publication_role"] = "standalone"
-    retention_deadline = (
-        args.retention_deadline
-        if args.retention_deadline is not None
-        else orchestrator.export_retention_deadline()
-    )
+    retention_deadline = args.retention_deadline
+    if retention_deadline is not None:
+        retention_deadline = orchestrator.validate_export_retention_deadline(
+            retention_deadline
+        )
+    elif not output.exists() and not output.is_symlink():
+        retention_deadline = orchestrator.validate_export_retention_deadline(
+            orchestrator.export_retention_deadline()
+        )
+    now = dt.datetime.now(dt.timezone.utc)
     receipt = _mapping_result(
         export_api.export_retained_bundle(
             output,
@@ -1380,6 +1399,14 @@ def command_export(args: argparse.Namespace) -> CommandResult:
             code="invalid_export_receipt",
             message="the retained export receipt is invalid",
         )
+    receipt_deadline = receipt.get("retention_deadline")
+    if not isinstance(receipt_deadline, str):
+        raise CliContractError(
+            exit_code=ExitCode.INVALID_STATE,
+            code="invalid_export_receipt",
+            message="the retained export receipt is invalid",
+        )
+    receipt_deadline = orchestrator.validate_export_retention_deadline(receipt_deadline)
     _persist_export_descriptor(
         run_dir,
         output,
@@ -1396,7 +1423,7 @@ def command_export(args: argparse.Namespace) -> CommandResult:
     else:
         marked = orchestrator.mark_exported(
             bundle_digest,
-            receipt.get("retention_deadline"),
+            receipt_deadline,
         )
     result = {
         "action": "export",

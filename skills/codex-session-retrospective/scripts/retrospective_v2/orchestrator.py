@@ -493,6 +493,16 @@ def accept_source(
     transport_streams: Mapping[str, Iterable[Mapping[str, Any]]] | None = None,
     transport_requests: Mapping[str, SessionShardsRequest | Mapping[str, Any]]
     | None = None,
+    transport_segments: Mapping[
+        str,
+        Iterable[
+            tuple[
+                Iterable[Mapping[str, Any]],
+                SessionShardsRequest | Mapping[str, Any],
+            ]
+        ],
+    ]
+    | None = None,
     identity_path: str | os.PathLike[str] | None = None,
     require_existing_identity: bool = False,
 ) -> dict[str, Any]:
@@ -507,6 +517,7 @@ def accept_source(
         raw_records=raw_records,
         transport_streams=transport_streams,
         transport_requests=transport_requests,
+        transport_segments=transport_segments,
     )
 
 

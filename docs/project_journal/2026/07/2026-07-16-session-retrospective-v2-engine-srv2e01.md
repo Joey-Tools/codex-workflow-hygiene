@@ -3,7 +3,7 @@ id: 20260716-srv2e01
 title: Session Retrospective v2 Engine
 status: completed
 created: 2026-07-16
-updated: 2026-08-07
+updated: 2026-08-08
 branch: wip/session-retrospective-v2-engine-clean
 pr: 43
 supersedes: []
@@ -100,6 +100,38 @@ superseded_by:
 - Synthetic history-topology merges disable inherited `commit.gpgsign`; those
   fixtures validate graph semantics and no longer depend on the operator's GPG
   configuration.
+- Source continuation uses the closed `source_transport_resume_v4` position,
+  independently reconstructs each outgoing cursor from captured evidence, and
+  spends one shared bounded probe budget. It detects changes intersecting the
+  accepted trailing probe without claiming arbitrary deep-history stability.
+- Session-shards descriptor cursors bind stable source identity, frozen byte and
+  record coordinates, and a full-prefix commitment. Records mode verifies the
+  complete frozen prefix into an owner-only range spool before any frame is
+  emitted; later appends remain outside the frozen snapshot.
+- Descriptor pages now stop at the 1,024-frame records budget and form one
+  contiguous multi-request chain. The adapter binds every continuation response,
+  validates all descriptor pages before raw replay, and the coordinator proves
+  the complete catalog range across all resulting records segments.
+- Source token v2 includes access-policy identity and platform generation or
+  birth-time evidence when available. Filesystems without either field retain an
+  explicit same-inode, byte-identical replacement non-guarantee; full-prefix
+  hashing still rejects content drift. Fragment relays bind every logical record
+  coordinate and encoding field across continuation frames.
+- Bounded history, publication, and remote-helper subprocesses close their
+  task-owned process group while the unreaped leader still pins the PID/PGID,
+  including the successful leader-exit path.
+- Agent results enforce depth, node, container, key, string, and aggregate
+  overlap-input bounds before privacy processing. Extractor output that repeats
+  sealed prompt or tool text is rejected before deterministic post-redaction,
+  so post-redaction cannot turn a raw-source echo into an accepted result.
+- Production automation validation rejects shadow backfill, controlled-gap, and
+  host-selection controls. Export validates the run-specific retention deadline
+  before staging or descriptor persistence and reuses the immutable staged
+  deadline across interrupted retries.
+- CLI export anchors its publication timestamp after retention-deadline
+  selection. A deadline generated immediately after a UTC second boundary can
+  therefore remain at the exact 72-hour policy ceiling without being compared
+  against an earlier subsecond timestamp.
 
 ## Next Steps
 
@@ -128,9 +160,27 @@ superseded_by:
   `OK`; OpenAI quick skill validation: `Skill is valid!`.
 - Source-transport suite: 29 tests, `OK`; orchestrator suite: 56 tests, `OK`;
   module-boundary suite: 17 tests, `OK`.
-- Architecture inventory: 49 package modules and 48,928 physical lines. The
-  principal facades are `orchestrator.py` at 676 lines and `finalize.py` at 87;
-  the largest transport units are `transport_source.py` at 1,648,
-  `transport_program.py` at 375, and `transport_remote.py` at 237.
+- Continuation and review-fix evidence: source transport 35 tests, session-shards
+  transport/adapter 45 tests, result/CLI 83 tests, orchestrator/identity/results
+  139 tests, and publication transaction 31 tests, all `OK`. The publication
+  suite ran outside the Desktop sandbox because sandboxed `gpg-agent` startup is
+  unavailable; its temporary GNUPG home and assertions were otherwise unchanged.
+- Independent read-only source-continuation audit: `No findings.`
+- Follow-up transport review found four issues: continuation response coordinates,
+  descriptor/records frame-budget mismatch, same-inode replacement identity, and
+  fragment-coordinate drift. All four were fixed; the focused transport,
+  adapter, and orchestrator group passed 108 tests in 75.004 seconds, including a
+  1,025-record two-page end-to-end acceptance case.
+- Architecture inventory: 52 package modules and 50,726 physical lines. The
+  principal facades are `orchestrator.py` at 688 lines and `finalize.py` at 87;
+  the largest transport units are `transport_source.py` at 1,641,
+  `transport_program.py` at 375, and `transport_remote.py` at 283. The public
+  CLI is 1,919 lines; its transcript helper is 176 lines and the source-segment
+  coordinator helper is 120 lines.
+- Final sandboxed Python 3.13 discovery found 1,463 tests in 180.124 seconds.
+  Every runnable test passed; the durable-publication class stopped in
+  `setUpClass` because sandboxed `gpg-agent` startup cannot generate its
+  temporary signing key. The export deadline boundary regression and its two
+  adjacent trend-history cases passed 3 tests in 4.457 seconds.
 - Ruff lint/format checks, Actionlint 1.7.12, and `git diff --check` passed for
   the merged v2 scope.
