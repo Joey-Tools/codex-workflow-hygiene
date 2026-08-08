@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
+import ctypes
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -211,6 +214,20 @@ class SafeIoTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
+
+    def _add_darwin_acl(self, path: Path, entry: str = "everyone allow read") -> None:
+        subprocess.run(
+            ["/bin/chmod", "+a", entry, os.fspath(path)],
+            check=True,
+            capture_output=True,
+        )
+
+    def _remove_darwin_acl(self, path: Path) -> None:
+        subprocess.run(
+            ["/bin/chmod", "-N", os.fspath(path)],
+            check=True,
+            capture_output=True,
+        )
 
     def test_capability_probe_uses_real_dir_fd_operations_and_fails_closed(
         self,
@@ -507,6 +524,129 @@ class SafeIoTests(unittest.TestCase):
                 read_bounded_bytes(target, max_bytes=len(original))
         finally:
             os.chmod(target, 0o600)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin ACL behavior")
+    def test_darwin_existing_owner_only_paths_reject_extended_acls(self) -> None:
+        directory = self.root / "acl-directory"
+        directory.mkdir(mode=0o700)
+        target = self.root / "acl-file"
+        atomic_write_bytes(target, b"payload")
+
+        self._add_darwin_acl(directory)
+        self._add_darwin_acl(target)
+        try:
+            with self.assertRaisesRegex(UnsafePathError, "extended ACL"):
+                safe_io.check_owner_only_directory(directory)
+            with self.assertRaisesRegex(UnsafePathError, "extended ACL"):
+                read_bounded_bytes(target, max_bytes=64)
+        finally:
+            self._remove_darwin_acl(directory)
+            self._remove_darwin_acl(target)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin ACL behavior")
+    def test_darwin_creation_clears_inherited_extended_acls(self) -> None:
+        inheriting = self.root / "inheriting"
+        inheriting.mkdir(mode=0o700)
+        self._add_darwin_acl(
+            inheriting,
+            "everyone allow read,file_inherit,directory_inherit",
+        )
+        try:
+            created = inheriting / "created" / "state"
+            atomic_write_bytes(created, b"payload")
+            directory_fd = os.open(created.parent, safe_io._DIRECTORY_FLAGS)
+            file_fd = os.open(created, os.O_RDONLY | safe_io._FILE_NOFOLLOW)
+            try:
+                safe_io.validate_owner_only_directory_descriptor(
+                    directory_fd,
+                    created.parent,
+                )
+                safe_io.validate_owner_only_file_descriptor(file_fd, created)
+            finally:
+                os.close(file_fd)
+                os.close(directory_fd)
+
+            cleared: list[Path] = []
+            real_clear = safe_io._clear_darwin_extended_acl
+
+            def observe_clear(descriptor: int, display_path: Path) -> None:
+                cleared.append(display_path)
+                real_clear(descriptor, display_path)
+
+            with mock.patch.object(
+                safe_io,
+                "_clear_darwin_extended_acl",
+                side_effect=observe_clear,
+            ):
+                atomic_write_bytes(created, b"replacement")
+                atomic_create_bytes(inheriting / "created" / "identity", b"key")
+
+            self.assertTrue(any("atomic-write" in path.name for path in cleared))
+            self.assertTrue(any(path.name.endswith(".lock") for path in cleared))
+            self.assertTrue(any(path.name.endswith(".tmp") for path in cleared))
+        finally:
+            self._remove_darwin_acl(inheriting)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin ACL behavior")
+    def test_darwin_bounded_read_rejects_late_acl_policy_change(self) -> None:
+        target = self.root / "late-acl"
+        payload = b"x" * (64 * 1024 + 32)
+        atomic_write_bytes(target, payload)
+        real_read = os.read
+        changed = False
+
+        def read_and_add_acl(descriptor: int, size: int) -> bytes:
+            nonlocal changed
+            chunk = real_read(descriptor, size)
+            if chunk and not changed:
+                changed = True
+                self._add_darwin_acl(target)
+            return chunk
+
+        try:
+            with (
+                mock.patch.object(safe_io.os, "read", side_effect=read_and_add_acl),
+                self.assertRaisesRegex(UnsafePathError, "extended ACL"),
+            ):
+                read_bounded_bytes(target, max_bytes=len(payload))
+        finally:
+            self._remove_darwin_acl(target)
+
+    def test_darwin_acl_query_distinguishes_absence_from_failure(self) -> None:
+        class FakeAclApi:
+            def __init__(self, error_number: int) -> None:
+                self.error_number = error_number
+
+            def acl_get_fd_np(self, _descriptor: int, _acl_type: int) -> None:
+                ctypes.set_errno(self.error_number)
+                return None
+
+        with mock.patch.object(
+            safe_io,
+            "_darwin_acl_api",
+            return_value=FakeAclApi(errno.ENOENT),
+        ):
+            self.assertFalse(safe_io._darwin_descriptor_has_extended_acl(1))
+        with mock.patch.object(
+            safe_io,
+            "_darwin_acl_api",
+            return_value=FakeAclApi(errno.EIO),
+        ):
+            with self.assertRaisesRegex(UnsafePathError, "could not verify"):
+                safe_io._darwin_descriptor_has_extended_acl(1)
+
+    def test_non_darwin_acl_hooks_do_not_load_libc_bindings(self) -> None:
+        safe_io._darwin_acl_api.cache_clear()
+        try:
+            with (
+                mock.patch.object(safe_io.sys, "platform", "linux"),
+                mock.patch.object(safe_io, "_DarwinAclApi") as constructor,
+            ):
+                self.assertFalse(safe_io._darwin_descriptor_has_extended_acl(1))
+                safe_io._clear_darwin_extended_acl(1, Path("synthetic"))
+                constructor.assert_not_called()
+        finally:
+            safe_io._darwin_acl_api.cache_clear()
 
 
 class IdentityKeyTests(unittest.TestCase):

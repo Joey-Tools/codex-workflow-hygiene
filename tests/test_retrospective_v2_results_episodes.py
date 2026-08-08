@@ -498,6 +498,30 @@ class ResultValidationTests(unittest.TestCase):
         )
         self.assertTrue(scan_for_leaks({"unsafe": "Acme"}, original_prompts=candidates))
 
+        nested_control_batches = list(
+            source_overlap_module.json_string_value_batches(
+                (
+                    '{"request_id":{"content":"Nested secret"},'
+                    '"evidence_ref":["Array secret"]}',
+                ),
+                query_chars=4,
+                maximum_batch_chars=32,
+                maximum_batch_items=2,
+            )
+        )
+        nested_control_candidates = [
+            candidate for batch in nested_control_batches for candidate in batch
+        ]
+
+        self.assertIn("nested secret", nested_control_candidates)
+        self.assertIn("array secret", nested_control_candidates)
+        self.assertTrue(
+            scan_for_leaks(
+                {"unsafe": "Nested secret"},
+                original_prompts=nested_control_candidates,
+            )
+        )
+
     def test_result_complexity_is_bounded_before_privacy_processing(self) -> None:
         value = extractor_result()
         value["turns"][0]["generalized_working_text"] = "x" * (

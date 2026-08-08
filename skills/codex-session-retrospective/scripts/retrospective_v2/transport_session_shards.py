@@ -12,11 +12,11 @@ import json
 import math
 import os
 import pathlib
-import stat
 import sys
 import tempfile
 from typing import Any, Callable, Iterable
 
+from . import safe_io
 from .contracts import (
     MAX_JSON_INTEGER,
     SESSION_SHARDS_PREFIX_COMMITMENT_DOMAIN,
@@ -38,6 +38,7 @@ from .transport_remote import (
     _relay_remote_host_context_command,
     _remote_host_context_command,
 )
+from .transport_resume import _source_object_generation
 from .transport_source import (
     _AnchoredCodexRoot,
     _local_codex_root,
@@ -46,46 +47,27 @@ from .transport_source import (
 )
 
 DEFAULT_SESSION_SHARD_BYTES = 512 * 1024
-
 MAX_SESSION_SHARD_BYTES = 512 * 1024
-
 DEFAULT_SESSION_SHARDS_PER_PAGE = 64
-
 MAX_SESSION_SHARDS_PER_PAGE = 1024
-
 DEFAULT_SESSION_RECORD_PROCESSING_BUDGET_BYTES = 64 * 1024 * 1024
-
 HARD_SESSION_RECORD_PROCESSING_CEILING_BYTES = 256 * 1024 * 1024
-
 MIN_SESSION_RECORD_PROCESSING_BUDGET_BYTES = 4 * 1024 * 1024
-
 MAX_SESSION_SHARDS_RANGE_BYTES = HARD_SESSION_RECORD_PROCESSING_CEILING_BYTES
-
 SESSION_SHARDS_RECORD_FRAGMENT_BYTES = 256 * 1024
-
 SESSION_SHARDS_RECORD_SCAN_CHUNK_BYTES = 64 * 1024
-
 SESSION_SHARDS_RECORD_SPOOL_MEMORY_BYTES = 64 * 1024
-
 SESSION_SHARDS_JSON_VALIDATION_CHUNK_BYTES = 64 * 1024
-
 SESSION_SHARDS_MAX_JSON_NESTING_DEPTH = 512
-
 SESSION_SHARDS_FRAME_METADATA_CHARS = 16 * 1024
-
 MAX_SESSION_SHARDS_FRAME_CHARS = (
     4 * ((max(MAX_SESSION_SHARD_BYTES, SESSION_SHARDS_RECORD_FRAGMENT_BYTES) + 2) // 3)
     + SESSION_SHARDS_FRAME_METADATA_CHARS
 )
-
 SESSION_SHARDS_SCHEMA = "session-shards-v1"
-
 SESSION_SHARDS_SOURCE_TOKEN_PREFIX = "session_shards_source_v2:"
-
 SESSION_SHARDS_RESUME_CURSOR_PREFIX = "session_shards_resume_v1:"
-
 SESSION_SHARDS_REQUEST_BINDING_PREFIX = "session_shards_request_v1:"
-
 SESSION_SHARDS_SOURCE_TOKEN_DOMAIN = b"session-shards-source-token-v2\0"
 
 SESSION_SHARDS_PROTOCOL_FEATURES = (
@@ -453,20 +435,15 @@ def _validate_session_shards_json_storage(storage: Any) -> None:
 
 
 def _session_shards_source_identity(stat_result: os.stat_result) -> tuple[int, ...]:
-    birthtime_ns = getattr(stat_result, "st_birthtime_ns", None)
-    if birthtime_ns is None:
-        birthtime = getattr(stat_result, "st_birthtime", None)
-        birthtime_ns = (
-            -1 if birthtime is None else int(round(float(birthtime) * 1_000_000_000))
-        )
+    generation, birthtime_ns = _source_object_generation(stat_result)
     return (
         int(stat_result.st_dev),
         int(stat_result.st_ino),
         int(stat_result.st_mode),
         int(stat_result.st_uid),
         int(stat_result.st_gid),
-        int(getattr(stat_result, "st_gen", -1)),
-        int(birthtime_ns),
+        generation,
+        birthtime_ns,
     )
 
 
@@ -641,9 +618,11 @@ def _spool_verified_session_shards_range(
 ) -> Any:
     storage = tempfile.TemporaryFile(mode="w+b")
     try:
-        os.fchmod(storage.fileno(), stat.S_IRUSR | stat.S_IWUSR)
-        if stat.S_IMODE(os.fstat(storage.fileno()).st_mode) & 0o077:
-            raise RuntimeError("session-shards verified spool is not owner-only")
+        safe_io.harden_created_owner_only_file_descriptor(
+            storage.fileno(),
+            pathlib.Path("<session-shards-verified-spool>"),
+            single_link=False,
+        )
         handle.seek(0)
         byte_offset = 0
         record_index = 0
@@ -721,10 +700,15 @@ def _iter_session_shard_records(
             mode="w+b",
         )
         try:
+            storage.rollover()
+            safe_io.harden_created_owner_only_file_descriptor(
+                storage.fileno(),
+                pathlib.Path("<session-shards-record-spool>"),
+                single_link=False,
+            )
             record_hasher = hashlib.sha256()
             total_bytes = 0
             over_processing_budget = False
-            spool_permissions_verified = False
             final_segment = b""
             record_tail = b""
             while byte_offset + total_bytes < byte_end:
@@ -744,17 +728,6 @@ def _iter_session_shard_records(
                         assert storage is not None
                         storage.write(segment)
                         record_hasher.update(segment)
-                        if (
-                            total_bytes > SESSION_SHARDS_RECORD_SPOOL_MEMORY_BYTES
-                            and not spool_permissions_verified
-                        ):
-                            spool_fd = storage.fileno()
-                            os.fchmod(spool_fd, stat.S_IRUSR | stat.S_IWUSR)
-                            if stat.S_IMODE(os.fstat(spool_fd).st_mode) & 0o077:
-                                raise RuntimeError(
-                                    "session-shards record spool is not owner-only"
-                                )
-                            spool_permissions_verified = True
                     else:
                         storage.close()
                         storage = None

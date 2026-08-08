@@ -28,6 +28,7 @@ _DIRECTORY_MODE = 0o700
 _FILE_MODE = 0o600
 _IGNORED_ROOT_NAME = ".codex-local"
 MAX_RETAINED_BUNDLE_BYTES = 256 * 1024 * 1024
+MAX_RETENTION_STATE_BYTES = 1024 * 1024
 DEFAULT_EXPORT_RETENTION = dt.timedelta(hours=24)
 MAX_EXPORT_RETENTION = dt.timedelta(hours=72)
 MAX_PUBLICATION_BOUND_RETENTION = dt.timedelta(days=7)
@@ -156,28 +157,34 @@ def _require_owner(path: Path, *, label: str) -> os.stat_result:
 
 
 def _require_directory_mode(path: Path) -> None:
-    metadata = _require_owner(path, label="retained staging directory")
-    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    try:
+        safe_io.check_owner_only_directory(path)
+    except (OSError, safe_io.UnsafePathError) as exc:
         raise RetainedInventoryError(
-            f"retained staging path is not a real directory: {path}"
-        )
-    if stat.S_IMODE(metadata.st_mode) != _DIRECTORY_MODE:
-        raise RetainedInventoryError(
-            f"retained staging directory must have mode 0700: {path}"
-        )
+            f"retained staging directory must be owner-only: {path}"
+        ) from exc
 
 
 def _require_file_mode(path: Path) -> os.stat_result:
-    metadata = _require_owner(path, label="retained artifact")
-    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise RetainedInventoryError(f"retained artifact is not a regular file: {path}")
-    if stat.S_IMODE(metadata.st_mode) != _FILE_MODE:
-        raise RetainedInventoryError(f"retained artifact must have mode 0600: {path}")
-    if metadata.st_nlink != 1:
+    try:
+        _normalized, parent_fd = safe_io.open_owner_only_directory(path.parent)
+        try:
+            descriptor = safe_io.open_checked_file_at(
+                parent_fd,
+                path.name,
+                display_path=path,
+                require_owner_only=True,
+            )
+            try:
+                return os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(parent_fd)
+    except (OSError, safe_io.UnsafePathError) as exc:
         raise RetainedInventoryError(
-            f"retained artifact must have exactly one hard link: {path}"
-        )
-    return metadata
+            f"retained artifact must be an owner-only regular file: {path}"
+        ) from exc
 
 
 def _fsync_directory(path: Path) -> None:
@@ -336,13 +343,11 @@ class _AnchoredExport:
             ) from exc
         try:
             opened = os.fstat(descriptor)
-            current_uid = getattr(os, "geteuid", lambda: opened.st_uid)()
-            if (
-                (observed.st_dev, observed.st_ino) != (opened.st_dev, opened.st_ino)
-                or not stat.S_ISDIR(opened.st_mode)
-                or opened.st_uid != current_uid
-                or stat.S_IMODE(opened.st_mode) != _DIRECTORY_MODE
-            ):
+            safe_io.validate_owner_only_directory_descriptor(
+                descriptor,
+                self.parent / target,
+            )
+            if (observed.st_dev, observed.st_ino) != (opened.st_dev, opened.st_ino):
                 raise RetainedInventoryError(
                     "retained staging directory is not owner-only and stable"
                 )
@@ -359,28 +364,23 @@ class _AnchoredExport:
 @contextmanager
 def _bundle_lock(output: Path) -> Any:
     lock_path = _retention_lock_path(output)
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    parent_fd: int | None = None
+    descriptor: int | None = None
     try:
-        descriptor = os.open(lock_path, flags, _FILE_MODE)
-    except OSError as exc:
+        _normalized, parent_fd = safe_io.open_owner_only_directory(lock_path.parent)
+        descriptor = safe_io.open_lock_file_at(
+            parent_fd,
+            lock_path.name,
+            display_path=lock_path,
+        )
+    except (OSError, safe_io.UnsafePathError) as exc:
+        if parent_fd is not None:
+            os.close(parent_fd)
         raise RetainedExportError(
             f"cannot open retained export lock {lock_path}: {exc}"
         ) from exc
     try:
-        os.fchmod(descriptor, _FILE_MODE)
-        metadata = os.fstat(descriptor)
-        current_uid = getattr(os, "geteuid", lambda: metadata.st_uid)()
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != current_uid
-            or stat.S_IMODE(metadata.st_mode) != _FILE_MODE
-            or metadata.st_nlink != 1
-        ):
-            raise RetainedExportError(
-                "retained export lock must be an owner-only regular file"
-            )
+        assert descriptor is not None
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
     finally:
@@ -388,22 +388,25 @@ def _bundle_lock(output: Path) -> Any:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+            assert parent_fd is not None
+            os.close(parent_fd)
 
 
 def _read_owner_only_json(path: Path) -> dict[str, Any]:
-    metadata = _require_owner(path, label="retained export state")
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or stat.S_ISLNK(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != _FILE_MODE
-        or metadata.st_nlink != 1
-    ):
-        raise RetainedExportError(
-            f"retained export state must be owner-only mode 0600: {path}"
-        )
     try:
-        value = json.loads(path.read_text(encoding="ascii"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload = safe_io.read_bounded_bytes(
+            path,
+            max_bytes=MAX_RETENTION_STATE_BYTES,
+            require_owner_only=True,
+        )
+        value = json.loads(payload.decode("ascii"))
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        safe_io.ReadLimitExceeded,
+        safe_io.UnsafePathError,
+    ) as exc:
         raise RetainedExportError(
             f"cannot read retained export state {path}: {exc}"
         ) from exc
@@ -432,13 +435,14 @@ def _write_owner_only_json(path: Path, value: Mapping[str, Any]) -> None:
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, _FILE_MODE)
+        safe_io.harden_created_owner_only_file_descriptor(descriptor, temporary)
         with os.fdopen(descriptor, "wb", closefd=True) as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
         os.chmod(path, _FILE_MODE)
+        safe_io.check_owner_only_file(path)
         _fsync_directory(path.parent)
     finally:
         if temporary.exists():
@@ -696,7 +700,15 @@ def _write_artifact_at(
         flags |= os.O_NOFOLLOW
     descriptor = os.open(name, flags, _FILE_MODE, dir_fd=directory_fd)
     try:
-        os.fchmod(descriptor, _FILE_MODE)
+        try:
+            safe_io.harden_created_owner_only_file_descriptor(
+                descriptor,
+                display_path,
+            )
+        except (OSError, safe_io.UnsafePathError) as exc:
+            raise RetainedExportError(
+                f"cannot harden retained artifact {display_path}"
+            ) from exc
         view = memoryview(content)
         while view:
             written = os.write(descriptor, view)
@@ -736,6 +748,17 @@ def _read_artifact_at(
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(name, flags, dir_fd=directory_fd)
     try:
+        try:
+            safe_io.validate_owner_only_file_descriptor(
+                descriptor,
+                display_path,
+                directory_fd=directory_fd,
+                name=name,
+            )
+        except (OSError, safe_io.UnsafePathError) as exc:
+            raise RetainedInventoryError(
+                f"retained artifact access policy is invalid: {display_path}"
+            ) from exc
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino, opened.st_size) != (
             expected.st_dev,
@@ -768,6 +791,17 @@ def _read_artifact_at(
             raise RetainedInventoryError(
                 f"retained artifact changed while read: {display_path}"
             )
+        try:
+            safe_io.validate_owner_only_file_descriptor(
+                descriptor,
+                display_path,
+                directory_fd=directory_fd,
+                name=name,
+            )
+        except (OSError, safe_io.UnsafePathError) as exc:
+            raise RetainedInventoryError(
+                f"retained artifact access policy changed while read: {display_path}"
+            ) from exc
         return b"".join(chunks)
     finally:
         os.close(descriptor)

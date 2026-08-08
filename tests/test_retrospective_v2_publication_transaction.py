@@ -84,6 +84,220 @@ def run_command(
 
 
 class PublicationInvariantUnitTests(unittest.TestCase):
+    def test_bounded_subprocess_uses_held_working_directory_after_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary_directory:
+            root = Path(temporary_directory)
+            original = root / "publisher-home"
+            displaced = root / "publisher-home-original"
+            original.mkdir(mode=0o700)
+            original.joinpath("marker").write_text("anchored", encoding="ascii")
+            descriptor = os.open(original, os.O_RDONLY | os.O_DIRECTORY)
+            original.rename(displaced)
+            original.mkdir(mode=0o700)
+            original.joinpath("marker").write_text("replacement", encoding="ascii")
+            try:
+                result = publication_support._run_bounded_subprocess(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-S",
+                        "-c",
+                        "import pathlib; print(pathlib.Path('marker').read_text())",
+                    ],
+                    cwd_descriptor=descriptor,
+                    environment=publication_support._strict_subprocess_environment(
+                        home=original
+                    ),
+                    max_output_bytes=1024,
+                    timeout_seconds=5,
+                )
+            finally:
+                os.close(descriptor)
+
+            self.assertEqual(0, result.returncode)
+            self.assertEqual(b"anchored\n", result.stdout)
+
+    def test_publisher_keyring_uses_descriptor_binding_across_path_aba(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "gnupg"
+            moved_home = root / "gnupg-original"
+            replacement_home = root / "gnupg-replacement"
+            home.mkdir(mode=0o700)
+            original_identity = home.stat()
+            fingerprint = "A" * 40
+
+            def inventory(primary: str) -> bytes:
+                rows = (
+                    ":".join((primary, *("" for _ in range(9)))),
+                    ":".join(("fpr", *("" for _ in range(8)), fingerprint)),
+                    ":".join(("uid", *("" for _ in range(8)), DEFAULT_PUBLISHER_UID)),
+                )
+                return ("\n".join(rows) + "\n").encode("ascii")
+
+            calls = 0
+
+            def replace_restore_and_list(command, **kwargs):
+                nonlocal calls
+                calls += 1
+                descriptor_path = command[command.index("--homedir") + 1]
+                self.assertEqual(
+                    descriptor_path,
+                    kwargs["environment"]["GNUPGHOME"],
+                )
+                self.assertEqual(".", descriptor_path)
+                self.assertGreaterEqual(kwargs["cwd_descriptor"], 0)
+                if calls == 1:
+                    home.rename(moved_home)
+                    replacement_home.mkdir(mode=0o700)
+                    replacement_home.rename(home)
+                    anchored = os.fstat(kwargs["cwd_descriptor"])
+                    self.assertEqual(
+                        (original_identity.st_dev, original_identity.st_ino),
+                        (anchored.st_dev, anchored.st_ino),
+                    )
+                    home.rename(replacement_home)
+                    moved_home.rename(home)
+                primary = "sec" if command[-1] == "--list-secret-keys" else "pub"
+                return subprocess.CompletedProcess(
+                    args=command,
+                    returncode=0,
+                    stdout=inventory(primary),
+                    stderr=b"",
+                )
+
+            with mock.patch.object(
+                publication_support,
+                "_run_bounded_subprocess",
+                side_effect=replace_restore_and_list,
+            ):
+                identity = publication_support.validate_publisher_keyring(
+                    gnupg_home=home,
+                    fingerprint=fingerprint,
+                    expected_uid=DEFAULT_PUBLISHER_UID,
+                    gpg_program=sys.executable,
+                )
+
+            self.assertEqual(fingerprint, identity["fingerprint"])
+            self.assertEqual(2, calls)
+
+    def test_publisher_keyring_rejects_secret_inventory_before_public_listing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary_directory:
+            home = Path(temporary_directory) / "gnupg"
+            home.mkdir(mode=0o700)
+            calls = 0
+
+            def secret_listing_only(command, **_kwargs):
+                nonlocal calls
+                calls += 1
+                if calls != 1:
+                    raise AssertionError("public listing must not start")
+                return subprocess.CompletedProcess(
+                    args=command,
+                    returncode=0,
+                    stdout=b"",
+                    stderr=b"",
+                )
+
+            with (
+                mock.patch.object(
+                    publication_support,
+                    "_run_bounded_subprocess",
+                    side_effect=secret_listing_only,
+                ),
+                self.assertRaisesRegex(
+                    publication_support.LocalGitPublicationError,
+                    "exactly the configured secret primary key",
+                ),
+            ):
+                publication_support.validate_publisher_keyring(
+                    gnupg_home=home,
+                    fingerprint="A" * 40,
+                    expected_uid=DEFAULT_PUBLISHER_UID,
+                    gpg_program=sys.executable,
+                )
+
+            self.assertEqual(1, calls)
+
+    def test_publisher_keyring_rejects_path_replacement_during_gpg(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "gnupg"
+            moved_home = root / "gnupg-original"
+            home.mkdir(mode=0o700)
+
+            def replace_keyring(*_args, **_kwargs):
+                home.rename(moved_home)
+                home.mkdir(mode=0o700)
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=b"",
+                    stderr=b"",
+                )
+
+            with (
+                mock.patch.object(
+                    publication_support,
+                    "_run_bounded_subprocess",
+                    side_effect=replace_keyring,
+                ),
+                self.assertRaisesRegex(
+                    publication_support.LocalGitPublicationError,
+                    "GNUPGHOME changed after validation",
+                ),
+            ):
+                publication_support.validate_publisher_keyring(
+                    gnupg_home=home,
+                    fingerprint="A" * 40,
+                    expected_uid=DEFAULT_PUBLISHER_UID,
+                    gpg_program=sys.executable,
+                )
+
+    def test_publisher_keyring_prioritizes_revalidation_after_listing_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "gnupg"
+            moved_home = root / "gnupg-original"
+            home.mkdir(mode=0o700)
+            operation_error = publication_support.LocalGitPublicationError(
+                "subprocess exceeded its deadline"
+            )
+            calls = 0
+
+            def replace_keyring_and_fail(*_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                home.rename(moved_home)
+                home.mkdir(mode=0o700)
+                raise operation_error
+
+            with mock.patch.object(
+                publication_support,
+                "_run_bounded_subprocess",
+                side_effect=replace_keyring_and_fail,
+            ):
+                with self.assertRaisesRegex(
+                    publication_support.LocalGitPublicationError,
+                    "GNUPGHOME changed after validation",
+                ) as raised:
+                    publication_support.validate_publisher_keyring(
+                        gnupg_home=home,
+                        fingerprint="A" * 40,
+                        expected_uid=DEFAULT_PUBLISHER_UID,
+                        gpg_program=sys.executable,
+                    )
+
+            self.assertIs(operation_error, raised.exception.__cause__)
+            self.assertEqual(1, calls)
+
     def test_bounded_subprocesses_close_group_after_leader_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

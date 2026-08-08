@@ -24,7 +24,6 @@ from .publication_contracts import (
     LOCAL_GIT_RECEIPT_PREFIX,
     MAX_STATE_BYTES,
     PROVIDER_EPISODE_HEADS_SCHEMA,
-    READ_CHUNK_BYTES,
     STATE_SCHEMA_VERSION,
     AppendOnlyViolation,
     ArtifactInventory,
@@ -93,17 +92,13 @@ class _AnchoredStateDirectory:
         return cls(normalized, descriptor)
 
     @staticmethod
-    def _validate_directory_descriptor(descriptor: int) -> None:
-        metadata = os.fstat(descriptor)
-        current_uid = getattr(os, "geteuid", lambda: metadata.st_uid)()
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != current_uid
-            or stat.S_IMODE(metadata.st_mode) != 0o700
-        ):
+    def _validate_directory_descriptor(descriptor: int, path: Path) -> None:
+        try:
+            safe_io.validate_owner_only_directory_descriptor(descriptor, path)
+        except safe_io.UnsafePathError as exc:
             raise StateCorruptionError(
                 "publication state directory descriptor is not owner-only"
-            )
+            ) from exc
 
     @staticmethod
     def _name(value: str) -> str:
@@ -150,6 +145,18 @@ class _AnchoredStateDirectory:
             raise StateCorruptionError(
                 "publication state unlink target is not a regular file"
             )
+        try:
+            descriptor = safe_io.open_checked_file_at(
+                self.descriptor,
+                normalized,
+                display_path=self.path / normalized,
+                require_owner_only=True,
+            )
+        except (OSError, safe_io.UnsafePathError) as exc:
+            raise StateCorruptionError(
+                "publication state unlink target is not owner-only"
+            ) from exc
+        os.close(descriptor)
         os.unlink(normalized, dir_fd=self.descriptor)
         os.fsync(self.descriptor)
 
@@ -160,9 +167,11 @@ class _AnchoredStateDirectory:
         create: bool = False,
     ) -> _AnchoredStateDirectory:
         normalized = self._name(name)
+        created = False
         if create:
             try:
                 os.mkdir(normalized, 0o700, dir_fd=self.descriptor)
+                created = True
                 os.fsync(self.descriptor)
             except FileExistsError:
                 pass
@@ -183,7 +192,13 @@ class _AnchoredStateDirectory:
                 "cannot anchor publication state child directory"
             ) from exc
         try:
-            self._validate_directory_descriptor(descriptor)
+            child_path = self.path / normalized
+            if created:
+                safe_io.harden_created_owner_only_directory_descriptor(
+                    descriptor,
+                    child_path,
+                )
+            self._validate_directory_descriptor(descriptor, child_path)
             anchored = os.fstat(descriptor)
             if (observed.st_dev, observed.st_ino) != (
                 anchored.st_dev,
@@ -199,64 +214,14 @@ class _AnchoredStateDirectory:
 
     def open_lock(self, name: str) -> int:
         normalized = self._name(name)
-        flags = os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        created = False
-        descriptor: int | None = None
         try:
-            descriptor = os.open(
+            return safe_io.open_lock_file_at(
+                self.descriptor,
                 normalized,
-                flags | os.O_CREAT | os.O_EXCL,
-                0o600,
-                dir_fd=self.descriptor,
+                display_path=self.path / normalized,
             )
-            created = True
-        except FileExistsError:
-            try:
-                observed = os.stat(
-                    normalized,
-                    dir_fd=self.descriptor,
-                    follow_symlinks=False,
-                )
-                descriptor = os.open(normalized, flags, dir_fd=self.descriptor)
-            except OSError as exc:
-                raise StateCorruptionError("cannot anchor publication lock") from exc
-        try:
-            assert descriptor is not None
-            if created:
-                os.fchmod(descriptor, 0o600)
-            metadata = os.fstat(descriptor)
-            if created:
-                observed = os.stat(
-                    normalized,
-                    dir_fd=self.descriptor,
-                    follow_symlinks=False,
-                )
-            current = os.stat(
-                normalized,
-                dir_fd=self.descriptor,
-                follow_symlinks=False,
-            )
-            current_uid = getattr(os, "geteuid", lambda: metadata.st_uid)()
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != current_uid
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-                or metadata.st_nlink != 1
-                or (observed.st_dev, observed.st_ino)
-                != (metadata.st_dev, metadata.st_ino)
-                or (current.st_dev, current.st_ino)
-                != (metadata.st_dev, metadata.st_ino)
-            ):
-                raise StateCorruptionError(
-                    "publication lock is not an owner-only anchored file"
-                )
-            return descriptor
-        except Exception:
-            if descriptor is not None:
-                os.close(descriptor)
-            raise
+        except (OSError, safe_io.UnsafePathError) as exc:
+            raise StateCorruptionError("cannot anchor publication lock") from exc
 
     @staticmethod
     def _encoded(value: Mapping[str, Any]) -> bytes:
@@ -291,7 +256,10 @@ class _AnchoredStateDirectory:
                 dir_fd=self.descriptor,
             )
             created = True
-            os.fchmod(descriptor, 0o600)
+            safe_io.harden_created_owner_only_file_descriptor(
+                descriptor,
+                self.path / normalized,
+            )
             self._write_descriptor(descriptor, data)
             os.close(descriptor)
             descriptor = None
@@ -329,7 +297,10 @@ class _AnchoredStateDirectory:
                 0o600,
                 dir_fd=self.descriptor,
             )
-            os.fchmod(descriptor, 0o600)
+            safe_io.harden_created_owner_only_file_descriptor(
+                descriptor,
+                self.path / temporary,
+            )
             self._write_descriptor(descriptor, data)
             os.close(descriptor)
             descriptor = None
@@ -356,41 +327,18 @@ class _AnchoredStateDirectory:
 
     def read_json(self, name: str) -> dict[str, Any]:
         normalized = self._name(name)
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
         try:
-            descriptor = os.open(normalized, flags, dir_fd=self.descriptor)
-        except OSError as exc:
+            data = safe_io.read_bounded_bytes_at(
+                self.descriptor,
+                normalized,
+                display_path=self.path / normalized,
+                max_bytes=MAX_STATE_BYTES,
+                require_owner_only=True,
+            )
+        except (OSError, safe_io.ReadLimitExceeded, safe_io.UnsafePathError) as exc:
             raise StateCorruptionError(
                 f"cannot inspect publication state: {self.path / normalized}"
             ) from exc
-        try:
-            metadata = os.fstat(descriptor)
-            current_uid = getattr(os, "geteuid", lambda: metadata.st_uid)()
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != current_uid
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-                or metadata.st_nlink != 1
-                or metadata.st_size > MAX_STATE_BYTES
-            ):
-                raise StateCorruptionError(
-                    "publication state file is not owner-only and bounded"
-                )
-            chunks: list[bytes] = []
-            remaining = MAX_STATE_BYTES + 1
-            while remaining > 0:
-                chunk = os.read(descriptor, min(READ_CHUNK_BYTES, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            data = b"".join(chunks)
-            if len(data) > MAX_STATE_BYTES:
-                raise StateCorruptionError("publication state exceeds the 8 MiB limit")
-        finally:
-            os.close(descriptor)
         try:
             value = json.loads(
                 data.decode("utf-8"),

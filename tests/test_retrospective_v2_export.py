@@ -1481,6 +1481,98 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
 
 
 class RetrospectiveV2ExportTests(unittest.TestCase):
+    def test_artifact_hardening_precedes_the_first_payload_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            os.chmod(root, 0o700)
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            hardened = False
+            real_harden = (
+                export_module.safe_io.harden_created_owner_only_file_descriptor
+            )
+            real_write = os.write
+
+            def observe_hardening(*args, **kwargs) -> None:
+                nonlocal hardened
+                real_harden(*args, **kwargs)
+                hardened = True
+
+            def reject_unhardened_write(descriptor: int, content: bytes) -> int:
+                if not hardened:
+                    raise AssertionError("payload reached an unhardened artifact")
+                return real_write(descriptor, content)
+
+            try:
+                with (
+                    mock.patch.object(
+                        export_module.safe_io,
+                        "harden_created_owner_only_file_descriptor",
+                        side_effect=observe_hardening,
+                    ),
+                    mock.patch.object(
+                        export_module.os,
+                        "write",
+                        side_effect=reject_unhardened_write,
+                    ),
+                ):
+                    export_module._write_artifact_at(
+                        directory_fd,
+                        "artifact.json",
+                        b"{}\n",
+                        display_path=root / "artifact.json",
+                    )
+            finally:
+                os.close(directory_fd)
+
+            self.assertTrue(hardened)
+            self.assertEqual((root / "artifact.json").read_bytes(), b"{}\n")
+
+    def test_artifact_read_rejects_late_access_policy_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            os.chmod(root, 0o700)
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            display_path = root / "artifact.json"
+            export_module._write_artifact_at(
+                directory_fd,
+                "artifact.json",
+                b"{}\n",
+                display_path=display_path,
+            )
+            real_validate = export_module.safe_io.validate_owner_only_file_descriptor
+            validation_count = 0
+
+            def change_after_read(*args, **kwargs) -> None:
+                nonlocal validation_count
+                validation_count += 1
+                if validation_count == 2:
+                    raise export_module.safe_io.UnsafePathError(
+                        "simulated late ACL drift"
+                    )
+                real_validate(*args, **kwargs)
+
+            try:
+                with (
+                    mock.patch.object(
+                        export_module.safe_io,
+                        "validate_owner_only_file_descriptor",
+                        side_effect=change_after_read,
+                    ),
+                    self.assertRaisesRegex(
+                        RetainedInventoryError,
+                        "access policy changed while read",
+                    ),
+                ):
+                    export_module._read_artifact_at(
+                        directory_fd,
+                        "artifact.json",
+                        display_path=display_path,
+                    )
+            finally:
+                os.close(directory_fd)
+
+            self.assertEqual(validation_count, 2)
+
     def test_export_is_owner_only_atomic_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = (

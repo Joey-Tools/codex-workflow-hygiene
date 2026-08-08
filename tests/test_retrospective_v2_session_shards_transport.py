@@ -444,8 +444,11 @@ class SessionShardsLocalTests(unittest.TestCase):
 
         self.assertEqual((descriptor_rc, descriptor_error), (0, ""))
         self.assertEqual((records_rc, records_error), (0, ""))
-        self.assertEqual(len(tracked_spools), 1)
-        self.assertEqual(tracked_spools[0].written, len(lines[0]))
+        self.assertEqual(len(tracked_spools), 2)
+        self.assertEqual(
+            [spool.written for spool in tracked_spools],
+            [len(lines[0]), len(lines[0])],
+        )
         self.assertEqual(
             base64.b64decode(frame_of_kind(records, "record")["record_b64"]),
             lines[0],
@@ -1004,6 +1007,60 @@ class SessionShardsLocalTests(unittest.TestCase):
                     MODULE._session_shards_content_commitment(data),
                 )
                 records.close()
+
+    def test_record_spool_is_hardened_before_the_first_payload_write(self) -> None:
+        data = b'{"text":"owner-only"}\n'
+        actual = tempfile.SpooledTemporaryFile(max_size=64, mode="w+b")
+
+        class GuardedSpool:
+            hardened = False
+
+            def rollover(self) -> None:
+                actual.rollover()
+
+            def fileno(self) -> int:
+                return actual.fileno()
+
+            def write(self, payload: bytes) -> int:
+                if not self.hardened:
+                    raise AssertionError("raw payload reached an unhardened spool")
+                return actual.write(payload)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(actual, name)
+
+        guarded = GuardedSpool()
+        real_harden = SHARDS_MODULE.safe_io.harden_created_owner_only_file_descriptor
+
+        def mark_hardened(*args, **kwargs) -> None:
+            real_harden(*args, **kwargs)
+            guarded.hardened = True
+
+        with (
+            mock.patch.object(
+                SHARDS_MODULE.tempfile,
+                "SpooledTemporaryFile",
+                return_value=guarded,
+            ),
+            mock.patch.object(
+                SHARDS_MODULE.safe_io,
+                "harden_created_owner_only_file_descriptor",
+                side_effect=mark_hardened,
+            ),
+        ):
+            records = iter(
+                SHARDS_MODULE._iter_session_shard_records(
+                    io.BytesIO(data),
+                    byte_start=0,
+                    byte_end=len(data),
+                    record_start=0,
+                    record_processing_budget_bytes=1024,
+                )
+            )
+            record = next(records)
+            self.assertTrue(guarded.hardened)
+            self.assertEqual(record.record_storage.read(), data)
+            records.close()
 
     def test_fixed_memory_envelope_covers_stream_frame_serialization(self) -> None:
         def measured_peak(data: bytes) -> int:

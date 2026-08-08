@@ -150,7 +150,10 @@ retained raw payload, and a submitted non-target consumed record is rejected.
   only the matching unexpired claim; expiry permits safe takeover on the same
   attempt with a new envelope and output sink. Result acceptance binds the exact
   active, unexpired claim.
-- Raw run directory: mode `0700`; every file: mode `0600`.
+- Raw run directory: mode `0700`; every file: mode `0600`. On Darwin, each
+  owner-only directory and file must also have no extended ACL. Newly created
+  objects clear inherited ACLs through their held descriptors before use;
+  existing objects with an ACL fail closed rather than being repaired.
 - Successful publication removes raw shards. Blocked raw state expires within
   seven days and remains an explicit recoverability/coverage outcome.
 

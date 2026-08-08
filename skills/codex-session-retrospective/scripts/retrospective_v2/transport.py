@@ -62,6 +62,7 @@ from .transport_contracts import (  # noqa: F401
     _stream_object,
     transcript_commitment,
 )
+from .transport_discovery import window_dates as _window_dates  # noqa: F401
 from .transport_paths import (  # noqa: F401
     ACTIVE_ROLLOUT_RELATIVE_RE,
     ARCHIVED_ROLLOUT_RELATIVE_RE,
@@ -155,8 +156,6 @@ from .transport_source import (  # noqa: F401
     _open_source_transport_candidate,
     _open_source_transport_path,
     _resolve_safe_codex_root,
-    _safe_relative_path,
-    _safe_rollout_path,
     _source_inventory_row,
     _source_record_session_identifiers,
     _source_structural_exclusion,
@@ -168,13 +167,41 @@ from .transport_source import (  # noqa: F401
     _source_transport_remote_arguments,
     _source_transport_scan,
     _SourceCandidateDiscovery,
-    _window_dates,
     session_selector_commitment,
 )
 
 TRANSPORT_REMOTE_HELPER_CONTRACT = (
     ".codex/skills/remote-host-context/scripts/remote_codex_probe.py"
 )
+
+
+def _safe_relative_path(
+    codex_root: pathlib.Path,
+    relative_path: pathlib.PurePosixPath,
+    *,
+    expect_directory: bool = False,
+    expect_regular_file: bool = False,
+) -> pathlib.Path:
+    anchor = _open_lexical_codex_root(codex_root)
+    try:
+        descriptor, _identities = _open_relative_from_codex_root(
+            anchor,
+            relative_path,
+            expect_directory=expect_directory,
+            expect_regular_file=expect_regular_file,
+        )
+        os.close(descriptor)
+        return anchor.path.joinpath(*relative_path.parts)
+    finally:
+        anchor.close()
+
+
+def _safe_rollout_path(
+    codex_root: pathlib.Path, rollout_relative_path: pathlib.PurePosixPath
+) -> pathlib.Path:
+    return _safe_relative_path(
+        codex_root, rollout_relative_path, expect_regular_file=True
+    )
 
 
 def _open_session_shard_source(

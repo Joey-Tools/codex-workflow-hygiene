@@ -138,7 +138,7 @@ superseded_by:
   contiguous multi-request chain. The adapter binds every continuation response,
   validates all descriptor pages before raw replay, and the coordinator proves
   the complete catalog range across all resulting records segments.
-- Source token v2 includes access-policy identity and platform generation or
+- Source token v4 includes access-policy identity and platform generation or
   birth-time evidence when available. Filesystems without either field retain an
   explicit same-inode, byte-identical replacement non-guarantee; full-prefix
   hashing still rejects content drift. Fragment relays bind every logical record
@@ -176,6 +176,21 @@ superseded_by:
   identity and type-aware entry snapshots, then revalidates every snapshot before
   a successful terminal; replacement, entry churn, or exhausted bounds becomes an
   explicit coverage gap rather than a partial success.
+- Active and archived discovery now share a fixed 250,000-entry, 64 MiB path,
+  30-second budget. Archived directory dates are not treated as event-time
+  authority, and every terminal outcome revalidates the root, each traversed
+  directory inventory, and each selected candidate identity/access-policy token.
+  Enumeration change, revalidation failure, and individual budget exhaustion
+  remain distinct explicit gaps and invalidate any outgoing resume position.
+- Every owner-only v2 directory and regular file rejects Darwin extended ACLs.
+  Newly created objects clear inherited ACLs through their held descriptors
+  before publication; bounded reads, locks, publication state, retained export,
+  GPG keyring validation, cleanup, and session-shard spools revalidate the same
+  access-policy property without treating timestamp-only changes as mutation.
+- JSON source-overlap control keys exempt only their direct scalar values.
+  Nested objects and arrays remain untrusted source-bearing structure, so strings
+  under `request_id`, `evidence_ref`, and related control keys cannot bypass the
+  retained-output overlap gate.
 - Retained privacy scanning and deterministic post-redaction recognize every
   bounded hierarchical URI scheme, including one-letter schemes, rather than an
   HTTP/SSH allowlist that could retain another URL form.
@@ -396,3 +411,91 @@ superseded_by:
   This run includes the disposable-GPG publication transaction suite and
   supersedes every earlier partial or sandbox-limited discovery result; no test
   was skipped, inferred, or carried forward from another tree.
+- The next frozen-range reviewer found five additional gaps: owner-only checks
+  omitted Darwin extended ACLs; archived discovery trusted directory dates as a
+  prefilter; successful terminal proof did not bind every directory/candidate;
+  nested containers under control keys inherited an unsafe overlap exemption;
+  and directory enumeration used a derived high memory ceiling. The current
+  fixes add descriptor ACL enforcement and inherited-ACL removal, one fixed
+  discovery resource contract with terminal revalidation on every outcome,
+  event-time filtering after bounded archive discovery, and direct-scalar-only
+  control exemptions.
+- Current focused Python 3.13 evidence covers 296 distinct affected tests:
+  identity/safe I/O 31/31, source transport 52/52, result/episode overlap 60/60,
+  checkpoint security 10/10, module boundaries 17/17, export 47/47,
+  session-shards transport 40/40, and the host-level disposable-GPG publication
+  transaction suite 39/39 in 333.263 seconds. The first host publication attempt
+  used macOS's lexical `/var` alias and therefore failed the existing strict
+  no-symlink-ancestor contract before the transaction cases; it is non-counting.
+  Repeating the unchanged suite with the real `/private/tmp` temporary root
+  passed. Scoped Ruff lint, Ruff format, Python compile, and `git diff --check`
+  also pass on the current implementation.
+- A subsequent host Python 3.13 discovery passed 1,539/1,539 tests in 591.564
+  seconds, but two bounded pre-commit audits then found four transport-discovery
+  gaps and three ACL/publication gaps. That discovery is therefore retained as
+  historical evidence only and is non-counting for the final tree. The transport
+  follow-up preserves the 366-day input bound, extends the fixed deadline through
+  candidate opens and final sorting, distinguishes post-snapshot disappearance
+  from authoritative absence, binds the root source directory as well as every
+  candidate, and makes the access-policy mutation regression independent of the
+  process umask. The original 7,600 branch-node and 20-large-function ceilings
+  remain unchanged after extracting the source-kind traversal.
+- The ACL follow-up forces each record spool to create and harden its disk backing
+  before the first raw payload byte, applies the same descriptor ACL contract to
+  retained-artifact writes and both sides of artifact reads, and keeps the
+  dedicated publisher `GNUPGHOME` descriptor anchored while every GPG inventory
+  call performs path/object revalidation before and after use. Exact regressions
+  cover hardening-before-write, late artifact ACL drift, keyring path replacement,
+  root/candidate disappearance, candidate-open deadline expiry, the 366-day bound,
+  and deterministic mode drift. The complete affected source, session-shards,
+  export, identity/safe-I/O, and result/episode suites passed 237/237 tests in
+  23.401 seconds. One prior instance exposed only the now-updated spool-count
+  assertion and is non-counting. Module boundaries passed 17/17, and the host
+  disposable-GPG publication suite passed 40/40 in 331.326 seconds under
+  `/private/tmp`.
+- The final host Python 3.13 discovery passed all 1,547 tests in 575.558 seconds
+  on the post-audit implementation. It includes the disposable-GPG publication
+  transactions and supersedes the earlier 1,539-test run; no test, setup class,
+  or cleanup result was inferred from a partial execution. Ruff lint passed,
+  all 18 changed Python files passed the scoped Ruff format check, project-journal
+  validation passed, the 56-test skill-structure/module/validator-wrapper group
+  passed, `git diff --check` passed, and the isolated OpenAI skill validator
+  reported `Skill is valid!`. A repository-wide format probe also identified
+  three pre-existing unmodified test files outside this change as not Ruff-
+  formatted; they were not rewritten as part of this delivery.
+- Follow-up transport audits found four remaining proof gaps: duplicated
+  `scandir` descriptor ownership leaked one descriptor per directory, the
+  discovery deadline started after lexical root traversal, an entirely missing
+  configured root could be reported as an unanchored verified absence, and
+  source tokens omitted Darwin generation/birth-time evidence. Discovery now
+  owns and closes every duplicated scan descriptor, creates one budget before
+  root traversal and checkpoints every component open, classifies an unexpected
+  missing root as an explicit source-enumeration gap, and binds the shared v4
+  generation/birth-time token in both discovery and session-shards transport.
+  The source/session/module group passed 118/118 tests in 21.349 seconds and the
+  complete affected six-suite group passed 258/258 in 24.651 seconds. The exact
+  descriptor, deadline, missing-root, and token regressions passed 7/7; the two
+  module size/complexity contracts passed 2/2.
+- Publication review then hardened dedicated GPG inventory around a held
+  `GNUPGHOME` descriptor. A fixed isolated Python trampoline performs `fchdir`
+  before `execve`, avoiding both Darwin's non-directory `/dev/fd` behavior and
+  `preexec_fn` deadlock before supervision starts. Secret-key inventory is
+  parsed and rejected before public-key enumeration. Every exceptional listing
+  exit now revalidates anchored directory identity plus owner/mode/ACL policy;
+  a safety failure takes precedence while preserving the operation failure as
+  its cause. Exact descriptor/ABA/ordering/exception regressions passed 5/5,
+  and the complete publication invariant class passed 10/10. Two additional
+  bounded explorer audits produced no terminal artifact and were closed while
+  still running; they are transport-inconclusive and non-counting. The formal
+  frozen-head review remains independently required.
+- The final host-level disposable-GPG publication suite passed 44/44 tests in
+  487.038 seconds under `/private/tmp`. The final Python 3.13 host discovery
+  passed all 1,555 tests in 920.024 seconds on the same tree, including real
+  signing, publication recovery, transport, privacy, export, and CLI coverage.
+  It supersedes the earlier 1,547-test evidence and every interrupted or
+  pre-audit run. One unquoted shell-pattern invocation was rejected by zsh
+  before Python started and is explicitly zero-test/non-counting. Project-journal
+  validation passed; the skill-structure, validator-wrapper, and module-boundary
+  group passed 56/56 tests in 6.725 seconds; OpenAI quick validation reported
+  `Skill is valid!`; scoped Ruff lint/format passed all 18 changed Python files;
+  and `git diff --check` passed.

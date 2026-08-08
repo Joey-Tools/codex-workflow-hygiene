@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
 from dataclasses import dataclass
 import errno
@@ -135,7 +136,11 @@ class _AnchoredCodexRoot:
         self.close()
 
 
-def _open_lexical_codex_root(codex_root: pathlib.Path) -> _AnchoredCodexRoot:
+def _open_lexical_codex_root(
+    codex_root: pathlib.Path,
+    *,
+    checkpoint: Callable[[], None] = lambda: None,
+) -> _AnchoredCodexRoot:
     """Anchor an absolute lexical root without following any path component."""
 
     nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -159,9 +164,12 @@ def _open_lexical_codex_root(codex_root: pathlib.Path) -> _AnchoredCodexRoot:
 
     close_on_exec = getattr(os, "O_CLOEXEC", 0)
     flags = os.O_RDONLY | directory | nofollow | close_on_exec
+    checkpoint()
     current_fd = os.open(root.anchor, flags)
     try:
+        checkpoint()
         for index, name in enumerate(parts):
+            checkpoint()
             try:
                 opened_fd = os.open(name, flags, dir_fd=current_fd)
             except OSError as exc:
@@ -181,12 +189,15 @@ def _open_lexical_codex_root(codex_root: pathlib.Path) -> _AnchoredCodexRoot:
                 common_hook = globals().get("_CODEX_ROOT_OPEN_COMPONENT_HOOK")
                 if callable(common_hook):
                     common_hook(index, name, opened_fd)
+                checkpoint()
             except BaseException:
                 os.close(opened_fd)
                 raise
             os.close(current_fd)
             current_fd = opened_fd
+        checkpoint()
         root_stat = os.fstat(current_fd)
+        checkpoint()
         descriptor = current_fd
         current_fd = -1
         return _AnchoredCodexRoot(
@@ -205,35 +216,6 @@ def _resolve_safe_codex_root(codex_root: pathlib.Path) -> pathlib.Path:
         return anchor.path
     finally:
         anchor.close()
-
-
-def _safe_relative_path(
-    codex_root: pathlib.Path,
-    relative_path: pathlib.PurePosixPath,
-    *,
-    expect_directory: bool = False,
-    expect_regular_file: bool = False,
-) -> pathlib.Path:
-    anchor = _open_lexical_codex_root(codex_root)
-    try:
-        descriptor, _identities = _open_relative_from_codex_root(
-            anchor,
-            relative_path,
-            expect_directory=expect_directory,
-            expect_regular_file=expect_regular_file,
-        )
-        os.close(descriptor)
-        return anchor.path.joinpath(*relative_path.parts)
-    finally:
-        anchor.close()
-
-
-def _safe_rollout_path(
-    codex_root: pathlib.Path, rollout_relative_path: pathlib.PurePosixPath
-) -> pathlib.Path:
-    return _safe_relative_path(
-        codex_root, rollout_relative_path, expect_regular_file=True
-    )
 
 
 def _source_transport_json_bytes(value: dict[str, Any]) -> bytes:
@@ -288,7 +270,6 @@ class _SourceCandidateDiscovery:
     candidate_identities: tuple[tuple[str, tuple[tuple[int, int], ...]], ...] = ()
     candidate_tokens: tuple[tuple[str, str], ...] = ()
     directory_snapshots: tuple[transport_discovery.SourceDirectorySnapshot, ...] = ()
-    directory_entry_limit: int = 0
     root_anchor: _AnchoredCodexRoot | None = None
 
     def close(self) -> None:
@@ -420,16 +401,6 @@ def _source_transport_instant(value: str, *, label: str) -> dt.datetime:
     return dt.datetime.fromisoformat(canonical.removesuffix("Z") + "+00:00")
 
 
-def _window_dates(start: dt.datetime, end: dt.datetime) -> tuple[dt.date, ...]:
-    if start >= end:
-        raise ValueError("source transport window is empty")
-    final = (end - dt.timedelta(microseconds=1)).date()
-    count = (final - start.date()).days + 1
-    if count < 1 or count > 366:
-        raise ValueError("source transport window exceeds the discovery bound")
-    return tuple(start.date() + dt.timedelta(days=index) for index in range(count))
-
-
 def _emit_source_transport_resume_probe(
     payload: bytes,
     *,
@@ -459,6 +430,67 @@ def _emit_source_transport_resume_probe(
         )
 
 
+def _discover_source_kind_candidates(
+    source_kind: str,
+    root_entries: Sequence[transport_discovery.DirectoryEntry],
+    candidates: Sequence[tuple[pathlib.Path, str]],
+    *,
+    read_entries: Callable[
+        [int, str, tuple[tuple[int, int], ...]],
+        Sequence[transport_discovery.DirectoryEntry],
+    ],
+    open_directory: Callable[[str], tuple[int, tuple[tuple[int, int], ...]]],
+    add_candidate: Callable[[str], None],
+    scan_candidate_entries: Callable[
+        [Sequence[transport_discovery.DirectoryEntry], str, re.Pattern[str]], None
+    ],
+    reject_active_entry: Callable[[], NoReturn],
+) -> bool:
+    if source_kind in {"session_index", "history"}:
+        relative = {
+            "history": "history.jsonl",
+            "session_index": "session_index.jsonl",
+        }[source_kind]
+        scan_candidate_entries(root_entries, "", re.compile(re.escape(relative)))
+        return bool(candidates)
+
+    base_name = {
+        "active_rollout": "sessions",
+        "archived_rollout": "archived_sessions",
+    }[source_kind]
+    base_entry = next(filter(lambda entry: entry[0] == base_name, root_entries), None)
+    if base_entry is None:
+        base_fd = -1
+    else:
+        _name, is_symlink, is_directory, _is_file = base_entry
+        if is_symlink or not is_directory:
+            reject_active_entry()
+        base_fd, base_identities = open_directory(base_name)
+    try:
+        if base_fd != -1:
+            pattern = {
+                "active_rollout": ACTIVE_ROLLOUT_RELATIVE_RE,
+                "archived_rollout": ARCHIVED_ROLLOUT_RELATIVE_RE,
+            }[source_kind]
+            transport_discovery.walk_dated_rollout_tree(
+                base_fd,
+                base_identities,
+                base_name,
+                read_entries=read_entries,
+                open_directory=open_directory,
+                add_candidate=add_candidate,
+                candidate_matches=lambda relative: pattern.fullmatch(relative)
+                is not None,
+                reject_entry=reject_active_entry,
+            )
+        if source_kind == "archived_rollout":
+            scan_candidate_entries(root_entries, "", ROOT_ROLLOUT_RELATIVE_RE)
+    finally:
+        if base_fd != -1:
+            os.close(base_fd)
+    return base_fd != -1 or bool(candidates)
+
+
 def _source_transport_candidate_paths(
     codex_root: pathlib.Path,
     source_kind: str,
@@ -467,16 +499,15 @@ def _source_transport_candidate_paths(
     window_end: dt.datetime,
     max_candidates: int,
 ) -> _SourceCandidateDiscovery:
-    window_dates = _window_dates(window_start, window_end)
-    anchor = _open_lexical_codex_root(codex_root)
+    transport_discovery.window_dates(window_start, window_end)
+    budget = transport_discovery.SourceDiscoveryBudget()
+    anchor = _open_lexical_codex_root(codex_root, checkpoint=budget.checkpoint)
     root = anchor.path
     candidates: list[tuple[pathlib.Path, str]] = []
     candidate_identities: dict[str, tuple[tuple[int, int], ...]] = {}
     candidate_tokens: dict[str, str] = {}
     directory_snapshots: list[transport_discovery.SourceDirectorySnapshot] = []
     seen: set[str] = set()
-    entry_limit = max(4096, max_candidates * 64)
-    entries_seen = 0
 
     class DiscoveryStop(Exception):
         def __init__(self, reason: str) -> None:
@@ -487,7 +518,7 @@ def _source_transport_candidate_paths(
         source_exists: bool,
         gap_reason: str | None = None,
     ) -> _SourceCandidateDiscovery:
-        ordered = tuple(sorted(candidates, key=lambda item: item[1].encode("utf-8")))
+        ordered = tuple(sorted(candidates, key=lambda item: os.fsencode(item[1])))
         return _SourceCandidateDiscovery(
             candidates=ordered,
             source_exists=source_exists,
@@ -501,9 +532,14 @@ def _source_transport_candidate_paths(
                 (relative, candidate_tokens[relative]) for _path, relative in ordered
             ),
             directory_snapshots=tuple(directory_snapshots),
-            directory_entry_limit=entry_limit,
             root_anchor=anchor,
         )
+
+    def successful_result(*, source_exists: bool) -> _SourceCandidateDiscovery:
+        budget.checkpoint()
+        completed = result(source_exists=source_exists)
+        budget.checkpoint()
+        return completed
 
     def directory_entries(
         descriptor: int,
@@ -511,13 +547,8 @@ def _source_transport_candidate_paths(
         relative: str | None = None,
         identities: tuple[tuple[int, int], ...] | None = None,
     ) -> list[tuple[str, bool, bool, bool]]:
-        nonlocal entries_seen
-
-        def observe_entry() -> None:
-            nonlocal entries_seen
-            entries_seen += 1
-            if entries_seen > entry_limit:
-                raise DiscoveryStop("candidate_discovery_limit_reached")
+        def observe_entry(name: str) -> None:
+            budget.observe("" if relative is None else relative, name)
 
         rows = transport_discovery.read_directory_entries(
             descriptor,
@@ -536,34 +567,44 @@ def _source_transport_candidate_paths(
     def open_directory(
         relative: str,
     ) -> tuple[int, tuple[tuple[int, int], ...]]:
-        return _open_relative_from_codex_root(
+        budget.checkpoint()
+        descriptor, identities = _open_relative_from_codex_root(
             anchor,
             pathlib.PurePosixPath(relative),
             expect_directory=True,
         )
+        with contextlib.ExitStack() as custody:
+            custody.callback(os.close, descriptor)
+            budget.checkpoint()
+            custody.pop_all()
+        return descriptor, identities
 
     def add_candidate(relative: str) -> None:
         if relative in seen:
             return
         if len(candidates) >= max_candidates:
-            raise DiscoveryStop("candidate_discovery_limit_reached")
+            raise DiscoveryStop("source_discovery_candidate_limit_reached")
+        budget.checkpoint()
         descriptor, identities = _open_source_transport_candidate(
             anchor,
             pathlib.PurePosixPath(relative),
         )
-        metadata = os.fstat(descriptor)
-        os.close(descriptor)
+        with contextlib.ExitStack() as custody:
+            custody.callback(os.close, descriptor)
+            metadata = os.fstat(descriptor)
+            budget.checkpoint()
         seen.add(relative)
         candidates.append((root / relative, relative))
         candidate_identities[relative] = identities
         candidate_tokens[relative] = _source_transport_candidate_token(metadata)
 
-    def scan_candidate_directory(
-        descriptor: int,
+    def scan_candidate_entries(
+        entries: Sequence[transport_discovery.DirectoryEntry],
         prefix: str,
         pattern: re.Pattern[str],
     ) -> None:
-        for name, is_symlink, _is_directory, is_file in directory_entries(descriptor):
+        for entry in entries:
+            name, is_symlink, _is_directory, is_file = entry[:4]
             relative = f"{prefix}/{name}" if prefix else name
             if pattern.fullmatch(relative) is None:
                 continue
@@ -575,83 +616,33 @@ def _source_transport_candidate_paths(
         raise DiscoveryStop("source_enumeration_failed")
 
     try:
-        if source_kind in {"session_index", "history"}:
-            relative = (
-                "session_index.jsonl"
-                if source_kind == "session_index"
-                else "history.jsonl"
-            )
-            try:
-                add_candidate(relative)
-            except FileNotFoundError:
-                return result(source_exists=False)
-            return result(source_exists=True)
-
-        base_name = (
-            "sessions" if source_kind == "active_rollout" else "archived_sessions"
+        root_entries = directory_entries(
+            anchor.descriptor,
+            relative="",
+            identities=(anchor.identity,),
         )
-        try:
-            base_fd, base_identities = open_directory(base_name)
-        except FileNotFoundError:
-            base_fd = -1
-            if source_kind == "active_rollout":
-                return result(source_exists=False)
-        try:
-            if base_fd != -1:
-                if source_kind == "active_rollout":
-                    transport_discovery.walk_active_rollout_tree(
-                        base_fd,
-                        base_identities,
-                        base_name,
-                        read_entries=lambda descriptor, relative, identities: (
-                            directory_entries(
-                                descriptor,
-                                relative=relative,
-                                identities=identities,
-                            )
-                        ),
-                        open_directory=open_directory,
-                        add_candidate=add_candidate,
-                        candidate_matches=lambda relative: (
-                            ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(relative) is not None
-                        ),
-                        reject_entry=reject_active_entry,
-                    )
-                else:
-                    for selected_date in window_dates:
-                        day_path = (
-                            f"{base_name}/{selected_date.year:04d}/"
-                            f"{selected_date.month:02d}/{selected_date.day:02d}"
-                        )
-                        try:
-                            day_fd, _day_identities = open_directory(day_path)
-                        except FileNotFoundError:
-                            continue
-                        try:
-                            scan_candidate_directory(
-                                day_fd,
-                                day_path,
-                                ARCHIVED_ROLLOUT_RELATIVE_RE,
-                            )
-                        finally:
-                            os.close(day_fd)
-                    scan_candidate_directory(
-                        base_fd,
-                        base_name,
-                        ARCHIVED_ROLLOUT_RELATIVE_RE,
-                    )
-            if source_kind == "archived_rollout":
-                scan_candidate_directory(
-                    anchor.descriptor,
-                    "",
-                    ROOT_ROLLOUT_RELATIVE_RE,
-                )
-        finally:
-            if base_fd != -1:
-                os.close(base_fd)
-        return result(source_exists=base_fd != -1 or bool(candidates))
-    except DiscoveryStop as exc:
+        source_exists = _discover_source_kind_candidates(
+            source_kind,
+            root_entries,
+            candidates,
+            read_entries=lambda descriptor, relative, identities: directory_entries(
+                descriptor,
+                relative=relative,
+                identities=identities,
+            ),
+            open_directory=open_directory,
+            add_candidate=add_candidate,
+            scan_candidate_entries=scan_candidate_entries,
+            reject_active_entry=reject_active_entry,
+        )
+        return successful_result(source_exists=source_exists)
+    except (
+        DiscoveryStop,
+        transport_discovery.SourceDiscoveryBudgetExceeded,
+    ) as exc:
         return result(source_exists=True, gap_reason=exc.reason)
+    except FileNotFoundError:
+        return result(source_exists=True, gap_reason="source_enumeration_changed")
     except BaseException:
         anchor.close()
         raise
@@ -841,7 +832,14 @@ def _source_transport_discovery_commitment(
                 {"source_locator": locator, "source_token": token}
                 for locator, token in discovery.candidate_tokens
             ],
-            "schema": "source_transport_discovery_v2",
+            "discovery_limits": {
+                "directory_entries": transport_discovery.SOURCE_DISCOVERY_MAX_DIRECTORY_ENTRIES,
+                "path_bytes": transport_discovery.SOURCE_DISCOVERY_MAX_PATH_BYTES,
+                "timeout_milliseconds": int(
+                    transport_discovery.SOURCE_DISCOVERY_TIMEOUT_SECONDS * 1000
+                ),
+            },
+            "schema": "source_transport_discovery_v3",
             "source_exists": discovery.source_exists,
         }
     )
@@ -905,14 +903,10 @@ def _prepare_source_transport_scan(
             window_end=window_end,
             max_candidates=args.max_records,
         )
-    except FileNotFoundError:
-        discovery = _SourceCandidateDiscovery((), False)
+    except transport_discovery.SourceDiscoveryBudgetExceeded as exc:
+        discovery = _SourceCandidateDiscovery((), True, exc.reason)
     except (OSError, ValueError):
-        discovery = _SourceCandidateDiscovery(
-            (),
-            True,
-            "source_enumeration_failed",
-        )
+        discovery = _SourceCandidateDiscovery((), True, "source_enumeration_failed")
     candidates = discovery.candidates
     candidate_tokens = dict(discovery.candidate_tokens)
     discovery_commitment = _source_transport_discovery_commitment(discovery)
@@ -1001,6 +995,27 @@ def _emit_source_transport_terminal(
             "status": terminal_status,
         },
         max_frame_bytes=args.max_frame_bytes,
+    )
+
+
+def _terminal_source_discovery_gap(discovery: _SourceCandidateDiscovery) -> str | None:
+    anchor = discovery.root_anchor
+    if anchor is None:
+        return discovery.gap_reason or "source_enumeration_revalidation_failed"
+
+    return transport_discovery.classify_terminal_source_discovery(
+        lambda: transport_discovery.terminal_revalidate_source_discovery(
+            snapshots=discovery.directory_snapshots,
+            root_authority=anchor,
+            open_relative=_open_relative_from_codex_root,
+            candidate_identities=discovery.candidate_identities,
+            candidate_tokens=discovery.candidate_tokens,
+            open_candidate=lambda relative,
+            identities: _open_source_transport_candidate(
+                anchor, pathlib.PurePosixPath(relative), expected_identities=identities
+            )[0],
+            candidate_token=_source_transport_candidate_token,
+        )
     )
 
 
@@ -1474,18 +1489,11 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
         finally:
             os.close(descriptor)
 
-    if terminal_status is None and discovery_gap_reason is None:
-        try:
-            transport_discovery.revalidate_rooted_directory_snapshots(
-                discovery.directory_snapshots,
-                entry_limit=discovery.directory_entry_limit,
-                root_authority=discovery.root_anchor,
-                open_relative=_open_relative_from_codex_root,
-            )
-        except (OSError, ValueError):
-            terminal_status = "gap"
-            terminal_reason = "source_enumeration_changed"
-            resume_position = None
+    revalidation_gap = _terminal_source_discovery_gap(discovery)
+    if revalidation_gap is not None:
+        terminal_status = "gap"
+        terminal_reason = revalidation_gap
+        resume_position = None
     discovery.close()
 
     _emit_source_transport_terminal(

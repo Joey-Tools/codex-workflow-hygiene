@@ -308,7 +308,7 @@ BOUNDED_MODULE_LINES = {
     "transport_auth.py": 200,
     "transport_capture.py": 1_000,
     "transport_contracts.py": 1_000,
-    "transport_discovery.py": 160,
+    "transport_discovery.py": 240,
     "transport_paths.py": 100,
     "transport_program.py": 420,
     "transport_remote.py": 320,
@@ -914,7 +914,7 @@ spec.loader.exec_module(module)
                 len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
                 for name in TRANSPORT_MODULES
             ),
-            7_085,
+            7_200,
         )
         self.assertLessEqual(
             sum(

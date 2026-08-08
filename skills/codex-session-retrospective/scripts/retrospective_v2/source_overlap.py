@@ -421,7 +421,10 @@ def _decoded_json_string_value_windows(
                     _ContainerFrame(
                         kind="object" if character == "{" else "array",
                         state="key_or_end" if character == "{" else "value_or_end",
-                        inherited_control_value=current_value_is_control(),
+                        # A control-key exemption applies only to its direct
+                        # scalar value. Containers are untrusted structure and
+                        # their nested strings remain overlap candidates.
+                        inherited_control_value=False,
                     )
                 )
             elif character in "}]":

@@ -223,6 +223,8 @@ class SourceTransportProtocolTests(unittest.TestCase):
         max_records: int,
         max_source_bytes: int = 16 * 1024 * 1024,
         resume_position: dict[str, object] | None = None,
+        window_start: str = WINDOW_START,
+        window_end: str = WINDOW_END,
     ) -> list[dict[str, object]]:
         output_path = self.root / f"{name}.jsonl"
         lease_ref = str(self.identity.derive_ref(RefType.LEASE, {"case": name}))
@@ -233,9 +235,9 @@ class SourceTransportProtocolTests(unittest.TestCase):
             "--source-kind",
             source_kind,
             "--window-start",
-            WINDOW_START,
+            window_start,
             "--window-end",
-            WINDOW_END,
+            window_end,
             "--lease-ref",
             lease_ref,
             "--process-nonce",
@@ -1165,7 +1167,10 @@ class SourceTransportProtocolTests(unittest.TestCase):
             window_end=end,
             max_candidates=2,
         )
-        self.assertEqual("candidate_discovery_limit_reached", limited.gap_reason)
+        self.assertEqual(
+            "source_discovery_candidate_limit_reached",
+            limited.gap_reason,
+        )
         self.assertLessEqual(len(limited.candidates), 2)
 
         output_path = self.root / "bounded-discovery.jsonl"
@@ -1214,7 +1219,10 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertEqual(2, len(inventory))
         self.assertEqual("gap", terminal["status"])
-        self.assertEqual("candidate_discovery_limit_reached", terminal["reason"])
+        self.assertEqual(
+            "source_discovery_candidate_limit_reached",
+            terminal["reason"],
+        )
 
     def test_active_rollout_directory_change_before_terminal_is_a_gap(self) -> None:
         day = self.codex_root / "sessions/2026/07/06"
@@ -1249,6 +1257,415 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.assertEqual("gap", frames[-1]["status"])
         self.assertEqual("source_enumeration_changed", frames[-1]["reason"])
         self.assertIsNone(frames[-1]["resume_position"])
+
+    def test_archived_rollout_directory_date_is_not_event_time_authority(
+        self,
+    ) -> None:
+        old_day = self.codex_root / "archived_sessions/2020/01/02"
+        old_day.mkdir(parents=True, mode=0o700)
+        rollout = old_day / "rollout-old-directory-current-event.jsonl"
+        rollout.write_bytes(
+            json.dumps(
+                {
+                    "content": "current event in an old archive directory",
+                    "role": "user",
+                    "session_id": "old-directory-current-event",
+                    "timestamp": "2026-07-06T01:00:00Z",
+                    "type": "response_item",
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+            + b"\n"
+        )
+
+        frames = self._direct_source_frames(
+            "archive-directory-date",
+            source_kind="archived_rollout",
+            max_records=8,
+        )
+        inventory = [frame for frame in frames if frame.get("frame") == "inventory"]
+
+        self.assertTrue(
+            any(
+                frame["source_locator"]
+                == "archived_sessions/2020/01/02/"
+                "rollout-old-directory-current-event.jsonl"
+                and frame["accounting_class"] == "consumed_candidate"
+                for frame in inventory
+            )
+        )
+        self.assertEqual("complete", frames[-1]["status"])
+
+    def test_candidate_same_name_replacement_before_terminal_is_a_gap(self) -> None:
+        day = self.codex_root / "sessions/2026/07/06"
+        day.mkdir(parents=True, mode=0o700)
+        rollout = day / "rollout-replaced.jsonl"
+        rollout.write_bytes(self._line("original", kind="session_meta"))
+        replacement = day / "replacement.jsonl"
+        replacement.write_bytes(self._line("attacker", kind="session_meta"))
+        mutated = False
+
+        original_revalidate = (
+            transport_source.transport_discovery.revalidate_directory_snapshots
+        )
+
+        def replace_before_terminal(*args, **kwargs) -> None:
+            nonlocal mutated
+            mutated = True
+            os.replace(replacement, rollout)
+            original_revalidate(*args, **kwargs)
+
+        with mock.patch.object(
+            transport_source.transport_discovery,
+            "revalidate_directory_snapshots",
+            side_effect=replace_before_terminal,
+        ):
+            frames = self._direct_source_frames(
+                "candidate-same-name-replacement",
+                source_kind="active_rollout",
+                max_records=8,
+            )
+
+        self.assertTrue(mutated)
+        self.assertEqual("gap", frames[-1]["status"])
+        self.assertEqual("source_enumeration_changed", frames[-1]["reason"])
+
+    def test_archived_rollout_membership_change_before_terminal_is_a_gap(
+        self,
+    ) -> None:
+        day = self.codex_root / "archived_sessions/2020/01/02"
+        day.mkdir(parents=True, mode=0o700)
+        day.joinpath("rollout-existing.jsonl").write_bytes(
+            self._line("existing", kind="session_meta")
+        )
+        late = day / "rollout-late.jsonl"
+        original_revalidate = (
+            transport_source.transport_discovery.revalidate_directory_snapshots
+        )
+
+        def mutate_then_revalidate(*args, **kwargs):
+            late.write_bytes(self._line("late", kind="session_meta"))
+            return original_revalidate(*args, **kwargs)
+
+        with mock.patch.object(
+            transport_source.transport_discovery,
+            "revalidate_directory_snapshots",
+            side_effect=mutate_then_revalidate,
+        ):
+            frames = self._direct_source_frames(
+                "archived-directory-change",
+                source_kind="archived_rollout",
+                max_records=16,
+            )
+
+        self.assertEqual("gap", frames[-1]["status"])
+        self.assertEqual("source_enumeration_changed", frames[-1]["reason"])
+
+    def test_non_candidate_directory_fanout_hits_bounded_gap(self) -> None:
+        sessions = self.codex_root / "sessions"
+        sessions.mkdir(mode=0o700)
+        for index in range(5):
+            sessions.joinpath(f"ignored-entry-{index}").write_text(
+                "noise",
+                encoding="ascii",
+            )
+
+        budget_cases = (
+            (
+                transport_source.transport_discovery.SourceDiscoveryBudget(
+                    entry_limit=4,
+                ),
+                "source_discovery_entry_limit_reached",
+            ),
+            (
+                transport_source.transport_discovery.SourceDiscoveryBudget(
+                    entry_limit=100,
+                    path_byte_limit=8,
+                ),
+                "source_discovery_path_limit_reached",
+            ),
+        )
+        for budget, expected_reason in budget_cases:
+            with self.subTest(expected_reason=expected_reason):
+                with mock.patch.object(
+                    transport_source.transport_discovery,
+                    "SourceDiscoveryBudget",
+                    return_value=budget,
+                ):
+                    discovery = transport._source_transport_candidate_paths(
+                        self.codex_root,
+                        "active_rollout",
+                        window_start=dt.datetime(2026, 7, 6, tzinfo=dt.timezone.utc),
+                        window_end=dt.datetime(2026, 7, 7, tzinfo=dt.timezone.utc),
+                        max_candidates=100,
+                    )
+                try:
+                    self.assertEqual(
+                        expected_reason,
+                        discovery.gap_reason,
+                    )
+                    self.assertEqual((), discovery.candidates)
+                finally:
+                    discovery.close()
+
+    def test_source_discovery_deadline_is_fixed_and_injectable(self) -> None:
+        now = [0.0]
+        budget = transport_source.transport_discovery.SourceDiscoveryBudget(
+            timeout_seconds=1.0,
+            clock=lambda: now[0],
+        )
+        budget.observe("sessions", "2026")
+        now[0] = 1.0
+
+        with self.assertRaisesRegex(
+            transport_source.transport_discovery.SourceDiscoveryBudgetExceeded,
+            "source_discovery_deadline_reached",
+        ):
+            budget.checkpoint()
+
+    def test_directory_snapshot_closes_duplicated_scan_descriptor(self) -> None:
+        directory = self.root / "descriptor-snapshot"
+        directory.mkdir(mode=0o700)
+        directory.joinpath("entry").write_text("value", encoding="ascii")
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        duplicated: list[int] = []
+        real_dup = os.dup
+
+        def track_dup(value: int) -> int:
+            opened = real_dup(value)
+            duplicated.append(opened)
+            return opened
+
+        try:
+            with mock.patch.object(
+                transport_source.transport_discovery.os,
+                "dup",
+                side_effect=track_dup,
+            ):
+                entries = transport_source.transport_discovery.read_directory_entries(
+                    descriptor
+                )
+        finally:
+            os.close(descriptor)
+
+        self.assertEqual((("entry", False, False, True),), entries)
+        self.assertEqual(1, len(duplicated))
+        with self.assertRaises(OSError):
+            os.fstat(duplicated[0])
+
+    def test_root_open_is_inside_the_discovery_deadline(self) -> None:
+        now = [0.0]
+        budget = transport_source.transport_discovery.SourceDiscoveryBudget(
+            timeout_seconds=1.0,
+            clock=lambda: now[0],
+        )
+
+        def expire_after_component_open(*_args) -> None:
+            now[0] = 1.0
+
+        with (
+            mock.patch.object(
+                transport_source.transport_discovery,
+                "SourceDiscoveryBudget",
+                return_value=budget,
+            ),
+            mock.patch.object(
+                transport_source,
+                "_SOURCE_TRANSPORT_OPEN_COMPONENT_HOOK",
+                side_effect=expire_after_component_open,
+                create=True,
+            ),
+        ):
+            frames = self._direct_source_frames(
+                "root-open-deadline",
+                source_kind="history",
+                max_records=8,
+            )
+
+        self.assertEqual("gap", frames[-1]["status"])
+        self.assertEqual("source_discovery_deadline_reached", frames[-1]["reason"])
+
+    def test_missing_codex_root_is_an_explicit_gap(self) -> None:
+        self.codex_root.rmdir()
+
+        frames = self._direct_source_frames(
+            "missing-codex-root",
+            source_kind="history",
+            max_records=8,
+        )
+
+        self.assertEqual("gap", frames[-1]["status"])
+        self.assertEqual("source_enumeration_failed", frames[-1]["reason"])
+        self.assertFalse(frames[-1]["complete"])
+
+    def test_candidate_token_binds_generation_and_birthtime(self) -> None:
+        baseline = types.SimpleNamespace(
+            st_birthtime=1234.5,
+            st_dev=1,
+            st_gen=7,
+            st_gid=20,
+            st_ino=2,
+            st_mode=stat.S_IFREG | 0o600,
+            st_uid=501,
+        )
+        replacement = types.SimpleNamespace(**vars(baseline))
+        replacement.st_birthtime = 1235.5
+        replacement.st_gen = 8
+
+        self.assertNotEqual(
+            transport_source._source_transport_candidate_token(baseline),
+            transport_source._source_transport_candidate_token(replacement),
+        )
+
+    def test_candidate_open_is_inside_the_discovery_deadline(self) -> None:
+        history = self.codex_root / "history.jsonl"
+        history.write_bytes(self._line("one"))
+        now = [0.0]
+        budget = transport_source.transport_discovery.SourceDiscoveryBudget(
+            timeout_seconds=1.0,
+            clock=lambda: now[0],
+        )
+        real_open = transport_source._open_source_transport_candidate
+
+        def open_then_expire(*args, **kwargs):
+            opened = real_open(*args, **kwargs)
+            now[0] = 1.0
+            return opened
+
+        with (
+            mock.patch.object(
+                transport_source.transport_discovery,
+                "SourceDiscoveryBudget",
+                return_value=budget,
+            ),
+            mock.patch.object(
+                transport_source,
+                "_open_source_transport_candidate",
+                side_effect=open_then_expire,
+            ),
+        ):
+            frames = self._direct_source_frames(
+                "candidate-open-deadline",
+                source_kind="history",
+                max_records=8,
+            )
+
+        self.assertEqual("gap", frames[-1]["status"])
+        self.assertEqual(
+            "source_discovery_deadline_reached",
+            frames[-1]["reason"],
+        )
+
+    def test_candidate_disappearance_after_root_snapshot_is_a_gap(self) -> None:
+        self.codex_root.joinpath("history.jsonl").write_bytes(self._line("one"))
+        with mock.patch.object(
+            transport_source,
+            "_open_source_transport_candidate",
+            side_effect=FileNotFoundError("simulated candidate disappearance"),
+        ):
+            frames = self._direct_source_frames(
+                "candidate-disappeared",
+                source_kind="history",
+                max_records=8,
+            )
+
+        self.assertEqual("gap", frames[-1]["status"])
+        self.assertEqual("source_enumeration_changed", frames[-1]["reason"])
+
+    def test_source_directory_disappearance_after_root_snapshot_is_a_gap(self) -> None:
+        self.codex_root.joinpath("sessions").mkdir(mode=0o700)
+        real_open = transport_source._open_relative_from_codex_root
+
+        def disappear_after_snapshot(anchor, relative_path, **kwargs):
+            if relative_path == transport_source.pathlib.PurePosixPath("sessions"):
+                raise FileNotFoundError("simulated source directory disappearance")
+            return real_open(anchor, relative_path, **kwargs)
+
+        with mock.patch.object(
+            transport_source,
+            "_open_relative_from_codex_root",
+            side_effect=disappear_after_snapshot,
+        ):
+            frames = self._direct_source_frames(
+                "source-directory-disappeared",
+                source_kind="active_rollout",
+                max_records=8,
+            )
+
+        self.assertEqual("gap", frames[-1]["status"])
+        self.assertEqual("source_enumeration_changed", frames[-1]["reason"])
+
+    def test_source_window_remains_bounded_to_366_days(self) -> None:
+        self.codex_root.joinpath("history.jsonl").write_bytes(self._line("one"))
+        with self.assertRaisesRegex(
+            ValueError,
+            "source transport window exceeds the discovery bound",
+        ):
+            transport._source_transport_candidate_paths(
+                self.codex_root,
+                "history",
+                window_start=dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc),
+                window_end=dt.datetime(2026, 1, 3, tzinfo=dt.timezone.utc),
+                max_candidates=8,
+            )
+
+    def test_resume_terminal_revalidation_clears_stale_resume(self) -> None:
+        history = self.codex_root / "history.jsonl"
+        history.write_bytes(self._line("first") + self._line("second"))
+        os.chmod(history, 0o600)
+        first = self._direct_source_frames(
+            "resume-terminal-first",
+            source_kind="history",
+            max_records=1,
+        )
+        resume_position = first[-1]["resume_position"]
+        self.assertIsInstance(resume_position, dict)
+        original_revalidate = (
+            transport_source.transport_discovery.revalidate_directory_snapshots
+        )
+
+        def mutate_then_revalidate(*args, **kwargs) -> None:
+            os.chmod(history, 0o640)
+            original_revalidate(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                transport_source.transport_discovery,
+                "revalidate_directory_snapshots",
+                side_effect=mutate_then_revalidate,
+            ):
+                second = self._direct_source_frames(
+                    "resume-terminal-second",
+                    source_kind="history",
+                    max_records=1,
+                    resume_position=resume_position,
+                )
+        finally:
+            os.chmod(history, 0o600)
+
+        self.assertEqual("gap", second[-1]["status"])
+        self.assertEqual("source_enumeration_changed", second[-1]["reason"])
+        self.assertIsNone(second[-1]["resume_position"])
+
+    def test_terminal_revalidation_io_failure_is_distinct_from_change(self) -> None:
+        self.codex_root.joinpath("history.jsonl").write_bytes(self._line("one"))
+        with mock.patch.object(
+            transport_source.transport_discovery,
+            "terminal_revalidate_source_discovery",
+            side_effect=PermissionError("simulated unreadable inventory"),
+        ):
+            frames = self._direct_source_frames(
+                "terminal-revalidation-io",
+                source_kind="history",
+                max_records=8,
+            )
+
+        self.assertEqual("gap", frames[-1]["status"])
+        self.assertEqual(
+            "source_enumeration_revalidation_failed",
+            frames[-1]["reason"],
+        )
 
     def test_oversized_source_record_yields_exact_gap_accounting(self) -> None:
         self.codex_root.joinpath("session_index.jsonl").write_bytes(

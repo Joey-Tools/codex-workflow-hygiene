@@ -35,13 +35,28 @@ except (ImportError, ModuleNotFoundError):
     )
 
 
+def _source_object_generation(metadata: os.stat_result) -> tuple[int, int]:
+    birthtime_ns = getattr(metadata, "st_birthtime_ns", None)
+    if birthtime_ns is None:
+        birthtime = getattr(metadata, "st_birthtime", None)
+        birthtime_ns = (
+            -1 if birthtime is None else int(round(float(birthtime) * 1_000_000_000))
+        )
+    return int(getattr(metadata, "st_gen", -1)), int(birthtime_ns)
+
+
 def _source_transport_candidate_token(metadata: os.stat_result) -> str:
+    generation, birthtime_ns = _source_object_generation(metadata)
     return _canonical_commitment(
         {
+            "birthtime_ns": birthtime_ns,
             "device": metadata.st_dev,
+            "generation": generation,
+            "gid": metadata.st_gid,
             "inode": metadata.st_ino,
             "mode": metadata.st_mode,
-            "schema": "source_transport_candidate_v2",
+            "schema": "source_transport_candidate_v4",
+            "uid": metadata.st_uid,
         }
     )
 

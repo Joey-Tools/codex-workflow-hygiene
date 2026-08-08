@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 from functools import lru_cache
 import hashlib
@@ -9,6 +10,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import sys
 import tempfile
 from typing import Any, Callable
 
@@ -55,6 +57,117 @@ PathSecurityError = UnsafePathError
 BoundedReadError = ReadLimitExceeded
 
 
+_DARWIN_ACL_TYPE_EXTENDED = 0x100
+_DARWIN_FILESEC_ACL = 5
+_DARWIN_FILESEC_REMOVE_ACL = ctypes.c_void_p(1)
+
+
+class _DarwinAclApi:
+    def __init__(self) -> None:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            self.acl_get_fd_np = libc.acl_get_fd_np
+            self.acl_get_fd_np.argtypes = (ctypes.c_int, ctypes.c_int)
+            self.acl_get_fd_np.restype = ctypes.c_void_p
+            self.acl_free = libc.acl_free
+            self.acl_free.argtypes = (ctypes.c_void_p,)
+            self.acl_free.restype = ctypes.c_int
+            self.filesec_init = libc.filesec_init
+            self.filesec_init.argtypes = ()
+            self.filesec_init.restype = ctypes.c_void_p
+            self.filesec_set_property = libc.filesec_set_property
+            self.filesec_set_property.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+            )
+            self.filesec_set_property.restype = ctypes.c_int
+            self.filesec_free = libc.filesec_free
+            self.filesec_free.argtypes = (ctypes.c_void_p,)
+            self.filesec_free.restype = None
+            self.fchmodx_np = libc.fchmodx_np
+            self.fchmodx_np.argtypes = (ctypes.c_int, ctypes.c_void_p)
+            self.fchmodx_np.restype = ctypes.c_int
+        except (AttributeError, OSError) as exc:
+            raise UnsafePathError(
+                "required Darwin descriptor ACL operations are unavailable"
+            ) from exc
+
+
+@lru_cache(maxsize=1)
+def _darwin_acl_api() -> _DarwinAclApi | None:
+    if sys.platform != "darwin":
+        return None
+    return _DarwinAclApi()
+
+
+def _darwin_descriptor_has_extended_acl(descriptor: int) -> bool:
+    api = _darwin_acl_api()
+    if api is None:
+        return False
+    ctypes.set_errno(0)
+    acl = api.acl_get_fd_np(descriptor, _DARWIN_ACL_TYPE_EXTENDED)
+    if not acl:
+        error_number = ctypes.get_errno()
+        if error_number == errno.ENOENT:
+            return False
+        raise UnsafePathError(
+            "could not verify the Darwin extended ACL on an owner-only object: "
+            f"errno={error_number}"
+        )
+
+    ctypes.set_errno(0)
+    if api.acl_free(acl) != 0:
+        raise UnsafePathError(
+            "could not release a Darwin ACL inspection object: "
+            f"errno={ctypes.get_errno()}"
+        )
+    return True
+
+
+def _validate_owner_only_acl(descriptor: int, display_path: Path) -> None:
+    if _darwin_descriptor_has_extended_acl(descriptor):
+        raise UnsafePathError(
+            f"owner-only object has a Darwin extended ACL: {display_path}"
+        )
+
+
+def _clear_darwin_extended_acl(descriptor: int, display_path: Path) -> None:
+    api = _darwin_acl_api()
+    if api is None:
+        return
+    ctypes.set_errno(0)
+    filesec = api.filesec_init()
+    if not filesec:
+        raise UnsafePathError(
+            "could not allocate Darwin ACL removal state for "
+            f"{display_path}: errno={ctypes.get_errno()}"
+        )
+    try:
+        ctypes.set_errno(0)
+        if (
+            api.filesec_set_property(
+                filesec,
+                _DARWIN_FILESEC_ACL,
+                _DARWIN_FILESEC_REMOVE_ACL,
+            )
+            != 0
+        ):
+            raise UnsafePathError(
+                "could not configure Darwin ACL removal for "
+                f"{display_path}: errno={ctypes.get_errno()}"
+            )
+        ctypes.set_errno(0)
+        if api.fchmodx_np(descriptor, filesec) != 0:
+            raise UnsafePathError(
+                f"could not remove inherited Darwin ACL from {display_path}: "
+                f"errno={ctypes.get_errno()}"
+            )
+    finally:
+        api.filesec_free(filesec)
+    _validate_owner_only_acl(descriptor, display_path)
+
+
 def _owner_uid() -> int:
     getter = getattr(os, "geteuid", os.getuid)
     return getter()
@@ -77,13 +190,25 @@ def _run_dir_fd_smoke_probe() -> tuple[str, ...]:
                 os.mkdir("child", OWNER_DIRECTORY_MODE, dir_fd=root_fd)
                 child_fd = os.open("child", _DIRECTORY_FLAGS, dir_fd=root_fd)
                 try:
+                    _clear_darwin_extended_acl(child_fd, Path(root) / "child")
+                    _validate_owner_only_acl(child_fd, Path(root) / "child")
                     source_fd = os.open(
                         "source",
                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_NOFOLLOW,
                         OWNER_FILE_MODE,
                         dir_fd=child_fd,
                     )
-                    os.close(source_fd)
+                    try:
+                        _clear_darwin_extended_acl(
+                            source_fd,
+                            Path(root) / "child" / "source",
+                        )
+                        _validate_owner_only_acl(
+                            source_fd,
+                            Path(root) / "child" / "source",
+                        )
+                    finally:
+                        os.close(source_fd)
                     os.replace(
                         "source",
                         "renamed",
@@ -215,6 +340,27 @@ def _validate_file_stat(st: os.stat_result, path: Path) -> None:
     _validate_regular_file_stat(st, path, exact_mode=True, single_link=True)
 
 
+def validate_owner_only_directory_descriptor(
+    descriptor: int,
+    display_path: Path,
+    *,
+    exact_mode: bool = True,
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    _validate_directory_stat(metadata, display_path, exact_mode=exact_mode)
+    _validate_owner_only_acl(descriptor, display_path)
+    return metadata
+
+
+def harden_created_owner_only_directory_descriptor(
+    descriptor: int,
+    display_path: Path,
+) -> os.stat_result:
+    os.fchmod(descriptor, OWNER_DIRECTORY_MODE)
+    _clear_darwin_extended_acl(descriptor, display_path)
+    return validate_owner_only_directory_descriptor(descriptor, display_path)
+
+
 def _normalize_component_sequence(parts: list[str]) -> list[str]:
     normalized: list[str] = []
     for part in parts:
@@ -322,12 +468,17 @@ def _open_directory_chain(
                 component_path = Path(path.anchor, *traversed, name)
                 if created:
                     _validate_directory_stat(metadata, component_path, exact_mode=False)
-                    os.fchmod(child_fd, OWNER_DIRECTORY_MODE)
-                    metadata = os.fstat(child_fd)
-                    _validate_directory_stat(metadata, component_path, exact_mode=True)
+                    metadata = harden_created_owner_only_directory_descriptor(
+                        child_fd,
+                        component_path,
+                    )
                     os.fsync(directory_fd)
                 elif is_final:
-                    _validate_directory_stat(metadata, path, exact_mode=exact_mode)
+                    metadata = validate_owner_only_directory_descriptor(
+                        child_fd,
+                        path,
+                        exact_mode=exact_mode,
+                    )
                 else:
                     _validate_ancestor_directory(metadata, component_path)
             except BaseException:
@@ -396,7 +547,10 @@ def secure_remove_tree_at(
     except OSError as exc:
         raise UnsafePathError(f"cannot anchor cleanup tree: {display_path}") from exc
     try:
-        anchored = os.fstat(descriptor)
+        anchored = validate_owner_only_directory_descriptor(
+            descriptor,
+            display_path,
+        )
         if (observed.st_dev, observed.st_ino) != (anchored.st_dev, anchored.st_ino):
             raise UnsafePathError(f"cleanup tree changed while opened: {display_path}")
         counts = {"byte_count": 0, "directory_count": 1, "file_count": 0}
@@ -412,20 +566,34 @@ def secure_remove_tree_at(
                 for key, value in nested.items():
                     counts[key] += value
                 continue
-            _validate_file_stat(child, child_path)
-            current = os.stat(
+            child_fd = open_checked_file_at(
+                descriptor,
                 child_name,
-                dir_fd=descriptor,
-                follow_symlinks=False,
+                display_path=child_path,
+                require_owner_only=True,
             )
-            if (child.st_dev, child.st_ino) != (current.st_dev, current.st_ino):
-                raise UnsafePathError(
-                    f"cleanup file changed before unlink: {child_path}"
+            try:
+                anchored_child = os.fstat(child_fd)
+                current = os.stat(
+                    child_name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
                 )
-            os.unlink(child_name, dir_fd=descriptor)
-            counts["byte_count"] += child.st_size
-            counts["file_count"] += 1
+                if (anchored_child.st_dev, anchored_child.st_ino) != (
+                    current.st_dev,
+                    current.st_ino,
+                ):
+                    raise UnsafePathError(
+                        f"cleanup file changed before unlink: {child_path}"
+                    )
+                _validate_owner_only_acl(child_fd, child_path)
+                os.unlink(child_name, dir_fd=descriptor)
+                counts["byte_count"] += anchored_child.st_size
+                counts["file_count"] += 1
+            finally:
+                os.close(child_fd)
         os.fsync(descriptor)
+        validate_owner_only_directory_descriptor(descriptor, display_path)
         current_root = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if (anchored.st_dev, anchored.st_ino) != (
             current_root.st_dev,
@@ -461,7 +629,10 @@ def inspect_tree_at(
     except OSError as exc:
         raise UnsafePathError(f"cannot anchor inspected tree: {display_path}") from exc
     try:
-        anchored = os.fstat(descriptor)
+        anchored = validate_owner_only_directory_descriptor(
+            descriptor,
+            display_path,
+        )
         if (observed.st_dev, observed.st_ino) != (anchored.st_dev, anchored.st_ino):
             raise UnsafePathError(
                 f"inspected tree changed while opened: {display_path}"
@@ -479,22 +650,33 @@ def inspect_tree_at(
                 for key, value in nested.items():
                     counts[key] += value
                 continue
-            _validate_file_stat(child, child_path)
-            current = os.stat(
+            child_fd = open_checked_file_at(
+                descriptor,
                 child_name,
-                dir_fd=descriptor,
-                follow_symlinks=False,
+                display_path=child_path,
+                require_owner_only=True,
             )
-            if (child.st_dev, child.st_ino, child.st_size) != (
-                current.st_dev,
-                current.st_ino,
-                current.st_size,
-            ):
-                raise UnsafePathError(
-                    f"inspected file changed while counted: {child_path}"
+            try:
+                anchored_child = os.fstat(child_fd)
+                current = os.stat(
+                    child_name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
                 )
-            counts["byte_count"] += child.st_size
-            counts["file_count"] += 1
+                if (
+                    anchored_child.st_dev,
+                    anchored_child.st_ino,
+                    anchored_child.st_size,
+                ) != (current.st_dev, current.st_ino, current.st_size):
+                    raise UnsafePathError(
+                        f"inspected file changed while counted: {child_path}"
+                    )
+                _validate_owner_only_acl(child_fd, child_path)
+                counts["byte_count"] += anchored_child.st_size
+                counts["file_count"] += 1
+            finally:
+                os.close(child_fd)
+        validate_owner_only_directory_descriptor(descriptor, display_path)
         current_root = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if (anchored.st_dev, anchored.st_ino) != (
             current_root.st_dev,
@@ -581,6 +763,7 @@ def open_checked_file_at(
         metadata = os.fstat(descriptor)
         if require_owner_only:
             _validate_file_stat(metadata, display_path)
+            _validate_owner_only_acl(descriptor, display_path)
         elif not stat.S_ISREG(metadata.st_mode):
             raise UnsafePathError(f"expected a regular file: {display_path}")
         current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -598,9 +781,16 @@ def validate_owner_only_file_descriptor(
     *,
     directory_fd: int | None = None,
     name: str | None = None,
+    single_link: bool = True,
 ) -> None:
     metadata = os.fstat(descriptor)
-    _validate_file_stat(metadata, display_path)
+    _validate_regular_file_stat(
+        metadata,
+        display_path,
+        exact_mode=True,
+        single_link=single_link,
+    )
+    _validate_owner_only_acl(descriptor, display_path)
     if directory_fd is None and name is None:
         return
     if directory_fd is None or name is None:
@@ -611,6 +801,21 @@ def validate_owner_only_file_descriptor(
         raise UnsafePathError(f"locked file name disappeared: {display_path}") from exc
     if (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino):
         raise UnsafePathError(f"locked file name changed: {display_path}")
+
+
+def harden_created_owner_only_file_descriptor(
+    descriptor: int,
+    display_path: Path,
+    *,
+    single_link: bool = True,
+) -> None:
+    os.fchmod(descriptor, OWNER_FILE_MODE)
+    _clear_darwin_extended_acl(descriptor, display_path)
+    validate_owner_only_file_descriptor(
+        descriptor,
+        display_path,
+        single_link=single_link,
+    )
 
 
 def open_lock_file_at(directory_fd: int, name: str, *, display_path: Path) -> int:
@@ -649,8 +854,13 @@ def open_lock_file_at(directory_fd: int, name: str, *, display_path: Path) -> in
                 f"lock file mode must be 0o600, found {_describe_mode(mode)}: "
                 f"{display_path}"
             )
+        if not created:
+            _validate_owner_only_acl(descriptor, display_path)
         if created or mode != OWNER_FILE_MODE:
             os.fchmod(descriptor, OWNER_FILE_MODE)
+        if created:
+            _clear_darwin_extended_acl(descriptor, display_path)
+        if created or mode != OWNER_FILE_MODE:
             os.fsync(directory_fd)
         validate_owner_only_file_descriptor(
             descriptor,
@@ -670,14 +880,15 @@ def _validate_existing_target_at(
     display_path: Path,
 ) -> bool:
     try:
-        target_stat = os.stat(
+        descriptor = open_checked_file_at(
+            directory_fd,
             target_name,
-            dir_fd=directory_fd,
-            follow_symlinks=False,
+            display_path=display_path,
+            require_owner_only=True,
         )
     except FileNotFoundError:
         return False
-    _validate_file_stat(target_stat, display_path)
+    os.close(descriptor)
     return True
 
 
@@ -713,7 +924,10 @@ def _write_temporary_at(directory_fd: int, target_name: str, data: bytes) -> str
                 exact_mode=False,
                 single_link=True,
             )
-            os.fchmod(descriptor, OWNER_FILE_MODE)
+            harden_created_owner_only_file_descriptor(
+                descriptor,
+                Path(temporary_name),
+            )
             _write_all(descriptor, data)
             os.fsync(descriptor)
             succeeded = True
@@ -847,6 +1061,7 @@ def _pending_candidates_at(
                 exact_mode=False,
                 single_link=False,
             )
+            _validate_owner_only_acl(descriptor, Path(name))
             if stat.S_IMODE(metadata.st_mode) != OWNER_FILE_MODE:
                 if metadata.st_nlink != 1:
                     raise UnsafePathError(
@@ -898,12 +1113,30 @@ def _recover_atomic_create_at(
         target_stat = None
 
     if target_stat is not None:
-        _validate_regular_file_stat(
-            target_stat,
-            display_path,
-            exact_mode=True,
-            single_link=False,
+        target_descriptor = os.open(
+            target_name,
+            os.O_RDONLY | _FILE_NOFOLLOW,
+            dir_fd=directory_fd,
         )
+        try:
+            anchored_target = os.fstat(target_descriptor)
+            _validate_regular_file_stat(
+                anchored_target,
+                display_path,
+                exact_mode=True,
+                single_link=False,
+            )
+            _validate_owner_only_acl(target_descriptor, display_path)
+            if (target_stat.st_dev, target_stat.st_ino) != (
+                anchored_target.st_dev,
+                anchored_target.st_ino,
+            ):
+                raise UnsafePathError(
+                    f"atomic-create target changed while opened: {display_path}"
+                )
+            target_stat = anchored_target
+        finally:
+            os.close(target_descriptor)
         matching = [
             name
             for name, metadata in candidates
@@ -918,7 +1151,10 @@ def _recover_atomic_create_at(
                 dir_fd=directory_fd,
                 follow_symlinks=False,
             )
-        _validate_file_stat(target_stat, display_path)
+        if not _validate_existing_target_at(directory_fd, target_name, display_path):
+            raise UnsafePathError(
+                f"atomic-create target disappeared during recovery: {display_path}"
+            )
         for name, metadata in candidates:
             if name in matching:
                 continue
@@ -952,8 +1188,10 @@ def _recover_atomic_create_at(
     os.fsync(directory_fd)
     os.unlink(pending_name, dir_fd=directory_fd)
     os.fsync(directory_fd)
-    recovered = os.stat(target_name, dir_fd=directory_fd, follow_symlinks=False)
-    _validate_file_stat(recovered, display_path)
+    if not _validate_existing_target_at(directory_fd, target_name, display_path):
+        raise UnsafePathError(
+            f"atomic-create target disappeared during recovery: {display_path}"
+        )
     return True
 
 
@@ -1109,7 +1347,10 @@ def atomic_create_bytes(
                 exact_mode=False,
                 single_link=True,
             )
-            os.fchmod(descriptor, OWNER_FILE_MODE)
+            harden_created_owner_only_file_descriptor(
+                descriptor,
+                target.parent / pending_name,
+            )
             _write_all(descriptor, payload)
             os.fsync(descriptor)
             prepared = True
@@ -1245,6 +1486,8 @@ def read_bounded_bytes_at(
             display_path,
             require_owner_only=require_owner_only,
         )
+        if require_owner_only:
+            _validate_owner_only_acl(descriptor, display_path)
         if before.st_size > max_bytes:
             raise ReadLimitExceeded(
                 "file exceeds byte limit "
@@ -1263,6 +1506,8 @@ def read_bounded_bytes_at(
             display_path,
             require_owner_only=require_owner_only,
         )
+        if require_owner_only:
+            _validate_owner_only_acl(descriptor, display_path)
         if (
             _bounded_read_identity(before) != _bounded_read_identity(after_first_read)
             or total != before.st_size
@@ -1283,6 +1528,8 @@ def read_bounded_bytes_at(
             display_path,
             require_owner_only=require_owner_only,
         )
+        if require_owner_only:
+            _validate_owner_only_acl(descriptor, display_path)
         try:
             path_after_verification = os.stat(
                 name,
@@ -1298,6 +1545,8 @@ def read_bounded_bytes_at(
             display_path,
             require_owner_only=require_owner_only,
         )
+        if require_owner_only:
+            _validate_owner_only_acl(descriptor, display_path)
         if (
             _bounded_read_identity(before) != _bounded_read_identity(after_verification)
             or _bounded_read_identity(before)
@@ -1356,6 +1605,8 @@ def fingerprint_file_bounded(
         )
         try:
             before = os.fstat(descriptor)
+            if require_owner_only:
+                _validate_owner_only_acl(descriptor, normalized)
             prefix = os.pread(descriptor, min(sample_bytes, before.st_size), 0)
             suffix_offset = max(0, before.st_size - sample_bytes)
             suffix = os.pread(
@@ -1364,6 +1615,8 @@ def fingerprint_file_bounded(
                 suffix_offset,
             )
             after = os.fstat(descriptor)
+            if require_owner_only:
+                _validate_owner_only_acl(descriptor, normalized)
             before_identity = (
                 before.st_dev,
                 before.st_ino,

@@ -11,9 +11,10 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -147,6 +148,14 @@ from .publication_state import (  # noqa: F401
 )
 
 
+_DESCRIPTOR_CWD_EXEC_SOURCE = (
+    "import os,sys\n"
+    "descriptor=int(sys.argv[1])\n"
+    "os.fchdir(descriptor)\n"
+    "os.execve(sys.argv[2],sys.argv[2:],os.environ)\n"
+)
+
+
 def _resolve_executable(
     value: str | os.PathLike[str],
     *,
@@ -181,10 +190,94 @@ def _strict_subprocess_environment(*, home: Path) -> dict[str, str]:
     return environment
 
 
+def _revalidate_publisher_home_binding(
+    descriptor: int,
+    home: Path,
+    identity: os.stat_result,
+) -> None:
+    try:
+        safe_io.validate_owner_only_directory_descriptor(descriptor, home)
+        with ExitStack() as reopened_custody:
+            _reopened_home, reopened_descriptor = safe_io.open_owner_only_directory(
+                home,
+                reject_symlink_ancestors=True,
+            )
+            reopened_custody.callback(os.close, reopened_descriptor)
+            reopened_identity = os.fstat(reopened_descriptor)
+            if (reopened_identity.st_dev, reopened_identity.st_ino) != (
+                identity.st_dev,
+                identity.st_ino,
+            ):
+                raise safe_io.UnsafePathError(
+                    "publisher GNUPGHOME path no longer names the anchored directory"
+                )
+    except (OSError, safe_io.UnsafePathError) as exc:
+        raise LocalGitPublicationError(
+            "publisher GNUPGHOME changed after validation"
+        ) from exc
+
+
+@contextmanager
+def _publisher_home_subprocess_binding(
+    gnupg_home: str | os.PathLike[str],
+):
+    home = Path(gnupg_home).expanduser().absolute()
+    try:
+        home, descriptor = safe_io.open_owner_only_directory(
+            home,
+            reject_symlink_ancestors=True,
+        )
+    except (OSError, safe_io.UnsafePathError) as exc:
+        raise LocalGitPublicationError(
+            f"publisher GNUPGHOME is unavailable: {home}"
+        ) from exc
+    identity = os.fstat(descriptor)
+
+    try:
+        _revalidate_publisher_home_binding(descriptor, home, identity)
+        try:
+            yield home, Path("."), descriptor
+        except BaseException as operation_error:
+            try:
+                _revalidate_publisher_home_binding(descriptor, home, identity)
+            except BaseException as validation_error:
+                raise validation_error from operation_error
+            raise
+        _revalidate_publisher_home_binding(descriptor, home, identity)
+    finally:
+        os.close(descriptor)
+
+
+def _descriptor_bound_launch(
+    command: Sequence[str],
+    descriptor: int | None,
+) -> tuple[list[str], tuple[int, ...]]:
+    if descriptor is None:
+        return list(command), ()
+    if os.name != "posix":
+        raise LocalGitPublicationError(
+            "descriptor-bound subprocess launch is unavailable on this platform"
+        )
+    return (
+        [
+            os.path.realpath(sys.executable),
+            "-I",
+            "-B",
+            "-S",
+            "-c",
+            _DESCRIPTOR_CWD_EXEC_SOURCE,
+            str(descriptor),
+            *command,
+        ],
+        (descriptor,),
+    )
+
+
 def _run_bounded_subprocess(
     command: Sequence[str],
     *,
     environment: Mapping[str, str],
+    cwd_descriptor: int | None = None,
     input_bytes: bytes | None = None,
     timeout_seconds: float,
     max_output_bytes: int,
@@ -201,17 +294,21 @@ def _run_bounded_subprocess(
         or max_output_bytes <= 0
     ):
         raise ValueError("subprocess output limit must be a positive integer")
+    launch_command, inherited_descriptors = _descriptor_bound_launch(
+        command, cwd_descriptor
+    )
     try:
         process = subprocess.Popen(
-            list(command),
+            launch_command,
             stdin=(subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=dict(environment),
             close_fds=True,
+            pass_fds=inherited_descriptors,
             start_new_session=os.name == "posix",
         )
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         raise LocalGitPublicationError("cannot start bounded subprocess") from exc
 
     assert process.stdout is not None
@@ -344,6 +441,39 @@ def _run_bounded_subprocess(
         kill_process()
 
 
+def _run_publisher_listing(
+    *,
+    argument: str,
+    descriptor: int,
+    gpg_executable: str,
+    home: Path,
+    subprocess_home: Path,
+    timeout_seconds: float,
+) -> bytes:
+    environment = _strict_subprocess_environment(home=subprocess_home)
+    environment["GNUPGHOME"] = str(subprocess_home)
+    result = _run_bounded_subprocess(
+        [
+            gpg_executable,
+            "--homedir",
+            str(subprocess_home),
+            "--batch",
+            "--with-colons",
+            argument,
+        ],
+        environment=environment,
+        cwd_descriptor=descriptor,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=MAX_RECEIPT_BYTES,
+    )
+    _revalidate_publisher_home_binding(descriptor, home, os.fstat(descriptor))
+    if result.returncode != 0:
+        raise LocalGitPublicationError(
+            f"cannot inspect dedicated publisher keyring: {_bounded_git_error(result)}"
+        )
+    return result.stdout
+
+
 def validate_publisher_keyring(
     *,
     gnupg_home: str | os.PathLike[str] = DEFAULT_PUBLISHER_GNUPG_HOME,
@@ -363,46 +493,7 @@ def validate_publisher_keyring(
         raise LocalGitPublicationError(
             "publisher UID has an invalid canonical name/email shape"
         )
-    home = Path(gnupg_home).expanduser().absolute()
     gpg_executable = _resolve_executable(gpg_program, label="GPG")
-    try:
-        metadata = home.lstat()
-    except OSError as exc:
-        raise LocalGitPublicationError(
-            f"publisher GNUPGHOME is unavailable: {home}"
-        ) from exc
-    current_uid = getattr(os, "geteuid", lambda: metadata.st_uid)()
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != current_uid
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-    ):
-        raise LocalGitPublicationError(
-            "publisher GNUPGHOME must be owner-only mode 0700"
-        )
-
-    def run_listing(argument: str) -> bytes:
-        environment = _strict_subprocess_environment(home=home)
-        environment["GNUPGHOME"] = str(home)
-        result = _run_bounded_subprocess(
-            [
-                gpg_executable,
-                "--homedir",
-                str(home),
-                "--batch",
-                "--with-colons",
-                argument,
-            ],
-            environment=environment,
-            timeout_seconds=timeout_seconds,
-            max_output_bytes=MAX_RECEIPT_BYTES,
-        )
-        if result.returncode != 0:
-            raise LocalGitPublicationError(
-                f"cannot inspect dedicated publisher keyring: {_bounded_git_error(result)}"
-            )
-        return result.stdout
 
     def inventory(
         payload: bytes,
@@ -432,22 +523,40 @@ def validate_publisher_keyring(
             ) from exc
         return fingerprints, uids
 
-    secret_fingerprints, secret_uids = inventory(
-        run_listing("--list-secret-keys"),
-        primary_record="sec",
-    )
-    if secret_fingerprints != [normalized_fingerprint]:
-        raise LocalGitPublicationError(
-            "publisher GNUPGHOME must contain exactly the configured secret primary key"
+    with _publisher_home_subprocess_binding(gnupg_home) as (
+        home,
+        subprocess_home,
+        home_descriptor,
+    ):
+        secret_payload = _run_publisher_listing(
+            argument="--list-secret-keys",
+            descriptor=home_descriptor,
+            gpg_executable=gpg_executable,
+            home=home,
+            subprocess_home=subprocess_home,
+            timeout_seconds=timeout_seconds,
         )
-    if secret_uids != [expected_uid]:
-        raise LocalGitPublicationError(
-            "publisher key must contain exactly the configured sole UID"
+        secret_fingerprints, secret_uids = inventory(
+            secret_payload,
+            primary_record="sec",
         )
-    public_fingerprints, public_uids = inventory(
-        run_listing("--list-keys"),
-        primary_record="pub",
-    )
+        if secret_fingerprints != [normalized_fingerprint]:
+            raise LocalGitPublicationError(
+                "publisher GNUPGHOME must contain exactly the configured secret primary key"
+            )
+        if secret_uids != [expected_uid]:
+            raise LocalGitPublicationError(
+                "publisher key must contain exactly the configured sole UID"
+            )
+        public_payload = _run_publisher_listing(
+            argument="--list-keys",
+            descriptor=home_descriptor,
+            gpg_executable=gpg_executable,
+            home=home,
+            subprocess_home=subprocess_home,
+            timeout_seconds=timeout_seconds,
+        )
+    public_fingerprints, public_uids = inventory(public_payload, primary_record="pub")
     if public_fingerprints != [normalized_fingerprint] or public_uids != [expected_uid]:
         raise LocalGitPublicationError(
             "publisher GNUPGHOME must contain only the configured public primary key and UID"
