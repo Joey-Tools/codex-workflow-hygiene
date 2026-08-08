@@ -522,6 +522,58 @@ class ResultValidationTests(unittest.TestCase):
             )
         )
 
+        untrusted_suffix_batches = list(
+            source_overlap_module.json_string_value_batches(
+                (
+                    '{"customer_ref":"Discuss frosted meadow launch carefully",'
+                    '"session_id":"valid-session",'
+                    '"timestamp":"2026-07-06T01:00:00Z",'
+                    '"STATUS":"uppercase-secret",'
+                    '"\\u017ftatus":"unicode-secret",'
+                    '"created_at":"2026-99-01T01:00:00Z",'
+                    '"started_at":"2026-01-01T99:00:00Z",'
+                    '"updated_at":"2026-01-01T01:00:00+99:00",'
+                    '"completed_at":"2025-02-29T01:00:00Z",'
+                    '"request_id":"Raw prompt hidden as a request id"}',
+                ),
+                query_chars=8,
+                maximum_batch_chars=64,
+                maximum_batch_items=4,
+            )
+        )
+        untrusted_suffix_candidates = [
+            candidate for batch in untrusted_suffix_batches for candidate in batch
+        ]
+
+        self.assertIn(
+            "discuss frosted meadow launch carefully",
+            untrusted_suffix_candidates,
+        )
+        self.assertIn(
+            "raw prompt hidden as a request id",
+            untrusted_suffix_candidates,
+        )
+        self.assertNotIn("valid-session", untrusted_suffix_candidates)
+        self.assertNotIn("2026-07-06t01:00:00z", untrusted_suffix_candidates)
+        self.assertIn("uppercase-secret", untrusted_suffix_candidates)
+        self.assertIn("unicode-secret", untrusted_suffix_candidates)
+        self.assertIn(
+            "2026-99-01t01:00:00z",
+            untrusted_suffix_candidates,
+        )
+        self.assertIn(
+            "2026-01-01t99:00:00z",
+            untrusted_suffix_candidates,
+        )
+        self.assertIn(
+            "2026-01-01t01:00:00+99:00",
+            untrusted_suffix_candidates,
+        )
+        self.assertIn(
+            "2025-02-29t01:00:00z",
+            untrusted_suffix_candidates,
+        )
+
     def test_result_complexity_is_bounded_before_privacy_processing(self) -> None:
         value = extractor_result()
         value["turns"][0]["generalized_working_text"] = "x" * (

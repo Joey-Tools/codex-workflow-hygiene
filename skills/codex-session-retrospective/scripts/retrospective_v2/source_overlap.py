@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import codecs
+import contextlib
+import datetime as dt
+import functools
+import re
 from collections import deque
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 
 _MAX_CLASSIFIED_KEY_CHARS = 256
-_NON_PROSE_VALUE_KEYS = frozenset(
+_MAX_CONTROL_VALUE_CHARS = 4_096
+_CONTROL_IDENTIFIER_KEYS = frozenset(
     {
         "approval_policy",
-        "cwd",
         "host",
         "id",
         "kind",
@@ -20,40 +24,113 @@ _NON_PROSE_VALUE_KEYS = frozenset(
         "outcome",
         "phase",
         "provider",
-        "role",
         "sandbox_policy",
         "schema",
         "state",
         "status",
-        "timestamp",
-        "ts",
         "type",
         "version",
+        "call_id",
+        "event_id",
+        "item_id",
+        "request_id",
+        "response_id",
+        "session_id",
     }
 )
-_NON_PROSE_VALUE_SUFFIXES = (
-    "_at",
-    "_commitment",
-    "_digest",
-    "_id",
-    "_ref",
-    "_timestamp",
+_CONTROL_TIMESTAMP_KEYS = frozenset(
+    {"completed_at", "created_at", "started_at", "timestamp", "ts", "updated_at"}
 )
+_CONTROL_REFERENCE_KEYS = frozenset(
+    {
+        "attempt_ref",
+        "configuration_ref",
+        "cursor_root_ref",
+        "episode_ref",
+        "episode_revision_ref",
+        "evidence_ref",
+        "gap_ref",
+        "goal_ref",
+        "host_ref",
+        "job_ref",
+        "result_ref",
+        "reviewer_ref",
+        "run_ref",
+        "session_ref",
+        "source_snapshot_ref",
+        "source_unit_ref",
+        "span_ref",
+        "task_ref",
+        "topic_ref",
+        "turn_ref",
+        "workstream_ref",
+    }
+)
+_CONTROL_DIGEST_KEYS = frozenset(
+    {
+        "bundle_digest",
+        "fragment_commitment",
+        "helper_commitment",
+        "record_commitment",
+        "source_snapshot_digest",
+    }
+)
+_CONTROL_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+~-]{0,511}")
+_CONTROL_TIMESTAMP_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
+)
+_CONTROL_REFERENCE_RE = re.compile(r"[a-z][a-z0-9_]*_ref_v[0-9]+:[0-9a-f]{16,128}")
+_CONTROL_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_CONTROL_CWD_RE = re.compile(r"/[^\x00-\x1f\x7f]{0,4095}")
+_CONTROL_ROLE_RE = re.compile(r"(?:assistant|developer|system|tool|user)")
 
 
-def _key_carries_control_value(value: str) -> bool:
-    normalized = value.casefold()
-    return normalized in _NON_PROSE_VALUE_KEYS or normalized.endswith(
-        _NON_PROSE_VALUE_SUFFIXES
-    )
+def _matches_pattern(value: str, *, pattern: re.Pattern[str]) -> bool:
+    return pattern.fullmatch(value) is not None
+
+
+def _matches_timestamp(value: str) -> bool:
+    match = _CONTROL_TIMESTAMP_RE.fullmatch(value)
+    with contextlib.suppress(AttributeError, ValueError):
+        dt.datetime.fromisoformat(match.group(0))
+        return True
+    return False
+
+
+_CONTROL_VALUE_VALIDATORS = {
+    **{
+        key: functools.partial(_matches_pattern, pattern=_CONTROL_IDENTIFIER_RE)
+        for key in _CONTROL_IDENTIFIER_KEYS
+    },
+    **dict.fromkeys(_CONTROL_TIMESTAMP_KEYS, _matches_timestamp),
+    **{
+        key: functools.partial(_matches_pattern, pattern=_CONTROL_REFERENCE_RE)
+        for key in _CONTROL_REFERENCE_KEYS
+    },
+    **{
+        key: functools.partial(_matches_pattern, pattern=_CONTROL_DIGEST_RE)
+        for key in _CONTROL_DIGEST_KEYS
+    },
+    "cwd": functools.partial(_matches_pattern, pattern=_CONTROL_CWD_RE),
+    "role": functools.partial(_matches_pattern, pattern=_CONTROL_ROLE_RE),
+}
+_CONTROL_VALUE_KEY_LOOKUP = {key: key for key in _CONTROL_VALUE_VALIDATORS}
+
+
+def _control_value_key(value: str) -> str | None:
+    return _CONTROL_VALUE_KEY_LOOKUP.get(value)
+
+
+def _validated_control_value(key: str, value: str) -> bool:
+    return _CONTROL_VALUE_VALIDATORS[key](value)
 
 
 @dataclass(slots=True)
 class _ContainerFrame:
     kind: str
     state: str
-    inherited_control_value: bool
-    next_value_is_control: bool = False
+    next_control_key: str | None = None
 
 
 def decoded_utf8_chunks(fragments: Iterable[bytes]) -> Iterator[str]:
@@ -180,7 +257,9 @@ def _decoded_json_string_value_windows(
     root_state = "value"
     in_string = False
     string_is_value = False
-    string_is_control = False
+    string_control_key: str | None = None
+    control_value_characters: list[str] | None = None
+    control_value_length = 0
     escaped = False
     unicode_digits: str | None = None
     pending_high_surrogate: int | None = None
@@ -214,18 +293,19 @@ def _decoded_json_string_value_windows(
             root_state = "done"
         else:
             stack[-1].state = "comma_or_end"
-            stack[-1].next_value_is_control = False
+            stack[-1].next_control_key = None
 
-    def current_value_is_control() -> bool:
+    def current_control_key() -> str | None:
         if not stack:
-            return False
+            return None
         frame = stack[-1]
-        return frame.inherited_control_value or (
-            frame.kind == "object" and frame.next_value_is_control
-        )
+        return frame.next_control_key if frame.kind == "object" else None
 
     def emit(decoded: str) -> list[str]:
+        nonlocal control_value_characters
+        nonlocal control_value_length
         nonlocal key_overflow
+        nonlocal string_control_key
         if not string_is_value:
             if not key_overflow:
                 remaining = _MAX_CLASSIFIED_KEY_CHARS - len(key_characters)
@@ -235,8 +315,16 @@ def _decoded_json_string_value_windows(
                 else:
                     key_characters.extend(decoded)
             return []
-        if string_is_control or windows is None:
-            return []
+        assert windows is not None
+        if string_control_key is not None and control_value_characters is not None:
+            if control_value_length + len(decoded) <= _MAX_CONTROL_VALUE_CHARS:
+                control_value_characters.append(decoded)
+                control_value_length += len(decoded)
+                return []
+            buffered = "".join(control_value_characters)
+            control_value_characters = None
+            string_control_key = None
+            return windows.feed(buffered + decoded)
         return windows.feed(decoded)
 
     def start_primitive(character: str) -> None:
@@ -360,16 +448,31 @@ def _decoded_json_string_value_windows(
                     in_string = False
                     if string_is_value:
                         if windows is not None:
+                            if (
+                                string_control_key is not None
+                                and control_value_characters is not None
+                                and not _validated_control_value(
+                                    string_control_key,
+                                    "".join(control_value_characters),
+                                )
+                            ):
+                                yield from windows.feed(
+                                    "".join(control_value_characters)
+                                )
                             yield from windows.finish()
                         complete_value()
                     else:
                         frame = stack[-1]
-                        frame.next_value_is_control = frame.inherited_control_value or (
-                            not key_overflow
-                            and _key_carries_control_value("".join(key_characters))
+                        frame.next_control_key = (
+                            None
+                            if key_overflow
+                            else _control_value_key("".join(key_characters))
                         )
                         frame.state = "colon"
                     windows = None
+                    string_control_key = None
+                    control_value_characters = None
+                    control_value_length = 0
                     continue
                 if ord(character) < 0x20 or pending_high_surrogate is not None:
                     raise ValueError("source JSON string contains an invalid character")
@@ -403,15 +506,17 @@ def _decoded_json_string_value_windows(
                 pending_high_surrogate = None
                 key_characters = []
                 key_overflow = False
-                string_is_control = (
-                    current_value_is_control() if string_is_value else False
+                string_control_key = current_control_key() if string_is_value else None
+                control_value_characters = (
+                    [] if string_control_key is not None else None
                 )
+                control_value_length = 0
                 windows = (
                     _NormalizedValueWindows(
                         query_chars=query_chars,
                         maximum_chars=maximum_chars,
                     )
-                    if string_is_value and not string_is_control
+                    if string_is_value
                     else None
                 )
             elif character in "{[":
@@ -421,10 +526,6 @@ def _decoded_json_string_value_windows(
                     _ContainerFrame(
                         kind="object" if character == "{" else "array",
                         state="key_or_end" if character == "{" else "value_or_end",
-                        # A control-key exemption applies only to its direct
-                        # scalar value. Containers are untrusted structure and
-                        # their nested strings remain overlap candidates.
-                        inherited_control_value=False,
                     )
                 )
             elif character in "}]":

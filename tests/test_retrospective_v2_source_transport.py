@@ -959,6 +959,35 @@ class SourceTransportProtocolTests(unittest.TestCase):
 
         self.assertLess(time.monotonic() - started, 1.5)
 
+    def test_remote_helper_timeout_closes_detached_inherited_stdout(self) -> None:
+        helper = self.root / "remote-helper-with-detached-writer.py"
+        helper.write_text(
+            "import subprocess, sys\n"
+            "subprocess.Popen(\n"
+            "    [sys.executable, '-I', '-c', 'import time; time.sleep(1)'],\n"
+            "    stdout=sys.stdout,\n"
+            "    start_new_session=True,\n"
+            ")\n"
+            "print('{}')\n",
+            encoding="ascii",
+        )
+        started = time.monotonic()
+
+        with (
+            mock.patch.object(
+                transport_remote,
+                "REMOTE_HOST_CONTEXT_COMMAND_TIMEOUT_SECONDS",
+                0.1,
+            ),
+            self.assertRaisesRegex(RuntimeError, "transport unavailable"),
+        ):
+            transport._relay_remote_host_context_command(
+                (sys.executable, "-I", str(helper)),
+                max_output_bytes=1024,
+            )
+
+        self.assertLess(time.monotonic() - started, 0.75)
+
     def test_remote_helper_success_closes_detached_output_descendant(self) -> None:
         helper = self.root / "remote-helper-detached-child.py"
         child_pid_path = self.root / "remote-helper-detached-child.pid"

@@ -1617,18 +1617,12 @@ def _garbage_collect_at(
                     else _normalize_instant(state["terminal_at"], label="terminal_at")
                 )
                 if state["status"] == "publication_bound":
-                    heartbeat = _normalize_instant(
-                        state["publication_heartbeat_at"],
-                        label="publication_heartbeat_at",
-                    )
-                    if clock >= heartbeat + MAX_PUBLICATION_BOUND_RETENTION:
-                        expired = dict(state)
-                        expired["status"] = "publication_terminal"
-                        expired["terminal_at"] = _format_instant(clock)
-                        expired["terminal_disposition"] = "aborted"
-                        _write_retention_at(anchor, expired)
-                        state = expired
-                        terminal_at = clock
+                    # Only the attempt owner can recover or terminate a bound
+                    # publication. GC has no transaction authority and must
+                    # retain the exact bundle until an authenticated terminal
+                    # disposition is persisted.
+                    retained.append(str(anchor.output))
+                    continue
                 eligible = (state["status"] == "exported" and clock >= deadline) or (
                     state["status"] == "publication_terminal"
                     and terminal_at is not None

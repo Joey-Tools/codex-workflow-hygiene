@@ -1758,7 +1758,7 @@ class RetrospectiveV2ExportTests(unittest.TestCase):
             self.assertEqual(result["deleted"], [str(staging.resolve())])
             self.assertFalse(staging.exists())
 
-    def test_publication_bound_export_is_not_collected_by_ordinary_retention_gc(
+    def test_publication_bound_export_requires_attempt_terminal_before_gc(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1788,7 +1788,26 @@ class RetrospectiveV2ExportTests(unittest.TestCase):
                 root,
                 now=now + dt.timedelta(days=8),
             )
-            self.assertEqual(expired["deleted"], [str(output.resolve())])
+            self.assertEqual(expired["deleted"], [])
+            self.assertEqual(expired["retained"], [str(output.resolve())])
+            self.assertTrue(output.exists())
+            retention = json.loads(
+                (root / ".retained-v2.retention-v2.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual("publication_bound", retention["status"])
+            self.assertEqual(attempt_ref, retention["publication_attempt_ref"])
+
+            release_staged_export(
+                output,
+                attempt_ref,
+                "aborted",
+                now=now + dt.timedelta(days=8),
+            )
+            collected = garbage_collect_expired_exports(
+                root,
+                now=now + dt.timedelta(days=8),
+            )
+            self.assertEqual(collected["deleted"], [str(output.resolve())])
             self.assertFalse(output.exists())
 
     def test_recent_publication_resume_heartbeat_prevents_stale_gc(self) -> None:

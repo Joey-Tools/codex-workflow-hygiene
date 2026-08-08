@@ -7,11 +7,12 @@ import codecs
 import os
 import pathlib
 import pwd
+import selectors
 import signal
 import subprocess
 import sys
 import tempfile
-import threading
+import time
 from typing import Any, Callable, Mapping, Sequence
 
 try:
@@ -165,6 +166,46 @@ def _relay_valid_utf8(output: Any) -> None:
     sys.stdout.flush()
 
 
+def _terminate_remote_process_group(process: subprocess.Popen[bytes]) -> None:
+    terminations = {
+        False: (process.kill,),
+        True: (lambda: os.killpg(process.pid, signal.SIGKILL), process.kill),
+    }[os.name == "posix"]
+    for terminate in terminations:
+        try:
+            terminate()
+        except OSError:
+            pass
+
+
+def _close_remote_process_group(process: subprocess.Popen[bytes]) -> int:
+    _terminate_remote_process_group(process)
+    try:
+        return process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            return process.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "remote-host-context transport did not terminate"
+            ) from exc
+
+
+def _filter_remote_output(stream_filter: Any, chunk: bytes | None = None) -> bytes:
+    try:
+        if chunk is None:
+            return stream_filter.finish()
+        return chunk if stream_filter is None else stream_filter.feed(chunk)
+    except (TransportValidationError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(
+            "remote-host-context transport emitted an invalid protocol stream"
+        ) from exc
+
+
 def _relay_remote_host_context_command(
     argv: Sequence[str],
     *,
@@ -189,111 +230,61 @@ def _relay_remote_host_context_command(
     except OSError as exc:
         raise RuntimeError("remote-host-context transport unavailable") from exc
 
-    timed_out = False
-    process_group_cleanup_attempted = False
-    process_group_cleanup_lock = threading.Lock()
+    leader_reaped = False
 
-    def terminate_process_group() -> None:
-        nonlocal process_group_cleanup_attempted
-        with process_group_cleanup_lock:
-            if process_group_cleanup_attempted:
-                return
-            process_group_cleanup_attempted = True
-        try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-        except OSError:
-            pass
-        if os.name == "posix":
-            try:
-                process.kill()
-            except OSError:
-                pass
-
-    def terminate_on_timeout() -> None:
-        nonlocal timed_out
-        timed_out = True
-        terminate_process_group()
-
-    timer = threading.Timer(
-        REMOTE_HOST_CONTEXT_COMMAND_TIMEOUT_SECONDS,
-        terminate_on_timeout,
-    )
-    timer.daemon = True
-    timer.start()
+    selector = selectors.DefaultSelector()
+    active_error: BaseException | None = None
     try:
         if process.stdout is None:
             raise RuntimeError("remote-host-context transport unavailable")
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + REMOTE_HOST_CONTEXT_COMMAND_TIMEOUT_SECONDS
         with tempfile.TemporaryFile(mode="w+b") as output:
             input_bytes = 0
             output_bytes = 0
-            while chunk := process.stdout.read(64 * 1024):
+            timed_out = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                if not selector.select(remaining):
+                    timed_out = True
+                    break
+                try:
+                    chunk = os.read(process.stdout.fileno(), 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    break
                 input_bytes += len(chunk)
                 if input_bytes > max_output_bytes:
-                    terminate_process_group()
-                    process.wait()
                     raise RuntimeError(
                         "remote-host-context transport exceeded its output envelope"
                     )
-                try:
-                    filtered = (
-                        chunk if stream_filter is None else stream_filter.feed(chunk)
-                    )
-                except (
-                    TransportValidationError,
-                    UnicodeDecodeError,
-                    ValueError,
-                ) as exc:
-                    terminate_process_group()
-                    process.wait()
-                    raise RuntimeError(
-                        "remote-host-context transport emitted an invalid protocol stream"
-                    ) from exc
+                filtered = _filter_remote_output(stream_filter, chunk)
                 output_bytes += len(filtered)
                 if output_bytes > max_output_bytes:
-                    terminate_process_group()
-                    process.wait()
                     raise RuntimeError(
                         "remote-host-context transport exceeded its output envelope"
                     )
                 output.write(filtered)
+            if timed_out:
+                raise RuntimeError("remote-host-context transport unavailable")
             if stream_filter is not None:
-                try:
-                    filtered = stream_filter.finish()
-                except (
-                    TransportValidationError,
-                    UnicodeDecodeError,
-                    ValueError,
-                ) as exc:
-                    terminate_process_group()
-                    process.wait()
-                    raise RuntimeError(
-                        "remote-host-context transport emitted an invalid protocol stream"
-                    ) from exc
+                filtered = _filter_remote_output(stream_filter)
                 output_bytes += len(filtered)
                 if output_bytes > max_output_bytes:
-                    terminate_process_group()
-                    process.wait()
                     raise RuntimeError(
                         "remote-host-context transport exceeded its output envelope"
                     )
                 output.write(filtered)
             # Close the task-owned group while the unreaped leader still pins
             # its PID/PGID. Reaping first would open a reuse race.
-            terminate_process_group()
-            try:
-                return_code = process.wait(timeout=5)
-            except subprocess.TimeoutExpired as exc:
-                terminate_process_group()
-                process.wait()
-                raise RuntimeError(
-                    "remote-host-context transport did not terminate"
-                ) from exc
-            timer.cancel()
-            timer.join(timeout=1)
-            if timed_out or return_code != 0:
+            return_code = _close_remote_process_group(process)
+            leader_reaped = True
+            if return_code != 0:
                 raise RuntimeError("remote-host-context transport unavailable")
             if validator is not None:
                 try:
@@ -308,11 +299,17 @@ def _relay_remote_host_context_command(
                 raise RuntimeError(
                     "remote-host-context transport emitted invalid UTF-8"
                 ) from exc
+    except BaseException as exc:
+        active_error = exc
+        raise
     finally:
-        timer.cancel()
-        timer.join(timeout=1)
-        terminate_process_group()
-        if process.returncode is None:
-            process.wait()
+        selector.close()
         if process.stdout is not None:
             process.stdout.close()
+        if not leader_reaped:
+            try:
+                _close_remote_process_group(process)
+            except RuntimeError as cleanup_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(str(cleanup_error))

@@ -3,7 +3,7 @@ id: 20260716-srv2e01
 title: Session Retrospective v2 Engine
 status: completed
 created: 2026-07-16
-updated: 2026-08-08
+updated: 2026-08-09
 branch: wip/session-retrospective-v2-engine-clean
 pr: 43
 supersedes: []
@@ -29,7 +29,9 @@ superseded_by:
 - Session-shards transcripts close descriptor-pass file descriptors before
   returning lazy, replay-validated record streams.
 - Remote helpers run under isolated Python with sanitized injection variables;
-  timeout and output-limit cleanup terminates the complete helper process group.
+  a nonblocking monotonic relay deadline remains enforceable even when a
+  detached descendant inherits stdout, while timeout and output-limit cleanup
+  terminates and reaps the task-owned helper process group.
 - The public v2 entrypoint requires Python 3.13 or newer and emits a closed
   machine-readable error before importing the engine on an older interpreter.
 - Session identifiers use one shared bounded predicate across worker and
@@ -187,10 +189,14 @@ superseded_by:
   before publication; bounded reads, locks, publication state, retained export,
   GPG keyring validation, cleanup, and session-shard spools revalidate the same
   access-policy property without treating timestamp-only changes as mutation.
-- JSON source-overlap control keys exempt only their direct scalar values.
-  Nested objects and arrays remain untrusted source-bearing structure, so strings
-  under `request_id`, `evidence_ref`, and related control keys cannot bypass the
-  retained-output overlap gate.
+- JSON source-overlap control keys exempt only exact case-sensitive allowlisted,
+  shape-valid direct scalar metadata. Nested objects, arrays, malformed values,
+  arbitrary suffix-shaped keys, and Unicode case-fold aliases remain untrusted
+  source-bearing structure and cannot bypass the retained-output overlap gate.
+- Retained-export garbage collection has no publication transaction authority.
+  It keeps every authenticated `publication_bound` bundle until the exact
+  attempt owner persists a terminal disposition; age alone cannot synthesize an
+  abort or authorize deletion.
 - Retained privacy scanning and deterministic post-redaction recognize every
   bounded hierarchical URI scheme, including one-letter schemes, rather than an
   HTTP/SSH allowlist that could retain another URL form.
@@ -499,3 +505,30 @@ superseded_by:
   group passed 56/56 tests in 6.725 seconds; OpenAI quick validation reported
   `Skill is valid!`; scoped Ruff lint/format passed all 18 changed Python files;
   and `git diff --check` passed.
+- The first formal fresh-context review of the frozen follow-up found three
+  issues: suffix-based overlap exemptions could omit arbitrary source prose,
+  garbage collection could synthesize a stale publication abort, and a blocking
+  stdout read could outlive the remote-helper timeout when a detached child kept
+  the pipe open. The fixes use exact case-sensitive metadata validators, retain
+  publication-bound exports until attempt-owner termination, and drive bounded
+  relay reads through a monotonic nonblocking selector before group closure.
+- A bounded pre-commit export audit returned `No findings.` The overlap audit
+  then found two additional validator gaps: Unicode/case-fold key aliases and
+  syntactically shaped but invalid timestamps. Both are covered by exact-key and
+  Python 3.13 calendar/time/offset regressions. The transport audit did not
+  produce a terminal artifact within its bounded observation window and was
+  closed while running; it is transport-inconclusive and non-counting.
+- The final affected result, export, source-transport, session-shards, and
+  module-boundary group passed 228/228 tests in 27.421 seconds. The skill
+  structure, validator-wrapper, and module-boundary group passed 56/56 tests in
+  7.120 seconds; scoped Ruff lint/format passed and the isolated OpenAI skill
+  validator reported `Skill is valid!`. An earlier host publication run was
+  interrupted after the overlap audit changed the candidate tree and is
+  explicitly non-counting; no recent task-owned `/private/tmp` directory
+  remained after shutdown.
+- The final host-level disposable-GPG publication transaction suite then passed
+  44/44 tests in 461.542 seconds under `/private/tmp` on the post-audit tree.
+- The final host Python 3.13 discovery passed all 1,556 tests in 766.713
+  seconds on the same post-audit implementation. It includes the real signing
+  and publication fixtures and supersedes the interrupted pre-fix publication
+  run; no test result was inferred or carried across candidate trees.
