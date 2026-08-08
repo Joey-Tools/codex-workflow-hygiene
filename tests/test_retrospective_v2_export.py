@@ -1234,6 +1234,39 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RetainedPrivacyError, "local path"):
                     validate_retained_artifacts(tampered)
 
+    def test_non_http_uri_schemes_are_rejected_before_and_after_assembly(self) -> None:
+        for uri in (
+            "x://private-endpoint/resource",
+            "wss://build.internal/events",
+            "s3://private-bucket/report",
+            "postgresql://database.internal/history",
+        ):
+            with self.subTest(uri=uri, phase="assembly"):
+                unsafe = review_data()
+                unsafe["turn_findings"][1]["rewritten_prompt"] = (
+                    f"Inspect {uri} before continuing."
+                )
+                with self.assertRaisesRegex(RetainedPrivacyError, "URL"):
+                    assemble_retained_artifacts(run_state(), unsafe)
+
+            with self.subTest(uri=uri, phase="retained-reread"):
+                artifacts = assemble_retained_artifacts(run_state(), review_data())
+                tampered = dict(artifacts)
+                rows = [
+                    json.loads(line)
+                    for line in tampered["turn_findings.jsonl"].splitlines()
+                ]
+                high_impact = next(
+                    row for row in rows if row["disposition"] == "high_impact"
+                )
+                high_impact["rewritten_prompt"] = f"Inspect {uri} before continuing."
+                tampered["turn_findings.jsonl"] = b"".join(
+                    canonical_json_bytes(row) for row in rows
+                )
+                refresh_bundle_digest(tampered)
+                with self.assertRaisesRegex(RetainedPrivacyError, "URL"):
+                    validate_retained_artifacts(tampered)
+
         untyped_review = review_data()
         untyped_review["turn_findings"][0]["note"] = "source_literal"
         with self.assertRaises(RetainedPrivacyError):

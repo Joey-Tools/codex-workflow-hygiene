@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any
 
 from retrospective_v2.contracts import SessionShardsRequest
@@ -21,20 +21,26 @@ class SessionShardsTranscriptError(ValueError):
         self.stage = stage
 
 
-def _next_stream(frames: Any) -> list[dict[str, Any]] | None:
+def _next_stream(frames: Any) -> Iterator[dict[str, Any]] | None:
     try:
-        first = next(frames)
+        first = dict(next(frames))
     except StopIteration:
         return None
-    stream = [dict(first)]
-    while stream[-1].get("kind") != "stream_end":
-        try:
-            stream.append(dict(next(frames)))
-        except StopIteration as error:
-            raise adapter.SessionShardsAdapterError(
-                "session-shards stream is truncated"
-            ) from error
-    return stream
+
+    def stream() -> Iterator[dict[str, Any]]:
+        frame = first
+        while True:
+            yield frame
+            if frame.get("kind") == "stream_end":
+                return
+            try:
+                frame = dict(next(frames))
+            except StopIteration as error:
+                raise adapter.SessionShardsAdapterError(
+                    "session-shards stream is truncated"
+                ) from error
+
+    return stream()
 
 
 def _descriptor_plan(
@@ -148,6 +154,9 @@ def session_shard_transcript(
             except adapter.SessionShardsAdapterError as error:
                 close_replay()
                 raise SessionShardsTranscriptError("records", str(error)) from error
+            finally:
+                if not consumption["complete"]:
+                    close_replay()
 
         try:
             for plan in plans:

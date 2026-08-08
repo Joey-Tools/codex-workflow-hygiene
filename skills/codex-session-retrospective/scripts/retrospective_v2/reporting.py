@@ -214,7 +214,7 @@ _OPAQUE_REF_RE = re.compile(
     r"(?:[a-z][a-z0-9_]*_ref_v2|source_snapshot_v2):[0-9a-f]{64}\Z"
 )
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
-_URL_RE = re.compile(r"(?i)(?:https?|ssh|file|vscode)://|git@")
+_URL_RE = re.compile(r"(?i)(?:[a-z][a-z0-9+.-]{0,31}://|git@)")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _LOCAL_PATH_RE = re.compile(
     r"(?:(?<![A-Za-z0-9_])/(?!/)"

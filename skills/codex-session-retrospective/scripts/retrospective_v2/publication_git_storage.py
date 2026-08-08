@@ -184,17 +184,11 @@ class LocalGitStorageOperations:
         self._git_metadata_anchors = {
             path: self._git_directory_identity(path) for path in paths
         }
-        alternates = object_store / "info" / "alternates"
-        try:
-            alternates.lstat()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            raise LocalGitPublicationError(
-                "Git object alternates cannot be authenticated"
-            ) from exc
-        else:
-            raise LocalGitPublicationError("Git object alternates are not allowed")
+        self._forbidden_git_metadata = {
+            object_store / "info" / "alternates": "Git object alternates",
+            common_dir / "info" / "grafts": "Git grafts",
+        }
+        self._reject_forbidden_git_metadata()
         self._git_dir = git_dir
 
     def _git_path(self, option: str, *values: str) -> Path:
@@ -220,6 +214,19 @@ class LocalGitStorageOperations:
         for path, expected in getattr(self, "_git_metadata_anchors", {}).items():
             if self._git_directory_identity(path) != expected:
                 raise LocalGitPublicationError("Git metadata changed after validation")
+        self._reject_forbidden_git_metadata()
+
+    def _reject_forbidden_git_metadata(self) -> None:
+        for path, label in getattr(self, "_forbidden_git_metadata", {}).items():
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise LocalGitPublicationError(
+                    f"{label} cannot be authenticated"
+                ) from exc
+            raise LocalGitPublicationError(f"{label} are not allowed")
 
     def _validate_signing_identity(self) -> None:
         if self._signing_format != "openpgp":

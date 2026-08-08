@@ -14,7 +14,7 @@ import pathlib
 import re
 import stat
 import sys
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 try:
     from . import catalog
@@ -27,8 +27,8 @@ try:
         parse_typed_ref,
     )
     from .transport_capture import _validate_source_transport_relay
+    from . import transport_discovery
     from .transport_contracts import (
-        SOURCE_TRANSPORT_ACTIVE_LOOKBACK_DAYS,
         SOURCE_TRANSPORT_MAX_RECORD_BYTES,
         SOURCE_TRANSPORT_RESUME_PROBE_BUDGET_BYTES,
         SOURCE_TRANSPORT_RESUME_PROBE_BYTES,
@@ -76,8 +76,8 @@ except (ImportError, ModuleNotFoundError):
     from transport_capture import (  # type: ignore[no-redef]
         _validate_source_transport_relay,
     )
+    import transport_discovery  # type: ignore[no-redef]
     from transport_contracts import (  # type: ignore[no-redef]
-        SOURCE_TRANSPORT_ACTIVE_LOOKBACK_DAYS,
         SOURCE_TRANSPORT_MAX_RECORD_BYTES,
         SOURCE_TRANSPORT_RESUME_PROBE_BUDGET_BYTES,
         SOURCE_TRANSPORT_RESUME_PROBE_BYTES,
@@ -287,6 +287,8 @@ class _SourceCandidateDiscovery:
     root: pathlib.Path | None = None
     candidate_identities: tuple[tuple[str, tuple[tuple[int, int], ...]], ...] = ()
     candidate_tokens: tuple[tuple[str, str], ...] = ()
+    directory_snapshots: tuple[transport_discovery.SourceDirectorySnapshot, ...] = ()
+    directory_entry_limit: int = 0
     root_anchor: _AnchoredCodexRoot | None = None
 
     def close(self) -> None:
@@ -471,6 +473,7 @@ def _source_transport_candidate_paths(
     candidates: list[tuple[pathlib.Path, str]] = []
     candidate_identities: dict[str, tuple[tuple[int, int], ...]] = {}
     candidate_tokens: dict[str, str] = {}
+    directory_snapshots: list[transport_discovery.SourceDirectorySnapshot] = []
     seen: set[str] = set()
     entry_limit = max(4096, max_candidates * 64)
     entries_seen = 0
@@ -497,35 +500,47 @@ def _source_transport_candidate_paths(
             candidate_tokens=tuple(
                 (relative, candidate_tokens[relative]) for _path, relative in ordered
             ),
+            directory_snapshots=tuple(directory_snapshots),
+            directory_entry_limit=entry_limit,
             root_anchor=anchor,
         )
 
-    def directory_entries(descriptor: int) -> list[tuple[str, bool, bool, bool]]:
+    def directory_entries(
+        descriptor: int,
+        *,
+        relative: str | None = None,
+        identities: tuple[tuple[int, int], ...] | None = None,
+    ) -> list[tuple[str, bool, bool, bool]]:
         nonlocal entries_seen
-        rows: list[tuple[str, bool, bool, bool]] = []
-        with os.scandir(os.dup(descriptor)) as entries:
-            for entry in entries:
-                entries_seen += 1
-                if entries_seen > entry_limit:
-                    raise DiscoveryStop("candidate_discovery_limit_reached")
-                rows.append(
-                    (
-                        entry.name,
-                        entry.is_symlink(),
-                        entry.is_dir(follow_symlinks=False),
-                        entry.is_file(follow_symlinks=False),
-                    )
-                )
-        rows.sort(key=lambda item: item[0].encode("utf-8"))
-        return rows
 
-    def open_directory(relative: str) -> int:
-        descriptor, _identities = _open_relative_from_codex_root(
+        def observe_entry() -> None:
+            nonlocal entries_seen
+            entries_seen += 1
+            if entries_seen > entry_limit:
+                raise DiscoveryStop("candidate_discovery_limit_reached")
+
+        rows = transport_discovery.read_directory_entries(
+            descriptor,
+            observe_entry=observe_entry,
+        )
+        if relative is not None and identities is not None:
+            directory_snapshots.append(
+                transport_discovery.SourceDirectorySnapshot(
+                    relative,
+                    identities,
+                    rows,
+                )
+            )
+        return list(rows)
+
+    def open_directory(
+        relative: str,
+    ) -> tuple[int, tuple[tuple[int, int], ...]]:
+        return _open_relative_from_codex_root(
             anchor,
             pathlib.PurePosixPath(relative),
             expect_directory=True,
         )
-        return descriptor
 
     def add_candidate(relative: str) -> None:
         if relative in seen:
@@ -556,6 +571,9 @@ def _source_transport_candidate_paths(
                 raise DiscoveryStop("source_enumeration_failed")
             add_candidate(relative)
 
+    def reject_active_entry() -> NoReturn:
+        raise DiscoveryStop("source_enumeration_failed")
+
     try:
         if source_kind in {"session_index", "history"}:
             relative = (
@@ -573,42 +591,55 @@ def _source_transport_candidate_paths(
             "sessions" if source_kind == "active_rollout" else "archived_sessions"
         )
         try:
-            base_fd = open_directory(base_name)
+            base_fd, base_identities = open_directory(base_name)
         except FileNotFoundError:
             base_fd = -1
             if source_kind == "active_rollout":
                 return result(source_exists=False)
         try:
-            pattern = (
-                ACTIVE_ROLLOUT_RELATIVE_RE
-                if source_kind == "active_rollout"
-                else ARCHIVED_ROLLOUT_RELATIVE_RE
-            )
             if base_fd != -1:
-                selected_dates = set(window_dates)
                 if source_kind == "active_rollout":
-                    selected_dates.update(
-                        window_start.date() - dt.timedelta(days=offset)
-                        for offset in range(
-                            1,
-                            SOURCE_TRANSPORT_ACTIVE_LOOKBACK_DAYS + 1,
+                    transport_discovery.walk_active_rollout_tree(
+                        base_fd,
+                        base_identities,
+                        base_name,
+                        read_entries=lambda descriptor, relative, identities: (
+                            directory_entries(
+                                descriptor,
+                                relative=relative,
+                                identities=identities,
+                            )
+                        ),
+                        open_directory=open_directory,
+                        add_candidate=add_candidate,
+                        candidate_matches=lambda relative: (
+                            ACTIVE_ROLLOUT_RELATIVE_RE.fullmatch(relative) is not None
+                        ),
+                        reject_entry=reject_active_entry,
+                    )
+                else:
+                    for selected_date in window_dates:
+                        day_path = (
+                            f"{base_name}/{selected_date.year:04d}/"
+                            f"{selected_date.month:02d}/{selected_date.day:02d}"
                         )
+                        try:
+                            day_fd, _day_identities = open_directory(day_path)
+                        except FileNotFoundError:
+                            continue
+                        try:
+                            scan_candidate_directory(
+                                day_fd,
+                                day_path,
+                                ARCHIVED_ROLLOUT_RELATIVE_RE,
+                            )
+                        finally:
+                            os.close(day_fd)
+                    scan_candidate_directory(
+                        base_fd,
+                        base_name,
+                        ARCHIVED_ROLLOUT_RELATIVE_RE,
                     )
-                for selected_date in sorted(selected_dates):
-                    day_path = (
-                        f"{base_name}/{selected_date.year:04d}/"
-                        f"{selected_date.month:02d}/{selected_date.day:02d}"
-                    )
-                    try:
-                        day_fd = open_directory(day_path)
-                    except FileNotFoundError:
-                        continue
-                    try:
-                        scan_candidate_directory(day_fd, day_path, pattern)
-                    finally:
-                        os.close(day_fd)
-                if source_kind == "archived_rollout":
-                    scan_candidate_directory(base_fd, base_name, pattern)
             if source_kind == "archived_rollout":
                 scan_candidate_directory(
                     anchor.descriptor,
@@ -1443,6 +1474,18 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
         finally:
             os.close(descriptor)
 
+    if terminal_status is None and discovery_gap_reason is None:
+        try:
+            transport_discovery.revalidate_rooted_directory_snapshots(
+                discovery.directory_snapshots,
+                entry_limit=discovery.directory_entry_limit,
+                root_authority=discovery.root_anchor,
+                open_relative=_open_relative_from_codex_root,
+            )
+        except (OSError, ValueError):
+            terminal_status = "gap"
+            terminal_reason = "source_enumeration_changed"
+            resume_position = None
     discovery.close()
 
     _emit_source_transport_terminal(

@@ -1068,7 +1068,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
         with self.assertRaises(transport.TransportValidationError):
             transport.capture_source_transport(without_inventory, lease=lease)
 
-    def test_cursor_filter_and_window_bounded_rollout_discovery(self) -> None:
+    def test_cursor_filter_and_bounded_complete_active_rollout_discovery(self) -> None:
         host_ref = str(self.identity.derive_ref(RefType.HOST, {"parts": ["local"]}))
         cursor_rows = (
             {
@@ -1149,16 +1149,14 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 max_candidates=8,
             )
         self.assertIsNone(bounded.gap_reason)
-        self.assertEqual(4, len(bounded.candidates))
+        self.assertEqual(8, len(bounded.candidates))
         self.assertIn(
             "sessions/2026/07/05/rollout-previous-cross-day.jsonl",
             {relative for _path, relative in bounded.candidates},
         )
-        self.assertFalse(
-            any(
-                relative.startswith("sessions/2010/")
-                for _path, relative in bounded.candidates
-            )
+        self.assertIn(
+            "sessions/2010/01/01/rollout-2010-01-02T00-01-00-old-continued.jsonl",
+            {relative for _path, relative in bounded.candidates},
         )
         limited = transport._source_transport_candidate_paths(
             self.codex_root,
@@ -1217,6 +1215,40 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.assertEqual(2, len(inventory))
         self.assertEqual("gap", terminal["status"])
         self.assertEqual("candidate_discovery_limit_reached", terminal["reason"])
+
+    def test_active_rollout_directory_change_before_terminal_is_a_gap(self) -> None:
+        day = self.codex_root / "sessions/2026/07/06"
+        day.mkdir(parents=True, mode=0o700)
+        day.joinpath("rollout-existing.jsonl").write_bytes(
+            self._line("existing", kind="session_meta")
+        )
+        late = day / "rollout-late.jsonl"
+        original_revalidate = (
+            transport_source.transport_discovery.revalidate_directory_snapshots
+        )
+        mutated = False
+
+        def mutate_then_revalidate(*args, **kwargs):
+            nonlocal mutated
+            mutated = True
+            late.write_bytes(self._line("late", kind="session_meta"))
+            original_revalidate(*args, **kwargs)
+
+        with mock.patch.object(
+            transport_source.transport_discovery,
+            "revalidate_directory_snapshots",
+            side_effect=mutate_then_revalidate,
+        ):
+            frames = self._direct_source_frames(
+                "active-directory-change",
+                source_kind="active_rollout",
+                max_records=16,
+            )
+
+        self.assertTrue(mutated)
+        self.assertEqual("gap", frames[-1]["status"])
+        self.assertEqual("source_enumeration_changed", frames[-1]["reason"])
+        self.assertIsNone(frames[-1]["resume_position"])
 
     def test_oversized_source_record_yields_exact_gap_accounting(self) -> None:
         self.codex_root.joinpath("session_index.jsonl").write_bytes(

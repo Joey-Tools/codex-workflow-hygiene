@@ -651,6 +651,27 @@ class ResultValidationTests(unittest.TestCase):
             (),
         )
 
+    def test_post_redaction_removes_non_http_uri_schemes(self) -> None:
+        for uri in (
+            "x://private-endpoint/resource",
+            "wss://build.internal/events",
+            "s3://private-bucket/report",
+            "postgresql://database.internal/history",
+        ):
+            with self.subTest(uri=uri):
+                value = extractor_result()
+                value["turns"][0]["generalized_working_text"] = (
+                    f"Inspect {uri} before continuing."
+                )
+
+                result = validate_extractor_result(value, ALL_REFS)
+
+                self.assertEqual(
+                    result["turns"][0]["generalized_working_text"],
+                    "Inspect [REDACTED_URL] before continuing.",
+                )
+                self.assertEqual(scan_for_leaks(result), ())
+
     def test_post_redaction_covers_posix_paths_under_unlisted_roots(self) -> None:
         for source_path in (
             "/root/acme/customer.txt",

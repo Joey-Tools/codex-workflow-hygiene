@@ -44,13 +44,13 @@ SOURCE_TRANSPORT_SCAN_CHUNK_BYTES = 64 * 1024
 SOURCE_TRANSPORT_RESUME_PROBE_BYTES = 64 * 1024
 SOURCE_TRANSPORT_RESUME_PROBE_BUDGET_BYTES = 3 * SOURCE_TRANSPORT_RESUME_PROBE_BYTES
 SOURCE_TRANSPORT_BOUNDARY_PROBE_BYTES = SOURCE_TRANSPORT_RESUME_PROBE_BYTES
-SOURCE_TRANSPORT_ACTIVE_LOOKBACK_DAYS = 7
 SOURCE_TRANSPORT_WORKER_MODULE_MANIFEST = (
     "catalog.py",
     "contracts.py",
     "safe_io.py",
     "transport_capture.py",
     "transport_contracts.py",
+    "transport_discovery.py",
     "transport_paths.py",
     "transport_program.py",
     "transport_remote.py",

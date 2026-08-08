@@ -67,8 +67,9 @@ index exactly. Each page stops before its derived records stream would exceed
 A retained transcript stores every descriptor page first, followed by one exact
 records stream per page. The adapter validates and closes the complete descriptor
 chain before lazily replaying those contiguous records requests into the
-coordinator. Descriptor pages alone are discovery metadata and never authorize
-retained raw evidence.
+coordinator. Abandoning any records iterator closes its replay immediately even
+while the outer segment iterator remains live. Descriptor pages alone are
+discovery metadata and never authorize retained raw evidence.
 
 The `session_shards_source_v2` token binds device, inode, mode, owner, group, and
 the platform generation and birth-time fields when they exist. On a filesystem
@@ -100,9 +101,16 @@ Every discovered source unit ends in exactly one accounting class:
 and archived copies retain distinct physical-file occurrence coordinates. An
 archived record is excluded only by the closed canonical-equivalence rule when
 there is exactly one equivalent active record; multiple active files never
-collapse. Source discovery opens only rollout date directories in the requested
-window, plus a fixed seven-day active-rollout lookback for cross-day sessions;
-filesystem mtimes never prefilter candidates. Resume positions use the closed
+collapse. Source discovery walks the complete active-rollout year/month/day
+hierarchy through descriptor-relative no-follow opens under global entry and
+candidate ceilings. It therefore includes old still-active sessions; exhausting
+either ceiling produces an explicit coverage gap instead of a partial catalog.
+Before a complete or no-activity terminal, the worker reopens every traversed
+active directory through its anchored identity chain and requires the bounded,
+type-aware entry snapshot to remain exact. A replacement or entry-set change is
+an explicit enumeration gap rather than an incomplete success.
+Archived discovery remains window-bound, and filesystem mtimes never prefilter
+candidates. Resume positions use the closed
 `source_transport_resume_v4` schema. They carry a public
 `accepted_prefix_commitment` transition chain plus the exact trailing probe
 range and content commitment; the chain is authoritative only because the

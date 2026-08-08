@@ -263,6 +263,7 @@ TRANSPORT_MODULES = {
     "transport_auth.py",
     "transport_capture.py",
     "transport_contracts.py",
+    "transport_discovery.py",
     "transport_paths.py",
     "transport_program.py",
     "transport_remote.py",
@@ -307,6 +308,7 @@ BOUNDED_MODULE_LINES = {
     "transport_auth.py": 200,
     "transport_capture.py": 1_000,
     "transport_contracts.py": 1_000,
+    "transport_discovery.py": 160,
     "transport_paths.py": 100,
     "transport_program.py": 420,
     "transport_remote.py": 320,
@@ -912,7 +914,7 @@ spec.loader.exec_module(module)
                 len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
                 for name in TRANSPORT_MODULES
             ),
-            6_900,
+            7_085,
         )
         self.assertLessEqual(
             sum(
@@ -1006,7 +1008,7 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertLessEqual(branch_total, 7_575)
+        self.assertLessEqual(branch_total, 7_600)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)
 
@@ -1046,7 +1048,7 @@ spec.loader.exec_module(module)
         manifest = tuple(transport.SOURCE_TRANSPORT_WORKER_MODULE_MANIFEST)
         self.assertEqual(manifest, transport.SOURCE_TRANSPORT_PROGRAM_MODULE_ALLOWLIST)
         self.assertEqual(len(manifest), len(set(manifest)))
-        self.assertLessEqual(len(manifest), 12)
+        self.assertLessEqual(len(manifest), 13)
         self.assertNotIn("reporting.py", manifest)
         self.assertFalse(set(manifest) & PUBLICATION_MODULES)
         self.assertFalse(set(manifest) & ORCHESTRATOR_MODULES)

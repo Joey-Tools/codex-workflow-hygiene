@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from unittest import mock
 
@@ -393,6 +394,74 @@ class SessionShardsAdapterCliTests(unittest.TestCase):
 
         self.assertEqual(0, active_streams)
         self.assertEqual(2, opened_streams)
+
+    def test_abandoned_record_stream_closes_replay_before_outer_generator(self) -> None:
+        descriptors, records = self.shard_streams()
+        transcript = [*descriptors, *records]
+        active_streams = 0
+        opened_streams = 0
+
+        def tracked_frames(_path: str):
+            nonlocal active_streams, opened_streams
+            active_streams += 1
+            opened_streams += 1
+            try:
+                yield from transcript
+            finally:
+                active_streams -= 1
+
+        with mock.patch.object(
+            cli,
+            "_iter_transport_frames",
+            side_effect=tracked_frames,
+        ):
+            segments = iter(
+                cli._session_shard_transcript(
+                    Path("unused-session-shards.jsonl"),
+                    expected_host="local",
+                )
+            )
+            normalized, _request = next(segments)
+            records_iterator = iter(normalized)
+            next(records_iterator)
+            self.assertEqual(1, active_streams)
+
+            records_iterator.close()
+            self.assertEqual(0, active_streams)
+            self.assertEqual(2, opened_streams)
+            segments.close()
+
+    def test_stream_segmentation_does_not_materialize_large_frame_pages(self) -> None:
+        frame_count = 50_000
+        produced = 0
+
+        def frames():
+            nonlocal produced
+            produced += 1
+            yield {"kind": "stream_meta"}
+            for index in range(frame_count):
+                produced += 1
+                yield {"kind": "record", "index": index}
+            produced += 1
+            yield {"kind": "stream_end"}
+            produced += 1
+            yield {"kind": "next_stream"}
+
+        source = iter(frames())
+        stream = cli.transcript_api._next_stream(source)
+        self.assertIsNotNone(stream)
+        self.assertEqual(1, produced)
+
+        tracemalloc.start()
+        try:
+            self.assertEqual(frame_count + 2, sum(1 for _frame in stream))
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertLess(peak, 2 * 1024 * 1024)
+        self.assertEqual(frame_count + 2, produced)
+        self.assertEqual({"kind": "next_stream"}, next(source))
 
     def test_adapter_binds_continuation_meta_to_the_request_cursor(self) -> None:
         data = (self.codex_root / self.rollout).read_bytes()

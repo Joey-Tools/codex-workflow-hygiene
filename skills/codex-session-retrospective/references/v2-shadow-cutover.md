@@ -56,12 +56,15 @@ commitments itself. There is no public coverage or cleanup issuer that accepts
 those values as arguments.
 
 Shadow cleanup first stores an authenticated fixed-root claim containing the
-observed inode inventory and counters for `raw-inputs`, `raw-shards`, and
-`agent-sinks`. The cleanup transaction then deletes only those anchored roots,
+observed inode inventory and counters for `raw-inputs`, `raw-shards`,
+`retained-inputs`, and `agent-sinks`. The v3 cleanup transaction then deletes
+only those four anchored roots,
 fsyncs their parent, confirms absence, and commits the coverage-bound cleanup
 receipt in the authenticated checkpoint. A retry after deletion or a lost close
 response uses the durable claim and returns the same receipt; pre-removed,
 replaced, symlinked, regrown, or caller-selected paths fail closed.
+The legacy three-root schema remains readable only for compatibility recovery;
+new cleanup claims always use the four-root v3 contract.
 
 ## Operational Cutover
 

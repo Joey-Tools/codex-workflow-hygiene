@@ -1907,6 +1907,46 @@ class DurablePublicationTests(unittest.TestCase):
         self.assertEqual("Initialize history", publication_subject)
         self.assertEqual("Initialize history", authority_subject)
 
+    def test_history_git_commands_reject_grafts_that_forge_reachability(self) -> None:
+        tree = run_command(
+            ["git", "rev-parse", f"{self.base_head}^{{tree}}"], cwd=self.repo
+        ).stdout.strip()
+        unreachable = run_command(
+            [
+                "git",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit-tree",
+                tree,
+                "-m",
+                "Unreachable history",
+            ],
+            cwd=self.repo,
+        ).stdout.strip()
+        grafts = self.repo / ".git" / "info" / "grafts"
+        grafts.write_text(f"{self.base_head} {unreachable}\n", encoding="ascii")
+
+        forged = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", unreachable, self.base_head],
+            cwd=self.repo,
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(0, forged.returncode)
+        with self.assertRaisesRegex(
+            publication_support.LocalGitPublicationError,
+            "Git grafts are not allowed",
+        ):
+            self.adapter._is_ancestor(unreachable, self.base_head)
+        with self.assertRaisesRegex(
+            publication_support.LocalGitPublicationError,
+            "Git grafts are not allowed",
+        ):
+            self.publication_adapter()
+
     def test_privacy_reread_rejects_replacement_symlink_and_oversize_races(
         self,
     ) -> None:

@@ -168,6 +168,21 @@ superseded_by:
   claim permanently fences all forward publication phases; conditional sidecar
   release closes the bind-before-attempt-flag crash window and checks the legal
   unbound no-op before validating an unrelated bundle.
+- Durable-history Git commands disable environment-selected grafts and reject
+  repository-local graft files before use and on revalidation, so forged ancestry
+  cannot satisfy publication or authority reachability checks.
+- Active-rollout discovery now walks the complete bounded year/month/day tree
+  instead of a seven-day date heuristic. It binds descriptor-relative directory
+  identity and type-aware entry snapshots, then revalidates every snapshot before
+  a successful terminal; replacement, entry churn, or exhausted bounds becomes an
+  explicit coverage gap rather than a partial success.
+- Retained privacy scanning and deterministic post-redaction recognize every
+  bounded hierarchical URI scheme, including one-letter schemes, rather than an
+  HTTP/SSH allowlist that could retain another URL form.
+- Session-shards transcript segmentation is lazy and constant-space across large
+  frame pages. An abandoned records iterator closes its replay immediately even
+  while the outer segment iterator remains live; complete pages keep one replay
+  open only for the next contiguous records request.
 
 ## Next Steps
 
@@ -363,3 +378,21 @@ superseded_by:
   This run includes the publication transaction suite and therefore supersedes
   the earlier sandbox-only discovery gaps; no test was skipped or inferred from
   a setup failure.
+- A fresh whole-range reviewer found five follow-up gaps: repository-local Git
+  grafts remained admissible, active discovery could omit an old still-appending
+  session, URI detection covered only selected schemes, transcript segmentation
+  materialized a complete child stream, and cleanup documentation still described
+  three roots after the v3 retained-input addition. The fixes include exact graft
+  rejection, complete bounded active-tree discovery plus terminal directory
+  snapshot revalidation, generic URI recognition before and after redaction,
+  lazy stream iteration, and the four-root/legacy-three-root recovery contract.
+- The host-level disposable-GPG publication module passed 39/39 tests in 493.549
+  seconds. The current source/adapter/result/export group passed 162/162 in 23.428
+  seconds; source transport passed 45/45 in 20.909 seconds; module boundaries
+  passed 17/17 in 1.579 seconds; and the added abandoned-replay regression plus
+  its complete adapter module passed 11/11 in 1.913 seconds. Ruff and
+  `git diff --check` passed on the same current diff.
+- The final host Python 3.13 discovery passed all 1,527 tests in 699.543 seconds.
+  This run includes the disposable-GPG publication transaction suite and
+  supersedes every earlier partial or sandbox-limited discovery result; no test
+  was skipped, inferred, or carried forward from another tree.
