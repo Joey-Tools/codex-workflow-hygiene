@@ -76,7 +76,7 @@ inventory and its aggregate are enforced together, so omitting a transport
 module cannot create a false budget pass. The newly affected modules are
 `transport_program.py` at 408/420 lines, `transport_remote.py` at 315/320,
 `transport_snapshot.py` at 196/200, and `transport_remote_snapshot.py` at
-79/100. The global branch proxy measures 7,563 nodes against a 7,575-node
+79/100. The global branch proxy measures 7,920 nodes against a 7,925-node
 ceiling. These
 small budget revisions admit the new commitment boundary without recreating a
 transport monolith.

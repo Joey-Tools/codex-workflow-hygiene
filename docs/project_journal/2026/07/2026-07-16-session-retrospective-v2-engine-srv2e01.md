@@ -254,6 +254,16 @@ superseded_by:
 - The transport boundary is an exact 14-module inventory at 7,181 lines under a
   7,200-line aggregate ceiling. The contract fails on membership drift, individual
   module drift, or aggregate growth instead of relying on an approximate total.
+- The public finalize command advances exactly one durable publication phase per
+  invocation and releases a publication-bound export only after the transaction
+  reaches `committed` and the cleanup-pending checkpoint is durable. Aborted and
+  intermediate phases preserve their own disposition without committed release.
+- Publication artifact reads protect descriptor identity, owner/mode/link/ACL
+  policy, and the expected digest before and after reading. Timestamp-only changes
+  trigger the proof but are not mutation evidence.
+- Export GC uses a descriptor-anchored iterative walk with global entry, depth,
+  path-byte, deadline, and result-sample budgets. Schema-v3 receipts retain full
+  counts and typed incomplete reasons without unbounded path arrays.
 
 ## Next Steps
 
@@ -693,3 +703,32 @@ superseded_by:
   on the same publication-recovery and transport-boundary implementation,
   including the real disposable-GPG publication transactions. It supersedes all
   affected and setup-blocked results for this tree.
+- The fresh named-single review of signed head `50f9d50` returned three actionable
+  findings: CLI finalize released exports before intermediate transaction phases
+  had committed, publication rereads omitted ACL validation and treated timestamps
+  as mutation, and recursive GC lacked global traversal and result budgets. The
+  workspace postvalidation reproduced the exact materialization receipt and the
+  independent task root was removed before fixes; no partial artifact was reused.
+- The review fixes pass GC adversarial tests 3/3, publication/CLI/ACL/timestamp
+  focused tests 4/4 in 65.481 seconds, the complete export module 53/53 in 2.764
+  seconds, module boundaries 18/18 in 1.614 seconds, and the CLI contract 30/30 in
+  32.641 seconds. The complete disposable-GPG publication module passes 58/58 in
+  823.954 seconds. One sandboxed disposable-key setup attempt ran zero tests and
+  is non-counting; the exact host-level rerun supplies the terminal evidence.
+- The bounded pre-commit read-only audit did not return a terminal artifact even
+  after its hard-stop request and is explicitly transport-inconclusive and
+  non-counting. A parent-side review then found one durability gap in the GC
+  follow-up: a deadline checkpoint between secure removal and parent-directory
+  `fsync` could interrupt the delete commit after mutation but before durable
+  receipt accounting. Deadline checks now occur immediately before destructive
+  work, and every started delete completes `remove -> fsync -> receipt` without
+  an intervening budget checkpoint. The direct deadline and delete-commit
+  regressions pass, and the complete export plus module-boundary group passes
+  73/73.
+- The final Python 3.13 host discovery passes all 1,595 tests in 1092.939 seconds
+  on the same review-fix tree, including the real disposable-GPG publication
+  transactions. It supersedes every partial, pre-fix, setup-blocked, and
+  pre-durability-fix result. Project-journal validation, scoped Ruff lint and
+  format checks, and `git diff --check` pass. The direct skill-validator wrapper
+  lacked `PyYAML`; its documented isolated `uv` fallback using Python 3.13 and
+  `pyyaml` passed the OpenAI quick validator.

@@ -1782,6 +1782,145 @@ class RetrospectiveV2ExportTests(unittest.TestCase):
             self.assertEqual(result["deleted"], [str(staging.resolve())])
             self.assertFalse(staging.exists())
 
+    def test_gc_does_not_check_deadline_inside_delete_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / ".codex-local" / "gc-delete-commit"
+            root.mkdir(mode=0o700, parents=True)
+            staging = root / f".retained-v2.staging-123-{'b' * 24}"
+            staging.mkdir(mode=0o700)
+            artifact = staging / "manifest.json"
+            artifact.write_bytes(b"{}\n")
+            os.chmod(artifact, 0o600)
+            created_at = dt.datetime(2026, 7, 15, 0, 0, tzinfo=dt.UTC)
+            timestamp = created_at.timestamp()
+            os.utime(staging, (timestamp, timestamp), follow_symlinks=False)
+
+            real_checkpoint = export_module._GcBudget.checkpoint
+            real_remove = export_module.safe_io.secure_remove_tree_at
+            real_fsync = os.fsync
+            delete_pending = False
+            delete_fsynced = False
+
+            def guarded_checkpoint(budget) -> None:
+                if delete_pending and not delete_fsynced:
+                    self.fail("GC checked its deadline inside a delete commit")
+                real_checkpoint(budget)
+
+            def tracked_remove(*args, **kwargs) -> None:
+                nonlocal delete_pending
+                real_remove(*args, **kwargs)
+                delete_pending = True
+
+            def tracked_fsync(descriptor: int) -> None:
+                nonlocal delete_fsynced
+                real_fsync(descriptor)
+                if delete_pending:
+                    delete_fsynced = True
+
+            with (
+                mock.patch.object(
+                    export_module._GcBudget,
+                    "checkpoint",
+                    guarded_checkpoint,
+                ),
+                mock.patch.object(
+                    export_module.safe_io,
+                    "secure_remove_tree_at",
+                    side_effect=tracked_remove,
+                ),
+                mock.patch.object(
+                    export_module.os,
+                    "fsync",
+                    side_effect=tracked_fsync,
+                ),
+            ):
+                result = garbage_collect_expired_exports(
+                    root,
+                    now=created_at + export_module.MAX_EXPORT_RETENTION,
+                )
+
+            self.assertTrue(delete_pending)
+            self.assertTrue(delete_fsynced)
+            self.assertEqual([str(staging.resolve())], result["deleted"])
+            self.assertFalse(staging.exists())
+
+    def test_gc_reports_wide_tree_entry_budget_exhaustion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / ".codex-local" / "wide-gc"
+            root.mkdir(mode=0o700, parents=True)
+            for index in range(4):
+                (root / f"branch-{index}").mkdir(mode=0o700)
+
+            with mock.patch.object(export_module, "_GC_MAX_ENTRIES", 3):
+                result = garbage_collect_expired_exports(root)
+
+            self.assertEqual("incomplete", result["status"])
+            self.assertEqual(
+                "entry_budget_exhausted",
+                result["incomplete_reason"],
+            )
+            self.assertEqual(4, result["budget"]["entries_observed"])
+            self.assertEqual([], result["deleted"])
+
+    def test_gc_checks_deadline_before_each_ordinary_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / ".codex-local" / "deadline-gc"
+            root.mkdir(mode=0o700, parents=True)
+            (root / "ordinary.txt").write_text("retained\n", encoding="ascii")
+
+            monotonic_values = [0.0, 0.0, 0.0, 0.0, 0.0, 61.0]
+            with mock.patch.object(
+                export_module.time,
+                "monotonic",
+                side_effect=monotonic_values,
+            ):
+                result = garbage_collect_expired_exports(root)
+
+            self.assertEqual("incomplete", result["status"])
+            self.assertEqual("deadline_exhausted", result["incomplete_reason"])
+            self.assertEqual(1, result["budget"]["entries_observed"])
+            self.assertTrue((root / "ordinary.txt").is_file())
+
+    def test_gc_reports_deep_tree_budget_without_recursion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / ".codex-local" / "deep-gc"
+            current = root
+            for index in range(5):
+                current.mkdir(mode=0o700, parents=True)
+                current = current / f"level-{index}"
+
+            with mock.patch.object(export_module, "_GC_MAX_DEPTH", 2):
+                result = garbage_collect_expired_exports(root)
+
+            self.assertEqual("incomplete", result["status"])
+            self.assertEqual(
+                "depth_budget_exhausted",
+                result["incomplete_reason"],
+            )
+            self.assertEqual(2, result["budget"]["max_depth_observed"])
+
+    def test_gc_bounds_retained_samples_while_preserving_full_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / ".codex-local" / "bounded-gc-results"
+            for index in range(3):
+                output = root / f"retained-{index}"
+                export_retained_bundle(output, run_state(), review_data())
+                bind_staged_export(
+                    output,
+                    f"attempt_ref_v2:{index + 1:064x}",
+                )
+
+            with mock.patch.object(export_module, "_GC_MAX_RESULT_SAMPLES", 2):
+                result = garbage_collect_expired_exports(
+                    root,
+                    now=dt.datetime(2100, 1, 1, tzinfo=dt.UTC),
+                )
+
+            self.assertEqual("complete", result["status"])
+            self.assertEqual(3, result["retained_count"])
+            self.assertEqual(2, len(result["retained"]))
+            self.assertTrue(result["retained_truncated"])
+
     def test_publication_bound_export_requires_attempt_terminal_before_gc(
         self,
     ) -> None:

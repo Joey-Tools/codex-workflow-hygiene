@@ -978,6 +978,12 @@ def _read_inventory_artifacts_anchored(
             try:
                 opened = os.fstat(descriptor)
                 _require_same_file(observed, opened, name)
+                _validate_artifact_access_policy(
+                    descriptor,
+                    normalized / name,
+                    directory_fd=directory_fd,
+                    name=name,
+                )
                 _require_owner_mode(
                     normalized / name,
                     opened,
@@ -1003,6 +1009,13 @@ def _read_inventory_artifacts_anchored(
                     )
                 closed = os.fstat(descriptor)
                 _require_same_file(observed, closed, name)
+                _validate_artifact_access_policy(
+                    descriptor,
+                    normalized / name,
+                    directory_fd=directory_fd,
+                    name=name,
+                    changed=True,
+                )
             finally:
                 os.close(descriptor)
             current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -1156,9 +1169,11 @@ def _checked_open(path: Path, expected: os.stat_result):
     try:
         opened = os.fstat(descriptor)
         _require_same_file(expected, opened, path.name)
+        _validate_artifact_access_policy(descriptor, path)
         yield descriptor
         closed = os.fstat(descriptor)
         _require_same_file(expected, closed, path.name)
+        _validate_artifact_access_policy(descriptor, path, changed=True)
     finally:
         os.close(descriptor)
 
@@ -1211,21 +1226,43 @@ def _require_same_file(
         expected.st_ino,
         expected.st_mode,
         expected.st_size,
-        expected.st_mtime_ns,
-        expected.st_ctime_ns,
+        expected.st_uid,
+        expected.st_nlink,
     )
     actual_tuple = (
         actual.st_dev,
         actual.st_ino,
         actual.st_mode,
         actual.st_size,
-        actual.st_mtime_ns,
-        actual.st_ctime_ns,
+        actual.st_uid,
+        actual.st_nlink,
     )
     if expected_tuple != actual_tuple or not stat.S_ISREG(actual.st_mode):
         raise ArtifactValidationError(
             f"retained artifact changed while reading: {name}"
         )
+
+
+def _validate_artifact_access_policy(
+    descriptor: int,
+    path: Path,
+    *,
+    directory_fd: int | None = None,
+    name: str | None = None,
+    changed: bool = False,
+) -> None:
+    try:
+        safe_io.validate_owner_only_file_descriptor(
+            descriptor,
+            path,
+            directory_fd=directory_fd,
+            name=name,
+        )
+    except (OSError, safe_io.UnsafePathError) as exc:
+        state = "changed while reading" if changed else "is invalid"
+        raise ArtifactValidationError(
+            f"retained artifact access policy {state}: {path.name}"
+        ) from exc
 
 
 def _require_owner_mode(

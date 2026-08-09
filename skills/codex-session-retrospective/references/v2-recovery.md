@@ -104,7 +104,19 @@ is durable but raw cleanup fails, the run remains
 is never rolled back. Once that pending checkpoint is durable, `finalize` may
 terminalize the attempt-bound export sidecar. A later retry accepts a fully
 collected bundle/sidecar pair as completed GC, while one-sided local state is a
-conflict.
+conflict. Publication rereads validate descriptor identity and owner-only
+mode/link/ACL policy before and after content reads, then compare the retained
+digest. Timestamp changes trigger that proof but are not mutation evidence.
+
+Export GC uses an iterative descriptor-anchored walk with one global deadline,
+entry count, depth, and path-byte budget. Its schema-v3 receipt reports complete
+counts but retains only bounded path samples. Exhaustion stops further traversal
+and returns `status: incomplete` with a typed reason; it is never represented as
+a complete no-activity result. Candidate artifact-directory probes are capped at
+the exact retained-artifact cardinality before recursive classification. The
+budget can block a new deletion before mutation starts, but a started deletion
+always completes secure removal, parent-directory fsync, and receipt accounting
+without an intervening deadline checkpoint.
 
 Shadow cleanup recovery is also checkpoint-authoritative. Before deletion, the
 engine fsyncs a fixed-root cleanup claim whose authenticated descriptor binds an

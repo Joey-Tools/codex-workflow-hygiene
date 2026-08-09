@@ -1668,7 +1668,6 @@ def command_finalize(args: argparse.Namespace) -> CommandResult:
             code="publication_not_resumable",
             message="the publication transaction is not resumable",
         )
-
     transaction_state = transaction.status()
     attempt_ref = transaction_state["attempt_ref"]
     run_result = orchestrator.mark_finalized(
@@ -1678,8 +1677,9 @@ def command_finalize(args: argparse.Namespace) -> CommandResult:
         defer_cleanup=True,
         plan_digest=transaction_state["plan_digest"],
     )
-    export_api.release_committed_staged_export(bundle_dir, attempt_ref)
-    run_result = orchestrator.complete_published_cleanup()
+    if transaction_state["phase"] == "committed":
+        export_api.release_committed_staged_export(bundle_dir, attempt_ref)
+        run_result = orchestrator.complete_published_cleanup()
     return CommandResult.success(
         "finalize",
         {

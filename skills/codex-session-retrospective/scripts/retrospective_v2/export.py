@@ -13,6 +13,7 @@ import re
 import secrets
 import stat
 import tempfile
+import time
 from typing import Any
 
 from . import safe_io
@@ -38,6 +39,11 @@ _ATTEMPT_REF_RE = re.compile(r"attempt_ref_v2:[0-9a-f]{64}\Z")
 _TEMPORARY_STAGING_RE = re.compile(
     r"\.(?P<output>.+)\.staging-(?:0|[1-9][0-9]*)-[0-9a-f]{24}\Z"
 )
+_GC_MAX_ENTRIES = 50_000
+_GC_MAX_DEPTH = 64
+_GC_MAX_PATH_BYTES = 16 * 1024 * 1024
+_GC_MAX_SECONDS = 60.0
+_GC_MAX_RESULT_SAMPLES = 256
 
 
 class RetainedExportError(RuntimeError):
@@ -50,6 +56,51 @@ class ExportLocationError(RetainedExportError):
 
 class ExportConflictError(RetainedExportError):
     """Raised when an immutable staging path already has different content."""
+
+
+class _GcBudgetExhausted(RuntimeError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _GcBudget:
+    def __init__(self) -> None:
+        self.deadline = time.monotonic() + _GC_MAX_SECONDS
+        self.entries = 0
+        self.path_bytes = 0
+        self.max_depth = 0
+
+    def checkpoint(self) -> None:
+        if time.monotonic() >= self.deadline:
+            raise _GcBudgetExhausted("deadline_exhausted")
+
+    def observe(self, path: Path, *, depth: int) -> None:
+        self.require_depth(depth)
+        self.entries += 1
+        self.path_bytes += len(os.fsencode(path))
+        self.max_depth = max(self.max_depth, depth)
+        if self.entries > _GC_MAX_ENTRIES:
+            raise _GcBudgetExhausted("entry_budget_exhausted")
+        if self.path_bytes > _GC_MAX_PATH_BYTES:
+            raise _GcBudgetExhausted("path_byte_budget_exhausted")
+
+    def require_depth(self, depth: int) -> None:
+        self.checkpoint()
+        if depth > _GC_MAX_DEPTH:
+            raise _GcBudgetExhausted("depth_budget_exhausted")
+        self.max_depth = max(self.max_depth, depth)
+
+
+class _GcPathSamples:
+    def __init__(self) -> None:
+        self.count = 0
+        self.values: list[str] = []
+
+    def append(self, value: str) -> None:
+        self.count += 1
+        if len(self.values) < _GC_MAX_RESULT_SAMPLES:
+            self.values.append(value)
 
 
 def _absolute(path: str | os.PathLike[str]) -> Path:
@@ -1451,6 +1502,16 @@ def _orphan_expired(metadata: os.stat_result, clock: dt.datetime) -> bool:
     return clock >= modified + MAX_EXPORT_RETENTION
 
 
+def _bounded_artifact_names(directory_fd: int) -> list[str] | None:
+    names: list[str] = []
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            if len(names) >= len(RETAINED_ARTIFACT_NAMES):
+                return None
+            names.append(entry.name)
+    return names
+
+
 def _temporary_staging_metadata(
     anchor: _AnchoredExport,
     temporary_name: str,
@@ -1461,9 +1522,11 @@ def _temporary_staging_metadata(
         return None
     try:
         before = os.fstat(descriptor)
-        names = os.listdir(descriptor)
-        if len(names) != len(set(names)) or not set(names).issubset(
-            RETAINED_ARTIFACT_NAMES
+        names = _bounded_artifact_names(descriptor)
+        if (
+            names is None
+            or len(names) != len(set(names))
+            or not set(names).issubset(RETAINED_ARTIFACT_NAMES)
         ):
             return None
         total_bytes = 0
@@ -1504,10 +1567,12 @@ def _collect_temporary_orphan(
     current: Path,
     name: str,
     *,
+    budget: _GcBudget,
     clock: dt.datetime,
-    deleted: list[str],
-    retained: list[str],
+    deleted: _GcPathSamples,
+    retained: _GcPathSamples,
 ) -> bool:
+    budget.checkpoint()
     match = _TEMPORARY_STAGING_RE.fullmatch(name)
     if match is None:
         return False
@@ -1526,6 +1591,7 @@ def _collect_temporary_orphan(
             if not _orphan_expired(metadata, clock):
                 retained.append(str(temporary_path))
                 return True
+            budget.checkpoint()
             safe_io.secure_remove_tree_at(
                 anchor.parent_fd,
                 name,
@@ -1543,20 +1609,24 @@ def _collect_installed_orphan(
     current: Path,
     name: str,
     *,
+    budget: _GcBudget,
     clock: dt.datetime,
-    deleted: list[str],
-    retained: list[str],
+    deleted: _GcPathSamples,
+    retained: _GcPathSamples,
 ) -> bool:
+    budget.checkpoint()
     anchor = _AnchoredExport(current / name, os.dup(directory_fd))
     try:
         descriptor = anchor.child_fd()
         try:
-            initial_names = os.listdir(descriptor)
+            initial_names = _bounded_artifact_names(descriptor)
         finally:
             os.close(descriptor)
-        if set(initial_names) != set(RETAINED_ARTIFACT_NAMES) or len(
-            initial_names
-        ) != len(RETAINED_ARTIFACT_NAMES):
+        if (
+            initial_names is None
+            or set(initial_names) != set(RETAINED_ARTIFACT_NAMES)
+            or len(initial_names) != len(RETAINED_ARTIFACT_NAMES)
+        ):
             return False
         with anchor.lock():
             if anchor.exists(anchor.retention_name):
@@ -1566,17 +1636,20 @@ def _collect_installed_orphan(
                 return True
             descriptor = anchor.child_fd()
             try:
-                directory_names = os.listdir(descriptor)
+                directory_names = _bounded_artifact_names(descriptor)
                 metadata = os.fstat(descriptor)
             finally:
                 os.close(descriptor)
-            if set(directory_names) != set(RETAINED_ARTIFACT_NAMES) or len(
-                directory_names
-            ) != len(RETAINED_ARTIFACT_NAMES):
+            if (
+                directory_names is None
+                or set(directory_names) != set(RETAINED_ARTIFACT_NAMES)
+                or len(directory_names) != len(RETAINED_ARTIFACT_NAMES)
+            ):
                 raise ExportConflictError(
                     "installed retained orphan inventory changed during GC inspection"
                 )
             _validate_at(anchor)
+            budget.checkpoint()
             current_metadata = os.stat(
                 anchor.name,
                 dir_fd=anchor.parent_fd,
@@ -1600,6 +1673,7 @@ def _collect_installed_orphan(
             if anchor.exists(anchor.retention_name):
                 retained.append(str(anchor.output))
                 return True
+            budget.checkpoint()
             safe_io.secure_remove_tree_at(
                 anchor.parent_fd,
                 anchor.name,
@@ -1612,18 +1686,43 @@ def _collect_installed_orphan(
         anchor.close()
 
 
-def _garbage_collect_at(
+def _bounded_gc_names(
     directory_fd: int,
     current: Path,
     *,
+    budget: _GcBudget,
+    depth: int,
+) -> list[str]:
+    budget.require_depth(depth)
+    names: list[str] = []
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            budget.observe(current / entry.name, depth=depth + 1)
+            names.append(entry.name)
+    budget.checkpoint()
+    return sorted(names, key=os.fsencode)
+
+
+def _garbage_collect_directory(
+    directory_fd: int,
+    current: Path,
+    *,
+    budget: _GcBudget,
     clock: dt.datetime,
-    deleted: list[str],
-    retained: list[str],
-) -> None:
-    names = sorted(os.listdir(directory_fd), key=os.fsencode)
+    deleted: _GcPathSamples,
+    retained: _GcPathSamples,
+    depth: int,
+) -> list[str]:
+    names = _bounded_gc_names(
+        directory_fd,
+        current,
+        budget=budget,
+        depth=depth,
+    )
     retention_names = [name for name in names if name.endswith(_RETENTION_SUFFIX)]
     bundle_names: set[str] = set()
     for state_name in retention_names:
+        budget.checkpoint()
         if not state_name.startswith("."):
             raise RetainedExportError(
                 "retained export state filename is not bundle-bound"
@@ -1667,6 +1766,7 @@ def _garbage_collect_at(
                     continue
                 if anchor.exists():
                     validation = _validate_at(anchor)
+                    budget.checkpoint()
                     if validation["bundle_digest"] != state["bundle_digest"]:
                         raise ExportConflictError(
                             "expired retained export bytes changed before GC"
@@ -1676,6 +1776,7 @@ def _garbage_collect_at(
                         "retained export state changed before GC deletion"
                     )
                 if anchor.exists():
+                    budget.checkpoint()
                     safe_io.secure_remove_tree_at(
                         anchor.parent_fd,
                         anchor.name,
@@ -1693,7 +1794,9 @@ def _garbage_collect_at(
                 deleted.append(str(anchor.output))
         finally:
             anchor.close()
+    child_names: list[str] = []
     for name in names:
+        budget.checkpoint()
         if name in bundle_names:
             continue
         if name.startswith("."):
@@ -1701,6 +1804,7 @@ def _garbage_collect_at(
                 directory_fd,
                 current,
                 name,
+                budget=budget,
                 clock=clock,
                 deleted=deleted,
                 retained=retained,
@@ -1713,27 +1817,111 @@ def _garbage_collect_at(
             directory_fd,
             current,
             name,
+            budget=budget,
             clock=clock,
             deleted=deleted,
             retained=retained,
         ):
             continue
-        child_path = current / name
-        child_anchor = _AnchoredExport(child_path / ".gc-anchor", os.dup(directory_fd))
+        child_names.append(name)
+    return child_names
+
+
+def _garbage_collect_iterative(
+    directory_fd: int,
+    current: Path,
+    *,
+    budget: _GcBudget,
+    clock: dt.datetime,
+    deleted: _GcPathSamples,
+    retained: _GcPathSamples,
+) -> None:
+    stack: list[dict[str, Any]] = []
+
+    def push(parent_fd: int, path: Path, depth: int, name: str | None) -> None:
+        budget.require_depth(depth)
+        if name is None:
+            child_fd = os.dup(parent_fd)
+        else:
+            anchor = _AnchoredExport(path / ".gc-anchor", os.dup(parent_fd))
+            try:
+                child_fd = anchor.child_fd(name)
+            finally:
+                anchor.close()
         try:
-            child_fd = child_anchor.child_fd(name)
-        finally:
-            child_anchor.close()
-        try:
-            _garbage_collect_at(
+            children = _garbage_collect_directory(
                 child_fd,
-                child_path,
+                path,
+                budget=budget,
                 clock=clock,
                 deleted=deleted,
                 retained=retained,
+                depth=depth,
             )
-        finally:
+        except BaseException:
             os.close(child_fd)
+            raise
+        stack.append(
+            {
+                "children": children,
+                "depth": depth,
+                "directory_fd": child_fd,
+                "index": 0,
+                "path": path,
+            }
+        )
+
+    push(directory_fd, current, 0, None)
+    try:
+        while stack:
+            budget.checkpoint()
+            frame = stack[-1]
+            index = frame["index"]
+            if index >= len(frame["children"]):
+                os.close(frame["directory_fd"])
+                stack.pop()
+                continue
+            name = frame["children"][index]
+            frame["index"] = index + 1
+            push(
+                frame["directory_fd"],
+                frame["path"] / name,
+                frame["depth"] + 1,
+                name,
+            )
+    finally:
+        for frame in stack:
+            os.close(frame["directory_fd"])
+
+
+def _gc_receipt(
+    *,
+    budget: _GcBudget,
+    deleted: _GcPathSamples,
+    retained: _GcPathSamples,
+    incomplete_reason: str | None,
+) -> dict[str, Any]:
+    return {
+        "budget": {
+            "deadline_seconds": _GC_MAX_SECONDS,
+            "entries_limit": _GC_MAX_ENTRIES,
+            "entries_observed": budget.entries,
+            "max_depth_limit": _GC_MAX_DEPTH,
+            "max_depth_observed": budget.max_depth,
+            "path_bytes_limit": _GC_MAX_PATH_BYTES,
+            "path_bytes_observed": budget.path_bytes,
+            "result_sample_limit": _GC_MAX_RESULT_SAMPLES,
+        },
+        "deleted": sorted(deleted.values),
+        "deleted_count": deleted.count,
+        "deleted_truncated": deleted.count > len(deleted.values),
+        "incomplete_reason": incomplete_reason,
+        "retained": sorted(retained.values),
+        "retained_count": retained.count,
+        "retained_truncated": retained.count > len(retained.values),
+        "schema_version": 3,
+        "status": "incomplete" if incomplete_reason else "complete",
+    }
 
 
 def garbage_collect_expired_exports(
@@ -1741,32 +1929,44 @@ def garbage_collect_expired_exports(
     *,
     now: dt.datetime | None = None,
 ) -> dict[str, Any]:
-    """Delete expired, unpublished retained bundles with owner/no-follow checks."""
+    """Delete eligible exports under one bounded descriptor-anchored traversal."""
 
+    budget = _GcBudget()
+    deleted = _GcPathSamples()
+    retained = _GcPathSamples()
     root = Path(os.path.abspath(os.fspath(root_dir)))
     if not os.path.lexists(root):
-        return {"deleted": [], "retained": [], "schema_version": 2}
-    root = _normalized_staging_path(root, require_ignored=True)
-    clock = _normalize_instant(now or _utc_now(), label="now")
-    deleted: list[str] = []
-    retained: list[str] = []
-    normalized_root, root_fd = safe_io.open_owner_only_directory(root)
-    root_stat = os.fstat(root_fd)
-    try:
-        _garbage_collect_at(
-            root_fd,
-            normalized_root,
-            clock=clock,
+        return _gc_receipt(
+            budget=budget,
             deleted=deleted,
             retained=retained,
+            incomplete_reason=None,
         )
+    root = _normalized_staging_path(root, require_ignored=True)
+    clock = _normalize_instant(now or _utc_now(), label="now")
+    normalized_root, root_fd = safe_io.open_owner_only_directory(root)
+    root_stat = os.fstat(root_fd)
+    incomplete_reason: str | None = None
+    try:
+        try:
+            _garbage_collect_iterative(
+                root_fd,
+                normalized_root,
+                budget=budget,
+                clock=clock,
+                deleted=deleted,
+                retained=retained,
+            )
+        except _GcBudgetExhausted as exc:
+            incomplete_reason = exc.reason
         current = os.stat(normalized_root, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (root_stat.st_dev, root_stat.st_ino):
             raise ExportLocationError("retained export GC root changed during GC")
     finally:
         os.close(root_fd)
-    return {
-        "deleted": sorted(deleted),
-        "retained": sorted(retained),
-        "schema_version": 2,
-    }
+    return _gc_receipt(
+        budget=budget,
+        deleted=deleted,
+        retained=retained,
+        incomplete_reason=incomplete_reason,
+    )

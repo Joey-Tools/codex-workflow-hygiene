@@ -2564,6 +2564,70 @@ class DurablePublicationTests(unittest.TestCase):
                     safe_io.atomic_write_bytes(target, original)
                     replacement.unlink(missing_ok=True)
 
+    def test_privacy_reread_accepts_benign_timestamp_change(self) -> None:
+        _, bundle = self.build_exportable_run("privacy-benign-timestamp")
+        target_name = "manifest.json"
+        target = bundle / target_name
+        inventory = build_artifact_inventory(bundle)
+        real_open = os.open
+        triggered = False
+
+        def touching_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal triggered
+            if path == target_name and dir_fd is not None and not triggered:
+                triggered = True
+                metadata = target.stat()
+                os.utime(
+                    target,
+                    ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
+                )
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(
+            finalize_module.os,
+            "open",
+            side_effect=touching_open,
+        ):
+            artifacts, _parsed = finalize_module._privacy_validate_bundle(
+                bundle,
+                expected_inventory=inventory,
+            )
+
+        self.assertTrue(triggered)
+        self.assertEqual(target.read_bytes(), artifacts[target_name])
+
+    def test_privacy_reread_rejects_late_acl_policy_drift(self) -> None:
+        _, bundle = self.build_exportable_run("privacy-late-acl")
+        inventory = build_artifact_inventory(bundle)
+        real_validate = safe_io.validate_owner_only_file_descriptor
+        target_validations = 0
+
+        def drift_after_read(descriptor, display_path, **kwargs):
+            nonlocal target_validations
+            real_validate(descriptor, display_path, **kwargs)
+            if display_path.name == "manifest.json":
+                target_validations += 1
+                if target_validations == 2:
+                    raise safe_io.UnsafePathError("simulated late Darwin ACL drift")
+
+        with (
+            mock.patch.object(
+                publication_support.safe_io,
+                "validate_owner_only_file_descriptor",
+                side_effect=drift_after_read,
+            ),
+            self.assertRaisesRegex(
+                finalize_module.ArtifactValidationError,
+                "access policy changed while reading",
+            ),
+        ):
+            finalize_module._privacy_validate_bundle(
+                bundle,
+                expected_inventory=inventory,
+            )
+
+        self.assertEqual(2, target_validations)
+
     def test_recovery_repairs_outer_promoted_after_exact_target_cas_crash(
         self,
     ) -> None:
@@ -3135,6 +3199,80 @@ class DurablePublicationTests(unittest.TestCase):
         retry = self.finalize_cli(coordinator)
         self.assertTrue(retry.result["idempotent"])
         self.assertEqual(RunStage.COMPLETE.value, retry.result["stage"])
+
+    def test_finalize_cli_releases_export_only_after_committed_checkpoint(
+        self,
+    ) -> None:
+        coordinator, bundle = self.build_exportable_run(
+            "cli-phased-finalize",
+            persist_descriptor=True,
+        )
+        sidecar = bundle.with_name(f".{bundle.name}.retention-v2.json")
+        orchestrator_class = cli_module.orchestrator_api.RetrospectiveOrchestrator
+
+        def frozen_orchestrator(*args, **kwargs):
+            return orchestrator_class(
+                *args,
+                clock=lambda: "2026-07-15T00:00:00Z",
+                **kwargs,
+            )
+
+        with mock.patch.object(
+            cli_module.orchestrator_api,
+            "RetrospectiveOrchestrator",
+            side_effect=frozen_orchestrator,
+        ):
+            for expected_phase in (
+                "prepared",
+                "staged",
+                "sealed",
+                "compliance_closed",
+                "promoted",
+            ):
+                result = self.finalize_cli(coordinator)
+                self.assertEqual(expected_phase, result.result["transaction_phase"])
+                self.assertEqual(expected_phase, result.result["publication_phase"])
+                retained_state = json.loads(sidecar.read_text(encoding="ascii"))
+                self.assertEqual("publication_bound", retained_state["status"])
+                collected = garbage_collect_expired_exports(
+                    self.root / ".codex-local" / "exports",
+                    now=dt.datetime(2100, 1, 1, tzinfo=dt.UTC),
+                )
+                self.assertEqual("complete", collected["status"])
+                self.assertIn(str(bundle.resolve()), collected["retained"])
+                self.assertTrue(bundle.is_dir())
+
+            committed = self.finalize_cli(coordinator)
+
+        self.assertEqual("committed", committed.result["transaction_phase"])
+        self.assertEqual("complete", committed.result["publication_phase"])
+        terminal_state = json.loads(sidecar.read_text(encoding="ascii"))
+        self.assertEqual("publication_terminal", terminal_state["status"])
+        self.assertEqual("committed", terminal_state["terminal_disposition"])
+        collected = garbage_collect_expired_exports(
+            self.root / ".codex-local" / "exports",
+            now=dt.datetime(2100, 1, 1, tzinfo=dt.UTC),
+        )
+        self.assertIn(str(bundle.resolve()), collected["deleted"])
+        self.assertFalse(bundle.exists())
+
+    def test_finalize_cli_preserves_aborted_export_disposition(self) -> None:
+        coordinator, bundle = self.build_exportable_run(
+            "cli-aborted-finalize",
+            persist_descriptor=True,
+        )
+        transaction = self.transaction(coordinator, bundle)
+        transaction.prepare()
+        transaction.abort("test_requested_abort")
+
+        result = self.finalize_cli(coordinator)
+
+        self.assertEqual("aborted", result.result["transaction_phase"])
+        self.assertEqual("aborted", result.result["publication_phase"])
+        sidecar = bundle.with_name(f".{bundle.name}.retention-v2.json")
+        terminal_state = json.loads(sidecar.read_text(encoding="ascii"))
+        self.assertEqual("publication_terminal", terminal_state["status"])
+        self.assertEqual("aborted", terminal_state["terminal_disposition"])
 
     def test_pending_checkpoint_recovers_after_terminal_export_gc(self) -> None:
         coordinator, bundle = self.build_exportable_run(
