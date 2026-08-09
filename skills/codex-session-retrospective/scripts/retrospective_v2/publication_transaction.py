@@ -263,6 +263,58 @@ class PublicationTransaction:
         finally:
             state_directory.close()
 
+    @classmethod
+    def inspect_local_for_run(
+        cls,
+        journal_path: str | os.PathLike[str],
+        *,
+        bundle_dir: str | os.PathLike[str],
+        destination: str,
+        target_ref: str,
+        expected_target_head: str | None,
+        run_dir: str | os.PathLike[str],
+        identity_path: str | os.PathLike[str],
+    ) -> dict[str, Any]:
+        """Validate an existing journal against the current run before claiming it."""
+
+        journal = Path(journal_path).absolute()
+        authoritative_run_dir = Path(run_dir).absolute()
+        if journal.parent != authoritative_run_dir:
+            raise AttemptMismatchError(
+                "publication journal is outside the authoritative run directory"
+            )
+        state = cls.inspect_local(journal)
+        inventory = build_artifact_inventory(Path(bundle_dir).absolute())
+        if state["inventory"] != inventory.to_dict():
+            raise AttemptMismatchError(
+                "publication journal inventory differs from the current run bundle"
+            )
+        publication_authority, cursor_vector, episode_update = (
+            _load_run_publication_authority(
+                run_dir=authoritative_run_dir,
+                identity_path=Path(identity_path).expanduser().absolute(),
+                bundle_dir=Path(bundle_dir).absolute(),
+                inventory=inventory,
+            )
+        )
+        expected_plan = {
+            "attempt_ref": state["attempt_ref"],
+            "bundle_dir": str(Path(bundle_dir).absolute()),
+            "destination": destination,
+            "episode_head_update": episode_update,
+            "expected_target_head": expected_target_head,
+            "host_cursor_vector": cursor_vector,
+            "inventory_digest_v2": inventory.inventory_digest_v2,
+            "kind": TransactionKind.PUBLISH.value,
+            "publication_authority": publication_authority,
+            "target_ref": target_ref,
+        }
+        if canonical_json_bytes(state["plan"]) != canonical_json_bytes(expected_plan):
+            raise AttemptMismatchError(
+                "publication journal does not belong to the current run"
+            )
+        return state
+
     @property
     def journal_path(self) -> Path:
         return self._journal_path

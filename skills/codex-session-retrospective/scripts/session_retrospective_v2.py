@@ -1598,9 +1598,19 @@ def command_finalize(args: argparse.Namespace) -> CommandResult:
         expected_signer_uid=finalize_api.DEFAULT_PUBLISHER_UID,
     )
     journal = run_dir / PUBLICATION_JOURNAL_NAME
+    destination = _publication_destination(run_state)
+    expected_history_commit = history_snapshot["history_commit"]
     if journal.exists() or journal.is_symlink():
-        local_transaction_state = finalize_api.PublicationTransaction.inspect_local(
-            journal
+        local_transaction_state = (
+            finalize_api.PublicationTransaction.inspect_local_for_run(
+                journal,
+                bundle_dir=bundle_dir,
+                destination=destination,
+                target_ref=target_ref,
+                expected_target_head=expected_history_commit,
+                run_dir=run_dir,
+                identity_path=identity_path,
+            )
         )
         claim_result = orchestrator.claim_publication(
             local_transaction_state["attempt_ref"],
@@ -1609,14 +1619,15 @@ def command_finalize(args: argparse.Namespace) -> CommandResult:
         transaction = finalize_api.PublicationTransaction.open(
             journal,
             adapter=adapter,
+            expected_attempt_ref=local_transaction_state["attempt_ref"],
         )
     else:
         transaction = finalize_api.PublicationTransaction.create(
             journal,
             bundle_dir=bundle_dir,
-            destination=_publication_destination(run_state),
+            destination=destination,
             target_ref=target_ref,
-            expected_target_head=history_snapshot["history_commit"],
+            expected_target_head=expected_history_commit,
             run_dir=run_dir,
             identity_path=identity_path,
             adapter=adapter,

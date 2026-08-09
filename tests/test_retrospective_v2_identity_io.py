@@ -263,6 +263,28 @@ class SafeIoTests(unittest.TestCase):
         self.assertEqual(0o600, stat.S_IMODE(target.stat().st_mode))
         self.assertEqual([], list(target.parent.glob(".*.tmp")))
 
+    def test_cleanup_inventory_uses_global_bytewise_path_order(self) -> None:
+        tree = self.root / "cleanup"
+        nested = tree / "a"
+        tree.mkdir(mode=0o700)
+        nested.mkdir(mode=0o700)
+        atomic_write_bytes(nested / "child", b"nested\n")
+        atomic_write_bytes(tree / "a.", b"sibling\n")
+        parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            snapshot = safe_io.inspect_tree_inventory_at(
+                parent_fd,
+                tree.name,
+                display_path=tree,
+            )
+        finally:
+            os.close(parent_fd)
+
+        self.assertEqual(
+            [".", "a", "a.", "a/child"],
+            [entry["relative_path"] for entry in snapshot["entries"]],
+        )
+
     def test_atomic_create_never_replaces_an_existing_file(self) -> None:
         target = self.root / "identity.key"
         atomic_create_bytes(target, b"first\n")

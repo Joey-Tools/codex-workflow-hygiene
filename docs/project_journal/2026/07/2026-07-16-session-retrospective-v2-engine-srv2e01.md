@@ -4,8 +4,8 @@ title: Session Retrospective v2 Engine
 status: completed
 created: 2026-07-16
 updated: 2026-08-09
-branch: wip/session-retrospective-v2-engine-clean
-pr: 43
+branch: codex/session-retrospective-v2-engine-linear
+pr: 67
 supersedes: []
 superseded_by:
 ---
@@ -67,6 +67,20 @@ superseded_by:
 - Durable-history verification isolates Git configuration, pins the OpenPGP
   verifier, and rejects any retained-history commit that does not add exactly
   one canonical eight-artifact bundle.
+- Durable-history verification now walks the complete bounded reachable graph
+  and evaluates `runs/` against every parent edge. A root that introduces
+  retained history or a merge that changes it relative to any parent fails
+  closed; a merge whose retained tree is identical to every parent remains
+  valid.
+- An existing publication journal is fully re-derived against the current run,
+  bundle inventory, durable head, cursor transition, and episode transition
+  before the coordinator may persist a publication claim. Copying a valid
+  journal to another run therefore cannot reserve or mutate that run.
+- Cleanup v4 authenticates a globally bytewise-sorted per-object inventory for
+  all four fixed roots and revalidates it twice before deletion. Same-size child
+  replacement, shrinkage, removal, type or access-policy drift fail closed;
+  timestamp-only changes remain benign and legacy v2/v3 claims retain their
+  original replay-only semantics.
 - Publication recovery can advance provider state when the exact signed
   publication remains reachable below an unrelated successor commit.
 - Retained episode, topic, turn, and global artifacts preserve opaque evidence
@@ -574,3 +588,27 @@ superseded_by:
   Its detached workspace passed postvalidation, the trusted manifest, playbook,
   and guard digests remained unchanged, and the task root was removed. A new
   signed head requires new admission, materialization, and review evidence.
+- The next valid frozen-head Codex review found three P1s: first-parent history
+  simplification could hide a rollback merge, cleanup claims bound only root
+  identity plus counters, and an existing journal could be claimed before its
+  current-run plan was proved. The follow-up adds complete parent-edge history
+  validation, v4 exact child inventories, and pre-claim journal re-derivation.
+  Focused regressions passed 7/7, the direct cleanup-order regression and
+  module-boundary group passed 21/21, identity/safe-I/O passed 32/32,
+  orchestrator passed 74/74 in 106.933 seconds, and the host-level disposable-
+  GPG publication suite passed 48/48 in 490.283 seconds. The prior head's review,
+  admission, and CI remain historical only; final-head gates must be rerun.
+- An initial post-P1 host Python 3.13 discovery passed all 1,573 tests in
+  781.751 seconds. A subsequent cleanup audit found that malformed inventory
+  modes could escape as `TypeError` and that the second exact inventory pass
+  still ran per root immediately before deletion instead of completing across
+  every root first. That discovery is retained as historical evidence only.
+  The repaired exact-cleanup and module group passed 21/21, the complete
+  orchestrator module passed 75/75 in 100.164 seconds, and the short module,
+  result-contract, skill-structure, and validator-wrapper group passed 71/71 in
+  6.596 seconds.
+- The final host Python 3.13 discovery passed all 1,574 tests in 789.683
+  seconds, including the disposable-GPG publication transactions. It
+  supersedes the earlier 1,573-test run and every affected-module result as the
+  complete implementation-tree gate; the only subsequent change was this
+  evidence-only journal update.

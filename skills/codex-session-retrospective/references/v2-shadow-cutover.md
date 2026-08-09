@@ -56,15 +56,19 @@ commitments itself. There is no public coverage or cleanup issuer that accepts
 those values as arguments.
 
 Shadow cleanup first stores an authenticated fixed-root claim containing the
-observed inode inventory and counters for `raw-inputs`, `raw-shards`,
-`retained-inputs`, and `agent-sinks`. The v3 cleanup transaction then deletes
-only those four anchored roots,
-fsyncs their parent, confirms absence, and commits the coverage-bound cleanup
-receipt in the authenticated checkpoint. A retry after deletion or a lost close
-response uses the durable claim and returns the same receipt; pre-removed,
-replaced, symlinked, regrown, or caller-selected paths fail closed.
-The legacy three-root schema remains readable only for compatibility recovery;
-new cleanup claims always use the four-root v3 contract.
+globally bytewise-sorted relative-path, type, device/inode, size, ownership,
+mode, link-count, and ACL-policy inventory for `raw-inputs`, `raw-shards`,
+`retained-inputs`, and `agent-sinks`. The v4 cleanup transaction then deletes
+only those four anchored roots, fsyncs their parent, confirms absence, and
+commits the coverage-bound cleanup receipt in the authenticated checkpoint. A
+retry after deletion or a lost close response uses the durable claim and returns
+the same receipt; pre-removed, replaced, symlinked, regrown, or caller-selected
+paths fail closed. Timestamp-only changes remain benign, and the final observed
+inventory does not claim atomic exclusion of an actively malicious same-UID
+writer after revalidation.
+The legacy v2 three-root and v3 counter-only four-root schemas remain readable
+only for compatibility recovery; new cleanup claims use the exact-inventory
+four-root v4 contract.
 
 ## Operational Cutover
 

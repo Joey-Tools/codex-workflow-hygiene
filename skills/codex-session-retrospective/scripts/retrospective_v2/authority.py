@@ -21,7 +21,18 @@ import time
 import tomllib
 from typing import Any, Mapping, Sequence
 
-from . import calibration, controlled_gaps, episode_review, reporting, safe_io
+from . import (
+    calibration,
+    controlled_gaps,
+    episode_review,
+    history_graph,
+    reporting,
+    safe_io,
+)
+from .authority_errors import AuthorityError as AuthorityError
+from .authority_errors import AutomationCutoverBlocked
+from .authority_errors import HistoryValidationError, ProductionMarkerError
+from .authority_errors import ProviderCacheConflict, ProviderCacheError
 from .contracts import RefType, canonical_json_bytes
 from .identity import IdentityKey
 from .orchestrator_core import LEGACY_SHADOW_CLEANUP_ROOTS, SHADOW_CLEANUP_ROOTS
@@ -50,10 +61,8 @@ STABLE_AUTOMATION_MODES = {
     "weekly-session-retrospective": "weekly",
 }
 MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024
-MAX_HISTORY_COMMITS = 65_536
 MAX_PROVIDER_CACHE_BYTES = 64 * 1024 * 1024
 MAX_AUTOMATION_RECORD_BYTES = 1024 * 1024
-_HISTORY_PATHSPEC = "runs"
 _OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _OPAQUE_REF_RE = re.compile(r"[a-z_]+_ref_v2:[0-9a-f]{64}\Z")
 _EPISODE_REF_RE = re.compile(r"episode_ref_v2:[0-9a-f]{64}\Z")
@@ -67,7 +76,7 @@ _SHADOW_POLICY_COMMITMENT_RE = re.compile(r"shadow_policy_commitment_v2:[0-9a-f]
 _SHADOW_VERSION_COMMITMENT_RE = re.compile(
     r"shadow_version_commitment_v2:[0-9a-f]{64}\Z"
 )
-_SHADOW_CLEANUP_CLAIM_RE = re.compile(r"shadow_cleanup_claim_v[23]:[0-9a-f]{64}\Z")
+_SHADOW_CLEANUP_CLAIM_RE = re.compile(r"shadow_cleanup_claim_v[234]:[0-9a-f]{64}\Z")
 _KEY_ID_RE = re.compile(r"identity_key_v2:[0-9a-f]{64}\Z")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _ATTEMPT_REF_RE = re.compile(r"attempt_ref_v2:[0-9a-f]{64}\Z")
@@ -76,8 +85,8 @@ _SHADOW_RECEIPT_REF_RE = re.compile(r"shadow_receipt_v2:[0-9a-f]{64}\Z")
 _SHADOW_RECEIPT_AUTH_RE = re.compile(r"shadow_receipt_auth_v2:[0-9a-f]{64}\Z")
 _SHADOW_COVERAGE_REF_RE = re.compile(r"shadow_coverage_receipt_v2:[0-9a-f]{64}\Z")
 _SHADOW_COVERAGE_AUTH_RE = re.compile(r"shadow_coverage_auth_v2:[0-9a-f]{64}\Z")
-_RAW_CLEANUP_REF_RE = re.compile(r"raw_cleanup_receipt_v[23]:[0-9a-f]{64}\Z")
-_RAW_CLEANUP_AUTH_RE = re.compile(r"raw_cleanup_auth_v[23]:[0-9a-f]{64}\Z")
+_RAW_CLEANUP_REF_RE = re.compile(r"raw_cleanup_receipt_v[234]:[0-9a-f]{64}\Z")
+_RAW_CLEANUP_AUTH_RE = re.compile(r"raw_cleanup_auth_v[234]:[0-9a-f]{64}\Z")
 _CONTROLLED_GAP_REF_RE = re.compile(r"controlled_gap_receipt_v2:[0-9a-f]{64}\Z")
 _BACKFILL_LINEAGE_REF_RE = re.compile(r"backfill_lineage_receipt_v2:[0-9a-f]{64}\Z")
 _AUTOMATION_RESULT_REF_RE = re.compile(r"automation_update_result_v2:[0-9a-f]{64}\Z")
@@ -102,30 +111,6 @@ _PUBLICATION_MESSAGE_RE = re.compile(
     rb"Ordinal: ([0-9]+)\n"
     rb"Role: (standalone)\n\Z"
 )
-
-
-class AuthorityError(RuntimeError):
-    """Base error for durable publication authority failures."""
-
-
-class HistoryValidationError(AuthorityError):
-    pass
-
-
-class ProductionMarkerError(AuthorityError):
-    pass
-
-
-class AutomationCutoverBlocked(AuthorityError):
-    pass
-
-
-class ProviderCacheError(AuthorityError):
-    pass
-
-
-class ProviderCacheConflict(ProviderCacheError):
-    pass
 
 
 def _sha256_ref(prefix: str, domain: bytes, value: Any) -> str:
@@ -678,13 +663,16 @@ def _run_bounded(
     argv: Sequence[str],
     *,
     env: Mapping[str, str],
+    input_bytes: bytes | None = None,
     max_output_bytes: int = MAX_GIT_OUTPUT_BYTES,
     timeout_seconds: float = 30.0,
 ) -> subprocess.CompletedProcess[bytes]:
+    if input_bytes is not None and len(input_bytes) > MAX_GIT_OUTPUT_BYTES:
+        raise HistoryValidationError("history command input exceeds its byte bound")
     try:
         process = subprocess.Popen(
             list(argv),
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=dict(env),
@@ -697,6 +685,7 @@ def _run_bounded(
     selector = selectors.DefaultSelector()
     output = bytearray()
     errors = bytearray()
+    input_offset = 0
     deadline = time.monotonic() + timeout_seconds
     process_group_id = process.pid
     process_group_cleanup_attempted = False
@@ -724,13 +713,37 @@ def _run_bounded(
     try:
         for stream, target in ((process.stdout, output), (process.stderr, errors)):
             os.set_blocking(stream.fileno(), False)
-            selector.register(stream, selectors.EVENT_READ, target)
+            selector.register(stream, selectors.EVENT_READ, ("read", target))
+        if process.stdin is not None:
+            if input_bytes:
+                os.set_blocking(process.stdin.fileno(), False)
+                selector.register(process.stdin, selectors.EVENT_WRITE, ("write", None))
+            else:
+                process.stdin.close()
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError
             for key, _mask in selector.select(min(remaining, 0.1)):
                 stream = key.fileobj
+                operation, target = key.data
+                if operation == "write":
+                    assert input_bytes is not None
+                    try:
+                        written = os.write(
+                            stream.fileno(),
+                            input_bytes[input_offset : input_offset + 64 * 1024],
+                        )
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        written = 0
+                    if written > 0:
+                        input_offset += written
+                    if written <= 0 or input_offset == len(input_bytes):
+                        selector.unregister(stream)
+                        stream.close()
+                    continue
                 try:
                     chunk = os.read(stream.fileno(), 1024 * 1024)
                 except BlockingIOError:
@@ -741,7 +754,7 @@ def _run_bounded(
                     continue
                 if len(output) + len(errors) + len(chunk) > max_output_bytes:
                     raise BufferError
-                key.data.extend(chunk)
+                target.extend(chunk)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError
@@ -758,7 +771,9 @@ def _run_bounded(
         raise HistoryValidationError(f"history command exceeded its {reason}") from exc
     finally:
         selector.close()
-        for stream in (process.stdout, process.stderr):
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is None:
+                continue
             try:
                 stream.close()
             except OSError:
@@ -802,6 +817,7 @@ class _GitRepository:
         self,
         *args: str,
         check: bool = True,
+        input_bytes: bytes | None = None,
         max_output_bytes: int = MAX_GIT_OUTPUT_BYTES,
     ) -> subprocess.CompletedProcess[bytes]:
         result = _run_bounded(
@@ -820,6 +836,7 @@ class _GitRepository:
                 *args,
             ),
             env=self.env,
+            input_bytes=input_bytes,
             max_output_bytes=max_output_bytes,
         )
         if check and result.returncode != 0:
@@ -915,7 +932,7 @@ def _retained_publication_bundle(
         parent,
         commit,
         "--",
-        _HISTORY_PATHSPEC,
+        history_graph.HISTORY_PATHSPEC,
     )
     paths: list[str] = []
     for line in [] if not changes_text else changes_text.splitlines():
@@ -1066,18 +1083,12 @@ def load_durable_history(
     head = repo.text("rev-parse", "--verify", target_ref)
     if _OBJECT_ID_RE.fullmatch(head) is None:
         raise HistoryValidationError("durable history head is invalid")
-    log_output = repo.text(
-        "log",
-        "--reverse",
-        f"--max-count={MAX_HISTORY_COMMITS + 1}",
-        "--format=%H",
+    commits = history_graph.retained_publication_commits(
+        repo,
         target_ref,
-        "--",
-        _HISTORY_PATHSPEC,
+        expected_head=head,
+        pathspec=history_graph.HISTORY_PATHSPEC,
     )
-    commits = [] if not log_output else log_output.splitlines()
-    if len(commits) > MAX_HISTORY_COMMITS:
-        raise HistoryValidationError("durable publication history exceeds its bound")
 
     cursor_root = EMPTY_CURSOR_ROOT_REF
     episode_root = empty_episode_head_root(identity)
@@ -1232,7 +1243,7 @@ def history_repository_binding(
 
 SHADOW_COVERAGE_RECEIPT_SCHEMA = "shadow_coverage_receipt_v2"
 SHADOW_GATE_RECEIPT_SCHEMA = "shadow_gate_receipt_v2"
-SHADOW_CLEANUP_RECEIPT_SCHEMA = "raw_cleanup_receipt_v3"
+SHADOW_CLEANUP_RECEIPT_SCHEMA = "raw_cleanup_receipt_v4"
 _RAW_CLEANUP_RECEIPT_CONTRACTS = {
     "raw_cleanup_receipt_v2": (
         LEGACY_SHADOW_CLEANUP_ROOTS,
@@ -1243,6 +1254,11 @@ _RAW_CLEANUP_RECEIPT_CONTRACTS = {
         SHADOW_CLEANUP_ROOTS,
         "raw_cleanup_auth_v3",
         "shadow_cleanup_claim_v3:",
+    ),
+    "raw_cleanup_receipt_v4": (
+        SHADOW_CLEANUP_ROOTS,
+        "raw_cleanup_auth_v4",
+        "shadow_cleanup_claim_v4:",
     ),
 }
 _SOURCE_UNIT_FIELDS = {

@@ -26,6 +26,7 @@ sys.path.insert(0, str(SCRIPTS))
 from retrospective_v2 import (  # noqa: E402
     authority,
     catalog,
+    cleanup_inventory,
     contracts,
     controlled_gaps,
     episode_review,
@@ -5302,7 +5303,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(sidecar_root.exists())
         self.assertIsNone(coordinator.load_state()["retained_export"])
 
-    def test_cleanup_v2_replay_and_v3_generation_are_schema_scoped(self) -> None:
+    def test_cleanup_v2_replay_and_v4_generation_are_schema_scoped(self) -> None:
         coordinator = self.start_daily("legacy-cleanup-replay")
         state = coordinator.load_state()
         legacy_roots = LEGACY_SHADOW_CLEANUP_ROOTS
@@ -5350,21 +5351,39 @@ class OrchestratorTests(unittest.TestCase):
             publication_claim_ref=None,
             inventory=current._raw_cleanup_inventory(),
         )
-        self.assertEqual("raw_cleanup_claim_v3", current_claim["schema"])
+        self.assertEqual("raw_cleanup_claim_v4", current_claim["schema"])
+        self.assertEqual(
+            set(orchestrator_module.SHADOW_CLEANUP_ROOTS),
+            set(current_claim["root_entries"]),
+        )
         self.assertEqual(
             list(orchestrator_module.SHADOW_CLEANUP_ROOTS),
             current_claim["raw_path_inventory"],
         )
         self.assertEqual(
-            "raw_cleanup_receipt_v3",
+            "raw_cleanup_receipt_v4",
             current._raw_cleanup_receipt_value(current_claim)["schema"],
         )
         cross_schema = copy.deepcopy(legacy_claim)
-        cross_schema["schema"] = "raw_cleanup_claim_v3"
-        with self.assertRaisesRegex(InvalidTransitionError, "inventory|authentication"):
+        cross_schema["schema"] = "raw_cleanup_claim_v4"
+        with self.assertRaisesRegex(
+            InvalidTransitionError,
+            "shape|inventory|authentication",
+        ):
             current._validate_raw_cleanup_claim(
                 current_state,
                 cross_schema,
+                disposition="expired",
+                durable_commit=None,
+                phase_before=current_state["publication"]["phase"],
+                publication_claim_ref=None,
+            )
+        malformed_mode = copy.deepcopy(current_claim)
+        malformed_mode["root_entries"]["raw-inputs"][0]["mode"] = "0700"
+        with self.assertRaisesRegex(InvalidTransitionError, "cleanup inventory"):
+            current._validate_raw_cleanup_claim(
+                current_state,
+                malformed_mode,
                 disposition="expired",
                 durable_commit=None,
                 phase_before=current_state["publication"]["phase"],
@@ -5423,7 +5442,7 @@ class OrchestratorTests(unittest.TestCase):
             coordinator._validate_completed_shadow_cleanup(replay_state),
         )
         cross_schema = copy.deepcopy(legacy_receipt)
-        cross_schema["schema"] = "raw_cleanup_receipt_v3"
+        cross_schema["schema"] = "raw_cleanup_receipt_v4"
         with self.assertRaises(authority.ProductionMarkerError):
             authority.verify_shadow_cleanup_receipt(
                 coordinator.identity,
@@ -5534,6 +5553,124 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIsNone(state["publication"]["cleanup_receipt"])
         self.assertGreater(claim["removed_file_count"], 0)
         self.assertTrue(raw_root.is_dir())
+
+    def test_expired_cleanup_claim_rejects_same_size_child_replacement(
+        self,
+    ) -> None:
+        coordinator = self.start_daily("expired-cleanup-child-replacement")
+        raw_root = coordinator.run_dir / "raw-inputs"
+        payload = raw_root / "retained.bin"
+        original = b"retained before exact cleanup claim"
+        payload.write_bytes(original)
+        os.chmod(payload, 0o600)
+        original_inode = payload.stat().st_ino
+        self.clock.value += dt.timedelta(days=8)
+        original_delete = coordinator._delete_claimed_raw_paths
+
+        def replace_after_claim(cleanup_claim):
+            replacement = raw_root / "replacement.tmp"
+            replacement.write_bytes(b"x" * len(original))
+            os.chmod(replacement, 0o600)
+            os.replace(replacement, payload)
+            original_delete(cleanup_claim)
+
+        with mock.patch.object(
+            coordinator,
+            "_delete_claimed_raw_paths",
+            side_effect=replace_after_claim,
+        ):
+            result = coordinator.gc_expired_raw()
+
+        state = coordinator.load_state()
+        claim = state["publication"]["expired_cleanup_claim"]
+        self.assertEqual("raw_cleanup_claim_v4", claim["schema"])
+        self.assertFalse(result["cleaned"])
+        self.assertEqual("UnsafePathError", result["cleanup_error"])
+        self.assertNotEqual(original_inode, payload.stat().st_ino)
+        self.assertEqual(b"x" * len(original), payload.read_bytes())
+
+    def test_expired_cleanup_claim_rejects_child_shrink_removal_or_policy_change(
+        self,
+    ) -> None:
+        initial_clock = self.clock.value
+        for operation in ("shrink", "remove", "mode"):
+            with self.subTest(operation=operation):
+                self.clock.value = initial_clock
+                coordinator = self.start_daily(f"expired-cleanup-child-{operation}")
+                raw_root = coordinator.run_dir / "raw-inputs"
+                payload = raw_root / "retained.bin"
+                sibling = raw_root / "sibling.bin"
+                payload.write_bytes(b"retained before exact cleanup claim")
+                sibling.write_bytes(b"must survive failed cleanup")
+                os.chmod(payload, 0o600)
+                os.chmod(sibling, 0o600)
+                self.clock.value += dt.timedelta(days=8)
+                original_delete = coordinator._delete_claimed_raw_paths
+
+                def mutate_after_claim(cleanup_claim):
+                    if operation == "shrink":
+                        payload.write_bytes(b"x")
+                    elif operation == "remove":
+                        payload.unlink()
+                    else:
+                        os.chmod(payload, 0o644)
+                    original_delete(cleanup_claim)
+
+                with mock.patch.object(
+                    coordinator,
+                    "_delete_claimed_raw_paths",
+                    side_effect=mutate_after_claim,
+                ):
+                    result = coordinator.gc_expired_raw()
+
+                self.assertFalse(result["cleaned"])
+                self.assertEqual("UnsafePathError", result["cleanup_error"])
+                self.assertEqual(b"must survive failed cleanup", sibling.read_bytes())
+
+    def test_cleanup_revalidates_every_root_before_deleting_any_root(self) -> None:
+        coordinator = self.start_daily("cleanup-complete-second-pass")
+        raw_sibling = coordinator.run_dir / "raw-inputs" / "must-survive.bin"
+        raw_sibling.write_bytes(b"retained until every root is revalidated")
+        os.chmod(raw_sibling, 0o600)
+        retained_root = coordinator.run_dir / "retained-inputs"
+        retained_root.mkdir(mode=0o700)
+        retained_payload = retained_root / "late-change.bin"
+        retained_payload.write_bytes(b"claimed retained input")
+        os.chmod(retained_payload, 0o600)
+        self.clock.value += dt.timedelta(days=8)
+        with mock.patch.object(
+            coordinator,
+            "_delete_claimed_raw_paths",
+            side_effect=safe_io.UnsafePathError("hold durable cleanup claim"),
+        ):
+            claimed = coordinator.gc_expired_raw()
+        self.assertFalse(claimed["cleaned"])
+        self.assertEqual(
+            "expired_cleanup_claimed", coordinator.load_state()["publication"]["phase"]
+        )
+        real_inspect = cleanup_inventory.safe_io.inspect_tree_inventory_at
+        calls = 0
+
+        def mutate_last_root_on_second_pass(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == len(orchestrator_module.SHADOW_CLEANUP_ROOTS) * 2:
+                retained_payload.unlink()
+            return real_inspect(*args, **kwargs)
+
+        with mock.patch.object(
+            cleanup_inventory.safe_io,
+            "inspect_tree_inventory_at",
+            side_effect=mutate_last_root_on_second_pass,
+        ):
+            result = coordinator.gc_expired_raw()
+
+        self.assertFalse(result["cleaned"])
+        self.assertEqual("UnsafePathError", result["cleanup_error"])
+        self.assertEqual(
+            b"retained until every root is revalidated",
+            raw_sibling.read_bytes(),
+        )
 
     def test_publication_claim_protects_expired_raw_and_recovers_lost_finalize(
         self,

@@ -35,6 +35,7 @@ from retrospective_v2.contracts import RefType, RunStage  # noqa: E402
 from retrospective_v2.checkpoints import CheckpointIntegrityError  # noqa: E402
 from retrospective_v2.export import export_retained_bundle  # noqa: E402
 from retrospective_v2.finalize import (  # noqa: E402
+    AttemptMismatchError,
     DEFAULT_PUBLISHER_UID,
     StateCorruptionError,
     LocalGitPublicationAdapter,
@@ -796,6 +797,48 @@ class DurablePublicationTests(unittest.TestCase):
         )
         return self.head()
 
+    def commit_signed_tree_fixture(
+        self,
+        tree: str,
+        *,
+        parents: tuple[str, ...],
+        message: str,
+        update_target: bool = True,
+    ) -> str:
+        environment = dict(os.environ)
+        environment["GNUPGHOME"] = str(self.gnupg_home)
+        arguments = [
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "gpg.format=openpgp",
+            "-c",
+            f"user.signingkey={self.fingerprint}",
+            "-c",
+            f"gpg.program={self.gpg}",
+            "commit-tree",
+            tree,
+            f"-S{self.fingerprint}",
+            "-m",
+            message,
+        ]
+        for parent in parents:
+            arguments.extend(("-p", parent))
+        commit = run_command(
+            arguments,
+            cwd=self.repo,
+            env=environment,
+        ).stdout.strip()
+        if update_target:
+            run_command(
+                ["git", "update-ref", TARGET_REF, commit, self.head()],
+                cwd=self.repo,
+            )
+        return commit
+
     def replace_tip_with_tampered_signature(self, commit: str) -> str:
         raw_commit = run_command(
             ["git", "cat-file", "commit", commit], cwd=self.repo
@@ -1246,6 +1289,65 @@ class DurablePublicationTests(unittest.TestCase):
         ):
             self.load_history()
 
+    def test_history_rejects_signed_merge_that_rolls_back_retained_tree(self) -> None:
+        coordinator, bundle = self.build_exportable_run("merge-rollback")
+        self.publish(self.transaction(coordinator, bundle))
+        published = self.head()
+        base_tree = run_command(
+            ["git", "rev-parse", f"{self.base_head}^{{tree}}"],
+            cwd=self.repo,
+        ).stdout.strip()
+        side = self.commit_signed_tree_fixture(
+            base_tree,
+            parents=(self.base_head,),
+            message="Create signed rollback side parent",
+            update_target=False,
+        )
+        self.commit_signed_tree_fixture(
+            base_tree,
+            parents=(published, side),
+            message="Signed merge restoring the pre-publication tree",
+        )
+
+        with self.assertRaisesRegex(
+            authority.HistoryValidationError,
+            "cannot change across a merge",
+        ):
+            self.load_history()
+
+    def test_history_accepts_merge_when_every_parent_retains_the_same_tree(
+        self,
+    ) -> None:
+        coordinator, bundle = self.build_exportable_run("merge-unrelated")
+        self.publish(self.transaction(coordinator, bundle))
+        published = self.head()
+        published_tree = run_command(
+            ["git", "rev-parse", f"{published}^{{tree}}"],
+            cwd=self.repo,
+        ).stdout.strip()
+        left = self.commit_signed_tree_fixture(
+            published_tree,
+            parents=(published,),
+            message="Create first unrelated side parent",
+            update_target=False,
+        )
+        right = self.commit_signed_tree_fixture(
+            published_tree,
+            parents=(published,),
+            message="Create second unrelated side parent",
+            update_target=False,
+        )
+        merged = self.commit_signed_tree_fixture(
+            published_tree,
+            parents=(left, right),
+            message="Merge unrelated history without changing retained data",
+        )
+
+        history = self.load_history()
+        self.assertEqual(merged, history.head_commit)
+        self.assertEqual(published, history.publication_commit)
+        self.assertEqual(1, history.provider_revision)
+
     def test_gc_recovers_commit_after_response_and_local_finalize_mark_are_lost(
         self,
     ) -> None:
@@ -1417,6 +1519,52 @@ class DurablePublicationTests(unittest.TestCase):
                 bundle,
                 journal_name="open-job.json",
             )
+
+    def test_existing_journal_is_bound_to_current_run_before_claim(self) -> None:
+        original, original_bundle = self.build_exportable_run("journal-original")
+        original_state = original.load_state()
+        PublicationTransaction.create(
+            original.run_dir / "publication-transaction-v2.json",
+            bundle_dir=original_bundle,
+            destination=self.destination(original_state),
+            target_ref=TARGET_REF,
+            expected_target_head=original_state["authority"]["history_snapshot"][
+                "history_commit"
+            ],
+            run_dir=original.run_dir,
+            identity_path=self.identity_path,
+            adapter=self.adapter,
+        )
+        copied_run_dir = self.root / "runs" / "journal-current"
+        shutil.copytree(original.run_dir, copied_run_dir)
+        current = RetrospectiveOrchestrator(
+            copied_run_dir,
+            identity_path=self.identity_path,
+            require_existing_identity=True,
+        )
+        copied_journal = copied_run_dir / "publication-transaction-v2.json"
+        current_state = current.load_state()
+
+        with self.assertRaisesRegex(
+            AttemptMismatchError,
+            "current run",
+        ):
+            PublicationTransaction.inspect_local_for_run(
+                copied_journal,
+                bundle_dir=original_bundle,
+                destination=self.destination(current_state),
+                target_ref=TARGET_REF,
+                expected_target_head=current_state["authority"]["history_snapshot"][
+                    "history_commit"
+                ],
+                run_dir=current.run_dir,
+                identity_path=self.identity_path,
+            )
+
+        self.assertNotIn(
+            "publication_claim",
+            current.load_state()["publication"],
+        )
 
     def test_latest_history_rejects_stale_run_and_local_cache_rollback(self) -> None:
         first, first_bundle = self.build_exportable_run("first")

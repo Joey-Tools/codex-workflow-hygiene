@@ -38,6 +38,16 @@ replace these facts. A stale run or rolled-back cache fails closed.
 
 The owner-local production marker is an HMAC-protected completed-cutover record,
 not an active lease. The signed private Git chain remains authority after cutover.
+History loading traverses the complete bounded parent graph without path
+simplification. Every commit-to-parent edge is checked for `runs/` changes; a
+merge is accepted only when its retained tree equals every parent, while every
+linear retained-tree change must be a valid signed publication transition.
+
+When `finalize` finds an existing journal, it first re-derives the complete
+publication plan from the current run, bundle, history snapshot, provider,
+target, and identity. The journal must match that plan before the run persists a
+publication claim. Copying a valid journal from another run therefore cannot
+claim or poison the current run.
 
 Publication recovery is phase-idempotent:
 
@@ -88,7 +98,14 @@ is durable but raw cleanup fails, the run remains
 is never rolled back.
 
 Shadow cleanup recovery is also checkpoint-authoritative. Before deletion, the
-engine fsyncs a fixed-root cleanup claim with exact inode and counter inventory.
+engine fsyncs a fixed-root cleanup claim with an exact per-object inventory:
+globally bytewise-sorted relative path, object type, device/inode, size,
+owner/group/mode, link count, and the verified owner-only/no-ACL access policy.
+It revalidates that complete inventory twice before deleting any claimed root;
+replacement, removal, size change, type change, or access-policy drift leaves
+cleanup pending. Timestamps are not mutation evidence. The inventory proves the
+claimed object set at each observation boundary; it does not claim an atomic
+defense against an actively malicious same-UID process after the final check.
 After deletion and absence verification, it fsyncs the final coverage-bound
 cleanup receipt. A lost response after that close is an idempotent read and
 revalidation of the same receipt. If deletion completed before the close, the
@@ -98,19 +115,21 @@ The fixed roots are `raw-inputs`, `raw-shards`, `agent-sinks`, and
 `retained-inputs`. Post-cleanup shadow validation and Daily successor derivation
 use the already authenticated coverage receipt bound to the run, configuration,
 model/policy era, and bundle digest; they do not reopen the deleted export-input
-sidecar. New cleanup claims and receipts use the v3 schema that binds all four
-roots. Exact legacy v2 claims and receipts remain replayable only with their
-original three-root inventory; v2 and v3 claims, authorization references, and
-receipts cannot adopt one another. Every published, shadow-complete, or expired
-terminal path also clears a legacy embedded retained-input payload from the
-authenticated checkpoint.
+sidecar. New cleanup claims and receipts use the v4 schema that binds the exact
+object inventory under all four roots. Exact legacy v2 and v3 claims and
+receipts remain replayable only with their original counter-only root
+inventories; v2, v3, and v4 claims, authorization references, and receipts
+cannot adopt one another. Every published, shadow-complete, or expired terminal
+path also clears a legacy embedded retained-input payload from the authenticated
+checkpoint.
 
 Formal post-publication cleanup and expired-run cleanup follow the same durable
-claim pattern. Before deletion they fsync an authenticated inode and counter
+claim pattern. Before deletion they fsync the authenticated v4 per-object
 inventory for the fixed raw/source/shard/working roots. Retry uses that original
-inventory, rejects replacement or growth, verifies final absence, then
-checkpoints the receipt. A response lost after deletion therefore preserves the
-original byte/file/directory counts instead of recounting an empty tree.
+inventory, rejects replacement, removal, shrinkage, type or access-policy drift,
+verifies final absence, then checkpoints the receipt. A response lost after
+deletion therefore preserves the original byte/file/directory counts instead of
+recounting an empty tree.
 
 Lost-finalize recovery and garbage collection never infer publication from
 matching retained roots alone. The signed publication commit must bind the exact

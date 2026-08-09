@@ -609,20 +609,194 @@ def secure_remove_tree_at(
     return counts
 
 
-def inspect_tree_at(
+def _cleanup_inventory_entry(
+    metadata: os.stat_result,
+    *,
+    object_type: str,
+    relative_path: str,
+) -> dict[str, Any]:
+    return {
+        "access_policy": "owner-only-no-acl",
+        "device": metadata.st_dev,
+        "group": metadata.st_gid,
+        "inode": metadata.st_ino,
+        "link_count": metadata.st_nlink,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "object_type": object_type,
+        "owner": metadata.st_uid,
+        "relative_path": relative_path,
+        "size": metadata.st_size,
+    }
+
+
+def _inspect_tree_descriptor(
+    descriptor: int,
+    *,
+    display_path: Path,
+    relative_path: str,
+) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    anchored = validate_owner_only_directory_descriptor(descriptor, display_path)
+    counts = {"byte_count": 0, "directory_count": 1, "file_count": 0}
+    entries = [
+        _cleanup_inventory_entry(
+            anchored,
+            object_type="directory",
+            relative_path=relative_path,
+        )
+    ]
+    for child_name in sorted(os.listdir(descriptor), key=os.fsencode):
+        child_path = display_path / child_name
+        child_relative = (
+            child_name if relative_path == "." else f"{relative_path}/{child_name}"
+        )
+        observed = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(observed.st_mode):
+            try:
+                child_fd = os.open(child_name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except OSError as exc:
+                raise UnsafePathError(
+                    f"cannot anchor inspected tree: {child_path}"
+                ) from exc
+            try:
+                child_anchored = validate_owner_only_directory_descriptor(
+                    child_fd,
+                    child_path,
+                )
+                if (observed.st_dev, observed.st_ino) != (
+                    child_anchored.st_dev,
+                    child_anchored.st_ino,
+                ):
+                    raise UnsafePathError(
+                        f"inspected tree changed while opened: {child_path}"
+                    )
+                nested_counts, nested_entries = _inspect_tree_descriptor(
+                    child_fd,
+                    display_path=child_path,
+                    relative_path=child_relative,
+                )
+                current = os.stat(
+                    child_name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_uid,
+                    current.st_gid,
+                    stat.S_IMODE(current.st_mode),
+                    current.st_nlink,
+                    current.st_size,
+                ) != (
+                    child_anchored.st_dev,
+                    child_anchored.st_ino,
+                    child_anchored.st_uid,
+                    child_anchored.st_gid,
+                    stat.S_IMODE(child_anchored.st_mode),
+                    child_anchored.st_nlink,
+                    child_anchored.st_size,
+                ):
+                    raise UnsafePathError(
+                        f"inspected tree changed while inventoried: {child_path}"
+                    )
+            finally:
+                os.close(child_fd)
+            for key, value in nested_counts.items():
+                counts[key] += value
+            entries.extend(nested_entries)
+            continue
+
+        child_fd = open_checked_file_at(
+            descriptor,
+            child_name,
+            display_path=child_path,
+            require_owner_only=True,
+        )
+        try:
+            anchored_child = os.fstat(child_fd)
+            current = os.stat(
+                child_name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                current.st_dev,
+                current.st_ino,
+                current.st_uid,
+                current.st_gid,
+                stat.S_IMODE(current.st_mode),
+                current.st_nlink,
+                current.st_size,
+            ) != (
+                anchored_child.st_dev,
+                anchored_child.st_ino,
+                anchored_child.st_uid,
+                anchored_child.st_gid,
+                stat.S_IMODE(anchored_child.st_mode),
+                anchored_child.st_nlink,
+                anchored_child.st_size,
+            ):
+                raise UnsafePathError(
+                    f"inspected file changed while inventoried: {child_path}"
+                )
+            _validate_owner_only_acl(child_fd, child_path)
+            entries.append(
+                _cleanup_inventory_entry(
+                    anchored_child,
+                    object_type="file",
+                    relative_path=child_relative,
+                )
+            )
+            counts["byte_count"] += anchored_child.st_size
+            counts["file_count"] += 1
+        finally:
+            os.close(child_fd)
+
+    final = validate_owner_only_directory_descriptor(descriptor, display_path)
+    if (
+        final.st_dev,
+        final.st_ino,
+        final.st_uid,
+        final.st_gid,
+        stat.S_IMODE(final.st_mode),
+        final.st_nlink,
+        final.st_size,
+    ) != (
+        anchored.st_dev,
+        anchored.st_ino,
+        anchored.st_uid,
+        anchored.st_gid,
+        stat.S_IMODE(anchored.st_mode),
+        anchored.st_nlink,
+        anchored.st_size,
+    ):
+        raise UnsafePathError(
+            f"inspected tree changed while inventoried: {display_path}"
+        )
+    return counts, entries
+
+
+def inspect_tree_inventory_at(
     parent_fd: int,
     name: str,
     *,
     display_path: Path,
-) -> dict[str, int]:
-    """Count one owner-only tree without following caller-controlled links."""
+) -> dict[str, Any]:
+    """Inventory one owner-only tree without following caller-controlled links."""
 
     if not name or name in {".", ".."} or "/" in name or "\x00" in name:
         raise UnsafePathError("inspect-tree name must be one safe component")
     try:
         observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return {"byte_count": 0, "directory_count": 0, "file_count": 0}
+        return {
+            "counters": {
+                "byte_count": 0,
+                "directory_count": 0,
+                "file_count": 0,
+            },
+            "entries": [],
+        }
     _validate_directory_stat(observed, display_path, exact_mode=True)
     try:
         descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
@@ -637,57 +811,51 @@ def inspect_tree_at(
             raise UnsafePathError(
                 f"inspected tree changed while opened: {display_path}"
             )
-        counts = {"byte_count": 0, "directory_count": 1, "file_count": 0}
-        for child_name in sorted(os.listdir(descriptor), key=os.fsencode):
-            child_path = display_path / child_name
-            child = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
-            if stat.S_ISDIR(child.st_mode):
-                nested = inspect_tree_at(
-                    descriptor,
-                    child_name,
-                    display_path=child_path,
-                )
-                for key, value in nested.items():
-                    counts[key] += value
-                continue
-            child_fd = open_checked_file_at(
-                descriptor,
-                child_name,
-                display_path=child_path,
-                require_owner_only=True,
-            )
-            try:
-                anchored_child = os.fstat(child_fd)
-                current = os.stat(
-                    child_name,
-                    dir_fd=descriptor,
-                    follow_symlinks=False,
-                )
-                if (
-                    anchored_child.st_dev,
-                    anchored_child.st_ino,
-                    anchored_child.st_size,
-                ) != (current.st_dev, current.st_ino, current.st_size):
-                    raise UnsafePathError(
-                        f"inspected file changed while counted: {child_path}"
-                    )
-                _validate_owner_only_acl(child_fd, child_path)
-                counts["byte_count"] += anchored_child.st_size
-                counts["file_count"] += 1
-            finally:
-                os.close(child_fd)
-        validate_owner_only_directory_descriptor(descriptor, display_path)
+        counts, entries = _inspect_tree_descriptor(
+            descriptor,
+            display_path=display_path,
+            relative_path=".",
+        )
+        entries.sort(key=lambda item: os.fsencode(item["relative_path"]))
         current_root = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (anchored.st_dev, anchored.st_ino) != (
+        if (
             current_root.st_dev,
             current_root.st_ino,
+            current_root.st_uid,
+            current_root.st_gid,
+            stat.S_IMODE(current_root.st_mode),
+            current_root.st_nlink,
+            current_root.st_size,
+        ) != (
+            anchored.st_dev,
+            anchored.st_ino,
+            anchored.st_uid,
+            anchored.st_gid,
+            stat.S_IMODE(anchored.st_mode),
+            anchored.st_nlink,
+            anchored.st_size,
         ):
             raise UnsafePathError(
-                f"inspected tree name changed while counted: {display_path}"
+                f"inspected tree name changed while inventoried: {display_path}"
             )
-        return counts
+        return {"counters": counts, "entries": entries}
     finally:
         os.close(descriptor)
+
+
+def inspect_tree_at(
+    parent_fd: int,
+    name: str,
+    *,
+    display_path: Path,
+) -> dict[str, int]:
+    """Count one owner-only tree without following caller-controlled links."""
+
+    return inspect_tree_inventory_at(
+        parent_fd,
+        name,
+        display_path=display_path,
+    )["counters"]
 
 
 def _open_parent_directory(

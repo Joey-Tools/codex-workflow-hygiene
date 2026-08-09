@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 from . import (
     authority,
     catalog,
+    cleanup_inventory,
     controlled_gaps,
     export as retained_export_api,
     finalize,
@@ -38,7 +39,6 @@ from .orchestrator_protocols import (
 from .orchestrator_support import (
     InvalidInputError,
     InvalidTransitionError,
-    LEGACY_SHADOW_CLEANUP_ROOTS,
     MAX_BASELINE_WINDOW_DAYS,
     MAX_EXPORT_RETENTION_HOURS,
     MAX_RETENTION_DAYS,
@@ -63,27 +63,8 @@ from .orchestrator_support import (
     _parse_timestamp,
 )
 
-
-def _cleanup_contract(kind: str, version: int, roots: Sequence[str]):
-    return (
-        f"{kind}_cleanup_claim_v{version}:",
-        f"{kind}-cleanup-claim-v{version}",
-        roots,
-        f"raw_cleanup_receipt_v{version}",
-        f"raw_cleanup_auth_v{version}",
-    )
-
-
-_RAW_CLEANUP_CONTRACTS = {
-    "raw_cleanup_claim_v2": _cleanup_contract("raw", 2, LEGACY_SHADOW_CLEANUP_ROOTS),
-    "raw_cleanup_claim_v3": _cleanup_contract("raw", 3, SHADOW_CLEANUP_ROOTS),
-}
-_SHADOW_CLEANUP_CONTRACTS = {
-    "shadow_cleanup_claim_v2": _cleanup_contract(
-        "shadow", 2, LEGACY_SHADOW_CLEANUP_ROOTS
-    ),
-    "shadow_cleanup_claim_v3": _cleanup_contract("shadow", 3, SHADOW_CLEANUP_ROOTS),
-}
+_RAW_CLEANUP_CONTRACTS = cleanup_inventory.RAW_CLEANUP_CONTRACTS
+_SHADOW_CLEANUP_CONTRACTS = cleanup_inventory.SHADOW_CLEANUP_CONTRACTS
 
 
 class RunLifecycleOperations(OrchestratorComponent):
@@ -965,7 +946,11 @@ class RunLifecycleOperations(OrchestratorComponent):
             )
             or not isinstance(successor["cleanup_receipt_ref"], str)
             or not successor["cleanup_receipt_ref"].startswith(
-                ("raw_cleanup_receipt_v2:", "raw_cleanup_receipt_v3:")
+                (
+                    "raw_cleanup_receipt_v2:",
+                    "raw_cleanup_receipt_v3:",
+                    "raw_cleanup_receipt_v4:",
+                )
             )
             or not isinstance(successor["authentication_tag"], str)
             or not hmac.compare_digest(successor["authentication_tag"], expected_tag)
@@ -2235,7 +2220,7 @@ class RunLifecycleOperations(OrchestratorComponent):
         phase_before: str,
         publication_claim_ref: str | None,
         inventory: Mapping[str, Any],
-        schema: str = "raw_cleanup_claim_v3",
+        schema: str = "raw_cleanup_claim_v4",
     ) -> dict[str, Any]:
         try:
             ref_prefix, digest_domain, roots, _receipt_schema, _auth_domain = (
@@ -2262,6 +2247,8 @@ class RunLifecycleOperations(OrchestratorComponent):
             "schema": schema,
             "stage": state["stage"],
         }
+        if schema == "raw_cleanup_claim_v4":
+            body["root_entries"] = copy.deepcopy(inventory["root_entries"])
         return {
             **body,
             "claim_ref": ref_prefix + self.identity.derive_digest(digest_domain, body),
@@ -2295,6 +2282,8 @@ class RunLifecycleOperations(OrchestratorComponent):
             "schema",
             "stage",
         }
+        if isinstance(value, Mapping) and value.get("schema") == "raw_cleanup_claim_v4":
+            fields.add("root_entries")
         if not isinstance(value, Mapping) or set(value) != fields:
             raise InvalidTransitionError("raw cleanup claim has an invalid shape")
         claim = copy.deepcopy(dict(value))
@@ -2305,6 +2294,7 @@ class RunLifecycleOperations(OrchestratorComponent):
             claim,
             label="raw",
             roots=contract[2],
+            require_exact_entries=str(claim["schema"]) == "raw_cleanup_claim_v4",
         )
         expected = self._raw_cleanup_claim_value(
             state,
@@ -2356,52 +2346,14 @@ class RunLifecycleOperations(OrchestratorComponent):
         *,
         label: str,
         roots: Sequence[str],
+        require_exact_entries: bool = False,
     ) -> dict[str, Any]:
-        counters = claim.get("root_counters")
-        objects = claim.get("root_objects")
-        totals = {"byte_count": 0, "directory_count": 0, "file_count": 0}
-        if (
-            claim.get("raw_path_inventory") != list(roots)
-            or not isinstance(counters, Mapping)
-            or set(counters) != set(roots)
-            or not isinstance(objects, Mapping)
-            or set(objects) != set(roots)
-        ):
-            raise InvalidTransitionError(f"{label} cleanup inventory is invalid")
-        for name in roots:
-            counts = counters[name]
-            root_object = objects[name]
-            if (
-                not isinstance(counts, Mapping)
-                or set(counts) != set(totals)
-                or any(
-                    not isinstance(item, int) or isinstance(item, bool) or item < 0
-                    for item in counts.values()
-                )
-                or (
-                    root_object is not None
-                    and (
-                        not isinstance(root_object, Mapping)
-                        or set(root_object) != {"device", "inode"}
-                        or any(
-                            not isinstance(item, int)
-                            or isinstance(item, bool)
-                            or item < 0
-                            for item in root_object.values()
-                        )
-                    )
-                )
-            ):
-                raise InvalidTransitionError(f"{label} cleanup inventory is invalid")
-            for key, item in counts.items():
-                totals[key] += item
-        if any(claim.get(f"removed_{key}") != value for key, value in totals.items()):
-            raise InvalidTransitionError(f"{label} cleanup totals are invalid")
-        return {
-            "root_counters": copy.deepcopy(dict(counters)),
-            "root_objects": copy.deepcopy(dict(objects)),
-            **totals,
-        }
+        return cleanup_inventory.validate_claim_inventory(
+            claim,
+            label=label,
+            roots=roots,
+            require_exact_entries=require_exact_entries,
+        )
 
     def _validate_completed_raw_cleanup(
         self,
@@ -2420,7 +2372,7 @@ class RunLifecycleOperations(OrchestratorComponent):
         if not isinstance(value, Mapping):
             raise InvalidTransitionError("completed raw cleanup claim is missing")
         claim = copy.deepcopy(dict(value))
-        if set(claim) != {
+        fields = {
             "bundle_digest",
             "claim_ref",
             "deadline",
@@ -2437,7 +2389,10 @@ class RunLifecycleOperations(OrchestratorComponent):
             "run_ref",
             "schema",
             "stage",
-        }:
+        }
+        if claim.get("schema") == "raw_cleanup_claim_v4":
+            fields.add("root_entries")
+        if set(claim) != fields:
             raise InvalidTransitionError(
                 "completed raw cleanup claim has an invalid shape"
             )
@@ -2449,6 +2404,7 @@ class RunLifecycleOperations(OrchestratorComponent):
             claim,
             label="completed raw",
             roots=roots,
+            require_exact_entries=str(claim["schema"]) == "raw_cleanup_claim_v4",
         )
         unsigned = dict(claim)
         claim_ref = unsigned.pop("claim_ref", None)
@@ -2508,36 +2464,7 @@ class RunLifecycleOperations(OrchestratorComponent):
         self,
         roots: Sequence[str] = SHADOW_CLEANUP_ROOTS,
     ) -> dict[str, Any]:
-        normalized, run_fd = safe_io.open_owner_only_directory(self.run_dir)
-        root_counters: dict[str, dict[str, int]] = {}
-        root_objects: dict[str, dict[str, int] | None] = {}
-        totals = {"byte_count": 0, "directory_count": 0, "file_count": 0}
-        try:
-            for name in roots:
-                counts = safe_io.inspect_tree_at(
-                    run_fd,
-                    name,
-                    display_path=normalized / name,
-                )
-                root_counters[name] = counts
-                try:
-                    metadata = os.stat(name, dir_fd=run_fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    root_objects[name] = None
-                else:
-                    root_objects[name] = {
-                        "device": metadata.st_dev,
-                        "inode": metadata.st_ino,
-                    }
-                for key, value in counts.items():
-                    totals[key] += value
-            return {
-                "root_counters": root_counters,
-                "root_objects": root_objects,
-                **totals,
-            }
-        finally:
-            os.close(run_fd)
+        return cleanup_inventory.inspect_run_paths(self.run_dir, roots)
 
     def _validated_shadow_coverage(
         self,
@@ -2644,7 +2571,7 @@ class RunLifecycleOperations(OrchestratorComponent):
         state: Mapping[str, Any],
         coverage: Mapping[str, Any],
         inventory: Mapping[str, Any],
-        schema: str = "shadow_cleanup_claim_v3",
+        schema: str = "shadow_cleanup_claim_v4",
     ) -> dict[str, Any]:
         try:
             ref_prefix, digest_domain, roots, _receipt_schema, _auth_domain = (
@@ -2666,6 +2593,8 @@ class RunLifecycleOperations(OrchestratorComponent):
             "run_ref": state["run_ref"],
             "schema": schema,
         }
+        if schema == "shadow_cleanup_claim_v4":
+            body["root_entries"] = copy.deepcopy(inventory["root_entries"])
         return {
             **body,
             "claim_ref": ref_prefix + self.identity.derive_digest(digest_domain, body),
@@ -2690,6 +2619,11 @@ class RunLifecycleOperations(OrchestratorComponent):
             "run_ref",
             "schema",
         }
+        if (
+            isinstance(value, Mapping)
+            and value.get("schema") == "shadow_cleanup_claim_v4"
+        ):
+            fields.add("root_entries")
         if not isinstance(value, Mapping) or set(value) != fields:
             raise InvalidTransitionError("shadow cleanup claim has an invalid shape")
         claim = copy.deepcopy(dict(value))
@@ -2697,59 +2631,23 @@ class RunLifecycleOperations(OrchestratorComponent):
         if contract is None:
             raise InvalidTransitionError("shadow cleanup claim schema is unsupported")
         roots = contract[2]
-        counters = claim["root_counters"]
-        objects = claim["root_objects"]
         if (
             claim["run_ref"] != state["run_ref"]
             or claim["coverage_receipt_ref"] != coverage["receipt_ref"]
             or claim["export_bundle_digest"] != coverage["export_bundle_digest"]
             or claim["raw_path_inventory"] != list(roots)
-            or not isinstance(counters, Mapping)
-            or set(counters) != set(roots)
-            or not isinstance(objects, Mapping)
-            or set(objects) != set(roots)
         ):
             raise InvalidTransitionError("shadow cleanup claim is invalid")
-        totals = {"byte_count": 0, "directory_count": 0, "file_count": 0}
-        for name in roots:
-            counts = counters[name]
-            root_object = objects[name]
-            if (
-                not isinstance(counts, Mapping)
-                or set(counts) != set(totals)
-                or any(
-                    not isinstance(item, int) or isinstance(item, bool) or item < 0
-                    for item in counts.values()
-                )
-                or (
-                    root_object is not None
-                    and (
-                        not isinstance(root_object, Mapping)
-                        or set(root_object) != {"device", "inode"}
-                        or any(
-                            not isinstance(item, int)
-                            or isinstance(item, bool)
-                            or item < 0
-                            for item in root_object.values()
-                        )
-                    )
-                )
-            ):
-                raise InvalidTransitionError("shadow cleanup inventory is invalid")
-            for key, item in counts.items():
-                totals[key] += item
-        if any(claim[f"removed_{key}"] != value for key, value in totals.items()):
-            raise InvalidTransitionError("shadow cleanup totals are invalid")
+        inventory = self._validated_cleanup_inventory(
+            claim,
+            label="shadow",
+            roots=roots,
+            require_exact_entries=(str(claim["schema"]) == "shadow_cleanup_claim_v4"),
+        )
         expected = self._shadow_cleanup_claim_value(
             state,
             coverage,
-            {
-                "byte_count": claim["removed_byte_count"],
-                "directory_count": claim["removed_directory_count"],
-                "file_count": claim["removed_file_count"],
-                "root_counters": claim["root_counters"],
-                "root_objects": claim["root_objects"],
-            },
+            inventory,
             schema=str(claim["schema"]),
         )
         if claim != expected:
@@ -2795,54 +2693,7 @@ class RunLifecycleOperations(OrchestratorComponent):
         return self.store.transaction(prepare).value
 
     def _delete_claimed_raw_paths(self, claim: Mapping[str, Any]) -> None:
-        normalized, run_fd = safe_io.open_owner_only_directory(self.run_dir)
-        try:
-            for name in claim["raw_path_inventory"]:
-                planned_object = claim["root_objects"][name]
-                try:
-                    metadata = os.stat(name, dir_fd=run_fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                if planned_object is None or (
-                    metadata.st_dev,
-                    metadata.st_ino,
-                ) != (
-                    planned_object["device"],
-                    planned_object["inode"],
-                ):
-                    raise safe_io.UnsafePathError(
-                        f"raw cleanup root changed after claim: {normalized / name}"
-                    )
-                current = safe_io.inspect_tree_at(
-                    run_fd,
-                    name,
-                    display_path=normalized / name,
-                )
-                planned = claim["root_counters"][name]
-                if any(current[key] > planned[key] for key in current):
-                    raise safe_io.UnsafePathError(
-                        f"raw cleanup root grew after claim: {normalized / name}"
-                    )
-                removed = safe_io.secure_remove_tree_at(
-                    run_fd,
-                    name,
-                    display_path=normalized / name,
-                )
-                if removed != current:
-                    raise safe_io.UnsafePathError(
-                        f"raw cleanup count changed during deletion: {normalized / name}"
-                    )
-            for name in claim["raw_path_inventory"]:
-                try:
-                    os.stat(name, dir_fd=run_fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                raise safe_io.UnsafePathError(
-                    f"raw working path survived cleanup: {normalized / name}"
-                )
-            os.fsync(run_fd)
-        finally:
-            os.close(run_fd)
+        cleanup_inventory.delete_claimed_paths(self.run_dir, claim)
 
     def _validate_completed_shadow_cleanup(
         self,
