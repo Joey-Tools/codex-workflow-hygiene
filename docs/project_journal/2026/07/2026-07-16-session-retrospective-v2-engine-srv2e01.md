@@ -561,3 +561,16 @@ superseded_by:
   on that same implementation, including the real GPG publication, checkpoint,
   transport, privacy, orchestration, reporting, and legacy-compatibility paths.
   It supersedes the zero-test invocation and all pre-audit discovery evidence.
+- The first PR head then exposed a platform-only test-fixture failure: five
+  publication invariant cases required macOS `/private/tmp`, which does not
+  exist on the Ubuntu runner. The runner completed the other tests before
+  reporting those five setup errors. Publication fixtures now prefer the real
+  macOS path when present and otherwise use Python's validated system temporary
+  root. The focused invariant class passed 11/11 in 0.764 seconds, Ruff lint and
+  format checks passed, and the complete host-level disposable-GPG publication
+  module passed 45/45 in 438.229 seconds.
+- The fresh Codex reviewer for the failed PR head was stopped while still
+  running and produced no terminal artifact, so it is explicitly non-counting.
+  Its detached workspace passed postvalidation, the trusted manifest, playbook,
+  and guard digests remained unchanged, and the task root was removed. A new
+  signed head requires new admission, materialization, and review evidence.

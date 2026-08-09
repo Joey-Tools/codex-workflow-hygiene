@@ -64,6 +64,13 @@ WINDOW_END = "2026-07-07T00:00:00Z"
 TARGET_REF = "refs/heads/main"
 
 
+def _publication_test_temp_parent() -> str:
+    private_tmp = Path("/private/tmp")
+    if private_tmp.is_dir():
+        return os.fspath(private_tmp)
+    return tempfile.gettempdir()
+
+
 def run_command(
     argv: list[str],
     *,
@@ -84,10 +91,21 @@ def run_command(
 
 
 class PublicationInvariantUnitTests(unittest.TestCase):
+    def test_publication_temp_parent_uses_portable_fallback(self) -> None:
+        with mock.patch.object(Path, "is_dir", return_value=True):
+            self.assertEqual("/private/tmp", _publication_test_temp_parent())
+        with (
+            mock.patch.object(Path, "is_dir", return_value=False),
+            mock.patch.object(tempfile, "gettempdir", return_value="/tmp"),
+        ):
+            self.assertEqual("/tmp", _publication_test_temp_parent())
+
     def test_bounded_subprocess_uses_held_working_directory_after_replacement(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary_directory:
+        with tempfile.TemporaryDirectory(
+            dir=_publication_test_temp_parent()
+        ) as temporary_directory:
             root = Path(temporary_directory)
             original = root / "publisher-home"
             displaced = root / "publisher-home-original"
@@ -121,7 +139,9 @@ class PublicationInvariantUnitTests(unittest.TestCase):
             self.assertEqual(b"anchored\n", result.stdout)
 
     def test_publisher_keyring_uses_descriptor_binding_across_path_aba(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary_directory:
+        with tempfile.TemporaryDirectory(
+            dir=_publication_test_temp_parent()
+        ) as temporary_directory:
             root = Path(temporary_directory)
             home = root / "gnupg"
             moved_home = root / "gnupg-original"
@@ -187,7 +207,9 @@ class PublicationInvariantUnitTests(unittest.TestCase):
     def test_publisher_keyring_rejects_secret_inventory_before_public_listing(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary_directory:
+        with tempfile.TemporaryDirectory(
+            dir=_publication_test_temp_parent()
+        ) as temporary_directory:
             home = Path(temporary_directory) / "gnupg"
             home.mkdir(mode=0o700)
             calls = 0
@@ -225,7 +247,9 @@ class PublicationInvariantUnitTests(unittest.TestCase):
             self.assertEqual(1, calls)
 
     def test_publisher_keyring_rejects_path_replacement_during_gpg(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary_directory:
+        with tempfile.TemporaryDirectory(
+            dir=_publication_test_temp_parent()
+        ) as temporary_directory:
             root = Path(temporary_directory)
             home = root / "gnupg"
             moved_home = root / "gnupg-original"
@@ -262,7 +286,9 @@ class PublicationInvariantUnitTests(unittest.TestCase):
     def test_publisher_keyring_prioritizes_revalidation_after_listing_error(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary_directory:
+        with tempfile.TemporaryDirectory(
+            dir=_publication_test_temp_parent()
+        ) as temporary_directory:
             root = Path(temporary_directory)
             home = root / "gnupg"
             moved_home = root / "gnupg-original"
