@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from dataclasses import dataclass
 import errno
 from functools import lru_cache
 import hashlib
@@ -12,6 +13,7 @@ import secrets
 import stat
 import sys
 import tempfile
+import time
 from typing import Any, Callable
 
 from .contracts import (
@@ -49,12 +51,73 @@ class ReadLimitExceeded(ValueError):
     pass
 
 
+class TreeInventoryLimitExceeded(UnsafePathError):
+    pass
+
+
 class InvalidJsonError(ValueError):
     pass
 
 
 PathSecurityError = UnsafePathError
 BoundedReadError = ReadLimitExceeded
+
+
+@dataclass(slots=True)
+class TreeInventoryBudget:
+    max_entries: int
+    max_path_bytes: int
+    max_depth: int
+    deadline: float
+    clock: Callable[[], float] = time.monotonic
+    entry_count: int = 0
+    path_byte_count: int = 0
+
+    @classmethod
+    def from_timeout(
+        cls,
+        *,
+        max_entries: int,
+        max_path_bytes: int,
+        max_depth: int,
+        timeout_seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> TreeInventoryBudget:
+        if timeout_seconds <= 0:
+            raise ValueError("tree inventory timeout must be positive")
+        return cls(
+            max_entries=max_entries,
+            max_path_bytes=max_path_bytes,
+            max_depth=max_depth,
+            deadline=clock() + timeout_seconds,
+            clock=clock,
+        )
+
+    def __post_init__(self) -> None:
+        if min(self.max_entries, self.max_path_bytes) < 1 or self.max_depth < 0:
+            raise ValueError("tree inventory bounds are invalid")
+
+    def checkpoint(self) -> None:
+        if self.clock() >= self.deadline:
+            raise TreeInventoryLimitExceeded("tree inventory exceeded its deadline")
+
+    def reserve(self, relative_path: str, *, depth: int) -> None:
+        self.checkpoint()
+        if depth > self.max_depth:
+            raise TreeInventoryLimitExceeded("tree inventory exceeds its depth bound")
+        try:
+            path_bytes = len(os.fsencode(relative_path))
+        except (TypeError, UnicodeEncodeError) as error:
+            raise UnsafePathError("tree inventory path cannot be encoded") from error
+        if self.entry_count >= self.max_entries:
+            raise TreeInventoryLimitExceeded("tree inventory exceeds its entry bound")
+        if self.path_byte_count + path_bytes > self.max_path_bytes:
+            raise TreeInventoryLimitExceeded(
+                "tree inventory exceeds its path-byte bound"
+            )
+        self.entry_count += 1
+        self.path_byte_count += path_bytes
+        self.checkpoint()
 
 
 _DARWIN_ACL_TYPE_EXTENDED = 0x100
@@ -632,9 +695,12 @@ def _cleanup_inventory_entry(
 def _inspect_tree_descriptor(
     descriptor: int,
     *,
+    budget: TreeInventoryBudget,
+    depth: int,
     display_path: Path,
     relative_path: str,
 ) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    budget.checkpoint()
     anchored = validate_owner_only_directory_descriptor(descriptor, display_path)
     counts = {"byte_count": 0, "directory_count": 1, "file_count": 0}
     entries = [
@@ -644,7 +710,18 @@ def _inspect_tree_descriptor(
             relative_path=relative_path,
         )
     ]
-    for child_name in sorted(os.listdir(descriptor), key=os.fsencode):
+    child_names: list[str] = []
+    with os.scandir(descriptor) as children:
+        for child in children:
+            budget.checkpoint()
+            child_name = child.name
+            child_relative = (
+                child_name if relative_path == "." else f"{relative_path}/{child_name}"
+            )
+            budget.reserve(child_relative, depth=depth + 1)
+            child_names.append(child_name)
+    for child_name in sorted(child_names, key=os.fsencode):
+        budget.checkpoint()
         child_path = display_path / child_name
         child_relative = (
             child_name if relative_path == "." else f"{relative_path}/{child_name}"
@@ -671,6 +748,8 @@ def _inspect_tree_descriptor(
                     )
                 nested_counts, nested_entries = _inspect_tree_descriptor(
                     child_fd,
+                    budget=budget,
+                    depth=depth + 1,
                     display_path=child_path,
                     relative_path=child_relative,
                 )
@@ -752,6 +831,7 @@ def _inspect_tree_descriptor(
         finally:
             os.close(child_fd)
 
+    budget.checkpoint()
     final = validate_owner_only_directory_descriptor(descriptor, display_path)
     if (
         final.st_dev,
@@ -780,12 +860,14 @@ def inspect_tree_inventory_at(
     parent_fd: int,
     name: str,
     *,
+    budget: TreeInventoryBudget,
     display_path: Path,
 ) -> dict[str, Any]:
     """Inventory one owner-only tree without following caller-controlled links."""
 
     if not name or name in {".", ".."} or "/" in name or "\x00" in name:
         raise UnsafePathError("inspect-tree name must be one safe component")
+    budget.checkpoint()
     try:
         observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -797,6 +879,7 @@ def inspect_tree_inventory_at(
             },
             "entries": [],
         }
+    budget.reserve(".", depth=0)
     _validate_directory_stat(observed, display_path, exact_mode=True)
     try:
         descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
@@ -813,6 +896,8 @@ def inspect_tree_inventory_at(
             )
         counts, entries = _inspect_tree_descriptor(
             descriptor,
+            budget=budget,
+            depth=0,
             display_path=display_path,
             relative_path=".",
         )
@@ -847,6 +932,7 @@ def inspect_tree_at(
     parent_fd: int,
     name: str,
     *,
+    budget: TreeInventoryBudget,
     display_path: Path,
 ) -> dict[str, int]:
     """Count one owner-only tree without following caller-controlled links."""
@@ -854,6 +940,7 @@ def inspect_tree_at(
     return inspect_tree_inventory_at(
         parent_fd,
         name,
+        budget=budget,
         display_path=display_path,
     )["counters"]
 

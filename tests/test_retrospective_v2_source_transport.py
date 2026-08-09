@@ -31,6 +31,7 @@ from retrospective_v2 import (  # noqa: E402
     authority,
     catalog,
     safe_io,
+    source_capacity,
     source_inputs,
     source_payloads,
     transport,
@@ -190,6 +191,96 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 {unit_ref: available},
                 {unit_ref: {"reason": "raw_payload_missing", "status": "gap"}},
             )
+
+    def test_source_capacity_is_run_global_before_new_materialization(self) -> None:
+        cells = {
+            "local": {
+                "history": {
+                    "continuation_segments": [],
+                    "metrics": {"byte_count": 1, "record_count": 1},
+                }
+            }
+        }
+        with (
+            mock.patch.object(source_capacity, "MAX_RUN_SOURCE_RECORDS", 1),
+            self.assertRaisesRegex(InvalidTransitionError, "records"),
+        ):
+            source_capacity.require_candidate_capacity(
+                cells,
+                acceptance_bytes=1,
+                byte_count=1,
+                record_count=1,
+            )
+
+        descriptor = {
+            "byte_count": 2,
+            "content_commitment": "sha256:" + "0" * 64,
+            "relative_path": "raw-inputs/source-acceptances/unused.json",
+            "schema": "source_acceptance_descriptor_v2",
+        }
+        cells["local"]["history"]["continuation_segments"] = [descriptor]
+        with (
+            mock.patch.object(source_capacity, "MAX_RUN_SOURCE_ACCEPTANCE_BYTES", 2),
+            self.assertRaisesRegex(InvalidTransitionError, "acceptance bytes"),
+        ):
+            source_capacity.require_candidate_capacity(
+                cells,
+                acceptance_bytes=1,
+                byte_count=0,
+                record_count=0,
+            )
+
+        cells["local"]["history"]["continuation_segments"] = [descriptor] * 65
+        with self.assertRaisesRegex(InvalidTransitionError, "continuation chain"):
+            source_capacity.require_candidate_capacity(
+                cells,
+                acceptance_bytes=0,
+                byte_count=0,
+                record_count=0,
+            )
+
+    def test_source_segment_payload_merge_is_in_place_and_linear(self) -> None:
+        descriptors = [{"manifest": {}} for _ in range(32)]
+        materialized = []
+        expected_refs = []
+        for index in range(len(descriptors)):
+            unit_ref = str(
+                self.identity.derive_ref(RefType.SOURCE_UNIT, {"segment": index})
+            )
+            expected_refs.append(unit_ref)
+            materialized.append(
+                {
+                    "model_era_by_unit": {},
+                    "model_eras_by_session": {},
+                    "payloads": {
+                        unit_ref: {"reason": "raw_payload_missing", "status": "gap"}
+                    },
+                    "segment": {
+                        "metrics": {
+                            "byte_count": 0,
+                            "record_count": 0,
+                            "scan_byte_count": 0,
+                        }
+                    },
+                }
+            )
+        with (
+            mock.patch.object(
+                source_inputs,
+                "materialized_segment",
+                side_effect=materialized,
+            ) as loader,
+            mock.patch.object(
+                source_payloads,
+                "merge_payload_index_into",
+                wraps=source_payloads.merge_payload_index_into,
+            ) as merger,
+        ):
+            result = source_inputs.materialize_segments(self.root, descriptors)
+
+        self.assertEqual(len(descriptors), loader.call_count)
+        self.assertEqual(len(descriptors), merger.call_count)
+        self.assertEqual(sorted(expected_refs), list(result["payloads"]))
 
     @staticmethod
     def _line(session_id: str, *, kind: str = "history") -> bytes:
@@ -1967,10 +2058,26 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.codex_root.joinpath("history.jsonl").write_bytes(b"".join(payloads))
         environment = {**os.environ, "HOME": str(self.home)}
         continued_source_kind = ""
-        with mock.patch.object(
-            orchestrator_module,
-            "SOURCE_TRANSPORT_MAX_SOURCE_BYTES",
-            2 * 1024 * 1024,
+        real_materialized_segment = source_inputs.materialized_segment
+        materialized_segment_calls = 0
+        continued_without_history_reload = False
+
+        def counted_materialized_segment(*args, **kwargs):
+            nonlocal materialized_segment_calls
+            materialized_segment_calls += 1
+            return real_materialized_segment(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                orchestrator_module,
+                "SOURCE_TRANSPORT_MAX_SOURCE_BYTES",
+                2 * 1024 * 1024,
+            ),
+            mock.patch.object(
+                source_inputs,
+                "materialized_segment",
+                side_effect=counted_materialized_segment,
+            ),
         ):
             coordinator = self._coordinator("continued-source")
             restarted = False
@@ -1993,12 +2100,24 @@ class SourceTransportProtocolTests(unittest.TestCase):
                     lease.lease_ref,
                     completed.stdout.splitlines(keepends=True),
                 )
+                existing_segment_count = len(
+                    coordinator.load_state()["source"]["cells"]["local"][
+                        lease.source_kind.value
+                    ]["continuation_segments"]
+                )
+                calls_before_acceptance = materialized_segment_calls
                 accepted = coordinator.accept_source(
                     lease.lease_ref,
                     preparation.manifest,
                     transport_receipt=preparation.receipt,
                     raw_records=preparation.raw_records,
                 )
+                if accepted["outcome"] == "continued" and existing_segment_count:
+                    self.assertEqual(
+                        calls_before_acceptance,
+                        materialized_segment_calls,
+                    )
+                    continued_without_history_reload = True
                 if accepted["outcome"] == "continued" and not restarted:
                     source_kind = lease.source_kind.value
                     continued_source_kind = source_kind
@@ -2026,6 +2145,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
 
         state = coordinator.store.read().state
         self.assertEqual("history", continued_source_kind)
+        self.assertTrue(continued_without_history_reload)
         cell = state["source"]["cells"]["local"][continued_source_kind]
         descriptors = cell["continuation_segments"]
         segments = [

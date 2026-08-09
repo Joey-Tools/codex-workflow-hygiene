@@ -14,6 +14,7 @@ from . import (
     catalog,
     result_validation,
     safe_io,
+    source_capacity,
     source_inputs,
     source_payloads,
     transport as source_transport,
@@ -927,16 +928,11 @@ class SourceCoordinationOperations(OrchestratorComponent):
             existing_segments = list(cell.get("continuation_segments", []))
             if len(existing_segments) >= source_inputs.MAX_SOURCE_ACCEPTANCE_SEGMENTS:
                 raise InvalidTransitionError("source continuation chain exceeds bounds")
-            prior_payloads = current_legacy_payloads
-            for descriptor in existing_segments:
-                materialized = source_inputs.materialized_segment(
-                    self.run_dir, descriptor
-                )
-                prior_payloads = source_payloads.merge_payload_indexes(
-                    prior_payloads, materialized["payloads"]
-                )
-            prior_payloads = source_payloads.merge_payload_indexes(
-                prior_payloads, staged
+            source_capacity.require_candidate_capacity(
+                current["source"]["cells"],
+                acceptance_bytes=prepared_acceptance.file.byte_count,
+                byte_count=transport.total_bytes,
+                record_count=transport.total_records,
             )
             segments = [*existing_segments, prepared_acceptance.descriptor]
             continuation = current_snapshot.resume_position

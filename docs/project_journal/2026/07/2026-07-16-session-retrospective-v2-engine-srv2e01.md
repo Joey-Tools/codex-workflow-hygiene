@@ -732,3 +732,35 @@ superseded_by:
   format checks, and `git diff --check` pass. The direct skill-validator wrapper
   lacked `PyYAML`; its documented isolated `uv` fallback using Python 3.13 and
   `pyyaml` passed the OpenAI quick validator.
+- The first Codex review attempt on signed head `d374bce` wrote ignored cache and
+  temporary files inside its independent workspace, so the lane is formally
+  non-counting. Its diagnostic output nevertheless identified two actionable
+  capacity gaps: cleanup inventory traversal accumulated the legal tree before
+  enforcing its large terminal sidecar limit, and source continuation repeatedly
+  loaded and merged every prior segment. Post-run inspection identified those
+  writes, the trusted bundle digests remained unchanged, and the task root was
+  removed; no artifact from that lane is accepted as formal review evidence.
+- The follow-up shares one early cleanup budget across all fixed roots and rejects
+  before 300,000 entries, 64 MiB of encoded relative paths, depth 64, or a
+  300-second traversal deadline. Its canonical sidecar is capped at 256 MiB.
+  Run acceptance is independently capped at 100,000 source records, 4 GiB of
+  source bytes, 768 source segments, 16,384 raw shards, and 15,000 agent tasks.
+  The retry and claim constants derive a conservative 288,688-entry maximum,
+  including fixed recovery reserve, below the cleanup ceiling.
+- Source continuation is limited to 64 segments per host/source cell and 256 MiB
+  of acceptance sidecars per run. Each segment is loaded once, payload indexes
+  merge in place, and only the final aggregate is sorted; accepting a later
+  segment no longer rereads historical sidecars. Exact regressions also prove
+  pre-staging run-global rejection, shard/task caps, a shared multi-root cleanup
+  budget, path/depth/deadline rejection, and retry/claim capacity derivation.
+  One initial focused command named a nonexistent test and is non-counting; the
+  intended test passed 1/1 after correction. The complete affected identity,
+  sharding, source-transport, orchestrator, and module-boundary run passes all
+  223 tests in 142.636 seconds under Python 3.13.
+- The final host Python 3.13 discovery passes all 1,602 tests in 1005.247
+  seconds on the same capacity-fix implementation, including the disposable-GPG
+  publication transactions under `/private/tmp`. An earlier shell invocation
+  left the discovery pattern unquoted and exited before Python started; it ran
+  zero tests and is explicitly non-counting. The successful discovery is the
+  complete implementation-tree gate; only evidence and commit metadata changes
+  follow it.

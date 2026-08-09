@@ -39,6 +39,11 @@ except (ImportError, ModuleNotFoundError):
     _CommonJobKind = None
 
 try:
+    from .contracts import MAX_RUN_RAW_SHARDS
+except (ImportError, ModuleNotFoundError):
+    from contracts import MAX_RUN_RAW_SHARDS  # type: ignore[no-redef]
+
+try:
     from . import safe_io as _safe_io
 except (ImportError, ModuleNotFoundError):
     _safe_io = None
@@ -807,6 +812,10 @@ def build_raw_shards(
         fits_turns = _piece_turn_count(candidate) <= selected_limits.max_turns
         fits_bytes = len(_serialize_pieces(candidate)[0]) <= selected_limits.max_bytes
         if current and (not fits_turns or not fits_bytes):
+            if len(shards) >= MAX_RUN_RAW_SHARDS:
+                raise ShardingValidationError(
+                    "raw shard count exceeds cleanup capacity"
+                )
             shards.append(_artifact_from_pieces(current, len(shards)))
             current = [piece]
         else:
@@ -816,6 +825,8 @@ def build_raw_shards(
                 "internal error: a prevalidated range exceeded the shard limit"
             )
     if current:
+        if len(shards) >= MAX_RUN_RAW_SHARDS:
+            raise ShardingValidationError("raw shard count exceeds cleanup capacity")
         shards.append(_artifact_from_pieces(current, len(shards)))
 
     _validate_conservation(ordered, shards, gaps)

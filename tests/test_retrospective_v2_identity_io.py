@@ -229,6 +229,20 @@ class SafeIoTests(unittest.TestCase):
             capture_output=True,
         )
 
+    @staticmethod
+    def _inventory_budget(
+        *,
+        entries: int = 100,
+        path_bytes: int = 4096,
+        depth: int = 8,
+    ) -> safe_io.TreeInventoryBudget:
+        return safe_io.TreeInventoryBudget.from_timeout(
+            max_entries=entries,
+            max_path_bytes=path_bytes,
+            max_depth=depth,
+            timeout_seconds=30.0,
+        )
+
     def test_capability_probe_uses_real_dir_fd_operations_and_fails_closed(
         self,
     ) -> None:
@@ -275,6 +289,7 @@ class SafeIoTests(unittest.TestCase):
             snapshot = safe_io.inspect_tree_inventory_at(
                 parent_fd,
                 tree.name,
+                budget=self._inventory_budget(),
                 display_path=tree,
             )
         finally:
@@ -284,6 +299,74 @@ class SafeIoTests(unittest.TestCase):
             [".", "a", "a.", "a/child"],
             [entry["relative_path"] for entry in snapshot["entries"]],
         )
+
+    def test_cleanup_inventory_budget_is_shared_across_actual_trees(self) -> None:
+        for name in ("first", "second"):
+            tree = self.root / name
+            tree.mkdir(mode=0o700)
+            atomic_write_bytes(tree / "child", b"payload\n")
+        parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        budget = self._inventory_budget(entries=3)
+        try:
+            safe_io.inspect_tree_inventory_at(
+                parent_fd,
+                "first",
+                budget=budget,
+                display_path=self.root / "first",
+            )
+            with self.assertRaisesRegex(
+                safe_io.TreeInventoryLimitExceeded,
+                "entry bound",
+            ):
+                safe_io.inspect_tree_inventory_at(
+                    parent_fd,
+                    "second",
+                    budget=budget,
+                    display_path=self.root / "second",
+                )
+        finally:
+            os.close(parent_fd)
+
+    def test_cleanup_inventory_rejects_actual_path_depth_and_deadline_limits(
+        self,
+    ) -> None:
+        tree = self.root / "bounded"
+        nested = tree / "nested"
+        tree.mkdir(mode=0o700)
+        nested.mkdir(mode=0o700)
+        atomic_write_bytes(nested / "child", b"payload\n")
+        parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            cases = (
+                (self._inventory_budget(path_bytes=1), "path-byte bound"),
+                (self._inventory_budget(depth=0), "depth bound"),
+                (
+                    safe_io.TreeInventoryBudget(
+                        max_entries=100,
+                        max_path_bytes=4096,
+                        max_depth=8,
+                        deadline=1.0,
+                        clock=lambda: 1.0,
+                    ),
+                    "deadline",
+                ),
+            )
+            for budget, reason in cases:
+                with (
+                    self.subTest(reason=reason),
+                    self.assertRaisesRegex(
+                        safe_io.TreeInventoryLimitExceeded,
+                        reason,
+                    ),
+                ):
+                    safe_io.inspect_tree_inventory_at(
+                        parent_fd,
+                        tree.name,
+                        budget=budget,
+                        display_path=tree,
+                    )
+        finally:
+            os.close(parent_fd)
 
     def test_atomic_create_never_replaces_an_existing_file(self) -> None:
         target = self.root / "identity.key"

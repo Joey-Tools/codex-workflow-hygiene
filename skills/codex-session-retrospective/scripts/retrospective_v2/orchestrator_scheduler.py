@@ -10,6 +10,7 @@ from . import catalog, controlled_gaps, safe_io, transport as source_transport
 from .checkpoints import CheckpointNotFoundError, canonical_json_bytes
 from .contracts import (
     ControlledGapReason,
+    MAX_AGENT_ATTEMPTS_PER_TASK,
     RefType,
     RunMode,
     RunStage,
@@ -526,7 +527,7 @@ class StageSchedulingOperations(OrchestratorComponent):
             if task["status"] not in {"pending", "retryable"}:
                 continue
             ordinal = len(task["attempts"])
-            if ordinal >= 2:
+            if ordinal >= MAX_AGENT_ATTEMPTS_PER_TASK:
                 raise InvalidTransitionError("fresh-agent retry budget was exhausted")
             job_manifest = self._jobs._execution_manifest(state, task, ordinal)
             job_ref = job_manifest["job_ref"]

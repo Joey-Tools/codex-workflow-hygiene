@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from . import result_validation, safe_io, sharding, transport as source_transport
 from .checkpoints import canonical_json_bytes, content_digest
-from .contracts import JobKind, RefType, RunStage
+from .contracts import MAX_RUN_AGENT_TASKS, JobKind, RefType, RunStage
 from .orchestrator_context import OrchestratorComponent, RuntimeContext
 from .orchestrator_protocols import JobsProjectionPort
 
@@ -275,6 +275,12 @@ class AgentJobOperations(OrchestratorComponent):
             metrics["agent_task_reuses"] = metrics.get("agent_task_reuses", 0) + 1
             existing["cache_reuse_count"] = reuse_count + 1
             return task_ref
+        metrics = state.setdefault("metrics", {})
+        misses = metrics.get("agent_task_cache_misses", 0)
+        if isinstance(misses, bool) or not isinstance(misses, int) or misses < 0:
+            raise RunConflictError("agent task cache miss count is invalid")
+        if misses >= MAX_RUN_AGENT_TASKS:
+            raise InvalidInputError("agent task count exceeds cleanup capacity")
         task = {
             "active_attempt_ref": None,
             "active_job_ref": None,
@@ -297,10 +303,7 @@ class AgentJobOperations(OrchestratorComponent):
         if len(canonical_json_bytes(projected_envelope)) > self._agent_envelope_limit():
             raise InvalidInputError("agent task exceeds the complete 512 KiB envelope")
         state["jobs"][task_ref] = task
-        metrics = state.setdefault("metrics", {})
-        metrics["agent_task_cache_misses"] = (
-            metrics.get("agent_task_cache_misses", 0) + 1
-        )
+        metrics["agent_task_cache_misses"] = misses + 1
         return task_ref
 
     def _execution_manifest(

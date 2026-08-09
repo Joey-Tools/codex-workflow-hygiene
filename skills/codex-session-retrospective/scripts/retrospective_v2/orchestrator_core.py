@@ -8,7 +8,12 @@ import re
 from typing import Any, Mapping, Sequence
 
 from .checkpoints import canonical_json_bytes
-from .contracts import RunStage, SourceCellStatus, SourceKind
+from .contracts import (
+    MAX_AGENT_CLAIM_GENERATIONS_PER_ATTEMPT,
+    RunStage,
+    SourceCellStatus,
+    SourceKind,
+)
 
 ENGINE_VERSION = "2.0"
 STATE_SCHEMA_VERSION = 2
@@ -39,7 +44,7 @@ MAX_AGENT_ENVELOPE_BYTES = 512 * 1024
 DEFAULT_AGENT_CLAIM_TTL_SECONDS = 300
 MIN_AGENT_CLAIM_TTL_SECONDS = 30
 MAX_AGENT_CLAIM_TTL_SECONDS = 3600
-MAX_AGENT_CLAIM_GENERATIONS = 2
+MAX_AGENT_CLAIM_GENERATIONS = MAX_AGENT_CLAIM_GENERATIONS_PER_ATTEMPT
 
 _SOURCE_TERMINAL = frozenset(status.value for status in SourceCellStatus)
 _NON_GAP_SOURCE_TERMINAL = frozenset(

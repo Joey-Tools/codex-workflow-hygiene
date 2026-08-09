@@ -294,11 +294,13 @@ def inspect_run_paths(
     root_entries: dict[str, list[dict[str, Any]]] = {}
     root_objects: dict[str, dict[str, int] | None] = {}
     totals = dict.fromkeys(COUNTER_FIELDS, 0)
+    budget = _new_inventory_budget()
     try:
         for name in roots:
             snapshot = safe_io.inspect_tree_inventory_at(
                 run_fd,
                 name,
+                budget=budget,
                 display_path=normalized / name,
             )
             counts = snapshot["counters"]
@@ -321,6 +323,15 @@ def inspect_run_paths(
         }
     finally:
         os.close(run_fd)
+
+
+def _new_inventory_budget() -> safe_io.TreeInventoryBudget:
+    return safe_io.TreeInventoryBudget.from_timeout(
+        max_entries=cleanup_sidecars.MAX_CLEANUP_INVENTORY_ENTRIES,
+        max_path_bytes=cleanup_sidecars.MAX_CLEANUP_INVENTORY_PATH_BYTES,
+        max_depth=cleanup_sidecars.MAX_CLEANUP_INVENTORY_DEPTH,
+        timeout_seconds=cleanup_sidecars.MAX_CLEANUP_INVENTORY_SECONDS,
+    )
 
 
 def _contract_roots(claim: Mapping[str, Any]) -> Sequence[str]:
@@ -520,7 +531,16 @@ def _exact_progress_snapshot(
 ) -> dict[str, dict[str, Any]]:
     roots = claim["raw_path_inventory"]
     expected_names = {item for name in roots for item in _quarantine_names(name)}
-    observed_names = set(os.listdir(quarantine_fd))
+    budget = _new_inventory_budget()
+    observed_names: set[str] = set()
+    with os.scandir(quarantine_fd) as entries:
+        for entry in entries:
+            budget.checkpoint()
+            if len(observed_names) >= len(expected_names):
+                raise safe_io.UnsafePathError(
+                    f"cleanup quarantine has unexpected entries: {quarantine_path}"
+                )
+            observed_names.add(entry.name)
     if not observed_names <= expected_names:
         raise safe_io.UnsafePathError(
             f"cleanup quarantine has unexpected entries: {quarantine_path}"
@@ -535,11 +555,13 @@ def _exact_progress_snapshot(
         original = safe_io.inspect_tree_inventory_at(
             run_fd,
             name,
+            budget=budget,
             display_path=normalized / name,
         )
         quarantined = safe_io.inspect_tree_inventory_at(
             quarantine_fd,
             quarantine_name,
+            budget=budget,
             display_path=quarantine_path / quarantine_name,
         )
         marker = _read_marker(
@@ -673,6 +695,7 @@ def _delete_exact_claimed_paths(
                 quarantined = safe_io.inspect_tree_inventory_at(
                     quarantine_fd,
                     quarantine_name,
+                    budget=_new_inventory_budget(),
                     display_path=quarantine_path / quarantine_name,
                 )
                 if quarantined != states[name]["inventory"]:
@@ -732,6 +755,7 @@ def _delete_legacy_claimed_paths(
     normalized: Path,
     claim: Mapping[str, Any],
 ) -> None:
+    budget = _new_inventory_budget()
     for name in claim["raw_path_inventory"]:
         planned_object = claim["root_objects"][name]
         if planned_object is None:
@@ -750,6 +774,7 @@ def _delete_legacy_claimed_paths(
         current = safe_io.inspect_tree_at(
             run_fd,
             name,
+            budget=budget,
             display_path=normalized / name,
         )
         planned = claim["root_counters"][name]

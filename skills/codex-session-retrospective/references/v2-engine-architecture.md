@@ -18,6 +18,7 @@ operate on that single coordinator context and do not import one another:
 | `orchestrator_history.py` | Result validation and retained history projection |
 | `orchestrator_source.py` | Source transport admission and leased agent result handling |
 | `orchestrator_lifecycle.py` | Run creation, publication claims, retention, and raw cleanup |
+| `source_capacity.py` | Run-global source, sidecar, and cleanup-capacity accounting |
 | `orchestrator_scheduler.py` | Stage transitions, task creation, and bounded envelope scheduling |
 
 Publication uses an explicit side-effect boundary:
@@ -76,10 +77,10 @@ inventory and its aggregate are enforced together, so omitting a transport
 module cannot create a false budget pass. The newly affected modules are
 `transport_program.py` at 408/420 lines, `transport_remote.py` at 315/320,
 `transport_snapshot.py` at 196/200, and `transport_remote_snapshot.py` at
-79/100. The global branch proxy measures 7,920 nodes against a 7,925-node
-ceiling. These
-small budget revisions admit the new commitment boundary without recreating a
-transport monolith.
+79/100. The global branch proxy measures 7,955 nodes against an exact
+7,955-node ceiling. The current increase is confined to the run-global source,
+shard, task, and cleanup-capacity guards; no additional coordinator capability
+or transport monolith was introduced.
 
 ## Architecture inventory
 

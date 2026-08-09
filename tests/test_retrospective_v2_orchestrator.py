@@ -31,6 +31,7 @@ from retrospective_v2 import (  # noqa: E402
     contracts,
     controlled_gaps,
     episode_review,
+    orchestrator_jobs,
     reporting,
     retained_inputs,
     result_validation,
@@ -3590,6 +3591,22 @@ class OrchestratorTests(unittest.TestCase):
             state["metrics"],
         )
         self.assertEqual(1, state["jobs"][created]["cache_reuse_count"])
+        with mock.patch.object(orchestrator_jobs, "MAX_RUN_AGENT_TASKS", 1):
+            self.assertEqual(
+                created,
+                coordinator._create_agent_task(state, **arguments),
+            )
+            with self.assertRaisesRegex(InvalidInputError, "cleanup capacity"):
+                coordinator._create_agent_task(
+                    state,
+                    **{
+                        **arguments,
+                        "partition_ref": typed_ref(
+                            RefType.RUN_INPUT,
+                            "second-cache-partition",
+                        ),
+                    },
+                )
 
     def test_all_post_extraction_jobs_partition_under_complete_envelope_cap(
         self,
@@ -5713,6 +5730,30 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(
             b"retained until every root is revalidated",
             raw_sibling.read_bytes(),
+        )
+
+    def test_cleanup_inventory_applies_one_budget_across_all_roots(self) -> None:
+        coordinator = self.start_daily("cleanup-global-budget")
+        roots = ("budget-first", "budget-second")
+        for root in roots:
+            (coordinator.run_dir / root).mkdir(mode=0o700)
+        with (
+            mock.patch.object(
+                cleanup_sidecars,
+                "MAX_CLEANUP_INVENTORY_ENTRIES",
+                1,
+            ),
+            self.assertRaisesRegex(
+                safe_io.TreeInventoryLimitExceeded,
+                "entry bound",
+            ),
+        ):
+            coordinator._raw_cleanup_inventory(roots)
+
+    def test_run_artifact_capacity_stays_within_cleanup_inventory(self) -> None:
+        self.assertLessEqual(
+            contracts.MAX_CONSERVATIVE_RUN_CLEANUP_ENTRIES,
+            contracts.MAX_CLEANUP_INVENTORY_ENTRIES,
         )
 
     def test_cleanup_v5_sidecar_tamper_hardlink_and_oversize_fail_closed(

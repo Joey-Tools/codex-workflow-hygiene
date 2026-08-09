@@ -242,6 +242,7 @@ ORCHESTRATOR_FOUNDATION_MODULES = {
 ORCHESTRATOR_SOURCE_SUPPORT_MODULES = {
     "agent_claim_artifacts.py",
     "orchestrator_source_segments.py",
+    "source_capacity.py",
     "source_inputs.py",
     "source_payloads.py",
 }
@@ -317,6 +318,7 @@ BOUNDED_MODULE_LINES = {
     "agent_claim_artifacts.py": 100,
     "source_inputs.py": 500,
     "source_payloads.py": 100,
+    "source_capacity.py": 150,
     "orchestrator_core.py": 250,
     "orchestrator_protocols.py": 450,
     "orchestrator_support.py": 600,
@@ -959,7 +961,7 @@ spec.loader.exec_module(module)
                     *ORCHESTRATOR_SOURCE_SUPPORT_MODULES,
                 }
             ),
-            2_850,
+            3_000,
         )
         self.assertLessEqual(
             len((SCRIPTS / "session_retrospective_v2.py").read_text().splitlines()),
@@ -1042,7 +1044,7 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertLessEqual(branch_total, 7_925)
+        self.assertLessEqual(branch_total, 7_955)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)
 

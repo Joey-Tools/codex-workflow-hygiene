@@ -9,25 +9,20 @@ from typing import Any, Mapping, Sequence
 
 from . import safe_io
 from .checkpoints import canonical_json_bytes
-from .contracts import strict_json_loads
-from .orchestrator_core import SHADOW_CLEANUP_ROOTS
-from .orchestrator_support import InvalidTransitionError
-from .transport_contracts import (
-    SOURCE_DISCOVERY_MAX_DIRECTORY_ENTRIES,
-    SOURCE_DISCOVERY_MAX_PATH_BYTES,
+from .contracts import (
+    MAX_CLEANUP_INVENTORY_BYTES,
+    MAX_CLEANUP_INVENTORY_DEPTH as MAX_CLEANUP_INVENTORY_DEPTH,
+    MAX_CLEANUP_INVENTORY_ENTRIES,
+    MAX_CLEANUP_INVENTORY_PATH_BYTES,
+    MAX_CLEANUP_INVENTORY_SECONDS as MAX_CLEANUP_INVENTORY_SECONDS,
+    strict_json_loads,
 )
+from .orchestrator_support import InvalidTransitionError
 
 
 CLEANUP_INVENTORY_SCHEMA = "cleanup_inventory_v1"
 CLEANUP_INVENTORY_DESCRIPTOR_SCHEMA = "cleanup_inventory_descriptor_v1"
 CLEANUP_INVENTORY_DIRECTORY = "cleanup-inventories"
-MAX_CLEANUP_INVENTORY_ENTRIES = len(SHADOW_CLEANUP_ROOTS) * (
-    SOURCE_DISCOVERY_MAX_DIRECTORY_ENTRIES + 1
-)
-MAX_CLEANUP_INVENTORY_PATH_BYTES = (
-    len(SHADOW_CLEANUP_ROOTS) * SOURCE_DISCOVERY_MAX_PATH_BYTES
-)
-MAX_CLEANUP_INVENTORY_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def _fail(message: str, error: BaseException | None = None) -> InvalidTransitionError:

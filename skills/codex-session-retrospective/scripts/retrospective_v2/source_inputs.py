@@ -9,9 +9,20 @@ import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import catalog, safe_io, source_payloads, transport as source_transport
+from . import (
+    catalog,
+    safe_io,
+    source_capacity,
+    source_payloads,
+    transport as source_transport,
+)
 from .checkpoints import canonical_json_bytes
-from .contracts import SourceCellStatus, strict_json_loads
+from .contracts import (
+    MAX_SOURCE_ACCEPTANCE_BYTES,
+    MAX_SOURCE_ACCEPTANCE_SEGMENTS_PER_CELL,
+    SourceCellStatus,
+    strict_json_loads,
+)
 from .identity import IdentityKey
 from .orchestrator_core import RAW_INPUT_DIRECTORY
 from .orchestrator_support import InvalidTransitionError
@@ -20,8 +31,7 @@ from .orchestrator_support import InvalidTransitionError
 SOURCE_ACCEPTANCE_SCHEMA = "source_acceptance_v2"
 SOURCE_ACCEPTANCE_DESCRIPTOR_SCHEMA = "source_acceptance_descriptor_v2"
 SOURCE_ACCEPTANCE_DIRECTORY = f"{RAW_INPUT_DIRECTORY}/source-acceptances"
-MAX_SOURCE_ACCEPTANCE_BYTES = 512 * 1024 * 1024
-MAX_SOURCE_ACCEPTANCE_SEGMENTS = 4_096
+MAX_SOURCE_ACCEPTANCE_SEGMENTS = MAX_SOURCE_ACCEPTANCE_SEGMENTS_PER_CELL
 _DESCRIPTOR_FIELDS = frozenset(
     {"byte_count", "content_commitment", "relative_path", "schema"}
 )
@@ -211,15 +221,15 @@ def materialize_segments(
     payloads: dict[str, Any] = {}
     model_era_by_unit: dict[str, str] = {}
     model_eras_by_session: dict[str, set[str]] = {}
+    usage = source_capacity.SourceUsage()
     for value in values:
         materialized = materialized_segment(run_dir, value)
         segment = materialized["segment"]
         if not isinstance(segment, dict):
             raise InvalidTransitionError("source continuation segment is invalid")
+        source_capacity.observe_segment(usage, value, segment)
         segments.append(segment)
-        payloads = source_payloads.merge_payload_indexes(
-            payloads, materialized["payloads"]
-        )
+        source_payloads.merge_payload_index_into(payloads, materialized["payloads"])
         for unit_ref, model_era in materialized["model_era_by_unit"].items():
             existing = model_era_by_unit.get(unit_ref)
             if existing is not None and existing != model_era:
@@ -232,7 +242,7 @@ def materialize_segments(
         "model_eras_by_session": {
             key: sorted(values) for key, values in model_eras_by_session.items()
         },
-        "payloads": payloads,
+        "payloads": dict(sorted(payloads.items())),
         "segments": tuple(segments),
     }
 

@@ -52,25 +52,31 @@ def _validated_payload_state(value: object) -> dict[str, Any]:
     }
 
 
+def merge_payload_index_into(merged: dict[str, dict[str, Any]], value: object) -> None:
+    """Validate one index and merge it in place without allowing overrides."""
+
+    if not isinstance(value, Mapping):
+        raise InvalidTransitionError("source payload index is invalid")
+    for unit_ref, payload_state in value.items():
+        if not isinstance(unit_ref, str):
+            raise InvalidTransitionError("source payload index is invalid")
+        try:
+            parse_typed_ref(unit_ref, expected=RefType.SOURCE_UNIT)
+        except (TypeError, ValueError) as error:
+            raise InvalidTransitionError(
+                "source payload index contains an invalid source unit"
+            ) from error
+        normalized = _validated_payload_state(payload_state)
+        existing = merged.get(unit_ref)
+        if existing is not None and existing != normalized:
+            raise InvalidTransitionError("source payload index changed")
+        merged[unit_ref] = normalized
+
+
 def merge_payload_indexes(*values: object) -> dict[str, dict[str, Any]]:
     """Validate and merge indexes without allowing later values to override."""
 
     merged: dict[str, dict[str, Any]] = {}
     for value in values:
-        if not isinstance(value, Mapping):
-            raise InvalidTransitionError("source payload index is invalid")
-        for unit_ref, payload_state in value.items():
-            if not isinstance(unit_ref, str):
-                raise InvalidTransitionError("source payload index is invalid")
-            try:
-                parse_typed_ref(unit_ref, expected=RefType.SOURCE_UNIT)
-            except (TypeError, ValueError) as error:
-                raise InvalidTransitionError(
-                    "source payload index contains an invalid source unit"
-                ) from error
-            normalized = _validated_payload_state(payload_state)
-            existing = merged.get(unit_ref)
-            if existing is not None and existing != normalized:
-                raise InvalidTransitionError("source payload index changed")
-            merged[unit_ref] = normalized
+        merge_payload_index_into(merged, value)
     return dict(sorted(merged.items()))

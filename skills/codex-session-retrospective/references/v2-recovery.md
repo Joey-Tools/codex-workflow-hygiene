@@ -124,8 +124,14 @@ owner-only, content-addressed sidecar with the exact per-object inventory:
 globally bytewise-sorted relative path, object type, device/inode, size,
 owner/group/mode, link count, and the verified owner-only/no-ACL access policy.
 The checkpoint remains below its fixed bound regardless of legal inventory
-cardinality. The engine revalidates every complete inventory twice before any
-mutation, then moves each root into a deterministic claim-scoped quarantine and
+cardinality. One budget is shared across every fixed root: traversal stops before
+300,000 entries, 64 MiB of encoded relative paths, depth 64, or 300 seconds, and
+the canonical sidecar may not exceed 256 MiB. Normal source, shard, and agent-task
+acceptance limits conservatively reserve fewer entries than that cleanup ceiling,
+including fixed directories and recovery artifacts. A limit failure retains the
+raw tree without serializing a partial inventory. The engine revalidates every
+complete inventory twice before any mutation, then moves each root into a
+deterministic claim-scoped quarantine and
 fsyncs a per-root `started` marker before recursive deletion. A retry accepts an
 exact remaining subset only inside that quarantine. An unmarked missing root,
 an original-path replacement, an unexpected quarantine entry, content/type

@@ -657,6 +657,29 @@ class ShardingTests(unittest.TestCase):
             [item.data for item in reverse.shards],
         )
 
+    def test_shard_count_fails_before_exceeding_cleanup_capacity(self) -> None:
+        records = []
+        for index in range(21):
+            payload = f'{{"turn":{index}}}\n'.encode()
+            records.append(
+                raw_record(
+                    candidate(
+                        f"bounded-unit-{index}",
+                        payload,
+                        byte_start=index * 100,
+                    ),
+                    payload,
+                )
+            )
+        with (
+            mock.patch.object(sharding, "MAX_RUN_RAW_SHARDS", 1),
+            self.assertRaisesRegex(
+                sharding.ShardingValidationError,
+                "cleanup capacity",
+            ),
+        ):
+            sharding.build_raw_shards(records)
+
     def test_oversized_utf8_record_splits_into_exact_contiguous_ranges(self) -> None:
         payload = ("prefix-" + "\u6c49\u5b57" * 1800 + "-suffix").encode("utf-8")
         record = candidate(

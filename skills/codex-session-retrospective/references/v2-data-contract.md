@@ -167,7 +167,13 @@ retained raw payload, and a submitted non-target consumed record is rejected.
   before unlink. A same-schema checkpoint that still carries the legacy full
   manifest or inline payload index remains readable; the next accepted continuation
   validates conflicts and migrates that index into the new sidecar before clearing
-  the inline copy.
+  the inline copy. A run accepts at most 64 continuation segments per host/source
+  cell, 768 segments and 100,000 records in total, 4 GiB of source bytes, and
+  256 MiB of acceptance-sidecar bytes. Materialization reads each accepted
+  segment once, merges payload indexes in place, and sorts only the final
+  aggregate; accepting a later segment never reloads earlier sidecars. The
+  coordinator rejects an over-limit segment before staging any file, leaving
+  coverage unresolved rather than committing an incomplete aggregate.
 - Raw run directory: mode `0700`; every file: mode `0600`. On Darwin, each
   owner-only directory and file must also have no extended ACL. Newly created
   objects clear inherited ACLs through their held descriptors before use;
