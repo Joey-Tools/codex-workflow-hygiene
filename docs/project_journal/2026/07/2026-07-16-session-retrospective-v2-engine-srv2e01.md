@@ -241,6 +241,19 @@ superseded_by:
 - Durable-history and publication Git commands share one local-only environment,
   reject shallow/promisor/partial-clone repositories before object reads, disable
   lazy fetch and credential helpers, and preserve caller-specific error contracts.
+- Durable publication replay uses the static authenticated run binding only after
+  a legal durable transaction phase exists; prepublication phases still require
+  the original live-history precondition. Finalization loads the commitment from
+  the reachable exact publication commit while provider-cache validation remains
+  bound to the current durable-history head, so an unrelated successor commit does
+  not strand cleanup or weaken current-head integrity.
+- A committed export remains publication-bound until both the outer transaction
+  journal and the run's cleanup-pending checkpoint are durable. Only then may the
+  sidecar become terminal; recovery accepts a fully collected bundle/sidecar pair
+  but rejects one-sided disappearance as a conflict.
+- The transport boundary is an exact 14-module inventory at 7,181 lines under a
+  7,200-line aggregate ceiling. The contract fails on membership drift, individual
+  module drift, or aggregate growth instead of relying on an approximate total.
 
 ## Next Steps
 
@@ -663,3 +676,20 @@ superseded_by:
   project-journal validator, scoped Ruff lint/format checks, isolated OpenAI
   skill validator, and `git diff --check` all pass; only this evidence-only
   journal update follows the complete implementation-tree gate.
+- A fresh whole-range Codex reviewer of signed head `0f622f5` found three
+  actionable recovery and boundary gaps: unrelated durable-history successors
+  blocked finalization, committed export sidecars could become collectible before
+  the outer run checkpoint was recoverable, and the documented transport total
+  did not match the actual module inventory. Its independent workspace was
+  postvalidated and removed before these fixes; no partial result was reused.
+- The follow-up focused evidence passes the complete export module at 50/50 in
+  2.626 seconds and module-boundary tests at 18/18 in 1.800 seconds. All four
+  disposable-GPG recovery regressions pass with explicit `TMPDIR=/private/tmp`;
+  the earlier default-TMPDIR attempt was setup-blocked by the symlink-ancestor
+  security contract before target logic and is non-counting. Scoped Ruff lint and
+  format checks over all 69 v2 modules and affected tests pass, as does
+  `git diff --check`.
+- The final Python 3.13 host discovery passes all 1,586 tests in 1031.874 seconds
+  on the same publication-recovery and transport-boundary implementation,
+  including the real disposable-GPG publication transactions. It supersedes all
+  affected and setup-blocked results for this tree.

@@ -742,11 +742,6 @@ class LocalGitPublicationAdapter(
             state = self._required_attempt(request)
             existing = state["receipts"].get("state_advance")
             if existing is not None:
-                self._release_export_retention_sidecars(
-                    request,
-                    state["unit_plan"],
-                    disposition="committed",
-                )
                 return deepcopy(existing)
             history = state["receipts"].get("history_validation")
             promotion = state["receipts"].get("promotion")
@@ -796,11 +791,6 @@ class LocalGitPublicationAdapter(
             state["receipts"]["state_advance"] = receipt
             self._write_attempt(state)
             self._inject("advance_state.after_persist", state)
-            self._release_export_retention_sidecars(
-                request,
-                state["unit_plan"],
-                disposition="committed",
-            )
             return deepcopy(receipt)
 
     def cleanup(self, request: OperationRequest) -> Mapping[str, Any]:

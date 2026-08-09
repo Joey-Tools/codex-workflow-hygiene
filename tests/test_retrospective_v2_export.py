@@ -31,6 +31,7 @@ from retrospective_v2.export import (  # noqa: E402
     bind_staged_export,
     export_retained_bundle,
     garbage_collect_expired_exports,
+    release_committed_staged_export,
     release_staged_export,
     release_staged_export_if_bound,
     stage_retained_artifacts,
@@ -2110,6 +2111,27 @@ class RetrospectiveV2ExportTests(unittest.TestCase):
             )
             self.assertEqual(collected["deleted"], [str(output.resolve())])
             self.assertFalse(output.exists())
+
+    def test_committed_release_accepts_only_a_fully_collected_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / ".codex-local" / "collected-retention"
+            root.mkdir(parents=True, mode=0o700)
+            output = root / "retained-v2"
+            attempt_ref = f"attempt_ref_v2:{'f' * 64}"
+
+            collected = release_committed_staged_export(output, attempt_ref)
+
+            self.assertTrue(collected["idempotent"])
+            self.assertEqual("collected", collected["status"])
+            self.assertEqual("committed", collected["terminal_disposition"])
+
+            export_retained_bundle(output, run_state(), review_data())
+            output.rename(root / "displaced-retained-v2")
+            with self.assertRaisesRegex(
+                ExportConflictError,
+                "bundle and retention state presence differ",
+            ):
+                release_committed_staged_export(output, attempt_ref)
 
     def test_conditional_publication_release_leaves_unbound_export_unchanged(
         self,

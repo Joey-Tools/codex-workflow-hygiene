@@ -280,6 +280,24 @@ TRANSPORT_MODULES = {
     "transport_worker.py",
 }
 
+TRANSPORT_LINE_INVENTORY = {
+    "transport.py": 231,
+    "transport_auth.py": 143,
+    "transport_capture.py": 999,
+    "transport_contracts.py": 999,
+    "transport_discovery.py": 240,
+    "transport_paths.py": 70,
+    "transport_program.py": 408,
+    "transport_remote.py": 315,
+    "transport_remote_snapshot.py": 79,
+    "transport_resume.py": 170,
+    "transport_session_shards.py": 1_605,
+    "transport_snapshot.py": 196,
+    "transport_source.py": 1_700,
+    "transport_worker.py": 26,
+}
+TRANSPORT_AGGREGATE_LINE_LIMIT = 7_200
+
 BOUNDED_MODULE_LINES = {
     "finalize.py": 120,
     "authority.py": 3_250,
@@ -922,13 +940,6 @@ spec.loader.exec_module(module)
         self.assertLessEqual(
             sum(
                 len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
-                for name in TRANSPORT_MODULES
-            ),
-            7_200,
-        )
-        self.assertLessEqual(
-            sum(
-                len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
                 for name in PUBLICATION_MODULES
             ),
             8_600,
@@ -977,6 +988,19 @@ spec.loader.exec_module(module)
                     len((PACKAGE / name).read_text(encoding="utf-8").splitlines()),
                     2_000,
                 )
+
+    def test_transport_inventory_and_aggregate_budget_are_exact(self) -> None:
+        observed = {
+            name: len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
+            for name in sorted(TRANSPORT_MODULES)
+        }
+        self.assertEqual(TRANSPORT_MODULES, set(TRANSPORT_LINE_INVENTORY))
+        self.assertEqual(TRANSPORT_LINE_INVENTORY, observed)
+        self.assertEqual(7_181, sum(observed.values()))
+        self.assertLessEqual(
+            sum(observed.values()),
+            TRANSPORT_AGGREGATE_LINE_LIMIT,
+        )
 
     def test_engine_function_complexity_and_duplication_remain_bounded(self) -> None:
         duplicate_bodies: dict[str, list[str]] = defaultdict(list)

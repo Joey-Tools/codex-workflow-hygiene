@@ -1537,7 +1537,6 @@ def command_finalize(args: argparse.Namespace) -> CommandResult:
             code="shadow_publication_forbidden",
             message="shadow runs cannot enter formal publication",
         )
-
     publication = run_state.get("publication")
     if not isinstance(publication, Mapping):
         raise CliContractError(
@@ -1545,9 +1544,7 @@ def command_finalize(args: argparse.Namespace) -> CommandResult:
             code="invalid_publication_state",
             message="the run publication state is invalid",
         )
-    if publication.get("phase") == "published_cleanup_pending":
-        cleanup = orchestrator.complete_published_cleanup()
-        return CommandResult.success("finalize", _mapping_result(cleanup))
+    phase = publication.get("phase")
     if run_state.get("stage") == contract_api.RunStage.COMPLETE.value:
         return CommandResult.success(
             "finalize",
@@ -1555,18 +1552,30 @@ def command_finalize(args: argparse.Namespace) -> CommandResult:
                 "action": "finalize",
                 "cleanup_pending": False,
                 "idempotent": True,
-                "publication_phase": publication.get("phase"),
+                "publication_phase": phase,
                 "run_ref": run_state.get("run_ref"),
                 "stage": run_state.get("stage"),
             },
         )
+    if phase in ("published_cleanup_pending", "published_cleanup_claimed"):
+        claim = publication.get("publication_claim")
+        attempt_ref = claim.get("attempt_ref") if isinstance(claim, Mapping) else None
+        if not isinstance(attempt_ref, str):
+            raise CliContractError(
+                exit_code=ExitCode.INVALID_STATE,
+                code="invalid_publication_state",
+                message="the pending publication claim is invalid",
+            )
+        bundle_dir = _absolute_path(_load_export_descriptor(run_dir)["output"])
+        export_api.release_committed_staged_export(bundle_dir, attempt_ref)
+        cleanup = orchestrator.complete_published_cleanup()
+        return CommandResult.success("finalize", _mapping_result(cleanup))
     if run_state.get("stage") != contract_api.RunStage.EXPORT.value:
         raise CliContractError(
             exit_code=ExitCode.INVALID_STATE,
             code="run_not_exportable",
             message="the v2 run has not reached formal export",
         )
-
     descriptor = _load_export_descriptor(run_dir)
     bundle_dir = _absolute_path(descriptor["output"])
     binding = run_state.get("authority")
@@ -1637,7 +1646,6 @@ def command_finalize(args: argparse.Namespace) -> CommandResult:
             local_transaction_state["attempt_ref"],
             local_transaction_state["plan_digest"],
         )
-
     transaction_state = transaction.status()
     previous_phase = transaction.phase.value
     if previous_phase == "created":
@@ -1662,17 +1670,21 @@ def command_finalize(args: argparse.Namespace) -> CommandResult:
         )
 
     transaction_state = transaction.status()
+    attempt_ref = transaction_state["attempt_ref"]
     run_result = orchestrator.mark_finalized(
         transaction_state["phase"],
-        attempt_ref=transaction_state["attempt_ref"],
+        attempt_ref=attempt_ref,
         claim_revision=claim_result["checkpoint_revision"],
+        defer_cleanup=True,
         plan_digest=transaction_state["plan_digest"],
     )
+    export_api.release_committed_staged_export(bundle_dir, attempt_ref)
+    run_result = orchestrator.complete_published_cleanup()
     return CommandResult.success(
         "finalize",
         {
             "action": "finalize",
-            "attempt_ref": transaction_state["attempt_ref"],
+            "attempt_ref": attempt_ref,
             "cleanup_pending": (
                 run_result.get("publication", {}).get("phase")
                 == "published_cleanup_pending"

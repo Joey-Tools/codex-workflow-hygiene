@@ -70,9 +70,11 @@ cleanup has claimed and removed the raw tree.
 The transport program commitment includes every runtime module above. Adding a
 module without adding it to the closed allowlist fails source transport.
 
-The transport slice remains independently bounded after this hardening: 6,876
-physical lines across a 6,900-line aggregate limit. The newly affected modules
-are `transport_program.py` at 408/420 lines, `transport_remote.py` at 318/320,
+The transport slice remains independently bounded after this hardening: 7,181
+physical lines across a 7,200-line aggregate limit. One exact 14-module
+inventory and its aggregate are enforced together, so omitting a transport
+module cannot create a false budget pass. The newly affected modules are
+`transport_program.py` at 408/420 lines, `transport_remote.py` at 315/320,
 `transport_snapshot.py` at 196/200, and `transport_remote_snapshot.py` at
 79/100. The global branch proxy measures 7,563 nodes against a 7,575-node
 ceiling. These

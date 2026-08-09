@@ -292,8 +292,11 @@ class PublicationTransaction:
         if state["phase"] in {
             PublicationPhase.ABORT_PENDING.value,
             PublicationPhase.ABORTED.value,
+            PublicationPhase.COMPLIANCE_CLOSED.value,
+            PublicationPhase.PROMOTED.value,
+            PublicationPhase.COMMITTED.value,
         }:
-            cls._validate_abort_recovery_binding(
+            cls._validate_recovery_binding(
                 state,
                 inventory=inventory,
                 bundle_dir=Path(bundle_dir).absolute(),
@@ -331,7 +334,7 @@ class PublicationTransaction:
         return state
 
     @staticmethod
-    def _validate_abort_recovery_binding(
+    def _validate_recovery_binding(
         state: Mapping[str, Any],
         *,
         inventory: ArtifactInventory,
@@ -342,7 +345,7 @@ class PublicationTransaction:
         run_dir: Path,
         identity_path: Path,
     ) -> None:
-        """Bind abort replay to its authenticated run without reopening live history."""
+        """Bind durable replay to its run without assuming the old history head."""
 
         plan = _require_mapping(state["plan"], "publication plan")
         try:

@@ -1317,6 +1317,7 @@ def _release_staged_export(
     *,
     now: dt.datetime | None = None,
     require_bound: bool,
+    allow_collected: bool = False,
 ) -> dict[str, Any]:
     if _ATTEMPT_REF_RE.fullmatch(attempt_ref) is None:
         raise RetainedExportError(
@@ -1329,6 +1330,21 @@ def _release_staged_export(
     anchor = _AnchoredExport.open(output_dir, create_parent=False)
     try:
         with anchor.lock():
+            bundle_present = anchor.exists()
+            retention_present = anchor.exists(anchor.retention_name)
+            if allow_collected and not bundle_present and not retention_present:
+                return {
+                    "idempotent": True,
+                    "publication_attempt_ref": attempt_ref,
+                    "schema_version": 2,
+                    "staging_dir": str(anchor.output),
+                    "status": "collected",
+                    "terminal_disposition": disposition,
+                }
+            if bundle_present != retention_present:
+                raise ExportConflictError(
+                    "retained export bundle and retention state presence differ"
+                )
             state = _read_retention_at(anchor)
             if state["staging_dir"] != str(anchor.output):
                 raise ExportConflictError(
@@ -1409,6 +1425,24 @@ def release_staged_export_if_bound(
         disposition,
         now=now,
         require_bound=False,
+    )
+
+
+def release_committed_staged_export(
+    output_dir: str | os.PathLike[str],
+    attempt_ref: str,
+    *,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    """Release committed bytes after the run checkpoint, tolerating completed GC."""
+
+    return _release_staged_export(
+        output_dir,
+        attempt_ref,
+        "committed",
+        now=now,
+        require_bound=True,
+        allow_collected=True,
     )
 
 

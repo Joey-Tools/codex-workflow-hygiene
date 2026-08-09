@@ -1912,6 +1912,7 @@ class RunLifecycleOperations(OrchestratorComponent):
         *,
         attempt_ref: str | None = None,
         claim_revision: int | None = None,
+        defer_cleanup: bool = False,
         plan_digest: str | None = None,
     ) -> dict[str, Any]:
         if phase not in {
@@ -2001,7 +2002,7 @@ class RunLifecycleOperations(OrchestratorComponent):
                 break
             except CheckpointConflictError:
                 continue
-        if phase != "committed":
+        if phase != "committed" or defer_cleanup:
             response = self._projection._status_view(result.snapshot)
             response.update({"action": "mark-finalized", **result.value})
             return response
@@ -2155,16 +2156,14 @@ class RunLifecycleOperations(OrchestratorComponent):
                 expected_fingerprint=binding["publisher_fingerprint"],
                 gnupg_home=binding["publisher_gnupg_home"],
             )
-            if (
-                published.publication_commit is None
-                or published.head_commit != published.publication_commit
-            ):
+            publication_commit = published.publication_commit
+            if publication_commit is None:
                 raise authority.HistoryValidationError(
-                    "durable history head is not this publication commit"
+                    "durable history does not retain this publication commit"
                 )
             commitment = authority.load_durable_publication_commitment(
                 binding["history_repo"],
-                published.head_commit,
+                publication_commit,
                 identity=self.identity,
                 expected_fingerprint=binding["publisher_fingerprint"],
                 gnupg_home=binding["publisher_gnupg_home"],
@@ -2192,7 +2191,7 @@ class RunLifecycleOperations(OrchestratorComponent):
             commitment["attempt_ref"] != claim["attempt_ref"]
             or commitment["plan_digest"] != claim["plan_digest"]
             or commitment["expected_history_commit"] != claim["expected_history_commit"]
-            or commitment["history_commit"] != published.head_commit
+            or commitment["history_commit"] != publication_commit
             or commitment["bundle_digest"] != claim["bundle_digest"]
             or commitment["durable_state_digest"] != claim["durable_state_digest"]
             or canonical_json_bytes(commitment["durable_state"])
@@ -2830,9 +2829,14 @@ class RunLifecycleOperations(OrchestratorComponent):
             raise InvalidTransitionError("durable publication is not awaiting cleanup")
         self._assert_no_open_job_leases_or_sinks(state)
         published = self._validate_published_authority(state)
+        durable_commit = published.publication_commit
+        if durable_commit is None:
+            raise InvalidTransitionError(
+                "published authority lacks its durable publication commit"
+            )
         try:
             claim = self._prepare_published_cleanup_claim(
-                durable_commit=published.head_commit,
+                durable_commit=durable_commit,
             )
         except (OSError, safe_io.UnsafePathError) as error:
             response = self._projection._status_view(self.store.read())
@@ -2875,7 +2879,7 @@ class RunLifecycleOperations(OrchestratorComponent):
                 current,
                 claim,
                 disposition="published",
-                durable_commit=published.head_commit,
+                durable_commit=durable_commit,
                 phase_before="published_cleanup_pending",
                 publication_claim_ref=publication_claim["receipt_ref"],
             )

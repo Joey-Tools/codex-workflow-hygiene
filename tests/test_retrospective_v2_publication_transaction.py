@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+import datetime as dt
 import hashlib
 import json
 import os
@@ -35,7 +36,11 @@ from retrospective_v2 import (  # noqa: E402
 )
 from retrospective_v2.contracts import RefType, RunStage  # noqa: E402
 from retrospective_v2.checkpoints import CheckpointIntegrityError  # noqa: E402
-from retrospective_v2.export import export_retained_bundle  # noqa: E402
+from retrospective_v2.export import (  # noqa: E402
+    export_retained_bundle,
+    garbage_collect_expired_exports,
+    release_committed_staged_export,
+)
 from retrospective_v2.finalize import (  # noqa: E402
     AttemptMismatchError,
     DEFAULT_PUBLISHER_UID,
@@ -1075,6 +1080,7 @@ class DurablePublicationTests(unittest.TestCase):
         *,
         shadow: bool = False,
         bind_export: bool = True,
+        persist_descriptor: bool = False,
     ) -> tuple[RetrospectiveOrchestrator, Path]:
         coordinator = RetrospectiveOrchestrator(
             self.root / "runs" / name,
@@ -1126,12 +1132,37 @@ class DurablePublicationTests(unittest.TestCase):
             run_state,
             review_data,
         )
+        if persist_descriptor:
+            cli_module._persist_export_descriptor(
+                coordinator.run_dir,
+                bundle,
+                receipt,
+                publication_role="standalone",
+            )
         if bind_export:
             if shadow:
                 coordinator.mark_shadow_exported(bundle)
             else:
                 coordinator.mark_exported(receipt["bundle_digest"])
         return coordinator, bundle
+
+    def finalize_cli(
+        self,
+        coordinator: RetrospectiveOrchestrator,
+    ) -> cli_module.CommandResult:
+        args = cli_module.build_parser().parse_args(
+            [
+                "finalize",
+                "--identity-path",
+                str(self.identity_path),
+                "--require-existing-identity",
+                "--run-dir",
+                str(coordinator.run_dir),
+            ]
+        )
+        result = cli_module.command_finalize(args)
+        self.assertTrue(result.ok, result.to_json())
+        return result
 
     @staticmethod
     def destination(state: dict[str, object]) -> str:
@@ -1613,6 +1644,25 @@ class DurablePublicationTests(unittest.TestCase):
                 provenance=self.provenance,
                 publisher_fingerprint=self.fingerprint,
                 publisher_gnupg_home=self.gnupg_home,
+            )
+
+    def test_prepublication_journal_still_rejects_advanced_history(self) -> None:
+        first, first_bundle = self.build_exportable_run("preflight-first")
+        stale, stale_bundle = self.build_exportable_run("preflight-stale")
+        transaction = self.transaction(stale, stale_bundle)
+        self.publish(self.transaction(first, first_bundle))
+
+        with self.assertRaisesRegex(PublicationRejected, "history"):
+            PublicationTransaction.inspect_local_for_run(
+                transaction.journal_path,
+                bundle_dir=stale_bundle,
+                destination=self.destination(stale.load_state()),
+                target_ref=TARGET_REF,
+                expected_target_head=transaction.status()["plan"][
+                    "expected_target_head"
+                ],
+                run_dir=stale.run_dir,
+                identity_path=self.identity_path,
             )
 
     def test_marker_is_hmac_cutover_state_not_an_active_lease(self) -> None:
@@ -2954,7 +3004,8 @@ class DurablePublicationTests(unittest.TestCase):
         self,
     ) -> None:
         coordinator, bundle = self.build_exportable_run(
-            "target-cas-unrelated-successor"
+            "target-cas-unrelated-successor",
+            persist_descriptor=True,
         )
 
         def crash(point, _state):
@@ -3014,6 +3065,113 @@ class DurablePublicationTests(unittest.TestCase):
             identity=self.identity,
         )
         self.assertEqual("committed", recovered.status()["phase"])
+
+        finalized = self.finalize_cli(coordinator)
+
+        self.assertEqual(RunStage.COMPLETE.value, finalized.result["stage"])
+        self.assertEqual(
+            "complete",
+            coordinator.load_state()["publication"]["phase"],
+        )
+        self.assertEqual(successor, self.head())
+        self.assertEqual(
+            publication_tip,
+            coordinator.load_state()["publication"]["cleanup_receipt"][
+                "durable_commit"
+            ],
+        )
+
+    def test_provider_cas_crash_keeps_export_recoverable_across_gc(self) -> None:
+        coordinator, bundle = self.build_exportable_run(
+            "provider-cas-gc-recovery",
+            persist_descriptor=True,
+        )
+
+        def crash(point, _state):
+            if point == "advance_state.after_callback":
+                raise RuntimeError("simulated outer commit journal crash")
+
+        transaction = self.transaction(
+            coordinator,
+            bundle,
+            failure_injector=crash,
+        )
+        transaction.prepare()
+        transaction.stage()
+        transaction.seal()
+        transaction.close_compliance()
+        transaction.promote()
+        with self.assertRaisesRegex(RuntimeError, "outer commit journal crash"):
+            transaction.commit()
+
+        sidecar = bundle.with_name(f".{bundle.name}.retention-v2.json")
+        retained_state = json.loads(sidecar.read_text(encoding="ascii"))
+        self.assertEqual("publication_bound", retained_state["status"])
+        self.assertEqual(
+            transaction.attempt_ref,
+            retained_state["publication_attempt_ref"],
+        )
+        collected = garbage_collect_expired_exports(
+            self.root / ".codex-local" / "exports",
+            now=dt.datetime(2100, 1, 1, tzinfo=dt.UTC),
+        )
+        self.assertIn(str(bundle.resolve()), collected["retained"])
+        self.assertTrue(bundle.is_dir())
+
+        finalized = self.finalize_cli(coordinator)
+
+        self.assertEqual("complete", finalized.result["publication_phase"])
+        terminal_state = json.loads(sidecar.read_text(encoding="ascii"))
+        self.assertEqual("publication_terminal", terminal_state["status"])
+        self.assertEqual("committed", terminal_state["terminal_disposition"])
+        reaped = garbage_collect_expired_exports(
+            self.root / ".codex-local" / "exports",
+            now=dt.datetime(2100, 1, 1, tzinfo=dt.UTC),
+        )
+        self.assertIn(str(bundle.resolve()), reaped["deleted"])
+        self.assertFalse(bundle.exists())
+        self.assertFalse(sidecar.exists())
+
+        retry = self.finalize_cli(coordinator)
+        self.assertTrue(retry.result["idempotent"])
+        self.assertEqual(RunStage.COMPLETE.value, retry.result["stage"])
+
+    def test_pending_checkpoint_recovers_after_terminal_export_gc(self) -> None:
+        coordinator, bundle = self.build_exportable_run(
+            "pending-checkpoint-collected-export",
+            persist_descriptor=True,
+        )
+        transaction = self.transaction(coordinator, bundle)
+        self.publish(transaction)
+        claim = coordinator.claim_publication(
+            transaction.attempt_ref,
+            transaction.status()["plan_digest"],
+        )
+        pending = coordinator.mark_finalized(
+            "committed",
+            attempt_ref=transaction.attempt_ref,
+            claim_revision=claim["checkpoint_revision"],
+            defer_cleanup=True,
+            plan_digest=transaction.status()["plan_digest"],
+        )
+        self.assertEqual(
+            "published_cleanup_pending",
+            pending["publication"]["phase"],
+        )
+        release_committed_staged_export(bundle, transaction.attempt_ref)
+        reaped = garbage_collect_expired_exports(
+            self.root / ".codex-local" / "exports",
+            now=dt.datetime(2100, 1, 1, tzinfo=dt.UTC),
+        )
+        self.assertIn(str(bundle.resolve()), reaped["deleted"])
+
+        finalized = self.finalize_cli(coordinator)
+
+        self.assertEqual(RunStage.COMPLETE.value, finalized.result["stage"])
+        self.assertEqual(
+            "complete",
+            coordinator.load_state()["publication"]["phase"],
+        )
 
     def test_recovery_repairs_outer_committed_after_exact_provider_cas_crash(
         self,

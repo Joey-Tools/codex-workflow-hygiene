@@ -61,7 +61,10 @@ If the adapter target CAS succeeds before the outer `PROMOTED` event, recovery
 requires this attempt's durable adapter binding and exact reachable tip before it
 repairs that event. If provider CAS succeeds before the outer `COMMITTED` event,
 recovery requires the exact provider projection and history-validation receipt
-before it repairs commit. Changed attempts or projections fail closed.
+before it repairs commit. The publication-bound export remains non-terminal
+until both that outer event and the run's authenticated publication checkpoint
+are durable; GC therefore cannot remove the bundle needed by this recovery.
+Changed attempts or projections fail closed.
 
 `abort_pending` is an explicit recoverable publication phase. Open/recovery
 dispatches its idempotent abort action before checking the now-conflicting live
@@ -98,7 +101,10 @@ authority.
 No state claims publication before the durable commit validates. If publication
 is durable but raw cleanup fails, the run remains
 `published_cleanup_pending`; rerun `finalize` to retry cleanup. The history commit
-is never rolled back.
+is never rolled back. Once that pending checkpoint is durable, `finalize` may
+terminalize the attempt-bound export sidecar. A later retry accepts a fully
+collected bundle/sidecar pair as completed GC, while one-sided local state is a
+conflict.
 
 Shadow cleanup recovery is also checkpoint-authoritative. Before deletion, the
 engine fsyncs a fixed-root cleanup claim whose authenticated descriptor binds an
