@@ -215,6 +215,12 @@ _OPAQUE_REF_RE = re.compile(
 )
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
 _URL_RE = re.compile(r"(?i)(?:[a-z][a-z0-9+.-]{0,31}://|git@)")
+_BARE_FQDN_RE = re.compile(
+    r"(?i)(?<![a-z0-9_@-])"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})"
+    r"(?::\d{1,5})?(?:/[^\s<>\"']*)?(?![a-z0-9_-])"
+)
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _LOCAL_PATH_RE = re.compile(
     r"(?:(?<![A-Za-z0-9_])/(?!/)"
@@ -658,8 +664,20 @@ def _validate_safe_string(value: str, *, path: str) -> None:
         raise RetainedPrivacyError(f"{path} exceeds the retained scalar length limit")
     if "\n" in value or "\r" in value or "\t" in value:
         raise RetainedPrivacyError(f"{path} contains multiline or tab-delimited text")
+    bare_fqdn = _BARE_FQDN_RE.search(value)
+    if (
+        bare_fqdn is not None
+        and ".artifact_inventory[" in path
+        and value in RETAINED_ARTIFACT_NAMES
+    ):
+        bare_fqdn = None
     if any(
-        (_URL_RE.search(value), _EMAIL_RE.search(value), _LOCAL_PATH_RE.search(value))
+        (
+            _URL_RE.search(value),
+            bare_fqdn,
+            _EMAIL_RE.search(value),
+            _LOCAL_PATH_RE.search(value),
+        )
     ):
         raise RetainedPrivacyError(
             f"{path} contains a URL, email address, or local path"
@@ -682,7 +700,12 @@ def _validate_reviewed_prose(value: Any, *, path: str) -> None:
     if any(character in value for character in "\r\n\t"):
         raise RetainedPrivacyError(f"{path} contains multiline reviewed text")
     if any(
-        (_URL_RE.search(value), _EMAIL_RE.search(value), _LOCAL_PATH_RE.search(value))
+        (
+            _URL_RE.search(value),
+            _BARE_FQDN_RE.search(value),
+            _EMAIL_RE.search(value),
+            _LOCAL_PATH_RE.search(value),
+        )
     ):
         raise RetainedPrivacyError(
             f"{path} contains a URL, email address, or local path"
@@ -3587,9 +3610,13 @@ def _validate_report_bytes(
         text = data.decode("ascii")
     except UnicodeDecodeError as exc:
         raise RetainedPrivacyError("report.md must be deterministic ASCII") from exc
+    locator_scan_text = text.replace("`AGENTS.md`", "")
+    for metric_id in trend["metrics"]:
+        locator_scan_text = locator_scan_text.replace(f"`{metric_id}`", "")
     if any(
         (
             _URL_RE.search(text),
+            _BARE_FQDN_RE.search(locator_scan_text),
             _EMAIL_RE.search(text),
             _LOCAL_PATH_RE.search(text),
             _SECRET_RE.search(text),

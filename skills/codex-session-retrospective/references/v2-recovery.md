@@ -159,14 +159,18 @@ delete its retained export. The public `export` command never performs this
 maintenance against the caller's output parent, including when run validation
 fails.
 
-History verification disables system and global Git configuration, pins the
-resolved OpenPGP verifier, and validates every reachable commit that changes
-`runs/**`. Each such commit must be a canonical signed publication that adds
-exactly one eight-artifact bundle; modification or deletion of retained history
-fails closed. An unrelated successor commit may advance the branch after the
-publication target CAS. Recovery accepts that state only while the exact
-publication commit remains reachable, then derives the provider cache from the
-validated current history tip.
+History verification and publication disable system and global Git
+configuration, credential helpers, interactive prompts, lazy fetching, pagers,
+and optional locks. Before object reads, both paths reject shallow repositories
+and every repository-local partial-clone or promisor declaration; missing local
+objects therefore fail instead of triggering network or credential access. They
+pin the resolved OpenPGP verifier and validate every reachable commit that
+changes `runs/**`. Each such commit must be a canonical signed publication that
+adds exactly one eight-artifact bundle; modification or deletion of retained
+history fails closed. An unrelated successor commit may advance the branch
+after the publication target CAS. Recovery accepts that state only while the
+exact publication commit remains reachable, then derives the provider cache
+from the validated current history tip.
 
 ## Retention Expiry
 

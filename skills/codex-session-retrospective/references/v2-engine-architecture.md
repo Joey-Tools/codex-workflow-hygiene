@@ -33,10 +33,14 @@ Publication uses an explicit side-effect boundary:
 | `publication_state.py` | Durable publication state and transition validation |
 | `publication_contracts.py` | Side-effect protocols and injected adapter contracts |
 | `publication_support.py` | Immutable contracts, anchored I/O, and pure validation |
+| `git_safety.py` | Shared local-only Git environment and repository completeness policy |
 
 `retained_inputs.py` owns authenticated export-input sidecars, while
 `source_overlap.py` owns strict streaming JSON token decoding, deterministic
-control-field classification, prose normalization, and bounded overlap windows.
+control-field classification, prose normalization, bounded overlap windows, and
+short source-token matching. `privacy_locators.py` owns working-zone bare-host
+patterns, while retained reporting keeps its independently loadable final
+locator validator.
 Keeping these deterministic policies outside the coordinator capabilities
 prevents lifecycle and result-validation modules from growing a second copy of
 either state machine.

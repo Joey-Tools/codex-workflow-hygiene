@@ -544,3 +544,12 @@ def json_string_value_batches(
         batch_chars += len(candidate)
     if batch:
         yield tuple(batch)
+
+
+def contains_short_token(candidates: Iterable[str], text: str) -> bool:
+    """Return whether a short source value occurs at Unicode token boundaries."""
+
+    return any(
+        re.search(rf"(?<!\w){re.escape(candidate)}(?!\w)", text) is not None
+        for candidate in filter(lambda value: 4 <= len(value) < 12, candidates)
+    )

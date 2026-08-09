@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import stat
 from typing import Any
-from . import safe_io
+from . import git_safety, safe_io
 
 from .publication_support import (
     ARTIFACT_NAMES_BYTEWISE,
@@ -189,6 +189,14 @@ class LocalGitStorageOperations:
             common_dir / "info" / "grafts": "Git grafts",
         }
         self._reject_forbidden_git_metadata()
+        try:
+            git_safety.validate_complete_local_repository_commands(
+                lambda args: self._git(args, check=False)
+            )
+        except ValueError as error:
+            raise LocalGitPublicationError(
+                "Git repository must be complete and non-promisor"
+            ) from error
         self._git_dir = git_dir
 
     def _git_path(self, option: str, *values: str) -> Path:

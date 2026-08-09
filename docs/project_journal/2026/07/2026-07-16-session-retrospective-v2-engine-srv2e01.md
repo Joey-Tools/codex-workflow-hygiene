@@ -232,6 +232,15 @@ superseded_by:
   host reference, and all four required source kinds. Result privacy preserves a
   reference-shaped value against source-overlap redaction only when the parent has
   independently supplied that exact value in the job allow-list.
+- Short source values from 4 through 11 normalized characters use token-boundary
+  matching, so embedded identifiers such as `Acme` are removed without treating a
+  longer token such as `Acmeology` as the same source value.
+- Working-zone redaction and retained validation cover generic bare FQDNs in
+  addition to protocol URLs, private hosts, and paths. Fixed report taxonomy and
+  artifact names remain closed renderer/schema values rather than prose exceptions.
+- Durable-history and publication Git commands share one local-only environment,
+  reject shallow/promisor/partial-clone repositories before object reads, disable
+  lazy fetch and credential helpers, and preserve caller-specific error contracts.
 
 ## Next Steps
 
@@ -637,3 +646,20 @@ superseded_by:
   publication transactions. It supersedes every partial or pre-fix result for
   this tree. Exact-secret admission, hosted CI, and final-head review evidence
   remain to be regenerated after the signed append-only commit.
+- The next fresh whole-range named-single retry on signed head `345e7c3` returned
+  three actionable findings: short source-token overlap, generic bare-FQDN
+  retention, and local Git object reads that had not explicitly disabled lazy
+  fetch and credential helpers or rejected promisor repositories. The retry
+  workspace was postvalidated clean and removed; no partial output from the
+  earlier metadata-failed launch was counted.
+- The finding fixes pass the complete result/export/module-boundary group at
+  126/126 in 4.667 seconds. Before deterministic helper extraction, the complete
+  host disposable-GPG publication module passed 51/51 in 540.681 seconds; after
+  extraction, the two exact Git-safety regressions passed 2/2 in 18.651 seconds.
+- The final Python 3.13 host discovery passes all 1,581 tests in 769.407 seconds
+  on the same privacy and Git-safety implementation, including the real
+  disposable-GPG publication transactions. It supersedes the affected and
+  pre-extraction results as the complete implementation-tree gate. The final
+  project-journal validator, scoped Ruff lint/format checks, isolated OpenAI
+  skill validator, and `git diff --check` all pass; only this evidence-only
+  journal update follows the complete implementation-tree gate.

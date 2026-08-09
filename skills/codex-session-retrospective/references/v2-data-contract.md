@@ -192,7 +192,12 @@ keeps the active window in a bounded deque rather than repeatedly copying a
 growing string. The
 result-side projection contains only the extractor's schema-authorized
 `turns[].generalized_working_text`, both before and after deterministic
-post-redaction. Typed references and hashes are exempt from source-literal
+post-redaction. Source values from 4 through 11 normalized characters use
+Unicode token-boundary matching, so a value such as `Acme` is removed from
+derived prose without treating `Acmeology` as the same source token. Bare FQDNs
+are redacted regardless of suffix; protocol URLs, private locators, paths, and
+bare hosts retain distinct deterministic precedence. Typed references and hashes
+are exempt from source-literal
 replacement only in result-side schema fields that are independently format- and
 allow-list validated; the same bytes in retained prose are rejected. Fixed enum,
 status, outcome, and object-key strings are not treated as retained source-derived
@@ -312,7 +317,8 @@ the validated `problem_statement`, `cause`, `rewritten_prompt`,
 reviewed text fields are the only retained prose exception and remain subject to
 ASCII, length, locator, and credential scans. The bundle never contains raw or
 quoted original prompts, excerpts, tool output, source paths, raw IDs, internal
-URLs, secrets, credentials, customer data, personal data, or proprietary code.
+URLs, bare FQDNs, secrets, credentials, customer data, personal data, or
+proprietary code.
 
 Retained prose is also content-validated, not merely field-name validated.
 Original/verbatim prompt markers, tool or command output markers, role

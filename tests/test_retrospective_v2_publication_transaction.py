@@ -27,7 +27,9 @@ from retrospective_v2 import (  # noqa: E402
     authority,
     calibration,
     finalize as finalize_module,
+    git_safety,
     orchestrator as orchestrator_module,
+    publication_git_commits,
     publication_support,
     safe_io,
 )
@@ -92,6 +94,22 @@ def run_command(
 
 
 class PublicationInvariantUnitTests(unittest.TestCase):
+    def test_local_git_completeness_policy_is_closed(self) -> None:
+        git_safety.validate_complete_local_repository(
+            b"false\n",
+            b"core.repositoryformatversion\nremote.origin.url\n",
+        )
+        for shallow, keys in (
+            (b"true\n", b"core.repositoryformatversion\n"),
+            (b"false\n", b"extensions.partialClone\n"),
+            (b"false\n", b"remote.origin.promisor\n"),
+            (b"false\n", b"remote.origin.partialCloneFilter\n"),
+            (b"false\n", b"remote.origin.promisor\x00suffix\n"),
+        ):
+            with self.subTest(shallow=shallow, keys=keys):
+                with self.assertRaises(ValueError):
+                    git_safety.validate_complete_local_repository(shallow, keys)
+
     def test_publication_temp_parent_uses_portable_fallback(self) -> None:
         with mock.patch.object(Path, "is_dir", return_value=True):
             self.assertEqual("/private/tmp", _publication_test_temp_parent())
@@ -2334,6 +2352,102 @@ class DurablePublicationTests(unittest.TestCase):
             "Git grafts are not allowed",
         ):
             self.publication_adapter()
+
+    def test_history_git_rejects_promisor_configuration_without_credentials(
+        self,
+    ) -> None:
+        marker = self.root / "credential-helper-ran"
+        helper = self.root / "credential-helper"
+        helper.write_text(
+            f"#!/bin/sh\n/usr/bin/touch {shlex.quote(str(marker))}\nexit 1\n",
+            encoding="ascii",
+        )
+        helper.chmod(0o700)
+        run_command(
+            [
+                "git",
+                "config",
+                "--local",
+                "credential.helper",
+                f"!{shlex.quote(str(helper))}",
+            ],
+            cwd=self.repo,
+        )
+        run_command(
+            ["git", "config", "--local", "remote.origin.promisor", "true"],
+            cwd=self.repo,
+        )
+        try:
+            with self.assertRaisesRegex(
+                publication_support.LocalGitPublicationError,
+                "complete and non-promisor",
+            ):
+                self.publication_adapter()
+            with self.assertRaisesRegex(
+                authority.HistoryValidationError,
+                "complete and non-promisor",
+            ):
+                authority._GitRepository(
+                    self.repo,
+                    gnupg_home=self.gnupg_home,
+                    git_binary="git",
+                    gpg_program=self.gpg,
+                )
+            self.assertFalse(marker.exists())
+        finally:
+            run_command(
+                ["git", "config", "--local", "--unset-all", "credential.helper"],
+                cwd=self.repo,
+            )
+            run_command(
+                ["git", "config", "--local", "--unset-all", "remote.origin.promisor"],
+                cwd=self.repo,
+            )
+
+    def test_history_git_commands_disable_lazy_fetch_and_credentials(self) -> None:
+        publication_calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+        authority_calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+        real_publication_run = publication_git_commits._run_bounded_subprocess
+        real_authority_run = authority._run_bounded
+
+        def record_publication(argv, **kwargs):
+            publication_calls.append((tuple(argv), dict(kwargs["environment"])))
+            return real_publication_run(argv, **kwargs)
+
+        def record_authority(argv, **kwargs):
+            authority_calls.append((tuple(argv), dict(kwargs["env"])))
+            return real_authority_run(argv, **kwargs)
+
+        with mock.patch.object(
+            publication_git_commits,
+            "_run_bounded_subprocess",
+            side_effect=record_publication,
+        ):
+            adapter = self.publication_adapter()
+            adapter._git(("rev-parse", "HEAD"))
+        with mock.patch.object(
+            authority,
+            "_run_bounded",
+            side_effect=record_authority,
+        ):
+            repository = authority._GitRepository(
+                self.repo,
+                gnupg_home=self.gnupg_home,
+                git_binary="git",
+                gpg_program=self.gpg,
+            )
+            repository.text("rev-parse", "HEAD")
+
+        for calls in (publication_calls, authority_calls):
+            self.assertTrue(calls)
+            for argv, environment in calls:
+                self.assertIn("core.askPass=/usr/bin/false", argv)
+                self.assertIn("credential.helper=", argv)
+                self.assertEqual("/usr/bin/false", environment["GIT_ASKPASS"])
+                self.assertEqual("/usr/bin/false", environment["SSH_ASKPASS"])
+                self.assertEqual("1", environment["GIT_NO_LAZY_FETCH"])
+                self.assertEqual("0", environment["GIT_OPTIONAL_LOCKS"])
+                self.assertEqual("0", environment["GIT_TERMINAL_PROMPT"])
 
     def test_privacy_reread_rejects_replacement_symlink_and_oversize_races(
         self,

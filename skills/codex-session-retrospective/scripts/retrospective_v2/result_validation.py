@@ -16,6 +16,8 @@ import json
 import re
 from typing import Any
 
+from . import privacy_locators, source_overlap
+
 
 EXTRACTOR_RESULT_SCHEMA = "extractor_result_v2"
 EPISODE_REVIEW_RESULT_SCHEMA = "episode_review_result_v2"
@@ -267,12 +269,6 @@ _INTERNAL_HOST_RE = re.compile(
     r"(?i)(?:localhost|(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
     r"192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
     r"[^/:]+\.(?:corp|home|internal|intranet|lan|local)(?::\d+)?)"
-)
-_BARE_INTERNAL_URL_RE = re.compile(
-    r"(?i)\b(?:localhost|(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
-    r"192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
-    r"(?:[a-z0-9-]+\.)+(?:corp|home|internal|intranet|lan|local))"
-    r"(?::\d{1,5})?(?:/[^\s<>\"']*)?"
 )
 _LABELED_INTERNAL_HOST_RE = re.compile(
     r"(?i)\b(?:host|hostname|node|server)\s*(?:=|:)\s*"
@@ -573,6 +569,8 @@ def _source_overlap(
     index: _SourceOverlapIndex,
 ) -> tuple[int, int] | None:
     normalized_text = _normalized_overlap_text(text)
+    if source_overlap.contains_short_token(index.candidates, normalized_text):
+        return (0, len(text))
     for normalized_candidate in index.candidates:
         if normalized_candidate == normalized_text:
             return (0, len(text))
@@ -691,8 +689,13 @@ def scan_for_leaks(
                 "internal_url" if _INTERNAL_HOST_RE.search(match.group(0)) else "url"
             )
             findings.add(LeakFinding(category, path, match.start(), match.end()))
-        for match in _BARE_INTERNAL_URL_RE.finditer(text):
+        for match in privacy_locators.BARE_PRIVATE_LOCATOR_RE.finditer(text):
             findings.add(LeakFinding("internal_url", path, match.start(), match.end()))
+        for match in privacy_locators.BARE_FQDN_RE.finditer(text):
+            category = (
+                "internal_url" if _INTERNAL_HOST_RE.search(match.group(0)) else "url"
+            )
+            findings.add(LeakFinding(category, path, match.start(), match.end()))
         for match in _LABELED_INTERNAL_HOST_RE.finditer(text):
             findings.add(LeakFinding("internal_host", path, match.start(), match.end()))
         for match in _ipv4_matches(text):
@@ -761,7 +764,7 @@ def _post_redact_text(
     for pattern in (_EMAIL_RE, _PHONE_RE, _LABELED_PERSONAL_ID_RE):
         redacted = pattern.sub("[REDACTED_PERSONAL_IDENTIFIER]", redacted)
     redacted = _URL_RE.sub("[REDACTED_URL]", redacted)
-    redacted = _BARE_INTERNAL_URL_RE.sub("[REDACTED_URL]", redacted)
+    redacted = privacy_locators.BARE_PRIVATE_LOCATOR_RE.sub("[REDACTED_URL]", redacted)
     redacted = _LABELED_INTERNAL_HOST_RE.sub("[REDACTED_INTERNAL_HOST]", redacted)
     redacted = _IPV4_CANDIDATE_RE.sub(
         lambda match: (
@@ -786,6 +789,7 @@ def _post_redact_text(
         _UNC_PATH_RE,
     ):
         redacted = pattern.sub("[REDACTED_PATH]", redacted)
+    redacted = privacy_locators.BARE_FQDN_RE.sub("[REDACTED_URL]", redacted)
     if not reference_field:
         for pattern in (_UUID_RE, _LONG_HEX_RE, _RAW_ID_LABEL_RE):
             redacted = pattern.sub("[REDACTED_RAW_ID]", redacted)

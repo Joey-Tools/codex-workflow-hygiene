@@ -1196,6 +1196,29 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
         with self.assertRaisesRegex(RetainedPrivacyError, "URL"):
             assemble_retained_artifacts(run_state(), locator_review)
 
+        bare_locator_review = review_data()
+        bare_locator_review["turn_findings"][1]["rewritten_prompt"] = (
+            "Inspect jira.cisco.example before continuing."
+        )
+        with self.assertRaisesRegex(RetainedPrivacyError, "URL"):
+            assemble_retained_artifacts(run_state(), bare_locator_review)
+
+        artifacts = assemble_retained_artifacts(run_state(), review_data())
+        tampered = dict(artifacts)
+        rows = [
+            json.loads(line) for line in tampered["turn_findings.jsonl"].splitlines()
+        ]
+        high_impact = next(row for row in rows if row["disposition"] == "high_impact")
+        high_impact["rewritten_prompt"] = (
+            "Inspect jira.cisco.example before continuing."
+        )
+        tampered["turn_findings.jsonl"] = b"".join(
+            canonical_json_bytes(row) for row in rows
+        )
+        refresh_bundle_digest(tampered)
+        with self.assertRaisesRegex(RetainedPrivacyError, "URL"):
+            validate_retained_artifacts(tampered)
+
         path_review = review_data()
         path_review["turn_findings"][1]["rewritten_prompt"] = (
             "Inspect /root/acme/customer.txt before continuing."

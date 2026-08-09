@@ -25,6 +25,7 @@ from . import (
     calibration,
     controlled_gaps,
     episode_review,
+    git_safety,
     history_graph,
     reporting,
     safe_io,
@@ -794,24 +795,20 @@ class _GitRepository:
         self.git = _resolve_executable(git_binary)
         self.gpg = _resolve_executable(gpg_program)
         self.gnupg_home = gnupg_home.expanduser().absolute()
-        self.env = {
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_SYSTEM": os.devnull,
-            "GIT_GRAFT_FILE": os.devnull,
-            "GIT_LITERAL_PATHSPECS": "1",
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-            "HOME": str(Path.home()),
-            "LANG": "C",
-            "LC_ALL": "C",
-            "PATH": os.defpath,
-            "TZ": "UTC",
-            "GNUPGHOME": str(self.gnupg_home),
-        }
+        self.env = git_safety.history_git_environment(
+            home=str(Path.home()), gnupg_home=str(self.gnupg_home)
+        )
         probe = self.run("rev-parse", "--is-inside-work-tree", check=False)
         if probe.returncode != 0 or probe.stdout.strip() != b"true":
             raise HistoryValidationError("history repository is not a Git work tree")
+        try:
+            git_safety.validate_complete_local_repository_commands(
+                lambda args: self.run(*args, check=False)
+            )
+        except ValueError as error:
+            raise HistoryValidationError(
+                "history repository must be complete and non-promisor"
+            ) from error
 
     def run(
         self,
@@ -825,6 +822,10 @@ class _GitRepository:
                 self.git,
                 "-c",
                 "core.hooksPath=/dev/null",
+                "-c",
+                "core.askPass=/usr/bin/false",
+                "-c",
+                "credential.helper=",
                 "-c",
                 "gpg.format=openpgp",
                 "-c",

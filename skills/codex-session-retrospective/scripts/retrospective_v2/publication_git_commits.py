@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 from typing import Any
-from . import authority
+from . import authority, git_safety
 from .checkpoints import canonical_json_bytes
 from .identity import IdentityKey
 
@@ -439,7 +439,16 @@ class LocalGitCommitOperations:
         command = [self._git_binary, "-C", str(self._repo)]
         if hasattr(self, "_git_dir"):
             command.extend((f"--git-dir={self._git_dir}", f"--work-tree={self._repo}"))
-        command.extend(("-c", "core.hooksPath=/dev/null"))
+        command.extend(
+            (
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.askPass=/usr/bin/false",
+                "-c",
+                "credential.helper=",
+            )
+        )
         if signing:
             command.extend(("-c", f"gpg.format={self._signing_format}"))
             if self._signing_key is not None:
@@ -449,17 +458,7 @@ class LocalGitCommitOperations:
         environment = _strict_subprocess_environment(
             home=self._gnupg_home or self._repo
         )
-        environment.update(
-            {
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_SYSTEM": os.devnull,
-                "GIT_GRAFT_FILE": os.devnull,
-                "GIT_LITERAL_PATHSPECS": "1",
-                "GIT_NO_REPLACE_OBJECTS": "1",
-                "GIT_TERMINAL_PROMPT": "0",
-            }
-        )
+        environment.update(git_safety.local_only_git_environment())
         if signing and self._gnupg_home is not None:
             environment["GNUPGHOME"] = str(self._gnupg_home)
         if extra_env:

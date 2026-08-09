@@ -497,6 +497,31 @@ class ResultValidationTests(unittest.TestCase):
             (), scan_for_leaks({"safe": "user"}, original_prompts=candidates)
         )
         self.assertTrue(scan_for_leaks({"unsafe": "Acme"}, original_prompts=candidates))
+        self.assertTrue(
+            scan_for_leaks(
+                {"unsafe": "Acme rollout failed"},
+                original_prompts=candidates,
+            )
+        )
+        self.assertEqual(
+            (),
+            scan_for_leaks(
+                {"safe": "Acmeology rollout failed"},
+                original_prompts=candidates,
+            ),
+        )
+
+        embedded = extractor_result()
+        embedded["turns"][0]["generalized_working_text"] = "Acme rollout failed"
+        validated = validate_extractor_result(
+            embedded,
+            ALL_REFS,
+            original_prompts=candidates,
+        )
+        self.assertEqual(
+            "[REDACTED_ORIGINAL_PROMPT] rollout failed",
+            validated["turns"][0]["generalized_working_text"],
+        )
 
         nested_control_batches = list(
             source_overlap_module.json_string_value_batches(
@@ -898,6 +923,20 @@ class ResultValidationTests(unittest.TestCase):
 
         text = result["turns"][0]["generalized_working_text"]
         self.assertEqual(text, "[REDACTED_SECRET] at [REDACTED_URL]")
+        self.assertEqual(scan_for_leaks(result), ())
+
+        value = extractor_result()
+        value["turns"][0]["generalized_working_text"] = (
+            "The failure involved jira.cisco.example before retry."
+        )
+
+        result = validate_extractor_result(value, ALL_REFS)
+
+        text = result["turns"][0]["generalized_working_text"]
+        self.assertEqual(
+            text,
+            "The failure involved [REDACTED_URL] before retry.",
+        )
         self.assertEqual(scan_for_leaks(result), ())
 
     def test_raw_and_excerpt_fields_are_rejected_recursively(self) -> None:
