@@ -204,6 +204,16 @@ superseded_by:
   frame pages. An abandoned records iterator closes its replay immediately even
   while the outer segment iterator remains live; complete pages keep one replay
   open only for the next contiguous records request.
+- Source acceptance now places bounded raw payload indexes and complete transport
+  segments in owner-only content-addressed sidecars. The checkpoint retains only
+  authenticated descriptors and compact terminal summaries; same-schema legacy
+  full manifests and inline continuation payloads are conflict-checked and migrated
+  on the next acceptance. Rollback proves identity, exact bytes, single-link state,
+  and owner-only access policy before deleting a newly staged file.
+- Session state binds every canonical host key, derived host reference, source-cell
+  host reference, and all four required source kinds. Result privacy preserves a
+  reference-shaped value against source-overlap redaction only when the parent has
+  independently supplied that exact value in the job allow-list.
 
 ## Next Steps
 
@@ -532,3 +542,22 @@ superseded_by:
   seconds on the same post-audit implementation. It includes the real signing
   and publication fixtures and supersedes the interrupted pre-fix publication
   run; no test result was inferred or carried across candidate trees.
+- The next two independent audits found legacy full-manifest and inline-payload
+  migration gaps, staged-source rollback races, incomplete host/reference
+  binding, claim retry exhaustion ambiguity, and an overlap exemption that
+  trusted reference-shaped values without an exact parent allow-list entry.
+  The fixes move source payloads into conflict-checked content-addressed
+  sidecars, retain exact legacy compatibility, revalidate rollback identity,
+  single-link state, access policy, and two descriptor reads, bind the complete
+  canonical host/source-cell matrix, and cap each claim at two generations.
+- On the resulting tree, the affected checkpoint, result/episode,
+  source-transport, orchestrator, and module-boundary group passed 226/226 tests
+  in 132.349 seconds. The exact disposable-GPG shadow-authority regression
+  passed 1/1 in 16.439 seconds. Scoped Ruff lint and format checks, import
+  checks, project-journal validation, and `git diff --check` passed. The first
+  full-discovery invocation omitted `-s tests`, collected zero tests, and is
+  explicitly non-counting.
+- The final host Python 3.13 discovery passed all 1,566 tests in 806.139 seconds
+  on that same implementation, including the real GPG publication, checkpoint,
+  transport, privacy, orchestration, reporting, and legacy-compatibility paths.
+  It supersedes the zero-test invocation and all pre-audit discovery evidence.

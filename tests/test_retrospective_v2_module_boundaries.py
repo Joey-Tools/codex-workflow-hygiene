@@ -239,7 +239,12 @@ ORCHESTRATOR_FOUNDATION_MODULES = {
     "orchestrator_transport.py",
 }
 
-ORCHESTRATOR_SOURCE_SUPPORT_MODULES = {"orchestrator_source_segments.py"}
+ORCHESTRATOR_SOURCE_SUPPORT_MODULES = {
+    "agent_claim_artifacts.py",
+    "orchestrator_source_segments.py",
+    "source_inputs.py",
+    "source_payloads.py",
+}
 
 ORCHESTRATOR_MODULES = (
     ORCHESTRATOR_OPERATION_MODULES
@@ -283,12 +288,15 @@ BOUNDED_MODULE_LINES = {
     "orchestrator_context.py": 180,
     "orchestrator_history.py": 1_000,
     "orchestrator_jobs.py": 500,
-    "orchestrator_lifecycle.py": 3_300,
+    "orchestrator_lifecycle.py": 3_325,
     "orchestrator_projection.py": 1_000,
     "orchestrator_reduction.py": 2_400,
     "orchestrator_scheduler.py": 1_000,
     "orchestrator_source.py": 2_100,
     "orchestrator_source_segments.py": 150,
+    "agent_claim_artifacts.py": 100,
+    "source_inputs.py": 500,
+    "source_payloads.py": 100,
     "orchestrator_core.py": 250,
     "orchestrator_protocols.py": 450,
     "orchestrator_support.py": 600,
@@ -303,7 +311,7 @@ BOUNDED_MODULE_LINES = {
     "publication_support.py": 1_300,
     "publication_transaction.py": 2_100,
     "reporting.py": 4_500,
-    "result_validation.py": 3_200,
+    "result_validation.py": 3_250,
     "transport.py": 250,
     "transport_auth.py": 200,
     "transport_capture.py": 1_000,
@@ -938,7 +946,7 @@ spec.loader.exec_module(module)
                     *ORCHESTRATOR_SOURCE_SUPPORT_MODULES,
                 }
             ),
-            2_250,
+            2_850,
         )
         self.assertLessEqual(
             len((SCRIPTS / "session_retrospective_v2.py").read_text().splitlines()),
@@ -1008,7 +1016,7 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertLessEqual(branch_total, 7_600)
+        self.assertLessEqual(branch_total, 7_800)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)
 

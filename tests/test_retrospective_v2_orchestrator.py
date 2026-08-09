@@ -34,6 +34,7 @@ from retrospective_v2 import (  # noqa: E402
     result_validation,
     safe_io,
     sharding,
+    source_inputs,
     transport,
 )
 from retrospective_v2.checkpoints import (  # noqa: E402
@@ -81,6 +82,7 @@ from retrospective_v2.orchestrator import (  # noqa: E402
 )
 from retrospective_v2.orchestrator_core import (  # noqa: E402
     LEGACY_SHADOW_CLEANUP_ROOTS,
+    REQUIRED_SOURCE_KINDS,
 )
 
 
@@ -1392,7 +1394,7 @@ class OrchestratorTests(unittest.TestCase):
                 publisher_readiness(gnupg_home=gnupg, gpg_program="fake-gpg")["ready"]
             )
 
-        with self.assertRaisesRegex(InvalidInputError, "every host"):
+        with self.assertRaisesRegex(InvalidInputError, "every canonical host"):
             self.coordinator("weekly-subset").start(
                 mode=RunMode.WEEKLY,
                 start=WINDOW_START,
@@ -1400,6 +1402,93 @@ class OrchestratorTests(unittest.TestCase):
                 hosts=("local",),
                 **self.start_authority(),
             )
+        session_selector = "session-host-policy"
+        session_target = str(
+            self.identity.derive_ref(
+                RefType.SESSION,
+                {"session_id": session_selector},
+            )
+        )
+        for name, hosts, message in (
+            ("session-subset", ("local",), "every canonical host"),
+            (
+                "session-unknown",
+                (*DEFAULT_HOSTS, "unknown-host"),
+                "only canonical hosts",
+            ),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(InvalidInputError, message):
+                    self.coordinator(name).start(
+                        mode=RunMode.SESSION,
+                        start=WINDOW_START,
+                        end=WINDOW_END,
+                        hosts=hosts,
+                        session_target=session_target,
+                        session_target_selector=session_selector,
+                        **self.start_authority(),
+                    )
+        session = self.coordinator("session-checkpoint-host-matrix")
+        session.start(
+            mode=RunMode.SESSION,
+            start=WINDOW_START,
+            end=WINDOW_END,
+            hosts=DEFAULT_HOSTS,
+            session_target=session_target,
+            session_target_selector=session_selector,
+            **self.start_authority(),
+        )
+
+        def swap_host_bindings(current):
+            left, right = DEFAULT_HOSTS[:2]
+            left_ref, right_ref = (
+                current["host_refs"][left],
+                current["host_refs"][right],
+            )
+            current["host_refs"][left], current["host_refs"][right] = (
+                right_ref,
+                left_ref,
+            )
+            for cell in current["source"]["cells"][left].values():
+                cell["host_ref"] = right_ref
+            for cell in current["source"]["cells"][right].values():
+                cell["host_ref"] = left_ref
+
+        for label, mutate in (
+            (
+                "host",
+                lambda current: current["host_refs"].pop(DEFAULT_HOSTS[-1]),
+            ),
+            (
+                "source-kind",
+                lambda current: current["source"]["cells"][DEFAULT_HOSTS[0]].pop(
+                    REQUIRED_SOURCE_KINDS[-1]
+                ),
+            ),
+            ("host-ref-binding", swap_host_bindings),
+        ):
+            with self.subTest(checkpoint_matrix=label):
+                checkpoint = self.coordinator(f"session-checkpoint-{label}")
+                checkpoint.start(
+                    mode=RunMode.SESSION,
+                    start=WINDOW_START,
+                    end=WINDOW_END,
+                    hosts=DEFAULT_HOSTS,
+                    session_target=session_target,
+                    session_target_selector=session_selector,
+                    **self.start_authority(),
+                )
+
+                def tamper(current):
+                    mutate(current)
+                    return current, None
+
+                checkpoint.store.transaction(tamper)
+                with self.assertRaisesRegex(
+                    InvalidTransitionError,
+                    "canonical source matrix",
+                ):
+                    checkpoint.status()
         with self.assertRaisesRegex(InvalidInputError, "complete canonical host set"):
             self.coordinator("daily-subset").start(
                 mode=RunMode.DAILY,
@@ -1526,10 +1615,16 @@ class OrchestratorTests(unittest.TestCase):
         coordinator.advance()
         state = coordinator.load_state()
         self.assertNotEqual("source_model_v1", coordinator._model_era(state))
+        active_cell = state["source"]["cells"]["local"][SourceKind.ACTIVE_ROLLOUT.value]
+        materialized_source = source_inputs.materialize_segments(
+            coordinator.run_dir,
+            active_cell["continuation_segments"],
+        )
         self.assertEqual(
             {"source_model_v1"},
-            set(state["source"]["model_era_by_unit"].values()),
+            set(materialized_source["model_era_by_unit"].values()),
         )
+        self.assertEqual({}, state["source"]["model_era_by_unit"])
         self.assertEqual(
             {"source_model_v1"},
             {row["model_era"] for row in state["source"]["reassembly"].values()},
@@ -1543,6 +1638,90 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(
             coordinator.MIXED_MODEL_ERA,
             coordinator._retained_model_era_for_turns(state, turn_refs),
+        )
+
+    def test_source_acceptance_keeps_large_evidence_out_of_checkpoint(self) -> None:
+        coordinator = self.start_daily("source-sidecar-checkpoint-bound")
+        coordinator.advance()
+        lease = next(
+            item
+            for item in coordinator.status()["active_source_leases"]
+            if item["host"] == "local"
+        )
+        payload = (
+            b'{"timestamp":"2026-07-06T01:00:00Z","text":"' + b"x" * 750_000 + b'"}\n'
+        )
+        manifest, records, _source_ref = activity_manifest(lease, [payload])
+        receipt = authenticated_receipt(
+            coordinator,
+            lease,
+            manifest,
+            raw_records={records[0].unit_ref: payload},
+        )
+
+        coordinator.accept_source(
+            lease["lease_ref"],
+            manifest.to_dict(),
+            transport_receipt=receipt,
+            raw_records={records[0].unit_ref: payload},
+        )
+
+        state = coordinator.load_state()
+        cell = state["source"]["cells"]["local"][lease["source_kind"]]
+        self.assertLess(coordinator.store.path.stat().st_size, 1024 * 1024)
+        self.assertNotIn("records", cell["manifest"])
+        self.assertEqual({}, cell["payloads"])
+        self.assertEqual(1, len(cell["continuation_segments"]))
+        accepted = source_inputs.load(
+            coordinator.run_dir,
+            cell["continuation_segments"][0],
+        )
+        self.assertEqual(1, len(accepted["segment"]["manifest"]["records"]))
+        raw_path = (
+            coordinator.run_dir
+            / accepted["payloads"][records[0].unit_ref]["relative_path"]
+        )
+        self.assertEqual(payload, raw_path.read_bytes())
+
+    def test_source_acceptance_rolls_back_new_files_on_checkpoint_failure(
+        self,
+    ) -> None:
+        coordinator = self.start_daily("source-sidecar-rollback")
+        coordinator.advance()
+        lease = next(
+            item
+            for item in coordinator.status()["active_source_leases"]
+            if item["host"] == "local"
+        )
+        payload = b'{"timestamp":"2026-07-06T01:00:00Z","text":"work"}\n'
+        manifest, records, _source_ref = activity_manifest(lease, [payload])
+        receipt = authenticated_receipt(
+            coordinator,
+            lease,
+            manifest,
+            raw_records={records[0].unit_ref: payload},
+        )
+        before = coordinator.store.read()
+
+        with mock.patch.object(
+            coordinator.store,
+            "_replace",
+            side_effect=OSError("simulated checkpoint replace failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "replace failure"):
+                coordinator.accept_source(
+                    lease["lease_ref"],
+                    manifest.to_dict(),
+                    transport_receipt=receipt,
+                    raw_records={records[0].unit_ref: payload},
+                )
+
+        self.assertEqual(before, coordinator.store.read())
+        raw_root = coordinator.run_dir / "raw-inputs"
+        self.assertEqual([], list(raw_root.glob("*.bin")))
+        self.assertEqual(
+            [],
+            list(raw_root.glob("source-acceptances/source-acceptance-v2-*.json")),
         )
 
     def test_cursor_boundaries_cover_overlap_disjoint_and_immutable_modes(self) -> None:
@@ -1626,7 +1805,7 @@ class OrchestratorTests(unittest.TestCase):
             list(session_history.cursor_rows),
             session.publication_durable_state()["proposed_cursor_rows"],
         )
-        with self.assertRaisesRegex(InvalidInputError, "every host"):
+        with self.assertRaisesRegex(InvalidInputError, "every canonical host"):
             self.coordinator("baseline-subset").start(
                 mode=RunMode.BASELINE,
                 start=WINDOW_START,
@@ -3116,6 +3295,88 @@ class OrchestratorTests(unittest.TestCase):
                 claim_ref=takeover["claim_ref"],
                 result_ref=takeover["result_ref"],
             )
+
+    def test_agent_claim_budget_retries_once_then_records_explicit_gap(self) -> None:
+        coordinator = self.activity_run("bounded-agent-claim-generations")
+
+        def exhaust_active_attempt(label: str) -> dict[str, object]:
+            job = coordinator.status()["runnable_jobs"][0]
+            first = coordinator.claim_agent_job(
+                job["job_ref"],
+                job["active_attempt_ref"],
+                typed_ref(RefType.LEASE, f"{label}-dispatcher-1"),
+            )
+            self.clock.value += dt.timedelta(
+                seconds=orchestrator_module.DEFAULT_AGENT_CLAIM_TTL_SECONDS + 1
+            )
+            second = coordinator.claim_agent_job(
+                job["job_ref"],
+                job["active_attempt_ref"],
+                typed_ref(RefType.LEASE, f"{label}-dispatcher-2"),
+            )
+            self.assertNotEqual(first["claim_ref"], second["claim_ref"])
+            self.clock.value += dt.timedelta(
+                seconds=orchestrator_module.DEFAULT_AGENT_CLAIM_TTL_SECONDS + 1
+            )
+            exhausted = coordinator.claim_agent_job(
+                job["job_ref"],
+                job["active_attempt_ref"],
+                typed_ref(RefType.LEASE, f"{label}-dispatcher-3"),
+            )
+            replay = coordinator.claim_agent_job(
+                job["job_ref"],
+                job["active_attempt_ref"],
+                typed_ref(RefType.LEASE, f"{label}-dispatcher-replay"),
+            )
+            self.assertTrue(replay["idempotent"])
+            self.assertEqual(exhausted["outcome"], replay["outcome"])
+            return exhausted
+
+        first_exhaustion = exhaust_active_attempt("first-attempt")
+        self.assertEqual("retryable", first_exhaustion["outcome"])
+        self.assertEqual(
+            2,
+            len(list((coordinator.run_dir / "raw-inputs/agent-claims").glob("*.json"))),
+        )
+        self.assertEqual(
+            2,
+            len(list((coordinator.run_dir / "agent-sinks").glob("*.json"))),
+        )
+        coordinator.advance()
+        second_exhaustion = exhaust_active_attempt("second-attempt")
+        self.assertEqual("gap", second_exhaustion["outcome"])
+        state = coordinator.load_state()
+        self.assertEqual(2, state["metrics"]["agent_claim_budget_exhaustions"])
+        self.assertEqual(0, state["metrics"]["agent_results"])
+        self.assertEqual(0, state["metrics"]["rejected_agent_results"])
+        self.assertEqual(
+            {"agent_claim_budget_exhausted"},
+            {gap["reason"] for gap in state["gaps"]},
+        )
+
+    def test_agent_claim_oversized_sink_exhausts_without_takeover(self) -> None:
+        coordinator = self.activity_run("bounded-agent-claim-sink")
+        job = coordinator.status()["runnable_jobs"][0]
+        dispatcher = typed_ref(RefType.LEASE, "oversized-sink-dispatcher")
+        claimed = coordinator.claim_agent_job(
+            job["job_ref"],
+            job["active_attempt_ref"],
+            dispatcher,
+        )
+        Path(claimed["output_sink"]).write_bytes(
+            b"x" * (result_validation.MAX_RESULT_BYTES + 1)
+        )
+
+        exhausted = coordinator.claim_agent_job(
+            job["job_ref"],
+            job["active_attempt_ref"],
+            dispatcher,
+            claim_ref=claimed["claim_ref"],
+        )
+
+        self.assertTrue(exhausted["claim_budget_exhausted"])
+        self.assertEqual("retryable", exhausted["outcome"])
+        self.assertFalse(exhausted["takeover"])
 
     def test_rejected_agent_result_replay_revalidates_job_binding(self) -> None:
         coordinator = self.activity_run("rejected-agent-result-replay")

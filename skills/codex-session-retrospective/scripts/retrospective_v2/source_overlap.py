@@ -14,11 +14,9 @@ from dataclasses import dataclass
 
 _MAX_CLASSIFIED_KEY_CHARS = 256
 _MAX_CONTROL_VALUE_CHARS = 4_096
-_CONTROL_IDENTIFIER_KEYS = frozenset(
+_CONTROL_CLASSIFIER_KEYS = frozenset(
     {
         "approval_policy",
-        "host",
-        "id",
         "kind",
         "model",
         "outcome",
@@ -30,59 +28,16 @@ _CONTROL_IDENTIFIER_KEYS = frozenset(
         "status",
         "type",
         "version",
-        "call_id",
-        "event_id",
-        "item_id",
-        "request_id",
-        "response_id",
-        "session_id",
     }
 )
 _CONTROL_TIMESTAMP_KEYS = frozenset(
     {"completed_at", "created_at", "started_at", "timestamp", "ts", "updated_at"}
-)
-_CONTROL_REFERENCE_KEYS = frozenset(
-    {
-        "attempt_ref",
-        "configuration_ref",
-        "cursor_root_ref",
-        "episode_ref",
-        "episode_revision_ref",
-        "evidence_ref",
-        "gap_ref",
-        "goal_ref",
-        "host_ref",
-        "job_ref",
-        "result_ref",
-        "reviewer_ref",
-        "run_ref",
-        "session_ref",
-        "source_snapshot_ref",
-        "source_unit_ref",
-        "span_ref",
-        "task_ref",
-        "topic_ref",
-        "turn_ref",
-        "workstream_ref",
-    }
-)
-_CONTROL_DIGEST_KEYS = frozenset(
-    {
-        "bundle_digest",
-        "fragment_commitment",
-        "helper_commitment",
-        "record_commitment",
-        "source_snapshot_digest",
-    }
 )
 _CONTROL_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+~-]{0,511}")
 _CONTROL_TIMESTAMP_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
 )
-_CONTROL_REFERENCE_RE = re.compile(r"[a-z][a-z0-9_]*_ref_v[0-9]+:[0-9a-f]{16,128}")
-_CONTROL_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
-_CONTROL_CWD_RE = re.compile(r"/[^\x00-\x1f\x7f]{0,4095}")
 _CONTROL_ROLE_RE = re.compile(r"(?:assistant|developer|system|tool|user)")
 
 
@@ -101,18 +56,9 @@ def _matches_timestamp(value: str) -> bool:
 _CONTROL_VALUE_VALIDATORS = {
     **{
         key: functools.partial(_matches_pattern, pattern=_CONTROL_IDENTIFIER_RE)
-        for key in _CONTROL_IDENTIFIER_KEYS
+        for key in _CONTROL_CLASSIFIER_KEYS
     },
     **dict.fromkeys(_CONTROL_TIMESTAMP_KEYS, _matches_timestamp),
-    **{
-        key: functools.partial(_matches_pattern, pattern=_CONTROL_REFERENCE_RE)
-        for key in _CONTROL_REFERENCE_KEYS
-    },
-    **{
-        key: functools.partial(_matches_pattern, pattern=_CONTROL_DIGEST_RE)
-        for key in _CONTROL_DIGEST_KEYS
-    },
-    "cwd": functools.partial(_matches_pattern, pattern=_CONTROL_CWD_RE),
     "role": functools.partial(_matches_pattern, pattern=_CONTROL_ROLE_RE),
 }
 _CONTROL_VALUE_KEY_LOOKUP = {key: key for key in _CONTROL_VALUE_VALIDATORS}

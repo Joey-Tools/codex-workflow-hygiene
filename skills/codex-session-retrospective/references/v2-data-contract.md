@@ -149,7 +149,25 @@ retained raw payload, and a submitted non-target consumed record is rejected.
 - Claim identity: a bounded dispatcher lease over one attempt. Heartbeat extends
   only the matching unexpired claim; expiry permits safe takeover on the same
   attempt with a new envelope and output sink. Result acceptance binds the exact
-  active, unexpired claim.
+  active, unexpired claim. Each fresh attempt permits exactly two claim
+  generations: the initial claim and one expired-lease takeover. Further takeover
+  or an over-limit result sink records `agent_claim_budget_exhausted` and closes
+  that attempt through the ordinary retry/explicit-gap state machine without
+  counting an agent result or accumulating more claim files.
+- Accepted source records and raw-payload indexes live in canonical, owner-only,
+  content-addressed sidecars under `raw-inputs/source-acceptances`; authenticated
+  checkpoint state stores only bounded descriptors and a compact manifest summary.
+  Checkpoint capacity is proved before any file is created. New raw files, the
+  sidecar, and the exact next checkpoint revision are then staged under one
+  checkpoint lock: a proved unchanged old revision rolls back only identity- and
+  content-matching files, an exact committed new revision retains them, and an
+  unreadable or inconsistent disposition fails closed with explicit retained-file
+  evidence. Rollback revalidates the held file's identity, single-link state,
+  owner-only access policy, and exact content through two bounded descriptor reads
+  before unlink. A same-schema checkpoint that still carries the legacy full
+  manifest or inline payload index remains readable; the next accepted continuation
+  validates conflicts and migrates that index into the new sidecar before clearing
+  the inline copy.
 - Raw run directory: mode `0700`; every file: mode `0600`. On Darwin, each
   owner-only directory and file must also have no extended ACL. Newly created
   objects clear inherited ACLs through their held descriptors before use;
@@ -163,9 +181,10 @@ overlap before retained state is written; raw material never leaves working
 retention. Each reassembled record is streamed through a strict UTF-8 and JSON
 token parser. The parser validates literals and numbers with a closed grammar;
 an invalid primitive cannot consume a following string. Object keys,
-non-string primitives, and values under deterministic control fields such as
-role/type/status, references, digests, commitments, and timestamps are not
-source-prose candidates. Every other decoded string value, including long
+non-string primitives, and validated low-risk classifiers such as role/type/status
+plus semantic timestamps are not source-prose candidates. Instance-bearing IDs,
+host and cwd values, typed references, digests, and commitments always remain
+source candidates. Every other decoded string value, including long
 escaped values and surrogate pairs, is case-folded, whitespace-normalized, and
 split into overlapping bounded windows; no long prose value is skipped. The
 normalizer accumulates one-character parser emissions in fixed-size chunks and
@@ -173,8 +192,11 @@ keeps the active window in a bounded deque rather than repeatedly copying a
 growing string. The
 result-side projection contains only the extractor's schema-authorized
 `turns[].generalized_working_text`, both before and after deterministic
-post-redaction. Fixed enum, status, outcome, reference, and object-key strings
-are not treated as retained source-derived prose. Window batches have independent
+post-redaction. Typed references and hashes are exempt from source-literal
+replacement only in result-side schema fields that are independently format- and
+allow-list validated; the same bytes in retained prose are rejected. Fixed enum,
+status, outcome, and object-key strings are not treated as retained source-derived
+prose. Window batches have independent
 item and aggregate-character bounds while preserving enough overlap to detect a
 query split across windows or transport fragments.
 

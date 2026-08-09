@@ -258,6 +258,96 @@ class CheckpointSecurityTests(unittest.TestCase):
         self.assertEqual(initial, current)
         self.assertEqual([], list(self.store.run_dir.glob(".atomic-write-*.tmp")))
 
+    def test_staged_transaction_preflights_capacity_before_creating_files(
+        self,
+    ) -> None:
+        store = AtomicCheckpointStore(
+            self.root / "bounded-run",
+            identity=self.identity,
+            max_bytes=1024,
+        )
+        store.initialize({"value": "before"})
+        staged = mock.Mock(return_value=())
+        rollback = mock.Mock()
+
+        with self.assertRaisesRegex(CheckpointIntegrityError, "size limit"):
+            store.staged_transaction(
+                lambda _state: ({"value": "x" * 4096}, None),
+                stage=staged,
+                rollback=rollback,
+            )
+
+        staged.assert_not_called()
+        rollback.assert_not_called()
+        self.assertEqual({"value": "before"}, store.read().state)
+
+    def test_staged_transaction_rolls_back_only_after_proven_old_revision(
+        self,
+    ) -> None:
+        initial = self.store.initialize({"value": "before"})
+        staged_path = self.store.run_dir / "raw-inputs" / "candidate.bin"
+
+        def stage() -> Path:
+            staged_path.parent.mkdir(mode=0o700)
+            staged_path.write_bytes(b"candidate")
+            os.chmod(staged_path, 0o600)
+            return staged_path
+
+        def rollback(path: Path) -> None:
+            path.unlink()
+
+        with mock.patch.object(
+            self.store,
+            "_replace",
+            side_effect=OSError("simulated staged replace failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "staged replace failure"):
+                self.store.staged_transaction(
+                    lambda _state: ({"value": "after"}, None),
+                    stage=stage,
+                    rollback=rollback,
+                )
+
+        self.assertFalse(staged_path.exists())
+        self.assertEqual(initial, self.store.read())
+
+    def test_staged_transaction_preserves_write_failure_when_recheck_fails(
+        self,
+    ) -> None:
+        initial = self.store.initialize({"value": "before"})
+        stage = mock.Mock(return_value=("staged",))
+        rollback = mock.Mock()
+        write_error = OSError("simulated staged publication failure")
+        read_error = CheckpointIntegrityError("simulated disposition failure")
+
+        with mock.patch.object(
+            self.store,
+            "_read_unlocked",
+            side_effect=(initial, read_error),
+        ):
+            with mock.patch.object(
+                self.store,
+                "_write_unlocked",
+                side_effect=write_error,
+            ):
+                with self.assertRaisesRegex(
+                    OSError,
+                    "staged publication failure",
+                ) as raised:
+                    self.store.staged_transaction(
+                        lambda _state: ({"value": "after"}, None),
+                        stage=stage,
+                        rollback=rollback,
+                    )
+
+        self.assertIs(write_error, raised.exception)
+        self.assertIs(read_error, raised.exception.__cause__)
+        self.assertTrue(
+            any("staged files retained" in note for note in raised.exception.__notes__)
+        )
+        stage.assert_called_once_with()
+        rollback.assert_not_called()
+
     def test_directory_fsync_failure_exposes_ambiguous_committed_revision(
         self,
     ) -> None:

@@ -398,7 +398,7 @@ class ResultValidationTests(unittest.TestCase):
         self.assertIn("line value", values)
         self.assertIn("😀", values)
         self.assertNotIn("complete", values)
-        self.assertNotIn("session-value", values)
+        self.assertIn("session-value", values)
         self.assertNotIn("role", values)
         self.assertFalse(any("never-retain" in value for value in values))
         self.assertTrue(any(value == "x" * 16 for value in values))
@@ -479,7 +479,7 @@ class ResultValidationTests(unittest.TestCase):
             maximum_chars // min(8_192, maximum_chars) + 1,
         )
 
-    def test_source_overlap_excludes_control_values_but_keeps_source_prose(
+    def test_source_overlap_excludes_safe_metadata_but_keeps_instance_values(
         self,
     ) -> None:
         batches = list(
@@ -553,7 +553,7 @@ class ResultValidationTests(unittest.TestCase):
             "raw prompt hidden as a request id",
             untrusted_suffix_candidates,
         )
-        self.assertNotIn("valid-session", untrusted_suffix_candidates)
+        self.assertIn("valid-session", untrusted_suffix_candidates)
         self.assertNotIn("2026-07-06t01:00:00z", untrusted_suffix_candidates)
         self.assertIn("uppercase-secret", untrusted_suffix_candidates)
         self.assertIn("unicode-secret", untrusted_suffix_candidates)
@@ -572,6 +572,70 @@ class ResultValidationTests(unittest.TestCase):
         self.assertIn(
             "2025-02-29t01:00:00z",
             untrusted_suffix_candidates,
+        )
+        self.assertTrue(
+            scan_for_leaks(
+                {"finding": "valid-session"},
+                original_prompts=untrusted_suffix_candidates,
+            )
+        )
+
+        instance_values = {
+            "id": "customer-secret-42",
+            "call_id": "call-secret-42",
+            "event_id": "event-secret-42",
+            "item_id": "item-secret-42",
+            "request_id": "request-secret-42",
+            "response_id": "response-secret-42",
+            "session_id": "session-secret-42",
+            "host": "private-host-42",
+            "cwd": "/private/workspace-42",
+            "attempt_ref": "attempt_ref_v2:" + "0" * 64,
+            "bundle_digest": "sha256:" + "a" * 64,
+        }
+        instance_batches = list(
+            source_overlap_module.json_string_value_batches(
+                (json.dumps(instance_values, separators=(",", ":")),),
+                query_chars=8,
+                maximum_batch_chars=128,
+                maximum_batch_items=8,
+            )
+        )
+        instance_candidates = [
+            candidate for batch in instance_batches for candidate in batch
+        ]
+        for value in instance_values.values():
+            with self.subTest(value=value):
+                self.assertIn(value.casefold(), instance_candidates)
+        findings = scan_for_leaks(
+            {"generalized_working_text": "customer-secret-42"},
+            original_prompts=instance_candidates,
+        )
+        self.assertIn("original_prompt", {finding.category for finding in findings})
+        attempt_ref = "attempt_ref_v2:" + "0" * 64
+        unallowed_reference_findings = scan_for_leaks(
+            {"attempt_ref": attempt_ref},
+            original_prompts=instance_candidates,
+        )
+        self.assertIn(
+            "original_prompt",
+            {finding.category for finding in unallowed_reference_findings},
+        )
+        self.assertEqual(
+            (),
+            scan_for_leaks(
+                {"attempt_ref": attempt_ref},
+                original_prompts=instance_candidates,
+                allowed_reference_values={attempt_ref},
+            ),
+        )
+        malformed_reference_findings = scan_for_leaks(
+            {"attempt_ref": "customer-secret-42"},
+            original_prompts=instance_candidates,
+        )
+        self.assertIn(
+            "original_prompt",
+            {finding.category for finding in malformed_reference_findings},
         )
 
     def test_result_complexity_is_bounded_before_privacy_processing(self) -> None:

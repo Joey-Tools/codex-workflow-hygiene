@@ -10,9 +10,12 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from . import (
+    agent_claim_artifacts,
     catalog,
     result_validation,
     safe_io,
+    source_inputs,
+    source_payloads,
     transport as source_transport,
 )
 from .checkpoints import canonical_json_bytes, content_digest
@@ -40,10 +43,10 @@ from .orchestrator_support import (
     InvalidInputError,
     InvalidTransitionError,
     MAX_AGENT_CLAIM_TTL_SECONDS,
+    MAX_AGENT_CLAIM_GENERATIONS,
     MIN_AGENT_CLAIM_TTL_SECONDS,
     RAW_INPUT_DIRECTORY,
     RunConflictError,
-    SOURCE_TRANSPORT_MAX_RECORDS,
     SourcePreparation,
     _SHA256_RE,
     _format_timestamp,
@@ -557,124 +560,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
         self,
         segments: Sequence[Mapping[str, Any]],
     ) -> tuple[catalog.SourceTransportManifest, str, str]:
-        if not segments:
-            raise InvalidTransitionError("source segment chain is empty")
-        manifests: list[catalog.SourceTransportManifest] = []
-        snapshot_refs: list[str] = []
-        receipt_refs: list[str] = []
-        for index, segment in enumerate(segments):
-            try:
-                manifest = catalog.SourceTransportManifest.from_dict(
-                    segment["manifest"]
-                )
-                snapshot = source_transport.AuthoritativeSourceSnapshot.from_dict(
-                    segment["source_snapshot"]
-                )
-            except (
-                KeyError,
-                TypeError,
-                ValueError,
-                catalog.CatalogValidationError,
-                source_transport.TransportValidationError,
-            ) as error:
-                raise InvalidTransitionError(
-                    "persisted source continuation segment is invalid"
-                ) from error
-            if snapshot.snapshot_ref != segment.get("snapshot_ref") or not isinstance(
-                segment.get("receipt_ref"), str
-            ):
-                raise InvalidTransitionError(
-                    "persisted source continuation binding is invalid"
-                )
-            if index < len(segments) - 1:
-                if (
-                    manifest.status is not SourceCellStatus.GAP
-                    or snapshot.resume_position is None
-                ):
-                    raise InvalidTransitionError(
-                        "non-final source segment lacks continuation authority"
-                    )
-            elif snapshot.resume_position is not None:
-                raise InvalidTransitionError("final source segment is still incomplete")
-            manifests.append(manifest)
-            snapshot_refs.append(snapshot.snapshot_ref)
-            receipt_refs.append(str(segment["receipt_ref"]))
-
-        first = manifests[0]
-        final = manifests[-1]
-        if any(
-            manifest.host_ref != first.host_ref
-            or manifest.source_kind is not first.source_kind
-            or manifest.window_start != first.window_start
-            or manifest.window_end != first.window_end
-            or manifest.transport_kind is not first.transport_kind
-            for manifest in manifests
-        ):
-            raise InvalidTransitionError("source continuation segment scope changed")
-        records_by_ref: dict[str, catalog.CatalogRecord] = {}
-        for manifest in manifests:
-            for record in manifest.records:
-                existing = records_by_ref.get(record.unit_ref)
-                if existing is not None and existing != record:
-                    raise InvalidTransitionError("source continuation records conflict")
-                records_by_ref[record.unit_ref] = record
-        records = sorted(
-            records_by_ref.values(),
-            key=catalog.catalog_record_sort_key,
-        )
-        status = final.status
-        if status is SourceCellStatus.NO_ACTIVITY and records:
-            status = SourceCellStatus.COMPLETE
-        if status is SourceCellStatus.VERIFIED_ABSENT and records:
-            raise InvalidTransitionError(
-                "source continuation cannot end absent after discovering records"
-            )
-        aggregate = catalog.SourceTransportManifest.create(
-            host_ref=first.host_ref,
-            transport_kind=first.transport_kind,
-            source_kind=first.source_kind,
-            window_start=first.window_start,
-            window_end=first.window_end,
-            status=status,
-            records=records,
-            snapshot_commitment=(
-                catalog.snapshot_commitment_for_records(records)
-                if status in {SourceCellStatus.COMPLETE, SourceCellStatus.NO_ACTIVITY}
-                else None
-            ),
-            absence_proof=(
-                final.absence_proof
-                if status is SourceCellStatus.VERIFIED_ABSENT
-                else None
-            ),
-            enumeration_gap=(
-                final.enumeration_gap if status is SourceCellStatus.GAP else None
-            ),
-            remote=final.remote,
-        )
-        if len(segments) == 1:
-            return aggregate, snapshot_refs[0], receipt_refs[0]
-        aggregate_snapshot_ref = (
-            source_transport.SOURCE_SNAPSHOT_REF_PREFIX
-            + self.identity.derive_digest(
-                "source-transport-aggregate-snapshot/v2",
-                {
-                    "manifest": aggregate.to_dict(),
-                    "segment_snapshot_refs": snapshot_refs,
-                },
-            )
-        )
-        aggregate_receipt_ref = (
-            source_transport.TRANSPORT_RECEIPT_REF_PREFIX
-            + self.identity.derive_digest(
-                "source-transport-aggregate-receipt/v2",
-                {
-                    "aggregate_snapshot_ref": aggregate_snapshot_ref,
-                    "segment_receipt_refs": receipt_refs,
-                },
-            )
-        )
-        return aggregate, aggregate_snapshot_ref, aggregate_receipt_ref
+        return source_inputs.aggregate_segments(self.identity, self.run_dir, segments)
 
     def accept_source(
         self,
@@ -886,6 +772,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
             raise InvalidInputError("raw_records contains an undeclared source unit")
 
         staged: dict[str, dict[str, Any]] = {}
+        prepared_raw_files: list[source_inputs.PreparedFile] = []
         for unit_ref, record in consumed.items():
             self._projection._validate_external_ref(unit_ref, "source_unit")
             payload = raw_values.get(unit_ref)
@@ -904,7 +791,13 @@ class SourceCoordinationOperations(OrchestratorComponent):
                     "status": "gap",
                 }
                 continue
-            relative_path = self._stage_raw_payload(unit_ref, payload)
+            relative_path, prepared_file = source_inputs.prepare_raw_payload(
+                self.identity,
+                self.run_dir,
+                unit_ref,
+                payload,
+            )
+            prepared_raw_files.append(prepared_file)
             staged[unit_ref] = {
                 "byte_count": len(payload),
                 "content_commitment": record.content_commitment,
@@ -944,6 +837,44 @@ class SourceCoordinationOperations(OrchestratorComponent):
             accepted_requests,
         )
         action_key = f"accept_source:{normalized_lease}"
+        segment = {
+            "lease_ref": normalized_lease,
+            "manifest": manifest_value,
+            "metrics": {
+                "byte_count": transport.total_bytes,
+                "record_count": transport.total_records,
+                "scan_byte_count": source_snapshot.terminal_byte_offset,
+            },
+            "receipt": receipt.to_dict(),
+            "receipt_ref": receipt.receipt_ref,
+            "snapshot_ref": source_snapshot.snapshot_ref,
+            "source_snapshot": source_snapshot.to_dict(),
+        }
+        segment_unit_eras = {
+            unit_ref: model_era
+            for unit_ref, (_session_ref, model_era) in model_era_evidence.items()
+        }
+        segment_session_eras: dict[str, list[str]] = {}
+        for session_ref, model_era in model_era_evidence.values():
+            segment_session_eras[session_ref] = sorted(
+                {*segment_session_eras.get(session_ref, []), model_era}
+            )
+        initial_cell = state["source"]["cells"][source_job["host"]][
+            source_job["source_kind"]
+        ]
+        initial_legacy_payloads = source_payloads.merge_payload_indexes(
+            initial_cell.get("payloads", {})
+        )
+        acceptance_payloads = source_payloads.merge_payload_indexes(
+            initial_legacy_payloads, staged
+        )
+        prepared_acceptance = source_inputs.prepare_acceptance(
+            self.run_dir,
+            segment=segment,
+            payloads=acceptance_payloads,
+            model_era_by_unit=segment_unit_eras,
+            model_eras_by_session=segment_session_eras,
+        )
 
         def mutate(current: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             self._state._assert_state_identity(current)
@@ -988,48 +919,26 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 raise RunConflictError(
                     "source continuation lease does not match durable progress"
                 )
-            existing_segments = list(cell.get("continuation_segments", []))
-            if len(existing_segments) >= SOURCE_TRANSPORT_MAX_RECORDS:
-                raise InvalidTransitionError("source continuation chain exceeds bounds")
-            prior_payloads = dict(cell.get("payloads", {}))
-            for unit_ref, payload_state in staged.items():
-                existing_payload = prior_payloads.get(unit_ref)
-                if existing_payload is not None and existing_payload != payload_state:
-                    raise RunConflictError("source continuation payload changed")
-                prior_payloads[unit_ref] = payload_state
-            unit_eras = dict(current["source"].get("model_era_by_unit", {}))
-            session_eras = {
-                session_ref: list(values)
-                for session_ref, values in current["source"]
-                .get("model_eras_by_session", {})
-                .items()
-            }
-            for unit_ref, (session_ref, model_era) in model_era_evidence.items():
-                existing_era = unit_eras.get(unit_ref)
-                if existing_era is not None and existing_era != model_era:
-                    raise RunConflictError("source model era evidence changed")
-                unit_eras[unit_ref] = model_era
-                session_eras[session_ref] = sorted(
-                    {*session_eras.get(session_ref, []), model_era}
-                )
-            current["source"]["model_era_by_unit"] = dict(sorted(unit_eras.items()))
-            current["source"]["model_eras_by_session"] = dict(
-                sorted(session_eras.items())
+            current_legacy_payloads = source_payloads.merge_payload_indexes(
+                cell.get("payloads", {})
             )
-            segment = {
-                "lease_ref": normalized_lease,
-                "manifest": manifest_value,
-                "metrics": {
-                    "byte_count": transport.total_bytes,
-                    "record_count": transport.total_records,
-                    "scan_byte_count": current_snapshot.terminal_byte_offset,
-                },
-                "receipt": receipt.to_dict(),
-                "receipt_ref": receipt.receipt_ref,
-                "snapshot_ref": current_snapshot.snapshot_ref,
-                "source_snapshot": current_snapshot.to_dict(),
-            }
-            segments = [*existing_segments, segment]
+            if current_legacy_payloads != initial_legacy_payloads:
+                raise RunConflictError("legacy source payload index changed")
+            existing_segments = list(cell.get("continuation_segments", []))
+            if len(existing_segments) >= source_inputs.MAX_SOURCE_ACCEPTANCE_SEGMENTS:
+                raise InvalidTransitionError("source continuation chain exceeds bounds")
+            prior_payloads = current_legacy_payloads
+            for descriptor in existing_segments:
+                materialized = source_inputs.materialized_segment(
+                    self.run_dir, descriptor
+                )
+                prior_payloads = source_payloads.merge_payload_indexes(
+                    prior_payloads, materialized["payloads"]
+                )
+            prior_payloads = source_payloads.merge_payload_indexes(
+                prior_payloads, staged
+            )
+            segments = [*existing_segments, prepared_acceptance.descriptor]
             continuation = current_snapshot.resume_position
             if continuation is not None:
                 if payload_gaps:
@@ -1058,14 +967,12 @@ class SourceCoordinationOperations(OrchestratorComponent):
                         "lease_ref": normalized_lease,
                         "manifest": None,
                         "metrics": {
-                            "byte_count": sum(
-                                item["metrics"]["byte_count"] for item in segments
-                            ),
-                            "record_count": sum(
-                                item["metrics"]["record_count"] for item in segments
-                            ),
+                            "byte_count": int(cell["metrics"]["byte_count"])
+                            + transport.total_bytes,
+                            "record_count": int(cell["metrics"]["record_count"])
+                            + transport.total_records,
                         },
-                        "payloads": prior_payloads,
+                        "payloads": {},
                         "snapshot_ref": None,
                         "status": "pending",
                         "transport_receipt": None,
@@ -1075,7 +982,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 )
             else:
                 aggregate, snapshot_ref, receipt_ref = self._aggregate_source_segments(
-                    segments
+                    [*existing_segments, segment]
                 )
                 effective_status = (
                     SourceCellStatus.GAP.value
@@ -1088,12 +995,12 @@ class SourceCoordinationOperations(OrchestratorComponent):
                         "continuation_position": None,
                         "continuation_segments": segments,
                         "lease_ref": normalized_lease,
-                        "manifest": aggregate.to_dict(),
+                        "manifest": source_inputs.manifest_summary(aggregate),
                         "metrics": {
                             "byte_count": aggregate.total_bytes,
                             "record_count": aggregate.total_records,
                         },
-                        "payloads": prior_payloads,
+                        "payloads": {},
                         "snapshot_ref": snapshot_ref,
                         "status": effective_status,
                         "transport_receipt": receipt.to_dict(),
@@ -1119,7 +1026,12 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 "outcome": effective_status,
             }
 
-        result = self.store.transaction(mutate)
+        prepared_files = (*prepared_raw_files, prepared_acceptance.file)
+        result = self.store.staged_transaction(
+            mutate,
+            stage=lambda: source_inputs.materialize(prepared_files),
+            rollback=source_inputs.rollback,
+        )
         response = self._projection._status_view(result.snapshot)
         response.update(
             {"action": "accept-source", "changed": result.changed, **result.value}
@@ -1165,9 +1077,31 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 "agent claim TTL is outside the closed lease bounds"
             )
 
+        budget_action_key = f"exhaust_agent_claim_budget:{normalized_attempt_ref}"
+        budget_input_digest = content_digest(
+            {
+                "attempt_ref": normalized_attempt_ref,
+                "job_ref": normalized_job_ref,
+                "reason": "agent_claim_budget_exhausted",
+            }
+        )
+        prepared_claim_files: list[source_inputs.PreparedFile] = []
+
         def mutate(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             self._state._assert_state_identity(state)
             self._state._require_retention_active_state(state)
+            previous_budget = state["actions"].get(budget_action_key)
+            if previous_budget is not None:
+                if previous_budget.get("input_digest") != budget_input_digest:
+                    raise RunConflictError("agent claim budget replay binding changed")
+                return state, {
+                    "attempt_ref": normalized_attempt_ref,
+                    "claim_budget_exhausted": True,
+                    "idempotent": True,
+                    "job_ref": normalized_job_ref,
+                    "outcome": previous_budget.get("outcome"),
+                    "takeover": bool(previous_budget.get("takeover")),
+                }
             task = self._projection._task_for_active_job(state, normalized_job_ref)
             if task.get("stage") != state["stage"]:
                 raise InvalidTransitionError("agent job is not in the current stage")
@@ -1183,8 +1117,41 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 dispatch_state == "claimed"
                 and self._projection._claim_is_expired(attempt, now)
             )
+
+            def exhaust_claim_budget(*, takeover: bool) -> dict[str, Any]:
+                outcome = self._close_exhausted_agent_claim(
+                    state,
+                    task,
+                    attempt,
+                    attempt_ref=normalized_attempt_ref,
+                    budget_digest=budget_input_digest,
+                )
+                state["actions"][budget_action_key] = {
+                    "input_digest": budget_input_digest,
+                    "outcome": outcome,
+                    "takeover": takeover,
+                }
+                return {
+                    "attempt_ref": normalized_attempt_ref,
+                    "claim_budget_exhausted": True,
+                    "idempotent": False,
+                    "job_ref": normalized_job_ref,
+                    "outcome": outcome,
+                    "takeover": takeover,
+                }
+
+            if (
+                dispatch_state == "claimed"
+                and agent_claim_artifacts.sink_exceeds_budget(
+                    self.run_dir,
+                    attempt,
+                    max_bytes=result_validation.MAX_RESULT_BYTES,
+                )
+            ):
+                return state, exhaust_claim_budget(takeover=expired)
             heartbeat = False
             takeover = False
+            new_claim = False
             if dispatch_state == "claimed" and not expired:
                 if attempt.get("dispatcher_ref") != normalized_dispatcher_ref:
                     raise RunConflictError(
@@ -1223,6 +1190,8 @@ class SourceCoordinationOperations(OrchestratorComponent):
                     )
                 takeover = expired
                 generation = int(attempt.get("claim_generation", 0)) + 1
+                if generation > MAX_AGENT_CLAIM_GENERATIONS:
+                    return state, exhaust_claim_budget(takeover=expired)
                 active_claim_ref = self._ref(
                     RefType.CLAIM,
                     state["run_ref"],
@@ -1231,9 +1200,10 @@ class SourceCoordinationOperations(OrchestratorComponent):
                     generation,
                     normalized_dispatcher_ref,
                 )
-                output_name = (
-                    hashlib.sha256(active_claim_ref.encode("ascii")).hexdigest()
-                    + ".json"
+                output_name = agent_claim_artifacts.artifact_name(
+                    normalized_attempt_ref,
+                    generation,
+                    "result",
                 )
                 output_relative = f"agent-sinks/{output_name}"
                 result_ref = self._ref(
@@ -1261,11 +1231,19 @@ class SourceCoordinationOperations(OrchestratorComponent):
                         "sink_state": "open",
                     }
                 )
-                self._materialize_claim_envelope(task, attempt)
+                prepared_claim_files.append(self._prepare_claim_envelope(task, attempt))
+                prepared_claim_files.append(
+                    source_inputs.prepare_file(
+                        self.run_dir / output_relative,
+                        b"",
+                    )
+                )
                 idempotent = False
+                new_claim = True
             else:
                 raise InvalidTransitionError("agent attempt cannot be claimed")
-            self._jobs._materialize_agent_result_sink(attempt)
+            if not new_claim:
+                self._jobs._materialize_agent_result_sink(attempt)
             return state, {
                 "attempt_ref": normalized_attempt_ref,
                 "claim_expires_at": attempt["claim_expires_at"],
@@ -1283,7 +1261,11 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 "takeover": takeover,
             }
 
-        transaction = self.store.transaction(mutate)
+        transaction = self.store.staged_transaction(
+            mutate,
+            stage=lambda: source_inputs.materialize(prepared_claim_files),
+            rollback=source_inputs.rollback,
+        )
         response = self._projection._status_view(transaction.snapshot)
         response.update(
             {
@@ -1294,13 +1276,21 @@ class SourceCoordinationOperations(OrchestratorComponent):
         )
         return response
 
-    def _materialize_claim_envelope(
+    def _prepare_claim_envelope(
         self,
         task: Mapping[str, Any],
         attempt: dict[str, Any],
-    ) -> None:
+    ) -> source_inputs.PreparedFile:
         claim_ref = attempt.get("claim_ref")
-        if not isinstance(claim_ref, str):
+        attempt_ref = attempt.get("attempt_ref")
+        generation = attempt.get("claim_generation")
+        if (
+            not isinstance(claim_ref, str)
+            or not isinstance(attempt_ref, str)
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 1
+        ):
             raise InvalidTransitionError("agent claim identity is missing")
         envelope = self._jobs._agent_envelope(task, attempt)
         envelope_bytes = canonical_json_bytes(envelope)
@@ -1308,26 +1298,22 @@ class SourceCoordinationOperations(OrchestratorComponent):
             raise InvalidTransitionError(
                 "claimed agent task exceeds the complete 512 KiB envelope"
             )
-        envelope_name = hashlib.sha256(claim_ref.encode("ascii")).hexdigest() + ".json"
+        envelope_name = agent_claim_artifacts.artifact_name(
+            attempt_ref,
+            generation,
+            "envelope",
+        )
         relative_path = f"{RAW_INPUT_DIRECTORY}/agent-claims/{envelope_name}"
-        envelope_path = self.run_dir / relative_path
-        safe_io.ensure_owner_only_directory(envelope_path.parent)
-        try:
-            safe_io.atomic_create_bytes(envelope_path, envelope_bytes)
-        except FileExistsError:
-            existing = safe_io.read_bounded_bytes(
-                envelope_path,
-                max_bytes=self._agent_envelope_limit(),
-                require_owner_only=True,
-            )
-            if existing != envelope_bytes:
-                raise RunConflictError("agent claim envelope changed")
         attempt.update(
             {
                 "envelope_digest": hashlib.sha256(envelope_bytes).hexdigest(),
                 "envelope_path": relative_path,
                 "envelope_size": len(envelope_bytes),
             }
+        )
+        return source_inputs.prepare_file(
+            self.run_dir / relative_path,
+            envelope_bytes,
         )
 
     def _require_active_agent_claim(
@@ -1764,6 +1750,47 @@ class SourceCoordinationOperations(OrchestratorComponent):
         )
         return "gap"
 
+    def _close_exhausted_agent_claim(
+        self,
+        state: dict[str, Any],
+        task: dict[str, Any],
+        attempt: dict[str, Any],
+        *,
+        attempt_ref: str,
+        budget_digest: str,
+    ) -> str:
+        reason = "agent_claim_budget_exhausted"
+        if attempt.get("attempt_ref") != attempt_ref:
+            raise RunConflictError("agent claim budget attempt binding changed")
+        attempt.update(
+            {
+                "claim_budget_digest": budget_digest,
+                "completed_at": self._state._now(),
+                "dispatch_state": "completed",
+                "reason": reason,
+                "sink_state": "closed",
+                "status": "failed",
+            }
+        )
+        task["active_attempt_ref"] = None
+        task["active_job_ref"] = None
+        state["metrics"]["agent_claim_budget_exhaustions"] = (
+            int(state["metrics"].get("agent_claim_budget_exhaustions", 0)) + 1
+        )
+        if len(task["attempts"]) < 2:
+            task["status"] = "retryable"
+            return "retryable"
+        task["status"] = "gap"
+        self._state._append_gap(
+            state,
+            dependency_ref=task["task_ref"],
+            reason=reason,
+            stage=task["stage"],
+            repairable=True,
+            host_refs=task.get("host_refs", []),
+        )
+        return "gap"
+
     @staticmethod
     def _check_replay(
         state: Mapping[str, Any],
@@ -1952,25 +1979,6 @@ class SourceCoordinationOperations(OrchestratorComponent):
         if len(matches) != 1:
             raise InvalidInputError("unknown or ambiguous source lease")
         return matches[0]
-
-    def _stage_raw_payload(self, unit_ref: str, payload: bytes) -> str:
-        digest = self.identity.derive_digest(
-            "raw-input-file/v2",
-            {"byte_count": len(payload), "unit_ref": unit_ref},
-        )
-        relative_path = f"{RAW_INPUT_DIRECTORY}/{digest}.bin"
-        target = self.run_dir / relative_path
-        try:
-            safe_io.atomic_create_bytes(target, payload)
-        except FileExistsError:
-            existing = safe_io.read_bounded_bytes(
-                target,
-                max_bytes=max(1, len(payload)),
-                require_owner_only=True,
-            )
-            if existing != payload:
-                raise RunConflictError("staged raw payload changed")
-        return relative_path
 
     @staticmethod
     def _validate_authoritative_source_snapshot(

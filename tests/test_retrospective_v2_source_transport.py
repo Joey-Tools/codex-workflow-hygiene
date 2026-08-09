@@ -27,7 +27,14 @@ SCRIPTS = (
 )
 sys.path.insert(0, str(SCRIPTS))
 
-from retrospective_v2 import authority, catalog, safe_io, transport  # noqa: E402
+from retrospective_v2 import (  # noqa: E402
+    authority,
+    catalog,
+    safe_io,
+    source_inputs,
+    source_payloads,
+    transport,
+)
 import retrospective_v2.orchestrator as orchestrator_module  # noqa: E402
 from retrospective_v2 import (  # noqa: E402
     orchestrator_transport,
@@ -47,6 +54,7 @@ from retrospective_v2.contracts import (  # noqa: E402
 from retrospective_v2.identity import IdentityKey  # noqa: E402
 from retrospective_v2.orchestrator import (  # noqa: E402
     InvalidInputError,
+    InvalidTransitionError,
     RetrospectiveOrchestrator,
 )
 from tests.test_retrospective_v2_orchestrator import (  # noqa: E402
@@ -104,6 +112,84 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.history_patch.stop()
         self.snapshot_cache_patch.stop()
         self.temporary_directory.cleanup()
+
+    def test_source_acceptance_sidecar_rejects_hardlinks_and_content_change(
+        self,
+    ) -> None:
+        prepared = source_inputs.prepare_acceptance(
+            self.root,
+            segment={"lease_ref": "lease-ref"},
+            payloads={},
+            model_era_by_unit={},
+            model_eras_by_session={},
+        )
+        source_inputs.materialize((prepared.file,))
+        alias = prepared.file.path.with_name("sidecar-alias.json")
+        os.link(prepared.file.path, alias)
+        with self.assertRaisesRegex(InvalidTransitionError, "authenticated"):
+            source_inputs.load(self.root, prepared.descriptor)
+        alias.unlink()
+
+        original = prepared.file.path.read_bytes()
+        prepared.file.path.write_bytes(b"[" + original[1:])
+        os.chmod(prepared.file.path, 0o600)
+        with self.assertRaisesRegex(InvalidTransitionError, "changed"):
+            source_inputs.load(self.root, prepared.descriptor)
+
+    def test_source_rollback_revalidates_single_link_and_exact_content(self) -> None:
+        unit_ref = str(
+            self.identity.derive_ref(RefType.SOURCE_UNIT, {"case": "rollback"})
+        )
+        _relative_path, prepared = source_inputs.prepare_raw_payload(
+            self.identity,
+            self.root,
+            unit_ref,
+            b"rollback evidence",
+        )
+        source_inputs.materialize((prepared,))
+        alias = prepared.path.with_name("rollback-alias.bin")
+        original_validate = safe_io.validate_owner_only_file_descriptor
+        calls = 0
+
+        def add_hardlink_before_revalidation(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                os.link(prepared.path, alias)
+            return original_validate(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                safe_io,
+                "validate_owner_only_file_descriptor",
+                side_effect=add_hardlink_before_revalidation,
+            ),
+            self.assertRaises(safe_io.UnsafePathError),
+        ):
+            source_inputs.rollback((prepared,))
+
+        self.assertEqual(b"rollback evidence", prepared.path.read_bytes())
+        self.assertEqual(b"rollback evidence", alias.read_bytes())
+
+    def test_source_payload_indexes_reject_legacy_sidecar_conflicts(self) -> None:
+        unit_ref = str(
+            self.identity.derive_ref(RefType.SOURCE_UNIT, {"case": "payload"})
+        )
+        available = {
+            "byte_count": 1,
+            "content_commitment": "sha256:" + "a" * 64,
+            "relative_path": "raw-inputs/" + "b" * 64 + ".bin",
+            "status": "available",
+        }
+        self.assertEqual(
+            {unit_ref: available},
+            source_payloads.merge_payload_indexes({unit_ref: available}),
+        )
+        with self.assertRaisesRegex(InvalidTransitionError, "index changed"):
+            source_payloads.merge_payload_indexes(
+                {unit_ref: available},
+                {unit_ref: {"reason": "raw_payload_missing", "status": "gap"}},
+            )
 
     @staticmethod
     def _line(session_id: str, *, kind: str = "history") -> bytes:
@@ -457,7 +543,11 @@ class SourceTransportProtocolTests(unittest.TestCase):
         state = coordinator.store.read().state
         excluded = 0
         for cell in state["source"]["cells"]["local"].values():
-            manifest = catalog.SourceTransportManifest.from_dict(cell["manifest"])
+            manifest, _snapshot_ref, _receipt_ref = source_inputs.aggregate_segments(
+                coordinator.identity,
+                coordinator.run_dir,
+                cell["continuation_segments"],
+            )
             self.assertGreaterEqual(len(manifest.records), 1)
             self.assertTrue(
                 all(
@@ -482,12 +572,17 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 len(manifest.records),
             )
         self.assertGreater(excluded, 0)
-        raw_paths = [
-            self.root / "session-run" / payload["relative_path"]
-            for cell in state["source"]["cells"]["local"].values()
-            for payload in cell.get("payloads", {}).values()
-            if payload.get("status") == "available"
-        ]
+        raw_paths = []
+        for cell in state["source"]["cells"]["local"].values():
+            materialized = source_inputs.materialize_segments(
+                coordinator.run_dir,
+                cell["continuation_segments"],
+            )
+            raw_paths.extend(
+                coordinator.run_dir / payload["relative_path"]
+                for payload in materialized["payloads"].values()
+                if payload.get("status") == "available"
+            )
         self.assertTrue(raw_paths)
         self.assertNotIn(
             b"AcmeNonTargetSecret",
@@ -1859,7 +1954,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 json.dumps(
                     {
                         "blob": "x" * 500_000,
-                        "id": f"continued-{index}",
+                        "session_id": f"continued-{index}",
                         "timestamp": "2026-07-06T01:00:00Z",
                     },
                     separators=(",", ":"),
@@ -1869,8 +1964,9 @@ class SourceTransportProtocolTests(unittest.TestCase):
             )
             for index in range(10)
         ]
-        self.codex_root.joinpath("session_index.jsonl").write_bytes(b"".join(payloads))
+        self.codex_root.joinpath("history.jsonl").write_bytes(b"".join(payloads))
         environment = {**os.environ, "HOME": str(self.home)}
+        continued_source_kind = ""
         with mock.patch.object(
             orchestrator_module,
             "SOURCE_TRANSPORT_MAX_SOURCE_BYTES",
@@ -1904,6 +2000,20 @@ class SourceTransportProtocolTests(unittest.TestCase):
                     raw_records=preparation.raw_records,
                 )
                 if accepted["outcome"] == "continued" and not restarted:
+                    source_kind = lease.source_kind.value
+                    continued_source_kind = source_kind
+
+                    def downgrade_to_legacy_inline_state(current):
+                        cell = current["source"]["cells"]["local"][source_kind]
+                        accepted_segment = source_inputs.load(
+                            coordinator.run_dir,
+                            cell["continuation_segments"][0],
+                        )
+                        cell["continuation_segments"] = [accepted_segment["segment"]]
+                        cell["payloads"] = accepted_segment["payloads"]
+                        return current, None
+
+                    coordinator.store.transaction(downgrade_to_legacy_inline_state)
                     coordinator = RetrospectiveOrchestrator(
                         coordinator.run_dir,
                         clock=lambda: "2026-07-15T00:00:00Z",
@@ -1915,8 +2025,15 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 self.fail("source continuation did not terminate")
 
         state = coordinator.store.read().state
-        cell = state["source"]["cells"]["local"]["session_index"]
-        segments = cell["continuation_segments"]
+        self.assertEqual("history", continued_source_kind)
+        cell = state["source"]["cells"]["local"][continued_source_kind]
+        descriptors = cell["continuation_segments"]
+        segments = [
+            source_inputs.materialized_segment(coordinator.run_dir, descriptor)[
+                "segment"
+            ]
+            for descriptor in descriptors
+        ]
         self.assertTrue(restarted)
         self.assertGreater(
             len(segments),
@@ -1932,8 +2049,37 @@ class SourceTransportProtocolTests(unittest.TestCase):
             ],
         )
         self.assertEqual(10, cell["metrics"]["record_count"])
-        aggregate = catalog.SourceTransportManifest.from_dict(cell["manifest"])
+        self.assertEqual({}, cell["payloads"])
+        aggregate, _snapshot_ref, _receipt_ref = source_inputs.aggregate_segments(
+            coordinator.identity,
+            coordinator.run_dir,
+            descriptors,
+        )
+        self.assertEqual(source_inputs.manifest_summary(aggregate), cell["manifest"])
         self.assertEqual(10, len(aggregate.records))
+        materialized = source_inputs.materialize_segments(
+            coordinator.run_dir,
+            descriptors,
+        )
+        self.assertEqual(
+            10,
+            len(materialized["payloads"]),
+            [descriptor.get("schema", "legacy") for descriptor in descriptors],
+        )
+        self.assertTrue(
+            source_inputs.manifest_matches_persisted(aggregate.to_dict(), aggregate)
+        )
+
+        legacy_state = json.loads(json.dumps(state))
+        legacy_cell = legacy_state["source"]["cells"]["local"][continued_source_kind]
+        legacy_cell["manifest"] = aggregate.to_dict()
+        coordinator._components.reduction._accepted_source_inputs(legacy_state)
+        unit_ref = next(iter(materialized["payloads"]))
+        legacy_cell["payloads"] = {
+            unit_ref: {"reason": "raw_payload_missing", "status": "gap"}
+        }
+        with self.assertRaisesRegex(InvalidTransitionError, "index changed"):
+            coordinator._components.reduction._accepted_source_inputs(legacy_state)
         byte_starts = [record.coordinate.byte_start for record in aggregate.records]
         expected_byte_starts: list[int] = []
         next_byte_start = 0

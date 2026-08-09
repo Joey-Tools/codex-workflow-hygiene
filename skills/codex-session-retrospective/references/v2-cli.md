@@ -254,8 +254,10 @@ record and an `installed_commits` inventory containing its installed commit.
 - Session mode requires both `--session-target` and
   `--session-target-selector`; the target must equal the identity-derived
   reference for that selector. These arguments are rejected for all other
-  modes. Session runs structurally account discovered non-target records and
-  reject any non-target consumed record.
+  modes. Session runs always scan the complete canonical three-host set and all
+  four required source kinds (12 coverage cells); subsets, unknown hosts, and
+  partial publication are rejected. They structurally account discovered
+  non-target records and reject any non-target consumed record.
 - Daily backfill requires an authenticated controlled-gap receipt; prior episode
   heads and their stable anchor membership are always derived from durable
   history and cannot be supplied by the caller.

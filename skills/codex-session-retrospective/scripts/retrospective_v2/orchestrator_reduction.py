@@ -14,6 +14,8 @@ from . import (
     result_validation,
     safe_io,
     sharding,
+    source_inputs,
+    source_payloads,
 )
 from .checkpoints import canonical_json_bytes
 from .contracts import JobKind, RefType, RunStage, SourceKind
@@ -46,21 +48,101 @@ class HierarchicalReductionOperations(OrchestratorComponent):
         self._projection = projection
         self._jobs = jobs
 
-    def _freeze_catalog_and_materialize(self, state: dict[str, Any]) -> None:
+    def _accepted_source_inputs(
+        self,
+        state: Mapping[str, Any],
+    ) -> tuple[
+        list[catalog.SourceTransportManifest],
+        dict[str, Mapping[str, Any]],
+        dict[str, str],
+        dict[str, list[str]],
+    ]:
         transport_manifests: list[catalog.SourceTransportManifest] = []
         payload_state: dict[str, Mapping[str, Any]] = {}
+        model_era_by_unit: dict[str, str] = {}
+        model_eras_by_session: dict[str, set[str]] = {}
         for cells in state["source"]["cells"].values():
             for cell in cells.values():
-                manifest_value = cell.get("manifest")
-                if not isinstance(manifest_value, Mapping):
+                descriptors = cell.get("continuation_segments")
+                if (
+                    not isinstance(descriptors, Sequence)
+                    or isinstance(descriptors, (str, bytes))
+                    or not descriptors
+                ):
                     raise InvalidTransitionError(
-                        "accepted source cell lacks a manifest"
+                        "accepted source cell lacks sidecar descriptors"
                     )
-                transport_manifests.append(
-                    catalog.SourceTransportManifest.from_dict(manifest_value)
+                materialized = source_inputs.materialize_segments(
+                    self.run_dir,
+                    descriptors,
                 )
-                for unit_ref, payload in cell.get("payloads", {}).items():
-                    payload_state[unit_ref] = payload
+                manifest, _snapshot_ref, _receipt_ref = (
+                    source_inputs.aggregate_segments(
+                        self.identity,
+                        self.run_dir,
+                        descriptors,
+                    )
+                )
+                if not source_inputs.manifest_matches_persisted(
+                    cell.get("manifest"), manifest
+                ):
+                    raise InvalidTransitionError(
+                        "accepted source cell differs from its sidecar manifest"
+                    )
+                transport_manifests.append(manifest)
+                payload_state = source_payloads.merge_payload_indexes(
+                    payload_state,
+                    materialized["payloads"],
+                    cell.get("payloads", {}),
+                )
+
+                for unit_ref, model_era in materialized["model_era_by_unit"].items():
+                    existing = model_era_by_unit.get(unit_ref)
+                    if existing is not None and existing != model_era:
+                        raise InvalidTransitionError(
+                            "accepted source model-era index changed"
+                        )
+                    model_era_by_unit[unit_ref] = model_era
+                for session_ref, model_eras in materialized[
+                    "model_eras_by_session"
+                ].items():
+                    model_eras_by_session.setdefault(session_ref, set()).update(
+                        model_eras
+                    )
+
+        legacy_unit_eras = state["source"].get("model_era_by_unit", {})
+        if isinstance(legacy_unit_eras, Mapping):
+            for unit_ref, model_era in legacy_unit_eras.items():
+                if isinstance(unit_ref, str) and isinstance(model_era, str):
+                    existing = model_era_by_unit.get(unit_ref)
+                    if existing is not None and existing != model_era:
+                        raise InvalidTransitionError(
+                            "accepted source model-era index changed"
+                        )
+                    model_era_by_unit[unit_ref] = model_era
+        legacy_session_eras = state["source"].get("model_eras_by_session", {})
+        if isinstance(legacy_session_eras, Mapping):
+            for session_ref, model_eras in legacy_session_eras.items():
+                if isinstance(session_ref, str) and isinstance(model_eras, Sequence):
+                    if isinstance(model_eras, (str, bytes)):
+                        continue
+                    model_eras_by_session.setdefault(session_ref, set()).update(
+                        value for value in model_eras if isinstance(value, str)
+                    )
+        return (
+            transport_manifests,
+            payload_state,
+            model_era_by_unit,
+            {key: sorted(values) for key, values in model_eras_by_session.items()},
+        )
+
+    def _freeze_catalog_and_materialize(self, state: dict[str, Any]) -> None:
+        (
+            transport_manifests,
+            payload_state,
+            model_era_by_unit,
+            model_eras_by_session,
+        ) = self._accepted_source_inputs(state)
 
         all_records = [
             record for manifest in transport_manifests for record in manifest.records
@@ -163,6 +245,8 @@ class HierarchicalReductionOperations(OrchestratorComponent):
             state,
             materialized,
             source_catalog,
+            model_era_by_unit=model_era_by_unit,
+            model_eras_by_session=model_eras_by_session,
         )
         self._apply_catalog_cells_and_gaps(state, source_catalog)
         self._recompute_frozen_metrics(state, source_catalog, materialized)
@@ -290,13 +374,11 @@ class HierarchicalReductionOperations(OrchestratorComponent):
             }
         )
 
-    @staticmethod
-    def _record_unmaterialized_catalog_metrics(state: dict[str, Any]) -> None:
-        records = []
-        for cells in state["source"]["cells"].values():
-            for cell in cells.values():
-                manifest = catalog.SourceTransportManifest.from_dict(cell["manifest"])
-                records.extend(manifest.records)
+    def _record_unmaterialized_catalog_metrics(self, state: dict[str, Any]) -> None:
+        manifests, _payloads, _unit_eras, _session_eras = self._accepted_source_inputs(
+            state
+        )
+        records = [record for manifest in manifests for record in manifest.records]
         accounting = {
             accounting_class.value: sum(
                 record.accounting_class is accounting_class for record in records
@@ -323,6 +405,9 @@ class HierarchicalReductionOperations(OrchestratorComponent):
         state: Mapping[str, Any],
         materialized: sharding.MaterializationResult,
         source_catalog: catalog.SourceCatalog,
+        *,
+        model_era_by_unit: Mapping[str, str],
+        model_eras_by_session: Mapping[str, Sequence[str]],
     ) -> dict[str, dict[str, Any]]:
         source_precedence = {
             SourceKind.ACTIVE_ROLLOUT: 0,
@@ -437,16 +522,8 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                         descriptor.coordinate.source_ref,
                     )
                 )
-                unit_model_era = (
-                    state["source"]
-                    .get("model_era_by_unit", {})
-                    .get(descriptor.unit_ref)
-                )
-                session_model_eras = (
-                    state["source"]
-                    .get("model_eras_by_session", {})
-                    .get(session_ref, [])
-                )
+                unit_model_era = model_era_by_unit.get(descriptor.unit_ref)
+                session_model_eras = model_eras_by_session.get(session_ref, [])
                 if isinstance(unit_model_era, str):
                     model_era = unit_model_era
                 elif len(session_model_eras) == 1:

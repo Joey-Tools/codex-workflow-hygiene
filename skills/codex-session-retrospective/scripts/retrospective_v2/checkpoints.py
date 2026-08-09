@@ -53,6 +53,7 @@ class CheckpointSnapshot:
 
 
 T = TypeVar("T")
+S = TypeVar("S")
 
 
 @dataclass(frozen=True)
@@ -249,6 +250,74 @@ class AtomicCheckpointStore:
             )
             return TransactionResult(committed, value, True)
 
+    def staged_transaction(
+        self,
+        mutator: Callable[[dict[str, Any]], tuple[Mapping[str, Any], T]],
+        *,
+        stage: Callable[[], S],
+        rollback: Callable[[S], None],
+        expected_revision: int | None = None,
+    ) -> TransactionResult[T]:
+        """Commit state only after its exact envelope and staged files are valid."""
+
+        expected_revision = _validated_expected_revision(expected_revision)
+        with self._locked(create_directory=False) as locked:
+            current = self._read_unlocked(locked.directory_fd)
+            if expected_revision is not None and expected_revision != current.revision:
+                raise CheckpointConflictError(
+                    f"expected revision {expected_revision}, found {current.revision}"
+                )
+            candidate, value = mutator(_copy_state(current.state))
+            desired = _copy_state(candidate)
+            if _states_equal(desired, current.state):
+                return TransactionResult(current, value, False)
+
+            next_revision = current.revision + 1
+            self._checkpoint_payload(desired, revision=next_revision)
+            staged = stage()
+            try:
+                committed = self._write_unlocked(
+                    locked.directory_fd,
+                    desired,
+                    revision=next_revision,
+                )
+            except BaseException as error:
+                try:
+                    observed = self._read_unlocked(locked.directory_fd)
+                except BaseException as read_error:
+                    if hasattr(error, "add_note"):
+                        error.add_note(
+                            "staged checkpoint commit could not be re-read; "
+                            f"staged files retained ({type(read_error).__name__})"
+                        )
+                    raise error from read_error
+                if observed.revision == next_revision and _states_equal(
+                    observed.state, desired
+                ):
+                    if hasattr(error, "add_note"):
+                        error.add_note(
+                            "staged checkpoint candidate is committed; staged files retained"
+                        )
+                    raise
+                if observed.revision != current.revision or not _states_equal(
+                    observed.state, current.state
+                ):
+                    if hasattr(error, "add_note"):
+                        error.add_note(
+                            "staged checkpoint disposition is inconsistent; staged files retained"
+                        )
+                    raise
+                try:
+                    rollback(staged)
+                except BaseException as rollback_error:
+                    if hasattr(error, "add_note"):
+                        error.add_note(
+                            "staged checkpoint rollback failed; "
+                            f"files retained ({type(rollback_error).__name__})"
+                        )
+                raise
+            return TransactionResult(committed, value, True)
+
     def update(
         self,
         mutator: Callable[[dict[str, Any]], Mapping[str, Any]],
@@ -380,24 +449,7 @@ class AtomicCheckpointStore:
         *,
         revision: int,
     ) -> CheckpointSnapshot:
-        body = _envelope_body(
-            revision=revision,
-            key_id=self.key_id,
-            state=state,
-        )
-        envelope = dict(body)
-        envelope["envelope_hmac"] = _envelope_authentication(self.identity, body)
-        try:
-            payload = canonical_json_bytes(envelope) + b"\n"
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise CheckpointIntegrityError(
-                "checkpoint state must be finite canonical JSON data"
-            ) from exc
-        if len(payload) > self.max_bytes:
-            raise CheckpointIntegrityError(
-                "checkpoint exceeds the configured size limit"
-            )
-
+        payload = self._checkpoint_payload(state, revision=revision)
         try:
             common_safe_io.atomic_write_bytes_at(
                 directory_fd,
@@ -415,6 +467,26 @@ class AtomicCheckpointStore:
             state=_copy_state(state),
             key_id=self.key_id,
         )
+
+    def _checkpoint_payload(self, state: dict[str, Any], *, revision: int) -> bytes:
+        body = _envelope_body(
+            revision=revision,
+            key_id=self.key_id,
+            state=state,
+        )
+        envelope = dict(body)
+        envelope["envelope_hmac"] = _envelope_authentication(self.identity, body)
+        try:
+            payload = canonical_json_bytes(envelope) + b"\n"
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CheckpointIntegrityError(
+                "checkpoint state must be finite canonical JSON data"
+            ) from exc
+        if len(payload) > self.max_bytes:
+            raise CheckpointIntegrityError(
+                "checkpoint exceeds the configured size limit"
+            )
+        return payload
 
     @staticmethod
     def _replace(directory_fd: int, source_name: str, destination_name: str) -> None:

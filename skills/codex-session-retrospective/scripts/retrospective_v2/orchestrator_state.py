@@ -6,6 +6,7 @@ from typing import Any, Iterable, Mapping
 from .checkpoints import CheckpointNotFoundError
 from .contracts import (
     RefType,
+    RunMode,
     RunStage,
     parse_typed_ref,
 )
@@ -14,6 +15,7 @@ from .identity import IdentityKeyMismatchError
 from .orchestrator_core import (
     InvalidInputError,
     InvalidTransitionError,
+    REQUIRED_SOURCE_KINDS,
     RunNotStartedError,
     _format_timestamp,
     _json_copy,
@@ -93,6 +95,36 @@ class CoordinatorStateOperations:
             raise IdentityKeyMismatchError(
                 "run state identity_key_id does not match the loaded fixed identity"
             )
+        if state.get("mode") == RunMode.SESSION.value:
+            canonical_hosts = set(self._canonical_hosts())
+            required_source_kinds = set(REQUIRED_SOURCE_KINDS)
+            host_refs = state.get("host_refs")
+            source_cells = state.get("source", {}).get("cells")
+            cursors = state.get("cursors")
+            if (
+                not isinstance(host_refs, Mapping)
+                or not isinstance(source_cells, Mapping)
+                or not isinstance(cursors, Mapping)
+                or set(host_refs) != canonical_hosts
+                or set(source_cells) != canonical_hosts
+                or set(cursors) != canonical_hosts
+                or any(
+                    not isinstance(cells, Mapping)
+                    or set(cells) != required_source_kinds
+                    for cells in source_cells.values()
+                )
+                or any(
+                    host_refs[host] != self._ref(RefType.HOST, host)
+                    or any(
+                        cell.get("host_ref") != host_refs[host]
+                        for cell in source_cells[host].values()
+                    )
+                    for host in canonical_hosts
+                )
+            ):
+                raise InvalidTransitionError(
+                    "session checkpoint does not cover the canonical source matrix"
+                )
 
     def _block(self, state: dict[str, Any], reason: str) -> None:
         state["blocked_reason"] = reason

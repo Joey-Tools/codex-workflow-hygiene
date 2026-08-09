@@ -16,6 +16,8 @@ from . import (
     reporting,
     retained_inputs,
     safe_io,
+    source_inputs,
+    source_payloads,
     transport as source_transport,
 )
 from .checkpoints import (
@@ -167,10 +169,16 @@ class RunLifecycleOperations(OrchestratorComponent):
         canonical_hosts = self._canonical_hosts()
         host_values = _normalize_hosts(canonical_hosts if hosts is None else hosts)
         source_values = _normalize_source_kinds(source_kinds)
-        if mode_value in {RunMode.WEEKLY.value, RunMode.BASELINE.value} and set(
-            host_values
-        ) != set(canonical_hosts):
-            raise InvalidInputError("weekly and baseline runs require every host")
+        if any(host not in canonical_hosts for host in host_values):
+            raise InvalidInputError("runs may target only canonical hosts")
+        if mode_value in {
+            RunMode.WEEKLY.value,
+            RunMode.BASELINE.value,
+            RunMode.SESSION.value,
+        } and set(host_values) != set(canonical_hosts):
+            raise InvalidInputError(
+                "weekly, baseline, and session runs require every canonical host"
+            )
         if (
             mode_value == RunMode.DAILY.value
             and backfill_of is None
@@ -1199,6 +1207,10 @@ class RunLifecycleOperations(OrchestratorComponent):
                         "shadow source cell lacks authenticated transport evidence"
                     )
                 try:
+                    materialized_segments = source_inputs.materialize_segments(
+                        self.run_dir,
+                        raw_segments,
+                    )
                     aggregate, aggregate_snapshot_ref, aggregate_receipt_ref = (
                         self._source._aggregate_source_segments(raw_segments)
                     )
@@ -1214,7 +1226,7 @@ class RunLifecycleOperations(OrchestratorComponent):
                     ) from error
                 final_receipt: source_transport.TransportReceipt | None = None
                 final_lease_ref: str | None = None
-                for segment in raw_segments:
+                for segment in materialized_segments["segments"]:
                     if not isinstance(segment, Mapping):
                         raise InvalidTransitionError(
                             "shadow source continuation segment is invalid"
@@ -1280,8 +1292,10 @@ class RunLifecycleOperations(OrchestratorComponent):
                     source_receipts.append(receipt.receipt_ref)
                     final_receipt = receipt
                     final_lease_ref = lease_ref
-                payloads = cell.get("payloads")
-                payload_gap = isinstance(payloads, Mapping) and any(
+                payloads = source_payloads.merge_payload_indexes(
+                    materialized_segments["payloads"], cell.get("payloads", {})
+                )
+                payload_gap = any(
                     isinstance(item, Mapping) and item.get("status") == "gap"
                     for item in payloads.values()
                 )
@@ -1295,7 +1309,9 @@ class RunLifecycleOperations(OrchestratorComponent):
                     or cell.get("host_ref") != host_ref
                     or cell.get("continuation_position") is not None
                     or cell.get("lease_ref") != final_lease_ref
-                    or cell.get("manifest") != aggregate.to_dict()
+                    or not source_inputs.manifest_matches_persisted(
+                        cell.get("manifest"), aggregate
+                    )
                     or cell.get("snapshot_ref") != aggregate_snapshot_ref
                     or cell.get("transport_receipt") != final_receipt.to_dict()
                     or cell.get("transport_receipt_ref") != aggregate_receipt_ref
@@ -2749,9 +2765,9 @@ class RunLifecycleOperations(OrchestratorComponent):
                 "shadow_cleanup_claimed",
             }:
                 raise RunConflictError("shadow cleanup phase changed")
-            coverage = self._validated_shadow_coverage(state)
             existing = publication.get("cleanup_claim")
             if existing is not None:
+                coverage = self._verified_persisted_shadow_coverage(state)
                 claim = self._validate_shadow_cleanup_claim(
                     state,
                     coverage,
@@ -2759,6 +2775,7 @@ class RunLifecycleOperations(OrchestratorComponent):
                 )
                 publication["phase"] = "shadow_cleanup_claimed"
                 return state, claim
+            coverage = self._validated_shadow_coverage(state)
             inventory = self._raw_cleanup_inventory()
             if any(
                 inventory["root_objects"][name] is None for name in SHADOW_CLEANUP_ROOTS
@@ -3223,6 +3240,7 @@ class RunLifecycleOperations(OrchestratorComponent):
                 "accepted_agent_results": 0,
                 "accepted_source_manifests": 0,
                 "agent_attempts": 0,
+                "agent_claim_budget_exhaustions": 0,
                 "agent_results": 0,
                 "agent_retries": 0,
                 "agent_task_cache_hits": 0,

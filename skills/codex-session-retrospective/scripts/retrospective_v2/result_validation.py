@@ -425,19 +425,44 @@ def _reject_forbidden_keys(value: Any, *, path: str = "$") -> None:
             _reject_forbidden_keys(child, path=_path(path, index))
 
 
-def _is_reference_path(path: tuple[str | int, ...]) -> bool:
+def _reference_path_kind(path: tuple[str | int, ...]) -> str | None:
     for component in reversed(path):
         if not isinstance(component, str):
             continue
         normalized = _normalized_key(component)
-        return (
-            normalized.endswith("_ref")
-            or normalized.endswith("_refs")
-            or normalized.endswith("_hash")
-            or normalized.endswith("_hashes")
-            or normalized.endswith("_commitments")
-        )
+        if normalized.endswith(("_hash", "_hashes")):
+            return "hash"
+        if normalized.endswith(("_ref", "_refs", "_commitment", "_commitments")):
+            return "reference"
+        return None
+    return None
+
+
+def _is_valid_reference_value(
+    path: tuple[str | int, ...],
+    value: str,
+) -> bool:
+    kind = _reference_path_kind(path)
+    if kind == "hash":
+        return _SHA256_RE.fullmatch(value) is not None
+    if kind == "reference":
+        return _OPAQUE_REF_RE.fullmatch(value) is not None
     return False
+
+
+def _privacy_reference_values(
+    *groups: Collection[str] | None,
+) -> frozenset[str]:
+    values: set[str] = set()
+    for group in groups:
+        if group is None:
+            continue
+        if isinstance(group, (str, bytes)) or any(
+            not isinstance(value, str) for value in group
+        ):
+            raise _error("allowed_reference_values", "must contain only strings")
+        values.update(group)
+    return frozenset(values)
 
 
 def _walk_strings(
@@ -640,6 +665,7 @@ def scan_for_leaks(
     *,
     original_prompts: Sequence[str] = (),
     tool_outputs: Sequence[str] = (),
+    allowed_reference_values: Collection[str] = (),
 ) -> tuple[LeakFinding, ...]:
     """Return deterministic, privacy-safe leak locations without matched text."""
 
@@ -649,12 +675,14 @@ def scan_for_leaks(
     )
     prompt_index = _build_source_overlap_index(original_prompts)
     tool_index = _build_source_overlap_index(tool_outputs)
+    allowed_values = _privacy_reference_values(allowed_reference_values)
     findings: set[LeakFinding] = set()
     for parts, text in _walk_strings(value):
         if not text or _REDACTION_PLACEHOLDER_RE.fullmatch(text.strip()):
             continue
         path = _display_path(parts)
-        reference_field = _is_reference_path(parts)
+        reference_field = _is_valid_reference_value(parts, text)
+        overlap_exempt = reference_field and text in allowed_values
         for category, pattern, _replacement in _SECRET_PATTERNS:
             for match in pattern.finditer(text):
                 findings.add(LeakFinding(category, path, match.start(), match.end()))
@@ -696,12 +724,13 @@ def scan_for_leaks(
             findings.add(
                 LeakFinding("unredactable_secret", path, match.start(), match.end())
             )
-        prompt_overlap = _source_overlap(text, prompt_index)
-        if prompt_overlap is not None:
-            findings.add(LeakFinding("original_prompt", path, *prompt_overlap))
-        tool_overlap = _source_overlap(text, tool_index)
-        if tool_overlap is not None:
-            findings.add(LeakFinding("tool_output", path, *tool_overlap))
+        if not overlap_exempt:
+            prompt_overlap = _source_overlap(text, prompt_index)
+            if prompt_overlap is not None:
+                findings.add(LeakFinding("original_prompt", path, *prompt_overlap))
+            tool_overlap = _source_overlap(text, tool_index)
+            if tool_overlap is not None:
+                findings.add(LeakFinding("tool_output", path, *tool_overlap))
     return tuple(sorted(findings))
 
 
@@ -719,12 +748,14 @@ def _post_redact_text(
     original_prompt_patterns: Sequence[re.Pattern[str]],
     tool_output_patterns: Sequence[re.Pattern[str]],
     reference_field: bool,
+    source_overlap_exempt: bool,
 ) -> str:
     redacted = text
-    for pattern in original_prompt_patterns:
-        redacted = pattern.sub("[REDACTED_ORIGINAL_PROMPT]", redacted)
-    for pattern in tool_output_patterns:
-        redacted = pattern.sub("[REDACTED_TOOL_OUTPUT]", redacted)
+    if not source_overlap_exempt:
+        for pattern in original_prompt_patterns:
+            redacted = pattern.sub("[REDACTED_ORIGINAL_PROMPT]", redacted)
+        for pattern in tool_output_patterns:
+            redacted = pattern.sub("[REDACTED_TOOL_OUTPUT]", redacted)
     for _category, pattern, replacement in _SECRET_PATTERNS:
         redacted = pattern.sub(replacement, redacted)
     for pattern in (_EMAIL_RE, _PHONE_RE, _LABELED_PERSONAL_ID_RE):
@@ -767,6 +798,7 @@ def post_redact(
     *,
     original_prompts: Sequence[str] = (),
     tool_outputs: Sequence[str] = (),
+    allowed_reference_values: Collection[str] = (),
 ) -> Any:
     """Return a deep redacted copy while preserving opaque reference fields."""
 
@@ -784,14 +816,17 @@ def post_redact(
         for value in tool_outputs
         if (pattern := _literal_redaction_pattern(value)) is not None
     )
+    allowed_values = _privacy_reference_values(allowed_reference_values)
 
     def redact(child: Any, path: tuple[str | int, ...]) -> Any:
         if isinstance(child, str):
+            reference_field = _is_valid_reference_value(path, child)
             return _post_redact_text(
                 child,
                 original_prompt_patterns=original_prompt_patterns,
                 tool_output_patterns=tool_output_patterns,
-                reference_field=_is_reference_path(path),
+                reference_field=reference_field,
+                source_overlap_exempt=reference_field and child in allowed_values,
             )
         if isinstance(child, Mapping):
             return {key: redact(item, path + (key,)) for key, item in child.items()}
@@ -1143,18 +1178,25 @@ def _validate_high_impact_turns(
 
 def _privacy_prepare(
     result: Mapping[str, Any],
-    *,
+    *allowed_reference_groups: Collection[str] | None,
     original_prompts: Sequence[str],
     tool_outputs: Sequence[str],
 ) -> dict[str, Any]:
     validate_result_envelope(result)
     source = _require_mapping(result, path="$")
     _reject_forbidden_keys(source)
+    allowed_reference_values = _privacy_reference_values(*allowed_reference_groups)
     sanitized = post_redact(
-        source, original_prompts=original_prompts, tool_outputs=tool_outputs
+        source,
+        original_prompts=original_prompts,
+        tool_outputs=tool_outputs,
+        allowed_reference_values=allowed_reference_values,
     )
     leaks = scan_for_leaks(
-        sanitized, original_prompts=original_prompts, tool_outputs=tool_outputs
+        sanitized,
+        original_prompts=original_prompts,
+        tool_outputs=tool_outputs,
+        allowed_reference_values=allowed_reference_values,
     )
     if leaks:
         first = leaks[0]
@@ -1177,7 +1219,10 @@ def validate_extractor_result(
 
     refs = _merge_allowed_refs(allowed_refs, allowed_references, allowed_evidence_refs)
     value = _privacy_prepare(
-        result, original_prompts=original_prompts, tool_outputs=tool_outputs
+        result,
+        refs,
+        original_prompts=original_prompts,
+        tool_outputs=tool_outputs,
     )
     _require_exact_keys(
         value,
@@ -1604,7 +1649,11 @@ def validate_episode_review_result(
 
     refs = _merge_allowed_refs(allowed_refs, allowed_references, allowed_evidence_refs)
     value = _privacy_prepare(
-        result, original_prompts=original_prompts, tool_outputs=tool_outputs
+        result,
+        refs,
+        allowed_turn_refs,
+        original_prompts=original_prompts,
+        tool_outputs=tool_outputs,
     )
     _validate_review_common(
         value,
@@ -2026,8 +2075,14 @@ def validate_adjudication_result(
         original_prompts=original_prompts,
         tool_outputs=tool_outputs,
     )
+    expected_hashes = [canonical_result_hash(primary), canonical_result_hash(secondary)]
     value = _privacy_prepare(
-        result, original_prompts=original_prompts, tool_outputs=tool_outputs
+        result,
+        refs,
+        allowed_turn_refs,
+        expected_hashes,
+        original_prompts=original_prompts,
+        tool_outputs=tool_outputs,
     )
     _validate_review_common(
         value,
@@ -2041,7 +2096,6 @@ def validate_adjudication_result(
         or value["episode_revision_ref"] != primary["episode_revision_ref"]
     ):
         raise _error("$", "adjudication is not bound to the candidate episode revision")
-    expected_hashes = [canonical_result_hash(primary), canonical_result_hash(secondary)]
     if value["candidate_result_hashes"] != expected_hashes:
         raise _error(
             "$.candidate_result_hashes",
@@ -2084,7 +2138,11 @@ def validate_topic_input(
 
     refs = _merge_allowed_refs(allowed_refs, allowed_references, allowed_evidence_refs)
     value = _privacy_prepare(
-        result, original_prompts=original_prompts, tool_outputs=tool_outputs
+        result,
+        refs,
+        allowed_turn_refs,
+        original_prompts=original_prompts,
+        tool_outputs=tool_outputs,
     )
     _require_exact_keys(
         value,
@@ -2508,6 +2566,12 @@ def validate_hierarchical_topic_result(
         _require_ref(value, path=path, allowed_refs=refs, expected_prefix=prefix)
     output = _privacy_prepare(
         result,
+        refs,
+        (
+            expected_topic_candidate_ref,
+            expected_topic_ref,
+            expected_workstream_ref,
+        ),
         original_prompts=original_prompts,
         tool_outputs=tool_outputs,
     )
@@ -2553,6 +2617,9 @@ def validate_topic_result(
     )
     value = _privacy_prepare(
         result,
+        refs,
+        allowed_turn_refs,
+        (topic_ref,),
         original_prompts=original_prompts,
         tool_outputs=tool_outputs,
     )
@@ -3002,8 +3069,16 @@ def validate_synthesis_result(
                 "independent_review_results", "contains duplicate review results"
             )
         independent_reviews_by_hash[review_hash] = validated_review
+    expected_topic_hashes = sorted(
+        canonical_result_hash(topic_result) for topic_result in topic_results
+    )
     value = _privacy_prepare(
-        result, original_prompts=original_prompts, tool_outputs=tool_outputs
+        result,
+        refs,
+        allowed_turn_refs,
+        expected_topic_hashes,
+        original_prompts=original_prompts,
+        tool_outputs=tool_outputs,
     )
     _require_exact_keys(
         value,
@@ -3033,9 +3108,6 @@ def validate_synthesis_result(
     )
     for index, digest in enumerate(topic_hashes):
         _require_sha256(digest, path=_path("$.topic_result_hashes", index))
-    expected_topic_hashes = sorted(
-        canonical_result_hash(topic_result) for topic_result in topic_results
-    )
     if topic_hashes != expected_topic_hashes:
         raise _error(
             "$.topic_result_hashes",
