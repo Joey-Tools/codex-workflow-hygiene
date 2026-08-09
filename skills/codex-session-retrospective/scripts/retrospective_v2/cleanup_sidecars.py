@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import re
 from typing import Any, Mapping, Sequence
 
 from . import safe_io
@@ -20,9 +21,27 @@ from .contracts import (
 from .orchestrator_support import InvalidTransitionError
 
 
-CLEANUP_INVENTORY_SCHEMA = "cleanup_inventory_v1"
-CLEANUP_INVENTORY_DESCRIPTOR_SCHEMA = "cleanup_inventory_descriptor_v1"
+LEGACY_CLEANUP_INVENTORY_SCHEMA = "cleanup_inventory_v1"
+LEGACY_CLEANUP_INVENTORY_DESCRIPTOR_SCHEMA = "cleanup_inventory_descriptor_v1"
+CLEANUP_INVENTORY_SCHEMA = "cleanup_inventory_v2"
+CLEANUP_INVENTORY_DESCRIPTOR_SCHEMA = "cleanup_inventory_descriptor_v2"
 CLEANUP_INVENTORY_DIRECTORY = "cleanup-inventories"
+_LEGACY_ENTRY_FIELDS = frozenset(
+    {
+        "access_policy",
+        "device",
+        "group",
+        "inode",
+        "link_count",
+        "mode",
+        "object_type",
+        "owner",
+        "relative_path",
+        "size",
+    }
+)
+_ENTRY_FIELDS = _LEGACY_ENTRY_FIELDS | {"content_commitment"}
+_CONTENT_COMMITMENT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 def _fail(message: str, error: BaseException | None = None) -> InvalidTransitionError:
@@ -62,6 +81,41 @@ def _inventory_statistics(
     return entry_count, path_byte_count
 
 
+def _validated_entries(
+    entries_by_root: Mapping[str, Any],
+    roots: Sequence[str],
+    *,
+    legacy: bool,
+) -> dict[str, list[dict[str, Any]]]:
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    expected_fields = _LEGACY_ENTRY_FIELDS if legacy else _ENTRY_FIELDS
+    for name in roots:
+        entries = entries_by_root.get(name)
+        if not isinstance(entries, list):
+            raise _fail("cleanup inventory sidecar entries are invalid")
+        normalized_entries: list[dict[str, Any]] = []
+        for raw_entry in entries:
+            if not isinstance(raw_entry, Mapping) or set(raw_entry) != expected_fields:
+                raise _fail("cleanup inventory sidecar entries are invalid")
+            entry = dict(raw_entry)
+            if legacy:
+                entry["content_commitment"] = None
+            else:
+                commitment = entry.get("content_commitment")
+                if entry.get("object_type") == "directory":
+                    if commitment is not None:
+                        raise _fail("cleanup inventory directory commitment is invalid")
+                elif (
+                    entry.get("object_type") != "file"
+                    or not isinstance(commitment, str)
+                    or _CONTENT_COMMITMENT_RE.fullmatch(commitment) is None
+                ):
+                    raise _fail("cleanup inventory file commitment is invalid")
+            normalized_entries.append(entry)
+        normalized[name] = normalized_entries
+    return normalized
+
+
 def persist(
     run_dir: Path,
     roots: Sequence[str],
@@ -70,11 +124,12 @@ def persist(
     entries_by_root = inventory.get("root_entries")
     if not isinstance(entries_by_root, Mapping) or set(entries_by_root) != set(roots):
         raise _fail("cleanup inventory sidecar entries are invalid")
-    entry_count, path_byte_count = _inventory_statistics(entries_by_root, roots)
+    normalized_entries = _validated_entries(entries_by_root, roots, legacy=False)
+    entry_count, path_byte_count = _inventory_statistics(normalized_entries, roots)
     try:
         payload = canonical_json_bytes(
             {
-                "root_entries": dict(entries_by_root),
+                "root_entries": normalized_entries,
                 "roots": list(roots),
                 "schema": CLEANUP_INVENTORY_SCHEMA,
             }
@@ -84,7 +139,7 @@ def persist(
     if len(payload) > MAX_CLEANUP_INVENTORY_BYTES:
         raise _fail("cleanup inventory sidecar exceeds its byte bound")
     digest = hashlib.sha256(payload).hexdigest()
-    name = f"cleanup-inventory-v1-{digest}.json"
+    name = f"cleanup-inventory-v2-{digest}.json"
     root = run_dir / CLEANUP_INVENTORY_DIRECTORY
     path = root / name
     try:
@@ -136,9 +191,19 @@ def load(
     path_byte_count = descriptor.get("path_byte_count")
     commitment = descriptor.get("content_commitment")
     relative_path = descriptor.get("relative_path")
+    descriptor_schema = descriptor.get("schema")
+    if descriptor_schema == CLEANUP_INVENTORY_DESCRIPTOR_SCHEMA:
+        inventory_schema = CLEANUP_INVENTORY_SCHEMA
+        filename_version = "v2"
+        legacy = False
+    elif descriptor_schema == LEGACY_CLEANUP_INVENTORY_DESCRIPTOR_SCHEMA:
+        inventory_schema = LEGACY_CLEANUP_INVENTORY_SCHEMA
+        filename_version = "v1"
+        legacy = True
+    else:
+        raise _fail("cleanup inventory descriptor is invalid")
     if (
-        descriptor.get("schema") != CLEANUP_INVENTORY_DESCRIPTOR_SCHEMA
-        or not isinstance(byte_count, int)
+        not isinstance(byte_count, int)
         or isinstance(byte_count, bool)
         or byte_count < 1
         or byte_count > MAX_CLEANUP_INVENTORY_BYTES
@@ -159,9 +224,7 @@ def load(
     digest = commitment.removeprefix("sha256:")
     if any(character not in "0123456789abcdef" for character in digest):
         raise _fail("cleanup inventory descriptor is invalid")
-    expected_relative = (
-        f"{CLEANUP_INVENTORY_DIRECTORY}/cleanup-inventory-v1-{digest}.json"
-    )
+    expected_relative = f"{CLEANUP_INVENTORY_DIRECTORY}/cleanup-inventory-{filename_version}-{digest}.json"
     if relative_path != expected_relative:
         raise _fail("cleanup inventory descriptor path is invalid")
     try:
@@ -184,19 +247,19 @@ def load(
     if (
         not isinstance(decoded, dict)
         or set(decoded) != {"root_entries", "roots", "schema"}
-        or decoded.get("schema") != CLEANUP_INVENTORY_SCHEMA
+        or decoded.get("schema") != inventory_schema
         or decoded.get("roots") != list(roots)
         or not isinstance(decoded.get("root_entries"), dict)
         or set(decoded["root_entries"]) != set(roots)
         or canonical_json_bytes(decoded) != payload
     ):
         raise _fail("cleanup inventory sidecar is invalid")
+    normalized_entries = _validated_entries(
+        decoded["root_entries"], roots, legacy=legacy
+    )
     observed_entry_count, observed_path_bytes = _inventory_statistics(
-        decoded["root_entries"],
-        roots,
+        normalized_entries, roots
     )
     if observed_entry_count != entry_count or observed_path_bytes != path_byte_count:
         raise _fail("cleanup inventory descriptor counters are invalid")
-    return {
-        name: [dict(entry) for entry in decoded["root_entries"][name]] for name in roots
-    }
+    return normalized_entries

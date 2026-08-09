@@ -80,7 +80,9 @@ superseded_by:
   copied journal still cannot reserve or mutate another run.
 - Cleanup v5 authenticates a bounded owner-only sidecar descriptor for the
   globally bytewise-sorted per-object inventory of all four fixed roots. It
-  revalidates every root twice, then records restart-safe progress in a
+  writes inventory-sidecar v2 with a SHA-256 content commitment for every file
+  while retaining authenticated contentless v1 sidecars only for legacy replay.
+  It revalidates every root twice, then records restart-safe progress in a
   claim-scoped quarantine. Same-size replacement, unproved removal, shrinkage,
   type or access-policy drift fail closed; timestamp-only and verified
   child-deletion directory metadata changes remain benign. Legacy v2/v3/v4
@@ -226,8 +228,16 @@ superseded_by:
   segments in owner-only content-addressed sidecars. The checkpoint retains only
   authenticated descriptors and compact terminal summaries; same-schema legacy
   full manifests and inline continuation payloads are conflict-checked and migrated
-  on the next acceptance. Rollback proves identity, exact bytes, single-link state,
-  and owner-only access policy before deleting a newly staged file.
+  on the next acceptance. Segmented input first uses one descriptor-held owner-only
+  spool, retains only one bounded record in memory, derives transcript/acceptance
+  commitments from compact descriptors, and removes the spool on every terminal
+  path. Final raw files and the acceptance sidecar remain checkpoint-coupled.
+  Rollback proves identity, exact bytes, single-link state, and owner-only access
+  policy before deleting a newly staged file.
+- Claim, heartbeat, accepted-result, and rejected-result mutations now validate
+  the actual candidate task and checkpoint against the 512 KiB terminal reserve.
+  Capacity failure restores the prior active claim, clears only candidate
+  envelope/sink/result staging, and records a content-free blocker.
 - Session state binds every canonical host key, derived host reference, source-cell
   host reference, and all four required source kinds. Result privacy preserves a
   reference-shaped value against source-overlap redaction only when the parent has
@@ -251,7 +261,7 @@ superseded_by:
   journal and the run's cleanup-pending checkpoint are durable. Only then may the
   sidecar become terminal; recovery accepts a fully collected bundle/sidecar pair
   but rejects one-sided disappearance as a conflict.
-- The transport boundary is an exact 14-module inventory at 7,229 lines under a
+- The transport boundary is an exact 14-module inventory at 7,214 lines under a
   7,250-line aggregate ceiling. The contract fails on membership drift, individual
   module drift, or aggregate growth instead of relying on an approximate total.
 - The public finalize command advances exactly one durable publication phase per
@@ -828,3 +838,69 @@ superseded_by:
   publication transactions and reports no skips. This terminal run supersedes
   the interrupted non-counting discovery while preserving the focused and
   affected-suite evidence above for diagnosis.
+- Fresh whole-range Codex review of signed head `1e8ae95` found three actionable
+  P1 issues: cleanup inventory did not bind same-inode file content, segmented
+  source acceptance accumulated the legal 4 GiB corpus in memory, and claim or
+  result transitions could consume the checkpoint terminal reserve. The
+  independent workspace was postvalidated and removed before repair; its result
+  is finding evidence for that superseded head, not final-head review evidence.
+- The repair writes cleanup inventory-sidecar v2 file commitments while retaining
+  authenticated v1 replay, streams segmented input through one descriptor-held
+  private spool with compact descriptor digests, and restores prior claim/result
+  state on capacity failure. Cohesive staging and reserve owners keep the source
+  coordinator slice at 2,889/3,000 lines, source staging at 593/625, transport at
+  7,214/7,250, and the branch proxy at 8,312/8,350. The six exact reviewer
+  regressions pass in 7.547 seconds and module boundaries pass 18/18 in 1.690
+  seconds under Python 3.13; affected and full host gates remain pending for this
+  uncommitted tree.
+- The complete affected identity, catalog, source-transport, orchestrator, and
+  module-boundary group passes 251/251 in 160.793 seconds. Scoped Ruff lint and
+  format checks, `git diff --check`, project-journal validation, and the installed
+  OpenAI quick skill validator pass. The skill validator first encountered
+  sandbox DNS failure while resolving its isolated `PyYAML` dependency and then
+  a documented bare-Python fallback error; the authorized network retry passed
+  and supersedes both non-counting runtime attempts.
+- A sandboxed full discovery ran 1,584 tests in 241.948 seconds before the
+  publication test class failed during disposable Ed25519 key setup; that run is
+  non-counting as a complete gate. The exact host-level publication module then
+  passed 58/58 in 656.973 seconds. The final host-level Python 3.13 discovery
+  passes all 1,630 tests in 978.525 seconds with `TMPDIR=/private/tmp`, including
+  the disposable-GPG publication transactions. One malformed `unittest` option
+  ordering exited with code 2 before discovery and is also non-counting.
+- Three bounded pre-commit audits of the uncommitted repair found additional
+  transaction windows. Cleanup rechecked a v2 inventory before deletion but did
+  not carry the expected per-file commitment into the unlink walk; segmented
+  input still retained each prepared payload and could lose rollback receipts to
+  post-create collection allocation; and accepted/rejected replay could migrate
+  a legacy inline job manifest before returning idempotently without rechecking
+  terminal reserve. The old 1,630-test result predates these findings and is now
+  superseded rather than final-tree evidence.
+- The follow-up makes recursive cleanup consume the authenticated expected
+  inventory and revalidate file identity, access policy, size, and v2 SHA-256
+  through the held descriptor immediately before unlink. Authenticated legacy
+  null commitments remain identity/policy-only compatibility. Segmented input
+  proves run-global capacity before transport iteration, enforces exact byte and
+  record caps before spool writes, uses a deterministic lease-derived spool plus
+  persistent owner-only lock for crash recovery, and preallocates a payload-free
+  receipt ledger before final-file creation. No-change result replay remains
+  reserve-neutral; replay-time legacy migration must pass the same checkpoint
+  reserve or restore the original representation and persist the blocker.
+- Exact regressions for those properties and their compatibility paths pass
+  11/11 in 11.448 seconds. A final memory audit then moved the session-shards
+  callback to each validated record instead of the end of a segment, preallocated
+  scheduler rollback slots before stage calls, and charged all 768 possible
+  persistent spool locks to cleanup capacity. The conservative cleanup maximum is
+  now 260,308/300,000 entries. Module boundaries pass 18/18 with 8,367/8,375
+  branch nodes, 20 functions over 200 lines, a 2,930/3,000-line source
+  coordinator/support slice, and 749/775 source-staging lines. The final complete
+  affected identity, catalog, source-transport, orchestrator, and module-boundary
+  group passes 257/257 in 161.921 seconds under Python 3.13.
+- The final host Python 3.13 discovery passes all 1,636 tests in 1,116.000
+  seconds with `TMPDIR=/private/tmp`. It includes the disposable-GPG publication
+  transactions, reports no skips, and supersedes the older 1,630-test result.
+  Scoped Ruff lint passes, all 19 changed Python files pass the Ruff format
+  check, `git diff --check` passes, project-journal validation passes, the skill
+  structure and validator-wrapper group passes 39/39 in 5.219 seconds, and the
+  isolated official OpenAI validator reports `Skill is valid!`. The only
+  subsequent change is this evidence-only journal update; exact-head admission,
+  review, CI, and PR lifecycle gates remain pending.

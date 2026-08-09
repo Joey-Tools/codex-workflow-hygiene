@@ -11,13 +11,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import (
-    agent_capacity,
+    agent_checkpoint_capacity,
     agent_claim_artifacts,
     agent_results,
     agent_task_inputs,
     catalog,
     result_validation,
-    safe_io,
     source_capacity,
     source_inputs,
     source_payloads,
@@ -618,25 +617,12 @@ class SourceCoordinationOperations(OrchestratorComponent):
             raise InvalidInputError(
                 "source transport receipt violates the closed contract"
             ) from error
-        if raw_records is not None and any(
-            value is not None
-            for value in (transport_streams, transport_requests, transport_segments)
-        ):
-            raise InvalidInputError(
-                "raw record files and session-shards streams are mutually exclusive"
-            )
-        if transport_segments is not None and (
-            transport_streams is not None or transport_requests is not None
-        ):
-            raise InvalidInputError(
-                "segmented and legacy session-shards inputs are mutually exclusive"
-            )
-        raw_values = {} if raw_records is None else dict(raw_records)
-        if any(
-            not isinstance(key, str) or not isinstance(value, bytes)
-            for key, value in raw_values.items()
-        ):
-            raise InvalidInputError("raw_records must map unit_ref strings to bytes")
+        raw_values, segments = source_inputs.normalize_transport_inputs(
+            raw_records=raw_records,
+            transport_streams=transport_streams,
+            transport_requests=transport_requests,
+            transport_segments=transport_segments,
+        )
 
         snapshot = self.store.read()
         state = snapshot.state
@@ -675,211 +661,138 @@ class SourceCoordinationOperations(OrchestratorComponent):
             )
         limits = self._projection._shard_limits_from_state(state)
         accepted_requests: dict[str, tuple[SessionShardsRequest, ...]] = {}
-        segments: (
-            dict[
-                str,
-                Iterable[
-                    tuple[
-                        Iterable[Mapping[str, Any]],
-                        SessionShardsRequest | Mapping[str, Any],
-                    ]
-                ],
-            ]
-            | None
-        ) = None
-        if transport_segments is not None:
-            segments = dict(transport_segments)
-        elif transport_streams is not None:
-            streams = dict(transport_streams)
-            if transport_requests is None:
-                raise InvalidInputError(
-                    "session-shards streams require exact request manifests"
-                )
-            request_values = dict(transport_requests)
-            if set(streams) != set(request_values):
-                raise InvalidInputError(
-                    "session-shards streams and requests must cover the same sources"
-                )
-            segments = {
-                source_ref: ((streams[source_ref], request_values[source_ref]),)
-                for source_ref in streams
-            }
+        consumed = source_inputs.consumed_records(transport)
+        payloads = source_inputs.SourcePayloadCollection(
+            self.identity,
+            self.run_dir,
+            consumed,
+            model_era_for_payload=lambda payload: self._projection._source_model_era(
+                _strict_source_record(payload)
+            ),
+            validate_unit_ref=lambda unit_ref: self._projection._validate_external_ref(
+                unit_ref,
+                "source_unit",
+            ),
+        )
         if segments is not None:
-            expected_source_refs = {
-                record.coordinate.source_ref
-                for record in transport.records
-                if record.accounting_class is catalog.AccountingClass.CONSUMED_CANDIDATE
-            }
+            if source_job["status"] == "runnable":
+                source_capacity.require_candidate_capacity(
+                    state["source"]["cells"],
+                    acceptance_bytes=0,
+                    byte_count=transport.total_bytes,
+                    record_count=transport.total_records,
+                )
+            expected_source_refs = source_inputs.consumed_source_refs(consumed)
             if set(segments) != expected_source_refs:
                 raise InvalidInputError(
                     "session-shards streams and requests must cover every source_ref"
                 )
-            transported: dict[str, bytes] = {}
-            for source_ref in sorted(segments):
-                consumptions, requests = consume_session_shard_segments(
-                    transport,
-                    source_ref,
-                    segments[source_ref],
-                    limits=limits,
-                )
-                accepted_requests[source_ref] = requests
-                for consumption in consumptions:
-                    for raw_record in consumption.raw_records:
-                        if raw_record.unit_ref in transported:
-                            raise InvalidInputError(
-                                "session-shards streams duplicate a source unit"
-                            )
-                        transported[raw_record.unit_ref] = raw_record.payload
-            raw_values = transported
-        elif transport_requests is not None:
-            raise InvalidInputError(
-                "session-shards requests require matching transport streams"
+            payloads.enable_streaming(
+                max_bytes=sum(record.byte_count for record in consumed.values()),
+                max_records=len(consumed),
+                spool_ref=normalized_lease,
             )
-        self._validate_received_transport_transcript(
-            normalized_lease,
-            transport,
-            source_snapshot,
-            raw_values,
-        )
-        if source_job["status"] != "runnable":
-            action_key = f"accept_source:{normalized_lease}"
-            previous = state["actions"].get(action_key)
-            digest = self._source_acceptance_digest(
+
+            def consume_record(raw_record) -> None:
+                payloads.add(raw_record.unit_ref, raw_record.payload)
+
+            try:
+                for source_ref in sorted(segments):
+                    accepted_requests[source_ref] = consume_session_shard_segments(
+                        transport,
+                        source_ref,
+                        segments[source_ref],
+                        limits=limits,
+                        on_record=consume_record,
+                    )
+            except BaseException as error:
+                payloads.discard_streamed(error)
+                raise
+        else:
+            for unit_ref, payload in sorted(raw_values.items()):
+                payloads.add(unit_ref, payload)
+        payloads.complete_missing()
+
+        try:
+            self._validate_received_transport_transcript(
+                normalized_lease,
+                transport,
+                source_snapshot,
+                payloads.payload_metadata,
+            )
+            if source_job["status"] != "runnable":
+                action_key = f"accept_source:{normalized_lease}"
+                previous = state["actions"].get(action_key)
+                digest = self._source_acceptance_digest(
+                    transport,
+                    receipt,
+                    payloads.payload_metadata,
+                    accepted_requests,
+                )
+                if previous is not None and previous.get("input_digest") != digest:
+                    raise RunConflictError(
+                        "source lease was replayed with different accepted input"
+                    )
+                if previous is not None:
+                    response = self._projection._status_view(snapshot)
+                    response.update(
+                        {
+                            "accepted": True,
+                            "action": "accept-source",
+                            "changed": False,
+                            "idempotent": True,
+                            "outcome": previous.get("outcome"),
+                        }
+                    )
+                    payloads.discard_streamed()
+                    return response
+                raise InvalidTransitionError("source lease is not runnable")
+            if transport.status in {
+                catalog.SourceCellStatus.COMPLETE,
+                catalog.SourceCellStatus.NO_ACTIVITY,
+                catalog.SourceCellStatus.VERIFIED_ABSENT,
+            } and any(
+                item.get("status") != "available" for item in payloads.staged.values()
+            ):
+                raise InvalidInputError(
+                    "terminal source transport is missing authenticated record bytes"
+                )
+            acceptance_digest = self._source_acceptance_digest(
                 transport,
                 receipt,
-                raw_values,
+                payloads.payload_metadata,
                 accepted_requests,
             )
-            if previous is not None and previous.get("input_digest") != digest:
-                raise RunConflictError(
-                    "source lease was replayed with different accepted input"
-                )
-            if previous is not None:
-                response = self._projection._status_view(snapshot)
-                response.update(
-                    {
-                        "accepted": True,
-                        "action": "accept-source",
-                        "changed": False,
-                        "idempotent": True,
-                        "outcome": previous.get("outcome"),
-                    }
-                )
-                return response
-            raise InvalidTransitionError("source lease is not runnable")
-        consumed = {
-            record.unit_ref: record
-            for record in transport.records
-            if record.accounting_class is catalog.AccountingClass.CONSUMED_CANDIDATE
-        }
-        extra_payloads = sorted(set(raw_values) - set(consumed))
-        if extra_payloads:
-            raise InvalidInputError("raw_records contains an undeclared source unit")
-
-        staged: dict[str, dict[str, Any]] = {}
-        prepared_raw_files: list[source_inputs.PreparedFile] = []
-        for unit_ref, record in consumed.items():
-            self._projection._validate_external_ref(unit_ref, "source_unit")
-            payload = raw_values.get(unit_ref)
-            if payload is None:
-                staged[unit_ref] = {"reason": "raw_payload_missing", "status": "gap"}
-                continue
-            if len(payload) != record.byte_count:
-                staged[unit_ref] = {
-                    "reason": "raw_payload_size_mismatch",
-                    "status": "gap",
-                }
-                continue
-            if catalog.content_commitment(payload) != record.content_commitment:
-                staged[unit_ref] = {
-                    "reason": "raw_payload_commitment_mismatch",
-                    "status": "gap",
-                }
-                continue
-            relative_path, prepared_file = source_inputs.prepare_raw_payload(
-                self.identity,
-                self.run_dir,
-                unit_ref,
-                payload,
-            )
-            prepared_raw_files.append(prepared_file)
-            staged[unit_ref] = {
-                "byte_count": len(payload),
-                "content_commitment": record.content_commitment,
-                "relative_path": relative_path,
-                "status": "available",
-            }
-        if transport.status in {
-            catalog.SourceCellStatus.COMPLETE,
-            catalog.SourceCellStatus.NO_ACTIVITY,
-            catalog.SourceCellStatus.VERIFIED_ABSENT,
-        } and any(item.get("status") != "available" for item in staged.values()):
-            raise InvalidInputError(
-                "terminal source transport is missing authenticated record bytes"
-            )
-
-        model_era_evidence: dict[str, tuple[str, str]] = {}
-        for unit_ref, payload_state in staged.items():
-            if payload_state.get("status") != "available":
-                continue
-            payload = raw_values[unit_ref]
-            try:
-                source_record = _strict_source_record(payload)
-                model_era = self._projection._source_model_era(source_record)
-            except (ValueError, safe_io.InvalidJsonError):
-                model_era = None
-            if model_era is not None:
-                model_era_evidence[unit_ref] = (
-                    consumed[unit_ref].coordinate.source_ref,
-                    model_era,
-                )
-
-        manifest_value = transport.to_dict()
-        acceptance_digest = self._source_acceptance_digest(
-            transport,
-            receipt,
-            raw_values,
-            accepted_requests,
-        )
+        except BaseException as error:
+            payloads.discard_streamed(error)
+            raise
         action_key = f"accept_source:{normalized_lease}"
-        segment = {
-            "lease_ref": normalized_lease,
-            "manifest": manifest_value,
-            "metrics": {
-                "byte_count": transport.total_bytes,
-                "record_count": transport.total_records,
-                "scan_byte_count": source_snapshot.terminal_byte_offset,
-            },
-            "receipt": receipt.to_dict(),
-            "receipt_ref": receipt.receipt_ref,
-            "snapshot_ref": source_snapshot.snapshot_ref,
-            "source_snapshot": source_snapshot.to_dict(),
-        }
-        segment_unit_eras = {
-            unit_ref: model_era
-            for unit_ref, (_session_ref, model_era) in model_era_evidence.items()
-        }
-        segment_session_eras: dict[str, list[str]] = {}
-        for session_ref, model_era in model_era_evidence.values():
-            segment_session_eras[session_ref] = sorted(
-                {*segment_session_eras.get(session_ref, []), model_era}
+        segment = source_inputs.segment_descriptor(
+            normalized_lease, transport, receipt, source_snapshot
+        )
+        segment_unit_eras, segment_session_eras = source_inputs.model_era_indexes(
+            payloads.model_era_evidence
+        )
+        try:
+            initial_cell = state["source"]["cells"][source_job["host"]][
+                source_job["source_kind"]
+            ]
+            initial_legacy_payloads = source_payloads.merge_payload_indexes(
+                initial_cell.get("payloads", {})
             )
-        initial_cell = state["source"]["cells"][source_job["host"]][
-            source_job["source_kind"]
-        ]
-        initial_legacy_payloads = source_payloads.merge_payload_indexes(
-            initial_cell.get("payloads", {})
-        )
-        acceptance_payloads = source_payloads.merge_payload_indexes(
-            initial_legacy_payloads, staged
-        )
-        prepared_acceptance = source_inputs.prepare_acceptance(
-            self.run_dir,
-            segment=segment,
-            payloads=acceptance_payloads,
-            model_era_by_unit=segment_unit_eras,
-            model_eras_by_session=segment_session_eras,
-        )
+            acceptance_payloads = source_payloads.merge_payload_indexes(
+                initial_legacy_payloads, payloads.staged
+            )
+            prepared_acceptance = source_inputs.prepare_acceptance(
+                self.run_dir,
+                segment=segment,
+                payloads=acceptance_payloads,
+                model_era_by_unit=segment_unit_eras,
+                model_eras_by_session=segment_session_eras,
+            )
+        except BaseException as error:
+            payloads.discard_streamed(error)
+            raise
 
         def mutate(current: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             self._state._assert_state_identity(current)
@@ -918,7 +831,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
             source_kind = job["source_kind"]
             cell = current["source"]["cells"][host][source_kind]
             payload_gaps = [
-                item for item in staged.values() if item.get("status") == "gap"
+                item for item in payloads.staged.values() if item.get("status") == "gap"
             ]
             if current_lease.resume_position != cell.get("continuation_position"):
                 raise RunConflictError(
@@ -1026,17 +939,55 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 "outcome": effective_status,
             }
 
-        prepared_files = (*prepared_raw_files, prepared_acceptance.file)
-        result = self.store.staged_transaction(
-            mutate,
-            stage=lambda: source_inputs.materialize(prepared_files),
-            rollback=source_inputs.rollback,
-        )
+        try:
+            result = self.store.staged_transaction(
+                mutate,
+                stage=lambda: payloads.materialize_with(prepared_acceptance.file),
+                rollback=source_inputs.rollback,
+            )
+        except BaseException as error:
+            payloads.discard_streamed(error)
+            raise
+        else:
+            payloads.discard_streamed()
         response = self._projection._status_view(result.snapshot)
         response.update(
             {"action": "accept-source", "changed": result.changed, **result.value}
         )
         return response
+
+    def _exhaust_agent_claim_budget(
+        self,
+        state: dict[str, Any],
+        task: dict[str, Any],
+        attempt: dict[str, Any],
+        *,
+        action_key: str,
+        attempt_ref: str,
+        budget_digest: str,
+        job_ref: str,
+        takeover: bool,
+    ) -> dict[str, Any]:
+        outcome = self._close_exhausted_agent_claim(
+            state,
+            task,
+            attempt,
+            attempt_ref=attempt_ref,
+            budget_digest=budget_digest,
+        )
+        state["actions"][action_key] = {
+            "input_digest": budget_digest,
+            "outcome": outcome,
+            "takeover": takeover,
+        }
+        return {
+            "attempt_ref": attempt_ref,
+            "claim_budget_exhausted": True,
+            "idempotent": False,
+            "job_ref": job_ref,
+            "outcome": outcome,
+            "takeover": takeover,
+        }
 
     def claim_agent_job(
         self,
@@ -1090,6 +1041,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
         def mutate(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             self._state._assert_state_identity(state)
             self._state._require_retention_active_state(state)
+            original_state = copy.deepcopy(state)
             previous_budget = state["actions"].get(budget_action_key)
             if previous_budget is not None:
                 if previous_budget.get("input_digest") != budget_input_digest:
@@ -1119,26 +1071,34 @@ class SourceCoordinationOperations(OrchestratorComponent):
             )
 
             def exhaust_claim_budget(*, takeover: bool) -> dict[str, Any]:
-                outcome = self._close_exhausted_agent_claim(
+                return self._exhaust_agent_claim_budget(
                     state,
                     task,
                     attempt,
+                    action_key=budget_action_key,
                     attempt_ref=normalized_attempt_ref,
                     budget_digest=budget_input_digest,
+                    job_ref=normalized_job_ref,
+                    takeover=takeover,
                 )
-                state["actions"][budget_action_key] = {
-                    "input_digest": budget_input_digest,
-                    "outcome": outcome,
-                    "takeover": takeover,
-                }
-                return {
-                    "attempt_ref": normalized_attempt_ref,
-                    "claim_budget_exhausted": True,
-                    "idempotent": False,
-                    "job_ref": normalized_job_ref,
-                    "outcome": outcome,
-                    "takeover": takeover,
-                }
+
+            def finalize_mutation(
+                value: dict[str, Any],
+                *,
+                changed: bool,
+            ) -> tuple[dict[str, Any], dict[str, Any]]:
+                return agent_checkpoint_capacity.finalize_claim(
+                    self.store,
+                    self._state,
+                    state,
+                    original_state,
+                    task,
+                    prepared_claim_files,
+                    value,
+                    attempt_ref=normalized_attempt_ref,
+                    changed=changed,
+                    job_ref=normalized_job_ref,
+                )
 
             if (
                 dispatch_state == "claimed"
@@ -1148,7 +1108,10 @@ class SourceCoordinationOperations(OrchestratorComponent):
                     max_bytes=result_validation.MAX_RESULT_BYTES,
                 )
             ):
-                return state, exhaust_claim_budget(takeover=expired)
+                return finalize_mutation(
+                    exhaust_claim_budget(takeover=expired),
+                    changed=True,
+                )
             heartbeat = False
             takeover = False
             new_claim = False
@@ -1191,7 +1154,10 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 takeover = expired
                 generation = int(attempt.get("claim_generation", 0)) + 1
                 if generation > MAX_AGENT_CLAIM_GENERATIONS:
-                    return state, exhaust_claim_budget(takeover=expired)
+                    return finalize_mutation(
+                        exhaust_claim_budget(takeover=expired),
+                        changed=True,
+                    )
                 active_claim_ref = self._ref(
                     RefType.CLAIM,
                     state["run_ref"],
@@ -1246,22 +1212,25 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 raise InvalidTransitionError("agent attempt cannot be claimed")
             if not new_claim:
                 self._jobs._materialize_agent_result_sink(attempt)
-            return state, {
-                "attempt_ref": normalized_attempt_ref,
-                "claim_expires_at": attempt["claim_expires_at"],
-                "claim_heartbeat_at": attempt["claim_heartbeat_at"],
-                "claim_ref": attempt["claim_ref"],
-                "dispatcher_ref": normalized_dispatcher_ref,
-                "envelope_digest": attempt["envelope_digest"],
-                "envelope_path": str(self.run_dir / attempt["envelope_path"]),
-                "envelope_size": attempt["envelope_size"],
-                "heartbeat": heartbeat,
-                "idempotent": idempotent,
-                "job_ref": normalized_job_ref,
-                "output_sink": attempt["output_sink"],
-                "result_ref": attempt["result_ref"],
-                "takeover": takeover,
-            }
+            return finalize_mutation(
+                {
+                    "attempt_ref": normalized_attempt_ref,
+                    "claim_expires_at": attempt["claim_expires_at"],
+                    "claim_heartbeat_at": attempt["claim_heartbeat_at"],
+                    "claim_ref": attempt["claim_ref"],
+                    "dispatcher_ref": normalized_dispatcher_ref,
+                    "envelope_digest": attempt["envelope_digest"],
+                    "envelope_path": str(self.run_dir / attempt["envelope_path"]),
+                    "envelope_size": attempt["envelope_size"],
+                    "heartbeat": heartbeat,
+                    "idempotent": idempotent,
+                    "job_ref": normalized_job_ref,
+                    "output_sink": attempt["output_sink"],
+                    "result_ref": attempt["result_ref"],
+                    "takeover": takeover,
+                },
+                changed=new_claim or heartbeat,
+            )
 
         transaction = self.store.staged_transaction(
             mutate,
@@ -1418,23 +1387,20 @@ class SourceCoordinationOperations(OrchestratorComponent):
         def mutate(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             self._state._assert_state_identity(state)
             self._state._require_retention_active_state(state)
+            original_state = copy.deepcopy(state)
             replay = self._check_replay(state, action_key, action_digest)
             if replay:
-                self._validate_agent_result_replay_binding(
+                return self._finalize_agent_result_replay(
                     state,
+                    original_state,
                     action_key=action_key,
                     attempt_ref=normalized_attempt_ref,
                     claim_ref=normalized_claim_ref,
                     job_ref=normalized_job_ref,
                     result_digest=result_digest,
                     result_ref=normalized_result_ref,
+                    staging=result_staging,
                 )
-                return state, {
-                    "accepted": True,
-                    "idempotent": True,
-                    "outcome": state["actions"][action_key]["outcome"],
-                    "reason": state["actions"][action_key].get("reason"),
-                }
             task = self._projection._task_for_active_job(state, normalized_job_ref)
             if task.get("stage") != state["stage"]:
                 raise InvalidTransitionError("agent job is not in the current stage")
@@ -1523,7 +1489,6 @@ class SourceCoordinationOperations(OrchestratorComponent):
                         "status": "accepted",
                     }
                 )
-                agent_capacity.validate_checkpoint_task(task)
                 state["metrics"]["accepted_agent_results"] += 1
                 outcome = "accepted"
             else:
@@ -1549,12 +1514,17 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 "outcome": outcome,
                 "reason": None if accepted else reason,
             }
-            return state, {
-                "accepted": True,
-                "idempotent": False,
-                "outcome": outcome,
-                "reason": None if accepted else reason,
-            }
+            return agent_checkpoint_capacity.finalize_result(
+                self.store,
+                self._state,
+                state,
+                original_state,
+                task,
+                job_ref=normalized_job_ref,
+                outcome=outcome,
+                reason=None if accepted else reason,
+                staging=result_staging,
+            )
 
         transaction = result_staging.commit(self.store, mutate)
         response = self._projection._status_view(transaction.snapshot)
@@ -1620,10 +1590,12 @@ class SourceCoordinationOperations(OrchestratorComponent):
         def mutate(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             self._state._assert_state_identity(state)
             self._state._require_retention_active_state(state)
+            original_state = copy.deepcopy(state)
             replay = self._check_replay(state, action_key, action_digest)
             if replay:
-                self._validate_agent_result_replay_binding(
+                return self._finalize_agent_result_replay(
                     state,
+                    original_state,
                     action_key=action_key,
                     attempt_ref=normalized_attempt_ref,
                     claim_ref=normalized_claim_ref,
@@ -1631,13 +1603,6 @@ class SourceCoordinationOperations(OrchestratorComponent):
                     result_digest=payload_digest,
                     result_ref=normalized_result_ref,
                 )
-                action = state["actions"][action_key]
-                return state, {
-                    "accepted": True,
-                    "idempotent": True,
-                    "outcome": action["outcome"],
-                    "reason": action.get("reason"),
-                }
             task = self._projection._task_for_active_job(state, normalized_job_ref)
             if task.get("stage") != state["stage"]:
                 raise InvalidTransitionError("agent job is not in the current stage")
@@ -1671,12 +1636,16 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 "outcome": outcome,
                 "reason": reason,
             }
-            return state, {
-                "accepted": True,
-                "idempotent": False,
-                "outcome": outcome,
-                "reason": reason,
-            }
+            return agent_checkpoint_capacity.finalize_result(
+                self.store,
+                self._state,
+                state,
+                original_state,
+                task,
+                job_ref=normalized_job_ref,
+                outcome=outcome,
+                reason=reason,
+            )
 
         transaction = self.store.transaction(mutate)
         response = self._projection._status_view(transaction.snapshot)
@@ -1856,7 +1825,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
         job_ref: str,
         result_digest: str,
         result_ref: str,
-    ) -> None:
+    ) -> Mapping[str, Any]:
         action = state["actions"].get(action_key)
         expected_binding = {
             "attempt_ref": attempt_ref,
@@ -1959,6 +1928,44 @@ class SourceCoordinationOperations(OrchestratorComponent):
             or attempt.get("status") not in {"failed", "review_gap"}
         ):
             raise RunConflictError("rejected agent result replay outcome changed")
+        return task
+
+    def _finalize_agent_result_replay(
+        self,
+        state: dict[str, Any],
+        original_state: Mapping[str, Any],
+        *,
+        action_key: str,
+        attempt_ref: str,
+        claim_ref: str,
+        job_ref: str,
+        result_digest: str,
+        result_ref: str,
+        staging: agent_results.Staging | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        task = self._validate_agent_result_replay_binding(
+            state,
+            action_key=action_key,
+            attempt_ref=attempt_ref,
+            claim_ref=claim_ref,
+            job_ref=job_ref,
+            result_digest=result_digest,
+            result_ref=result_ref,
+        )
+        action = state["actions"][action_key]
+        return agent_checkpoint_capacity.finalize_result(
+            self.store,
+            self._state,
+            state,
+            original_state,
+            task,
+            job_ref=job_ref,
+            outcome=action["outcome"],
+            reason=action.get("reason"),
+            staging=staging,
+            changed=state != original_state,
+            idempotent=True,
+        )
 
     def _recompute_source_metrics(self, state: dict[str, Any]) -> None:
         accepted_cells = [
@@ -1978,15 +1985,15 @@ class SourceCoordinationOperations(OrchestratorComponent):
     def _source_acceptance_digest(
         manifest: catalog.SourceTransportManifest,
         receipt: source_transport.TransportReceipt,
-        raw_records: Mapping[str, bytes],
+        payloads: Mapping[str, Mapping[str, Any]],
         transport_requests: Mapping[str, Sequence[SessionShardsRequest]] | None = None,
     ) -> str:
-        payloads = {
+        payload_descriptors = {
             unit_ref: {
-                "byte_count": len(payload),
-                "content_commitment": catalog.content_commitment(payload),
+                "byte_count": descriptor["byte_count"],
+                "content_commitment": descriptor["content_commitment"],
             }
-            for unit_ref, payload in sorted(raw_records.items())
+            for unit_ref, descriptor in sorted(payloads.items())
         }
         requests = {
             source_ref: [request.to_dict() for request in source_requests]
@@ -1997,7 +2004,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
         return content_digest(
             {
                 "manifest": manifest.to_dict(),
-                "payloads": payloads,
+                "payloads": payload_descriptors,
                 "transport_receipt": receipt.to_dict(),
                 "transport_requests": requests,
             }
@@ -2056,10 +2063,10 @@ class SourceCoordinationOperations(OrchestratorComponent):
         lease_ref: str,
         manifest: catalog.SourceTransportManifest,
         snapshot: source_transport.AuthoritativeSourceSnapshot,
-        raw_records: Mapping[str, bytes],
+        payloads: Mapping[str, Mapping[str, Any]],
     ) -> None:
-        expected_transcript = source_transport.transcript_commitment(
-            raw_records,
+        expected_transcript = catalog.transcript_descriptor_commitment(
+            payloads,
             source_marker=lease_ref,
         )
         if (
@@ -2069,7 +2076,9 @@ class SourceCoordinationOperations(OrchestratorComponent):
             raise InvalidInputError(
                 "source transport receipt does not bind the received transcript"
             )
-        received_bytes = sum(len(payload) for payload in raw_records.values())
+        received_bytes = sum(
+            int(descriptor["byte_count"]) for descriptor in payloads.values()
+        )
         if snapshot.source_byte_count != received_bytes:
             raise InvalidInputError(
                 "source transport receipt byte count does not match the transcript"

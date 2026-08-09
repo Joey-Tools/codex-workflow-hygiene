@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import re
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import catalog, safe_io, sharding
 from .contracts import (
@@ -367,6 +367,7 @@ class _SessionShardStreamConsumer:
         source_ref: str,
         request: SessionShardsRequest | Mapping[str, Any],
         limits: sharding.ShardLimits,
+        on_raw_record: Callable[[sharding.RawEvidenceRecord], None] | None = None,
     ) -> None:
         try:
             restored_request = (
@@ -401,6 +402,7 @@ class _SessionShardStreamConsumer:
         self.source_ref = source_ref
         self.request = restored_request
         self.limits = limits
+        self.on_raw_record = on_raw_record
         all_records = tuple(
             sorted(
                 (
@@ -686,9 +688,14 @@ class _SessionShardStreamConsumer:
             raise InvalidInputError("explicit-gap catalog unit carried record content")
         self._validate_json_record(payload, delimiter_bytes)
         if record.accounting_class is catalog.AccountingClass.CONSUMED_CANDIDATE:
-            self.raw_records.append(
-                sharding.RawEvidenceRecord(catalog_record=record, payload=payload)
+            evidence = sharding.RawEvidenceRecord(
+                catalog_record=record,
+                payload=payload,
             )
+            if self.on_raw_record is None:
+                self.raw_records.append(evidence)
+            else:
+                self.on_raw_record(evidence)
 
     def _advance_record(self, byte_end: int, record_end: int) -> None:
         self.next_byte = byte_end
@@ -1003,6 +1010,7 @@ def consume_session_shard_frames(
     *,
     request: SessionShardsRequest | Mapping[str, Any],
     limits: sharding.ShardLimits | None = None,
+    on_raw_record: Callable[[sharding.RawEvidenceRecord], None] | None = None,
 ) -> SessionShardConsumption:
     """Validate one stream and fully reassemble records before local sharding."""
 
@@ -1011,6 +1019,7 @@ def consume_session_shard_frames(
         source_ref,
         request,
         limits or sharding.ShardLimits(max_bytes=EXTRACTOR_SHARD_MAX_BYTES),
+        on_raw_record,
     )
     for frame in frames:
         consumer.accept(frame)

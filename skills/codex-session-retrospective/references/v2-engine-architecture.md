@@ -19,12 +19,16 @@ operate on that single coordinator context and do not import one another:
 | `orchestrator_source.py` | Source transport admission and leased agent result handling |
 | `orchestrator_lifecycle.py` | Run creation, publication claims, retention, and raw cleanup |
 | `source_capacity.py` | Run-global source, sidecar, and cleanup-capacity accounting |
+| `source_acceptance.py` | Input normalization and compact accepted-payload accounting |
+| `source_spool.py` | Lease-bound spool locking, exact pre-write limits, and crash recovery |
 | `agent_capacity.py` | Extractor/downstream task partitions and cache-miss reservations |
+| `agent_checkpoint_capacity.py` | Claim/result checkpoint-reserve rollback transactions |
 | `agent_task_inputs.py` | Authenticated immutable task-input sidecars and checkpoint summaries |
 | `agent_results.py` | Authenticated accepted-result sidecars and checkpoint-coupled staging |
 | `agent_raw_artifacts.py` | Sealed raw-artifact projection and envelope loading |
 | `extracted_turns.py` | Authenticated derived-turn sidecar preparation and loading |
 | `raw_shard_staging.py` | Two-pass source-payload streaming and raw-shard rollback ownership |
+| `source_staging.py` | Preallocated receipt ledger and atomic final-file staging |
 | `orchestrator_scheduler.py` | Stage transitions, task creation, and bounded envelope scheduling |
 
 Publication uses an explicit side-effect boundary:
@@ -76,25 +80,40 @@ authenticates the existing binding and never creates raw state, so a stale
 snapshot cannot recreate a path after retention cleanup has claimed and removed
 the raw tree.
 
+Source acceptance has a separate bounded staging boundary. Before transport
+iteration, the coordinator proves the candidate batch fits run-global source
+capacity. Segmented transport then keeps at most one bounded raw record in memory
+while appending accepted bytes to one deterministic lease-derived, owner-only,
+descriptor-held spool. A persistent owner-only lock serializes cooperating
+recovery; after the lock is acquired, a retry authenticates and removes only the
+same deterministic orphan. Exact record and byte caps are checked before each
+write. Compact per-record descriptors drive transcript validation and the
+acceptance digest. A preallocated receipt ledger exists before any final file is
+created, so rollback authority cannot be lost to a post-create collection
+allocation. Replay, failure, rollback, and success all discard the exact spool.
+
 The transport program commitment includes every runtime module above. Adding a
 module without adding it to the closed allowlist fails source transport.
 
-The transport slice remains independently bounded after this hardening: 7,229
+The transport slice remains independently bounded after this hardening: 7,214
 physical lines across a 7,250-line aggregate limit. One exact 14-module
 inventory and its aggregate are enforced together, so omitting a transport
 module cannot create a false budget pass. The newly affected modules are
 `transport_program.py` at 432/450 lines, `transport_remote.py` at 315/320,
 `transport_snapshot.py` at 213/220, and `transport_remote_snapshot.py` at
-86/100. The global branch proxy measures 8,230 nodes against an 8,250-node
-ceiling. The current increase is confined to run-global source/shard/task
+86/100, while `transport_contracts.py` is 984/1,000. The global branch proxy
+measures 8,367 nodes against an 8,375-node ceiling. The source coordinator and
+its original support slice are 2,930/3,000 lines; the three source-staging modules
+are independently capped at 749/775, and the claim/result reserve owner is
+123/130. The current increase is confined to run-global source/shard/task
 capacity, authenticated task/result/derived sidecars, and checkpoint-coupled
 staging; no additional coordinator capability or transport monolith was
 introduced. The six agent support modules are independently bounded at
-1,027/1,050 aggregate lines; their individual ceilings are 100, 120, 320, 350,
+1,030/1,050 aggregate lines; their individual ceilings are 100, 120, 320, 350,
 200, and 100 lines. Raw-artifact and derived-turn loading remain separate so
 `orchestrator_jobs.py` stays at 507/520 lines, while
 `orchestrator_reduction.py`, `orchestrator_scheduler.py`, and
-`orchestrator_source.py` stay at 2,465/2,480, 1,093/1,100, and 2,137/2,150 lines.
+`orchestrator_source.py` stay at 2,465/2,480, 1,092/1,100, and 2,146/2,150 lines.
 
 ## Architecture inventory
 

@@ -45,6 +45,9 @@ class PreparedAgentResult:
 class Staging:
     files: list[source_inputs.PreparedFile] = field(default_factory=list)
 
+    def clear(self) -> None:
+        self.files.clear()
+
     def prepare(
         self,
         run_dir: Path,

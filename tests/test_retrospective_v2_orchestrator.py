@@ -1941,6 +1941,39 @@ class OrchestratorTests(unittest.TestCase):
                 limits=limits,
             )
 
+    def test_session_shard_callback_delivers_without_segment_accumulation(self) -> None:
+        limits = sharding.ShardLimits(max_bytes=128 * 1024)
+        coordinator = self.start_daily("transport-record-callback")
+        coordinator.advance()
+        lease = coordinator.status()["active_source_leases"][0]
+        payloads = [b'{"ordinal":0}\n', b'{"ordinal":1}\n']
+        manifest, records, source_ref = activity_manifest(lease, payloads)
+        request, frames = record_stream_frames(
+            records,
+            payloads,
+            limits,
+            token_seed="transport-record-callback",
+        )
+        delivered = []
+
+        def observed_frames():
+            for frame in frames:
+                if frame["kind"] == "stream_end":
+                    self.assertEqual(2, len(delivered))
+                yield frame
+
+        consumption = consume_session_shard_frames(
+            manifest,
+            source_ref,
+            observed_frames(),
+            request=request,
+            limits=limits,
+            on_raw_record=delivered.append,
+        )
+
+        self.assertEqual((), consumption.raw_records)
+        self.assertEqual(payloads, [record.payload for record in delivered])
+
     def test_accept_source_consumes_a_frame_limited_segment_chain(self) -> None:
         limits = sharding.ShardLimits(
             max_bytes=orchestrator_module.EXTRACTOR_SHARD_MAX_BYTES
@@ -1975,22 +2008,48 @@ class OrchestratorTests(unittest.TestCase):
             for record, payload in zip(records, payloads, strict=True)
         }
 
-        result = coordinator.accept_source(
-            lease["lease_ref"],
-            manifest.to_dict(),
-            transport_receipt=authenticated_receipt(
-                coordinator,
-                lease,
-                manifest,
-                raw_records,
+        spooled_units: list[str] = []
+        real_add = source_inputs.StreamingRawPayloadStaging.add
+
+        def observed_add(staging, unit_ref, payload):
+            value = real_add(staging, unit_ref, payload)
+            spooled_units.append(unit_ref)
+            return value
+
+        def observed_second_frames():
+            self.assertEqual(split, len(spooled_units))
+            yield from second_frames
+
+        with (
+            mock.patch.object(
+                source_inputs.StreamingRawPayloadStaging,
+                "add",
+                new=observed_add,
             ),
-            transport_segments={
-                source_ref: (
-                    (first_frames, first_request),
-                    (second_frames, second_request),
-                )
-            },
-        )
+            mock.patch.object(
+                source_inputs,
+                "prepare_raw_payload",
+                side_effect=AssertionError(
+                    "segmented transport must not retain prepared raw bytes"
+                ),
+            ),
+        ):
+            result = coordinator.accept_source(
+                lease["lease_ref"],
+                manifest.to_dict(),
+                transport_receipt=authenticated_receipt(
+                    coordinator,
+                    lease,
+                    manifest,
+                    raw_records,
+                ),
+                transport_segments={
+                    source_ref: (
+                        (first_frames, first_request),
+                        (observed_second_frames(), second_request),
+                    )
+                },
+            )
 
         self.assertTrue(result["accepted"])
         self.assertEqual("complete", result["outcome"])
@@ -2001,6 +2060,174 @@ class OrchestratorTests(unittest.TestCase):
             len(payloads),
             cell["metrics"]["record_count"],
         )
+        spool_root = (
+            coordinator.run_dir / source_inputs.SOURCE_TRANSPORT_SPOOL_DIRECTORY
+        )
+        self.assertFalse(any(spool_root.glob("source-spool-*.bin")))
+
+    def test_segmented_source_failure_discards_private_spool(self) -> None:
+        limits = sharding.ShardLimits(
+            max_bytes=orchestrator_module.EXTRACTOR_SHARD_MAX_BYTES
+        )
+        coordinator = self.start_daily("transport-segment-spool-rollback")
+        coordinator.advance()
+        lease = next(
+            item
+            for item in coordinator.status()["active_source_leases"]
+            if item["host"] == "local"
+        )
+        payload = b'{"timestamp":"2026-07-06T01:00:00Z"}\n'
+        manifest, records, source_ref = activity_manifest(lease, [payload])
+        request, frames = record_stream_frames(
+            records,
+            [payload],
+            limits,
+            token_seed="transport-segment-spool-rollback",
+        )
+        raw_records = {records[0].unit_ref: payload}
+
+        with (
+            mock.patch.object(
+                source_inputs,
+                "prepare_acceptance",
+                side_effect=InvalidTransitionError("injected acceptance failure"),
+            ),
+            self.assertRaisesRegex(InvalidTransitionError, "injected acceptance"),
+        ):
+            coordinator.accept_source(
+                lease["lease_ref"],
+                manifest.to_dict(),
+                transport_receipt=authenticated_receipt(
+                    coordinator,
+                    lease,
+                    manifest,
+                    raw_records,
+                ),
+                transport_segments={source_ref: (((frames), request),)},
+            )
+
+        spool_root = (
+            coordinator.run_dir / source_inputs.SOURCE_TRANSPORT_SPOOL_DIRECTORY
+        )
+        self.assertFalse(any(spool_root.glob("source-spool-*.bin")))
+        self.assertFalse(
+            (
+                coordinator.run_dir
+                / source_inputs.raw_payload_relative_path(
+                    coordinator.identity,
+                    records[0].unit_ref,
+                    len(payload),
+                )
+            ).exists()
+        )
+
+    def test_segmented_source_capacity_blocks_before_transport_iteration(self) -> None:
+        limits = sharding.ShardLimits(
+            max_bytes=orchestrator_module.EXTRACTOR_SHARD_MAX_BYTES
+        )
+        coordinator = self.start_daily("transport-segment-capacity-preflight")
+        coordinator.advance()
+        lease = next(
+            item
+            for item in coordinator.status()["active_source_leases"]
+            if item["host"] == "local"
+        )
+        payload = b'{"timestamp":"2026-07-06T01:00:00Z"}\n'
+        manifest, records, source_ref = activity_manifest(lease, [payload])
+        request, frames = record_stream_frames(
+            records,
+            [payload],
+            limits,
+            token_seed="transport-segment-capacity-preflight",
+        )
+        iterated = False
+
+        def forbidden_frames():
+            nonlocal iterated
+            iterated = True
+            yield from frames
+
+        with (
+            mock.patch(
+                "retrospective_v2.orchestrator_source.source_capacity."
+                "require_candidate_capacity",
+                side_effect=InvalidTransitionError("injected source capacity"),
+            ),
+            self.assertRaisesRegex(InvalidTransitionError, "source capacity"),
+        ):
+            coordinator.accept_source(
+                lease["lease_ref"],
+                manifest.to_dict(),
+                transport_receipt=authenticated_receipt(
+                    coordinator,
+                    lease,
+                    manifest,
+                    {records[0].unit_ref: payload},
+                ),
+                transport_segments={
+                    source_ref: ((forbidden_frames(), request),),
+                },
+            )
+
+        self.assertFalse(iterated)
+        spool_root = (
+            coordinator.run_dir / source_inputs.SOURCE_TRANSPORT_SPOOL_DIRECTORY
+        )
+        self.assertFalse(spool_root.exists())
+
+    def test_streaming_source_spool_is_bounded_recoverable_and_receipt_only(
+        self,
+    ) -> None:
+        coordinator = self.start_daily("bounded-source-spool")
+        bounded = source_inputs.StreamingRawPayloadStaging(
+            coordinator.identity,
+            coordinator.run_dir,
+            max_bytes=3,
+            max_records=1,
+            spool_ref="bounded",
+        )
+        with self.assertRaisesRegex(InvalidTransitionError, "byte bound"):
+            bounded.add("oversized", b"four")
+        self.assertEqual(0, os.fstat(bounded._descriptor).st_size)
+        bounded.add("first", b"one")
+        with self.assertRaisesRegex(InvalidTransitionError, "record bound"):
+            bounded.add("second", b"")
+        self.assertEqual(3, os.fstat(bounded._descriptor).st_size)
+        bounded.discard()
+
+        crashed = source_inputs.StreamingRawPayloadStaging(
+            coordinator.identity,
+            coordinator.run_dir,
+            max_bytes=16,
+            max_records=2,
+            spool_ref="recoverable",
+        )
+        crashed.add("stale", b"stale")
+        orphan_path = crashed._path
+        self.assertTrue(orphan_path.is_file())
+        self.assertIsNone(crashed._close_all(None))
+        crashed._closed = True
+
+        recovered = source_inputs.StreamingRawPayloadStaging(
+            coordinator.identity,
+            coordinator.run_dir,
+            max_bytes=16,
+            max_records=2,
+            spool_ref="recoverable",
+        )
+        self.assertEqual(0, os.fstat(recovered._descriptor).st_size)
+        descriptor = recovered.add("current", b"current")
+        materialized = recovered.materialize()
+        self.assertIsInstance(materialized, source_inputs.MaterializedFiles)
+        self.assertTrue(
+            all(
+                receipt is None or isinstance(receipt, safe_io.AtomicCreateReceipt)
+                for receipt in materialized.receipts
+            )
+        )
+        self.assertTrue((coordinator.run_dir / descriptor["relative_path"]).is_file())
+        source_inputs.rollback(materialized)
+        self.assertFalse(orphan_path.exists())
 
     def test_transport_replays_physical_offsets_not_record_identity_order(
         self,
@@ -3472,6 +3699,102 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(replay["idempotent"])
         assert_migrated(completed, completed_job["active_attempt_ref"])
 
+    def test_agent_result_replay_migration_preserves_terminal_reserve(self) -> None:
+        for disposition in ("accept", "reject"):
+            with self.subTest(disposition=disposition):
+                coordinator = self.activity_run(
+                    f"legacy-result-replay-capacity-{disposition}"
+                )
+                job = coordinator.status()["runnable_jobs"][0]
+                claimed = coordinator.claim_agent_job(
+                    job["job_ref"],
+                    job["active_attempt_ref"],
+                    typed_ref(RefType.LEASE, f"legacy-{disposition}-dispatcher"),
+                )
+                if disposition == "accept":
+                    submitted = self.extractor_result(job)
+                    RetrospectiveOrchestrator.accept_agent_result(
+                        coordinator,
+                        job["job_ref"],
+                        job["active_attempt_ref"],
+                        submitted,
+                        claim_ref=claimed["claim_ref"],
+                        result_ref=claimed["result_ref"],
+                    )
+
+                    def replay_result():
+                        return RetrospectiveOrchestrator.accept_agent_result(
+                            coordinator,
+                            job["job_ref"],
+                            job["active_attempt_ref"],
+                            submitted,
+                            claim_ref=claimed["claim_ref"],
+                            result_ref=claimed["result_ref"],
+                        )
+
+                else:
+                    coordinator.reject_agent_result_payload(
+                        job["job_ref"],
+                        job["active_attempt_ref"],
+                        claim_ref=claimed["claim_ref"],
+                        result_ref=claimed["result_ref"],
+                        payload_digest="a" * 64,
+                        reason="malformed_json",
+                    )
+
+                    def replay_result():
+                        return coordinator.reject_agent_result_payload(
+                            job["job_ref"],
+                            job["active_attempt_ref"],
+                            claim_ref=claimed["claim_ref"],
+                            result_ref=claimed["result_ref"],
+                            payload_digest="a" * 64,
+                            reason="malformed_json",
+                        )
+
+                with mock.patch.object(
+                    coordinator.store,
+                    "has_operating_capacity",
+                    return_value=False,
+                ):
+                    unchanged = replay_result()
+                self.assertTrue(unchanged["idempotent"])
+
+                def install_legacy_manifest(state):
+                    task = state["jobs"][job["task_ref"]]
+                    attempt = next(
+                        value
+                        for value in task["attempts"]
+                        if value["attempt_ref"] == job["active_attempt_ref"]
+                    )
+                    attempt["job_manifest"] = coordinator._execution_manifest(
+                        state,
+                        task,
+                        attempt["ordinal"],
+                    )
+                    attempt.pop("job_manifest_digest")
+                    return state, None
+
+                coordinator.store.transaction(install_legacy_manifest)
+                with mock.patch.object(
+                    coordinator.store,
+                    "has_operating_capacity",
+                    return_value=False,
+                ):
+                    blocked = replay_result()
+
+                state = coordinator.load_state()
+                attempt = next(
+                    value
+                    for value in state["jobs"][job["task_ref"]]["attempts"]
+                    if value["attempt_ref"] == job["active_attempt_ref"]
+                )
+                self.assertFalse(blocked["accepted"])
+                self.assertTrue(blocked["checkpoint_capacity_exhausted"])
+                self.assertEqual(RunStage.BLOCKED.value, state["stage"])
+                self.assertIn("job_manifest", attempt)
+                self.assertNotIn("job_manifest_digest", attempt)
+
     def test_agent_claim_budget_retries_once_then_records_explicit_gap(self) -> None:
         coordinator = self.activity_run("bounded-agent-claim-generations")
 
@@ -4119,6 +4442,100 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(RunStage.BLOCKED.value, blocked["stage"])
         self.assertEqual(before_files, raw_input_files())
 
+    def test_agent_claim_capacity_failure_restores_task_without_artifacts(
+        self,
+    ) -> None:
+        coordinator = self.activity_run("agent-claim-capacity")
+        job = coordinator.status()["runnable_jobs"][0]
+        before = {
+            path.relative_to(coordinator.run_dir)
+            for root in ("agent-sinks", "raw-inputs/agent-claims")
+            for path in (coordinator.run_dir / root).glob("*.json")
+        }
+
+        with mock.patch.object(
+            coordinator.store,
+            "has_operating_capacity",
+            return_value=False,
+        ):
+            blocked = coordinator.claim_agent_job(
+                job["job_ref"],
+                job["active_attempt_ref"],
+                typed_ref(RefType.LEASE, "capacity-blocked-dispatcher"),
+            )
+
+        state = coordinator.load_state()
+        task = state["jobs"][job["task_ref"]]
+        attempt = task["attempts"][0]
+        after = {
+            path.relative_to(coordinator.run_dir)
+            for root in ("agent-sinks", "raw-inputs/agent-claims")
+            for path in (coordinator.run_dir / root).glob("*.json")
+        }
+        self.assertTrue(blocked["checkpoint_capacity_exhausted"])
+        self.assertEqual("blocked", blocked["outcome"])
+        self.assertEqual(RunStage.BLOCKED.value, state["stage"])
+        self.assertEqual("unclaimed", attempt["dispatch_state"])
+        self.assertIsNone(attempt["claim_ref"])
+        self.assertEqual(before, after)
+        self.assertEqual(
+            {"checkpoint_capacity_exhausted"},
+            {gap["reason"] for gap in state["gaps"]},
+        )
+
+    def test_agent_result_capacity_failure_restores_claim_and_sidecars(
+        self,
+    ) -> None:
+        for disposition in ("accept", "reject"):
+            with self.subTest(disposition=disposition):
+                coordinator = self.activity_run(f"agent-result-capacity-{disposition}")
+                job = coordinator.status()["runnable_jobs"][0]
+                claimed = coordinator.claim_agent_job(
+                    job["job_ref"],
+                    job["active_attempt_ref"],
+                    typed_ref(RefType.LEASE, f"{disposition}-capacity-dispatcher"),
+                )
+                result_root = coordinator.run_dir / agent_results.AGENT_RESULT_DIRECTORY
+                before_results = (
+                    set(result_root.glob("*.json")) if result_root.exists() else set()
+                )
+                with mock.patch.object(
+                    coordinator.store,
+                    "has_operating_capacity",
+                    return_value=False,
+                ):
+                    if disposition == "accept":
+                        blocked = RetrospectiveOrchestrator.accept_agent_result(
+                            coordinator,
+                            job["job_ref"],
+                            job["active_attempt_ref"],
+                            self.extractor_result(job),
+                            claim_ref=claimed["claim_ref"],
+                            result_ref=claimed["result_ref"],
+                        )
+                    else:
+                        blocked = coordinator.reject_agent_result_payload(
+                            job["job_ref"],
+                            job["active_attempt_ref"],
+                            claim_ref=claimed["claim_ref"],
+                            result_ref=claimed["result_ref"],
+                            payload_digest="a" * 64,
+                            reason="malformed_json",
+                        )
+
+                state = coordinator.load_state()
+                task = state["jobs"][job["task_ref"]]
+                attempt = task["attempts"][0]
+                after_results = (
+                    set(result_root.glob("*.json")) if result_root.exists() else set()
+                )
+                self.assertFalse(blocked["accepted"])
+                self.assertTrue(blocked["checkpoint_capacity_exhausted"])
+                self.assertEqual(RunStage.BLOCKED.value, state["stage"])
+                self.assertEqual("claimed", attempt["dispatch_state"])
+                self.assertEqual(claimed["claim_ref"], attempt["claim_ref"])
+                self.assertEqual(before_results, after_results)
+
     def test_staged_transaction_rollback_continues_across_independent_stages(
         self,
     ) -> None:
@@ -4144,6 +4561,20 @@ class OrchestratorTests(unittest.TestCase):
                 for note in caught.exception.__notes__
             )
         )
+
+    def test_staged_transaction_preallocates_receipt_ledger(self) -> None:
+        rolled_back = []
+
+        def rollback(receipt):
+            rolled_back.append(receipt)
+
+        materialized = StageSchedulingOperations._stage_raw_materializations(
+            [(lambda: "first", rollback), (lambda: "second", rollback)]
+        )
+
+        self.assertEqual([[rollback, "first"], [rollback, "second"]], materialized)
+        StageSchedulingOperations._rollback_raw_materializations(materialized)
+        self.assertEqual(["second", "first"], rolled_back)
 
     def test_all_post_extraction_jobs_partition_under_complete_envelope_cap(
         self,
@@ -5973,6 +6404,44 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(
             set(orchestrator_module.SHADOW_CLEANUP_ROOTS), set(loaded_entries)
         )
+        legacy_entries = copy.deepcopy(loaded_entries)
+        for entries in legacy_entries.values():
+            for entry in entries:
+                entry.pop("content_commitment")
+        legacy_payload = canonical_json_bytes(
+            {
+                "root_entries": legacy_entries,
+                "roots": list(orchestrator_module.SHADOW_CLEANUP_ROOTS),
+                "schema": cleanup_sidecars.LEGACY_CLEANUP_INVENTORY_SCHEMA,
+            }
+        )
+        legacy_digest = hashlib.sha256(legacy_payload).hexdigest()
+        legacy_relative = (
+            f"cleanup-inventories/cleanup-inventory-v1-{legacy_digest}.json"
+        )
+        safe_io.atomic_create_bytes(
+            current.run_dir / legacy_relative,
+            legacy_payload,
+        )
+        legacy_descriptor = {
+            **current_claim["inventory_descriptor"],
+            "byte_count": len(legacy_payload),
+            "content_commitment": f"sha256:{legacy_digest}",
+            "relative_path": legacy_relative,
+            "schema": cleanup_sidecars.LEGACY_CLEANUP_INVENTORY_DESCRIPTOR_SCHEMA,
+        }
+        loaded_legacy = cleanup_sidecars.load(
+            current.run_dir,
+            orchestrator_module.SHADOW_CLEANUP_ROOTS,
+            legacy_descriptor,
+        )
+        self.assertTrue(
+            all(
+                entry["content_commitment"] is None
+                for entries in loaded_legacy.values()
+                for entry in entries
+            )
+        )
         self.assertEqual(
             list(orchestrator_module.SHADOW_CLEANUP_ROOTS),
             current_claim["raw_path_inventory"],
@@ -6232,6 +6701,45 @@ class OrchestratorTests(unittest.TestCase):
         self.assertNotEqual(original_inode, payload.stat().st_ino)
         self.assertEqual(b"x" * len(original), payload.read_bytes())
 
+    def test_expired_cleanup_claim_rejects_same_inode_same_size_content_change(
+        self,
+    ) -> None:
+        coordinator = self.start_daily("expired-cleanup-content-change")
+        raw_root = coordinator.run_dir / "raw-inputs"
+        payload = raw_root / "retained.bin"
+        original = b"retained before content-bound cleanup claim"
+        replacement = b"x" * len(original)
+        payload.write_bytes(original)
+        os.chmod(payload, 0o600)
+        original_inode = payload.stat().st_ino
+        self.clock.value += dt.timedelta(days=8)
+        original_delete = coordinator._delete_claimed_raw_paths
+
+        def mutate_after_claim(cleanup_claim):
+            with payload.open("r+b") as stream:
+                stream.write(replacement)
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.assertEqual(original_inode, payload.stat().st_ino)
+            original_delete(cleanup_claim)
+
+        with mock.patch.object(
+            coordinator,
+            "_delete_claimed_raw_paths",
+            side_effect=mutate_after_claim,
+        ):
+            result = coordinator.gc_expired_raw()
+
+        state = coordinator.load_state()
+        descriptor = state["publication"]["expired_cleanup_claim"][
+            "inventory_descriptor"
+        ]
+        self.assertEqual("cleanup_inventory_descriptor_v2", descriptor["schema"])
+        self.assertFalse(result["cleaned"])
+        self.assertEqual("UnsafePathError", result["cleanup_error"])
+        self.assertEqual(original_inode, payload.stat().st_ino)
+        self.assertEqual(replacement, payload.read_bytes())
+
     def test_expired_cleanup_claim_rejects_child_shrink_removal_or_policy_change(
         self,
     ) -> None:
@@ -6346,6 +6854,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(
             contracts.MAX_CONSERVATIVE_RUN_CLEANUP_ENTRIES,
             contracts.ATOMIC_CREATE_ENTRIES_PER_FILE * target_file_count
+            + contracts.MAX_RUN_SOURCE_SPOOL_LOCKS
             + contracts.MAX_CLEANUP_FIXED_ENTRY_RESERVE,
         )
         self.assertLessEqual(
@@ -6417,7 +6926,13 @@ class OrchestratorTests(unittest.TestCase):
         real_remove = cleanup_inventory.safe_io.secure_remove_tree_at
         crashed = False
 
-        def remove_one_child_then_crash(parent_fd, name, *, display_path):
+        def remove_one_child_then_crash(
+            parent_fd,
+            name,
+            *,
+            display_path,
+            expected_inventory=None,
+        ):
             nonlocal crashed
             if not crashed and display_path.name.startswith("root-"):
                 root_fd = os.open(
@@ -6432,7 +6947,12 @@ class OrchestratorTests(unittest.TestCase):
                     os.close(root_fd)
                 crashed = True
                 raise OSError("simulated crash after child deletion")
-            return real_remove(parent_fd, name, display_path=display_path)
+            return real_remove(
+                parent_fd,
+                name,
+                display_path=display_path,
+                expected_inventory=expected_inventory,
+            )
 
         with mock.patch.object(
             cleanup_inventory.safe_io,
@@ -6465,9 +6985,20 @@ class OrchestratorTests(unittest.TestCase):
         real_remove = cleanup_inventory.safe_io.secure_remove_tree_at
         crashed = False
 
-        def remove_root_then_crash(parent_fd, name, *, display_path):
+        def remove_root_then_crash(
+            parent_fd,
+            name,
+            *,
+            display_path,
+            expected_inventory=None,
+        ):
             nonlocal crashed
-            removed = real_remove(parent_fd, name, display_path=display_path)
+            removed = real_remove(
+                parent_fd,
+                name,
+                display_path=display_path,
+                expected_inventory=expected_inventory,
+            )
             if not crashed and display_path.name.startswith("root-"):
                 crashed = True
                 raise OSError("simulated crash after root deletion")
@@ -6487,6 +7018,72 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(recovered["cleaned"])
         for name in orchestrator_module.SHADOW_CLEANUP_ROOTS:
             self.assertFalse((coordinator.run_dir / name).exists())
+
+    def test_cleanup_v5_rejects_content_mutation_after_inventory_validation(
+        self,
+    ) -> None:
+        coordinator = self.start_daily("cleanup-delete-time-content-binding")
+        payload = coordinator.run_dir / "raw-inputs" / "mutable.bin"
+        payload.write_bytes(b"before")
+        os.chmod(payload, 0o600)
+        self.clock.value += dt.timedelta(days=8)
+        with mock.patch.object(
+            coordinator,
+            "_delete_claimed_raw_paths",
+            side_effect=safe_io.UnsafePathError("persist claim before cleanup"),
+        ):
+            self.assertFalse(coordinator.gc_expired_raw()["cleaned"])
+        real_remove = cleanup_inventory.safe_io.secure_remove_tree_at
+        mutated = False
+
+        def mutate_then_remove(
+            parent_fd,
+            name,
+            *,
+            display_path,
+            expected_inventory=None,
+        ):
+            nonlocal mutated
+            if not mutated and display_path.name.startswith("root-"):
+                root_fd = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    dir_fd=parent_fd,
+                )
+                try:
+                    file_fd = os.open("mutable.bin", os.O_WRONLY, dir_fd=root_fd)
+                    try:
+                        os.pwrite(file_fd, b"after!", 0)
+                        os.fsync(file_fd)
+                    finally:
+                        os.close(file_fd)
+                finally:
+                    os.close(root_fd)
+                mutated = True
+            return real_remove(
+                parent_fd,
+                name,
+                display_path=display_path,
+                expected_inventory=expected_inventory,
+            )
+
+        with mock.patch.object(
+            cleanup_inventory.safe_io,
+            "secure_remove_tree_at",
+            side_effect=mutate_then_remove,
+        ):
+            blocked = coordinator.gc_expired_raw()
+
+        self.assertTrue(mutated)
+        self.assertFalse(blocked["cleaned"])
+        self.assertEqual("UnsafePathError", blocked["cleanup_error"])
+        retained = list(
+            (
+                coordinator.run_dir / cleanup_inventory.CLEANUP_QUARANTINE_DIRECTORY
+            ).rglob("mutable.bin")
+        )
+        self.assertEqual(1, len(retained))
+        self.assertEqual(b"after!", retained[0].read_bytes())
 
     def test_cleanup_v5_rejects_all_roots_missing_without_progress(self) -> None:
         coordinator = self.start_daily("cleanup-unproved-all-missing")

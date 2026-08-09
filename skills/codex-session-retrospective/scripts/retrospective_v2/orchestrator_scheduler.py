@@ -218,16 +218,14 @@ class StageSchedulingOperations(OrchestratorComponent):
     @staticmethod
     def _stage_raw_materializations(
         stages: list[tuple[Any, Any]],
-    ) -> tuple[tuple[Any, Any], ...]:
-        materialized: list[tuple[Any, Any]] = []
+    ) -> list[list[Any]]:
+        materialized = [[rollback, None] for _stage, rollback in stages]
         try:
-            for stage, rollback in stages:
-                materialized.append((rollback, stage()))
+            for index, (stage, _rollback) in enumerate(stages):
+                materialized[index][1] = stage()
         except BaseException as error:
             try:
-                StageSchedulingOperations._rollback_raw_materializations(
-                    tuple(materialized)
-                )
+                StageSchedulingOperations._rollback_raw_materializations(materialized)
             except BaseException as rollback_error:
                 if hasattr(error, "add_note"):
                     error.add_note(
@@ -235,26 +233,27 @@ class StageSchedulingOperations(OrchestratorComponent):
                         f"files retained ({type(rollback_error).__name__})"
                     )
             raise
-        return tuple(materialized)
+        return materialized
 
     @staticmethod
     def _rollback_raw_materializations(
-        materialized: tuple[tuple[Any, Any], ...],
+        materialized: list[list[Any]] | tuple[tuple[Any, Any], ...],
     ) -> None:
-        failures: list[BaseException] = []
+        primary: BaseException | None = None
         for rollback, receipt in reversed(materialized):
+            if receipt is None:
+                continue
             try:
                 rollback(receipt)
             except BaseException as error:
-                failures.append(error)
-        if failures:
-            primary = failures[0]
-            if hasattr(primary, "add_note"):
-                for secondary in failures[1:]:
+                if primary is None:
+                    primary = error
+                elif hasattr(primary, "add_note"):
                     primary.add_note(
                         "additional staged rollback failure: "
-                        f"{type(secondary).__name__}: {secondary}"
+                        f"{type(error).__name__}: {error}"
                     )
+        if primary is not None:
             raise primary
 
     def _advance_sharding(

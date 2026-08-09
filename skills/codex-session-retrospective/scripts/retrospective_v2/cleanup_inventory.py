@@ -6,6 +6,7 @@ import copy
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
+import re
 from typing import Any, Mapping, Sequence
 
 from . import cleanup_sidecars, safe_io
@@ -20,6 +21,7 @@ from .orchestrator_support import (
 COUNTER_FIELDS = ("byte_count", "directory_count", "file_count")
 ENTRY_FIELDS = {
     "access_policy",
+    "content_commitment",
     "device",
     "group",
     "inode",
@@ -30,6 +32,8 @@ ENTRY_FIELDS = {
     "relative_path",
     "size",
 }
+LEGACY_ENTRY_FIELDS = ENTRY_FIELDS - {"content_commitment"}
+CONTENT_COMMITMENT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 INTEGER_ENTRY_FIELDS = (
     "device",
     "group",
@@ -151,6 +155,20 @@ def _validate_entries(
                 label,
             )
         _require(object_type in {"directory", "file"}, label)
+        content_commitment = entry["content_commitment"]
+        _require(
+            (
+                object_type == "directory"
+                and content_commitment is None
+                or object_type == "file"
+                and (
+                    content_commitment is None
+                    or isinstance(content_commitment, str)
+                    and CONTENT_COMMITMENT_RE.fullmatch(content_commitment) is not None
+                )
+            ),
+            label,
+        )
         _require(
             all(
                 (
@@ -238,6 +256,25 @@ def validate_claim_inventory(
             label,
         )
         _require(descriptor is None, label)
+        assert isinstance(entries_by_root, Mapping)
+        normalized_inline: dict[str, list[dict[str, Any]]] = {}
+        for name in roots:
+            raw_entries = entries_by_root[name]
+            _require(isinstance(raw_entries, list), label)
+            normalized_inline[name] = []
+            for raw_entry in raw_entries:
+                _require(
+                    isinstance(raw_entry, Mapping)
+                    and (
+                        set(raw_entry) == ENTRY_FIELDS
+                        or set(raw_entry) == LEGACY_ENTRY_FIELDS
+                    ),
+                    label,
+                )
+                entry = dict(raw_entry)
+                entry.setdefault("content_commitment", None)
+                normalized_inline[name].append(entry)
+        entries_by_root = normalized_inline
     elif schema in SIDECAR_EXACT_CLAIM_SCHEMAS:
         _require(entries_by_root is None, label)
         entries_by_root = cleanup_sidecars.load(run_dir, roots, descriptor)
@@ -499,6 +536,31 @@ def _create_marker(
         )
 
 
+def _entry_matches(
+    entry: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    relaxed_directory_metadata: bool,
+) -> bool:
+    if entry["object_type"] != expected["object_type"]:
+        return False
+    if entry["object_type"] == "file":
+        stable_fields = ENTRY_FIELDS - {"content_commitment"}
+        if any(entry[field] != expected[field] for field in stable_fields):
+            return False
+        expected_commitment = expected["content_commitment"]
+        return (
+            expected_commitment is None
+            or entry["content_commitment"] == expected_commitment
+        )
+    stable_fields = (
+        ENTRY_FIELDS - {"link_count", "size"}
+        if relaxed_directory_metadata
+        else ENTRY_FIELDS
+    )
+    return all(entry[field] == expected[field] for field in stable_fields)
+
+
 def _remaining_entries_match(
     observed: Sequence[Mapping[str, Any]],
     planned: Sequence[Mapping[str, Any]],
@@ -506,16 +568,29 @@ def _remaining_entries_match(
     planned_by_path = {entry["relative_path"]: entry for entry in planned}
     if not observed or observed[0]["relative_path"] != ".":
         return False
-    for entry in observed:
-        expected = planned_by_path.get(entry["relative_path"])
-        if expected is None or entry["object_type"] != expected["object_type"]:
-            return False
-        if entry["object_type"] == "file":
-            if dict(entry) != dict(expected):
-                return False
-            continue
-        stable_fields = ENTRY_FIELDS - {"link_count", "size"}
-        if any(entry[field] != expected[field] for field in stable_fields):
+    return all(
+        (expected := planned_by_path.get(entry["relative_path"])) is not None
+        and _entry_matches(
+            entry,
+            expected,
+            relaxed_directory_metadata=True,
+        )
+        for entry in observed
+    )
+
+
+def _complete_entries_match(
+    observed: Sequence[Mapping[str, Any]],
+    planned: Sequence[Mapping[str, Any]],
+) -> bool:
+    if len(observed) != len(planned):
+        return False
+    for entry, expected in zip(observed, planned, strict=True):
+        if not _entry_matches(
+            entry,
+            expected,
+            relaxed_directory_metadata=False,
+        ):
             return False
     return True
 
@@ -589,7 +664,9 @@ def _exact_progress_snapshot(
                     root["device"] == planned_object["device"],
                     root["inode"] == planned_object["inode"],
                     original["counters"] == claim["root_counters"][name],
-                    original["entries"] == claim["root_entries"][name],
+                    _complete_entries_match(
+                        original["entries"], claim["root_entries"][name]
+                    ),
                 )
             ):
                 raise safe_io.UnsafePathError(
@@ -702,6 +779,9 @@ def _delete_exact_claimed_paths(
                     raise safe_io.UnsafePathError(
                         f"raw cleanup root changed during quarantine: {normalized / name}"
                     )
+                expected_entries = quarantined["entries"]
+            else:
+                expected_entries = states[name]["inventory"]["entries"]
             _create_marker(
                 quarantine_fd,
                 quarantine_path,
@@ -712,6 +792,7 @@ def _delete_exact_claimed_paths(
                 quarantine_fd,
                 quarantine_name,
                 display_path=quarantine_path / quarantine_name,
+                expected_inventory=expected_entries,
             )
             updated = _exact_progress_snapshot(
                 run_fd,

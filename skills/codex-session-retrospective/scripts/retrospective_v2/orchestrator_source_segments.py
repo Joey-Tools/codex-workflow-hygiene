@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from . import catalog
@@ -13,9 +13,9 @@ from .contracts import (
 from .orchestrator_support import (
     InvalidInputError,
     SOURCE_TRANSPORT_MAX_RECORDS,
-    SessionShardConsumption,
     consume_session_shard_frames,
 )
+from .sharding import RawEvidenceRecord
 
 
 def consume_session_shard_segments(
@@ -29,7 +29,8 @@ def consume_session_shard_segments(
     ],
     *,
     limits: Any,
-) -> tuple[tuple[SessionShardConsumption, ...], tuple[SessionShardsRequest, ...]]:
+    on_record: Callable[[RawEvidenceRecord], None],
+) -> tuple[SessionShardsRequest, ...]:
     catalog_records = tuple(
         sorted(
             (
@@ -53,7 +54,6 @@ def consume_session_shard_segments(
     expected_record_index: int | None = None
     chain: tuple[str, int, str, str, int, int, int] | None = None
     accepted: list[SessionShardsRequest] = []
-    consumptions: list[SessionShardConsumption] = []
     for position, segment in enumerate(segments):
         if position >= SOURCE_TRANSPORT_MAX_RECORDS:
             raise InvalidInputError("session-shards segment count exceeds its bound")
@@ -100,13 +100,13 @@ def consume_session_shard_segments(
             frames,
             request=request,
             limits=limits,
+            on_raw_record=on_record,
         )
         if consumption.source_token != request.source_token:
             raise InvalidInputError("session-shards segment source token changed")
         expected_byte = request.byte_end
         expected_record_index += consumption.record_count
         accepted.append(request)
-        consumptions.append(consumption)
     if (
         not accepted
         or expected_byte != final_byte
@@ -117,4 +117,4 @@ def consume_session_shard_segments(
         raise InvalidInputError(
             "session-shards segments do not cover the complete catalog source"
         )
-    return tuple(consumptions), tuple(accepted)
+    return tuple(accepted)

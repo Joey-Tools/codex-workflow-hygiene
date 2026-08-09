@@ -87,7 +87,7 @@ class Staging:
         self.files.append(prepared)
         return descriptor
 
-    def materialize(self) -> tuple[source_inputs.MaterializedFile, ...]:
+    def materialize(self) -> source_inputs.MaterializedFiles:
         return source_inputs.materialize(self.files)
 
     def add_file(self, path: Path, payload: bytes) -> None:
@@ -122,7 +122,7 @@ class Staging:
         return immutable
 
     @staticmethod
-    def rollback(files: tuple[source_inputs.MaterializedFile, ...]) -> None:
+    def rollback(files: source_inputs.MaterializedFiles) -> None:
         source_inputs.rollback(files)
 
     def clear(self) -> None:

@@ -25,6 +25,28 @@ from .contracts import (
 from .identity import IdentityKey
 from .orchestrator_core import RAW_INPUT_DIRECTORY
 from .orchestrator_support import InvalidTransitionError
+from .source_acceptance import (  # noqa: F401
+    SourcePayloadCollection,
+    consumed_records,
+    consumed_source_refs,
+    model_era_indexes,
+    normalize_transport_inputs,
+    segment_descriptor,
+)
+from .source_staging import (  # noqa: F401
+    MaterializedFile,
+    MaterializedFiles,
+    PreparedFile,
+    materialize,
+    prepare_file,
+    prepare_raw_payload,
+    raw_payload_relative_path,
+    rollback,
+)
+from .source_spool import (  # noqa: F401
+    SOURCE_TRANSPORT_SPOOL_DIRECTORY,
+    StreamingRawPayloadStaging,
+)
 
 
 SOURCE_ACCEPTANCE_SCHEMA = "source_acceptance_v2"
@@ -37,49 +59,9 @@ _DESCRIPTOR_FIELDS = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedFile:
-    path: Path
-    payload: bytes
-
-    @property
-    def byte_count(self) -> int:
-        return len(self.payload)
-
-    @property
-    def digest(self) -> str:
-        return hashlib.sha256(self.payload).hexdigest()
-
-
-@dataclass(frozen=True, slots=True)
 class PreparedAcceptance:
     descriptor: dict[str, Any]
     file: PreparedFile
-
-
-@dataclass(frozen=True, slots=True)
-class MaterializedFile:
-    prepared: PreparedFile
-    receipt: safe_io.AtomicCreateReceipt
-
-
-def prepare_file(path: Path, payload: bytes) -> PreparedFile:
-    if not isinstance(payload, bytes):
-        raise TypeError("prepared source payload must be bytes")
-    return PreparedFile(path=path.expanduser().absolute(), payload=payload)
-
-
-def prepare_raw_payload(
-    identity: IdentityKey,
-    run_dir: Path,
-    unit_ref: str,
-    payload: bytes,
-) -> tuple[str, PreparedFile]:
-    digest = identity.derive_digest(
-        "raw-input-file/v2",
-        {"byte_count": len(payload), "unit_ref": unit_ref},
-    )
-    relative_path = f"{RAW_INPUT_DIRECTORY}/{digest}.bin"
-    return relative_path, prepare_file(run_dir / relative_path, payload)
 
 
 def prepare_acceptance(
@@ -392,64 +374,3 @@ def aggregate_segments(
         )
     )
     return aggregate, aggregate_snapshot_ref, aggregate_receipt_ref
-
-
-def materialize(files: Sequence[PreparedFile]) -> tuple[MaterializedFile, ...]:
-    created: list[MaterializedFile] = []
-    try:
-        for prepared in files:
-            safe_io.ensure_owner_only_directory(prepared.path.parent)
-            try:
-                receipt = safe_io.atomic_create_bytes_with_receipt(
-                    prepared.path,
-                    prepared.payload,
-                    create_parents=False,
-                )
-            except FileExistsError:
-                existing = safe_io.read_bounded_bytes(
-                    prepared.path,
-                    max_bytes=max(1, prepared.byte_count),
-                    require_owner_only=True,
-                )
-                if existing != prepared.payload:
-                    raise InvalidTransitionError("staged source file changed")
-            else:
-                created.append(MaterializedFile(prepared=prepared, receipt=receipt))
-    except BaseException as error:
-        try:
-            rollback(tuple(created))
-        except BaseException as rollback_error:
-            if hasattr(error, "add_note"):
-                error.add_note(
-                    "staged source rollback was incomplete; "
-                    f"{type(rollback_error).__name__}"
-                )
-        raise
-    return tuple(created)
-
-
-def rollback(files: Sequence[MaterializedFile]) -> None:
-    failures: list[BaseException] = []
-    for materialized in reversed(tuple(files)):
-        if not isinstance(materialized, MaterializedFile):
-            failures.append(
-                InvalidTransitionError(
-                    "staged source rollback lacks a creation identity receipt"
-                )
-            )
-            continue
-        try:
-            safe_io.remove_atomic_created_bytes(materialized.receipt)
-        except (OSError, safe_io.UnsafePathError) as error:
-            failure = InvalidTransitionError("staged source rollback target changed")
-            failure.__cause__ = error
-            failures.append(failure)
-    if failures:
-        primary = failures[0]
-        if hasattr(primary, "add_note"):
-            for secondary in failures[1:]:
-                primary.add_note(
-                    "additional staged source rollback failure: "
-                    f"{type(secondary).__name__}: {secondary}"
-                )
-        raise primary

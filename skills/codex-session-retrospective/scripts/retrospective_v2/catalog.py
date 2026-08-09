@@ -188,6 +188,57 @@ def content_commitment(payload: bytes) -> str:
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
+def transcript_descriptor_commitment(
+    raw_records: Mapping[str, Mapping[str, Any]], *, source_marker: str
+) -> str:
+    rows: list[dict[str, Any]] = []
+    for unit_ref, descriptor in sorted(raw_records.items()):
+        byte_count = descriptor.get("byte_count")
+        commitment = descriptor.get("content_commitment")
+        if (
+            not isinstance(unit_ref, str)
+            or isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count < 0
+            or not isinstance(commitment, str)
+            or _SHA256_RE.fullmatch(commitment) is None
+        ):
+            raise CatalogValidationError(
+                "source transport transcript descriptor is invalid"
+            )
+        rows.append(
+            {
+                "byte_count": byte_count,
+                "content_commitment": commitment,
+                "unit_ref": unit_ref,
+            }
+        )
+    return content_commitment(
+        canonical_json_bytes(
+            {
+                "records": rows,
+                "schema": "source_transport_transcript_v2",
+                "source": source_marker,
+            }
+        )
+    )
+
+
+def transcript_commitment(
+    raw_records: Mapping[str, bytes], *, source_marker: str
+) -> str:
+    return transcript_descriptor_commitment(
+        {
+            unit_ref: {
+                "byte_count": len(payload),
+                "content_commitment": content_commitment(payload),
+            }
+            for unit_ref, payload in raw_records.items()
+        },
+        source_marker=source_marker,
+    )
+
+
 def event_time_from_record(
     record: Mapping[str, Any],
     *,

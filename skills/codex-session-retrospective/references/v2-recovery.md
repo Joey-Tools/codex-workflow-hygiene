@@ -12,6 +12,15 @@ a new attempt or run.
 - An invalid or truncated source stream does not make its source cell terminal.
 - `accept-source` is the only source transition; its input remains below the run
   cache and can be retried unchanged.
+- Segmented source input proves run-global capacity before transport iteration,
+  then uses one deterministic lease-derived owner-only descriptor-held spool and
+  retains only one bounded record in memory. A persistent owner-only lock
+  serializes retry; after acquiring it, recovery authenticates and removes only
+  the same orphan. Byte and record limits are enforced before every write.
+  Replay, validation failure, capacity rejection, checkpoint rollback, and
+  success all remove that exact spool; inability to prove removal remains an
+  explicit failure rather than accepted evidence. A receipt-only rollback ledger
+  is preallocated before final raw payloads or the acceptance sidecar are created.
 - Source scheduling prepares the transport-program snapshot, remote-helper
   snapshot, and bound empty transport output with the candidate checkpoint.
   Capacity is proved before materialization and the files commit as one staging
@@ -52,6 +61,13 @@ a new attempt or run.
   terminal reserve. Exhaustion restores the prior checkpoint state, clears the
   staging set, and records `checkpoint_capacity_exhausted` from the reserved
   terminal space. It never publishes a partial task batch.
+- Claim creation, claim heartbeat, accepted-result, and rejected-result
+  transitions apply the same reserve to their actual mutated checkpoint. On
+  exhaustion they restore the prior task and active claim, clear only newly
+  staged claim/result artifacts, and persist the content-free blocker; a
+  capacity failure cannot consume the claim or masquerade as an accepted result.
+  A no-change replay is reserve-neutral, while replay-time migration of a legacy
+  inline job manifest must pass the same reserve before the migration commits.
 - A bound malformed agent result consumes one attempt. A second failure becomes
   an explicit content-free gap. JSON numeric overflow such as `1e999` is
   malformed at this ingestion boundary; it cannot become a non-finite stored
@@ -170,6 +186,8 @@ engine fsyncs a fixed-root cleanup claim whose authenticated descriptor binds an
 owner-only, content-addressed sidecar with the exact per-object inventory:
 globally bytewise-sorted relative path, object type, device/inode, size,
 owner/group/mode, link count, and the verified owner-only/no-ACL access policy.
+New inventory-sidecar schema v2 entries additionally bind the exact SHA-256
+content commitment of every regular file; directory commitments are null.
 The checkpoint remains below its fixed bound regardless of legal inventory
 cardinality. One budget is shared across every fixed root: traversal stops before
 300,000 entries, 64 MiB of encoded relative paths, depth 64, or 300 seconds, and
@@ -184,8 +202,13 @@ exact remaining subset only inside that quarantine. An unmarked missing root,
 an original-path replacement, an unexpected quarantine entry, content/type
 change, or access-policy drift leaves cleanup pending. Timestamps and directory
 size/link-count changes caused by verified child deletion are not mutation
-evidence. The inventory proves the claimed object set at each observation
-boundary; it does not claim an atomic defense against an actively malicious
+evidence. Recursive deletion consumes the authenticated expected inventory:
+each file's identity, access policy, size, and, for v2 entries, SHA-256 content
+commitment are revalidated through the held descriptor immediately before its
+unlink. A null legacy commitment retains identity/policy compatibility but does
+not gain a content-stability claim. The inventory proves the claimed object set
+at each observation boundary; it does not claim an atomic defense against an
+actively malicious
 same-UID process between the final check and a rename or unlink syscall. After
 deletion and absence verification, the engine fsyncs the final coverage-bound
 cleanup receipt. A lost response after that close is an idempotent read and
@@ -196,7 +219,10 @@ The fixed roots are `raw-inputs`, `raw-shards`, `agent-sinks`, and
 `retained-inputs`. Post-cleanup shadow validation and Daily successor derivation
 use the already authenticated coverage receipt bound to the run, configuration,
 model/policy era, and bundle digest; they do not reopen the deleted export-input
-sidecar. New cleanup claims and receipts use the v5 descriptor schema. Exact
+sidecar. New cleanup claims and receipts use the v5 claim schema with v2
+inventory-sidecar descriptors. Authenticated legacy inventory-sidecar v1
+entries remain contentless replay compatibility and never authorize a new
+contentless inventory write. Exact
 legacy v2 and v3 claims and receipts remain replayable only with their original
 counter-only root inventories, while v4 inline exact inventories remain
 replayable under their original all-roots-absent response-loss rule. v2, v3,

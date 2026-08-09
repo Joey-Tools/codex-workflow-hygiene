@@ -938,22 +938,7 @@ class TransportReceipt:
 def transcript_commitment(
     raw_records: Mapping[str, bytes], *, source_marker: str
 ) -> str:
-    rows: list[JsonValue] = []
-    for unit_ref, payload in sorted(raw_records.items()):
-        rows.append(
-            {
-                "byte_count": len(payload),
-                "content_commitment": "sha256:" + hashlib.sha256(payload).hexdigest(),
-                "unit_ref": unit_ref,
-            }
-        )
-    return _canonical_commitment(
-        {
-            "records": rows,
-            "schema": "source_transport_transcript_v2",
-            "source": source_marker,
-        }
-    )
+    return catalog.transcript_commitment(raw_records, source_marker=source_marker)
 
 
 def _stream_object(pairs: Sequence[tuple[str, object]]) -> dict[str, object]:

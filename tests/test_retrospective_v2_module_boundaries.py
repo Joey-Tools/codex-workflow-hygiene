@@ -251,6 +251,12 @@ ORCHESTRATOR_SOURCE_SUPPORT_MODULES = {
     "source_payloads.py",
 }
 
+ORCHESTRATOR_SOURCE_STAGING_MODULES = {
+    "source_acceptance.py",
+    "source_spool.py",
+    "source_staging.py",
+}
+
 ORCHESTRATOR_AGENT_SUPPORT_MODULES = {
     "agent_capacity.py",
     "agent_raw_artifacts.py",
@@ -260,11 +266,17 @@ ORCHESTRATOR_AGENT_SUPPORT_MODULES = {
     "raw_shard_staging.py",
 }
 
+ORCHESTRATOR_AGENT_TRANSACTION_MODULES = {
+    "agent_checkpoint_capacity.py",
+}
+
 ORCHESTRATOR_MODULES = (
     ORCHESTRATOR_OPERATION_MODULES
     | ORCHESTRATOR_FOUNDATION_MODULES
     | ORCHESTRATOR_SOURCE_SUPPORT_MODULES
+    | ORCHESTRATOR_SOURCE_STAGING_MODULES
     | ORCHESTRATOR_AGENT_SUPPORT_MODULES
+    | ORCHESTRATOR_AGENT_TRANSACTION_MODULES
 )
 
 PUBLICATION_MODULES = {
@@ -299,7 +311,7 @@ TRANSPORT_LINE_INVENTORY = {
     "transport.py": 231,
     "transport_auth.py": 143,
     "transport_capture.py": 999,
-    "transport_contracts.py": 999,
+    "transport_contracts.py": 984,
     "transport_discovery.py": 240,
     "transport_paths.py": 70,
     "transport_program.py": 432,
@@ -316,7 +328,7 @@ TRANSPORT_AGGREGATE_LINE_LIMIT = 7_250
 BOUNDED_MODULE_LINES = {
     "finalize.py": 120,
     "authority.py": 3_250,
-    "cleanup_inventory.py": 900,
+    "cleanup_inventory.py": 925,
     "cleanup_sidecars.py": 300,
     "orchestrator.py": 720,
     "orchestrator_components.py": 250,
@@ -330,14 +342,18 @@ BOUNDED_MODULE_LINES = {
     "orchestrator_source.py": 2_150,
     "orchestrator_source_segments.py": 150,
     "agent_capacity.py": 100,
+    "agent_checkpoint_capacity.py": 130,
     "agent_claim_artifacts.py": 100,
     "agent_raw_artifacts.py": 120,
     "agent_results.py": 320,
     "agent_task_inputs.py": 350,
     "extracted_turns.py": 200,
     "raw_shard_staging.py": 100,
-    "source_inputs.py": 500,
+    "source_acceptance.py": 275,
+    "source_inputs.py": 400,
     "source_payloads.py": 100,
+    "source_spool.py": 350,
+    "source_staging.py": 350,
     "source_capacity.py": 150,
     "orchestrator_core.py": 250,
     "orchestrator_protocols.py": 450,
@@ -987,9 +1003,23 @@ spec.loader.exec_module(module)
         self.assertLessEqual(
             sum(
                 len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
+                for name in ORCHESTRATOR_SOURCE_STAGING_MODULES
+            ),
+            775,
+        )
+        self.assertLessEqual(
+            sum(
+                len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
                 for name in ORCHESTRATOR_AGENT_SUPPORT_MODULES
             ),
             1_050,
+        )
+        self.assertLessEqual(
+            sum(
+                len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
+                for name in ORCHESTRATOR_AGENT_TRANSACTION_MODULES
+            ),
+            130,
         )
         self.assertLessEqual(
             len((SCRIPTS / "session_retrospective_v2.py").read_text().splitlines()),
@@ -1026,7 +1056,7 @@ spec.loader.exec_module(module)
         }
         self.assertEqual(TRANSPORT_MODULES, set(TRANSPORT_LINE_INVENTORY))
         self.assertEqual(TRANSPORT_LINE_INVENTORY, observed)
-        self.assertEqual(7_229, sum(observed.values()))
+        self.assertEqual(7_214, sum(observed.values()))
         self.assertLessEqual(
             sum(observed.values()),
             TRANSPORT_AGGREGATE_LINE_LIMIT,
@@ -1072,7 +1102,7 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertLessEqual(branch_total, 8_250)
+        self.assertLessEqual(branch_total, 8_375)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)
 

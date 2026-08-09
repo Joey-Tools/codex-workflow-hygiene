@@ -157,6 +157,15 @@ retained raw payload, and a submitted non-target consumed record is rejected.
   or an over-limit result sink records `agent_claim_budget_exhausted` and closes
   that attempt through the ordinary retry/explicit-gap state machine without
   counting an agent result or accumulating more claim files.
+- Every new claim, heartbeat, accepted result, and rejected-result disposition
+  serializes the actual candidate checkpoint before commit. If either the task
+  bound or the 512 KiB terminal reserve would be consumed, the coordinator
+  restores the prior task/claim state, clears only the candidate envelope, sink,
+  or result-sidecar staging it owns, and persists a content-free
+  `checkpoint_capacity_exhausted` blocker from the reserve. A byte-identical
+  replay that makes no state change needs no new reserve; replay-time migration
+  of a legacy inline job manifest does and is blocked before that migration can
+  consume the terminal reserve.
 - Accepted agent results live in canonical owner-only sidecars under
   `agent-sinks/results`. The checkpoint stores only a closed descriptor that
   binds the task reference, canonical result hash, byte count, SHA-256 content
@@ -192,31 +201,48 @@ retained raw payload, and a submitted non-target consumed record is rejected.
   state and are reconstructed from legacy task state before a new miss is
   accepted. Before any task input, envelope, or shard is published, the
   coordinator serializes the exact candidate checkpoint and requires it to fit
-  below the 32 MiB checkpoint bound with a 512 KiB terminal reserve. Capacity
+  below the 32 MiB checkpoint bound with a 512 KiB terminal reserve. Scheduling
   exhaustion restores the prior state and records an explicit repairable blocker
-  without staging files. These limits reserve the complete downstream pipeline
-  before raw materialization and keep the conservative cleanup inventory at no
-  more than 259,540 entries under its fixed 300,000-entry ceiling.
+  without staging files; claim and result transitions additionally remove their
+  not-yet-committed candidate artifacts. These limits reserve the complete
+  downstream pipeline before raw materialization and keep the conservative
+  cleanup inventory at no more than 260,308 entries under its fixed 300,000-entry
+  ceiling.
 - Accepted source records and raw-payload indexes live in canonical, owner-only,
   content-addressed sidecars under `raw-inputs/source-acceptances`; authenticated
   checkpoint state stores only bounded descriptors and a compact manifest summary.
-  Checkpoint capacity is proved before any file is created. New raw files, the
-  sidecar, and the exact next checkpoint revision are then staged under one
-  checkpoint lock: a proved unchanged old revision rolls back only identity- and
-  content-matching files, an exact committed new revision retains them, and an
-  unreadable or inconsistent disposition fails closed with explicit retained-file
-  evidence. Rollback revalidates the held file's identity, single-link state,
-  owner-only access policy, and exact content through two bounded descriptor reads
-  before unlink. A same-schema checkpoint that still carries the legacy full
-  manifest or inline payload index remains readable; the next accepted continuation
-  validates conflicts and migrates that index into the new sidecar before clearing
-  the inline copy. A run accepts at most 64 continuation segments per host/source
-  cell, 768 segments and 100,000 records in total, 4 GiB of source bytes, and
-  256 MiB of acceptance-sidecar bytes. Materialization reads each accepted
-  segment once, merges payload indexes in place, and sorts only the final
-  aggregate; accepting a later segment never reloads earlier sidecars. The
-  coordinator rejects an over-limit segment before staging any file, leaving
-  coverage unresolved rather than committing an incomplete aggregate.
+  Before segmented transport is consumed, the candidate batch must fit the
+  run-global source capacity. Accepted bytes then stream into one deterministic
+  lease-derived, owner-only, descriptor-held spool under
+  `raw-inputs/source-spool-v1`. A persistent owner-only lock serializes retry;
+  after acquiring it, the next process authenticates and removes only the same
+  orphan spool. Exact byte and record caps are checked before every write. Only
+  one bounded record is retained in memory; the coordinator keeps compact
+  offsets, byte counts, content commitments, and final paths, so the legal 4 GiB
+  corpus is never assembled in the Python heap. The spool is not retained
+  evidence and is removed on replay, rejection, rollback, and successful
+  materialization.
+  Checkpoint capacity is proved before any final raw file or acceptance sidecar
+  is created. A rollback receipt ledger is fully allocated before the first
+  create and stores no payload bytes. Those files and the exact next checkpoint
+  revision are then staged
+  under one checkpoint lock: a proved unchanged old revision rolls back only
+  identity- and content-matching files, an exact committed new revision retains
+  them, and an unreadable or inconsistent disposition fails closed with explicit
+  retained-file evidence. Rollback revalidates the held file's identity,
+  single-link state, owner-only access policy, and exact content through two
+  bounded descriptor reads before unlink. A same-schema checkpoint that still
+  carries the legacy full manifest or inline payload index remains readable; the
+  next accepted continuation validates conflicts and migrates that index into
+  the new sidecar before clearing the inline copy. A run accepts at most 64
+  continuation segments per host/source cell, 768 segments and 100,000 records
+  in total, 4 GiB of source bytes, and 256 MiB of acceptance-sidecar bytes.
+  Transcript and acceptance digests derive from the compact per-record
+  descriptors. Materialization reads each accepted segment once, merges payload
+  indexes in place, and sorts only the final aggregate; accepting a later segment
+  never reloads earlier sidecars. The coordinator rejects an over-limit segment
+  before final-file staging, leaving coverage unresolved rather than committing
+  an incomplete aggregate.
 - Raw sharding uses two bounded ordered passes over the authenticated source
   payload sidecars. The first pass retains only shard/gap manifests and rejects
   more than 1,000 shards before raw-shard I/O. A catalog record whose declared

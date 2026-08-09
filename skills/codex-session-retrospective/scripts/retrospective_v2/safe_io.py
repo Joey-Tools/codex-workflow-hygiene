@@ -7,14 +7,14 @@ from functools import lru_cache
 import hashlib
 import hmac
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import secrets
 import stat
 import sys
 import tempfile
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 from .contracts import (
     JsonValue,
@@ -590,19 +590,123 @@ def owner_controlled_directory_identity(
         os.close(descriptor)
 
 
-def secure_remove_tree_at(
+_CLEANUP_ENTRY_FIELDS = frozenset(
+    {
+        "access_policy",
+        "content_commitment",
+        "device",
+        "group",
+        "inode",
+        "link_count",
+        "mode",
+        "object_type",
+        "owner",
+        "relative_path",
+        "size",
+    }
+)
+
+
+def _expected_cleanup_entries(
+    inventory: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, dict[str, Any]] | None:
+    if inventory is None:
+        return None
+    if isinstance(inventory, (str, bytes)):
+        raise UnsafePathError("expected cleanup inventory must be a sequence")
+    entries: dict[str, dict[str, Any]] = {}
+    for raw_entry in inventory:
+        if (
+            not isinstance(raw_entry, Mapping)
+            or set(raw_entry) != _CLEANUP_ENTRY_FIELDS
+        ):
+            raise UnsafePathError("expected cleanup inventory entry is invalid")
+        entry = dict(raw_entry)
+        relative_path = entry.get("relative_path")
+        object_type = entry.get("object_type")
+        commitment = entry.get("content_commitment")
+        if (
+            not isinstance(relative_path, str)
+            or relative_path in entries
+            or relative_path != str(PurePosixPath(relative_path))
+            or PurePosixPath(relative_path).is_absolute()
+            or any(part in {"", ".."} for part in PurePosixPath(relative_path).parts)
+            or object_type not in {"directory", "file"}
+            or entry.get("access_policy") != "owner-only-no-acl"
+            or commitment is not None
+            and (
+                object_type != "file"
+                or not isinstance(commitment, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", commitment) is None
+            )
+        ):
+            raise UnsafePathError("expected cleanup inventory entry is invalid")
+        entries[relative_path] = entry
+    if not entries or entries.get(".", {}).get("object_type") != "directory":
+        raise UnsafePathError("expected cleanup inventory lacks its root")
+    return entries
+
+
+def _cleanup_entry_path(relative_path: str, child_name: str) -> str:
+    return child_name if relative_path == "." else f"{relative_path}/{child_name}"
+
+
+def _expected_direct_children(
+    entries: Mapping[str, Mapping[str, Any]],
+    relative_path: str,
+) -> list[str]:
+    prefix = "" if relative_path == "." else f"{relative_path}/"
+    names: set[str] = set()
+    for candidate in entries:
+        if candidate == relative_path or not candidate.startswith(prefix):
+            continue
+        tail = candidate[len(prefix) :]
+        if tail and "/" not in tail:
+            names.add(tail)
+    return sorted(names, key=os.fsencode)
+
+
+def _require_expected_cleanup_stat(
+    metadata: os.stat_result,
+    expected: Mapping[str, Any],
+    *,
+    display_path: Path,
+    relaxed_directory_metadata: bool,
+) -> None:
+    is_directory = stat.S_ISDIR(metadata.st_mode)
+    if is_directory != (expected.get("object_type") == "directory"):
+        raise UnsafePathError(f"cleanup object type changed: {display_path}")
+    fields = (
+        (metadata.st_dev, expected.get("device")),
+        (metadata.st_ino, expected.get("inode")),
+        (metadata.st_uid, expected.get("owner")),
+        (metadata.st_gid, expected.get("group")),
+        (stat.S_IMODE(metadata.st_mode), expected.get("mode")),
+    )
+    if not is_directory or not relaxed_directory_metadata:
+        fields += (
+            (metadata.st_nlink, expected.get("link_count")),
+            (metadata.st_size, expected.get("size")),
+        )
+    if any(observed != planned for observed, planned in fields):
+        raise UnsafePathError(
+            f"cleanup object identity or policy changed: {display_path}"
+        )
+
+
+def _secure_remove_tree_at(
     parent_fd: int,
     name: str,
     *,
     display_path: Path,
+    expected_entries: Mapping[str, Mapping[str, Any]] | None,
+    relative_path: str,
 ) -> dict[str, int]:
-    """Remove one owner-only tree through an already anchored parent fd."""
-
-    if not name or name in {".", ".."} or "/" in name or "\x00" in name:
-        raise UnsafePathError("remove-tree name must be one safe component")
     try:
         observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
+        if expected_entries is not None:
+            raise UnsafePathError(f"expected cleanup tree disappeared: {display_path}")
         return {"byte_count": 0, "directory_count": 0, "file_count": 0}
     _validate_directory_stat(observed, display_path, exact_mode=True)
     try:
@@ -616,15 +720,38 @@ def secure_remove_tree_at(
         )
         if (observed.st_dev, observed.st_ino) != (anchored.st_dev, anchored.st_ino):
             raise UnsafePathError(f"cleanup tree changed while opened: {display_path}")
+        expected = (
+            None if expected_entries is None else expected_entries.get(relative_path)
+        )
+        if expected_entries is not None and expected is None:
+            raise UnsafePathError(
+                f"cleanup tree is absent from inventory: {display_path}"
+            )
+        if expected is not None:
+            _require_expected_cleanup_stat(
+                anchored,
+                expected,
+                display_path=display_path,
+                relaxed_directory_metadata=False,
+            )
         counts = {"byte_count": 0, "directory_count": 1, "file_count": 0}
-        for child_name in sorted(os.listdir(descriptor), key=os.fsencode):
+        child_names = sorted(os.listdir(descriptor), key=os.fsencode)
+        if expected_entries is not None and child_names != _expected_direct_children(
+            expected_entries,
+            relative_path,
+        ):
+            raise UnsafePathError(f"cleanup tree contents changed: {display_path}")
+        for child_name in child_names:
             child_path = display_path / child_name
+            child_relative = _cleanup_entry_path(relative_path, child_name)
             child = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
             if stat.S_ISDIR(child.st_mode):
-                nested = secure_remove_tree_at(
+                nested = _secure_remove_tree_at(
                     descriptor,
                     child_name,
                     display_path=child_path,
+                    expected_entries=expected_entries,
+                    relative_path=child_relative,
                 )
                 for key, value in nested.items():
                     counts[key] += value
@@ -637,6 +764,37 @@ def secure_remove_tree_at(
             )
             try:
                 anchored_child = os.fstat(child_fd)
+                expected_child = (
+                    None
+                    if expected_entries is None
+                    else expected_entries.get(child_relative)
+                )
+                if expected_entries is not None and expected_child is None:
+                    raise UnsafePathError(
+                        f"cleanup file is absent from inventory: {child_path}"
+                    )
+                if expected_child is not None:
+                    _require_expected_cleanup_stat(
+                        anchored_child,
+                        expected_child,
+                        display_path=child_path,
+                        relaxed_directory_metadata=False,
+                    )
+                    commitment = expected_child.get("content_commitment")
+                    if commitment is not None and not hmac.compare_digest(
+                        commitment,
+                        "sha256:" + _hash_file_descriptor(child_fd),
+                    ):
+                        raise UnsafePathError(
+                            f"cleanup file content changed: {child_path}"
+                        )
+                    final_child = os.fstat(child_fd)
+                    _require_expected_cleanup_stat(
+                        final_child,
+                        expected_child,
+                        display_path=child_path,
+                        relaxed_directory_metadata=False,
+                    )
                 current = os.stat(
                     child_name,
                     dir_fd=descriptor,
@@ -665,6 +823,13 @@ def secure_remove_tree_at(
             raise UnsafePathError(
                 f"cleanup tree name changed before removal: {display_path}"
             )
+        if expected is not None:
+            _require_expected_cleanup_stat(
+                current_root,
+                expected,
+                display_path=display_path,
+                relaxed_directory_metadata=True,
+            )
     finally:
         os.close(descriptor)
     os.rmdir(name, dir_fd=parent_fd)
@@ -672,14 +837,36 @@ def secure_remove_tree_at(
     return counts
 
 
+def secure_remove_tree_at(
+    parent_fd: int,
+    name: str,
+    *,
+    display_path: Path,
+    expected_inventory: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, int]:
+    """Remove one owner-only tree through an already anchored parent fd."""
+
+    if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+        raise UnsafePathError("remove-tree name must be one safe component")
+    return _secure_remove_tree_at(
+        parent_fd,
+        name,
+        display_path=display_path,
+        expected_entries=_expected_cleanup_entries(expected_inventory),
+        relative_path=".",
+    )
+
+
 def _cleanup_inventory_entry(
     metadata: os.stat_result,
     *,
+    content_commitment: str | None = None,
     object_type: str,
     relative_path: str,
 ) -> dict[str, Any]:
     return {
         "access_policy": "owner-only-no-acl",
+        "content_commitment": content_commitment,
         "device": metadata.st_dev,
         "group": metadata.st_gid,
         "inode": metadata.st_ino,
@@ -690,6 +877,95 @@ def _cleanup_inventory_entry(
         "relative_path": relative_path,
         "size": metadata.st_size,
     }
+
+
+def _inspect_file_inventory_entry(
+    parent_fd: int,
+    name: str,
+    *,
+    budget: TreeInventoryBudget,
+    display_path: Path,
+    relative_path: str,
+) -> dict[str, Any]:
+    descriptor = open_checked_file_at(
+        parent_fd,
+        name,
+        display_path=display_path,
+        require_owner_only=True,
+    )
+    try:
+        anchored = os.fstat(descriptor)
+        initial = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            initial.st_dev,
+            initial.st_ino,
+            initial.st_uid,
+            initial.st_gid,
+            stat.S_IMODE(initial.st_mode),
+            initial.st_nlink,
+            initial.st_size,
+        ) != (
+            anchored.st_dev,
+            anchored.st_ino,
+            anchored.st_uid,
+            anchored.st_gid,
+            stat.S_IMODE(anchored.st_mode),
+            anchored.st_nlink,
+            anchored.st_size,
+        ):
+            raise UnsafePathError(
+                f"inspected file changed while inventoried: {display_path}"
+            )
+        _validate_owner_only_acl(descriptor, display_path)
+        commitment = "sha256:" + _hash_file_descriptor(
+            descriptor,
+            checkpoint=budget.checkpoint,
+        )
+        final = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            final.st_dev,
+            final.st_ino,
+            final.st_uid,
+            final.st_gid,
+            stat.S_IMODE(final.st_mode),
+            final.st_nlink,
+            final.st_size,
+            current.st_dev,
+            current.st_ino,
+            current.st_uid,
+            current.st_gid,
+            stat.S_IMODE(current.st_mode),
+            current.st_nlink,
+            current.st_size,
+        ) != (
+            anchored.st_dev,
+            anchored.st_ino,
+            anchored.st_uid,
+            anchored.st_gid,
+            stat.S_IMODE(anchored.st_mode),
+            anchored.st_nlink,
+            anchored.st_size,
+            anchored.st_dev,
+            anchored.st_ino,
+            anchored.st_uid,
+            anchored.st_gid,
+            stat.S_IMODE(anchored.st_mode),
+            anchored.st_nlink,
+            anchored.st_size,
+        ):
+            raise UnsafePathError(
+                f"inspected file changed while hashed: {display_path}"
+            )
+        _validate_owner_only_acl(descriptor, display_path)
+        return _cleanup_inventory_entry(
+            anchored,
+            content_commitment=commitment,
+            object_type="file",
+            relative_path=relative_path,
+        )
+    finally:
+        os.close(descriptor)
 
 
 def _inspect_tree_descriptor(
@@ -785,51 +1061,16 @@ def _inspect_tree_descriptor(
             entries.extend(nested_entries)
             continue
 
-        child_fd = open_checked_file_at(
+        file_entry = _inspect_file_inventory_entry(
             descriptor,
             child_name,
+            budget=budget,
             display_path=child_path,
-            require_owner_only=True,
+            relative_path=child_relative,
         )
-        try:
-            anchored_child = os.fstat(child_fd)
-            current = os.stat(
-                child_name,
-                dir_fd=descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                current.st_dev,
-                current.st_ino,
-                current.st_uid,
-                current.st_gid,
-                stat.S_IMODE(current.st_mode),
-                current.st_nlink,
-                current.st_size,
-            ) != (
-                anchored_child.st_dev,
-                anchored_child.st_ino,
-                anchored_child.st_uid,
-                anchored_child.st_gid,
-                stat.S_IMODE(anchored_child.st_mode),
-                anchored_child.st_nlink,
-                anchored_child.st_size,
-            ):
-                raise UnsafePathError(
-                    f"inspected file changed while inventoried: {child_path}"
-                )
-            _validate_owner_only_acl(child_fd, child_path)
-            entries.append(
-                _cleanup_inventory_entry(
-                    anchored_child,
-                    object_type="file",
-                    relative_path=child_relative,
-                )
-            )
-            counts["byte_count"] += anchored_child.st_size
-            counts["file_count"] += 1
-        finally:
-            os.close(child_fd)
+        entries.append(file_entry)
+        counts["byte_count"] += file_entry["size"]
+        counts["file_count"] += 1
 
     budget.checkpoint()
     final = validate_owner_only_directory_descriptor(descriptor, display_path)
@@ -1307,14 +1548,22 @@ class AtomicCreateReceipt:
     digest: str
 
 
-def _hash_file_descriptor(descriptor: int) -> str:
+def _hash_file_descriptor(
+    descriptor: int,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> str:
     digest = hashlib.sha256()
     os.lseek(descriptor, 0, os.SEEK_SET)
     while True:
+        if checkpoint is not None:
+            checkpoint()
         chunk = os.read(descriptor, 64 * 1024)
         if not chunk:
             break
         digest.update(chunk)
+    if checkpoint is not None:
+        checkpoint()
     return digest.hexdigest()
 
 
