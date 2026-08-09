@@ -76,7 +76,7 @@ _SHADOW_POLICY_COMMITMENT_RE = re.compile(r"shadow_policy_commitment_v2:[0-9a-f]
 _SHADOW_VERSION_COMMITMENT_RE = re.compile(
     r"shadow_version_commitment_v2:[0-9a-f]{64}\Z"
 )
-_SHADOW_CLEANUP_CLAIM_RE = re.compile(r"shadow_cleanup_claim_v[234]:[0-9a-f]{64}\Z")
+_SHADOW_CLEANUP_CLAIM_RE = re.compile(r"shadow_cleanup_claim_v[2345]:[0-9a-f]{64}\Z")
 _KEY_ID_RE = re.compile(r"identity_key_v2:[0-9a-f]{64}\Z")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _ATTEMPT_REF_RE = re.compile(r"attempt_ref_v2:[0-9a-f]{64}\Z")
@@ -85,8 +85,8 @@ _SHADOW_RECEIPT_REF_RE = re.compile(r"shadow_receipt_v2:[0-9a-f]{64}\Z")
 _SHADOW_RECEIPT_AUTH_RE = re.compile(r"shadow_receipt_auth_v2:[0-9a-f]{64}\Z")
 _SHADOW_COVERAGE_REF_RE = re.compile(r"shadow_coverage_receipt_v2:[0-9a-f]{64}\Z")
 _SHADOW_COVERAGE_AUTH_RE = re.compile(r"shadow_coverage_auth_v2:[0-9a-f]{64}\Z")
-_RAW_CLEANUP_REF_RE = re.compile(r"raw_cleanup_receipt_v[234]:[0-9a-f]{64}\Z")
-_RAW_CLEANUP_AUTH_RE = re.compile(r"raw_cleanup_auth_v[234]:[0-9a-f]{64}\Z")
+_RAW_CLEANUP_REF_RE = re.compile(r"raw_cleanup_receipt_v[2345]:[0-9a-f]{64}\Z")
+_RAW_CLEANUP_AUTH_RE = re.compile(r"raw_cleanup_auth_v[2345]:[0-9a-f]{64}\Z")
 _CONTROLLED_GAP_REF_RE = re.compile(r"controlled_gap_receipt_v2:[0-9a-f]{64}\Z")
 _BACKFILL_LINEAGE_REF_RE = re.compile(r"backfill_lineage_receipt_v2:[0-9a-f]{64}\Z")
 _AUTOMATION_RESULT_REF_RE = re.compile(r"automation_update_result_v2:[0-9a-f]{64}\Z")
@@ -1243,23 +1243,21 @@ def history_repository_binding(
 
 SHADOW_COVERAGE_RECEIPT_SCHEMA = "shadow_coverage_receipt_v2"
 SHADOW_GATE_RECEIPT_SCHEMA = "shadow_gate_receipt_v2"
-SHADOW_CLEANUP_RECEIPT_SCHEMA = "raw_cleanup_receipt_v4"
+SHADOW_CLEANUP_RECEIPT_SCHEMA = "raw_cleanup_receipt_v5"
 _RAW_CLEANUP_RECEIPT_CONTRACTS = {
     "raw_cleanup_receipt_v2": (
         LEGACY_SHADOW_CLEANUP_ROOTS,
         "raw_cleanup_auth_v2",
         "shadow_cleanup_claim_v2:",
     ),
-    "raw_cleanup_receipt_v3": (
-        SHADOW_CLEANUP_ROOTS,
-        "raw_cleanup_auth_v3",
-        "shadow_cleanup_claim_v3:",
-    ),
-    "raw_cleanup_receipt_v4": (
-        SHADOW_CLEANUP_ROOTS,
-        "raw_cleanup_auth_v4",
-        "shadow_cleanup_claim_v4:",
-    ),
+    **{
+        f"raw_cleanup_receipt_v{version}": (
+            SHADOW_CLEANUP_ROOTS,
+            f"raw_cleanup_auth_v{version}",
+            f"shadow_cleanup_claim_v{version}:",
+        )
+        for version in (3, 4, 5)
+    },
 }
 _SOURCE_UNIT_FIELDS = {
     "consumed_candidate",

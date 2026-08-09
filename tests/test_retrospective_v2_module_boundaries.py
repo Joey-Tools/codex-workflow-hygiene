@@ -283,6 +283,8 @@ TRANSPORT_MODULES = {
 BOUNDED_MODULE_LINES = {
     "finalize.py": 120,
     "authority.py": 3_250,
+    "cleanup_inventory.py": 900,
+    "cleanup_sidecars.py": 300,
     "orchestrator.py": 720,
     "orchestrator_components.py": 250,
     "orchestrator_context.py": 180,
@@ -1016,7 +1018,7 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertLessEqual(branch_total, 7_800)
+        self.assertLessEqual(branch_total, 7_900)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)
 

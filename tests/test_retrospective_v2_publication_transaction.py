@@ -2985,6 +2985,20 @@ class DurablePublicationTests(unittest.TestCase):
             transaction.recover_abort(cleanup_receipt={"synthetic": True})
 
         claim = coordinator.load_state()["publication"]["publication_claim"]
+        inspected = PublicationTransaction.inspect_local_for_run(
+            transaction.journal_path,
+            bundle_dir=bundle,
+            destination=self.destination(coordinator.load_state()),
+            target_ref=TARGET_REF,
+            expected_target_head=transaction.status()["plan"]["expected_target_head"],
+            run_dir=coordinator.run_dir,
+            identity_path=self.identity_path,
+        )
+        self.assertEqual("abort_pending", inspected["phase"])
+        coordinator.claim_publication(
+            claim["attempt_ref"],
+            claim["plan_digest"],
+        )
         with self.assertRaises(RunConflictError):
             coordinator.mark_finalized(
                 "aborted",

@@ -11,6 +11,7 @@ from . import (
     authority,
     catalog,
     cleanup_inventory,
+    cleanup_sidecars,
     controlled_gaps,
     export as retained_export_api,
     finalize,
@@ -950,6 +951,7 @@ class RunLifecycleOperations(OrchestratorComponent):
                     "raw_cleanup_receipt_v2:",
                     "raw_cleanup_receipt_v3:",
                     "raw_cleanup_receipt_v4:",
+                    "raw_cleanup_receipt_v5:",
                 )
             )
             or not isinstance(successor["authentication_tag"], str)
@@ -2220,7 +2222,7 @@ class RunLifecycleOperations(OrchestratorComponent):
         phase_before: str,
         publication_claim_ref: str | None,
         inventory: Mapping[str, Any],
-        schema: str = "raw_cleanup_claim_v4",
+        schema: str = "raw_cleanup_claim_v5",
     ) -> dict[str, Any]:
         try:
             ref_prefix, digest_domain, roots, _receipt_schema, _auth_domain = (
@@ -2249,6 +2251,15 @@ class RunLifecycleOperations(OrchestratorComponent):
         }
         if schema == "raw_cleanup_claim_v4":
             body["root_entries"] = copy.deepcopy(inventory["root_entries"])
+        elif schema == "raw_cleanup_claim_v5":
+            descriptor = inventory.get("inventory_descriptor")
+            if descriptor is None:
+                descriptor = cleanup_sidecars.persist(
+                    self.run_dir,
+                    roots,
+                    inventory,
+                )
+            body["inventory_descriptor"] = copy.deepcopy(descriptor)
         return {
             **body,
             "claim_ref": ref_prefix + self.identity.derive_digest(digest_domain, body),
@@ -2284,6 +2295,8 @@ class RunLifecycleOperations(OrchestratorComponent):
         }
         if isinstance(value, Mapping) and value.get("schema") == "raw_cleanup_claim_v4":
             fields.add("root_entries")
+        if isinstance(value, Mapping) and value.get("schema") == "raw_cleanup_claim_v5":
+            fields.add("inventory_descriptor")
         if not isinstance(value, Mapping) or set(value) != fields:
             raise InvalidTransitionError("raw cleanup claim has an invalid shape")
         claim = copy.deepcopy(dict(value))
@@ -2294,7 +2307,6 @@ class RunLifecycleOperations(OrchestratorComponent):
             claim,
             label="raw",
             roots=contract[2],
-            require_exact_entries=str(claim["schema"]) == "raw_cleanup_claim_v4",
         )
         expected = self._raw_cleanup_claim_value(
             state,
@@ -2346,13 +2358,12 @@ class RunLifecycleOperations(OrchestratorComponent):
         *,
         label: str,
         roots: Sequence[str],
-        require_exact_entries: bool = False,
     ) -> dict[str, Any]:
         return cleanup_inventory.validate_claim_inventory(
             claim,
+            run_dir=self.run_dir,
             label=label,
             roots=roots,
-            require_exact_entries=require_exact_entries,
         )
 
     def _validate_completed_raw_cleanup(
@@ -2392,6 +2403,8 @@ class RunLifecycleOperations(OrchestratorComponent):
         }
         if claim.get("schema") == "raw_cleanup_claim_v4":
             fields.add("root_entries")
+        if claim.get("schema") == "raw_cleanup_claim_v5":
+            fields.add("inventory_descriptor")
         if set(claim) != fields:
             raise InvalidTransitionError(
                 "completed raw cleanup claim has an invalid shape"
@@ -2404,7 +2417,6 @@ class RunLifecycleOperations(OrchestratorComponent):
             claim,
             label="completed raw",
             roots=roots,
-            require_exact_entries=str(claim["schema"]) == "raw_cleanup_claim_v4",
         )
         unsigned = dict(claim)
         claim_ref = unsigned.pop("claim_ref", None)
@@ -2571,7 +2583,7 @@ class RunLifecycleOperations(OrchestratorComponent):
         state: Mapping[str, Any],
         coverage: Mapping[str, Any],
         inventory: Mapping[str, Any],
-        schema: str = "shadow_cleanup_claim_v4",
+        schema: str = "shadow_cleanup_claim_v5",
     ) -> dict[str, Any]:
         try:
             ref_prefix, digest_domain, roots, _receipt_schema, _auth_domain = (
@@ -2595,6 +2607,15 @@ class RunLifecycleOperations(OrchestratorComponent):
         }
         if schema == "shadow_cleanup_claim_v4":
             body["root_entries"] = copy.deepcopy(inventory["root_entries"])
+        elif schema == "shadow_cleanup_claim_v5":
+            descriptor = inventory.get("inventory_descriptor")
+            if descriptor is None:
+                descriptor = cleanup_sidecars.persist(
+                    self.run_dir,
+                    roots,
+                    inventory,
+                )
+            body["inventory_descriptor"] = copy.deepcopy(descriptor)
         return {
             **body,
             "claim_ref": ref_prefix + self.identity.derive_digest(digest_domain, body),
@@ -2624,6 +2645,11 @@ class RunLifecycleOperations(OrchestratorComponent):
             and value.get("schema") == "shadow_cleanup_claim_v4"
         ):
             fields.add("root_entries")
+        if (
+            isinstance(value, Mapping)
+            and value.get("schema") == "shadow_cleanup_claim_v5"
+        ):
+            fields.add("inventory_descriptor")
         if not isinstance(value, Mapping) or set(value) != fields:
             raise InvalidTransitionError("shadow cleanup claim has an invalid shape")
         claim = copy.deepcopy(dict(value))
@@ -2642,7 +2668,6 @@ class RunLifecycleOperations(OrchestratorComponent):
             claim,
             label="shadow",
             roots=roots,
-            require_exact_entries=(str(claim["schema"]) == "shadow_cleanup_claim_v4"),
         )
         expected = self._shadow_cleanup_claim_value(
             state,

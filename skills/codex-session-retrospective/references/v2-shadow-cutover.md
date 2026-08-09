@@ -58,17 +58,21 @@ those values as arguments.
 Shadow cleanup first stores an authenticated fixed-root claim containing the
 globally bytewise-sorted relative-path, type, device/inode, size, ownership,
 mode, link-count, and ACL-policy inventory for `raw-inputs`, `raw-shards`,
-`retained-inputs`, and `agent-sinks`. The v4 cleanup transaction then deletes
-only those four anchored roots, fsyncs their parent, confirms absence, and
-commits the coverage-bound cleanup receipt in the authenticated checkpoint. A
-retry after deletion or a lost close response uses the durable claim and returns
-the same receipt; pre-removed, replaced, symlinked, regrown, or caller-selected
-paths fail closed. Timestamp-only changes remain benign, and the final observed
-inventory does not claim atomic exclusion of an actively malicious same-UID
-writer after revalidation.
+`retained-inputs`, and `agent-sinks`. The v5 cleanup claim keeps only an
+authenticated descriptor in the checkpoint; its exact inventory lives in a
+bounded owner-only content-addressed sidecar. The transaction revalidates every
+root twice, renames each root into a deterministic claim-scoped quarantine,
+fsyncs a `started` marker, deletes only the verified remaining subset, confirms
+absence, and commits the coverage-bound receipt. A retry after child/root
+deletion or a lost close response uses the same durable claim and marker;
+unmarked removal, replacement, symlinks, regrowth, or caller-selected paths fail
+closed. Timestamp-only changes and directory metadata changes caused by verified
+child deletion remain benign. The final observation does not claim atomic
+exclusion of an actively malicious same-UID writer between revalidation and a
+rename or unlink syscall.
 The legacy v2 three-root and v3 counter-only four-root schemas remain readable
-only for compatibility recovery; new cleanup claims use the exact-inventory
-four-root v4 contract.
+only for compatibility recovery. Inline exact v4 claims remain replayable, while
+new cleanup claims use the sidecar-backed four-root v5 contract.
 
 ## Operational Cutover
 

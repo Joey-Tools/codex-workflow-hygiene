@@ -289,6 +289,21 @@ class PublicationTransaction:
             raise AttemptMismatchError(
                 "publication journal inventory differs from the current run bundle"
             )
+        if state["phase"] in {
+            PublicationPhase.ABORT_PENDING.value,
+            PublicationPhase.ABORTED.value,
+        }:
+            cls._validate_abort_recovery_binding(
+                state,
+                inventory=inventory,
+                bundle_dir=Path(bundle_dir).absolute(),
+                destination=destination,
+                target_ref=target_ref,
+                expected_target_head=expected_target_head,
+                run_dir=authoritative_run_dir,
+                identity_path=Path(identity_path).expanduser().absolute(),
+            )
+            return state
         publication_authority, cursor_vector, episode_update = (
             _load_run_publication_authority(
                 run_dir=authoritative_run_dir,
@@ -314,6 +329,57 @@ class PublicationTransaction:
                 "publication journal does not belong to the current run"
             )
         return state
+
+    @staticmethod
+    def _validate_abort_recovery_binding(
+        state: Mapping[str, Any],
+        *,
+        inventory: ArtifactInventory,
+        bundle_dir: Path,
+        destination: str,
+        target_ref: str,
+        expected_target_head: str | None,
+        run_dir: Path,
+        identity_path: Path,
+    ) -> None:
+        """Bind abort replay to its authenticated run without reopening live history."""
+
+        plan = _require_mapping(state["plan"], "publication plan")
+        try:
+            binding = _normalize_publication_authority(
+                _require_mapping(
+                    plan["publication_authority"],
+                    "publication authority",
+                )
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise AttemptMismatchError(
+                "publication journal does not belong to the current run"
+            ) from error
+        if any(
+            (
+                plan.get("attempt_ref") != state["attempt_ref"],
+                plan.get("bundle_dir") != str(bundle_dir),
+                plan.get("destination") != destination,
+                plan.get("target_ref") != target_ref,
+                plan.get("expected_target_head") != expected_target_head,
+                plan.get("inventory_digest_v2") != inventory.inventory_digest_v2,
+                binding["candidate_digest"] != inventory.retained_bundle_digest_v2,
+                binding["destination"] != destination,
+                binding["target_ref"] != target_ref,
+                binding["run_dir"] != str(run_dir),
+                binding["identity_path"] != str(identity_path),
+            )
+        ):
+            raise AttemptMismatchError(
+                "publication journal does not belong to the current run"
+            )
+        _validate_persistent_publication_claim(
+            run_dir=run_dir,
+            identity_path=identity_path,
+            attempt_ref=state["attempt_ref"],
+            plan_digest=state["plan_digest"],
+        )
 
     @property
     def journal_path(self) -> Path:

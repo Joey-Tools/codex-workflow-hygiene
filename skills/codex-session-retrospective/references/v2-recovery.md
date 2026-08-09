@@ -65,7 +65,10 @@ before it repairs commit. Changed attempts or projections fail closed.
 
 `abort_pending` is an explicit recoverable publication phase. Open/recovery
 dispatches its idempotent abort action before checking the now-conflicting live
-history authority. The provider first persists an authenticated cleanup claim
+history authority. CLI journal inspection likewise validates the static plan,
+bundle inventory, run/identity paths, and authenticated checkpoint claim before
+abort replay; it does not require the superseded history head to remain current.
+The provider first persists an authenticated cleanup claim
 binding the exact attempt, plan, expected target, staging identity, capacity,
 retention sidecar, and immutable provider state. Only verified deletion/absence
 may produce cleanup and reservation-release receipts. This also covers a
@@ -98,38 +101,47 @@ is durable but raw cleanup fails, the run remains
 is never rolled back.
 
 Shadow cleanup recovery is also checkpoint-authoritative. Before deletion, the
-engine fsyncs a fixed-root cleanup claim with an exact per-object inventory:
+engine fsyncs a fixed-root cleanup claim whose authenticated descriptor binds an
+owner-only, content-addressed sidecar with the exact per-object inventory:
 globally bytewise-sorted relative path, object type, device/inode, size,
 owner/group/mode, link count, and the verified owner-only/no-ACL access policy.
-It revalidates that complete inventory twice before deleting any claimed root;
-replacement, removal, size change, type change, or access-policy drift leaves
-cleanup pending. Timestamps are not mutation evidence. The inventory proves the
-claimed object set at each observation boundary; it does not claim an atomic
-defense against an actively malicious same-UID process after the final check.
-After deletion and absence verification, it fsyncs the final coverage-bound
+The checkpoint remains below its fixed bound regardless of legal inventory
+cardinality. The engine revalidates every complete inventory twice before any
+mutation, then moves each root into a deterministic claim-scoped quarantine and
+fsyncs a per-root `started` marker before recursive deletion. A retry accepts an
+exact remaining subset only inside that quarantine. An unmarked missing root,
+an original-path replacement, an unexpected quarantine entry, content/type
+change, or access-policy drift leaves cleanup pending. Timestamps and directory
+size/link-count changes caused by verified child deletion are not mutation
+evidence. The inventory proves the claimed object set at each observation
+boundary; it does not claim an atomic defense against an actively malicious
+same-UID process between the final check and a rename or unlink syscall. After
+deletion and absence verification, the engine fsyncs the final coverage-bound
 cleanup receipt. A lost response after that close is an idempotent read and
-revalidation of the same receipt. If deletion completed before the close, the
-durable claim supplies the original counters while the retry verifies that all
-claimed roots remain absent; no caller may replace counters or paths.
+revalidation of the same receipt. Durable progress markers distinguish a
+legitimate completed root from externally removed data while preserving the
+original counters; no caller may replace counters or paths.
 The fixed roots are `raw-inputs`, `raw-shards`, `agent-sinks`, and
 `retained-inputs`. Post-cleanup shadow validation and Daily successor derivation
 use the already authenticated coverage receipt bound to the run, configuration,
 model/policy era, and bundle digest; they do not reopen the deleted export-input
-sidecar. New cleanup claims and receipts use the v4 schema that binds the exact
-object inventory under all four roots. Exact legacy v2 and v3 claims and
-receipts remain replayable only with their original counter-only root
-inventories; v2, v3, and v4 claims, authorization references, and receipts
-cannot adopt one another. Every published, shadow-complete, or expired terminal
+sidecar. New cleanup claims and receipts use the v5 descriptor schema. Exact
+legacy v2 and v3 claims and receipts remain replayable only with their original
+counter-only root inventories, while v4 inline exact inventories remain
+replayable under their original all-roots-absent response-loss rule. v2, v3,
+v4, and v5 claims, authorization references, and receipts cannot adopt one
+another. Every published, shadow-complete, or expired terminal
 path also clears a legacy embedded retained-input payload from the authenticated
 checkpoint.
 
 Formal post-publication cleanup and expired-run cleanup follow the same durable
-claim pattern. Before deletion they fsync the authenticated v4 per-object
-inventory for the fixed raw/source/shard/working roots. Retry uses that original
-inventory, rejects replacement, removal, shrinkage, type or access-policy drift,
-verifies final absence, then checkpoints the receipt. A response lost after
-deletion therefore preserves the original byte/file/directory counts instead of
-recounting an empty tree.
+claim pattern. Before deletion they fsync the authenticated v5 sidecar
+descriptor for the fixed raw/source/shard/working roots. Retry uses that exact
+inventory and durable quarantine progress, rejects unproved removal,
+replacement, shrinkage, type or access-policy drift, verifies final absence,
+then checkpoints the receipt. A response lost after deletion therefore
+preserves the original byte/file/directory counts instead of recounting an empty
+tree.
 
 Lost-finalize recovery and garbage collection never infer publication from
 matching retained roots alone. The signed publication commit must bind the exact

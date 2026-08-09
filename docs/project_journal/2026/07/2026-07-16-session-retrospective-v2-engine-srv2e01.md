@@ -74,13 +74,17 @@ superseded_by:
   valid.
 - An existing publication journal is fully re-derived against the current run,
   bundle inventory, durable head, cursor transition, and episode transition
-  before the coordinator may persist a publication claim. Copying a valid
-  journal to another run therefore cannot reserve or mutate that run.
-- Cleanup v4 authenticates a globally bytewise-sorted per-object inventory for
-  all four fixed roots and revalidates it twice before deletion. Same-size child
-  replacement, shrinkage, removal, type or access-policy drift fail closed;
-  timestamp-only changes remain benign and legacy v2/v3 claims retain their
-  original replay-only semantics.
+  before the coordinator may persist a publication claim. Abort replay instead
+  proves the static plan and authenticated current-run claim before recovering,
+  so an intentionally advanced durable head cannot strand cleanup while a
+  copied journal still cannot reserve or mutate another run.
+- Cleanup v5 authenticates a bounded owner-only sidecar descriptor for the
+  globally bytewise-sorted per-object inventory of all four fixed roots. It
+  revalidates every root twice, then records restart-safe progress in a
+  claim-scoped quarantine. Same-size replacement, unproved removal, shrinkage,
+  type or access-policy drift fail closed; timestamp-only and verified
+  child-deletion directory metadata changes remain benign. Legacy v2/v3/v4
+  claims retain schema-scoped replay semantics.
 - Publication recovery can advance provider state when the exact signed
   publication remains reachable below an unrelated successor commit.
 - Retained episode, topic, turn, and global artifacts preserve opaque evidence
@@ -612,3 +616,24 @@ superseded_by:
   supersedes the earlier 1,573-test run and every affected-module result as the
   complete implementation-tree gate; the only subsequent change was this
   evidence-only journal update.
+- The fresh whole-range Codex review of signed head `05a218d` then found three
+  actionable recovery gaps: CLI prevalidation could strand `abort_pending`
+  after the target advanced, incremental exact deletion had no restart-safe
+  child/root progress, and inline `root_entries` could exceed the 32 MiB
+  checkpoint at legal scale. The follow-up keeps live-history re-derivation for
+  normal publication but authenticates only static run binding before abort
+  replay. Cleanup v5 moves exact entries to a bounded content-addressed sidecar
+  and uses deterministic quarantine plus durable per-root `started` markers.
+  Sidecar tamper, hardlink, oversize, same-size replacement, child deletion
+  interruption, root deletion interruption, and global two-pass regressions all
+  pass. The complete orchestrator module now passes 78/78 in 103.068 seconds,
+  module-boundary tests pass 17/17, and the exact host `/private/tmp` OpenPGP
+  conflict-recovery regression passes 1/1 in 13.681 seconds. The complete
+  host-level disposable-GPG publication module passes 48/48 in 486.504 seconds.
+  An additional v5 regression proves that moving away every claimed root without
+  a durable progress marker is rejected rather than treated as completed cleanup.
+- The final Python 3.13 host discovery passes all 1,578 tests in 783.319 seconds
+  on the same recovery-fix implementation, including the real OpenPGP
+  publication transactions. It supersedes every partial or pre-fix result for
+  this tree. Exact-secret admission, hosted CI, and final-head review evidence
+  remain to be regenerated after the signed append-only commit.

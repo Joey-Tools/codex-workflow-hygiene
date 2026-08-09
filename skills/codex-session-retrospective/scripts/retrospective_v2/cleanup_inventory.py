@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
-from . import safe_io
+from . import cleanup_sidecars, safe_io
+from .checkpoints import canonical_json_bytes
 from .orchestrator_support import (
     InvalidTransitionError,
     LEGACY_SHADOW_CLEANUP_ROOTS,
@@ -37,7 +39,22 @@ INTEGER_ENTRY_FIELDS = (
     "owner",
     "size",
 )
-EXACT_CLAIM_SCHEMAS = {"raw_cleanup_claim_v4", "shadow_cleanup_claim_v4"}
+INLINE_EXACT_CLAIM_SCHEMAS = {
+    "raw_cleanup_claim_v4",
+    "shadow_cleanup_claim_v4",
+}
+SIDECAR_EXACT_CLAIM_SCHEMAS = {
+    "raw_cleanup_claim_v5",
+    "shadow_cleanup_claim_v5",
+}
+EXACT_CLAIM_SCHEMAS = INLINE_EXACT_CLAIM_SCHEMAS | SIDECAR_EXACT_CLAIM_SCHEMAS
+CLEANUP_QUARANTINE_DIRECTORY = "cleanup-quarantine-v1"
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 
 
 def _cleanup_contract(kind: str, version: int, roots: Sequence[str]):
@@ -54,6 +71,7 @@ RAW_CLEANUP_CONTRACTS = {
     "raw_cleanup_claim_v2": _cleanup_contract("raw", 2, LEGACY_SHADOW_CLEANUP_ROOTS),
     "raw_cleanup_claim_v3": _cleanup_contract("raw", 3, SHADOW_CLEANUP_ROOTS),
     "raw_cleanup_claim_v4": _cleanup_contract("raw", 4, SHADOW_CLEANUP_ROOTS),
+    "raw_cleanup_claim_v5": _cleanup_contract("raw", 5, SHADOW_CLEANUP_ROOTS),
 }
 SHADOW_CLEANUP_CONTRACTS = {
     "shadow_cleanup_claim_v2": _cleanup_contract(
@@ -61,6 +79,7 @@ SHADOW_CLEANUP_CONTRACTS = {
     ),
     "shadow_cleanup_claim_v3": _cleanup_contract("shadow", 3, SHADOW_CLEANUP_ROOTS),
     "shadow_cleanup_claim_v4": _cleanup_contract("shadow", 4, SHADOW_CLEANUP_ROOTS),
+    "shadow_cleanup_claim_v5": _cleanup_contract("shadow", 5, SHADOW_CLEANUP_ROOTS),
 }
 
 
@@ -191,13 +210,15 @@ def _validate_entries(
 def validate_claim_inventory(
     claim: Mapping[str, Any],
     *,
+    run_dir: Path,
     label: str,
     roots: Sequence[str],
-    require_exact_entries: bool = False,
 ) -> dict[str, Any]:
+    schema = claim.get("schema")
     counters = claim.get("root_counters")
     objects = claim.get("root_objects")
     entries_by_root = claim.get("root_entries")
+    descriptor = claim.get("inventory_descriptor")
     totals = dict.fromkeys(COUNTER_FIELDS, 0)
     _require(
         all(
@@ -211,13 +232,17 @@ def validate_claim_inventory(
         ),
         label,
     )
-    if require_exact_entries:
+    if schema in INLINE_EXACT_CLAIM_SCHEMAS:
         _require(
             isinstance(entries_by_root, Mapping) and set(entries_by_root) == set(roots),
             label,
         )
-    else:
+        _require(descriptor is None, label)
+    elif schema in SIDECAR_EXACT_CLAIM_SCHEMAS:
         _require(entries_by_root is None, label)
+        entries_by_root = cleanup_sidecars.load(run_dir, roots, descriptor)
+    else:
+        _require(entries_by_root is None and descriptor is None, label)
     assert isinstance(counters, Mapping) and isinstance(objects, Mapping)
     for name in roots:
         counts = counters[name]
@@ -235,7 +260,7 @@ def validate_claim_inventory(
             label,
         )
         assert isinstance(counts, Mapping)
-        if require_exact_entries:
+        if schema in EXACT_CLAIM_SCHEMAS:
             assert isinstance(entries_by_root, Mapping)
             _validate_entries(
                 entries_by_root[name],
@@ -252,9 +277,11 @@ def validate_claim_inventory(
         "root_objects": copy.deepcopy(dict(objects)),
         **totals,
     }
-    if require_exact_entries:
+    if schema in EXACT_CLAIM_SCHEMAS:
         assert isinstance(entries_by_root, Mapping)
         inventory["root_entries"] = copy.deepcopy(dict(entries_by_root))
+    if schema in SIDECAR_EXACT_CLAIM_SCHEMAS:
+        inventory["inventory_descriptor"] = copy.deepcopy(descriptor)
     return inventory
 
 
@@ -296,128 +323,469 @@ def inspect_run_paths(
         os.close(run_fd)
 
 
-def _exact_prevalidation(
+def _contract_roots(claim: Mapping[str, Any]) -> Sequence[str]:
+    schema = str(claim.get("schema"))
+    contract = RAW_CLEANUP_CONTRACTS.get(schema)
+    if contract is None:
+        contract = SHADOW_CLEANUP_CONTRACTS.get(schema)
+    if contract is None or claim.get("raw_path_inventory") != list(contract[2]):
+        raise safe_io.UnsafePathError("raw cleanup claim has unsupported roots")
+    return contract[2]
+
+
+def _open_owner_only_child_directory(
+    parent_fd: int,
+    name: str,
+    *,
+    display_path: Path,
+) -> int:
+    created = False
+    try:
+        os.mkdir(name, safe_io.OWNER_DIRECTORY_MODE, dir_fd=parent_fd)
+        created = True
+    except FileExistsError:
+        pass
+    try:
+        descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise safe_io.UnsafePathError(
+            f"cannot anchor cleanup quarantine: {display_path}"
+        ) from error
+    try:
+        if created:
+            anchored = safe_io.harden_created_owner_only_directory_descriptor(
+                descriptor,
+                display_path,
+            )
+            os.fsync(parent_fd)
+        else:
+            anchored = safe_io.validate_owner_only_directory_descriptor(
+                descriptor,
+                display_path,
+            )
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (anchored.st_dev, anchored.st_ino) != (current.st_dev, current.st_ino):
+            raise safe_io.UnsafePathError(
+                f"cleanup quarantine changed while opened: {display_path}"
+            )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_claim_quarantine(
     run_fd: int,
     normalized: Path,
     claim: Mapping[str, Any],
-) -> dict[str, dict[str, Any]] | None:
-    prevalidated: dict[str, dict[str, Any]] = {}
-    missing: list[str] = []
+) -> tuple[Path, int]:
+    root_path = normalized / CLEANUP_QUARANTINE_DIRECTORY
+    root_fd = _open_owner_only_child_directory(
+        run_fd,
+        CLEANUP_QUARANTINE_DIRECTORY,
+        display_path=root_path,
+    )
+    token = hashlib.sha256(os.fsencode(str(claim["claim_ref"]))).hexdigest()
+    claim_path = root_path / token
+    try:
+        claim_fd = _open_owner_only_child_directory(
+            root_fd,
+            token,
+            display_path=claim_path,
+        )
+    finally:
+        os.close(root_fd)
+    return claim_path, claim_fd
+
+
+def _quarantine_names(name: str) -> tuple[str, str]:
+    token = hashlib.sha256(os.fsencode(name)).hexdigest()
+    return f"root-{token}", f"started-{token}.json"
+
+
+def _marker_bytes(claim: Mapping[str, Any], name: str) -> bytes:
+    return canonical_json_bytes(
+        {
+            "claim_ref": claim["claim_ref"],
+            "root": name,
+            "root_object": claim["root_objects"][name],
+            "schema": "cleanup_quarantine_progress_v1",
+            "state": "started",
+        }
+    )
+
+
+def _read_marker(
+    quarantine_fd: int,
+    quarantine_path: Path,
+    marker_name: str,
+    expected: bytes,
+) -> bool:
+    try:
+        observed = safe_io.read_bounded_bytes_at(
+            quarantine_fd,
+            marker_name,
+            display_path=quarantine_path / marker_name,
+            max_bytes=len(expected),
+            require_owner_only=True,
+        )
+    except FileNotFoundError:
+        return False
+    if observed != expected:
+        raise safe_io.UnsafePathError(
+            f"cleanup progress marker changed: {quarantine_path / marker_name}"
+        )
+    return True
+
+
+def _create_marker(
+    quarantine_fd: int,
+    quarantine_path: Path,
+    marker_name: str,
+    payload: bytes,
+) -> None:
+    marker_path = quarantine_path / marker_name
+    try:
+        descriptor = os.open(
+            marker_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            safe_io.OWNER_FILE_MODE,
+            dir_fd=quarantine_fd,
+        )
+    except FileExistsError:
+        if not _read_marker(quarantine_fd, quarantine_path, marker_name, payload):
+            raise safe_io.UnsafePathError(
+                f"cleanup progress marker disappeared: {marker_path}"
+            )
+        return
+    succeeded = False
+    try:
+        safe_io.harden_created_owner_only_file_descriptor(descriptor, marker_path)
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
+                raise OSError("short write while persisting cleanup progress")
+            written += count
+        os.fsync(descriptor)
+        succeeded = True
+    finally:
+        os.close(descriptor)
+        if not succeeded:
+            try:
+                os.unlink(marker_name, dir_fd=quarantine_fd)
+            except FileNotFoundError:
+                pass
+    os.fsync(quarantine_fd)
+    if not _read_marker(quarantine_fd, quarantine_path, marker_name, payload):
+        raise safe_io.UnsafePathError(
+            f"cleanup progress marker was not persisted: {marker_path}"
+        )
+
+
+def _remaining_entries_match(
+    observed: Sequence[Mapping[str, Any]],
+    planned: Sequence[Mapping[str, Any]],
+) -> bool:
+    planned_by_path = {entry["relative_path"]: entry for entry in planned}
+    if not observed or observed[0]["relative_path"] != ".":
+        return False
+    for entry in observed:
+        expected = planned_by_path.get(entry["relative_path"])
+        if expected is None or entry["object_type"] != expected["object_type"]:
+            return False
+        if entry["object_type"] == "file":
+            if dict(entry) != dict(expected):
+                return False
+            continue
+        stable_fields = ENTRY_FIELDS - {"link_count", "size"}
+        if any(entry[field] != expected[field] for field in stable_fields):
+            return False
+    return True
+
+
+def _exact_progress_snapshot(
+    run_fd: int,
+    quarantine_fd: int,
+    normalized: Path,
+    quarantine_path: Path,
+    claim: Mapping[str, Any],
+    *,
+    allow_legacy_all_absent: bool,
+) -> dict[str, dict[str, Any]]:
+    roots = claim["raw_path_inventory"]
+    expected_names = {item for name in roots for item in _quarantine_names(name)}
+    observed_names = set(os.listdir(quarantine_fd))
+    if not observed_names <= expected_names:
+        raise safe_io.UnsafePathError(
+            f"cleanup quarantine has unexpected entries: {quarantine_path}"
+        )
+    states: dict[str, dict[str, Any]] = {}
+    unproved_missing: list[str] = []
     claimed_present = {
-        name
-        for name in claim["raw_path_inventory"]
-        if claim["root_objects"][name] is not None
+        name for name in roots if claim["root_objects"][name] is not None
     }
-    for name in claim["raw_path_inventory"]:
-        snapshot = safe_io.inspect_tree_inventory_at(
+    for name in roots:
+        quarantine_name, marker_name = _quarantine_names(name)
+        original = safe_io.inspect_tree_inventory_at(
             run_fd,
             name,
             display_path=normalized / name,
         )
+        quarantined = safe_io.inspect_tree_inventory_at(
+            quarantine_fd,
+            quarantine_name,
+            display_path=quarantine_path / quarantine_name,
+        )
+        marker = _read_marker(
+            quarantine_fd,
+            quarantine_path,
+            marker_name,
+            _marker_bytes(claim, name),
+        )
         planned_object = claim["root_objects"][name]
         if planned_object is None:
-            if snapshot["entries"]:
+            if original["entries"] or quarantined["entries"] or marker:
                 raise safe_io.UnsafePathError(
                     f"raw cleanup root appeared after claim: {normalized / name}"
                 )
+            states[name] = {"phase": "absent"}
             continue
-        if not snapshot["entries"]:
-            missing.append(name)
-            continue
-        root = snapshot["entries"][0]
-        if not all(
-            (
-                root["device"] == planned_object["device"],
-                root["inode"] == planned_object["inode"],
-                snapshot["counters"] == claim["root_counters"][name],
-                snapshot["entries"] == claim["root_entries"][name],
+        if original["entries"] and quarantined["entries"]:
+            raise safe_io.UnsafePathError(
+                f"raw cleanup root exists both live and quarantined: {normalized / name}"
             )
+        if original["entries"]:
+            root = original["entries"][0]
+            if marker or not all(
+                (
+                    root["device"] == planned_object["device"],
+                    root["inode"] == planned_object["inode"],
+                    original["counters"] == claim["root_counters"][name],
+                    original["entries"] == claim["root_entries"][name],
+                )
+            ):
+                raise safe_io.UnsafePathError(
+                    f"raw cleanup inventory changed after claim: {normalized / name}"
+                )
+            states[name] = {"inventory": original, "phase": "original"}
+            continue
+        if quarantined["entries"]:
+            root = quarantined["entries"][0]
+            if not all(
+                (
+                    root["device"] == planned_object["device"],
+                    root["inode"] == planned_object["inode"],
+                    _remaining_entries_match(
+                        quarantined["entries"],
+                        claim["root_entries"][name],
+                    ),
+                )
+            ):
+                raise safe_io.UnsafePathError(
+                    f"quarantined cleanup inventory changed: {normalized / name}"
+                )
+            states[name] = {
+                "inventory": quarantined,
+                "marker": marker,
+                "phase": "quarantined",
+            }
+            continue
+        if marker:
+            states[name] = {"phase": "complete"}
+            continue
+        unproved_missing.append(name)
+    if unproved_missing:
+        if allow_legacy_all_absent and set(unproved_missing) == claimed_present:
+            for name in unproved_missing:
+                states[name] = {"phase": "legacy-complete"}
+        else:
+            raise safe_io.UnsafePathError(
+                "raw cleanup inventory became absent without durable progress"
+            )
+    return states
+
+
+def _delete_exact_claimed_paths(
+    run_fd: int,
+    normalized: Path,
+    claim: Mapping[str, Any],
+) -> None:
+    quarantine_path, quarantine_fd = _open_claim_quarantine(
+        run_fd,
+        normalized,
+        claim,
+    )
+    try:
+        allow_legacy_all_absent = claim["schema"] in INLINE_EXACT_CLAIM_SCHEMAS
+        states = _exact_progress_snapshot(
+            run_fd,
+            quarantine_fd,
+            normalized,
+            quarantine_path,
+            claim,
+            allow_legacy_all_absent=allow_legacy_all_absent,
+        )
+        revalidated = _exact_progress_snapshot(
+            run_fd,
+            quarantine_fd,
+            normalized,
+            quarantine_path,
+            claim,
+            allow_legacy_all_absent=allow_legacy_all_absent,
+        )
+        if revalidated != states:
+            raise safe_io.UnsafePathError(
+                "raw cleanup inventory changed during complete revalidation"
+            )
+        states = revalidated
+        for name in claim["raw_path_inventory"]:
+            phase = states[name]["phase"]
+            if phase in {"absent", "complete", "legacy-complete"}:
+                continue
+            current = _exact_progress_snapshot(
+                run_fd,
+                quarantine_fd,
+                normalized,
+                quarantine_path,
+                claim,
+                allow_legacy_all_absent=allow_legacy_all_absent,
+            )
+            if current != states:
+                raise safe_io.UnsafePathError(
+                    "raw cleanup inventory changed before quarantine"
+                )
+            quarantine_name, marker_name = _quarantine_names(name)
+            if phase == "original":
+                os.rename(
+                    name,
+                    quarantine_name,
+                    src_dir_fd=run_fd,
+                    dst_dir_fd=quarantine_fd,
+                )
+                os.fsync(run_fd)
+                os.fsync(quarantine_fd)
+                quarantined = safe_io.inspect_tree_inventory_at(
+                    quarantine_fd,
+                    quarantine_name,
+                    display_path=quarantine_path / quarantine_name,
+                )
+                if quarantined != states[name]["inventory"]:
+                    raise safe_io.UnsafePathError(
+                        f"raw cleanup root changed during quarantine: {normalized / name}"
+                    )
+            _create_marker(
+                quarantine_fd,
+                quarantine_path,
+                marker_name,
+                _marker_bytes(claim, name),
+            )
+            safe_io.secure_remove_tree_at(
+                quarantine_fd,
+                quarantine_name,
+                display_path=quarantine_path / quarantine_name,
+            )
+            updated = _exact_progress_snapshot(
+                run_fd,
+                quarantine_fd,
+                normalized,
+                quarantine_path,
+                claim,
+                allow_legacy_all_absent=allow_legacy_all_absent,
+            )
+            if updated[name]["phase"] != "complete":
+                raise safe_io.UnsafePathError(
+                    f"raw cleanup progress was not durable: {normalized / name}"
+                )
+            for other_name in claim["raw_path_inventory"]:
+                if other_name != name and updated[other_name] != states[other_name]:
+                    raise safe_io.UnsafePathError(
+                        "another raw cleanup root changed during deletion"
+                    )
+            states = updated
+        final = _exact_progress_snapshot(
+            run_fd,
+            quarantine_fd,
+            normalized,
+            quarantine_path,
+            claim,
+            allow_legacy_all_absent=allow_legacy_all_absent,
+        )
+        if any(
+            value["phase"] not in {"absent", "complete", "legacy-complete"}
+            for value in final.values()
+        ):
+            raise safe_io.UnsafePathError("raw working paths survived cleanup")
+        os.fsync(quarantine_fd)
+        os.fsync(run_fd)
+    finally:
+        os.close(quarantine_fd)
+
+
+def _delete_legacy_claimed_paths(
+    run_fd: int,
+    normalized: Path,
+    claim: Mapping[str, Any],
+) -> None:
+    for name in claim["raw_path_inventory"]:
+        planned_object = claim["root_objects"][name]
+        if planned_object is None:
+            continue
+        try:
+            metadata = os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if (metadata.st_dev, metadata.st_ino) != (
+            planned_object["device"],
+            planned_object["inode"],
         ):
             raise safe_io.UnsafePathError(
-                f"raw cleanup inventory changed after claim: {normalized / name}"
+                f"raw cleanup root changed after claim: {normalized / name}"
             )
-        prevalidated[name] = snapshot
-    if not missing:
-        return prevalidated
-    if set(missing) == claimed_present:
-        os.fsync(run_fd)
-        return None
-    raise safe_io.UnsafePathError(
-        "raw cleanup inventory became partially absent after claim"
-    )
+        current = safe_io.inspect_tree_at(
+            run_fd,
+            name,
+            display_path=normalized / name,
+        )
+        planned = claim["root_counters"][name]
+        if any(current[key] > planned[key] for key in current):
+            raise safe_io.UnsafePathError(
+                f"raw cleanup root grew after claim: {normalized / name}"
+            )
+        removed = safe_io.secure_remove_tree_at(
+            run_fd,
+            name,
+            display_path=normalized / name,
+        )
+        if removed != current:
+            raise safe_io.UnsafePathError(
+                f"raw cleanup count changed during deletion: {normalized / name}"
+            )
 
 
 def delete_claimed_paths(run_dir: Path, claim: Mapping[str, Any]) -> None:
+    roots = _contract_roots(claim)
+    inventory = validate_claim_inventory(
+        claim,
+        run_dir=run_dir,
+        label="raw",
+        roots=roots,
+    )
+    effective_claim = copy.deepcopy(dict(claim))
+    if claim.get("schema") in EXACT_CLAIM_SCHEMAS:
+        effective_claim["root_entries"] = inventory["root_entries"]
     normalized, run_fd = safe_io.open_owner_only_directory(run_dir)
     try:
-        exact = claim.get("schema") in EXACT_CLAIM_SCHEMAS
-        prevalidated = _exact_prevalidation(run_fd, normalized, claim) if exact else {}
-        if prevalidated is None:
-            return
-        if exact:
-            revalidated = _exact_prevalidation(run_fd, normalized, claim)
-            if revalidated is None or revalidated != prevalidated:
-                raise safe_io.UnsafePathError(
-                    "raw cleanup inventory changed during complete revalidation"
-                )
-            prevalidated = revalidated
-        for name in claim["raw_path_inventory"]:
-            planned_object = claim["root_objects"][name]
-            if planned_object is None:
-                continue
-            try:
-                metadata = os.stat(name, dir_fd=run_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                if exact:
-                    raise safe_io.UnsafePathError(
-                        f"raw cleanup root disappeared before deletion: "
-                        f"{normalized / name}"
-                    )
-                continue
-            if (metadata.st_dev, metadata.st_ino) != (
-                planned_object["device"],
-                planned_object["inode"],
-            ):
-                raise safe_io.UnsafePathError(
-                    f"raw cleanup root changed after claim: {normalized / name}"
-                )
-            if exact:
-                current_snapshot = safe_io.inspect_tree_inventory_at(
-                    run_fd,
-                    name,
-                    display_path=normalized / name,
-                )
-                if current_snapshot != prevalidated[name]:
-                    raise safe_io.UnsafePathError(
-                        "raw cleanup inventory changed during revalidation: "
-                        f"{normalized / name}"
-                    )
-                current = current_snapshot["counters"]
-            else:
-                current = safe_io.inspect_tree_at(
-                    run_fd,
-                    name,
-                    display_path=normalized / name,
-                )
-            planned = claim["root_counters"][name]
-            if exact and current != planned:
-                raise safe_io.UnsafePathError(
-                    f"raw cleanup root changed after claim: {normalized / name}"
-                )
-            if not exact and any(current[key] > planned[key] for key in current):
-                raise safe_io.UnsafePathError(
-                    f"raw cleanup root grew after claim: {normalized / name}"
-                )
-            removed = safe_io.secure_remove_tree_at(
-                run_fd,
-                name,
-                display_path=normalized / name,
-            )
-            if removed != current:
-                raise safe_io.UnsafePathError(
-                    f"raw cleanup count changed during deletion: {normalized / name}"
-                )
-        for name in claim["raw_path_inventory"]:
+        if claim.get("schema") in EXACT_CLAIM_SCHEMAS:
+            _delete_exact_claimed_paths(run_fd, normalized, effective_claim)
+        else:
+            _delete_legacy_claimed_paths(run_fd, normalized, effective_claim)
+        for name in roots:
             try:
                 os.stat(name, dir_fd=run_fd, follow_symlinks=False)
             except FileNotFoundError:
