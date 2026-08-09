@@ -1275,7 +1275,36 @@ def _atomic_create_pending_name(target_name: str, data: bytes) -> str:
 
 
 def _atomic_create_lock_name(target_name: str) -> str:
-    return f"{_ATOMIC_CREATE_PREFIX}{_atomic_create_target_token(target_name)}.lock"
+    if not target_name or target_name in {".", ".."} or "/" in target_name:
+        raise UnsafePathError("atomic-create target name is invalid")
+    return f"{_ATOMIC_CREATE_PREFIX}directory.lock"
+
+
+def _atomic_create_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(stat.S_IFMT(metadata.st_mode)),
+        int(metadata.st_uid),
+        int(metadata.st_gid),
+        int(stat.S_IMODE(metadata.st_mode)),
+        int(metadata.st_nlink),
+    )
+
+
+def _atomic_create_parent_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return _atomic_create_identity(metadata)[:-1]
+
+
+@dataclass(frozen=True, slots=True)
+class AtomicCreateReceipt:
+    """Identity-bound ownership proof for one newly created file."""
+
+    path: Path
+    parent_identity: tuple[int, ...]
+    file_identity: tuple[int, ...]
+    byte_count: int
+    digest: str
 
 
 def _hash_file_descriptor(descriptor: int) -> str:
@@ -1546,12 +1575,12 @@ def read_recoverable_atomic_json(
         os.close(directory_fd)
 
 
-def atomic_create_bytes(
+def atomic_create_bytes_with_receipt(
     path: str | os.PathLike[str],
     data: bytes | bytearray | memoryview,
     *,
     create_parents: bool = True,
-) -> Path:
+) -> AtomicCreateReceipt:
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError("atomic create data must be bytes-like")
     payload = bytes(data)
@@ -1624,7 +1653,36 @@ def atomic_create_bytes(
         pending_name = None
         os.fsync(directory_fd)
         _validate_existing_target_at(directory_fd, target.name, target)
-        return target
+        target_fd = open_checked_file_at(
+            directory_fd,
+            target.name,
+            display_path=target,
+            require_owner_only=True,
+        )
+        try:
+            target_metadata = os.fstat(target_fd)
+            validate_owner_only_file_descriptor(
+                target_fd,
+                target,
+                directory_fd=directory_fd,
+                name=target.name,
+            )
+            if (
+                target_metadata.st_size != len(payload)
+                or _hash_file_descriptor(target_fd)
+                != hashlib.sha256(payload).hexdigest()
+            ):
+                raise UnsafePathError(f"atomic-create target content changed: {target}")
+            parent_metadata = os.fstat(directory_fd)
+            return AtomicCreateReceipt(
+                path=target,
+                parent_identity=_atomic_create_parent_identity(parent_metadata),
+                file_identity=_atomic_create_identity(target_metadata),
+                byte_count=len(payload),
+                digest=hashlib.sha256(payload).hexdigest(),
+            )
+        finally:
+            os.close(target_fd)
     finally:
         if pending_name is not None and not prepared:
             try:
@@ -1639,6 +1697,157 @@ def atomic_create_bytes(
             finally:
                 os.close(lock_fd)
         os.close(directory_fd)
+
+
+def atomic_create_bytes(
+    path: str | os.PathLike[str],
+    data: bytes | bytearray | memoryview,
+    *,
+    create_parents: bool = True,
+) -> Path:
+    return atomic_create_bytes_with_receipt(
+        path,
+        data,
+        create_parents=create_parents,
+    ).path
+
+
+def remove_atomic_created_bytes(receipt: AtomicCreateReceipt) -> None:
+    """Remove only the cooperating object bound by an atomic-create receipt.
+
+    The directory lock excludes other users of this API through the final unlink.
+    A non-cooperating same-UID writer remains outside this point-in-time
+    ownership proof and can only cause a detected mismatch before that boundary.
+    """
+
+    if not isinstance(receipt, AtomicCreateReceipt):
+        raise TypeError("atomic-create rollback requires an ownership receipt")
+    target, directory_fd = _open_parent_directory(
+        receipt.path,
+        create_parents=False,
+    )
+    lock_name = _atomic_create_lock_name(target.name)
+    lock_path = target.parent / lock_name
+    lock_fd: int | None = None
+    descriptor = -1
+    try:
+        if (
+            _atomic_create_parent_identity(os.fstat(directory_fd))
+            != receipt.parent_identity
+        ):
+            raise UnsafePathError(
+                f"atomic-create rollback parent changed: {receipt.path.parent}"
+            )
+        lock_fd = open_lock_file_at(
+            directory_fd,
+            lock_name,
+            display_path=lock_path,
+        )
+        import fcntl
+
+        validate_owner_only_file_descriptor(
+            lock_fd,
+            lock_path,
+            directory_fd=directory_fd,
+            name=lock_name,
+        )
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        validate_owner_only_file_descriptor(
+            lock_fd,
+            lock_path,
+            directory_fd=directory_fd,
+            name=lock_name,
+        )
+        if (
+            _atomic_create_parent_identity(os.fstat(directory_fd))
+            != receipt.parent_identity
+        ):
+            raise UnsafePathError(
+                f"atomic-create rollback parent changed: {receipt.path.parent}"
+            )
+        try:
+            descriptor = open_checked_file_at(
+                directory_fd,
+                target.name,
+                display_path=target,
+                require_owner_only=True,
+            )
+        except FileNotFoundError:
+            return
+        validate_owner_only_file_descriptor(
+            descriptor,
+            target,
+            directory_fd=directory_fd,
+            name=target.name,
+        )
+        before = os.fstat(descriptor)
+        if (
+            _atomic_create_identity(before) != receipt.file_identity
+            or before.st_size != receipt.byte_count
+            or _hash_file_descriptor(descriptor) != receipt.digest
+        ):
+            raise UnsafePathError(f"atomic-create rollback target changed: {target}")
+        validate_owner_only_file_descriptor(
+            descriptor,
+            target,
+            directory_fd=directory_fd,
+            name=target.name,
+        )
+        after = os.fstat(descriptor)
+        if (
+            _atomic_create_identity(after) != receipt.file_identity
+            or after.st_size != receipt.byte_count
+            or _hash_file_descriptor(descriptor) != receipt.digest
+        ):
+            raise UnsafePathError(f"atomic-create rollback target changed: {target}")
+        validate_owner_only_file_descriptor(
+            descriptor,
+            target,
+            directory_fd=directory_fd,
+            name=target.name,
+        )
+        os.unlink(target.name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        primary = sys.exception()
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as close_error:
+                if primary is not None and hasattr(primary, "add_note"):
+                    primary.add_note(
+                        "atomic-create rollback target descriptor close failed: "
+                        f"{type(close_error).__name__}"
+                    )
+        if lock_fd is not None:
+            try:
+                import fcntl
+
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError as unlock_error:
+                    if primary is not None and hasattr(primary, "add_note"):
+                        primary.add_note(
+                            "atomic-create rollback lock release failed: "
+                            f"{type(unlock_error).__name__}"
+                        )
+            finally:
+                try:
+                    os.close(lock_fd)
+                except OSError as close_error:
+                    if primary is not None and hasattr(primary, "add_note"):
+                        primary.add_note(
+                            "atomic-create rollback lock descriptor close failed: "
+                            f"{type(close_error).__name__}"
+                        )
+        try:
+            os.close(directory_fd)
+        except OSError as close_error:
+            if primary is not None and hasattr(primary, "add_note"):
+                primary.add_note(
+                    "atomic-create rollback parent descriptor close failed: "
+                    f"{type(close_error).__name__}"
+                )
 
 
 def atomic_write_json(

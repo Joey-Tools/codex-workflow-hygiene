@@ -20,6 +20,8 @@ SCRIPTS = (
 sys.path.insert(0, str(SCRIPTS))
 
 from retrospective_v2 import catalog  # noqa: E402
+from retrospective_v2 import contracts  # noqa: E402
+from retrospective_v2 import raw_shard_staging  # noqa: E402
 from retrospective_v2 import sharding  # noqa: E402
 from retrospective_v2.identity import IdentityKey  # noqa: E402
 
@@ -808,6 +810,37 @@ class ShardingTests(unittest.TestCase):
         self.assertEqual(result.gap_bytes, len(payload))
         self.assertEqual(result.materialized_raw_bytes + result.gap_bytes, len(payload))
 
+    def test_over_budget_catalog_record_is_gapped_before_payload_read(self) -> None:
+        payload = b"0123456789"
+        record = candidate("deferred-over-budget", payload)
+        limits = sharding.ShardLimits(
+            max_bytes=8,
+            record_processing_budget=9,
+        )
+
+        with mock.patch.object(
+            raw_shard_staging.safe_io,
+            "read_bounded_bytes",
+        ) as read_payload:
+            staged = raw_shard_staging.prepare(
+                Path("/owner-only/run"),
+                [record],
+                {
+                    record.unit_ref: {
+                        "relative_path": "raw-inputs/must-not-be-opened.bin"
+                    }
+                },
+                limits,
+            )
+
+        read_payload.assert_not_called()
+        self.assertFalse(staged.plan.shards)
+        self.assertEqual(1, len(staged.plan.gaps))
+        self.assertEqual(
+            "oversized_record_budget_exceeded",
+            staged.plan.gaps[0].reason,
+        )
+
     def test_failed_oversized_record_is_gapped_without_losing_normal_records(
         self,
     ) -> None:
@@ -921,6 +954,134 @@ class ShardingTests(unittest.TestCase):
                         fallback_directory,
                     )
             self.assertFalse(fallback_directory.exists())
+
+    def test_streaming_plan_and_materialization_keep_raw_working_set_bounded(
+        self,
+    ) -> None:
+        payloads = [
+            (f'{{"turn":{index},"text":"' + "x" * 64_000 + '"}}\n').encode()
+            for index in range(24)
+        ]
+        records = [
+            raw_record(
+                candidate(
+                    f"stream-unit-{index:03d}",
+                    payload,
+                    record_ref=f"record-{index:03d}",
+                    byte_start=sum(len(value) for value in payloads[:index]),
+                ),
+                payload,
+            )
+            for index, payload in enumerate(payloads)
+        ]
+        limits = sharding.ShardLimits(max_turns=4, max_bytes=320 * 1024)
+
+        plan = sharding.plan_ordered_raw_shards(iter(records), limits=limits)
+
+        self.assertEqual(len(records), plan.source_record_count)
+        self.assertLess(plan.peak_working_byte_count, plan.source_byte_count)
+        self.assertLessEqual(
+            plan.peak_working_byte_count,
+            2 * max(map(len, payloads)) + 2 * limits.max_bytes,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary) / "streamed-raw-run"
+            receipt = sharding.materialize_ordered_raw_shards(
+                iter(records),
+                run_directory,
+                plan=plan,
+                limits=limits,
+            )
+            self.assertEqual(
+                plan.canonical_manifest_bytes() + b"\n",
+                (run_directory / sharding.RAW_SHARDS_MANIFEST_FILE).read_bytes(),
+            )
+            self.assertEqual(len(plan.shards) + 1, len(receipt.files))
+            sharding.rollback_ordered_raw_shards(receipt)
+            self.assertFalse(
+                any(
+                    path.name == sharding.RAW_SHARDS_MANIFEST_FILE
+                    or path.name.startswith("raw-shard-")
+                    for path in run_directory.iterdir()
+                )
+            )
+
+    def test_streaming_shard_rollback_continues_after_receipt_mismatch(self) -> None:
+        payloads = [b'{"turn":1}\n', b'{"turn":2}\n']
+        records = [
+            raw_record(
+                candidate(
+                    f"rollback-unit-{index}",
+                    payload,
+                    record_ref=f"rollback-record-{index}",
+                    byte_start=sum(len(value) for value in payloads[:index]),
+                ),
+                payload,
+            )
+            for index, payload in enumerate(payloads)
+        ]
+        limits = sharding.ShardLimits(max_turns=1)
+        plan = sharding.plan_ordered_raw_shards(records, limits=limits)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary) / "rollback-run"
+            receipt = sharding.materialize_ordered_raw_shards(
+                records,
+                run_directory,
+                plan=plan,
+                limits=limits,
+            )
+            changed = run_directory / plan.shards[0].file_name
+            original = changed.with_name("changed-original.jsonl")
+            payload = changed.read_bytes()
+            changed.rename(original)
+            changed.write_bytes(payload)
+            os.chmod(changed, 0o600)
+
+            with self.assertRaisesRegex(
+                sharding.ShardingValidationError,
+                "target changed",
+            ):
+                sharding.rollback_ordered_raw_shards(receipt)
+
+            self.assertTrue(changed.is_file())
+            self.assertTrue(original.is_file())
+            self.assertFalse(
+                (run_directory / sharding.RAW_SHARDS_MANIFEST_FILE).exists()
+            )
+            self.assertFalse((run_directory / plan.shards[1].file_name).exists())
+
+    def test_streaming_plan_rejects_shards_beyond_reserved_task_budget_before_io(
+        self,
+    ) -> None:
+        payloads = [b'{"turn":1}\n', b'{"turn":2}\n']
+        records = [
+            raw_record(
+                candidate(
+                    f"capacity-unit-{index}",
+                    payload,
+                    record_ref=f"record-{index}",
+                    byte_start=sum(len(value) for value in payloads[:index]),
+                ),
+                payload,
+            )
+            for index, payload in enumerate(payloads)
+        ]
+        limits = sharding.ShardLimits(max_turns=1)
+
+        with self.assertRaisesRegex(
+            sharding.ShardingValidationError,
+            "reserved extractor task budget",
+        ):
+            sharding.plan_ordered_raw_shards(
+                iter(records),
+                limits=limits,
+                max_shards=1,
+            )
+        self.assertEqual(
+            contracts.MAX_RUN_AGENT_TASKS,
+            contracts.MAX_RUN_RAW_SHARDS + contracts.MAX_RUN_DOWNSTREAM_AGENT_TASKS,
+        )
 
     def test_job_manifest_is_hmac_deterministic_and_enforces_full_input_limit(
         self,

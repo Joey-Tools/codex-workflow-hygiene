@@ -1,14 +1,22 @@
 """Bounded agent job and execution-envelope construction."""
 
 from __future__ import annotations
-import base64
 import copy
-import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
-from . import result_validation, safe_io, sharding, transport as source_transport
+from . import (
+    agent_capacity,
+    agent_raw_artifacts,
+    agent_task_inputs,
+    extracted_turns,
+    result_validation,
+    safe_io,
+    sharding,
+    transport as source_transport,
+)
 from .checkpoints import canonical_json_bytes, content_digest
-from .contracts import MAX_RUN_AGENT_TASKS, JobKind, RefType, RunStage
+from .contracts import JobKind, RefType, RunStage
 from .orchestrator_context import OrchestratorComponent, RuntimeContext
 from .orchestrator_protocols import JobsProjectionPort
 
@@ -19,12 +27,14 @@ from .orchestrator_support import (
     InvalidTransitionError,
     PROMPT_DIGEST,
     PROMPT_VERSION,
-    RAW_SHARD_DIRECTORY,
     RunConflictError,
     _AGENT_INSTRUCTIONS,
     _RESULT_SCHEMA_BY_KIND,
     _json_copy,
 )
+
+
+_READ_SEALED_RAW_ARTIFACT = object()
 
 
 class AgentJobOperations(OrchestratorComponent):
@@ -36,18 +46,64 @@ class AgentJobOperations(OrchestratorComponent):
     ) -> None:
         super().__init__(context)
         self._projection = projection
+        self._task_input_staging: agent_task_inputs.Staging | None = None
+
+    @contextmanager
+    def _task_input_staging_scope(
+        self,
+        staging: agent_task_inputs.Staging,
+    ) -> Iterable[None]:
+        if self._task_input_staging is not None:
+            raise InvalidTransitionError("agent task input staging is already active")
+        self._task_input_staging = staging
+        try:
+            yield
+        finally:
+            self._task_input_staging = None
+
+    def _stage_run_file(self, path: Path, payload: bytes) -> None:
+        if self._task_input_staging is None:
+            raise InvalidTransitionError("run file staging is not active")
+        self._task_input_staging.add_file(path, payload)
+
+    def _load_extracted_turns(
+        self,
+        value: Mapping[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        return extracted_turns.load(
+            self.run_dir,
+            value,
+            staged_files=(
+                None
+                if self._task_input_staging is None
+                else tuple(self._task_input_staging.files)
+            ),
+        )
+
+    def _task_immutable(self, task: Mapping[str, Any]) -> dict[str, Any]:
+        if self._task_input_staging is not None:
+            return self._task_input_staging.for_task(self.run_dir, task)
+        return agent_task_inputs.for_task(self.run_dir, task)
 
     def _agent_envelope(
         self,
         task: Mapping[str, Any],
         attempt: Mapping[str, Any],
+        *,
+        raw_artifact_override: object = _READ_SEALED_RAW_ARTIFACT,
+        immutable_override: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        immutable = (
+            dict(immutable_override)
+            if immutable_override is not None
+            else self._task_immutable(task)
+        )
         sink_name = str(attempt["job_ref"]).replace(":", "-") + ".json"
         output_sink = attempt.get("output_sink")
         if not isinstance(output_sink, str):
             output_sink = str(self.run_dir / "agent-sinks" / sink_name)
         public_metadata = {
-            "allowed_output_refs": copy.deepcopy(task["allowed_refs"]),
+            "allowed_output_refs": copy.deepcopy(immutable["allowed_refs"]),
             "attempt_ref": attempt["attempt_ref"],
             "input_digest": task["input_digest"],
             "job_ref": attempt["job_ref"],
@@ -71,15 +127,23 @@ class AgentJobOperations(OrchestratorComponent):
                     "reviewer_slot": task["metadata"]["reviewer_slot"],
                 }
             )
-        raw_artifact = self._sealed_raw_agent_artifact(task)
+        raw_artifact = (
+            agent_raw_artifacts.sealed(
+                self.run_dir,
+                immutable,
+                restore_manifest=self._projection._restore_shard_manifest,
+            )
+            if raw_artifact_override is _READ_SEALED_RAW_ARTIFACT
+            else raw_artifact_override
+        )
         return {
-            "execution_contract": copy.deepcopy(task["execution_contract"]),
-            "framing": copy.deepcopy(task["framing"]),
+            "execution_contract": copy.deepcopy(immutable["execution_contract"]),
+            "framing": copy.deepcopy(immutable["framing"]),
             "instruction": _AGENT_INSTRUCTIONS[task["job_kind"]],
             "job_manifest": copy.deepcopy(attempt["job_manifest"]),
             "payload": {
-                "input_payload": copy.deepcopy(task.get("input_payload")),
-                "input_refs": copy.deepcopy(task["input_refs"]),
+                "input_payload": copy.deepcopy(immutable["input_payload"]),
+                "input_refs": copy.deepcopy(immutable["input_refs"]),
                 "raw_artifact": raw_artifact,
             },
             "public_metadata": public_metadata,
@@ -147,6 +211,7 @@ class AgentJobOperations(OrchestratorComponent):
         metadata = {"reviewer_slot": reviewer_slot} if reviewer_slot else {}
         task = {
             "allowed_refs": normalized_allowed,
+            "allowed_turn_refs": [],
             "execution_contract": {
                 "model": {
                     "model": "size-probe",
@@ -167,6 +232,7 @@ class AgentJobOperations(OrchestratorComponent):
                 "versions": dict(EXECUTION_VERSION_CONTRACT),
             },
             "framing": {},
+            "host_refs": [],
             "input_digest": input_digest,
             "input_payload": (
                 None if input_payload is None else copy.deepcopy(dict(input_payload))
@@ -174,6 +240,7 @@ class AgentJobOperations(OrchestratorComponent):
             "input_refs": normalized_refs,
             "job_kind": kind,
             "metadata": metadata,
+            "partition_ref": "run_input_ref_v2:" + "0" * 64,
             "raw_artifact": None,
             "raw_manifest": None,
             "stage": RunStage.GLOBAL_SYNTHESIS.value,
@@ -276,11 +343,15 @@ class AgentJobOperations(OrchestratorComponent):
             existing["cache_reuse_count"] = reuse_count + 1
             return task_ref
         metrics = state.setdefault("metrics", {})
-        misses = metrics.get("agent_task_cache_misses", 0)
-        if isinstance(misses, bool) or not isinstance(misses, int) or misses < 0:
-            raise RunConflictError("agent task cache miss count is invalid")
-        if misses >= MAX_RUN_AGENT_TASKS:
-            raise InvalidInputError("agent task count exceeds cleanup capacity")
+        reservation = agent_capacity.reserve(state, kind)
+        if self._task_input_staging is None:
+            raise InvalidTransitionError("agent task input staging is not active")
+        task_input_artifact = self._task_input_staging.prepare(
+            self.run_dir,
+            task_ref=task_ref,
+            immutable=immutable,
+            immutable_digest=immutable_digest,
+        )
         task = {
             "active_attempt_ref": None,
             "active_job_ref": None,
@@ -295,15 +366,26 @@ class AgentJobOperations(OrchestratorComponent):
                     "raw_manifest": immutable["raw_manifest"],
                 }
             ),
+            "host_refs": immutable["host_refs"],
+            "job_kind": immutable["job_kind"],
+            "metadata": agent_task_inputs.checkpoint_metadata(immutable["metadata"]),
+            "partition_ref": immutable["partition_ref"],
+            "stage": immutable["stage"],
             "status": "pending",
+            "task_input_artifact": task_input_artifact,
             "task_ref": task_ref,
-            **immutable,
         }
-        projected_envelope = self._project_agent_envelope(state, task, ordinal=1)
+        projected_envelope = self._project_agent_envelope(
+            state,
+            task,
+            ordinal=1,
+            immutable_override=immutable,
+        )
         if len(canonical_json_bytes(projected_envelope)) > self._agent_envelope_limit():
             raise InvalidInputError("agent task exceeds the complete 512 KiB envelope")
+        agent_capacity.validate_checkpoint_task(task)
         state["jobs"][task_ref] = task
-        metrics["agent_task_cache_misses"] = misses + 1
+        reservation.commit(metrics)
         return task_ref
 
     def _execution_manifest(
@@ -311,14 +393,21 @@ class AgentJobOperations(OrchestratorComponent):
         state: Mapping[str, Any],
         task: Mapping[str, Any],
         retry_ordinal: int,
+        *,
+        immutable_override: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         kind = task["job_kind"]
-        execution_contract = copy.deepcopy(task["execution_contract"])
+        immutable = (
+            dict(immutable_override)
+            if immutable_override is not None
+            else self._task_immutable(task)
+        )
+        execution_contract = copy.deepcopy(immutable["execution_contract"])
         if kind == JobKind.EXTRACTOR_REDACTOR.value:
             shard_manifest = self._projection._restore_shard_manifest(
-                task["raw_manifest"]
+                immutable["raw_manifest"]
             )
-            framing = canonical_json_bytes(task["framing"])
+            framing = canonical_json_bytes(immutable["framing"])
             generated = sharding.build_job_manifest(
                 shard_manifest,
                 job_kind=JobKind.EXTRACTOR_REDACTOR,
@@ -337,7 +426,7 @@ class AgentJobOperations(OrchestratorComponent):
             body.update(
                 {
                     "execution_contract": execution_contract,
-                    "allowed_output_refs": copy.deepcopy(task["allowed_refs"]),
+                    "allowed_output_refs": copy.deepcopy(immutable["allowed_refs"]),
                     "result_schema": result_validation.EXTRACTOR_RESULT_SCHEMA,
                     "task_ref": task["task_ref"],
                 }
@@ -347,12 +436,12 @@ class AgentJobOperations(OrchestratorComponent):
                 **body,
             }
         body = {
-            "allowed_output_refs": copy.deepcopy(task["allowed_refs"]),
+            "allowed_output_refs": copy.deepcopy(immutable["allowed_refs"]),
             "candidate_result_hashes": copy.deepcopy(
                 task["metadata"].get("candidate_result_hashes", [])
             ),
             "input_digest": task["input_digest"],
-            "input_refs": copy.deepcopy(task["input_refs"]),
+            "input_refs": copy.deepcopy(immutable["input_refs"]),
             "execution_contract": execution_contract,
             "job_kind": kind,
             "result_schema": _RESULT_SCHEMA_BY_KIND[kind],
@@ -372,8 +461,19 @@ class AgentJobOperations(OrchestratorComponent):
         task: Mapping[str, Any],
         *,
         ordinal: int,
+        immutable_override: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        job_manifest = self._execution_manifest(state, task, ordinal)
+        immutable = (
+            dict(immutable_override)
+            if immutable_override is not None
+            else self._task_immutable(task)
+        )
+        job_manifest = self._execution_manifest(
+            state,
+            task,
+            ordinal,
+            immutable_override=immutable,
+        )
         job_ref = job_manifest["job_ref"]
         attempt_ref = self._ref(
             RefType.ATTEMPT,
@@ -399,53 +499,9 @@ class AgentJobOperations(OrchestratorComponent):
                 "ordinal": ordinal,
                 "reviewer_ref": reviewer_ref,
             },
+            raw_artifact_override=agent_raw_artifacts.projected(
+                immutable,
+                restore_manifest=self._projection._restore_shard_manifest,
+            ),
+            immutable_override=immutable,
         )
-
-    def _sealed_raw_agent_artifact(
-        self,
-        task: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        relative_path = task.get("raw_artifact")
-        manifest_value = task.get("raw_manifest")
-        if relative_path is None and manifest_value is None:
-            return None
-        if not isinstance(relative_path, str) or not isinstance(
-            manifest_value, Mapping
-        ):
-            raise InvalidTransitionError(
-                "raw agent artifact requires one sealed path and manifest"
-            )
-        relative = Path(relative_path)
-        if (
-            relative.is_absolute()
-            or relative.parts[:1] != (RAW_SHARD_DIRECTORY,)
-            or any(part in {"", ".", ".."} for part in relative.parts)
-        ):
-            raise InvalidTransitionError("raw agent artifact path is invalid")
-        manifest = self._projection._restore_shard_manifest(manifest_value)
-        if relative.name != manifest.file_name:
-            raise InvalidTransitionError(
-                "raw agent artifact path does not match its manifest"
-            )
-        try:
-            data = safe_io.read_bounded_bytes(
-                self.run_dir / relative,
-                max_bytes=manifest.byte_count,
-                require_owner_only=True,
-            )
-        except (OSError, ValueError) as error:
-            raise InvalidTransitionError(
-                "raw agent artifact cannot be read within its sealed bound"
-            ) from error
-        if (
-            len(data) != manifest.byte_count
-            or hashlib.sha256(data).hexdigest() != manifest.content_sha256
-        ):
-            raise InvalidTransitionError(
-                "raw agent artifact does not match its sealed manifest"
-            )
-        return {
-            "encoding": "base64",
-            "manifest": copy.deepcopy(dict(manifest_value)),
-            "payload_b64": base64.b64encode(data).decode("ascii"),
-        }

@@ -105,6 +105,7 @@ def _source_transport_snapshot_flags(
     schema: str,
     cache: pathlib.Path,
     maximum_bytes: int,
+    stage_file: Callable[[pathlib.Path, bytes], None] | None = None,
 ) -> tuple[str, ...]:
     try:
         from . import safe_io as snapshot_io
@@ -125,28 +126,31 @@ def _source_transport_snapshot_flags(
         raise TransportValidationError("source transport program snapshot is too large")
     digest = "sha256:" + hashlib.sha256(payload).hexdigest()
     snapshot_path = _source_transport_snapshot_path(cache, digest)
-    snapshot_io.ensure_owner_only_directory(snapshot_path.parent)
-    try:
-        snapshot_io.atomic_create_bytes(
-            snapshot_path,
-            payload,
-            create_parents=False,
-        )
-    except FileExistsError:
+    if stage_file is not None:
+        stage_file(snapshot_path, payload)
+    else:
+        snapshot_io.ensure_owner_only_directory(snapshot_path.parent)
         try:
-            existing = snapshot_io.read_bounded_bytes(
+            snapshot_io.atomic_create_bytes(
                 snapshot_path,
-                max_bytes=maximum_bytes,
-                require_owner_only=True,
+                payload,
+                create_parents=False,
             )
-        except (OSError, snapshot_io.UnsafePathError) as exc:
-            raise TransportValidationError(
-                "source transport program snapshot is invalid"
-            ) from exc
-        if not hmac.compare_digest(existing, payload):
-            raise TransportValidationError(
-                "source transport program snapshot digest changed"
-            )
+        except FileExistsError:
+            try:
+                existing = snapshot_io.read_bounded_bytes(
+                    snapshot_path,
+                    max_bytes=maximum_bytes,
+                    require_owner_only=True,
+                )
+            except (OSError, snapshot_io.UnsafePathError) as exc:
+                raise TransportValidationError(
+                    "source transport program snapshot is invalid"
+                ) from exc
+            if not hmac.compare_digest(existing, payload):
+                raise TransportValidationError(
+                    "source transport program snapshot digest changed"
+                )
     return (
         *base_flags,
         "-c",
@@ -164,6 +168,7 @@ def _source_transport_decode_snapshot(
     cache: pathlib.Path,
     maximum_bytes: int,
     component_reader: Callable[..., Mapping[str, JsonValue]],
+    prepared_files: Mapping[pathlib.Path, bytes] | None = None,
 ) -> tuple[dict[str, JsonValue], int, str]:
     try:
         from . import safe_io as snapshot_io
@@ -176,18 +181,30 @@ def _source_transport_decode_snapshot(
     snapshot_path = pathlib.Path(argv[len(prefix) + 1])
     if snapshot_path != _source_transport_snapshot_path(cache, digest):
         raise TransportValidationError("source transport snapshot path is invalid")
+    prepared = None if prepared_files is None else prepared_files.get(snapshot_path)
     try:
-        snapshot_io.recover_atomic_create(snapshot_path)
-        component = component_reader(
-            snapshot_path,
-            role="program_snapshot",
-            allow_missing=False,
-            maximum_bytes=maximum_bytes,
-            include_content=True,
-        )
-        payload = base64.b64decode(str(component["content_b64"]), validate=True)
+        if prepared is None:
+            snapshot_io.recover_atomic_create(snapshot_path)
+            component = component_reader(
+                snapshot_path,
+                role="program_snapshot",
+                allow_missing=False,
+                maximum_bytes=maximum_bytes,
+                include_content=True,
+            )
+            payload = base64.b64decode(str(component["content_b64"]), validate=True)
+        else:
+            if not isinstance(prepared, bytes) or len(prepared) > maximum_bytes:
+                raise ValueError("prepared source transport snapshot is invalid")
+            payload = prepared
         snapshot = strict_json_loads(zlib.decompress(payload))
-    except (OSError, ValueError, zlib.error, snapshot_io.UnsafePathError) as exc:
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        zlib.error,
+        snapshot_io.UnsafePathError,
+    ) as exc:
         raise TransportValidationError("source transport snapshot is invalid") from exc
     if digest != "sha256:" + hashlib.sha256(payload).hexdigest() or not isinstance(
         snapshot, dict

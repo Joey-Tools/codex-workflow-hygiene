@@ -7,7 +7,7 @@ import hmac
 import os
 from pathlib import Path
 import re
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 try:
     from .catalog import (
@@ -158,6 +158,34 @@ class RawEvidenceRecord:
 
 
 RawRecord = RawEvidenceRecord
+
+
+@dataclass(frozen=True)
+class DeferredRawGap:
+    """Catalog-authenticated gap that does not require loading raw payload bytes."""
+
+    catalog_record: CatalogRecord
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.catalog_record, CatalogRecord):
+            raise ShardingValidationError("catalog_record must be a CatalogRecord")
+        if (
+            self.catalog_record.accounting_class
+            is not AccountingClass.CONSUMED_CANDIDATE
+        ):
+            raise ShardingValidationError(
+                "deferred raw gaps require a consumed_candidate unit"
+            )
+        if self.reason not in {
+            "oversized_record_budget_exceeded",
+            "record_turn_limit_exceeded",
+        }:
+            raise ShardingValidationError("deferred raw gap reason is invalid")
+
+    @property
+    def unit_ref(self) -> str:
+        return self.catalog_record.unit_ref
 
 
 @dataclass(frozen=True)
@@ -475,6 +503,89 @@ class MaterializationResult:
 
 
 @dataclass(frozen=True)
+class ShardPlan:
+    """Manifest-only result from one bounded ordered streaming pass."""
+
+    shards: tuple[ShardManifest, ...]
+    gaps: tuple[RawGapDescriptor, ...]
+    source_record_count: int
+    source_byte_count: int
+    peak_working_byte_count: int
+    schema_version: int = SHARD_SET_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SHARD_SET_SCHEMA_VERSION:
+            raise ShardingValidationError(
+                f"shard set schema_version must be {SHARD_SET_SCHEMA_VERSION}"
+            )
+        for name, value in (
+            ("source_record_count", self.source_record_count),
+            ("source_byte_count", self.source_byte_count),
+            ("peak_working_byte_count", self.peak_working_byte_count),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ShardingValidationError(f"{name} must be non-negative")
+        shards = tuple(self.shards)
+        gaps = tuple(self.gaps)
+        object.__setattr__(self, "shards", shards)
+        object.__setattr__(self, "gaps", gaps)
+        if [item.ordinal for item in shards] != list(range(len(shards))):
+            raise ShardingValidationError("shard ordinals must be contiguous from zero")
+        if len({item.unit_ref for item in gaps}) != len(gaps):
+            raise ShardingValidationError(
+                "a source unit cannot have multiple whole-record gaps"
+            )
+        shard_units = {
+            descriptor.unit_ref for shard in shards for descriptor in shard.ranges
+        }
+        gap_units = {item.unit_ref for item in gaps}
+        if shard_units & gap_units:
+            raise ShardingValidationError(
+                "a source unit cannot be both materialized and gapped"
+            )
+        if len(shard_units | gap_units) != self.source_record_count:
+            raise ShardingValidationError(
+                "source_record_count does not match materialized and gapped units"
+            )
+        if self.materialized_raw_bytes + self.gap_bytes != self.source_byte_count:
+            raise ShardingValidationError(
+                "shard set byte totals do not conserve the source corpus"
+            )
+
+    @property
+    def materialized_raw_bytes(self) -> int:
+        return sum(item.raw_byte_count for item in self.shards)
+
+    @property
+    def gap_bytes(self) -> int:
+        return sum(item.byte_count for item in self.gaps)
+
+    def to_manifest_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "source_record_count": self.source_record_count,
+            "source_byte_count": self.source_byte_count,
+            "materialized_raw_bytes": self.materialized_raw_bytes,
+            "gap_bytes": self.gap_bytes,
+            "shards": [item.to_dict() for item in self.shards],
+            "gaps": [item.to_dict() for item in self.gaps],
+        }
+
+    def canonical_manifest_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_manifest_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedShardFile:
+    receipt: object
+
+
+@dataclass(frozen=True, slots=True)
+class RawShardStageReceipt:
+    files: tuple[MaterializedShardFile, ...]
+
+
+@dataclass(frozen=True)
 class _RangePiece:
     descriptor: RawRangeDescriptor
     payload: bytes
@@ -592,7 +703,10 @@ def _largest_fitting_end(
     return best
 
 
-def _gap_for_record(record: RawEvidenceRecord, reason: str) -> RawGapDescriptor:
+def _gap_for_record(
+    record: RawEvidenceRecord | DeferredRawGap,
+    reason: str,
+) -> RawGapDescriptor:
     return RawGapDescriptor(
         unit_ref=record.unit_ref,
         coordinate=record.catalog_record.coordinate,
@@ -666,6 +780,119 @@ def _piece_turn_count(pieces: Sequence[_RangePiece]) -> int:
             seen.add(piece.descriptor.unit_ref)
             count += piece.descriptor.turn_count
     return count
+
+
+def _stream_ordered_raw_shards(
+    records: Iterable[RawEvidenceRecord | DeferredRawGap],
+    *,
+    limits: ShardLimits,
+    max_shards: int,
+    emit: Callable[[RawShardArtifact], None] | None = None,
+) -> ShardPlan:
+    if (
+        isinstance(max_shards, bool)
+        or not isinstance(max_shards, int)
+        or not 0 < max_shards <= MAX_RUN_RAW_SHARDS
+    ):
+        raise ShardingValidationError("max_shards exceeds the run task reservation")
+
+    manifests: list[ShardManifest] = []
+    gaps: list[RawGapDescriptor] = []
+    current: list[_RangePiece] = []
+    seen_unit_refs: set[str] = set()
+    prior_sort_key: object | None = None
+    source_record_count = 0
+    source_byte_count = 0
+    peak_working_byte_count = 0
+
+    def flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        if len(manifests) >= max_shards:
+            raise ShardingValidationError(
+                "raw shard count exceeds its reserved extractor task budget"
+            )
+        artifact = _artifact_from_pieces(current, len(manifests))
+        if emit is not None:
+            emit(artifact)
+        manifests.append(artifact.manifest)
+        current = []
+
+    for raw_record in records:
+        if not isinstance(raw_record, (RawEvidenceRecord, DeferredRawGap)):
+            raise ShardingValidationError(
+                "records must contain bounded raw evidence values"
+            )
+        sort_key = catalog_record_sort_key(raw_record.catalog_record)
+        if prior_sort_key is not None and sort_key < prior_sort_key:
+            raise ShardingValidationError(
+                "streaming raw records must be in canonical catalog order"
+            )
+        prior_sort_key = sort_key
+        if raw_record.unit_ref in seen_unit_refs:
+            raise ShardingValidationError(
+                "raw records must have unique unit_ref values"
+            )
+        seen_unit_refs.add(raw_record.unit_ref)
+        source_record_count += 1
+        source_byte_count += raw_record.catalog_record.byte_count
+
+        if isinstance(raw_record, DeferredRawGap):
+            gaps.append(_gap_for_record(raw_record, raw_record.reason))
+            peak_working_byte_count = max(
+                peak_working_byte_count,
+                sum(len(piece.payload) for piece in current) + limits.max_bytes,
+            )
+            continue
+
+        record_pieces, gap = _split_record(raw_record, limits)
+        working_bytes = (
+            len(raw_record.payload)
+            + sum(len(piece.payload) for piece in record_pieces)
+            + sum(len(piece.payload) for piece in current)
+            + limits.max_bytes
+        )
+        peak_working_byte_count = max(peak_working_byte_count, working_bytes)
+        if gap is not None:
+            gaps.append(gap)
+            continue
+        for piece in record_pieces:
+            candidate = (*current, piece)
+            fits_turns = _piece_turn_count(candidate) <= limits.max_turns
+            fits_bytes = len(_serialize_pieces(candidate)[0]) <= limits.max_bytes
+            if current and (not fits_turns or not fits_bytes):
+                flush()
+                current = [piece]
+            else:
+                current.append(piece)
+            if len(_serialize_pieces(current)[0]) > limits.max_bytes:
+                raise ShardingValidationError(
+                    "internal error: a prevalidated range exceeded the shard limit"
+                )
+    flush()
+    return ShardPlan(
+        shards=tuple(manifests),
+        gaps=tuple(gaps),
+        source_record_count=source_record_count,
+        source_byte_count=source_byte_count,
+        peak_working_byte_count=peak_working_byte_count,
+    )
+
+
+def plan_ordered_raw_shards(
+    records: Iterable[RawEvidenceRecord | DeferredRawGap],
+    *,
+    limits: ShardLimits | None = None,
+    max_shards: int = MAX_RUN_RAW_SHARDS,
+) -> ShardPlan:
+    """Plan canonically ordered records without retaining their raw corpus."""
+
+    return _stream_ordered_raw_shards(
+        records,
+        limits=limits or ShardLimits(),
+        max_shards=max_shards,
+    )
 
 
 def _validate_conservation(
@@ -873,6 +1100,132 @@ def materialize_raw_shards(
         result.canonical_manifest_bytes() + b"\n",
     )
     return result
+
+
+def _create_or_validate_staged_file(
+    path: Path,
+    payload: bytes,
+) -> MaterializedShardFile | None:
+    if _safe_io is None:
+        raise ShardingValidationError("secure raw shard I/O is unavailable")
+    _safe_io.ensure_owner_only_directory(path.parent)
+    try:
+        receipt = _safe_io.atomic_create_bytes_with_receipt(
+            path, payload, create_parents=False
+        )
+    except FileExistsError:
+        try:
+            existing = _safe_io.read_bounded_bytes(
+                path,
+                max_bytes=max(1, len(payload)),
+                require_owner_only=True,
+            )
+        except (OSError, _safe_io.UnsafePathError) as error:
+            raise ShardingValidationError(
+                "staged raw shard cannot be authenticated"
+            ) from error
+        if existing != payload:
+            raise ShardingValidationError("staged raw shard changed")
+        return None
+    except (OSError, _safe_io.UnsafePathError) as error:
+        raise ShardingValidationError("staged raw shard cannot be created") from error
+    return MaterializedShardFile(receipt=receipt)
+
+
+def materialize_ordered_raw_shards(
+    records: Iterable[RawEvidenceRecord | DeferredRawGap],
+    run_directory: str | os.PathLike[str],
+    *,
+    plan: ShardPlan,
+    limits: ShardLimits | None = None,
+) -> RawShardStageReceipt:
+    """Stream one exact plan to owner-only files with bounded working data."""
+
+    selected_limits = limits or ShardLimits()
+    run_path = _ensure_private_directory(Path(run_directory))
+    created: list[MaterializedShardFile] = []
+    observed_ordinal = 0
+
+    def emit(artifact: RawShardArtifact) -> None:
+        nonlocal observed_ordinal
+        if observed_ordinal >= len(plan.shards):
+            raise ShardingValidationError("raw shard materialization exceeded its plan")
+        if artifact.manifest != plan.shards[observed_ordinal]:
+            raise ShardingValidationError(
+                "raw shard materialization diverged from plan"
+            )
+        receipt = _create_or_validate_staged_file(
+            run_path / artifact.manifest.file_name,
+            artifact.data,
+        )
+        if receipt is not None:
+            created.append(receipt)
+        observed_ordinal += 1
+
+    try:
+        observed = _stream_ordered_raw_shards(
+            records,
+            limits=selected_limits,
+            max_shards=MAX_RUN_RAW_SHARDS,
+            emit=emit,
+        )
+        if (
+            observed_ordinal != len(plan.shards)
+            or observed.canonical_manifest_bytes() != plan.canonical_manifest_bytes()
+        ):
+            raise ShardingValidationError(
+                "raw shard materialization manifest changed after planning"
+            )
+        manifest_receipt = _create_or_validate_staged_file(
+            run_path / RAW_SHARDS_MANIFEST_FILE,
+            plan.canonical_manifest_bytes() + b"\n",
+        )
+        if manifest_receipt is not None:
+            created.append(manifest_receipt)
+    except BaseException as error:
+        try:
+            rollback_ordered_raw_shards(RawShardStageReceipt(tuple(created)))
+        except BaseException as rollback_error:
+            if hasattr(error, "add_note"):
+                error.add_note(
+                    "raw shard rollback was incomplete; "
+                    f"{type(rollback_error).__name__}"
+                )
+        raise
+    return RawShardStageReceipt(tuple(created))
+
+
+def rollback_ordered_raw_shards(receipt: RawShardStageReceipt) -> None:
+    failures: list[BaseException] = []
+    for materialized in reversed(receipt.files):
+        try:
+            _remove_matching_staged_file(materialized)
+        except BaseException as error:
+            failures.append(error)
+    if failures:
+        primary = failures[0]
+        if hasattr(primary, "add_note"):
+            for secondary in failures[1:]:
+                primary.add_note(
+                    "additional raw shard rollback failure: "
+                    f"{type(secondary).__name__}: {secondary}"
+                )
+        raise primary
+
+
+def _remove_matching_staged_file(materialized: MaterializedShardFile) -> None:
+    if _safe_io is None:
+        raise ShardingValidationError("secure raw shard I/O is unavailable")
+    if not isinstance(materialized.receipt, _safe_io.AtomicCreateReceipt):
+        raise ShardingValidationError(
+            "staged raw shard rollback lacks a creation identity receipt"
+        )
+    try:
+        _safe_io.remove_atomic_created_bytes(materialized.receipt)
+    except (OSError, _safe_io.UnsafePathError) as error:
+        raise ShardingValidationError(
+            "staged raw shard rollback target changed"
+        ) from error
 
 
 @dataclass(frozen=True)

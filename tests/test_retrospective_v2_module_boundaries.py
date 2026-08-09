@@ -133,6 +133,10 @@ COMPONENT_DEPENDENCIES = {
     },
 }
 
+COMPONENT_LOCAL_FIELDS = {
+    "jobs": {"_task_input_staging"},
+}
+
 COMPONENT_DEPENDENCY_PORTS = {
     StateProjectionOperations: {
         "state": orchestrator_protocols.ProjectionStatePort,
@@ -247,10 +251,20 @@ ORCHESTRATOR_SOURCE_SUPPORT_MODULES = {
     "source_payloads.py",
 }
 
+ORCHESTRATOR_AGENT_SUPPORT_MODULES = {
+    "agent_capacity.py",
+    "agent_raw_artifacts.py",
+    "agent_results.py",
+    "agent_task_inputs.py",
+    "extracted_turns.py",
+    "raw_shard_staging.py",
+}
+
 ORCHESTRATOR_MODULES = (
     ORCHESTRATOR_OPERATION_MODULES
     | ORCHESTRATOR_FOUNDATION_MODULES
     | ORCHESTRATOR_SOURCE_SUPPORT_MODULES
+    | ORCHESTRATOR_AGENT_SUPPORT_MODULES
 )
 
 PUBLICATION_MODULES = {
@@ -288,16 +302,16 @@ TRANSPORT_LINE_INVENTORY = {
     "transport_contracts.py": 999,
     "transport_discovery.py": 240,
     "transport_paths.py": 70,
-    "transport_program.py": 408,
+    "transport_program.py": 432,
     "transport_remote.py": 315,
-    "transport_remote_snapshot.py": 79,
+    "transport_remote_snapshot.py": 86,
     "transport_resume.py": 170,
     "transport_session_shards.py": 1_605,
-    "transport_snapshot.py": 196,
+    "transport_snapshot.py": 213,
     "transport_source.py": 1_700,
     "transport_worker.py": 26,
 }
-TRANSPORT_AGGREGATE_LINE_LIMIT = 7_200
+TRANSPORT_AGGREGATE_LINE_LIMIT = 7_250
 
 BOUNDED_MODULE_LINES = {
     "finalize.py": 120,
@@ -308,14 +322,20 @@ BOUNDED_MODULE_LINES = {
     "orchestrator_components.py": 250,
     "orchestrator_context.py": 180,
     "orchestrator_history.py": 1_000,
-    "orchestrator_jobs.py": 500,
+    "orchestrator_jobs.py": 520,
     "orchestrator_lifecycle.py": 3_325,
     "orchestrator_projection.py": 1_000,
-    "orchestrator_reduction.py": 2_400,
-    "orchestrator_scheduler.py": 1_000,
-    "orchestrator_source.py": 2_100,
+    "orchestrator_reduction.py": 2_480,
+    "orchestrator_scheduler.py": 1_100,
+    "orchestrator_source.py": 2_150,
     "orchestrator_source_segments.py": 150,
+    "agent_capacity.py": 100,
     "agent_claim_artifacts.py": 100,
+    "agent_raw_artifacts.py": 120,
+    "agent_results.py": 320,
+    "agent_task_inputs.py": 350,
+    "extracted_turns.py": 200,
+    "raw_shard_staging.py": 100,
     "source_inputs.py": 500,
     "source_payloads.py": 100,
     "source_capacity.py": 150,
@@ -340,12 +360,12 @@ BOUNDED_MODULE_LINES = {
     "transport_contracts.py": 1_000,
     "transport_discovery.py": 240,
     "transport_paths.py": 100,
-    "transport_program.py": 420,
+    "transport_program.py": 450,
     "transport_remote.py": 320,
     "transport_remote_snapshot.py": 100,
     "transport_resume.py": 200,
     "transport_session_shards.py": 1_650,
-    "transport_snapshot.py": 200,
+    "transport_snapshot.py": 220,
     "transport_source.py": 1_700,
     "transport_worker.py": 40,
 }
@@ -525,6 +545,7 @@ class ModuleBoundaryTests(unittest.TestCase):
                 expected_fields = {
                     "_context",
                     *(f"_{dependency}" for dependency in COMPONENT_DEPENDENCIES[name]),
+                    *COMPONENT_LOCAL_FIELDS.get(name, set()),
                 }
                 self.assertEqual(expected_fields, set(vars(component)))
                 for dependency, target in COMPONENT_DEPENDENCIES[name].items():
@@ -964,6 +985,13 @@ spec.loader.exec_module(module)
             3_000,
         )
         self.assertLessEqual(
+            sum(
+                len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
+                for name in ORCHESTRATOR_AGENT_SUPPORT_MODULES
+            ),
+            1_050,
+        )
+        self.assertLessEqual(
             len((SCRIPTS / "session_retrospective_v2.py").read_text().splitlines()),
             1_950,
         )
@@ -998,7 +1026,7 @@ spec.loader.exec_module(module)
         }
         self.assertEqual(TRANSPORT_MODULES, set(TRANSPORT_LINE_INVENTORY))
         self.assertEqual(TRANSPORT_LINE_INVENTORY, observed)
-        self.assertEqual(7_181, sum(observed.values()))
+        self.assertEqual(7_229, sum(observed.values()))
         self.assertLessEqual(
             sum(observed.values()),
             TRANSPORT_AGGREGATE_LINE_LIMIT,
@@ -1044,7 +1072,7 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertLessEqual(branch_total, 7_955)
+        self.assertLessEqual(branch_total, 8_250)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)
 

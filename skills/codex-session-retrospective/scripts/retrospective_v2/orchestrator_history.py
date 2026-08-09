@@ -9,6 +9,8 @@ import hashlib
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from . import (
+    agent_results,
+    agent_task_inputs,
     authority,
     catalog,
     result_validation,
@@ -43,6 +45,48 @@ class ResultHistoryOperations(OrchestratorComponent):
         self._projection = projection
         self._reduction = reduction
 
+    def _adjudication_candidates(
+        self,
+        state: Mapping[str, Any],
+        task: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        metadata = task.get("metadata")
+        jobs = state.get("jobs")
+        if not isinstance(metadata, Mapping) or not isinstance(jobs, Mapping):
+            raise InvalidTransitionError("adjudication candidate binding is invalid")
+        task_refs = metadata.get("candidate_task_refs")
+        result_hashes = metadata.get("candidate_result_hashes")
+        if (
+            not isinstance(task_refs, list)
+            or not isinstance(result_hashes, list)
+            or len(task_refs) != 2
+            or len(result_hashes) != 2
+            or len(set(task_refs)) != 2
+        ):
+            raise InvalidTransitionError("adjudication candidate binding is invalid")
+        candidates: list[dict[str, Any]] = []
+        for task_ref, result_hash in zip(task_refs, result_hashes, strict=True):
+            candidate_task = jobs.get(task_ref)
+            if (
+                not isinstance(task_ref, str)
+                or not isinstance(result_hash, str)
+                or not isinstance(candidate_task, Mapping)
+                or candidate_task.get("status") != "accepted"
+                or candidate_task.get("result_hash") != result_hash
+            ):
+                raise InvalidTransitionError(
+                    "adjudication candidate task binding changed"
+                )
+            candidate = agent_results.require(
+                self.run_dir,
+                candidate_task,
+                label="adjudication candidate",
+            )
+            if result_validation.canonical_result_hash(candidate) != result_hash:
+                raise InvalidTransitionError("adjudication candidate result changed")
+            candidates.append(candidate)
+        return candidates
+
     def _validate_agent_result(
         self,
         state: Mapping[str, Any],
@@ -52,10 +96,12 @@ class ResultHistoryOperations(OrchestratorComponent):
         attempt_ref: str,
     ) -> dict[str, Any]:
         kind = task["job_kind"]
-        allowed_refs = task["allowed_refs"]
-        allowed_turn_refs = task["allowed_turn_refs"]
+        immutable = agent_task_inputs.for_task(self.run_dir, task)
+        allowed_refs = immutable["allowed_refs"]
+        allowed_turn_refs = immutable["allowed_turn_refs"]
+        metadata = immutable["metadata"]
         if kind == JobKind.EXTRACTOR_REDACTOR.value:
-            metadata = task["metadata"]["turn_metadata"]
+            turn_metadata = metadata["turn_metadata"]
             result_validation.validate_result_envelope(result)
             sanitized = result_validation.post_redact(result)
             overlap_views = (
@@ -85,15 +131,15 @@ class ResultHistoryOperations(OrchestratorComponent):
             validated = result_validation.validate_extractor_result(
                 result,
                 allowed_refs,
-                turn_bindings=metadata,
+                turn_bindings=turn_metadata,
             )
             return validated
         if kind in {
             JobKind.EPISODE_REVIEWER.value,
             JobKind.INDEPENDENT_RISK_REVIEWER.value,
         }:
-            slot = task["metadata"]["reviewer_slot"]
-            input_payload = task.get("input_payload")
+            slot = metadata["reviewer_slot"]
+            input_payload = immutable.get("input_payload")
             child_results = (
                 input_payload.get("child_results")
                 if isinstance(input_payload, Mapping)
@@ -131,7 +177,7 @@ class ResultHistoryOperations(OrchestratorComponent):
                     "review result is not bound to the assigned reviewer"
                 )
             for field in ("episode_ref", "episode_revision_ref"):
-                if validated[field] != task["metadata"][field]:
+                if validated[field] != metadata[field]:
                     raise result_validation.ResultValidationError(
                         f"review result {field} does not match its job"
                     )
@@ -141,28 +187,26 @@ class ResultHistoryOperations(OrchestratorComponent):
                 result,
                 allowed_refs,
                 allowed_turn_refs=allowed_turn_refs,
-                candidate_results=task["metadata"]["candidate_results"],
+                candidate_results=self._adjudication_candidates(state, task),
             )
         if kind == JobKind.TOPIC_REDUCER.value:
-            child_results = task["metadata"].get("validation_child_topic_results")
+            child_results = metadata.get("validation_child_topic_results")
             if child_results is not None:
                 return result_validation.validate_hierarchical_topic_result(
                     result,
                     child_results,
                     allowed_refs,
-                    expected_topic_candidate_ref=task["metadata"][
-                        "topic_candidate_ref"
-                    ],
-                    expected_topic_ref=task["metadata"]["topic_ref"],
-                    expected_workstream_ref=task["metadata"]["workstream_ref"],
+                    expected_topic_candidate_ref=metadata["topic_candidate_ref"],
+                    expected_topic_ref=metadata["topic_ref"],
+                    expected_workstream_ref=metadata["workstream_ref"],
                 )
             return result_validation.validate_topic_result(
                 result,
-                task["metadata"]["validation_topic_input"],
+                metadata["validation_topic_input"],
                 allowed_refs,
-                expected_topic_ref=task["metadata"]["topic_ref"],
+                expected_topic_ref=metadata["topic_ref"],
                 allowed_turn_refs=allowed_turn_refs,
-                adjudication_candidate_results=task["metadata"].get(
+                adjudication_candidate_results=metadata.get(
                     "adjudication_candidate_results", {}
                 ),
             )
@@ -193,8 +237,11 @@ class ResultHistoryOperations(OrchestratorComponent):
         *,
         query_chars: int,
     ) -> Iterator[tuple[str, ...]]:
-        task_manifest = self._projection._restore_shard_manifest(task["raw_manifest"])
-        task_relative_path = task.get("raw_artifact")
+        immutable = agent_task_inputs.for_task(self.run_dir, task)
+        task_manifest = self._projection._restore_shard_manifest(
+            immutable["raw_manifest"]
+        )
+        task_relative_path = immutable.get("raw_artifact")
         shard_state = state.get("source", {}).get("shards", {})
         reassembly = state.get("source", {}).get("reassembly", {})
         if (
@@ -272,7 +319,7 @@ class ResultHistoryOperations(OrchestratorComponent):
                 )
             return manifest, payload
 
-        turn_metadata = task.get("metadata", {}).get("turn_metadata", {})
+        turn_metadata = immutable["metadata"].get("turn_metadata", {})
         if not isinstance(turn_metadata, Mapping):
             raise result_validation.ResultValidationError(
                 "extractor task turn metadata is invalid"
@@ -448,8 +495,8 @@ class ResultHistoryOperations(OrchestratorComponent):
             },
         }
 
-    @staticmethod
     def _retained_review_provenance(
+        self,
         state: Mapping[str, Any],
         revision_ref: str,
     ) -> list[dict[str, Any]]:
@@ -463,7 +510,7 @@ class ResultHistoryOperations(OrchestratorComponent):
                 or metadata.get("hierarchy_final") is not True
             ):
                 continue
-            result = task.get("result")
+            result = agent_results.for_task(self.run_dir, task)
             result_hash = task.get("result_hash")
             attempt_ref = task.get("accepted_attempt_ref")
             if (
@@ -546,16 +593,20 @@ class ResultHistoryOperations(OrchestratorComponent):
             meaningfulness = revision["meaningfulness"]
             context_only_count += len(meaningfulness["context_only_turn_refs"])
             meaningfulness_gap_count += len(meaningfulness["gap_turn_refs"])
-            resolved = state["resolved_reviews"].get(revision_ref)
+            resolved_binding = state["resolved_reviews"].get(revision_ref)
             if not meaningfulness["review_required"]:
                 disposition = "review_not_required"
                 decision: Mapping[str, Any] = {}
-            elif resolved is None:
+            elif resolved_binding is None:
                 disposition = "review_gap"
                 decision = {}
             else:
                 disposition = "reviewed"
-                decision = resolved
+                decision = agent_results.from_reference(
+                    self.run_dir,
+                    state["jobs"],
+                    resolved_binding,
+                )
             review_result_hash = (
                 None
                 if disposition != "reviewed"
@@ -651,7 +702,9 @@ class ResultHistoryOperations(OrchestratorComponent):
                 or task.get("metadata", {}).get("hierarchy_final") is not True
             ):
                 continue
-            topic_result = task["result"]
+            topic_result = agent_results.for_task(self.run_dir, task)
+            if topic_result is None:
+                raise InvalidTransitionError("accepted topic result is missing")
             topic_model_eras = {
                 episode_model_eras.get(episode_ref, self._projection.UNKNOWN_MODEL_ERA)
                 for episode_ref in topic_result["episode_refs"]

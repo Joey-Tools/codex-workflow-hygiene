@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+from contextlib import contextmanager
 from dataclasses import replace
 import datetime as dt
 import hashlib
@@ -24,14 +25,17 @@ SCRIPTS = (
 sys.path.insert(0, str(SCRIPTS))
 
 from retrospective_v2 import (  # noqa: E402
+    agent_capacity,
+    agent_results,
+    agent_task_inputs,
     authority,
     catalog,
     cleanup_inventory,
     cleanup_sidecars,
     contracts,
     controlled_gaps,
+    extracted_turns,
     episode_review,
-    orchestrator_jobs,
     reporting,
     retained_inputs,
     result_validation,
@@ -43,8 +47,10 @@ from retrospective_v2 import (  # noqa: E402
 from retrospective_v2.checkpoints import (  # noqa: E402
     AtomicCheckpointStore,
     CheckpointConflictError,
+    CheckpointIntegrityError,
     CheckpointPermissionError,
     DEFAULT_MAX_CHECKPOINT_BYTES,
+    DEFAULT_CHECKPOINT_TERMINAL_RESERVE_BYTES,
     canonical_json_bytes,
     content_digest,
 )
@@ -84,6 +90,9 @@ from retrospective_v2.orchestrator import (  # noqa: E402
     consume_session_shard_frames,
     doctor,
     publisher_readiness,
+)
+from retrospective_v2.orchestrator_scheduler import (  # noqa: E402
+    StageSchedulingOperations,
 )
 from retrospective_v2.orchestrator_core import (  # noqa: E402
     LEGACY_SHADOW_CLEANUP_ROOTS,
@@ -744,6 +753,13 @@ class OrchestratorTests(unittest.TestCase):
             patcher.stop()
         self.temporary_directory.cleanup()
 
+    @contextmanager
+    def agent_task_transaction(self, coordinator: RetrospectiveOrchestrator):
+        staging = agent_task_inputs.Staging()
+        with coordinator._components.jobs._task_input_staging_scope(staging):
+            yield
+        staging.materialize()
+
     def durable_history(
         self,
         episode_heads: list[dict[str, object]] | None = None,
@@ -913,16 +929,18 @@ class OrchestratorTests(unittest.TestCase):
             task_ref = typed_ref(
                 RefType.RUN_INPUT, f"synthesis-source-{index}-{root_ref}"
             )
+            result = {
+                "schema": result_validation.TOPIC_RESULT_SCHEMA,
+                "topic_candidate_ref": root_ref,
+            }
             jobs[task_ref] = {
                 "job_kind": JobKind.TOPIC_REDUCER.value,
                 "metadata": {
                     "hierarchy_final": True,
                     "hierarchy_root_ref": root_ref,
                 },
-                "result": {
-                    "schema": result_validation.TOPIC_RESULT_SCHEMA,
-                    "topic_candidate_ref": root_ref,
-                },
+                "result": result,
+                "result_hash": result_validation.canonical_result_hash(result),
                 "stage": RunStage.TOPIC_REDUCTION.value,
                 "status": "accepted",
                 "task_ref": task_ref,
@@ -1169,10 +1187,16 @@ class OrchestratorTests(unittest.TestCase):
         )
         return json.loads(envelope_bytes)
 
-    @staticmethod
-    def extractor_result_for_task(task: dict[str, object]) -> dict[str, object]:
+    def extractor_result_for_task(
+        self,
+        coordinator: RetrospectiveOrchestrator,
+        task: dict[str, object],
+    ) -> dict[str, object]:
+        metadata_by_turn = agent_task_inputs.for_task(coordinator.run_dir, task)[
+            "metadata"
+        ]["turn_metadata"]
         turns = []
-        for turn_ref, metadata in sorted(task["metadata"]["turn_metadata"].items()):
+        for turn_ref, metadata in sorted(metadata_by_turn.items()):
             evidence_refs = list(metadata["evidence_refs"])
             turns.append(
                 {
@@ -2677,7 +2701,7 @@ class OrchestratorTests(unittest.TestCase):
             for task in state["jobs"].values()
             if task.get("active_job_ref") == job["job_ref"]
         )
-        result = self.extractor_result_for_task(task)
+        result = self.extractor_result_for_task(coordinator, task)
         result["turns"][0]["generalized_working_text"] = phrase
 
         rejected = coordinator.accept_agent_result(
@@ -2720,7 +2744,7 @@ class OrchestratorTests(unittest.TestCase):
             for task in state["jobs"].values()
             if task.get("active_job_ref") == job["job_ref"]
         )
-        result = self.extractor_result_for_task(task)
+        result = self.extractor_result_for_task(coordinator, task)
         result["turns"][0]["generalized_working_text"] = phrase
 
         rejected = coordinator.accept_agent_result(
@@ -2766,7 +2790,7 @@ class OrchestratorTests(unittest.TestCase):
             for task in state["jobs"].values()
             if task.get("active_job_ref") == job["job_ref"]
         )
-        safe_result = self.extractor_result_for_task(task)
+        safe_result = self.extractor_result_for_task(coordinator, task)
         safe_result["turns"][0]["outcome"] = "completed"
         accepted = coordinator.accept_agent_result(
             job["job_ref"],
@@ -2785,7 +2809,7 @@ class OrchestratorTests(unittest.TestCase):
             for task in second_state["jobs"].values()
             if task.get("active_job_ref") == second_job["job_ref"]
         )
-        leaking_result = self.extractor_result_for_task(second_task)
+        leaking_result = self.extractor_result_for_task(coordinator, second_task)
         leaking_result["turns"][0]["generalized_working_text"] = "Acme"
         rejected = second.accept_agent_result(
             second_job["job_ref"],
@@ -2849,7 +2873,7 @@ class OrchestratorTests(unittest.TestCase):
         accepted = coordinator.accept_agent_result(
             job["job_ref"],
             job["active_attempt_ref"],
-            self.extractor_result_for_task(task),
+            self.extractor_result_for_task(coordinator, task),
         )
 
         self.assertEqual("accepted", accepted["outcome"])
@@ -2911,7 +2935,7 @@ class OrchestratorTests(unittest.TestCase):
             for task in state["jobs"].values()
             if task.get("active_job_ref") == job["job_ref"]
         )
-        result = self.extractor_result_for_task(task)
+        result = self.extractor_result_for_task(coordinator, task)
         result["turns"][0]["generalized_working_text"] = phrase
         rejected = coordinator.accept_agent_result(
             job["job_ref"],
@@ -2998,17 +3022,21 @@ class OrchestratorTests(unittest.TestCase):
             accepted = fragmented.accept_agent_result(
                 job["job_ref"],
                 job["active_attempt_ref"],
-                self.extractor_result_for_task(task),
+                self.extractor_result_for_task(fragmented, task),
             )
             self.assertEqual("accepted", accepted["outcome"])
         fragmented.advance()
         state = fragmented.store.read().state
 
-        self.assertEqual(set(fragmented_plan), set(state["extracted_turns"]))
-        self.assertEqual(2, len(state["extracted_turns"]))
+        restored_turns = extracted_turns.load(
+            fragmented.run_dir,
+            state["extracted_turns"],
+        )
+        self.assertEqual(set(fragmented_plan), set(restored_turns))
+        self.assertEqual(2, len(restored_turns))
         self.assertEqual(
             fragmented_plan[large_turn_ref]["fragment_count"],
-            len(state["extracted_turns"][large_turn_ref]["evidence_refs"]),
+            len(restored_turns[large_turn_ref]["evidence_refs"]),
         )
 
     def test_cross_source_offsets_use_one_stable_session_order(self) -> None:
@@ -3211,9 +3239,10 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(claimed["result_ref"], public["result_ref"])
         self.assertFalse(public["claim_expired"])
 
-        self.clock.value += dt.timedelta(
+        expiry_delta = dt.timedelta(
             seconds=orchestrator_module.DEFAULT_AGENT_CLAIM_TTL_SECONDS + 1
         )
+        self.clock.value += expiry_delta
         expired = coordinator.status()["runnable_jobs"][0]
         self.assertTrue(expired["claim_expired"])
         takeover = coordinator.claim_agent_job(
@@ -3300,6 +3329,148 @@ class OrchestratorTests(unittest.TestCase):
                 claim_ref=takeover["claim_ref"],
                 result_ref=takeover["result_ref"],
             )
+
+    def test_accepted_result_replay_reauthenticates_its_sidecar(self) -> None:
+        for disposition in ("missing", "changed"):
+            with self.subTest(disposition=disposition):
+                coordinator = self.activity_run(f"result-replay-{disposition}")
+                job = coordinator.status()["runnable_jobs"][0]
+                submitted = self.extractor_result(job)
+                coordinator.accept_agent_result(
+                    job["job_ref"],
+                    job["active_attempt_ref"],
+                    submitted,
+                )
+                state = coordinator.load_state()
+                task = next(
+                    item
+                    for item in state["jobs"].values()
+                    if item.get("accepted_job_ref") == job["job_ref"]
+                )
+                attempt = next(
+                    item
+                    for item in task["attempts"]
+                    if item["attempt_ref"] == job["active_attempt_ref"]
+                )
+                result_path = (
+                    coordinator.run_dir / task["result_artifact"]["relative_path"]
+                )
+                if disposition == "missing":
+                    result_path.unlink()
+                    expected = "cannot be authenticated"
+                else:
+                    payload = result_path.read_bytes()
+                    result_path.write_bytes(b"[" + payload[1:])
+                    os.chmod(result_path, 0o600)
+                    expected = "changed"
+
+                with self.assertRaisesRegex(InvalidTransitionError, expected):
+                    RetrospectiveOrchestrator.accept_agent_result(
+                        coordinator,
+                        job["job_ref"],
+                        job["active_attempt_ref"],
+                        submitted,
+                        claim_ref=attempt["claim_ref"],
+                        result_ref=attempt["result_ref"],
+                    )
+
+    def test_legacy_attempt_manifests_migrate_on_claim_and_replay(self) -> None:
+        def install_legacy_manifest(coordinator, attempt_ref):
+            def mutate(state):
+                task = next(
+                    item
+                    for item in state["jobs"].values()
+                    if any(
+                        attempt["attempt_ref"] == attempt_ref
+                        for attempt in item.get("attempts", [])
+                    )
+                )
+                attempt = next(
+                    item
+                    for item in task["attempts"]
+                    if item["attempt_ref"] == attempt_ref
+                )
+                attempt["job_manifest"] = coordinator._execution_manifest(
+                    state,
+                    task,
+                    attempt["ordinal"],
+                )
+                attempt.pop("job_manifest_digest")
+                return state, None
+
+            coordinator.store.transaction(mutate)
+
+        def assert_migrated(coordinator, attempt_ref):
+            state = coordinator.load_state()
+            attempt = next(
+                attempt
+                for task in state["jobs"].values()
+                for attempt in task.get("attempts", [])
+                if attempt["attempt_ref"] == attempt_ref
+            )
+            self.assertNotIn("job_manifest", attempt)
+            self.assertRegex(attempt["job_manifest_digest"], r"^[0-9a-f]{64}$")
+
+        unclaimed = self.activity_run("legacy-unclaimed-manifest")
+        unclaimed_job = unclaimed.status()["runnable_jobs"][0]
+        install_legacy_manifest(unclaimed, unclaimed_job["active_attempt_ref"])
+        unclaimed.claim_agent_job(
+            unclaimed_job["job_ref"],
+            unclaimed_job["active_attempt_ref"],
+            typed_ref(RefType.LEASE, "legacy-unclaimed-dispatcher"),
+        )
+        assert_migrated(unclaimed, unclaimed_job["active_attempt_ref"])
+
+        expired = self.activity_run("legacy-expired-manifest")
+        expired_job = expired.status()["runnable_jobs"][0]
+        expired.claim_agent_job(
+            expired_job["job_ref"],
+            expired_job["active_attempt_ref"],
+            typed_ref(RefType.LEASE, "legacy-expired-first-dispatcher"),
+        )
+        install_legacy_manifest(expired, expired_job["active_attempt_ref"])
+        expiry_delta = dt.timedelta(
+            seconds=orchestrator_module.DEFAULT_AGENT_CLAIM_TTL_SECONDS + 1
+        )
+        self.clock.value += expiry_delta
+        expired.claim_agent_job(
+            expired_job["job_ref"],
+            expired_job["active_attempt_ref"],
+            typed_ref(RefType.LEASE, "legacy-expired-second-dispatcher"),
+        )
+        assert_migrated(expired, expired_job["active_attempt_ref"])
+        self.clock.value -= expiry_delta
+
+        completed = self.activity_run("legacy-completed-manifest")
+        completed_job = completed.status()["runnable_jobs"][0]
+        submitted = self.extractor_result(completed_job)
+        completed.accept_agent_result(
+            completed_job["job_ref"],
+            completed_job["active_attempt_ref"],
+            submitted,
+        )
+        completed_state = completed.load_state()
+        completed_task = next(
+            item
+            for item in completed_state["jobs"].values()
+            if item.get("accepted_job_ref") == completed_job["job_ref"]
+        )
+        completed_attempt = next(
+            item
+            for item in completed_task["attempts"]
+            if item["attempt_ref"] == completed_job["active_attempt_ref"]
+        )
+        install_legacy_manifest(completed, completed_job["active_attempt_ref"])
+        replay = RetrospectiveOrchestrator.accept_agent_result(
+            completed,
+            completed_job["job_ref"],
+            completed_job["active_attempt_ref"],
+            submitted,
+            claim_ref=completed_attempt["claim_ref"],
+            result_ref=completed_attempt["result_ref"],
+        )
+        self.assertTrue(replay["idempotent"])
+        assert_migrated(completed, completed_job["active_attempt_ref"])
 
     def test_agent_claim_budget_retries_once_then_records_explicit_gap(self) -> None:
         coordinator = self.activity_run("bounded-agent-claim-generations")
@@ -3519,17 +3690,18 @@ class OrchestratorTests(unittest.TestCase):
         def envelope_size(payload_size: int) -> int | None:
             state = copy.deepcopy(base_state)
             try:
-                coordinator._create_agent_task(
-                    state,
-                    stage=RunStage.GLOBAL_SYNTHESIS.value,
-                    kind=JobKind.GLOBAL_SYNTHESIS.value,
-                    partition_ref=typed_ref(
-                        RefType.RUN_INPUT, "exact-envelope-partition"
-                    ),
-                    input_refs=(),
-                    input_payload={"payload": "x" * payload_size},
-                    allowed_refs=(),
-                )
+                with self.agent_task_transaction(coordinator):
+                    coordinator._create_agent_task(
+                        state,
+                        stage=RunStage.GLOBAL_SYNTHESIS.value,
+                        kind=JobKind.GLOBAL_SYNTHESIS.value,
+                        partition_ref=typed_ref(
+                            RefType.RUN_INPUT, "exact-envelope-partition"
+                        ),
+                        input_refs=(),
+                        input_payload={"payload": "x" * payload_size},
+                        allowed_refs=(),
+                    )
             except InvalidInputError:
                 return None
             task = next(iter(state["jobs"].values()))
@@ -3577,8 +3749,9 @@ class OrchestratorTests(unittest.TestCase):
             "allowed_refs": (),
         }
 
-        created = coordinator._create_agent_task(state, **arguments)
-        reused = coordinator._create_agent_task(state, **arguments)
+        with self.agent_task_transaction(coordinator):
+            created = coordinator._create_agent_task(state, **arguments)
+            reused = coordinator._create_agent_task(state, **arguments)
 
         self.assertEqual(created, reused)
         self.assertEqual(1, len(state["jobs"]))
@@ -3587,26 +3760,390 @@ class OrchestratorTests(unittest.TestCase):
                 "agent_task_cache_hits": 1,
                 "agent_task_cache_misses": 1,
                 "agent_task_reuses": 1,
+                "downstream_agent_task_misses": 1,
             },
             state["metrics"],
         )
         self.assertEqual(1, state["jobs"][created]["cache_reuse_count"])
-        with mock.patch.object(orchestrator_jobs, "MAX_RUN_AGENT_TASKS", 1):
-            self.assertEqual(
-                created,
-                coordinator._create_agent_task(state, **arguments),
-            )
-            with self.assertRaisesRegex(InvalidInputError, "cleanup capacity"):
-                coordinator._create_agent_task(
-                    state,
-                    **{
-                        **arguments,
-                        "partition_ref": typed_ref(
-                            RefType.RUN_INPUT,
-                            "second-cache-partition",
-                        ),
-                    },
+        with self.agent_task_transaction(coordinator):
+            with mock.patch.object(agent_capacity, "MAX_RUN_AGENT_TASKS", 1):
+                self.assertEqual(
+                    created,
+                    coordinator._create_agent_task(state, **arguments),
                 )
+                with self.assertRaisesRegex(InvalidInputError, "cleanup capacity"):
+                    coordinator._create_agent_task(
+                        state,
+                        **{
+                            **arguments,
+                            "partition_ref": typed_ref(
+                                RefType.RUN_INPUT,
+                                "second-cache-partition",
+                            ),
+                        },
+                    )
+
+    def test_accepted_agent_result_is_authenticated_sidecar_and_reloads(self) -> None:
+        coordinator = self.activity_run("accepted-result-sidecar")
+        job = coordinator.status()["runnable_jobs"][0]
+        submitted = self.extractor_result(job)
+
+        accepted = coordinator.accept_agent_result(
+            job["job_ref"],
+            job["active_attempt_ref"],
+            submitted,
+        )
+
+        self.assertEqual("accepted", accepted["outcome"])
+        state = coordinator.store.load()
+        task = next(
+            task
+            for task in state["jobs"].values()
+            if task.get("job_kind") == JobKind.EXTRACTOR_REDACTOR.value
+        )
+        self.assertNotIn("result", task)
+        self.assertEqual(
+            agent_results.AGENT_RESULT_DESCRIPTOR_SCHEMA,
+            task["result_artifact"]["schema"],
+        )
+        restored = agent_results.for_task(coordinator.run_dir, task)
+        self.assertEqual(
+            task["result_hash"], result_validation.canonical_result_hash(restored)
+        )
+
+        reopened = RetrospectiveOrchestrator(
+            coordinator.run_dir,
+            clock=self.clock,
+            identity_path=self.identity_path,
+            require_existing_identity=True,
+        )
+        reloaded_task = reopened.store.load()["jobs"][task["task_ref"]]
+        self.assertEqual(
+            restored, agent_results.for_task(reopened.run_dir, reloaded_task)
+        )
+        sidecar_path = (
+            reopened.run_dir / reloaded_task["result_artifact"]["relative_path"]
+        )
+        original = sidecar_path.read_bytes()
+        sidecar_path.write_bytes(b"[" + original[1:])
+        os.chmod(sidecar_path, 0o600)
+        with self.assertRaisesRegex(InvalidTransitionError, "changed"):
+            agent_results.for_task(reopened.run_dir, reloaded_task)
+
+    def test_agent_result_sidecar_requires_one_hash_bound_representation(self) -> None:
+        coordinator = self.activity_run("accepted-result-unique-representation")
+        job = coordinator.status()["runnable_jobs"][0]
+        coordinator.accept_agent_result(
+            job["job_ref"],
+            job["active_attempt_ref"],
+            self.extractor_result(job),
+        )
+        task = next(
+            task
+            for task in coordinator.load_state()["jobs"].values()
+            if task.get("category") == "agent" and task.get("status") == "accepted"
+        )
+        restored = agent_results.require(coordinator.run_dir, task)
+
+        duplicate = copy.deepcopy(task)
+        duplicate["result"] = restored
+        with self.assertRaisesRegex(InvalidTransitionError, "multiple"):
+            agent_results.for_task(coordinator.run_dir, duplicate)
+
+        stale_hash = copy.deepcopy(task)
+        stale_hash["result_hash"] = "0" * 64
+        with self.assertRaisesRegex(InvalidTransitionError, "hash binding"):
+            agent_results.for_task(coordinator.run_dir, stale_hash)
+
+        stale_descriptor = copy.deepcopy(task)
+        stale_descriptor["result_artifact"]["result_hash"] = "1" * 64
+        with self.assertRaisesRegex(InvalidTransitionError, "hash binding"):
+            agent_results.for_task(coordinator.run_dir, stale_descriptor)
+
+    def test_agent_task_sidecar_reloads_and_attempt_manifest_is_digest_bound(
+        self,
+    ) -> None:
+        coordinator = self.activity_run("agent-task-sidecar")
+        job = coordinator.status()["runnable_jobs"][0]
+        state = coordinator.load_state()
+        task = next(
+            task
+            for task in state["jobs"].values()
+            if task.get("job_kind") == JobKind.EXTRACTOR_REDACTOR.value
+        )
+        self.assertNotIn("input_payload", task)
+        self.assertNotIn("allowed_refs", task)
+        self.assertNotIn("turn_metadata", task["metadata"])
+        immutable = agent_task_inputs.for_task(coordinator.run_dir, task)
+        self.assertIn("turn_metadata", immutable["metadata"])
+
+        envelope = self.agent_envelope(coordinator, job)
+        self.assertIn("job_manifest", envelope)
+        claimed_task = coordinator.load_state()["jobs"][task["task_ref"]]
+        active = next(
+            attempt
+            for attempt in claimed_task["attempts"]
+            if attempt["attempt_ref"] == claimed_task["active_attempt_ref"]
+        )
+        self.assertNotIn("job_manifest", active)
+        self.assertEqual(64, len(active["job_manifest_digest"]))
+
+        sidecar_path = (
+            coordinator.run_dir / claimed_task["task_input_artifact"]["relative_path"]
+        )
+        original = sidecar_path.read_bytes()
+        sidecar_path.write_bytes(b"[" + original[1:])
+        os.chmod(sidecar_path, 0o600)
+        with self.assertRaisesRegex(InvalidTransitionError, "changed"):
+            agent_task_inputs.for_task(coordinator.run_dir, claimed_task)
+
+    def test_gap_projection_survives_task_sidecar_cleanup(self) -> None:
+        coordinator = self.activity_run("gap-projection-after-cleanup")
+        first = coordinator.status()["runnable_jobs"][0]
+        coordinator.accept_agent_result(
+            first["job_ref"],
+            first["active_attempt_ref"],
+            AgentFailure(AgentFailureKind.TIMEOUT).to_dict(),
+        )
+        coordinator.advance()
+        second = coordinator.status()["runnable_jobs"][0]
+        coordinator.accept_agent_result(
+            second["job_ref"],
+            second["active_attempt_ref"],
+            AgentFailure(AgentFailureKind.TIMEOUT).to_dict(),
+        )
+        state = coordinator.load_state()
+        gap_task = next(
+            task for task in state["jobs"].values() if task["status"] == "gap"
+        )
+        sidecar = coordinator.run_dir / gap_task["task_input_artifact"]["relative_path"]
+        sidecar.unlink()
+
+        status = coordinator.status()
+
+        self.assertEqual(1, len(status["blocked_jobs"]))
+        self.assertEqual("gap", status["blocked_jobs"][0]["status"])
+        self.assertEqual([], status["blocked_jobs"][0]["allowed_output_refs"])
+        self.assertIsNone(status["blocked_jobs"][0]["input_payload"])
+
+    def test_extracted_turn_sidecar_keeps_large_material_out_of_checkpoint(
+        self,
+    ) -> None:
+        coordinator = self.start_daily("large-extracted-turn-sidecar")
+        turns = {
+            typed_ref(RefType.TURN, f"large-extracted-turn-{index}"): {
+                "generalized_working_text": "x" * 16_384,
+                "turn_ref": typed_ref(
+                    RefType.TURN,
+                    f"large-extracted-turn-{index}",
+                ),
+            }
+            for index in range(2_050)
+        }
+        descriptor, prepared = extracted_turns.prepare(coordinator.run_dir, turns)
+        source_inputs.materialize((prepared,))
+        state = coordinator.load_state()
+        state["extracted_turns"] = descriptor
+
+        self.assertGreater(prepared.byte_count, DEFAULT_MAX_CHECKPOINT_BYTES)
+        self.assertTrue(coordinator.store.has_operating_capacity(state))
+        self.assertEqual(turns, extracted_turns.load(coordinator.run_dir, descriptor))
+        with prepared.path.open("r+b") as handle:
+            handle.write(b"[")
+        with self.assertRaisesRegex(InvalidTransitionError, "changed"):
+            extracted_turns.load(coordinator.run_dir, descriptor)
+
+    def test_result_sidecars_keep_near_limit_checkpoint_reloadable(self) -> None:
+        run_dir = self.root / "accepted-result-capacity"
+        files = []
+        jobs = {}
+        inline_jobs = {}
+        for index in range(8):
+            task_ref = typed_ref(RefType.RUN_INPUT, f"capacity-result-{index}")
+            result = {
+                "payload": chr(ord("a") + index) * 8_000,
+                "schema": "capacity_result_fixture_v2",
+            }
+            result_hash = result_validation.canonical_result_hash(result)
+            prepared = agent_results.prepare(
+                run_dir,
+                task_ref=task_ref,
+                result=result,
+                result_hash=result_hash,
+            )
+            files.append(prepared.file)
+            jobs[task_ref] = {
+                "result_artifact": prepared.descriptor,
+                "result_hash": result_hash,
+                "status": "accepted",
+                "task_ref": task_ref,
+            }
+            inline_jobs[task_ref] = {
+                "result": result,
+                "result_hash": result_hash,
+                "status": "accepted",
+                "task_ref": task_ref,
+            }
+        source_inputs.materialize(files)
+        sidecar_state = {"jobs": jobs}
+        inline_state = {"jobs": inline_jobs}
+        self.assertLess(len(canonical_json_bytes(sidecar_state)), 16 * 1024)
+        self.assertGreater(len(canonical_json_bytes(inline_state)), 16 * 1024)
+
+        store = AtomicCheckpointStore(
+            run_dir,
+            identity=self.identity,
+            max_bytes=16 * 1024,
+        )
+        snapshot = store.initialize(sidecar_state)
+        self.assertEqual(sidecar_state, store.read().state)
+        for task in snapshot.state["jobs"].values():
+            self.assertIsNotNone(agent_results.for_task(run_dir, task))
+
+        inline_store = AtomicCheckpointStore(
+            self.root / "inline-result-capacity",
+            identity=self.identity,
+            max_bytes=16 * 1024,
+        )
+        with self.assertRaisesRegex(CheckpointIntegrityError, "exceeds"):
+            inline_store.initialize(inline_state)
+
+    def test_shard_stage_rolls_back_files_when_checkpoint_commit_fails(self) -> None:
+        coordinator = self.start_daily("shard-stage-checkpoint-rollback")
+        payload = b'{"timestamp":"2026-07-06T01:00:00Z","text":"work"}\n'
+
+        def handler(lease):
+            if (
+                lease["host"] != "local"
+                or lease["source_kind"] != SourceKind.ACTIVE_ROLLOUT.value
+            ):
+                return None
+            manifest, records, _source_ref = activity_manifest(lease, [payload])
+            return manifest, {"raw_records": {records[0].unit_ref: payload}}
+
+        original_write = coordinator.store._write_unlocked
+
+        def fail_sharding_commit(directory_fd, state, *, revision):
+            if (
+                state.get("stage") == RunStage.EXTRACTION.value
+                and state.get("source", {}).get("catalog") is not None
+            ):
+                raise OSError("injected sharding checkpoint failure")
+            return original_write(directory_fd, state, revision=revision)
+
+        with (
+            mock.patch.object(
+                coordinator.store,
+                "_write_unlocked",
+                side_effect=fail_sharding_commit,
+            ),
+            self.assertRaisesRegex(OSError, "injected sharding checkpoint failure"),
+        ):
+            self.drain_sources(coordinator, handler)
+
+        raw_directory = coordinator.run_dir / "raw-shards"
+        if raw_directory.exists():
+            self.assertFalse(
+                any(
+                    path.name == sharding.RAW_SHARDS_MANIFEST_FILE
+                    or path.name.startswith("raw-shard-")
+                    for path in raw_directory.iterdir()
+                )
+            )
+        retried = coordinator.advance()
+        self.assertEqual("sharding_complete", retried["reason"])
+        self.assertTrue((raw_directory / sharding.RAW_SHARDS_MANIFEST_FILE).is_file())
+
+    def test_checkpoint_capacity_blocks_before_staged_artifacts_are_written(
+        self,
+    ) -> None:
+        coordinator = self.start_daily("checkpoint-capacity-precommit")
+        payload = b'{"timestamp":"2026-07-06T01:00:00Z","text":"work"}\n'
+
+        def handler(lease):
+            if (
+                lease["host"] != "local"
+                or lease["source_kind"] != SourceKind.ACTIVE_ROLLOUT.value
+            ):
+                return None
+            manifest, records, _source_ref = activity_manifest(lease, [payload])
+            return manifest, {"raw_records": {records[0].unit_ref: payload}}
+
+        self.drain_sources(coordinator, handler)
+        working_roots = ("agent-sinks", "raw-inputs", "raw-shards")
+
+        def working_files() -> set[str]:
+            return {
+                str(path.relative_to(coordinator.run_dir))
+                for root in working_roots
+                for path in (coordinator.run_dir / root).rglob("*")
+                if path.is_file()
+            }
+
+        before_files = working_files()
+        with mock.patch.object(
+            coordinator.store,
+            "has_operating_capacity",
+            return_value=False,
+        ):
+            blocked = coordinator.advance()
+
+        self.assertEqual("checkpoint_capacity_exhausted", blocked["reason"])
+        self.assertEqual(RunStage.BLOCKED.value, blocked["stage"])
+        self.assertEqual(before_files, working_files())
+
+    def test_initial_source_capacity_failure_leaves_raw_inputs_unchanged(
+        self,
+    ) -> None:
+        coordinator = self.start_daily("source-capacity-precommit")
+        raw_inputs = coordinator.run_dir / "raw-inputs"
+
+        def raw_input_files() -> set[str]:
+            if not raw_inputs.exists():
+                return set()
+            return {
+                str(path.relative_to(raw_inputs))
+                for path in raw_inputs.rglob("*")
+                if path.is_file()
+            }
+
+        before_files = raw_input_files()
+        with mock.patch.object(
+            coordinator.store,
+            "has_operating_capacity",
+            return_value=False,
+        ):
+            blocked = coordinator.advance()
+
+        self.assertEqual("checkpoint_capacity_exhausted", blocked["reason"])
+        self.assertEqual(RunStage.BLOCKED.value, blocked["stage"])
+        self.assertEqual(before_files, raw_input_files())
+
+    def test_staged_transaction_rollback_continues_across_independent_stages(
+        self,
+    ) -> None:
+        calls = []
+
+        def fail_first(receipt):
+            calls.append(("first", receipt))
+            raise RuntimeError("first rollback failed")
+
+        def fail_second(receipt):
+            calls.append(("second", receipt))
+            raise OSError("second rollback failed")
+
+        with self.assertRaisesRegex(OSError, "second rollback failed") as caught:
+            StageSchedulingOperations._rollback_raw_materializations(
+                ((fail_first, "one"), (fail_second, "two"))
+            )
+
+        self.assertEqual([("second", "two"), ("first", "one")], calls)
+        self.assertTrue(
+            any(
+                "additional staged rollback failure" in note
+                for note in caught.exception.__notes__
+            )
+        )
 
     def test_all_post_extraction_jobs_partition_under_complete_envelope_cap(
         self,
@@ -3636,7 +4173,8 @@ class OrchestratorTests(unittest.TestCase):
         envelope_cap = 96 * 1024
 
         def issue_and_accept(stage: str, payload_size: int = 18_000) -> None:
-            coordinator._issue_agent_tasks(state, stage)
+            with self.agent_task_transaction(coordinator):
+                coordinator._issue_agent_tasks(state, stage)
             for task in coordinator._tasks_for_stage(state, stage):
                 if task["status"] != "runnable":
                     continue
@@ -3651,9 +4189,13 @@ class OrchestratorTests(unittest.TestCase):
                     "schema": f"{task['job_kind']}_result_v2",
                     "task_ref": task["task_ref"],
                 }
+                task["result_hash"] = result_validation.canonical_result_hash(
+                    task["result"]
+                )
 
         def issue_final(stage: str) -> list[dict[str, object]]:
-            coordinator._issue_agent_tasks(state, stage)
+            with self.agent_task_transaction(coordinator):
+                coordinator._issue_agent_tasks(state, stage)
             tasks = coordinator._tasks_for_stage(state, stage)
             for task in tasks:
                 if task["status"] == "runnable":
@@ -3714,13 +4256,14 @@ class OrchestratorTests(unittest.TestCase):
                         else "secondary"
                     ),
                 }
-                coordinator._ensure_review_hierarchy(
-                    state,
-                    revision=revision,
-                    kind=kind,
-                    metadata=metadata,
-                    full_input=full_review_input,
-                )
+                with self.agent_task_transaction(coordinator):
+                    coordinator._ensure_review_hierarchy(
+                        state,
+                        revision=revision,
+                        kind=kind,
+                        metadata=metadata,
+                        full_input=full_review_input,
+                    )
                 for _ in range(12):
                     tasks = [
                         task
@@ -3732,13 +4275,14 @@ class OrchestratorTests(unittest.TestCase):
                     if any(task["metadata"]["hierarchy_final"] for task in tasks):
                         break
                     issue_and_accept(RunStage.EPISODE_REVIEW.value)
-                    coordinator._ensure_review_hierarchy(
-                        state,
-                        revision=revision,
-                        kind=kind,
-                        metadata=metadata,
-                        full_input=full_review_input,
-                    )
+                    with self.agent_task_transaction(coordinator):
+                        coordinator._ensure_review_hierarchy(
+                            state,
+                            revision=revision,
+                            kind=kind,
+                            metadata=metadata,
+                            full_input=full_review_input,
+                        )
                 else:  # pragma: no cover - bounded convergence assertion
                     self.fail(f"{kind} hierarchy did not converge")
                 tasks = issue_final(RunStage.EPISODE_REVIEW.value)
@@ -3788,21 +4332,23 @@ class OrchestratorTests(unittest.TestCase):
                 "MAX_AGENT_ENVELOPE_BYTES",
                 512 * 1024,
             ):
-                coordinator._create_agent_task(
-                    state,
-                    stage=RunStage.EPISODE_REVIEW.value,
-                    kind=JobKind.ADJUDICATOR.value,
-                    partition_ref=revision["episode_revision_ref"],
-                    input_refs=[
-                        revision["episode_ref"],
-                        revision["episode_revision_ref"],
-                    ],
-                    input_payload=adjudication_payload,
-                    allowed_refs=coordinator._collect_refs(adjudication_payload),
-                    allowed_turn_refs=revision["turn_refs"],
-                    metadata={"candidate_results": candidate_results},
-                )
-                coordinator._issue_agent_tasks(state, RunStage.EPISODE_REVIEW.value)
+                with self.agent_task_transaction(coordinator):
+                    coordinator._create_agent_task(
+                        state,
+                        stage=RunStage.EPISODE_REVIEW.value,
+                        kind=JobKind.ADJUDICATOR.value,
+                        partition_ref=revision["episode_revision_ref"],
+                        input_refs=[
+                            revision["episode_ref"],
+                            revision["episode_revision_ref"],
+                        ],
+                        input_payload=adjudication_payload,
+                        allowed_refs=coordinator._collect_refs(adjudication_payload),
+                        allowed_turn_refs=revision["turn_refs"],
+                        metadata={"candidate_results": candidate_results},
+                    )
+                with self.agent_task_transaction(coordinator):
+                    coordinator._issue_agent_tasks(state, RunStage.EPISODE_REVIEW.value)
             adjudication_tasks = coordinator._tasks_for_stage(
                 state, RunStage.EPISODE_REVIEW.value
             )
@@ -3909,12 +4455,13 @@ class OrchestratorTests(unittest.TestCase):
                         "topic_input": sliced,
                     }
                 )
-            coordinator._seed_topic_hierarchy(
-                state,
-                partitions=partitions,
-                topic_ref=topic_ref,
-                root_ref=root_ref,
-            )
+            with self.agent_task_transaction(coordinator):
+                coordinator._seed_topic_hierarchy(
+                    state,
+                    partitions=partitions,
+                    topic_ref=topic_ref,
+                    root_ref=root_ref,
+                )
             for _ in range(12):
                 topic_tasks = coordinator._tasks_for_stage(
                     state, RunStage.TOPIC_REDUCTION.value
@@ -3922,7 +4469,8 @@ class OrchestratorTests(unittest.TestCase):
                 if any(task["metadata"]["hierarchy_final"] for task in topic_tasks):
                     break
                 issue_and_accept(RunStage.TOPIC_REDUCTION.value)
-                coordinator._refresh_topic_hierarchies(state)
+                with self.agent_task_transaction(coordinator):
+                    coordinator._refresh_topic_hierarchies(state)
             else:  # pragma: no cover - bounded convergence assertion
                 self.fail("topic hierarchy did not converge")
             topic_tasks = issue_final(RunStage.TOPIC_REDUCTION.value)
@@ -3932,7 +4480,11 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(1, len(final_topic))
             self.assertEqual(
                 set(topic_input["expected_episode_revision_refs"]),
-                set(final_topic[0]["metadata"]["underlying_episode_refs"]),
+                set(
+                    agent_task_inputs.for_task(coordinator.run_dir, final_topic[0])[
+                        "metadata"
+                    ]["underlying_episode_refs"]
+                ),
             )
 
             state["jobs"] = {
@@ -3972,6 +4524,7 @@ class OrchestratorTests(unittest.TestCase):
                         "hierarchy_root_ref": synthesis_topic_roots[index],
                     },
                     "result": copy.deepcopy(result),
+                    "result_hash": result_validation.canonical_result_hash(result),
                     "stage": RunStage.TOPIC_REDUCTION.value,
                     "status": "accepted",
                     "task_ref": task_ref,
@@ -4001,12 +4554,13 @@ class OrchestratorTests(unittest.TestCase):
                 len(reporting.canonical_json_bytes(sorted(synthesis_source_refs))),
                 envelope_cap,
             )
-            coordinator._seed_synthesis_hierarchy(
-                state,
-                root_ref=synthesis_root,
-                topic_results=topic_results,
-                independent_reviews=independent_reviews,
-            )
+            with self.agent_task_transaction(coordinator):
+                coordinator._seed_synthesis_hierarchy(
+                    state,
+                    root_ref=synthesis_root,
+                    topic_results=topic_results,
+                    independent_reviews=independent_reviews,
+                )
             for _ in range(12):
                 synthesis_tasks = coordinator._tasks_for_stage(
                     state, RunStage.GLOBAL_SYNTHESIS.value
@@ -4014,16 +4568,36 @@ class OrchestratorTests(unittest.TestCase):
                 if any(task["metadata"]["hierarchy_final"] for task in synthesis_tasks):
                     break
                 issue_and_accept(RunStage.GLOBAL_SYNTHESIS.value)
-                coordinator._refresh_synthesis_hierarchy(state)
+                with self.agent_task_transaction(coordinator):
+                    coordinator._refresh_synthesis_hierarchy(state)
             else:  # pragma: no cover - bounded convergence assertion
-                self.fail("synthesis hierarchy did not converge")
+                self.fail(
+                    "synthesis hierarchy did not converge: "
+                    + repr(
+                        [
+                            (
+                                task["metadata"].get("hierarchy_level"),
+                                task["status"],
+                                task["task_ref"],
+                            )
+                            for task in coordinator._tasks_for_stage(
+                                state, RunStage.GLOBAL_SYNTHESIS.value
+                            )
+                        ]
+                    )
+                )
             synthesis_tasks = issue_final(RunStage.GLOBAL_SYNTHESIS.value)
             final_synthesis = [
                 task for task in synthesis_tasks if task["metadata"]["hierarchy_final"]
             ]
             self.assertEqual(1, len(final_synthesis))
             self.assertFalse(
-                synthesis_source_refs <= set(final_synthesis[0]["allowed_refs"])
+                synthesis_source_refs
+                <= set(
+                    agent_task_inputs.for_task(coordinator.run_dir, final_synthesis[0])[
+                        "allowed_refs"
+                    ]
+                )
             )
             validation_topics, validation_reviews = (
                 coordinator._synthesis_validation_results(state, final_synthesis[0])
@@ -4297,7 +4871,7 @@ class OrchestratorTests(unittest.TestCase):
             for task in backfill.store.read().state["jobs"].values()
             if task.get("active_job_ref") == extractor["job_ref"]
         )
-        result = self.extractor_result_for_task(task)
+        result = self.extractor_result_for_task(backfill, task)
         for turn in result["turns"]:
             turn["goal_change"] = "continues"
         backfill.accept_agent_result(
@@ -4954,9 +5528,18 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertEqual("accepted", accepted["outcome"], accepted)
         propagated = coordinator.store.load()
-        resolved_review = next(iter(propagated["resolved_reviews"].values()))
+        review_binding = next(iter(propagated["resolved_reviews"].values()))
+        self.assertEqual(
+            agent_results.AGENT_RESULT_REFERENCE_SCHEMA, review_binding["schema"]
+        )
+        self.assertNotIn("findings", review_binding)
+        resolved_review = agent_results.from_reference(
+            coordinator.run_dir,
+            propagated["jobs"],
+            review_binding,
+        )
         topic_result = next(
-            task["result"]
+            agent_results.for_task(coordinator.run_dir, task)
             for task in propagated["jobs"].values()
             if task.get("job_kind") == JobKind.TOPIC_REDUCER.value
             and task.get("status") == "accepted"
@@ -5751,9 +6334,27 @@ class OrchestratorTests(unittest.TestCase):
             coordinator._raw_cleanup_inventory(roots)
 
     def test_run_artifact_capacity_stays_within_cleanup_inventory(self) -> None:
+        target_file_count = (
+            contracts.MAX_RUN_AGENT_TASKS * contracts.MAX_AGENT_ARTIFACTS_PER_TASK
+            + contracts.MAX_RUN_RAW_SHARDS
+            + 1
+            + contracts.MAX_RUN_SOURCE_RECORDS
+            + contracts.MAX_RUN_SOURCE_SEGMENTS
+            + contracts.MAX_RUN_DERIVED_SIDECARS
+        )
+        self.assertEqual(2, contracts.ATOMIC_CREATE_ENTRIES_PER_FILE)
+        self.assertEqual(
+            contracts.MAX_CONSERVATIVE_RUN_CLEANUP_ENTRIES,
+            contracts.ATOMIC_CREATE_ENTRIES_PER_FILE * target_file_count
+            + contracts.MAX_CLEANUP_FIXED_ENTRY_RESERVE,
+        )
         self.assertLessEqual(
             contracts.MAX_CONSERVATIVE_RUN_CLEANUP_ENTRIES,
             contracts.MAX_CLEANUP_INVENTORY_ENTRIES,
+        )
+        self.assertLessEqual(
+            contracts.MAX_RUN_AGENT_TASKS * contracts.MAX_AGENT_CHECKPOINT_TASK_BYTES,
+            DEFAULT_MAX_CHECKPOINT_BYTES - DEFAULT_CHECKPOINT_TERMINAL_RESERVE_BYTES,
         )
 
     def test_cleanup_v5_sidecar_tamper_hardlink_and_oversize_fail_closed(
@@ -6103,11 +6704,22 @@ class OrchestratorTests(unittest.TestCase):
                 "active_attempt_ref": None,
                 "active_job_ref": None,
                 "allowed_refs": [],
+                "allowed_turn_refs": [],
                 "attempts": [],
                 "category": "agent",
+                "execution_contract": {},
+                "framing": {},
+                "host_refs": [],
                 "input_payload": {},
+                "input_refs": [],
                 "job_kind": "synthetic_nonterminal_worker",
                 "job_ref": job_ref,
+                "metadata": {},
+                "partition_ref": typed_ref(
+                    RefType.RUN_INPUT, "still-running-worker-partition"
+                ),
+                "raw_artifact": None,
+                "raw_manifest": None,
                 "stage": RunStage.EXPORT.value,
                 "status": "runnable",
                 "task_ref": typed_ref(RefType.RUN_INPUT, "still-running-worker-task"),

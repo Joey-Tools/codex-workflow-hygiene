@@ -9,7 +9,7 @@ import pathlib
 import stat
 import sys
 import tempfile
-from typing import Sequence
+from typing import Callable, Mapping, Sequence
 
 try:
     from .contracts import JsonValue
@@ -238,6 +238,8 @@ def _program_snapshot_protocol():
 
 def source_transport_python_flags(
     snapshot_cache: pathlib.Path | None = None,
+    *,
+    stage_file: Callable[[pathlib.Path, bytes], None] | None = None,
 ) -> tuple[str, ...]:
     package_dir = pathlib.Path(
         os.path.abspath(os.fspath(pathlib.Path(__file__).parent))
@@ -251,6 +253,7 @@ def source_transport_python_flags(
         schema=SOURCE_TRANSPORT_SNAPSHOT_SCHEMA,
         cache=pathlib.Path(snapshot_cache or SOURCE_TRANSPORT_SNAPSHOT_CACHE),
         maximum_bytes=SOURCE_TRANSPORT_MAX_SNAPSHOT_BYTES,
+        stage_file=stage_file,
     )
 
 
@@ -266,6 +269,7 @@ def _decode_program_snapshot(
     argv: tuple[str, ...],
     *,
     snapshot_cache: pathlib.Path,
+    prepared_files: Mapping[pathlib.Path, bytes] | None = None,
 ) -> tuple[dict[str, JsonValue], int, str]:
     protocol = _program_snapshot_protocol()
     prefix = (
@@ -281,6 +285,7 @@ def _decode_program_snapshot(
         cache=snapshot_cache,
         maximum_bytes=SOURCE_TRANSPORT_MAX_SNAPSHOT_BYTES,
         component_reader=_program_component,
+        prepared_files=prepared_files,
     )
 
 
@@ -288,6 +293,7 @@ def transport_program_commitment(
     command_argv: Sequence[str],
     *,
     snapshot_cache: pathlib.Path | None = None,
+    prepared_files: Mapping[pathlib.Path, bytes] | None = None,
 ) -> str:
     """Commit every executable component used by one source transport lease."""
 
@@ -295,6 +301,7 @@ def transport_program_commitment(
     snapshot, worker_index, snapshot_commitment = _decode_program_snapshot(
         argv,
         snapshot_cache=pathlib.Path(snapshot_cache or SOURCE_TRANSPORT_SNAPSHOT_CACHE),
+        prepared_files=prepared_files,
     )
     worker = pathlib.Path(argv[worker_index])
     if not worker.is_absolute():
@@ -375,11 +382,28 @@ def transport_program_commitment(
             raise TransportValidationError(
                 "source transport remote helper snapshot path is invalid"
             )
-        helper_component = _program_component(
-            helper,
-            role="remote_host_context_helper",
-            allow_missing=False,
-        )
+        prepared_helper = None if prepared_files is None else prepared_files.get(helper)
+        if prepared_helper is None:
+            helper_component = _program_component(
+                helper,
+                role="remote_host_context_helper",
+                allow_missing=False,
+            )
+        else:
+            if (
+                not isinstance(prepared_helper, bytes)
+                or len(prepared_helper) > SOURCE_TRANSPORT_MAX_PROGRAM_COMPONENT_BYTES
+            ):
+                raise TransportValidationError(
+                    "source transport remote helper snapshot is invalid"
+                )
+            helper_component = {
+                "content_commitment": "sha256:"
+                + hashlib.sha256(prepared_helper).hexdigest(),
+                "path": str(helper),
+                "role": "remote_host_context_helper",
+                "state": "present",
+            }
         if helper_component["content_commitment"] != helper_commitment:
             raise TransportValidationError(
                 "source transport remote helper snapshot changed"

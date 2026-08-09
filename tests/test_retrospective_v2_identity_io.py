@@ -55,11 +55,13 @@ from retrospective_v2.safe_io import (  # noqa: E402
     ReadLimitExceeded,
     UnsafePathError,
     atomic_create_bytes,
+    atomic_create_bytes_with_receipt,
     atomic_write_bytes,
     atomic_write_json,
     read_bounded_bytes,
     read_bounded_json,
     read_bounded_jsonl,
+    remove_atomic_created_bytes,
     require_secure_io_capabilities,
     secure_io_capability_issues,
 )
@@ -376,6 +378,104 @@ class SafeIoTests(unittest.TestCase):
             atomic_create_bytes(target, b"second\n")
 
         self.assertEqual(b"first\n", target.read_bytes())
+
+    def test_atomic_create_receipt_rejects_same_content_object_replacement(
+        self,
+    ) -> None:
+        target = self.root / "staged.json"
+        receipt = atomic_create_bytes_with_receipt(target, b'{"value":1}\n')
+        original_inode = target.stat().st_ino
+        replacement = self.root / "replacement.json"
+        replacement.write_bytes(b'{"value":1}\n')
+        os.chmod(replacement, 0o600)
+        self.assertNotEqual(original_inode, replacement.stat().st_ino)
+        os.replace(replacement, target)
+        self.assertNotEqual(original_inode, target.stat().st_ino)
+
+        with self.assertRaisesRegex(UnsafePathError, "target changed"):
+            remove_atomic_created_bytes(receipt)
+
+        self.assertEqual(b'{"value":1}\n', target.read_bytes())
+
+    def test_atomic_create_receipt_allows_benign_parent_child_churn(self) -> None:
+        target = self.root / "staged.json"
+        receipt = atomic_create_bytes_with_receipt(target, b"payload\n")
+        sibling = self.root / "benign-sibling"
+        sibling.write_bytes(b"temporary\n")
+        sibling.unlink()
+
+        remove_atomic_created_bytes(receipt)
+
+        self.assertFalse(target.exists())
+
+    def test_atomic_create_uses_one_persistent_lock_per_directory(self) -> None:
+        first = atomic_create_bytes_with_receipt(self.root / "first.json", b"one\n")
+        second = atomic_create_bytes_with_receipt(self.root / "second.json", b"two\n")
+
+        locks = list(self.root.glob(".atomic-create-*.lock"))
+
+        self.assertEqual(
+            [".atomic-create-directory.lock"], [item.name for item in locks]
+        )
+        remove_atomic_created_bytes(first)
+        remove_atomic_created_bytes(second)
+        self.assertEqual(
+            [".atomic-create-directory.lock"],
+            [item.name for item in self.root.glob(".atomic-create-*.lock")],
+        )
+
+    def test_atomic_create_rollback_close_failure_cannot_reverse_unlink(self) -> None:
+        target = self.root / "staged.json"
+        receipt = atomic_create_bytes_with_receipt(target, b"payload\n")
+        original_open = safe_io.open_checked_file_at
+        original_close = os.close
+        target_descriptor: int | None = None
+        close_failed = False
+
+        def capture_target_descriptor(*args, **kwargs):
+            nonlocal target_descriptor
+            descriptor = original_open(*args, **kwargs)
+            if kwargs.get("display_path") == target:
+                target_descriptor = descriptor
+            return descriptor
+
+        def close_then_fail(descriptor: int) -> None:
+            nonlocal close_failed
+            original_close(descriptor)
+            if descriptor == target_descriptor and not close_failed:
+                close_failed = True
+                raise OSError("simulated post-unlink close failure")
+
+        with (
+            mock.patch.object(
+                safe_io,
+                "open_checked_file_at",
+                side_effect=capture_target_descriptor,
+            ),
+            mock.patch.object(safe_io.os, "close", side_effect=close_then_fail),
+        ):
+            remove_atomic_created_bytes(receipt)
+
+        self.assertTrue(close_failed)
+        self.assertFalse(target.exists())
+
+    def test_atomic_create_receipt_rejects_parent_replacement(self) -> None:
+        parent = self.root / "created-parent"
+        parent.mkdir(mode=0o700)
+        target = parent / "staged.json"
+        receipt = atomic_create_bytes_with_receipt(target, b"payload\n")
+        original_parent = self.root / "original-parent"
+        parent.rename(original_parent)
+        parent.mkdir(mode=0o700)
+        replacement = parent / target.name
+        replacement.write_bytes(b"payload\n")
+        os.chmod(replacement, 0o600)
+
+        with self.assertRaisesRegex(UnsafePathError, "parent changed"):
+            remove_atomic_created_bytes(receipt)
+
+        self.assertTrue((original_parent / target.name).is_file())
+        self.assertTrue(replacement.is_file())
 
     def test_failed_atomic_write_removes_its_temporary_file(self) -> None:
         target = self.root / "failed.json"

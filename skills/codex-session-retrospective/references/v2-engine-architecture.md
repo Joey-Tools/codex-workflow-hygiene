@@ -19,6 +19,12 @@ operate on that single coordinator context and do not import one another:
 | `orchestrator_source.py` | Source transport admission and leased agent result handling |
 | `orchestrator_lifecycle.py` | Run creation, publication claims, retention, and raw cleanup |
 | `source_capacity.py` | Run-global source, sidecar, and cleanup-capacity accounting |
+| `agent_capacity.py` | Extractor/downstream task partitions and cache-miss reservations |
+| `agent_task_inputs.py` | Authenticated immutable task-input sidecars and checkpoint summaries |
+| `agent_results.py` | Authenticated accepted-result sidecars and checkpoint-coupled staging |
+| `agent_raw_artifacts.py` | Sealed raw-artifact projection and envelope loading |
+| `extracted_turns.py` | Authenticated derived-turn sidecar preparation and loading |
+| `raw_shard_staging.py` | Two-pass source-payload streaming and raw-shard rollback ownership |
 | `orchestrator_scheduler.py` | Stage transitions, task creation, and bounded envelope scheduling |
 
 Publication uses an explicit side-effect boundary:
@@ -62,29 +68,37 @@ live-helper source commitment from the same descriptor-bound read used to create
 the snapshot and requires it to equal the run's frozen transport provenance, so
 one run cannot mix helper versions across source leases.
 
-Source scheduling creates each lease's owner-only capture directory inside the
-checkpoint scheduling transaction and records its exact run-relative output
-binding. Status projection only authenticates that existing directory; it never
-creates raw state, so a stale snapshot cannot recreate a path after retention
-cleanup has claimed and removed the raw tree.
+Source scheduling prepares the transport-program snapshot, remote-helper
+snapshot, and bound empty output together with the candidate checkpoint. Exact
+checkpoint capacity is proved before any file is materialized. A successful
+commit records the run-relative output binding; status projection only
+authenticates the existing binding and never creates raw state, so a stale
+snapshot cannot recreate a path after retention cleanup has claimed and removed
+the raw tree.
 
 The transport program commitment includes every runtime module above. Adding a
 module without adding it to the closed allowlist fails source transport.
 
-The transport slice remains independently bounded after this hardening: 7,181
-physical lines across a 7,200-line aggregate limit. One exact 14-module
+The transport slice remains independently bounded after this hardening: 7,229
+physical lines across a 7,250-line aggregate limit. One exact 14-module
 inventory and its aggregate are enforced together, so omitting a transport
 module cannot create a false budget pass. The newly affected modules are
-`transport_program.py` at 408/420 lines, `transport_remote.py` at 315/320,
-`transport_snapshot.py` at 196/200, and `transport_remote_snapshot.py` at
-79/100. The global branch proxy measures 7,955 nodes against an exact
-7,955-node ceiling. The current increase is confined to the run-global source,
-shard, task, and cleanup-capacity guards; no additional coordinator capability
-or transport monolith was introduced.
+`transport_program.py` at 432/450 lines, `transport_remote.py` at 315/320,
+`transport_snapshot.py` at 213/220, and `transport_remote_snapshot.py` at
+86/100. The global branch proxy measures 8,230 nodes against an 8,250-node
+ceiling. The current increase is confined to run-global source/shard/task
+capacity, authenticated task/result/derived sidecars, and checkpoint-coupled
+staging; no additional coordinator capability or transport monolith was
+introduced. The six agent support modules are independently bounded at
+1,027/1,050 aggregate lines; their individual ceilings are 100, 120, 320, 350,
+200, and 100 lines. Raw-artifact and derived-turn loading remain separate so
+`orchestrator_jobs.py` stays at 507/520 lines, while
+`orchestrator_reduction.py`, `orchestrator_scheduler.py`, and
+`orchestrator_source.py` stay at 2,465/2,480, 1,093/1,100, and 2,137/2,150 lines.
 
 ## Architecture inventory
 
-The inventory uses physical lines, Python AST function boundaries (including
+The inventory snapshot below uses physical lines, Python AST function boundaries (including
 nested functions), and a branch proxy that counts `if`, loops, `try`, `match`,
 boolean branches, conditional expressions, and comprehensions. Exact duplicate
 groups hash normalized AST function bodies of at least eight lines.
@@ -105,7 +119,7 @@ groups hash normalized AST function bodies of at least eight lines.
 | Largest publication module | 7,271 | 3,186 |
 
 The package inventory includes transport and excludes the 1,892-line public CLI
-entrypoint. The current largest modules are:
+entrypoint. At that boundary-refactor snapshot, the largest modules were:
 
 | Module | Lines | Functions | Branch proxy | Largest function |
 | --- | ---: | ---: | ---: | ---: |

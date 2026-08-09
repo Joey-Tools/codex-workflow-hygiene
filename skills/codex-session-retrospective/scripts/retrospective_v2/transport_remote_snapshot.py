@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import pathlib
+from typing import Callable
 
 try:
     from . import safe_io
@@ -38,6 +39,7 @@ def snapshot_remote_host_context_helper(
     snapshot_cache: pathlib.Path,
     *,
     expected_source_commitment: str | None = None,
+    stage_file: Callable[[pathlib.Path, bytes], None] | None = None,
 ) -> tuple[pathlib.Path, str]:
     component = _program_component(
         pathlib.Path(path),
@@ -64,16 +66,21 @@ def snapshot_remote_host_context_helper(
     snapshot_path = _source_transport_external_snapshot_path(
         pathlib.Path(snapshot_cache), digest
     )
-    safe_io.ensure_owner_only_directory(snapshot_path.parent)
-    safe_io.recover_atomic_create(snapshot_path)
-    try:
-        safe_io.atomic_create_bytes(snapshot_path, payload, create_parents=False)
-    except FileExistsError:
-        existing = safe_io.read_bounded_bytes(
-            snapshot_path,
-            max_bytes=SOURCE_TRANSPORT_MAX_PROGRAM_COMPONENT_BYTES,
-            require_owner_only=True,
-        )
-        if not hmac.compare_digest(existing, payload):
-            raise TransportValidationError("source transport external snapshot changed")
+    if stage_file is not None:
+        stage_file(snapshot_path, payload)
+    else:
+        safe_io.ensure_owner_only_directory(snapshot_path.parent)
+        safe_io.recover_atomic_create(snapshot_path)
+        try:
+            safe_io.atomic_create_bytes(snapshot_path, payload, create_parents=False)
+        except FileExistsError:
+            existing = safe_io.read_bounded_bytes(
+                snapshot_path,
+                max_bytes=SOURCE_TRANSPORT_MAX_PROGRAM_COMPONENT_BYTES,
+                require_owner_only=True,
+            )
+            if not hmac.compare_digest(existing, payload):
+                raise TransportValidationError(
+                    "source transport external snapshot changed"
+                )
     return snapshot_path, digest

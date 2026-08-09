@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import hmac
-import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -55,6 +54,12 @@ class PreparedFile:
 class PreparedAcceptance:
     descriptor: dict[str, Any]
     file: PreparedFile
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedFile:
+    prepared: PreparedFile
+    receipt: safe_io.AtomicCreateReceipt
 
 
 def prepare_file(path: Path, payload: bytes) -> PreparedFile:
@@ -389,13 +394,13 @@ def aggregate_segments(
     return aggregate, aggregate_snapshot_ref, aggregate_receipt_ref
 
 
-def materialize(files: Sequence[PreparedFile]) -> tuple[PreparedFile, ...]:
-    created: list[PreparedFile] = []
+def materialize(files: Sequence[PreparedFile]) -> tuple[MaterializedFile, ...]:
+    created: list[MaterializedFile] = []
     try:
         for prepared in files:
             safe_io.ensure_owner_only_directory(prepared.path.parent)
             try:
-                safe_io.atomic_create_bytes(
+                receipt = safe_io.atomic_create_bytes_with_receipt(
                     prepared.path,
                     prepared.payload,
                     create_parents=False,
@@ -409,84 +414,42 @@ def materialize(files: Sequence[PreparedFile]) -> tuple[PreparedFile, ...]:
                 if existing != prepared.payload:
                     raise InvalidTransitionError("staged source file changed")
             else:
-                created.append(prepared)
-    except BaseException:
-        rollback(tuple(created))
+                created.append(MaterializedFile(prepared=prepared, receipt=receipt))
+    except BaseException as error:
+        try:
+            rollback(tuple(created))
+        except BaseException as rollback_error:
+            if hasattr(error, "add_note"):
+                error.add_note(
+                    "staged source rollback was incomplete; "
+                    f"{type(rollback_error).__name__}"
+                )
         raise
     return tuple(created)
 
 
-def rollback(files: Sequence[PreparedFile]) -> None:
-    for prepared in reversed(tuple(files)):
-        _remove_matching_file(prepared)
-
-
-def _remove_matching_file(prepared: PreparedFile) -> None:
-    normalized, directory_fd = safe_io.open_owner_only_directory(prepared.path.parent)
-    del normalized
-    descriptor = -1
-    try:
+def rollback(files: Sequence[MaterializedFile]) -> None:
+    failures: list[BaseException] = []
+    for materialized in reversed(tuple(files)):
+        if not isinstance(materialized, MaterializedFile):
+            failures.append(
+                InvalidTransitionError(
+                    "staged source rollback lacks a creation identity receipt"
+                )
+            )
+            continue
         try:
-            descriptor = safe_io.open_checked_file_at(
-                directory_fd,
-                prepared.path.name,
-                display_path=prepared.path,
-                require_owner_only=True,
-            )
-        except FileNotFoundError:
-            return
-        safe_io.validate_owner_only_file_descriptor(
-            descriptor,
-            prepared.path,
-            directory_fd=directory_fd,
-            name=prepared.path.name,
-        )
-        before = os.fstat(descriptor)
-        if before.st_size != prepared.byte_count:
-            raise InvalidTransitionError("staged source rollback target changed")
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(descriptor, 64 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-        safe_io.validate_owner_only_file_descriptor(
-            descriptor,
-            prepared.path,
-            directory_fd=directory_fd,
-            name=prepared.path.name,
-        )
-        first_digest = digest.hexdigest()
-        second_digest = hashlib.sha256()
-        offset = 0
-        while offset < prepared.byte_count:
-            chunk = os.pread(
-                descriptor,
-                min(64 * 1024, prepared.byte_count - offset),
-                offset,
-            )
-            if not chunk:
-                break
-            second_digest.update(chunk)
-            offset += len(chunk)
-        safe_io.validate_owner_only_file_descriptor(
-            descriptor,
-            prepared.path,
-            directory_fd=directory_fd,
-            name=prepared.path.name,
-        )
-        after = os.fstat(descriptor)
-        if (
-            (before.st_dev, before.st_ino, before.st_size)
-            != (after.st_dev, after.st_ino, after.st_size)
-            or offset != prepared.byte_count
-            or not hmac.compare_digest(first_digest, prepared.digest)
-            or not hmac.compare_digest(second_digest.hexdigest(), prepared.digest)
-        ):
-            raise InvalidTransitionError("staged source rollback target changed")
-        os.unlink(prepared.path.name, dir_fd=directory_fd)
-        os.fsync(directory_fd)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        os.close(directory_fd)
+            safe_io.remove_atomic_created_bytes(materialized.receipt)
+        except (OSError, safe_io.UnsafePathError) as error:
+            failure = InvalidTransitionError("staged source rollback target changed")
+            failure.__cause__ = error
+            failures.append(failure)
+    if failures:
+        primary = failures[0]
+        if hasattr(primary, "add_note"):
+            for secondary in failures[1:]:
+                primary.add_note(
+                    "additional staged source rollback failure: "
+                    f"{type(secondary).__name__}: {secondary}"
+                )
+        raise primary

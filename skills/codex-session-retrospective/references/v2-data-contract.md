@@ -33,10 +33,13 @@ directory with `O_NOFOLLOW`, must be a bounded regular file, and is hashed only
 after matching `fstat` and no-follow name identities before and after the read.
 
 Before a remote lease is committed, the parent opens the installed
-`$remote-host-context` helper and writes its exact bytes to an owner-only,
+`$remote-host-context` helper and prepares its exact bytes for an owner-only,
 content-addressed snapshot below that run's `raw-inputs` tree. The source
 commitment derived from that same descriptor-bound read must equal the run's
-frozen helper provenance before snapshot publication or lease creation. The
+frozen helper provenance before snapshot preparation or lease creation. The
+transport-program snapshot, remote-helper snapshot, bound empty transport output,
+and candidate checkpoint are capacity-checked and staged as one transaction;
+none of those files is materialized before the candidate checkpoint fits. The
 worker receives only the snapshot path and SHA-256 commitment. Its isolated
 `-I -B` bootstrap opens the snapshot with no-follow descriptor checks, verifies
 regular-file identity, owner, mode, link count, byte count, and digest, then
@@ -154,6 +157,46 @@ retained raw payload, and a submitted non-target consumed record is rejected.
   or an over-limit result sink records `agent_claim_budget_exhausted` and closes
   that attempt through the ordinary retry/explicit-gap state machine without
   counting an agent result or accumulating more claim files.
+- Accepted agent results live in canonical owner-only sidecars under
+  `agent-sinks/results`. The checkpoint stores only a closed descriptor that
+  binds the task reference, canonical result hash, byte count, SHA-256 content
+  commitment, and content-addressed run-relative path. Every consumer
+  authenticates the descriptor and exact canonical payload before use. Existing
+  checkpoints with a legacy inline result remain read-compatible, but every new
+  acceptance stages the sidecar and its exact checkpoint revision as one
+  transaction; a failed checkpoint commit rolls back only the newly created,
+  identity- and content-matching sidecar.
+- Immutable agent-task inputs live in canonical owner-only sidecars under
+  `agent-sinks/task-inputs`. The checkpoint keeps only their authenticated
+  descriptor plus bounded scheduling summaries; hierarchy inputs, turn metadata,
+  candidate results, framing, and payloads remain sidecar-only. Each sidecar is
+  capped at 640 KiB and every checkpoint task is capped at 16 KiB. Attempts retain
+  only the deterministic job reference and manifest digest; claim and replay
+  reconstruct the full manifest and require the digest to match before returning
+  an execution envelope. A legacy attempt may carry the full manifest instead of
+  its digest, but never both: the coordinator requires an exact reconstruction,
+  migrates it to the digest form, and rejects every ambiguous or changed legacy
+  representation. Replaying an accepted result also reauthenticates its result
+  sidecar instead of trusting checkpoint status alone.
+- Reassembled extracted turns live in one canonical owner-only,
+  content-addressed sidecar under `agent-sinks/derived`. Its 96 MiB cap is
+  independent of the 32 MiB checkpoint cap, and the checkpoint retains only a
+  descriptor binding its schema, turn count, byte count, SHA-256 commitment, and
+  run-relative path. Every consumer authenticates the complete canonical mapping
+  and each turn reference. Legacy inline extracted-turn mappings remain
+  read-compatible; new non-empty writes always use the sidecar.
+- One run admits at most 1,500 deterministic agent-task cache misses. Exactly
+  1,000 are reserved for extractor-redactor tasks and exactly 500 for episode
+  review, adjudication, topic reduction, and global synthesis. Cache hits do not
+  consume another task slot. Partition counters are authenticated checkpoint
+  state and are reconstructed from legacy task state before a new miss is
+  accepted. Before any task input, envelope, or shard is published, the
+  coordinator serializes the exact candidate checkpoint and requires it to fit
+  below the 32 MiB checkpoint bound with a 512 KiB terminal reserve. Capacity
+  exhaustion restores the prior state and records an explicit repairable blocker
+  without staging files. These limits reserve the complete downstream pipeline
+  before raw materialization and keep the conservative cleanup inventory at no
+  more than 259,540 entries under its fixed 300,000-entry ceiling.
 - Accepted source records and raw-payload indexes live in canonical, owner-only,
   content-addressed sidecars under `raw-inputs/source-acceptances`; authenticated
   checkpoint state stores only bounded descriptors and a compact manifest summary.
@@ -174,6 +217,35 @@ retained raw payload, and a submitted non-target consumed record is rejected.
   aggregate; accepting a later segment never reloads earlier sidecars. The
   coordinator rejects an over-limit segment before staging any file, leaving
   coverage unresolved rather than committing an incomplete aggregate.
+- Raw sharding uses two bounded ordered passes over the authenticated source
+  payload sidecars. The first pass retains only shard/gap manifests and rejects
+  more than 1,000 shards before raw-shard I/O. A catalog record whose declared
+  byte or turn count exceeds its processing budget becomes an explicit gap before
+  its payload file is read. The second pass reads one source
+  payload at a time, emits one shard at a time, and requires every emitted
+  manifest plus the complete canonical manifest to match the first pass. Its
+  working data is bounded by one source record, that record's fragments, the
+  current shard, and one maximum-sized serialization buffer; the legal 4 GiB
+  source corpus is never assembled in memory. Newly created shard files and the
+  manifest are staged with the candidate checkpoint revision. A checkpoint
+  failure performs descriptor-authenticated exact-file rollback, while an
+  existing byte-identical artifact remains idempotent and is never claimed as a
+  newly created rollback target.
+- Every newly created staged file returns an object-identity receipt binding its
+  parent identity, file identity, owner-only access policy, exact byte count, and
+  SHA-256 content. All atomic creates in one directory share one persistent
+  directory lock, so two target names cannot bypass each other's transaction
+  boundary. Rollback reacquires that lock and performs
+  two descriptor-bound content and policy samples before unlinking. Parent or
+  leaf replacement, same-inode content mutation, unreadability, or policy drift
+  fails closed and retains the path. Child-entry churn that does not change the
+  protected parent identity is benign. The receipt excludes a non-cooperating
+  malicious same-UID writer from its guarantee; it proves and protects the
+  cooperating transaction boundary rather than claiming an atomic unlink-by-FD
+  primitive the platform does not provide. Independent receipts and staging
+  groups continue rollback after one retained mismatch; a close failure after a
+  proved unlink is secondary evidence and cannot reverse the known disposition
+  or replace the original primary failure.
 - Raw run directory: mode `0700`; every file: mode `0600`. On Darwin, each
   owner-only directory and file must also have no extended ACL. Newly created
   objects clear inherited ACLs through their held descriptors before use;

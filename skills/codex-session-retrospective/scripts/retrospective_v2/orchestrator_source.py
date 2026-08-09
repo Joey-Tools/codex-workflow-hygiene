@@ -9,8 +9,12 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
+
 from . import (
+    agent_capacity,
     agent_claim_artifacts,
+    agent_results,
+    agent_task_inputs,
     catalog,
     result_validation,
     safe_io,
@@ -1227,7 +1231,9 @@ class SourceCoordinationOperations(OrchestratorComponent):
                         "sink_state": "open",
                     }
                 )
-                prepared_claim_files.append(self._prepare_claim_envelope(task, attempt))
+                prepared_claim_files.append(
+                    self._prepare_claim_envelope(state, task, attempt)
+                )
                 prepared_claim_files.append(
                     source_inputs.prepare_file(
                         self.run_dir / output_relative,
@@ -1274,6 +1280,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
 
     def _prepare_claim_envelope(
         self,
+        state: Mapping[str, Any],
         task: Mapping[str, Any],
         attempt: dict[str, Any],
     ) -> source_inputs.PreparedFile:
@@ -1288,7 +1295,11 @@ class SourceCoordinationOperations(OrchestratorComponent):
             or generation < 1
         ):
             raise InvalidTransitionError("agent claim identity is missing")
-        envelope = self._jobs._agent_envelope(task, attempt)
+        job_manifest = self._bound_agent_job_manifest(state, task, attempt)
+        envelope = self._jobs._agent_envelope(
+            task,
+            {**attempt, "job_manifest": job_manifest},
+        )
         envelope_bytes = canonical_json_bytes(envelope)
         if len(envelope_bytes) > self._agent_envelope_limit():
             raise InvalidTransitionError(
@@ -1311,6 +1322,33 @@ class SourceCoordinationOperations(OrchestratorComponent):
             self.run_dir / relative_path,
             envelope_bytes,
         )
+
+    def _bound_agent_job_manifest(
+        self,
+        state: Mapping[str, Any],
+        task: Mapping[str, Any],
+        attempt: dict[str, Any],
+    ) -> dict[str, Any]:
+        ordinal = attempt.get("ordinal")
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0:
+            raise InvalidTransitionError("agent job manifest ordinal is invalid")
+        expected = self._jobs._execution_manifest(state, task, ordinal)
+        expected_digest = content_digest(expected)
+        has_manifest = "job_manifest" in attempt
+        has_digest = "job_manifest_digest" in attempt
+        if has_manifest == has_digest:
+            raise InvalidTransitionError("agent job manifest binding is ambiguous")
+        if has_manifest:
+            legacy = attempt.get("job_manifest")
+            if not isinstance(legacy, Mapping) or dict(legacy) != expected:
+                raise InvalidTransitionError("legacy agent job manifest changed")
+            attempt.pop("job_manifest")
+            attempt["job_manifest_digest"] = expected_digest
+        elif attempt.get("job_manifest_digest") != expected_digest:
+            raise InvalidTransitionError("agent job manifest binding changed")
+        if expected.get("job_ref") != attempt.get("job_ref"):
+            raise InvalidTransitionError("agent job manifest job_ref changed")
+        return expected
 
     def _require_active_agent_claim(
         self,
@@ -1375,6 +1413,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
             }
         )
         action_key = f"accept_agent_result:{normalized_attempt_ref}"
+        result_staging = agent_results.Staging()
 
         def mutate(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             self._state._assert_state_identity(state)
@@ -1459,7 +1498,9 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 task["active_attempt_ref"] = None
                 task["active_job_ref"] = None
                 state["metrics"]["agent_results"] += 1
-                result_hash = result_validation.canonical_result_hash(validated)
+                result_artifact, result_hash = result_staging.prepare(
+                    self.run_dir, task, validated
+                )
                 task.update(
                     {
                         "accepted_attempt_ref": normalized_attempt_ref,
@@ -1468,16 +1509,21 @@ class SourceCoordinationOperations(OrchestratorComponent):
                             "attempt_ref": normalized_attempt_ref,
                             "claim_ref": normalized_claim_ref,
                             "input_digest": task["input_digest"],
-                            "input_refs": copy.deepcopy(task["input_refs"]),
+                            "input_refs": copy.deepcopy(
+                                agent_task_inputs.for_task(self.run_dir, task)[
+                                    "input_refs"
+                                ]
+                            ),
                             "job_ref": normalized_job_ref,
                             "result_digest": result_digest,
                             "result_ref": normalized_result_ref,
                         },
-                        "result": validated,
+                        "result_artifact": result_artifact,
                         "result_hash": result_hash,
                         "status": "accepted",
                     }
                 )
+                agent_capacity.validate_checkpoint_task(task)
                 state["metrics"]["accepted_agent_results"] += 1
                 outcome = "accepted"
             else:
@@ -1510,7 +1556,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 "reason": None if accepted else reason,
             }
 
-        transaction = self.store.transaction(mutate)
+        transaction = result_staging.commit(self.store, mutate)
         response = self._projection._status_view(transaction.snapshot)
         response.update(
             {
@@ -1821,30 +1867,25 @@ class SourceCoordinationOperations(OrchestratorComponent):
         }
         if not isinstance(action, Mapping) or action.get("binding") != expected_binding:
             raise RunConflictError("agent result replay binding changed")
-        matches: list[tuple[str, Mapping[str, Any], Mapping[str, Any]]] = []
+        matches: list[tuple[str, Mapping[str, Any], dict[str, Any]]] = []
         for task_key, task in state["jobs"].items():
             attempts = task.get("attempts")
             if not isinstance(attempts, list):
                 continue
             for attempt in attempts:
                 if (
-                    isinstance(attempt, Mapping)
+                    isinstance(attempt, dict)
                     and attempt.get("attempt_ref") == attempt_ref
                 ):
                     matches.append((task_key, task, attempt))
         if len(matches) != 1:
             raise RunConflictError("agent result replay attempt is not unique")
         task_key, task, attempt = matches[0]
-        manifest = attempt.get("job_manifest")
         ordinal = attempt.get("ordinal")
         generation = attempt.get("claim_generation")
         dispatcher_ref = attempt.get("dispatcher_ref")
         output_relative = attempt.get("output_sink_relative")
-        expected_manifest = (
-            None
-            if not isinstance(ordinal, int) or isinstance(ordinal, bool)
-            else self._jobs._execution_manifest(state, task, ordinal)
-        )
+        expected_manifest = self._bound_agent_job_manifest(state, task, attempt)
         expected_attempt_ref = (
             None
             if expected_manifest is None
@@ -1883,8 +1924,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
             task.get("category") != "agent"
             or task.get("task_ref") != task_key
             or attempt.get("job_ref") != job_ref
-            or not isinstance(manifest, Mapping)
-            or manifest != expected_manifest
+            or expected_manifest.get("job_ref") != job_ref
             or expected_attempt_ref != attempt_ref
             or attempt.get("claim_ref") != claim_ref
             or expected_claim_ref != claim_ref
@@ -1912,6 +1952,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 )
             ):
                 raise RunConflictError("accepted agent result replay binding changed")
+            agent_results.require(self.run_dir, task)
         elif (
             outcome not in {"retryable", "gap"}
             or task.get("status") != outcome

@@ -251,8 +251,8 @@ superseded_by:
   journal and the run's cleanup-pending checkpoint are durable. Only then may the
   sidecar become terminal; recovery accepts a fully collected bundle/sidecar pair
   but rejects one-sided disappearance as a conflict.
-- The transport boundary is an exact 14-module inventory at 7,181 lines under a
-  7,200-line aggregate ceiling. The contract fails on membership drift, individual
+- The transport boundary is an exact 14-module inventory at 7,229 lines under a
+  7,250-line aggregate ceiling. The contract fails on membership drift, individual
   module drift, or aggregate growth instead of relying on an approximate total.
 - The public finalize command advances exactly one durable publication phase per
   invocation and releases a publication-bound export only after the transaction
@@ -764,3 +764,67 @@ superseded_by:
   zero tests and is explicitly non-counting. The successful discovery is the
   complete implementation-tree gate; only evidence and commit metadata changes
   follow it.
+- The fresh whole-range Codex review of signed head `3bf0d01` returned three
+  actionable capacity findings. Legal accepted results could still expand the
+  authenticated checkpoint beyond 32 MiB; the 16,384-shard contract exceeded
+  the complete 15,000-task budget and failed only after raw files were written;
+  and the 4 GiB legal source corpus could be copied several times during shard
+  planning/materialization. The independent workspace reproduced its exact
+  postvalidation receipt, the trusted bundle digests remained unchanged, and
+  the task root was removed before fixes.
+- New acceptances place canonical result payloads in authenticated owner-only
+  `agent-sinks/results` sidecars and retain only task/hash/size/path commitments
+  in the checkpoint. Complete immutable task inputs and hierarchy metadata use
+  authenticated `agent-sinks/task-inputs` sidecars; attempts retain only a
+  deterministic job-manifest digest and reconstruct the manifest at claim/replay.
+  Legacy inline results remain read-compatible. The task budget is partitioned
+  into 1,000 extractor misses plus 500 downstream misses, with cache hits
+  conserved separately. Each checkpoint task is limited to 16 KiB and exact
+  candidate checkpoint serialization reserves 512 KiB for terminal blockers
+  before any staged file is written.
+- Raw sharding now performs a manifest-only first pass and a
+  one-record/one-shard-at-a-time second pass. Oversized catalog records become
+  explicit gaps before payload I/O, and no more than 1,000 shards may be planned.
+  Shard files, task sidecars, envelopes, and the candidate checkpoint form one
+  staged transaction. Rollback uses parent/file identity plus exact content and
+  access-policy receipts under one persistent directory lock. The conservative
+  cleanup proof charges both target and a lock share for every atomic file and is
+  259,540/300,000 entries.
+- Intermediate review-fix evidence passed scoped Ruff format/lint for all 73 engine
+  and affected-test files, module boundaries 18/18 in 1.630 seconds, the
+  identity/checkpoint/source/result/history/export group 246/246 in 31.307
+  seconds, and catalog/sharding/orchestrator 110/110 in 145.597 seconds. Earlier
+  test-first attempts with two incorrect selector names, a stale test constant,
+  and an assertion that treated persistent atomic-create lock files as staged
+  payloads are non-counting; corrected exact tests are included in the terminal
+  groups above.
+- After extracting sealed raw-artifact loading into its own bounded module, an
+  intermediate quick gate passed Ruff lint/format for 22 directly affected files,
+  module boundaries 18/18 in 1.636 seconds, catalog/identity 64/64 in 0.386
+  seconds, and orchestrator 87/87 in 125.376 seconds under Python 3.13. The five
+  agent-support modules occupy 873/900 lines and the package branch proxy is
+  8,151/8,160. A previously started disposable-GPG discovery was interrupted
+  before terminal output and is explicitly non-counting; the host publication
+  tests must be rerun on the final frozen tree.
+- The capacity follow-up now stages each source program snapshot, remote-helper
+  snapshot, and bound empty output with the candidate checkpoint only after the
+  exact capacity check. Reassembled extracted turns moved to one authenticated
+  96 MiB derived sidecar; accepted-result replay reauthenticates its sidecar, gap
+  projection remains content-free after task-sidecar cleanup, and legacy attempt
+  manifests migrate only after exact reconstruction. Atomic creates share one
+  directory lock, independent rollback groups continue after a retained mismatch,
+  and close failures cannot reverse a proved file disposition or replace the
+  original primary failure.
+- Current terminal Python 3.13 evidence for this follow-up includes source
+  transport 69/69 in 27.965 seconds, catalog/identity 67/67 in 0.204 seconds,
+  orchestrator 93/93 in 134.708 seconds, module boundaries 18/18 in 1.629
+  seconds, and the post-suite large-derived-sidecar tamper regression 1/1 in
+  0.426 seconds. The six agent-support modules occupy 1,027/1,050 lines, the
+  exact transport inventory is 7,229/7,250, and the package branch proxy is
+  8,230/8,250. At that checkpoint these focused and affected-suite results did
+  not replace the still-pending full discovery or host-level disposable-GPG gate.
+- The final host-level Python 3.13 discovery passes all 1,626 tests in 1,105.564
+  seconds with `TMPDIR=/private/tmp`. It includes the real disposable-GPG
+  publication transactions and reports no skips. This terminal run supersedes
+  the interrupted non-counting discovery while preserving the focused and
+  affected-suite evidence above for diagnosis.

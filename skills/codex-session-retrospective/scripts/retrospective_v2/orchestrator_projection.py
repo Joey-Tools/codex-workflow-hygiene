@@ -9,8 +9,11 @@ import re
 import sys
 from typing import Any, Iterable, Mapping, Sequence
 from . import (
+    agent_results,
+    agent_task_inputs,
     catalog,
     controlled_gaps,
+    extracted_turns,
     result_validation,
     safe_io,
     sharding,
@@ -109,9 +112,14 @@ class StateProjectionOperations(OrchestratorComponent):
         turn_refs: Sequence[str],
         *,
         episode_revision_ref: str,
+        extracted: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]] | None:
         wanted = set(turn_refs)
-        extracted = state.get("extracted_turns", {})
+        if extracted is None:
+            state_value = state.get("extracted_turns", {})
+            if not isinstance(state_value, Mapping):
+                raise InvalidTransitionError("extracted turn state is invalid")
+            extracted = extracted_turns.load(self.run_dir, state_value)
         result = [
             copy.deepcopy(turn)
             for turn_ref, turn in extracted.items()
@@ -152,15 +160,14 @@ class StateProjectionOperations(OrchestratorComponent):
             raise RunConflictError("duplicate review task")
         return matches[0] if matches else None
 
-    @staticmethod
     def _review_plan_result(
+        self,
         task: Mapping[str, Any] | None,
     ) -> dict[str, Any] | None:
         if task is None:
             return None
         if task.get("status") == "accepted":
-            result = task.get("result")
-            return result if isinstance(result, dict) else None
+            return agent_results.for_task(self.run_dir, task)
         gaps = task.get("validated_gap_results", [])
         if isinstance(gaps, list) and gaps and isinstance(gaps[-1], dict):
             return gaps[-1]
@@ -579,13 +586,12 @@ class StateProjectionOperations(OrchestratorComponent):
                 if job["status"] == "runnable":
                     runnable_jobs.append(self._public_source_job(job))
                 continue
-            public = self._public_agent_task(job, now=now)
             if job["status"] == "runnable":
-                runnable_jobs.append(public)
+                runnable_jobs.append(self._public_agent_task(job, now=now))
             elif job["status"] == "retryable":
-                retryable_jobs.append(public)
+                retryable_jobs.append(self._public_agent_task(job, now=now))
             elif job["status"] == "gap":
-                blocked_jobs.append(public)
+                blocked_jobs.append(self._public_agent_task(job, now=now))
         for host, cells in state["source"]["cells"].items():
             for source_kind, cell in cells.items():
                 if cell.get("manifest") is None:
@@ -763,11 +769,22 @@ class StateProjectionOperations(OrchestratorComponent):
                 for item in task["attempts"]
                 if item["attempt_ref"] == task["active_attempt_ref"]
             )
+        immutable = (
+            None
+            if task.get("status") == "gap"
+            else agent_task_inputs.for_task(self.run_dir, task)
+        )
         result: dict[str, Any] = {
             "active_attempt_ref": task.get("active_attempt_ref"),
-            "allowed_output_refs": copy.deepcopy(task["allowed_refs"]),
+            "allowed_output_refs": (
+                [] if immutable is None else copy.deepcopy(immutable["allowed_refs"])
+            ),
             "category": "agent",
-            "input_payload": copy.deepcopy(task.get("input_payload")),
+            "input_payload": (
+                None
+                if immutable is None
+                else copy.deepcopy(immutable.get("input_payload"))
+            ),
             "job_kind": task["job_kind"],
             "job_ref": task.get("active_job_ref"),
             "retry_ordinal": max(0, len(task["attempts"]) - 1),

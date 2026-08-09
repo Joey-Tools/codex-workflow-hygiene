@@ -12,10 +12,12 @@ a new attempt or run.
 - An invalid or truncated source stream does not make its source cell terminal.
 - `accept-source` is the only source transition; its input remains below the run
   cache and can be retried unchanged.
-- Source scheduling creates and binds each lease's owner-only capture directory
-  inside the checkpoint transaction. Status only authenticates the existing
-  binding. A stale status snapshot therefore fails closed after raw expiry
-  cleanup instead of recreating the deleted `raw-inputs` tree.
+- Source scheduling prepares the transport-program snapshot, remote-helper
+  snapshot, and bound empty transport output with the candidate checkpoint.
+  Capacity is proved before materialization and the files commit as one staging
+  group. Status only authenticates the existing binding. A stale status snapshot
+  therefore fails closed after raw expiry cleanup instead of recreating the
+  deleted `raw-inputs` tree.
 - A job attempt is dispatched only through a bounded claim lease. Repeating the
   matching claim before expiry is an idempotent heartbeat; after expiry, another
   dispatcher may take over the same attempt with a new claim-specific envelope
@@ -24,10 +26,55 @@ a new attempt or run.
   result was accepted with the exact active, unexpired `claim_ref`. Results from
   expired or replaced claims fail closed. Finalization requires no open claim or
   output sink.
+- A newly accepted result is not embedded in the bounded checkpoint. The engine
+  stages an owner-only, content-addressed result sidecar and an authenticated
+  descriptor in one checkpoint transaction. A write failure before the new
+  revision is proved durable removes only sidecars created by that attempt after
+  exact identity, access-policy, size, and content revalidation. A committed or
+  disposition-unknown revision retains the sidecar for recovery. Existing
+  same-schema checkpoints with inline results remain readable but do not cause a
+  new sidecar to be inferred retroactively.
+- New tasks stage their complete immutable inputs in authenticated owner-only
+  sidecars and retain only bounded summaries in the checkpoint. Claim and replay
+  rebuild the full job manifest from authenticated task state and require its
+  stored digest to match. Missing, ambiguous, oversized, or changed task/result
+  sidecars fail closed; they are never replaced by a guessed inline payload. A
+  legacy full attempt manifest is accepted only after exact reconstruction, is
+  migrated to the digest form, and is rejected when a digest is already present.
+  Accepted-result replay reauthenticates the result sidecar before returning it.
+- Reassembled extracted turns use one authenticated owner-only derived sidecar
+  capped at 96 MiB. New non-empty checkpoints retain only its closed descriptor;
+  legacy inline mappings remain readable. A missing, changed, oversized, or
+  turn-reference-inconsistent sidecar blocks reduction. Gap status projection
+  remains content-free and does not reopen a deleted task-input sidecar.
+- Before staging any task sidecar, envelope, or raw shard, `advance` measures the
+  exact candidate checkpoint envelope against the 32 MiB limit and its 512 KiB
+  terminal reserve. Exhaustion restores the prior checkpoint state, clears the
+  staging set, and records `checkpoint_capacity_exhausted` from the reserved
+  terminal space. It never publishes a partial task batch.
 - A bound malformed agent result consumes one attempt. A second failure becomes
   an explicit content-free gap. JSON numeric overflow such as `1e999` is
   malformed at this ingestion boundary; it cannot become a non-finite stored
   value, and each rejected attempt closes its claim and output sink.
+- Raw-shard recovery follows the same checkpoint-authoritative disposition. A
+  manifest-only first pass proves the complete shard count and downstream task
+  reservation before file creation. The second pass stages only exact emitted
+  shards and their manifest. If the checkpoint remains at the old revision,
+  rollback removes the exact newly created set; byte-identical pre-existing
+  files are not part of that receipt. A committed candidate is resumed from its
+  descriptors, while an inconsistent or unreadable disposition retains staged
+  files and fails closed rather than guessing ownership.
+- Staged-file rollback consumes only the creation receipt returned for that
+  exact new object. It reacquires the persistent directory lock and revalidates
+  parent identity, file identity, owner-only policy, size, and content twice.
+  Replacement or unreadability retains the object and preserves the primary
+  failure. Benign sibling churn does not alter the protected parent identity.
+  This is a cooperating-writer guarantee; cleanup does not claim an atomic
+  defense against a malicious same-UID replacement between the final descriptor
+  check and the platform's path-based unlink syscall. Rollback continues through
+  independent receipts and staging groups after one retained mismatch. A close
+  failure after a proved unlink is recorded as secondary evidence and cannot
+  reverse that disposition or replace the original primary error.
 
 ## Durable Publication
 

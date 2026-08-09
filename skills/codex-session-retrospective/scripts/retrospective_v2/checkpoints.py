@@ -17,6 +17,7 @@ from .identity import IdentityKey
 
 CHECKPOINT_FORMAT_VERSION = common_contracts.CHECKPOINT_FORMAT_VERSION
 DEFAULT_MAX_CHECKPOINT_BYTES = 32 * 1024 * 1024
+DEFAULT_CHECKPOINT_TERMINAL_RESERVE_BYTES = 512 * 1024
 _LOCK_FILE = ".checkpoint.lock"
 _ENVELOPE_BODY_FIELDS = frozenset({"format_version", "revision", "key_id", "state"})
 _ENVELOPE_FIELDS = _ENVELOPE_BODY_FIELDS | {"envelope_hmac"}
@@ -179,6 +180,33 @@ class AtomicCheckpointStore:
 
     def load(self) -> dict[str, Any]:
         return self.read().state
+
+    def payload_size(
+        self,
+        state: Mapping[str, Any],
+        *,
+        revision: int = common_contracts.MAX_JSON_INTEGER,
+    ) -> int:
+        """Return the exact authenticated envelope size without writing it."""
+
+        body = _envelope_body(
+            revision=revision,
+            key_id=self.key_id,
+            state=state,
+        )
+        envelope = dict(body)
+        envelope["envelope_hmac"] = _envelope_authentication(self.identity, body)
+        try:
+            return len(canonical_json_bytes(envelope)) + 1
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CheckpointIntegrityError(
+                "checkpoint state must be finite canonical JSON data"
+            ) from exc
+
+    def has_operating_capacity(self, state: Mapping[str, Any]) -> bool:
+        return self.payload_size(state) <= (
+            self.max_bytes - DEFAULT_CHECKPOINT_TERMINAL_RESERVE_BYTES
+        )
 
     def read(self) -> CheckpointSnapshot:
         with self._locked(create_directory=False) as locked:

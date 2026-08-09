@@ -6,8 +6,16 @@ import hashlib
 from pathlib import Path
 import sys
 from typing import Any, Mapping
-from . import catalog, controlled_gaps, safe_io, transport as source_transport
-from .checkpoints import CheckpointNotFoundError, canonical_json_bytes
+
+from . import (
+    agent_capacity,
+    agent_results,
+    agent_task_inputs,
+    catalog,
+    controlled_gaps,
+    transport as source_transport,
+)
+from .checkpoints import CheckpointNotFoundError, canonical_json_bytes, content_digest
 from .contracts import (
     ControlledGapReason,
     MAX_AGENT_ATTEMPTS_PER_TASK,
@@ -68,9 +76,13 @@ class StageSchedulingOperations(OrchestratorComponent):
 
     def advance(self) -> dict[str, Any]:
         self._lifecycle.gc_expired_raw()
+        raw_stages: list[tuple[Any, Any]] = []
+        task_input_staging = agent_task_inputs.Staging()
+        prepared_files: dict[Path, bytes] = {}
 
         def mutate(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             self._state._assert_state_identity(state)
+            original_state = copy.deepcopy(state)
             if state["stage"] in {RunStage.COMPLETE.value, RunStage.BLOCKED.value}:
                 return state, {"advanced": False, "reason": "terminal_stage"}
             if self._state._retention_expired(state):
@@ -92,9 +104,12 @@ class StageSchedulingOperations(OrchestratorComponent):
             for _ in range(len(_STAGE_SEQUENCE) + 4):
                 stage = state["stage"]
                 if stage == RunStage.SOURCE_CATALOG.value:
-                    step = self._advance_source_catalog(state)
+                    step = self._advance_source_catalog(
+                        state,
+                        prepared_files=prepared_files,
+                    )
                 elif stage == RunStage.SHARDING.value:
-                    step = self._advance_sharding(state)
+                    step = self._advance_sharding(state, raw_stages=raw_stages)
                 elif stage == RunStage.EXTRACTION.value:
                     step = self._advance_extraction(state)
                 elif stage == RunStage.EPISODE_REVIEW.value:
@@ -108,6 +123,8 @@ class StageSchedulingOperations(OrchestratorComponent):
                 advanced = advanced or bool(step["advanced"])
                 reason = step["reason"]
                 scheduled.extend(step.get("scheduled", []))
+                if raw_stages:
+                    break
                 if not step["advanced"]:
                     break
                 if state["stage"] in {
@@ -122,28 +139,68 @@ class StageSchedulingOperations(OrchestratorComponent):
                 raise InvalidTransitionError(
                     "advance did not reach a stable checkpoint"
                 )
+            if not self.store.has_operating_capacity(state):
+                raw_stages.clear()
+                task_input_staging.clear()
+                state.clear()
+                state.update(original_state)
+                self._state._append_gap(
+                    state,
+                    dependency_ref=state["run_ref"],
+                    reason="checkpoint_capacity_exhausted",
+                    stage=state["stage"],
+                    repairable=True,
+                )
+                self._state._block(state, "checkpoint_capacity_exhausted")
+                return state, {
+                    "advanced": True,
+                    "reason": "checkpoint_capacity_exhausted",
+                }
             result: dict[str, Any] = {"advanced": advanced, "reason": reason}
             if scheduled:
                 result["scheduled"] = sorted(set(scheduled))
             return state, result
 
         try:
-            transaction = self.store.transaction(mutate)
+            with self._jobs._task_input_staging_scope(task_input_staging):
+                transaction = self.store.staged_transaction(
+                    mutate,
+                    stage=lambda: self._stage_raw_materializations(
+                        [
+                            (
+                                task_input_staging.materialize,
+                                task_input_staging.rollback,
+                            ),
+                            *raw_stages,
+                        ]
+                    ),
+                    rollback=self._rollback_raw_materializations,
+                )
         except CheckpointNotFoundError as error:
             raise RunNotStartedError("run has not been started") from error
+        finally:
+            task_input_staging.clear()
         response = self._projection._status_view(transaction.snapshot)
         response.update(
             {"action": "advance", "changed": transaction.changed, **transaction.value}
         )
         return response
 
-    def _advance_source_catalog(self, state: dict[str, Any]) -> dict[str, Any]:
+    def _advance_source_catalog(
+        self,
+        state: dict[str, Any],
+        *,
+        prepared_files: dict[Path, bytes],
+    ) -> dict[str, Any]:
         if any(
             job.get("category") == "source" and job.get("status") == "runnable"
             for job in state["jobs"].values()
         ):
             return {"advanced": False, "reason": "source_results_pending"}
-        scheduled = self._schedule_source_wave(state)
+        scheduled = self._schedule_source_wave(
+            state,
+            prepared_files=prepared_files,
+        )
         if scheduled:
             return {
                 "advanced": True,
@@ -158,7 +215,54 @@ class StageSchedulingOperations(OrchestratorComponent):
         self._state._transition(state, RunStage.SHARDING)
         return {"advanced": True, "reason": "source_catalog_complete"}
 
-    def _advance_sharding(self, state: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _stage_raw_materializations(
+        stages: list[tuple[Any, Any]],
+    ) -> tuple[tuple[Any, Any], ...]:
+        materialized: list[tuple[Any, Any]] = []
+        try:
+            for stage, rollback in stages:
+                materialized.append((rollback, stage()))
+        except BaseException as error:
+            try:
+                StageSchedulingOperations._rollback_raw_materializations(
+                    tuple(materialized)
+                )
+            except BaseException as rollback_error:
+                if hasattr(error, "add_note"):
+                    error.add_note(
+                        "raw shard staging rollback failed; "
+                        f"files retained ({type(rollback_error).__name__})"
+                    )
+            raise
+        return tuple(materialized)
+
+    @staticmethod
+    def _rollback_raw_materializations(
+        materialized: tuple[tuple[Any, Any], ...],
+    ) -> None:
+        failures: list[BaseException] = []
+        for rollback, receipt in reversed(materialized):
+            try:
+                rollback(receipt)
+            except BaseException as error:
+                failures.append(error)
+        if failures:
+            primary = failures[0]
+            if hasattr(primary, "add_note"):
+                for secondary in failures[1:]:
+                    primary.add_note(
+                        "additional staged rollback failure: "
+                        f"{type(secondary).__name__}: {secondary}"
+                    )
+            raise primary
+
+    def _advance_sharding(
+        self,
+        state: dict[str, Any],
+        *,
+        raw_stages: list[tuple[Any, Any]],
+    ) -> dict[str, Any]:
         if self._projection._source_has_gaps(
             state
         ) and not self._projection._partial_can_continue(state):
@@ -166,7 +270,10 @@ class StageSchedulingOperations(OrchestratorComponent):
             self._state._block(state, "source_coverage_incomplete")
             return {"advanced": True, "reason": "source_coverage_incomplete"}
         if state["source"]["catalog"] is None:
-            self._reduction._freeze_catalog_and_materialize(state)
+            self._reduction._freeze_catalog_and_materialize(
+                state,
+                raw_stages=raw_stages,
+            )
         self._prepare_cursor_proposals(state)
         if self._projection._source_has_gaps(state):
             state["coverage"]["status"] = "partial"
@@ -175,11 +282,10 @@ class StageSchedulingOperations(OrchestratorComponent):
             state["coverage"]["status"] = "complete"
             state["partial_policy"]["decision"] = "complete"
         self._state._transition(state, RunStage.EXTRACTION)
-        scheduled = self._issue_agent_tasks(state, RunStage.EXTRACTION.value)
         return {
             "advanced": True,
             "reason": "sharding_complete",
-            "scheduled": scheduled,
+            "scheduled": [],
         }
 
     def _advance_extraction(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -292,7 +398,10 @@ class StageSchedulingOperations(OrchestratorComponent):
             and task["status"] == "accepted"
         ]
         if len(final_tasks) == 1:
-            self._history._build_retained_export(state, final_tasks[0]["result"])
+            synthesis_result = agent_results.for_task(self.run_dir, final_tasks[0])
+            if synthesis_result is None:
+                raise InvalidTransitionError("accepted synthesis result is missing")
+            self._history._build_retained_export(state, synthesis_result)
         elif final_tasks:
             raise RunConflictError("global synthesis has duplicate final reducers")
         else:
@@ -324,7 +433,12 @@ class StageSchedulingOperations(OrchestratorComponent):
             )
         return None
 
-    def _schedule_source_wave(self, state: dict[str, Any]) -> list[str]:
+    def _schedule_source_wave(
+        self,
+        state: dict[str, Any],
+        *,
+        prepared_files: dict[Path, bytes],
+    ) -> list[str]:
         scheduled: list[str] = []
         for host in state["source"]["cells"]:
             active = any(
@@ -378,6 +492,7 @@ class StageSchedulingOperations(OrchestratorComponent):
                     remote_helper_source_commitment=state["provenance"]["transport"][
                         "remote_host_context_helper_commitment"
                     ],
+                    prepared_files=prepared_files,
                 )
                 transport_lease = source_transport.issue_transport_lease(
                     self.identity,
@@ -399,6 +514,7 @@ class StageSchedulingOperations(OrchestratorComponent):
                                 / RAW_INPUT_DIRECTORY
                                 / "source-program-snapshots"
                             ),
+                            prepared_files=prepared_files,
                         )
                     ),
                     source_byte_limit=self._source_transport_max_source_bytes(),
@@ -413,12 +529,11 @@ class StageSchedulingOperations(OrchestratorComponent):
                 source_transport_output = (
                     self._projection._source_transport_output_path(lease_ref)
                 )
-                try:
-                    safe_io.ensure_owner_only_directory(source_transport_output.parent)
-                except (OSError, safe_io.UnsafePathError) as error:
-                    raise InvalidTransitionError(
-                        "source transport output directory cannot be authenticated"
-                    ) from error
+                self._stage_prepared_file(
+                    prepared_files,
+                    source_transport_output,
+                    b"",
+                )
                 state["jobs"][job_ref] = {
                     "category": "source",
                     "execution_contract": self._projection._execution_contract(state),
@@ -457,12 +572,18 @@ class StageSchedulingOperations(OrchestratorComponent):
         resume_position: Mapping[str, object] | None,
         session_selector_commitment: str | None,
         remote_helper_source_commitment: str,
+        prepared_files: dict[Path, bytes],
     ) -> tuple[str, ...]:
         worker = Path(__file__).resolve().with_name("transport_worker.py")
         command = [
             sys.executable,
             *source_transport.source_transport_python_flags(
-                self.run_dir / RAW_INPUT_DIRECTORY / "source-program-snapshots"
+                self.run_dir / RAW_INPUT_DIRECTORY / "source-program-snapshots",
+                stage_file=lambda path, payload: self._stage_prepared_file(
+                    prepared_files,
+                    path,
+                    payload,
+                ),
             ),
             str(worker),
             "source-transport",
@@ -509,6 +630,11 @@ class StageSchedulingOperations(OrchestratorComponent):
                     source_transport.remote_host_context_helper_path(),
                     self.run_dir / RAW_INPUT_DIRECTORY / "source-program-snapshots",
                     expected_source_commitment=remote_helper_source_commitment,
+                    stage_file=lambda path, payload: self._stage_prepared_file(
+                        prepared_files,
+                        path,
+                        payload,
+                    ),
                 )
             )
             command.extend(
@@ -520,6 +646,21 @@ class StageSchedulingOperations(OrchestratorComponent):
                 )
             )
         return tuple(command)
+
+    def _stage_prepared_file(
+        self,
+        prepared_files: dict[Path, bytes],
+        path: Path,
+        payload: bytes,
+    ) -> None:
+        normalized = path.expanduser().absolute()
+        prior = prepared_files.get(normalized)
+        if prior is not None:
+            if prior != payload:
+                raise RunConflictError("staged run file content changed")
+            return
+        prepared_files[normalized] = payload
+        self._jobs._stage_run_file(normalized, payload)
 
     def _issue_agent_tasks(self, state: dict[str, Any], stage: str) -> list[str]:
         scheduled: list[str] = []
@@ -546,6 +687,7 @@ class StageSchedulingOperations(OrchestratorComponent):
                     reviewer_slot,
                     ordinal,
                 )
+            prior_task = copy.deepcopy(task)
             attempt = {
                 "attempt_ref": attempt_ref,
                 "claim_expires_at": None,
@@ -573,24 +715,14 @@ class StageSchedulingOperations(OrchestratorComponent):
                 raise InvalidTransitionError(
                     "issued agent task exceeds the complete 512 KiB envelope"
                 )
+            attempt.pop("job_manifest")
+            attempt["job_manifest_digest"] = content_digest(job_manifest)
             envelope_name = (
                 hashlib.sha256(attempt_ref.encode("ascii")).hexdigest() + ".json"
             )
             envelope_relative_path = (
                 f"{RAW_INPUT_DIRECTORY}/agent-envelopes/{envelope_name}"
             )
-            envelope_path = self.run_dir / envelope_relative_path
-            safe_io.ensure_owner_only_directory(envelope_path.parent)
-            try:
-                safe_io.atomic_create_bytes(envelope_path, envelope_bytes)
-            except FileExistsError:
-                existing_envelope = safe_io.read_bounded_bytes(
-                    envelope_path,
-                    max_bytes=self._agent_envelope_limit(),
-                    require_owner_only=True,
-                )
-                if existing_envelope != envelope_bytes:
-                    raise RunConflictError("issued agent envelope changed")
             attempt.update(
                 {
                     "base_envelope_digest": hashlib.sha256(envelope_bytes).hexdigest(),
@@ -598,6 +730,22 @@ class StageSchedulingOperations(OrchestratorComponent):
                     "base_envelope_size": len(envelope_bytes),
                 }
             )
+            try:
+                agent_capacity.validate_checkpoint_task(task)
+            except InvalidInputError:
+                task.clear()
+                task.update(prior_task)
+                task["status"] = "gap"
+                self._state._append_gap(
+                    state,
+                    dependency_ref=task["task_ref"],
+                    reason="agent_checkpoint_task_budget_exhausted",
+                    stage=stage,
+                    repairable=True,
+                )
+                continue
+            envelope_path = self.run_dir / envelope_relative_path
+            self._jobs._stage_run_file(envelope_path, envelope_bytes)
             state["metrics"]["agent_attempts"] += 1
             if ordinal == 1:
                 state["metrics"]["agent_retries"] += 1
@@ -750,12 +898,11 @@ class StageSchedulingOperations(OrchestratorComponent):
             source_kind = leased[0] if leased else pending[0]
             cell = cells[source_kind]
             if cell["status"] == "pending":
-                self.store.transaction(
-                    lambda current: (
-                        current,
-                        self._schedule_source_wave(current),
+                scheduled = self._commit_source_wave()
+                if scheduled.snapshot.state["stage"] == RunStage.BLOCKED.value:
+                    raise InvalidTransitionError(
+                        "controlled holdout source scheduling was blocked"
                     )
-                )
                 continue
             jobs = [
                 job
@@ -908,3 +1055,39 @@ class StageSchedulingOperations(OrchestratorComponent):
             }
         )
         return response
+
+    def _commit_source_wave(self):
+        staging = agent_task_inputs.Staging()
+        prepared_files: dict[Path, bytes] = {}
+
+        def mutate(state: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+            self._state._assert_state_identity(state)
+            original_state = copy.deepcopy(state)
+            scheduled = self._schedule_source_wave(
+                state,
+                prepared_files=prepared_files,
+            )
+            if not self.store.has_operating_capacity(state):
+                staging.clear()
+                state.clear()
+                state.update(original_state)
+                self._state._append_gap(
+                    state,
+                    dependency_ref=state["run_ref"],
+                    reason="checkpoint_capacity_exhausted",
+                    stage=state["stage"],
+                    repairable=True,
+                )
+                self._state._block(state, "checkpoint_capacity_exhausted")
+                return state, []
+            return state, scheduled
+
+        try:
+            with self._jobs._task_input_staging_scope(staging):
+                return self.store.staged_transaction(
+                    mutate,
+                    stage=staging.materialize,
+                    rollback=staging.rollback,
+                )
+        finally:
+            staging.clear()

@@ -3126,6 +3126,8 @@ class RunLifecycleOperations(OrchestratorComponent):
                 "agent_task_cache_hits": 0,
                 "agent_task_cache_misses": 0,
                 "agent_task_reuses": 0,
+                "downstream_agent_task_misses": 0,
+                "extractor_agent_task_misses": 0,
                 "rejected_agent_results": 0,
                 "source_bytes": 0,
                 "source_leases": 0,

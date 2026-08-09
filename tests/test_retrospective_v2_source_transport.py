@@ -147,7 +147,8 @@ class SourceTransportProtocolTests(unittest.TestCase):
             unit_ref,
             b"rollback evidence",
         )
-        source_inputs.materialize((prepared,))
+        materialized = source_inputs.materialize((prepared,))
+        self.assertEqual(1, len(materialized))
         alias = prepared.path.with_name("rollback-alias.bin")
         original_validate = safe_io.validate_owner_only_file_descriptor
         calls = 0
@@ -165,12 +166,118 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 "validate_owner_only_file_descriptor",
                 side_effect=add_hardlink_before_revalidation,
             ),
-            self.assertRaises(safe_io.UnsafePathError),
+            self.assertRaisesRegex(InvalidTransitionError, "target changed"),
         ):
-            source_inputs.rollback((prepared,))
+            source_inputs.rollback(materialized)
 
         self.assertEqual(b"rollback evidence", prepared.path.read_bytes())
         self.assertEqual(b"rollback evidence", alias.read_bytes())
+
+    def test_source_rollback_rejects_same_content_leaf_replacement(self) -> None:
+        unit_ref = str(
+            self.identity.derive_ref(RefType.SOURCE_UNIT, {"case": "replacement"})
+        )
+        _relative_path, prepared = source_inputs.prepare_raw_payload(
+            self.identity,
+            self.root,
+            unit_ref,
+            b"same content replacement",
+        )
+        materialized = source_inputs.materialize((prepared,))
+        self.assertEqual(1, len(materialized))
+        original = prepared.path.with_name("rollback-original.bin")
+        prepared.path.rename(original)
+        prepared.path.write_bytes(b"same content replacement")
+        os.chmod(prepared.path, 0o600)
+
+        with self.assertRaisesRegex(InvalidTransitionError, "target changed"):
+            source_inputs.rollback(materialized)
+
+        self.assertEqual(b"same content replacement", original.read_bytes())
+        self.assertEqual(b"same content replacement", prepared.path.read_bytes())
+
+    def test_source_rollback_continues_after_one_receipt_mismatch(self) -> None:
+        prepared = []
+        for label in ("changed", "exact"):
+            unit_ref = str(
+                self.identity.derive_ref(RefType.SOURCE_UNIT, {"case": label})
+            )
+            _relative_path, item = source_inputs.prepare_raw_payload(
+                self.identity,
+                self.root,
+                unit_ref,
+                label.encode("ascii"),
+            )
+            prepared.append(item)
+        materialized = source_inputs.materialize(tuple(prepared))
+        changed = prepared[0].path
+        original = changed.with_name("changed-original.bin")
+        changed.rename(original)
+        changed.write_bytes(b"changed")
+        os.chmod(changed, 0o600)
+
+        with self.assertRaisesRegex(InvalidTransitionError, "target changed"):
+            source_inputs.rollback(materialized)
+
+        self.assertTrue(changed.is_file())
+        self.assertTrue(original.is_file())
+        self.assertFalse(prepared[1].path.exists())
+
+    def test_source_materialization_preserves_primary_when_rollback_fails(
+        self,
+    ) -> None:
+        prepared = []
+        for label in ("created", "failed"):
+            unit_ref = str(
+                self.identity.derive_ref(
+                    RefType.SOURCE_UNIT,
+                    {"case": f"primary-{label}"},
+                )
+            )
+            _relative_path, item = source_inputs.prepare_raw_payload(
+                self.identity,
+                self.root,
+                unit_ref,
+                label.encode("ascii"),
+            )
+            prepared.append(item)
+        original_create = safe_io.atomic_create_bytes_with_receipt
+        calls = 0
+
+        def create_then_fail(path, payload, *, create_parents=True):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                receipt = original_create(
+                    path,
+                    payload,
+                    create_parents=create_parents,
+                )
+                original = Path(path).with_name("primary-original.bin")
+                Path(path).rename(original)
+                Path(path).write_bytes(bytes(payload))
+                os.chmod(path, 0o600)
+                return receipt
+            raise RuntimeError("primary materialization failure")
+
+        with (
+            mock.patch.object(
+                safe_io,
+                "atomic_create_bytes_with_receipt",
+                side_effect=create_then_fail,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "primary materialization failure"
+            ) as caught,
+        ):
+            source_inputs.materialize(tuple(prepared))
+
+        self.assertTrue(
+            any(
+                "rollback was incomplete" in note for note in caught.exception.__notes__
+            )
+        )
+        self.assertTrue(prepared[0].path.is_file())
 
     def test_source_payload_indexes_reject_legacy_sidecar_conflicts(self) -> None:
         unit_ref = str(

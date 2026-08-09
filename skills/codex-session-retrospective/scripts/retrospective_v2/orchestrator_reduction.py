@@ -5,14 +5,17 @@ from collections import defaultdict
 import copy
 from dataclasses import replace
 import heapq
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from . import (
+    agent_results,
+    agent_task_inputs,
     authority,
     catalog,
     controlled_gaps,
     episode_review,
+    extracted_turns,
+    raw_shard_staging,
     result_validation,
-    safe_io,
     sharding,
     source_inputs,
     source_payloads,
@@ -29,7 +32,6 @@ from .orchestrator_protocols import (
 from .orchestrator_support import (
     InvalidTransitionError,
     RAW_SHARD_DIRECTORY,
-    RunConflictError,
     _safe_reason,
 )
 
@@ -47,6 +49,9 @@ class HierarchicalReductionOperations(OrchestratorComponent):
         self._state = state
         self._projection = projection
         self._jobs = jobs
+
+    def _task_metadata(self, task: Mapping[str, Any]) -> Mapping[str, Any]:
+        return agent_task_inputs.for_task(self.run_dir, task)["metadata"]
 
     def _accepted_source_inputs(
         self,
@@ -136,7 +141,17 @@ class HierarchicalReductionOperations(OrchestratorComponent):
             {key: sorted(values) for key, values in model_eras_by_session.items()},
         )
 
-    def _freeze_catalog_and_materialize(self, state: dict[str, Any]) -> None:
+    def _freeze_catalog_and_materialize(
+        self,
+        state: dict[str, Any],
+        *,
+        raw_stages: list[
+            tuple[
+                Callable[[], sharding.RawShardStageReceipt],
+                Callable[[sharding.RawShardStageReceipt], None],
+            ]
+        ],
+    ) -> None:
         (
             transport_manifests,
             payload_state,
@@ -191,37 +206,18 @@ class HierarchicalReductionOperations(OrchestratorComponent):
             for record in manifest.records
             if record.accounting_class is catalog.AccountingClass.CONSUMED_CANDIDATE
         ]
-        raw_records: list[sharding.RawEvidenceRecord] = []
-        for record in candidates:
-            payload = payload_state[record.unit_ref]
-            relative_path = payload.get("relative_path")
-            if not isinstance(relative_path, str):
-                raise InvalidTransitionError(
-                    "materializable source unit lacks raw input"
-                )
-            data = safe_io.read_bounded_bytes(
-                self.run_dir / relative_path,
-                max_bytes=max(1, record.byte_count),
-                require_owner_only=True,
-            )
-            raw_records.append(
-                sharding.RawEvidenceRecord(catalog_record=record, payload=data)
-            )
         limits = self._projection._shard_limits_from_state(state)
-        planned = sharding.build_raw_shards(raw_records, limits=limits)
-        materialized = sharding.materialize_raw_shards(
-            raw_records,
-            self.run_dir / RAW_SHARD_DIRECTORY,
-            limits=limits,
+        raw_stage = raw_shard_staging.prepare(
+            self.run_dir,
+            candidates,
+            payload_state,
+            limits,
         )
-        if (
-            planned.canonical_manifest_bytes()
-            != materialized.canonical_manifest_bytes()
-        ):
-            raise RunConflictError("raw shard planning and materialization diverged")
+        planned = raw_stage.plan
+        raw_stages.append((raw_stage.materialize, raw_stage.rollback))
 
-        if materialized.gaps:
-            for gap in materialized.gaps:
+        if planned.gaps:
+            for gap in planned.gaps:
                 record = records_by_ref[gap.unit_ref]
                 records_by_ref[gap.unit_ref] = gap.as_catalog_gap(record)
             normalized_manifests = self._rebuild_manifests(
@@ -233,25 +229,28 @@ class HierarchicalReductionOperations(OrchestratorComponent):
             source_catalog = catalog.SourceCatalog.from_dict(source_catalog.to_dict())
 
         state["source"]["catalog"] = source_catalog.to_dict()
-        state["source"]["materialization"] = materialized.to_manifest_dict()
+        state["source"]["materialization"] = planned.to_manifest_dict()
         state["source"]["shards"] = {
-            artifact.manifest.shard_ref: {
-                "manifest": artifact.manifest.to_dict(),
-                "relative_path": f"{RAW_SHARD_DIRECTORY}/{artifact.manifest.file_name}",
+            manifest.shard_ref: {
+                "manifest": manifest.to_dict(),
+                "relative_path": f"{RAW_SHARD_DIRECTORY}/{manifest.file_name}",
             }
-            for artifact in materialized.shards
+            for manifest in planned.shards
         }
         state["source"]["reassembly"] = self._build_turn_reassembly(
             state,
-            materialized,
+            planned,
             source_catalog,
             model_era_by_unit=model_era_by_unit,
             model_eras_by_session=model_eras_by_session,
         )
         self._apply_catalog_cells_and_gaps(state, source_catalog)
-        self._recompute_frozen_metrics(state, source_catalog, materialized)
-        for artifact in materialized.shards:
-            self._create_extractor_task(state, artifact.manifest)
+        self._recompute_frozen_metrics(state, source_catalog, planned)
+        state["metrics"]["sharding_peak_working_bytes"] = (
+            planned.peak_working_byte_count
+        )
+        for manifest in planned.shards:
+            self._create_extractor_task(state, manifest)
 
     @staticmethod
     def _payload_for_equivalent_record(
@@ -351,7 +350,7 @@ class HierarchicalReductionOperations(OrchestratorComponent):
         self,
         state: dict[str, Any],
         source_catalog: catalog.SourceCatalog,
-        materialized: sharding.MaterializationResult,
+        materialized: sharding.ShardPlan,
     ) -> None:
         counts = source_catalog.accounting_counts()
         records = [
@@ -403,7 +402,7 @@ class HierarchicalReductionOperations(OrchestratorComponent):
     def _build_turn_reassembly(
         self,
         state: Mapping[str, Any],
-        materialized: sharding.MaterializationResult,
+        materialized: sharding.ShardPlan,
         source_catalog: catalog.SourceCatalog,
         *,
         model_era_by_unit: Mapping[str, str],
@@ -495,8 +494,7 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                 sequence_by_unit[record.unit_ref] = sequence
 
         plan: dict[str, dict[str, Any]] = {}
-        for artifact in materialized.shards:
-            manifest = artifact.manifest
+        for manifest in materialized.shards:
             for descriptor in manifest.ranges:
                 try:
                     sequence = sequence_by_unit[descriptor.unit_ref]
@@ -701,7 +699,7 @@ class HierarchicalReductionOperations(OrchestratorComponent):
         for task in self._projection._tasks_for_stage(state, RunStage.EXTRACTION.value):
             if task["status"] != "accepted":
                 continue
-            result = task["result"]
+            result = agent_results.require(self.run_dir, task, label="extractor")
             if "gap_reason" in result:
                 self._state._append_gap(
                     state,
@@ -713,7 +711,7 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                 )
                 gapped_shards.add(task["partition_ref"])
                 continue
-            metadata_by_turn = task["metadata"]["turn_metadata"]
+            metadata_by_turn = self._task_metadata(task)["turn_metadata"]
             for turn in result["turns"]:
                 turn_ref = turn["turn_ref"]
                 if task["partition_ref"] in contributions[turn_ref]:
@@ -767,7 +765,12 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                 }
             )
         self._resolve_semantic_turn_refs(enriched_turns)
-        state["extracted_turns"] = reassembled
+        if reassembled:
+            descriptor, prepared = extracted_turns.prepare(self.run_dir, reassembled)
+            self._jobs._stage_run_file(prepared.path, prepared.payload)
+            state["extracted_turns"] = descriptor
+        else:
+            state["extracted_turns"] = {}
         try:
             episodes = episode_review.construct_episodes(enriched_turns)
             self._bind_episode_revisions(state, episodes)
@@ -1167,17 +1170,24 @@ class HierarchicalReductionOperations(OrchestratorComponent):
             ),
         }
 
-    @staticmethod
     def _compose_episode_screening_results(
+        self,
         state: Mapping[str, Any],
         turn_refs: Sequence[str],
+        *,
+        extracted: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        extracted_turns = state.get("extracted_turns")
-        if not isinstance(extracted_turns, Mapping):
+        state_value = state.get("extracted_turns")
+        if not isinstance(state_value, Mapping):
             return []
+        extracted_values = (
+            self._jobs._load_extracted_turns(state_value)
+            if extracted is None
+            else extracted
+        )
         decisions: list[dict[str, Any]] = []
         for turn_ref in turn_refs:
-            turn = extracted_turns.get(turn_ref)
+            turn = extracted_values.get(turn_ref)
             if not isinstance(turn, Mapping):
                 continue
             risk_flags = turn.get("risk_flags")
@@ -1199,6 +1209,10 @@ class HierarchicalReductionOperations(OrchestratorComponent):
     def _refresh_review_plan(self, state: dict[str, Any]) -> bool:
         resolved: dict[str, dict[str, Any] | None] = {}
         plans: dict[str, dict[str, Any]] = {}
+        extracted_value = state.get("extracted_turns")
+        if not isinstance(extracted_value, Mapping):
+            raise InvalidTransitionError("extracted turn state is invalid")
+        extracted = self._jobs._load_extracted_turns(extracted_value)
         for revision in state["episodes"]:
             revision_ref = revision["episode_revision_ref"]
             primary_task = self._projection._review_task(
@@ -1219,6 +1233,7 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                 screening_results=self._compose_episode_screening_results(
                     state,
                     revision["turn_refs"],
+                    extracted=extracted,
                 ),
                 primary_review=primary,
                 secondary_review=secondary,
@@ -1239,6 +1254,7 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                     state,
                     revision["turn_refs"],
                     episode_revision_ref=revision_ref,
+                    extracted=extracted,
                 )
                 if restored is None:
                     state["review_plans"] = plans
@@ -1273,8 +1289,15 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                         result_validation.canonical_result_hash(primary),
                         result_validation.canonical_result_hash(secondary),
                     ]
+                    if primary_task is None or secondary_task is None:
+                        raise InvalidTransitionError(
+                            "completed episode reviews lack task bindings"
+                        )
                     metadata["candidate_result_hashes"] = hashes
-                    metadata["candidate_results"] = [primary, secondary]
+                    metadata["candidate_task_refs"] = [
+                        primary_task["task_ref"],
+                        secondary_task["task_ref"],
+                    ]
                     input_payload = {
                         "candidate_result_hashes": hashes,
                         "candidate_results": [primary, secondary],
@@ -1334,14 +1357,25 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                 JobKind.ADJUDICATOR.value,
             )
             if plan["adjudication_required"]:
+                adjudication_result = (
+                    None
+                    if adjudicator is None
+                    else agent_results.for_task(self.run_dir, adjudicator)
+                )
                 if (
                     adjudicator
                     and adjudicator.get("status") == "accepted"
-                    and self._projection._is_resolved_review(adjudicator.get("result"))
+                    and self._projection._is_resolved_review(adjudication_result)
                 ):
-                    resolved[revision_ref] = adjudicator["result"]
+                    resolved[revision_ref] = agent_results.reference_for_task(
+                        adjudicator
+                    )
             else:
-                resolved[revision_ref] = primary
+                if primary_task is None:
+                    raise InvalidTransitionError(
+                        "completed primary review lacks its task binding"
+                    )
+                resolved[revision_ref] = agent_results.reference_for_task(primary_task)
         state["review_plans"] = plans
         state["resolved_reviews"] = resolved
         return True
@@ -1484,7 +1518,7 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                 {
                     turn_ref
                     for task in group
-                    for turn_ref in task["metadata"]["underlying_turn_refs"]
+                    for turn_ref in self._task_metadata(task)["underlying_turn_refs"]
                 }
             )
             self._jobs._create_agent_task(
@@ -1530,12 +1564,14 @@ class HierarchicalReductionOperations(OrchestratorComponent):
             ],
         }
 
-    @staticmethod
     def _review_reduce_payload(
+        self,
         revision: Mapping[str, Any],
         tasks: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
-        results = [copy.deepcopy(task["result"]) for task in tasks]
+        results = agent_results.copies_for_tasks(
+            self.run_dir, tasks, label="accepted review"
+        )
         return {
             "child_result_hashes": [
                 result_validation.canonical_result_hash(result) for result in results
@@ -1573,9 +1609,14 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                 "resolved episode reviews must exactly cover every review-required "
                 "episode revision"
             )
-        for revision_ref, review in state["resolved_reviews"].items():
-            if review is None:
+        for revision_ref, review_binding in state["resolved_reviews"].items():
+            if review_binding is None:
                 continue
+            review = agent_results.from_reference(
+                self.run_dir,
+                state["jobs"],
+                review_binding,
+            )
             if not self._projection._is_resolved_review(review):
                 raise InvalidTransitionError(
                     "non-reviewed disposition cannot enter topic reduction"
@@ -1613,7 +1654,27 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                     raise InvalidTransitionError(
                         "resolved adjudication task is missing"
                     )
-                candidate_map[revision_ref] = task["metadata"]["candidate_results"]
+                candidate_task_refs = task["metadata"].get("candidate_task_refs")
+                if candidate_task_refs is None:
+                    candidate_map[revision_ref] = self._task_metadata(task)[
+                        "candidate_results"
+                    ]
+                else:
+                    if (
+                        not isinstance(candidate_task_refs, list)
+                        or len(candidate_task_refs) != 2
+                    ):
+                        raise InvalidTransitionError(
+                            "adjudication candidate task bindings are invalid"
+                        )
+                    candidate_map[revision_ref] = [
+                        agent_results.require(
+                            self.run_dir,
+                            state["jobs"][task_ref],
+                            label="adjudication candidate",
+                        )
+                        for task_ref in candidate_task_refs
+                    ]
             topic_ref = self._ref(RefType.TOPIC, topic_candidate_ref)
             partitions = self._partition_topic_rows(
                 topic_candidate_ref=topic_candidate_ref,
@@ -1875,7 +1936,7 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                     {
                         ref
                         for child in candidate
-                        for ref in child["metadata"]["underlying_episode_refs"]
+                        for ref in self._task_metadata(child)["underlying_episode_refs"]
                     }
                 )
                 allowed = self._projection._collect_refs(
@@ -1903,7 +1964,7 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                     {
                         ref
                         for task in group
-                        for ref in task["metadata"]["underlying_episode_refs"]
+                        for ref in self._task_metadata(task)["underlying_episode_refs"]
                     }
                 )
                 payload = self._topic_reduce_payload(root_ref, group)
@@ -1936,7 +1997,9 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                     allowed_turn_refs={
                         turn_ref
                         for task in group
-                        for turn_ref in task["allowed_turn_refs"]
+                        for turn_ref in agent_task_inputs.for_task(self.run_dir, task)[
+                            "allowed_turn_refs"
+                        ]
                     },
                     metadata={
                         "child_result_hashes": payload["child_result_hashes"],
@@ -1953,12 +2016,14 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                     },
                 )
 
-    @staticmethod
     def _topic_reduce_payload(
+        self,
         root_ref: str,
         tasks: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
-        results = [copy.deepcopy(task["result"]) for task in tasks]
+        results = agent_results.copies_for_tasks(
+            self.run_dir, tasks, label="accepted topic"
+        )
         return {
             "child_result_hashes": [
                 result_validation.canonical_result_hash(result) for result in results
@@ -1972,17 +2037,22 @@ class HierarchicalReductionOperations(OrchestratorComponent):
         final_topic_tasks = self._accepted_final_topic_tasks(state)
         if self._projection._tasks_for_stage(state, RunStage.GLOBAL_SYNTHESIS.value):
             return
-        topic_results = [task["result"] for task in final_topic_tasks]
-        independent_reviews = [
-            task["result"]
-            for task in self._projection._tasks_for_stage(
-                state, RunStage.EPISODE_REVIEW.value
-            )
-            if task["job_kind"] == JobKind.INDEPENDENT_RISK_REVIEWER.value
-            and task["status"] == "accepted"
-            and task["metadata"].get("hierarchy_final") is True
-            and self._projection._is_completed_episode_review(task.get("result"))
-        ]
+        topic_results = agent_results.copies_for_tasks(
+            self.run_dir, final_topic_tasks, label="accepted topic"
+        )
+        independent_reviews = []
+        for task in self._projection._tasks_for_stage(
+            state, RunStage.EPISODE_REVIEW.value
+        ):
+            if (
+                task["job_kind"] != JobKind.INDEPENDENT_RISK_REVIEWER.value
+                or task["status"] != "accepted"
+                or task["metadata"].get("hierarchy_final") is not True
+            ):
+                continue
+            result = agent_results.for_task(self.run_dir, task)
+            if self._projection._is_completed_episode_review(result):
+                independent_reviews.append(result)
         root_ref = self._ref(
             RefType.RUN_INPUT,
             state["run_ref"],
@@ -1996,8 +2066,8 @@ class HierarchicalReductionOperations(OrchestratorComponent):
             independent_reviews=independent_reviews,
         )
 
-    @staticmethod
     def _accepted_final_topic_tasks(
+        self,
         state: Mapping[str, Any],
     ) -> list[Mapping[str, Any]]:
         expected_roots = set(state["topic_inputs"])
@@ -2012,7 +2082,7 @@ class HierarchicalReductionOperations(OrchestratorComponent):
         roots: list[str] = []
         for task in accepted:
             root_ref = task["metadata"].get("hierarchy_root_ref")
-            result = task.get("result")
+            result = agent_results.for_task(self.run_dir, task)
             if (
                 not isinstance(root_ref, str)
                 or not isinstance(result, Mapping)
@@ -2252,8 +2322,8 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                 validation_child_task_refs=[task["task_ref"] for task in group],
             )
 
-    @staticmethod
     def _synthesis_validation_results(
+        self,
         state: Mapping[str, Any],
         task: Mapping[str, Any],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2288,7 +2358,9 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                         "synthesis parent duplicates leaf validation results"
                     )
             else:
-                payload = current.get("input_payload")
+                payload = agent_task_inputs.for_task(self.run_dir, current).get(
+                    "input_payload"
+                )
                 if (
                     not isinstance(payload, Mapping)
                     or payload.get("schema") != "global_synthesis_input_v2"
@@ -2359,13 +2431,13 @@ class HierarchicalReductionOperations(OrchestratorComponent):
                 pending.append(child)
 
         try:
-            source_topic_tasks = (
-                HierarchicalReductionOperations._accepted_final_topic_tasks(state)
-            )
+            source_topic_tasks = self._accepted_final_topic_tasks(state)
         except InvalidTransitionError as exc:
             raise result_validation.ResultValidationError(str(exc)) from exc
         source_hashes = sorted(
-            result_validation.canonical_result_hash(source_task["result"])
+            result_validation.canonical_result_hash(
+                agent_results.for_task(self.run_dir, source_task)
+            )
             for source_task in source_topic_tasks
         )
         if sorted(digest for digest, _result in topics) != source_hashes:
@@ -2377,11 +2449,13 @@ class HierarchicalReductionOperations(OrchestratorComponent):
             [result for _digest, result in sorted(reviews)],
         )
 
-    @staticmethod
     def _synthesis_reduce_payload(
+        self,
         tasks: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
-        results = [copy.deepcopy(task["result"]) for task in tasks]
+        results = agent_results.copies_for_tasks(
+            self.run_dir, tasks, label="accepted synthesis"
+        )
         return {
             "child_result_hashes": [
                 result_validation.canonical_result_hash(result) for result in results
