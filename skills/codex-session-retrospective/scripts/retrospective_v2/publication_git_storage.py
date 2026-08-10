@@ -692,14 +692,11 @@ class LocalGitStorageOperations:
     ) -> None:
         for unit in units:
             bundle_dir = Path(str(unit["bundle_dir"]))
-            sidecar = bundle_dir.parent / f".{bundle_dir.name}.retention-v2.json"
-            bundle_present = bundle_dir.exists() or bundle_dir.is_symlink()
-            if bundle_present and (sidecar.exists() or sidecar.is_symlink()):
-                self._retained_export_lifecycle.release_staged_export_if_bound(
-                    bundle_dir,
-                    request.attempt_ref,
-                    disposition,
-                )
+            self._retained_export_lifecycle.release_staged_export_if_bound(
+                bundle_dir,
+                request.attempt_ref,
+                disposition,
+            )
 
     def _inject(self, point: str, state: Mapping[str, Any]) -> None:
         if self._failure_injector is not None:

@@ -37,6 +37,7 @@ from retrospective_v2 import (  # noqa: E402
 from retrospective_v2.contracts import RefType, RunStage  # noqa: E402
 from retrospective_v2.checkpoints import CheckpointIntegrityError  # noqa: E402
 from retrospective_v2.export import (  # noqa: E402
+    ExportConflictError,
     export_retained_bundle,
     garbage_collect_expired_exports,
     release_committed_staged_export,
@@ -503,11 +504,19 @@ class PublicationInvariantUnitTests(unittest.TestCase):
                 units,
                 disposition="aborted",
             )
+            bundle.rmdir()
+            bundle.with_name(f".{bundle.name}.retention-v2.json").unlink()
+            adapter._release_export_retention_sidecars(
+                request,
+                units,
+                disposition="aborted",
+            )
 
         self.assertEqual(
             calls,
             [
                 ("bind", bundle, request.attempt_ref, None),
+                ("release-if-bound", bundle, request.attempt_ref, "aborted"),
                 ("release-if-bound", bundle, request.attempt_ref, "aborted"),
             ],
         )
@@ -2792,6 +2801,94 @@ class DurablePublicationTests(unittest.TestCase):
                     attempt["retention_bound"],
                     attempt["cleanup_claim"]["retention_bound"],
                 )
+
+    def test_cleanup_presence_mismatch_does_not_persist_abort(self) -> None:
+        for missing in ("bundle", "sidecar"):
+            with self.subTest(missing=missing):
+                coordinator, bundle = self.build_exportable_run(
+                    f"cleanup-presence-mismatch-{missing}"
+                )
+                adapter = self.publication_adapter()
+                transaction = self.transaction(
+                    coordinator,
+                    bundle,
+                    adapter=adapter,
+                )
+                transaction.prepare()
+                sidecar = bundle.with_name(f".{bundle.name}.retention-v2.json")
+                if missing == "bundle":
+                    shutil.rmtree(bundle)
+                else:
+                    sidecar.unlink()
+
+                with self.assertRaisesRegex(
+                    ExportConflictError,
+                    "bundle and retention state presence differ",
+                ):
+                    transaction.abort("cleanup_presence_mismatch")
+
+                attempt = adapter.inspect_attempt(transaction.attempt_ref)
+                self.assertIsNotNone(attempt)
+                assert attempt is not None
+                self.assertFalse(attempt["aborted"])
+                self.assertNotIn("cleanup", attempt["receipts"])
+                self.assertTrue(attempt["capacity_held"])
+                self.assertIsNotNone(attempt["cleanup_claim"])
+                self.assertEqual("abort_pending", transaction.status()["phase"])
+                capacity = safe_io.read_bounded_json(
+                    self.provider_state / "capacity.json",
+                    max_bytes=1024 * 1024,
+                    require_owner_only=True,
+                )
+                self.assertIn(transaction.attempt_ref, capacity["reservations"])
+
+    def test_cleanup_recovers_after_retention_release_precedes_journal(self) -> None:
+        coordinator, bundle = self.build_exportable_run(
+            "cleanup-retention-release-before-journal"
+        )
+        transaction = self.transaction(coordinator, bundle)
+        transaction.prepare()
+
+        def crash(point, _state):
+            if point == "cleanup.after_retention_release":
+                raise RuntimeError("simulated post-retention-release crash")
+
+        crashing = self.publication_adapter(failure_injector=crash)
+        with self.assertRaisesRegex(RuntimeError, "post-retention-release crash"):
+            crashing.cleanup(transaction.operation_request("cleanup"))
+
+        sidecar = bundle.with_name(f".{bundle.name}.retention-v2.json")
+        terminal = safe_io.read_bounded_json(
+            sidecar,
+            max_bytes=1024 * 1024,
+            require_owner_only=True,
+        )
+        self.assertEqual("publication_terminal", terminal["status"])
+        self.assertEqual("aborted", terminal["terminal_disposition"])
+        interrupted = crashing.inspect_attempt(transaction.attempt_ref)
+        self.assertIsNotNone(interrupted)
+        assert interrupted is not None
+        self.assertFalse(interrupted["aborted"])
+        self.assertNotIn("cleanup", interrupted["receipts"])
+        self.assertTrue(interrupted["capacity_held"])
+
+        collected = garbage_collect_expired_exports(
+            bundle.parent,
+            now=dt.datetime(2100, 1, 1, tzinfo=dt.UTC),
+        )
+        self.assertIn(str(bundle.resolve()), collected["deleted"])
+        self.assertFalse(bundle.exists())
+        self.assertFalse(sidecar.exists())
+
+        recovered = self.adapter.cleanup(transaction.operation_request("cleanup"))
+
+        self.assertEqual("remote_object_cleanup_complete", recovered["status"])
+        attempt = self.adapter.inspect_attempt(transaction.attempt_ref)
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        self.assertTrue(attempt["aborted"])
+        self.assertIn("cleanup", attempt["receipts"])
+        self.assertTrue(attempt["capacity_held"])
 
     def test_abort_reconciles_retention_bound_before_attempt_flag_persists(
         self,

@@ -106,6 +106,12 @@ destination without allowing two completed results. Final result persistence
 reauthenticates the claim and any legacy descriptor before binding the bundle
 digest and retention deadline.
 
+Publication cleanup classifies the retained bundle and retention sidecar while
+holding the export anchor lock. Two absent objects are an idempotent collected
+state; exactly one present object is a conflict. The lifecycle release must
+complete before the provider persists its abort and cleanup receipt, so a
+one-sided or unreadable retained state cannot authorize reservation release.
+
 The transport program commitment includes every runtime module above. Adding a
 module without adding it to the closed allowlist fails source transport.
 

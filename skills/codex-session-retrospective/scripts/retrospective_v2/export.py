@@ -1484,6 +1484,7 @@ def release_staged_export_if_bound(
         disposition,
         now=now,
         require_bound=False,
+        allow_collected=True,
     )
 
 

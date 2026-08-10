@@ -445,7 +445,10 @@ class RetainedExportLifecycle(Protocol):
         output_dir: str | os.PathLike[str],
         attempt_ref: str,
         disposition: str,
-    ) -> Mapping[str, Any]: ...
+    ) -> Mapping[str, Any]:
+        """Release a bound pair, accept two absent objects, and reject one-sided state."""
+
+        ...
 
 
 FailureInjector = Callable[[str, Mapping[str, Any]], None]

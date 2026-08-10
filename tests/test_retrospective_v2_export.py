@@ -2296,6 +2296,39 @@ class RetrospectiveV2ExportTests(unittest.TestCase):
             self.assertIsNone(unchanged["publication_attempt_ref"])
             self.assertEqual(exported["bundle_digest"], unchanged["bundle_digest"])
 
+    def test_conditional_release_accepts_only_a_fully_collected_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / ".codex-local" / "collected-retention"
+            root.mkdir(parents=True, mode=0o700)
+            output = root / "retained-v2"
+            sidecar = output.with_name(f".{output.name}.retention-v2.json")
+            attempt_ref = f"attempt_ref_v2:{'c' * 64}"
+
+            collected = release_staged_export_if_bound(
+                output,
+                attempt_ref,
+                "aborted",
+            )
+
+            self.assertTrue(collected["idempotent"])
+            self.assertEqual("collected", collected["status"])
+            self.assertEqual("aborted", collected["terminal_disposition"])
+
+            output.mkdir(mode=0o700)
+            with self.assertRaisesRegex(
+                ExportConflictError,
+                "bundle and retention state presence differ",
+            ):
+                release_staged_export_if_bound(output, attempt_ref, "aborted")
+            output.rmdir()
+
+            sidecar.write_text("{}\n", encoding="ascii")
+            with self.assertRaisesRegex(
+                ExportConflictError,
+                "bundle and retention state presence differ",
+            ):
+                release_staged_export_if_bound(output, attempt_ref, "aborted")
+
     def test_conditional_unbound_release_does_not_validate_corrupt_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / ".codex-local" / "retained-v2"

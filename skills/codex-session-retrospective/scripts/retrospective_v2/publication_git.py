@@ -856,15 +856,16 @@ class LocalGitPublicationAdapter(
                 terminal_disposition=disposition,
                 transaction_ref=claim["transaction_ref"],
             )
-            state["aborted"] = True
-            state["receipts"]["cleanup"] = receipt
-            self._write_attempt(state)
-            self._inject("cleanup.after_persist", state)
             self._release_export_retention_sidecars(
                 request,
                 state["unit_plan"],
                 disposition="aborted",
             )
+            self._inject("cleanup.after_retention_release", state)
+            state["aborted"] = True
+            state["receipts"]["cleanup"] = receipt
+            self._write_attempt(state)
+            self._inject("cleanup.after_persist", state)
             return deepcopy(receipt)
 
     def release_reservations(self, request: OperationRequest) -> Mapping[str, Any]:

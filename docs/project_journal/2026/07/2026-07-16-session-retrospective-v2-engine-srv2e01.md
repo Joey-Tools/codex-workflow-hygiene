@@ -1049,3 +1049,38 @@ superseded_by:
   class setup; it is non-counting and is superseded by the host publication
   result. Full host Python 3.13 discovery remains pending for the superseding
   signed head.
+- Signed head `aa55eea` retained the complete host Python 3.13 discovery result
+  above, passed exact-secret admission, and reached exact-head CI. CI attempt 1
+  found one unrelated pre-existing file-creation/read race in
+  `test_normal_leader_exit_does_not_clean_up_background_child`; the test file is
+  unchanged in the PR range, and an exact Python 3.13 rerun passed 1/1 in 0.113
+  seconds. The same-head CI attempt 2 then passed the complete 1,661-test job.
+- Fresh whole-range Codex review of `aa55eea` found one actionable P2 issue:
+  retained-export cleanup skipped lifecycle validation whenever either the
+  bundle or sidecar was absent. A one-sided state could therefore bypass the
+  anchored presence-mismatch check and let cleanup persist an abort receipt.
+  The independent review workspace was postvalidated with exact receipt
+  equality, its trusted control hashes remained unchanged, and the task root was
+  removed before repair.
+- The repair always delegates pair classification to the anchored retained-export
+  lifecycle, accepts only a fully collected pair as idempotent, and rejects
+  bundle-only or sidecar-only state. Cleanup now releases the retention binding
+  before persisting its abort/cleanup receipt, so a mismatch cannot authorize
+  reservation release. A crash after retention release remains recoverable even
+  after GC removes the complete terminal pair. The injected lifecycle protocol
+  documents the expanded collected/XOR contract.
+- Focused collected/XOR and injected-protocol tests pass 4/4; the revised
+  publication tests use the authorized host `/private/tmp` GPG fixture and pass
+  2/2 in 39.002 seconds. The complete export module passes 56/56 in 2.656
+  seconds, and the eight affected retention/abort regressions pass 8/8 in
+  139.765 seconds. A two-part read-only precommit audit first requested explicit
+  protocol semantics, authoritative `capacity.json` evidence, and fully
+  collected recovery coverage; all three were added, and its follow-up plus the
+  independent transaction-ordering audit returned `No findings.` The full run
+  interrupted after those findings is non-counting for the superseded tree.
+- The final host Python 3.13 discovery for the repaired retained-export lifecycle
+  passes all 1,664 tests in 1,954.038 seconds with `TMPDIR=/private/tmp`. The
+  binary working-tree patch digest immediately before and after that run is
+  unchanged at
+  `6a014d01dba3b7a22713603aeb36ea3c816080715b66e8a9270c66c0589eadf3`;
+  this evidence-only journal update is the sole subsequent edit.
