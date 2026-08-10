@@ -41,6 +41,7 @@ from retrospective_v2 import (  # noqa: E402
     result_validation,
     safe_io,
     sharding,
+    source_capacity,
     source_inputs,
     transport,
 )
@@ -2148,12 +2149,12 @@ class OrchestratorTests(unittest.TestCase):
             yield from frames
 
         with (
-            mock.patch(
-                "retrospective_v2.orchestrator_source.source_capacity."
-                "require_candidate_capacity",
-                side_effect=InvalidTransitionError("injected source capacity"),
+            mock.patch.object(
+                source_capacity,
+                "MAX_RUN_SOURCE_ACCEPTANCE_BYTES",
+                source_inputs.MAX_SOURCE_ACCEPTANCE_BYTES - 1,
             ),
-            self.assertRaisesRegex(InvalidTransitionError, "source capacity"),
+            self.assertRaisesRegex(InvalidTransitionError, "acceptance bytes"),
         ):
             coordinator.accept_source(
                 lease["lease_ref"],

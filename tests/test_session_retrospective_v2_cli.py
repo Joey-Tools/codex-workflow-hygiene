@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import hashlib
 import io
@@ -11,6 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -1097,7 +1099,177 @@ class CliContractTests(unittest.TestCase):
 
         self.assertEqual(cli.ExitCode.INVALID_INPUT, result.exit_code)
         self.assertFalse(output.exists())
+        self.assertFalse(
+            (self.run_dir / cli.export_cli_api.EXPORT_DESTINATION_CLAIM_NAME).exists()
+        )
         self.assertFalse((self.run_dir / cli.EXPORT_DESCRIPTOR_NAME).exists())
+
+    def test_export_retry_rejects_a_different_destination_before_staging(
+        self,
+    ) -> None:
+        coordinator = self.real_coordinator(self.run_dir, activity=False)
+        self.assertEqual(RunStage.EXPORT.value, coordinator.status()["stage"])
+        first_output = self.root / ".codex-local" / "exports" / "first"
+        second_output = self.root / ".codex-local" / "exports" / "second"
+        common = (
+            "--identity-path",
+            str(self.identity_path),
+            "--require-existing-identity",
+            "--run-dir",
+            str(self.run_dir),
+        )
+
+        with mock.patch.object(
+            orchestrator_lifecycle.RunLifecycleOperations,
+            "mark_shadow_exported",
+            side_effect=cli.orchestrator_api.InvalidTransitionError(
+                "simulated post-staging interruption"
+            ),
+        ):
+            interrupted = self.parse_dispatch(
+                "export", *common, "--output", str(first_output)
+            )
+
+        self.assertEqual(cli.ExitCode.INVALID_STATE, interrupted.exit_code)
+        with mock.patch.object(cli.export_api, "export_retained_bundle") as export:
+            conflicting = self.parse_dispatch(
+                "export", *common, "--output", str(second_output)
+            )
+
+        self.assertEqual(cli.ExitCode.CONFLICT, conflicting.exit_code)
+        self.assertEqual("export_descriptor_conflict", conflicting.error.code)
+        export.assert_not_called()
+        self.assertTrue((first_output / "manifest.json").is_file())
+        self.assertFalse(second_output.exists())
+
+    def test_export_destination_claim_serializes_concurrent_destinations(
+        self,
+    ) -> None:
+        self.real_coordinator(self.run_dir, activity=False)
+        outputs = (
+            self.root / ".codex-local" / "exports" / "race-a",
+            self.root / ".codex-local" / "exports" / "race-b",
+        )
+        barrier = threading.Barrier(2)
+
+        def claim(output: Path) -> tuple[str, Path]:
+            barrier.wait(timeout=5)
+            try:
+                cli._claim_export_destination(
+                    self.run_dir,
+                    output,
+                    publication_role="standalone",
+                )
+            except cli.CliContractError as error:
+                return error.code, output
+            return "accepted", output
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(claim, outputs))
+
+        self.assertEqual(
+            ["accepted", "export_descriptor_conflict"],
+            sorted(code for code, _output in results),
+        )
+        winner = next(output for code, output in results if code == "accepted")
+        claim_record = json.loads(
+            (self.run_dir / cli.export_cli_api.EXPORT_DESTINATION_CLAIM_NAME).read_text(
+                encoding="ascii"
+            )
+        )
+        self.assertEqual(
+            str(cli.export_api.normalize_retained_export_destination(winner)),
+            claim_record["output"],
+        )
+        self.assertFalse(any(output.exists() for output in outputs))
+
+    def test_export_claim_promotes_a_legacy_descriptor_before_retry(self) -> None:
+        self.real_coordinator(self.run_dir, activity=False)
+        original = self.root / ".codex-local" / "exports" / "legacy"
+        conflicting = self.root / ".codex-local" / "exports" / "conflicting"
+        safe_io.atomic_create_json(
+            self.run_dir / cli.EXPORT_DESCRIPTOR_NAME,
+            {
+                "bundle_digest": "a" * 64,
+                "output": str(original),
+                "publication_role": "standalone",
+                "retention_deadline": "2026-07-07T01:00:00Z",
+                "schema": cli.EXPORT_DESCRIPTOR_SCHEMA,
+            },
+        )
+
+        with self.assertRaises(cli.CliContractError) as caught:
+            cli._claim_export_destination(
+                self.run_dir,
+                conflicting,
+                publication_role="standalone",
+            )
+
+        self.assertEqual("export_descriptor_conflict", caught.exception.code)
+        claim_record = json.loads(
+            (self.run_dir / cli.export_cli_api.EXPORT_DESTINATION_CLAIM_NAME).read_text(
+                encoding="ascii"
+            )
+        )
+        self.assertEqual(
+            str(cli.export_api.normalize_retained_export_destination(original)),
+            claim_record["output"],
+        )
+        cli._persist_export_descriptor(
+            self.run_dir,
+            original,
+            {
+                "bundle_digest": "a" * 64,
+                "retention_deadline": "2026-07-07T01:00:00Z",
+            },
+            publication_role="standalone",
+        )
+        self.assertFalse(conflicting.exists())
+
+    def test_export_claim_recovers_a_pending_legacy_descriptor_first(self) -> None:
+        self.real_coordinator(self.run_dir, activity=False)
+        original = self.root / ".codex-local" / "exports" / "pending-legacy"
+        conflicting = self.root / ".codex-local" / "exports" / "conflicting"
+        descriptor = {
+            "bundle_digest": "b" * 64,
+            "output": str(original),
+            "publication_role": "standalone",
+            "retention_deadline": "2026-07-07T01:00:00Z",
+            "schema": cli.EXPORT_DESCRIPTOR_SCHEMA,
+        }
+        descriptor_bytes = (
+            cli.contract_api.canonical_json(descriptor).encode("ascii") + b"\n"
+        )
+        pending_name = safe_io._atomic_create_pending_name(
+            cli.EXPORT_DESCRIPTOR_NAME,
+            descriptor_bytes,
+        )
+        pending_path = self.run_dir / pending_name
+        pending_path.write_bytes(descriptor_bytes)
+        os.chmod(pending_path, 0o600)
+
+        with self.assertRaises(cli.CliContractError) as caught:
+            cli._claim_export_destination(
+                self.run_dir,
+                conflicting,
+                publication_role="standalone",
+            )
+
+        self.assertEqual("export_descriptor_conflict", caught.exception.code)
+        recovered = json.loads(
+            (self.run_dir / cli.EXPORT_DESCRIPTOR_NAME).read_text(encoding="ascii")
+        )
+        claim_record = json.loads(
+            (self.run_dir / cli.export_cli_api.EXPORT_DESTINATION_CLAIM_NAME).read_text(
+                encoding="ascii"
+            )
+        )
+        self.assertEqual(descriptor, recovered)
+        self.assertEqual(
+            str(cli.export_api.normalize_retained_export_destination(original)),
+            claim_record["output"],
+        )
+        self.assertFalse(conflicting.exists())
 
     def test_export_retry_reuses_staged_retention_deadline(self) -> None:
         coordinator = self.real_coordinator(self.run_dir, activity=False)

@@ -1127,6 +1127,12 @@ class DurablePublicationTests(unittest.TestCase):
         run_state, review_data = cli_module._retained_inputs(coordinator, state)
         run_state["durable_state"] = coordinator.publication_durable_state()
         bundle = self.root / ".codex-local" / "exports" / name / "retained-v2"
+        if persist_descriptor:
+            cli_module._claim_export_destination(
+                coordinator.run_dir,
+                bundle,
+                publication_role="standalone",
+            )
         receipt = export_retained_bundle(
             bundle,
             run_state,

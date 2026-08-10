@@ -82,7 +82,10 @@ the raw tree.
 
 Source acceptance has a separate bounded staging boundary. Before transport
 iteration, the coordinator proves the candidate batch fits run-global source
-capacity. Segmented transport then keeps at most one bounded raw record in memory
+capacity and conservatively reserves the full 64 MiB acceptance-sidecar ceiling.
+The final checkpoint transaction rechecks the current state with the exact
+prepared sidecar bytes. Segmented transport then keeps at most one bounded raw
+record in memory
 while appending accepted bytes to one deterministic lease-derived, owner-only,
 descriptor-held spool. A persistent owner-only lock serializes cooperating
 recovery; after the lock is acquired, a retry authenticates and removes only the
@@ -91,6 +94,14 @@ write. Compact per-record descriptors drive transcript validation and the
 acceptance digest. A preallocated receipt ledger exists before any final file is
 created, so rollback authority cannot be lost to a post-create collection
 allocation. Replay, failure, rollback, and success all discard the exact spool.
+
+Retained export uses a separate 250-line-bounded CLI support module. It
+canonicalizes the ignored destination and atomically persists a no-replace
+run-owned claim before artifact assembly or output writes. Serial and concurrent
+different-destination retries therefore stop before staging; a legacy final
+descriptor first supplies the authoritative destination for claim migration.
+Final descriptor persistence reauthenticates that same claim before binding the
+bundle digest and retention deadline.
 
 The transport program commitment includes every runtime module above. Adding a
 module without adding it to the closed allowlist fails source transport.

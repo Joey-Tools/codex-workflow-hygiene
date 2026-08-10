@@ -964,3 +964,30 @@ superseded_by:
   setup and is non-counting as a complete gate. The authorized host Python 3.13
   discovery then passed all 1,649 tests in 1,111.116 seconds with
   `TMPDIR=/private/tmp`, including the disposable-GPG publication transactions.
+- Fresh whole-range Codex review of signed head `45ce17c` found two additional
+  blockers. CLI export could finish an eight-file retained bundle at one output
+  before the run persisted its unique destination descriptor, and segmented
+  source acceptance reserved no acceptance-sidecar bytes before consuming the
+  bounded transport iterator. That head's review, admission, and CI evidence is
+  retained only as superseded finding evidence.
+- The repair adds a 250-line-bounded CLI export support module and persists one
+  canonical, owner-only, no-replace destination claim before artifact assembly
+  or output writes. It promotes and authenticates exact legacy final descriptors,
+  first recovers a crash-retained atomic-create descriptor transaction, and
+  compares `/var`-style lexical aliases by their canonical destination while
+  keeping bundle digest, publication role, and retention deadline exact. Serial
+  and concurrent different-output losers therefore stop before staging. Source
+  acceptance now reserves the complete 64 MiB per-segment sidecar ceiling before
+  the first transport frame or spool write, then rechecks the current checkpoint
+  with the exact prepared sidecar bytes.
+- Two read-only precommit audits independently checked those properties. The
+  capacity audit returned no findings. The export audit identified pending
+  descriptor recovery and legacy lexical/canonical comparison windows; both were
+  closed with focused crash-recovery and `/var` to `/private/var` regressions.
+  Exact claim tests pass 6/6 in 11.329 seconds, export/CLI tests 89/89 in 44.822
+  seconds, source transport 69/69 in 22.065 seconds, orchestrator 108/108 in
+  169.907 seconds, module boundaries 18/18 in 1.838 seconds, and the authorized
+  host publication regression 1/1 in 24.487 seconds. The final host Python 3.13
+  discovery passes all 1,653 tests in 1,204.465 seconds with
+  `TMPDIR=/private/tmp`. Its pre/post diff digest is exactly
+  `fe824844fa1bca9ecd7cf1f984eb6792f241f862e897a179513ac28cf9877e12`.

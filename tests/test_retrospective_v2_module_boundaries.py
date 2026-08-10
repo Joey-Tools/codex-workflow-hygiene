@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "codex-session-retrospective" / "scripts"
 PACKAGE = SCRIPTS / "retrospective_v2"
 PUBLIC_CLI = SCRIPTS / "session_retrospective_v2.py"
+EXPORT_CLI_SUPPORT = SCRIPTS / "session_retrospective_v2_export.py"
 TRANSCRIPT_ADAPTER = SCRIPTS / "session_retrospective_v2_transcript.py"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -1024,6 +1025,10 @@ spec.loader.exec_module(module)
         self.assertLessEqual(
             len((SCRIPTS / "session_retrospective_v2.py").read_text().splitlines()),
             1_950,
+        )
+        self.assertLessEqual(
+            len(EXPORT_CLI_SUPPORT.read_text(encoding="utf-8").splitlines()),
+            250,
         )
         self.assertLessEqual(
             len(TRANSCRIPT_ADAPTER.read_text(encoding="utf-8").splitlines()),

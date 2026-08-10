@@ -216,7 +216,11 @@ retained raw payload, and a submitted non-target consumed record is rejected.
   content-addressed sidecars under `raw-inputs/source-acceptances`; authenticated
   checkpoint state stores only bounded descriptors and a compact manifest summary.
   Before segmented transport is consumed, the candidate batch must fit the
-  run-global source capacity. Accepted bytes then stream into one deterministic
+  run-global source capacity while reserving the complete 64 MiB per-segment
+  acceptance-sidecar ceiling. This conservative proof happens before the first
+  frame or spool write; the checkpoint transaction later uses the sidecar's exact
+  canonical byte count for its final capacity check against the current state.
+  Accepted bytes then stream into one deterministic
   lease-derived, owner-only, descriptor-held spool under
   `raw-inputs/source-spool-v1`. A persistent owner-only lock serializes retry;
   after acquiring it, the next process authenticates and removes only the same
@@ -344,6 +348,16 @@ fixed authenticated cleanup root and is never retained in durable history.
 Idempotent replay of each authenticated published, shadow, or expired terminal
 cleanup clears any legacy embedded retained input after revalidating the
 terminal receipt.
+
+Before retained artifact assembly or staging, the CLI canonicalizes the ignored
+output path and atomically creates one immutable, run-owned destination claim.
+Only retries for that exact output and publication role may proceed. A different
+serial retry or the loser of a concurrent different-output race fails before it
+creates any bundle artifact. An exact legacy final export descriptor is promoted
+to the same claim before retry comparison, while final receipt persistence must
+reauthenticate the claim. The final descriptor continues to bind the bundle
+digest and retention deadline; the earlier claim is the unique-destination
+linearization point.
 
 ## Partial And Backfill Lineage
 

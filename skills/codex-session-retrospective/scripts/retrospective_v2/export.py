@@ -176,6 +176,14 @@ def _normalized_staging_path(
     return resolved
 
 
+def normalize_retained_export_destination(
+    path: str | os.PathLike[str],
+) -> Path:
+    """Validate and canonicalize one retained-export destination."""
+
+    return _normalized_staging_path(path, require_ignored=True)
+
+
 def _assert_no_symlink_components(path: Path) -> None:
     current = Path(path.anchor)
     relative_parts = path.parts[1:] if path.anchor else path.parts
@@ -1249,7 +1257,7 @@ def export_retained_bundle(
 ) -> dict[str, Any]:
     """Assemble and stage retained output without committing or advancing state."""
 
-    output = _normalized_staging_path(output_dir, require_ignored=True)
+    output = normalize_retained_export_destination(output_dir)
     artifacts = assemble_retained_artifacts(
         run_state, review_data, prior_period=prior_period
     )

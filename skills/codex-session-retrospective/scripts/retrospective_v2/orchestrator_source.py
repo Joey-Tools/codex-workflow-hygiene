@@ -679,7 +679,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
             if source_job["status"] == "runnable":
                 source_capacity.require_candidate_capacity(
                     state["source"]["cells"],
-                    acceptance_bytes=0,
+                    acceptance_bytes=source_inputs.MAX_SOURCE_ACCEPTANCE_BYTES,
                     byte_count=transport.total_bytes,
                     record_count=transport.total_records,
                 )

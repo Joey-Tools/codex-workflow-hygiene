@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 import datetime as dt
 from enum import IntEnum
@@ -59,12 +59,13 @@ from retrospective_v2 import orchestrator as orchestrator_api  # noqa: E402
 from retrospective_v2 import reporting as reporting_api  # noqa: E402
 from retrospective_v2 import result_validation as result_validation_api  # noqa: E402
 from retrospective_v2 import safe_io  # noqa: E402
+import session_retrospective_v2_export as export_cli_api  # noqa: E402
 import session_retrospective_v2_transcript as transcript_api  # noqa: E402
 
 
 CLI_SCHEMA = "cli_result_v2"
-EXPORT_DESCRIPTOR_SCHEMA = "cli_export_descriptor_v2"
-EXPORT_DESCRIPTOR_NAME = "cli-export-v2.json"
+EXPORT_DESCRIPTOR_SCHEMA = export_cli_api.EXPORT_DESCRIPTOR_SCHEMA
+EXPORT_DESCRIPTOR_NAME = export_cli_api.EXPORT_DESCRIPTOR_NAME
 PUBLICATION_JOURNAL_NAME = "publication-transaction-v2.json"
 MAX_AGENT_RESULT_BYTES = result_validation_api.MAX_RESULT_BYTES
 MAX_AGENT_RESULT_JSON_DEPTH = result_validation_api.MAX_RESULT_DEPTH
@@ -224,6 +225,21 @@ class CliContractError(RuntimeError):
         self.code = code
         self.safe_message = message
         self.retryable = retryable
+
+
+def _export_cli_contract(
+    operation: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    try:
+        return operation(*args, **kwargs)
+    except export_cli_api.ExportCliContractError as error:
+        raise CliContractError(
+            exit_code=ExitCode[error.exit_code],
+            code=error.code,
+            message=error.safe_message,
+        ) from error
 
 
 class HelpRequested(Exception):
@@ -1317,43 +1333,29 @@ def _persist_export_descriptor(
     *,
     publication_role: str,
 ) -> None:
-    bundle_digest = receipt.get("bundle_digest")
-    retention_deadline = receipt.get("retention_deadline")
-    if not isinstance(bundle_digest, str) or not SHA256_RE.fullmatch(bundle_digest):
-        raise CliContractError(
-            exit_code=ExitCode.INVALID_STATE,
-            code="invalid_export_receipt",
-            message="the retained export receipt is invalid",
-        )
-    if not isinstance(retention_deadline, str):
-        raise CliContractError(
-            exit_code=ExitCode.INVALID_STATE,
-            code="invalid_export_receipt",
-            message="the retained export receipt is invalid",
-        )
-    descriptor = {
-        "bundle_digest": bundle_digest,
-        "output": str(output),
-        "publication_role": publication_role,
-        "retention_deadline": retention_deadline,
-        "schema": EXPORT_DESCRIPTOR_SCHEMA,
-    }
-    descriptor_path = run_dir / EXPORT_DESCRIPTOR_NAME
-    try:
-        safe_io.atomic_create_json(descriptor_path, descriptor)
-    except FileExistsError:
-        existing = _read_json_object(
-            descriptor_path,
-            max_bytes=MAX_DESCRIPTOR_BYTES,
-        )
-        if contract_api.canonical_json(existing) != contract_api.canonical_json(
-            descriptor
-        ):
-            raise CliContractError(
-                exit_code=ExitCode.CONFLICT,
-                code="export_descriptor_conflict",
-                message="the immutable export destination conflicts with this request",
-            )
+    _export_cli_contract(
+        export_cli_api.persist_export_descriptor,
+        run_dir,
+        output,
+        receipt,
+        publication_role,
+        read_json=_read_json_object,
+    )
+
+
+def _claim_export_destination(
+    run_dir: Path,
+    output: Path,
+    *,
+    publication_role: str,
+) -> Path:
+    return _export_cli_contract(
+        export_cli_api.claim_export_destination,
+        run_dir,
+        output,
+        publication_role,
+        read_json=_read_json_object,
+    )
 
 
 def command_export(args: argparse.Namespace) -> CommandResult:
@@ -1389,6 +1391,11 @@ def command_export(args: argparse.Namespace) -> CommandResult:
         retention_deadline = orchestrator.validate_export_retention_deadline(
             orchestrator.export_retention_deadline()
         )
+    output = _claim_export_destination(
+        run_dir,
+        output,
+        publication_role="standalone",
+    )
     now = dt.datetime.now(dt.timezone.utc)
     receipt = _mapping_result(
         export_api.export_retained_bundle(
@@ -1453,32 +1460,11 @@ def command_export(args: argparse.Namespace) -> CommandResult:
 
 
 def _load_export_descriptor(run_dir: Path) -> dict[str, Any]:
-    descriptor = _read_json_object(
-        run_dir / EXPORT_DESCRIPTOR_NAME,
-        max_bytes=MAX_DESCRIPTOR_BYTES,
+    return _export_cli_contract(
+        export_cli_api.load_export_descriptor,
+        run_dir,
+        read_json=_read_json_object,
     )
-    if (
-        set(descriptor)
-        != {
-            "bundle_digest",
-            "output",
-            "publication_role",
-            "retention_deadline",
-            "schema",
-        }
-        or descriptor.get("schema") != EXPORT_DESCRIPTOR_SCHEMA
-        or not isinstance(descriptor.get("output"), str)
-        or not isinstance(descriptor.get("bundle_digest"), str)
-        or not SHA256_RE.fullmatch(descriptor["bundle_digest"])
-        or descriptor.get("publication_role") != "standalone"
-        or not isinstance(descriptor.get("retention_deadline"), str)
-    ):
-        raise CliContractError(
-            exit_code=ExitCode.INVALID_STATE,
-            code="invalid_export_descriptor",
-            message="the retained export descriptor is invalid",
-        )
-    return descriptor
 
 
 def _publication_destination(state: Mapping[str, Any]) -> str:
