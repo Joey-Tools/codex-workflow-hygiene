@@ -209,10 +209,12 @@ superseded_by:
   before publication; bounded reads, locks, publication state, retained export,
   GPG keyring validation, cleanup, and session-shard spools revalidate the same
   access-policy property without treating timestamp-only changes as mutation.
-- JSON source-overlap control keys exempt only exact case-sensitive allowlisted,
-  shape-valid direct scalar metadata. Nested objects, arrays, malformed values,
-  arbitrary suffix-shaped keys, and Unicode case-fold aliases remain untrusted
-  source-bearing structure and cannot bypass the retained-output overlap gate.
+- JSON source-overlap control keys exempt only exact case-sensitive, per-field
+  allowlisted direct scalar values. Unknown classifier values, including
+  identifier-shaped model, schema, provider, and status values, remain untrusted
+  source-bearing text. Nested objects, arrays, malformed values, arbitrary
+  suffix-shaped keys, and Unicode case-fold aliases likewise cannot bypass the
+  retained-output overlap gate.
 - Retained-export garbage collection has no publication transaction authority.
   It keeps every authenticated `publication_bound` bundle until the exact
   attempt owner persists a terminal disposition; age alone cannot synthesize an
@@ -942,3 +944,23 @@ superseded_by:
   1,106.765 seconds. The direct Claude lane is skipped under Joey's explicit
   authorization for this Codex task and is not represented as an executed
   double or triple review.
+- The first whole-range Codex review attempt on signed head `f032fec` returned
+  no findings but wrote an empty ignored validator cache, so it was postvalidated,
+  cleaned, and classified non-counting. Its strict read-only retry returned two
+  P1 findings: result-side substrings from 12 through 15 normalized characters
+  could evade the asymmetric reverse-overlap threshold, and identifier-shaped
+  values under classifier keys were exempt without field-specific semantics.
+  That workspace postvalidated clean and was removed before repair; `f032fec`
+  admission and CI evidence is superseded by the forthcoming signed head.
+- The repair makes source/result substring containment symmetric from 12
+  normalized characters and replaces the broad classifier regex with exact
+  per-field value sets; every unknown classifier value falls back to ordinary
+  bounded source-text windows. Regressions cover all former classifier keys,
+  every 12--15-character length, and both paths through a real coordinator.
+  Focused tests pass 3/3 in 3.579 seconds, result/episode tests 62/62 in 0.800
+  seconds, result-contract audit 15/15 in 0.096 seconds, orchestrator tests
+  108/108 in 156.045 seconds, and module boundaries 18/18 in 1.636 seconds.
+  A sandboxed discovery ran 1,603 tests before the temporary GPG class failed in
+  setup and is non-counting as a complete gate. The authorized host Python 3.13
+  discovery then passed all 1,649 tests in 1,111.116 seconds with
+  `TMPDIR=/private/tmp`, including the disposable-GPG publication transactions.

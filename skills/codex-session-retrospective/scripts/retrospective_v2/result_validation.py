@@ -580,7 +580,7 @@ def _source_overlap(
         ):
             return (0, len(text))
         if (
-            16 <= len(normalized_text) <= len(normalized_candidate)
+            12 <= len(normalized_text) <= len(normalized_candidate)
             and normalized_text in normalized_candidate
         ):
             return (0, len(text))

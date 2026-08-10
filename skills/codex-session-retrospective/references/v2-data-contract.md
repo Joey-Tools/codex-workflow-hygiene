@@ -308,8 +308,9 @@ overlap before retained state is written; raw material never leaves working
 retention. Each reassembled record is streamed through a strict UTF-8 and JSON
 token parser. The parser validates literals and numbers with a closed grammar;
 an invalid primitive cannot consume a following string. Object keys,
-non-string primitives, and validated low-risk classifiers such as role/type/status
-plus semantic timestamps are not source-prose candidates. Instance-bearing IDs,
+non-string primitives, exact per-field low-risk classifier values, and semantic
+timestamps are not source-prose candidates. Unknown classifier values, model and
+schema identifiers without an exact allowlisted value, instance-bearing IDs,
 host and cwd values, typed references, digests, and commitments always remain
 source candidates. Every other decoded string value, including long
 escaped values and surrogate pairs, is case-folded, whitespace-normalized, and

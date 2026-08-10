@@ -663,6 +663,63 @@ class ResultValidationTests(unittest.TestCase):
             {finding.category for finding in malformed_reference_findings},
         )
 
+    def test_source_overlap_classifier_values_use_closed_field_semantics(
+        self,
+    ) -> None:
+        unknown_values = {
+            key: f"private-{key}-value"
+            for key in source_overlap_module._CONTROL_CLASSIFIER_VALUES
+        }
+        payload = {
+            **unknown_values,
+            "nested": {
+                "approval_policy": "never",
+                "provider": "openai",
+                "sandbox_policy": "read-only",
+                "state": "present",
+                "status": "completed",
+                "type": "response_item",
+            },
+        }
+        candidates = [
+            candidate
+            for batch in source_overlap_module.json_string_value_batches(
+                (json.dumps(payload, separators=(",", ":")),),
+                query_chars=8,
+                maximum_batch_chars=512,
+                maximum_batch_items=32,
+            )
+            for candidate in batch
+        ]
+
+        for value in unknown_values.values():
+            with self.subTest(value=value):
+                self.assertIn(value, candidates)
+        for value in payload["nested"].values():
+            with self.subTest(closed_value=value):
+                self.assertNotIn(value, candidates)
+
+    def test_source_overlap_rejects_twelve_through_fifteen_character_substrings(
+        self,
+    ) -> None:
+        source_fragment = "FrostedMeadowLaunch"
+
+        for length in range(12, 16):
+            fragment = source_fragment[:length]
+            source = f"prefix{fragment}suffix"
+            with self.subTest(length=length):
+                self.assertEqual(length, len(fragment))
+                self.assertIn(
+                    "original_prompt",
+                    {
+                        finding.category
+                        for finding in scan_for_leaks(
+                            {"unsafe": fragment},
+                            original_prompts=(source,),
+                        )
+                    },
+                )
+
     def test_result_complexity_is_bounded_before_privacy_processing(self) -> None:
         value = extractor_result()
         value["turns"][0]["generalized_working_text"] = "x" * (

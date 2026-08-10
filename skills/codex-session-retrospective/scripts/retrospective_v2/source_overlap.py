@@ -14,26 +14,31 @@ from dataclasses import dataclass
 
 _MAX_CLASSIFIED_KEY_CHARS = 256
 _MAX_CONTROL_VALUE_CHARS = 4_096
-_CONTROL_CLASSIFIER_KEYS = frozenset(
-    {
-        "approval_policy",
-        "kind",
-        "model",
-        "outcome",
-        "phase",
-        "provider",
-        "sandbox_policy",
-        "schema",
-        "state",
-        "status",
-        "type",
-        "version",
-    }
-)
+_CONTROL_CLASSIFIER_VALUES = {
+    "approval_policy": frozenset({"never", "on-failure", "on-request", "untrusted"}),
+    "kind": frozenset(),
+    "model": frozenset(),
+    "outcome": frozenset({"completed", "no_activity"}),
+    "phase": frozenset(),
+    "provider": frozenset({"openai"}),
+    "sandbox_policy": frozenset({"danger-full-access", "read-only", "workspace-write"}),
+    "schema": frozenset(),
+    "state": frozenset({"absent", "present"}),
+    "status": frozenset({"complete", "completed"}),
+    "type": frozenset(
+        {
+            "event_msg",
+            "message",
+            "response_item",
+            "session_meta",
+            "turn_context",
+        }
+    ),
+    "version": frozenset(),
+}
 _CONTROL_TIMESTAMP_KEYS = frozenset(
     {"completed_at", "created_at", "started_at", "timestamp", "ts", "updated_at"}
 )
-_CONTROL_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+~-]{0,511}")
 _CONTROL_TIMESTAMP_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
@@ -43,6 +48,10 @@ _CONTROL_ROLE_RE = re.compile(r"(?:assistant|developer|system|tool|user)")
 
 def _matches_pattern(value: str, *, pattern: re.Pattern[str]) -> bool:
     return pattern.fullmatch(value) is not None
+
+
+def _matches_closed_value(value: str, *, allowed: frozenset[str]) -> bool:
+    return value in allowed
 
 
 def _matches_timestamp(value: str) -> bool:
@@ -55,8 +64,8 @@ def _matches_timestamp(value: str) -> bool:
 
 _CONTROL_VALUE_VALIDATORS = {
     **{
-        key: functools.partial(_matches_pattern, pattern=_CONTROL_IDENTIFIER_RE)
-        for key in _CONTROL_CLASSIFIER_KEYS
+        key: functools.partial(_matches_closed_value, allowed=allowed)
+        for key, allowed in _CONTROL_CLASSIFIER_VALUES.items()
     },
     **dict.fromkeys(_CONTROL_TIMESTAMP_KEYS, _matches_timestamp),
     "role": functools.partial(_matches_pattern, pattern=_CONTROL_ROLE_RE),

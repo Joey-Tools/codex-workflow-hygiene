@@ -2878,6 +2878,67 @@ class OrchestratorTests(unittest.TestCase):
             coordinator.store.path.read_text(encoding="utf-8"),
         )
 
+    def test_extractor_rejects_short_substring_and_unknown_classifier_value(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "short-substring-overlap",
+                "FrostedMeadow",
+                {
+                    "content": "prefixFrostedMeadowSuffix",
+                    "status": "completed",
+                },
+            ),
+            (
+                "unknown-classifier-overlap",
+                "FrostedMeadowLaunch",
+                {
+                    "content": "safe generalized source text",
+                    "status": "FrostedMeadowLaunch",
+                },
+            ),
+        )
+
+        for name, phrase, source in cases:
+            payload = (
+                json.dumps(
+                    {
+                        **source,
+                        "role": "user",
+                        "timestamp": "2026-07-06T01:00:00Z",
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("ascii")
+                + b"\n"
+            )
+            coordinator = self.start_daily(name)
+
+            def handler(lease):
+                if (
+                    lease["host"] != "local"
+                    or lease["source_kind"] != SourceKind.ACTIVE_ROLLOUT.value
+                ):
+                    return None
+                manifest, records, _source_ref = activity_manifest(lease, [payload])
+                return manifest, {"raw_records": {records[0].unit_ref: payload}}
+
+            with self.subTest(name=name):
+                self.drain_sources(coordinator, handler)
+                coordinator.advance()
+                job = coordinator.status()["runnable_jobs"][0]
+                result = self.extractor_result(job)
+                result["turns"][0]["generalized_working_text"] = phrase
+                rejected = coordinator.accept_agent_result(
+                    job["job_ref"],
+                    job["active_attempt_ref"],
+                    result,
+                )
+
+                self.assertEqual("retryable", rejected["outcome"])
+                self.assertEqual("schema_violation", rejected["reason"])
+
     def test_extractor_rejects_short_prompt_from_fragmented_record(self) -> None:
         phrase = "Acme"
         payload = (
