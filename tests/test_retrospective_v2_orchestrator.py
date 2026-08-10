@@ -2176,6 +2176,151 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertFalse(spool_root.exists())
 
+    def test_segmented_source_cell_cap_blocks_before_iterator_and_spool(self) -> None:
+        limits = sharding.ShardLimits(
+            max_bytes=orchestrator_module.EXTRACTOR_SHARD_MAX_BYTES
+        )
+        coordinator = self.start_daily("transport-segment-cell-cap-preflight")
+        coordinator.advance()
+        lease = next(
+            item
+            for item in coordinator.status()["active_source_leases"]
+            if item["host"] == "local"
+        )
+        payload = b'{"timestamp":"2026-07-06T01:00:00Z"}\n'
+        manifest, records, source_ref = activity_manifest(lease, [payload])
+        request, frames = record_stream_frames(
+            records,
+            [payload],
+            limits,
+            token_seed="transport-segment-cell-cap-preflight",
+        )
+        receipt = authenticated_receipt(
+            coordinator,
+            lease,
+            manifest,
+            {records[0].unit_ref: payload},
+        )
+        snapshot = coordinator.store.read()
+        capped_state = copy.deepcopy(snapshot.state)
+        capped_state["source"]["cells"][lease["host"]][lease["source_kind"]][
+            "continuation_segments"
+        ] = [{"manifest": {}}] * source_inputs.MAX_SOURCE_ACCEPTANCE_SEGMENTS
+        iterated = False
+
+        def forbidden_frames():
+            nonlocal iterated
+            iterated = True
+            yield from frames
+
+        with (
+            mock.patch.object(
+                coordinator.store,
+                "read",
+                return_value=replace(snapshot, state=capped_state),
+            ),
+            mock.patch.object(
+                source_inputs.SourcePayloadCollection,
+                "enable_streaming",
+            ) as enable_streaming,
+            self.assertRaisesRegex(InvalidTransitionError, "chain exceeds bounds"),
+        ):
+            coordinator.accept_source(
+                lease["lease_ref"],
+                manifest.to_dict(),
+                transport_receipt=receipt,
+                transport_segments={
+                    source_ref: ((forbidden_frames(), request),),
+                },
+            )
+
+        self.assertFalse(iterated)
+        enable_streaming.assert_not_called()
+        spool_root = (
+            coordinator.run_dir / source_inputs.SOURCE_TRANSPORT_SPOOL_DIRECTORY
+        )
+        self.assertFalse(spool_root.exists())
+
+    def test_segmented_source_replay_at_cell_cap_is_zero_consumption(self) -> None:
+        limits = sharding.ShardLimits(
+            max_bytes=orchestrator_module.EXTRACTOR_SHARD_MAX_BYTES
+        )
+        coordinator = self.start_daily("transport-segment-cell-cap-replay")
+        coordinator.advance()
+        lease = next(
+            item
+            for item in coordinator.status()["active_source_leases"]
+            if item["host"] == "local"
+        )
+        payload = b'{"timestamp":"2026-07-06T01:00:00Z"}\n'
+        manifest, records, source_ref = activity_manifest(lease, [payload])
+        request, frames = record_stream_frames(
+            records,
+            [payload],
+            limits,
+            token_seed="transport-segment-cell-cap-replay",
+        )
+        receipt = authenticated_receipt(
+            coordinator,
+            lease,
+            manifest,
+            {records[0].unit_ref: payload},
+        )
+        coordinator.accept_source(
+            lease["lease_ref"],
+            manifest.to_dict(),
+            transport_receipt=receipt,
+            transport_segments={source_ref: ((frames, request),)},
+        )
+        snapshot = coordinator.store.read()
+        capped_state = copy.deepcopy(snapshot.state)
+        capped_state["source"]["cells"][lease["host"]][lease["source_kind"]][
+            "continuation_segments"
+        ] = [{"manifest": {}}] * source_inputs.MAX_SOURCE_ACCEPTANCE_SEGMENTS
+        spool_root = (
+            coordinator.run_dir / source_inputs.SOURCE_TRANSPORT_SPOOL_DIRECTORY
+        )
+        before_spools = tuple(spool_root.glob("source-spool-*.bin"))
+        self.assertEqual((), before_spools)
+        _replay_request, replay_frames = record_stream_frames(
+            records,
+            [payload],
+            limits,
+            token_seed="transport-segment-cell-cap-replay",
+        )
+        iterated = False
+
+        def forbidden_frames():
+            nonlocal iterated
+            iterated = True
+            yield from replay_frames
+
+        with (
+            mock.patch.object(
+                coordinator.store,
+                "read",
+                return_value=replace(snapshot, state=capped_state),
+            ),
+            mock.patch.object(
+                source_inputs.SourcePayloadCollection,
+                "enable_streaming",
+            ) as enable_streaming,
+        ):
+            replay = coordinator.accept_source(
+                lease["lease_ref"],
+                manifest.to_dict(),
+                transport_receipt=receipt,
+                transport_segments={
+                    source_ref: ((forbidden_frames(), _replay_request),),
+                },
+            )
+
+        self.assertTrue(replay["idempotent"])
+        self.assertFalse(replay["changed"])
+        self.assertFalse(iterated)
+        enable_streaming.assert_not_called()
+        self.assertEqual(before_spools, tuple(spool_root.glob("source-spool-*.bin")))
+
     def test_streaming_source_spool_is_bounded_recoverable_and_receipt_only(
         self,
     ) -> None:

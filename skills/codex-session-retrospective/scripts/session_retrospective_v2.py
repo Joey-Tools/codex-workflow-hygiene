@@ -66,6 +66,7 @@ import session_retrospective_v2_transcript as transcript_api  # noqa: E402
 CLI_SCHEMA = "cli_result_v2"
 EXPORT_DESCRIPTOR_SCHEMA = export_cli_api.EXPORT_DESCRIPTOR_SCHEMA
 EXPORT_DESCRIPTOR_NAME = export_cli_api.EXPORT_DESCRIPTOR_NAME
+LEGACY_EXPORT_DESCRIPTOR_NAME = export_cli_api.LEGACY_EXPORT_DESCRIPTOR_NAME
 PUBLICATION_JOURNAL_NAME = "publication-transaction-v2.json"
 MAX_AGENT_RESULT_BYTES = result_validation_api.MAX_RESULT_BYTES
 MAX_AGENT_RESULT_JSON_DEPTH = result_validation_api.MAX_RESULT_DEPTH

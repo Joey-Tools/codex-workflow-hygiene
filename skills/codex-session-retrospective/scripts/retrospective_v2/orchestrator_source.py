@@ -660,7 +660,28 @@ class SourceCoordinationOperations(OrchestratorComponent):
             raise InvalidInputError(
                 "source transport receipt was not issued by the execution boundary"
             )
+        action_key = f"accept_source:{normalized_lease}"
+        if source_job["status"] != "runnable":
+            previous = state["actions"].get(action_key)
+            if previous is None:
+                raise InvalidTransitionError("source lease is not runnable")
+            if source_job.get("accepted_input_digest") != previous.get("input_digest"):
+                raise RunConflictError("accepted source action binding changed")
+            response = self._projection._status_view(snapshot)
+            response.update(
+                {
+                    "accepted": True,
+                    "action": "accept-source",
+                    "changed": False,
+                    "idempotent": True,
+                    "outcome": previous.get("outcome"),
+                }
+            )
+            return response
         limits = self._projection._shard_limits_from_state(state)
+        initial_cell = state["source"]["cells"][source_job["host"]][
+            source_job["source_kind"]
+        ]
         accepted_requests: dict[str, tuple[SessionShardsRequest, ...]] = {}
         consumed = source_inputs.consumed_records(transport)
         payloads = source_inputs.SourcePayloadCollection(
@@ -677,6 +698,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
         )
         if segments is not None:
             if source_job["status"] == "runnable":
+                source_inputs.require_new_segment_capacity(initial_cell)
                 source_capacity.require_candidate_capacity(
                     state["source"]["cells"],
                     acceptance_bytes=source_inputs.MAX_SOURCE_ACCEPTANCE_BYTES,
@@ -721,33 +743,6 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 source_snapshot,
                 payloads.payload_metadata,
             )
-            if source_job["status"] != "runnable":
-                action_key = f"accept_source:{normalized_lease}"
-                previous = state["actions"].get(action_key)
-                digest = self._source_acceptance_digest(
-                    transport,
-                    receipt,
-                    payloads.payload_metadata,
-                    accepted_requests,
-                )
-                if previous is not None and previous.get("input_digest") != digest:
-                    raise RunConflictError(
-                        "source lease was replayed with different accepted input"
-                    )
-                if previous is not None:
-                    response = self._projection._status_view(snapshot)
-                    response.update(
-                        {
-                            "accepted": True,
-                            "action": "accept-source",
-                            "changed": False,
-                            "idempotent": True,
-                            "outcome": previous.get("outcome"),
-                        }
-                    )
-                    payloads.discard_streamed()
-                    return response
-                raise InvalidTransitionError("source lease is not runnable")
             if transport.status in {
                 catalog.SourceCellStatus.COMPLETE,
                 catalog.SourceCellStatus.NO_ACTIVITY,
@@ -767,7 +762,6 @@ class SourceCoordinationOperations(OrchestratorComponent):
         except BaseException as error:
             payloads.discard_streamed(error)
             raise
-        action_key = f"accept_source:{normalized_lease}"
         segment = source_inputs.segment_descriptor(
             normalized_lease, transport, receipt, source_snapshot
         )
@@ -775,9 +769,6 @@ class SourceCoordinationOperations(OrchestratorComponent):
             payloads.model_era_evidence
         )
         try:
-            initial_cell = state["source"]["cells"][source_job["host"]][
-                source_job["source_kind"]
-            ]
             initial_legacy_payloads = source_payloads.merge_payload_indexes(
                 initial_cell.get("payloads", {})
             )
@@ -844,8 +835,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
             if current_legacy_payloads != initial_legacy_payloads:
                 raise RunConflictError("legacy source payload index changed")
             existing_segments = list(cell.get("continuation_segments", []))
-            if len(existing_segments) >= source_inputs.MAX_SOURCE_ACCEPTANCE_SEGMENTS:
-                raise InvalidTransitionError("source continuation chain exceeds bounds")
+            source_inputs.require_new_segment_capacity(cell)
             source_capacity.require_candidate_capacity(
                 current["source"]["cells"],
                 acceptance_bytes=prepared_acceptance.file.byte_count,

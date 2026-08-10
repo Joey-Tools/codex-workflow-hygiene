@@ -215,11 +215,16 @@ retained raw payload, and a submitted non-target consumed record is rejected.
 - Accepted source records and raw-payload indexes live in canonical, owner-only,
   content-addressed sidecars under `raw-inputs/source-acceptances`; authenticated
   checkpoint state stores only bounded descriptors and a compact manifest summary.
-  Before segmented transport is consumed, the candidate batch must fit the
+  Before segmented transport is consumed, the target host/source cell must have
+  room below its 64-segment ceiling and the candidate batch must fit the
   run-global source capacity while reserving the complete 64 MiB per-segment
-  acceptance-sidecar ceiling. This conservative proof happens before the first
-  frame or spool write; the checkpoint transaction later uses the sidecar's exact
-  canonical byte count for its final capacity check against the current state.
+  acceptance-sidecar ceiling. These conservative proofs happen before streaming
+  is enabled, the segment iterator advances, or a spool path is created; the
+  same boundary returns an already-authenticated accepted lease replay directly
+  from its durable action binding without consuming the supplied transport. The
+  checkpoint transaction later repeats the cell check and uses the sidecar's
+  exact canonical byte count for its final capacity check against the current
+  state.
   Accepted bytes then stream into one deterministic
   lease-derived, owner-only, descriptor-held spool under
   `raw-inputs/source-spool-v1`. A persistent owner-only lock serializes retry;
@@ -350,14 +355,26 @@ cleanup clears any legacy embedded retained input after revalidating the
 terminal receipt.
 
 Before retained artifact assembly or staging, the CLI canonicalizes the ignored
-output path and atomically creates one immutable, run-owned destination claim.
-Only retries for that exact output and publication role may proceed. A different
-serial retry or the loser of a concurrent different-output race fails before it
-creates any bundle artifact. An exact legacy final export descriptor is promoted
-to the same claim before retry comparison, while final receipt persistence must
-reauthenticate the claim. The final descriptor continues to bind the bundle
-digest and retention deadline; the earlier claim is the unique-destination
-linearization point.
+output path and rejects every destination equal to or below `raw-inputs`,
+`raw-shards`, `agent-sinks`, or `retained-inputs` for the current run. This keeps
+shadow cleanup from deleting the bundle that the same command just exported.
+Component comparison applies NFD before and after Unicode case folding, so
+case-insensitive filesystem aliases are rejected conservatively on every
+supported filesystem.
+
+Export destination binding uses three immutable records so new and legacy CLI
+writers cannot split one run across outputs. `cli-export-v2.json` remains the
+legacy final-descriptor location. A new writer first occupies that location with
+a closed v3 reservation, which prevents a not-yet-committed legacy writer from
+later publishing a final descriptor there. `cli-export-destination-v2.json` is
+the destination claim and `cli-export-result-v3.json` is the completed result.
+An exact legacy final descriptor remains authoritative and is promoted to the
+same claim before retry comparison. If an already-started legacy writer publishes
+its no-replace claim after the reservation but before the new claim, that claim
+becomes the effective destination; the conflicting invocation stops before
+artifact assembly and an exact retry can finish it. Final receipt persistence
+reauthenticates the effective claim and any legacy final descriptor. The result
+continues to bind the bundle digest, publication role, and retention deadline.
 
 ## Partial And Backfill Lineage
 

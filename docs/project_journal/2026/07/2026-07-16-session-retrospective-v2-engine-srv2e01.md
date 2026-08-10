@@ -991,3 +991,61 @@ superseded_by:
   discovery passes all 1,653 tests in 1,204.465 seconds with
   `TMPDIR=/private/tmp`. Its pre/post diff digest is exactly
   `fe824844fa1bca9ecd7cf1f984eb6792f241f862e897a179513ac28cf9877e12`.
+- Fresh whole-range Codex review of signed head `6bc364a` found three additional
+  blockers. A shadow export could target one of the same run's four cleanup
+  roots and then delete its own completed bundle; legacy export descriptor,
+  destination-claim, and result writes were separate transactions that allowed
+  old and new writers to establish conflicting immutable records; and a source
+  cell already holding 64 continuation segments could consume and spool a 65th
+  segmented transport before the late checkpoint rejection. The reviewer
+  workspace postvalidated clean and was removed, so that head's review,
+  admission, and CI evidence is superseded.
+- The repair rejects canonical retained destinations inside every current-run
+  cleanup root before any claim or artifact write. It occupies the legacy result
+  path with a closed reservation before establishing the destination claim,
+  preserves exact legacy final descriptors, admits an already-in-flight legacy
+  claim as the sole recoverable destination, and writes completed results to a
+  separate immutable v3 record. Source acceptance now checks the per-cell segment
+  ceiling before enabling streaming, advancing the supplied iterator, or creating
+  the deterministic spool, then rechecks it in the checkpoint transaction.
+- A read-only precommit source audit found that an already accepted lease at the
+  64-segment ceiling still bypassed the runnable-only preflight and consumed its
+  replay transport before the late idempotency return. The follow-up now returns
+  an authenticated accepted replay from the durable job/action digest binding
+  before payload staging, streaming, iterator advancement, or spool creation;
+  a missing or inconsistent binding fails closed. The host full discovery that
+  was in progress when this finding arrived was interrupted once and is
+  non-counting for the superseded candidate.
+- A parallel export audit found that case-insensitive APFS could resolve an
+  uppercase cleanup-root alias to the same object while the prior lexical
+  `relative_to` comparison treated it as unrelated. Cleanup-root exclusion now
+  compares path components using NFD before and after case folding and therefore
+  rejects those aliases conservatively on every supported filesystem. A
+  follow-up audit caught and closed the missing post-fold NFD step. The affected
+  suite running when this finding arrived was interrupted once and is
+  non-counting.
+- The final combined cleanup-alias, export-race, segment-cap, accepted-replay,
+  and module-boundary focused gate passes 24/24 in 7.164 seconds. The complete
+  CLI, export, orchestrator, source-transport, and module-boundary group passes
+  292/292 in 226.599 seconds. Follow-up read-only audits of both the export alias
+  rule and the source replay boundary returned `No findings.`
+- The final authorized host Python 3.13 discovery passes all 1,661 tests in
+  1,127.088 seconds with `TMPDIR=/private/tmp`, including the disposable-GPG
+  publication transactions. The pre/post tracked patch digest is exactly
+  `ab31807b8906a5061ccb29d6e309846dd605ffd325946bb9b752c315aaf5e72d`;
+  the added export-record module digest is exactly
+  `eb1307a873f8b266d0740e861cebfde27b9d956a350a6bcb152380b0d341627c`.
+  Skill structure and validator-wrapper tests pass 39/39 in 5.796 seconds,
+  project-journal validation passes, the official OpenAI validator reports
+  `Skill is valid!`, Ruff format/lint passes, and `git diff --check` is clean.
+  The only subsequent change is this evidence-only journal update.
+- The three exact behavior regressions plus all module-boundary tests pass 21/21
+  in 5.067 seconds; the dedicated 64-segment iterator/spool regression passes
+  1/1 in 0.224 seconds. Ruff format and lint pass for the eight changed Python
+  files, and `git diff --check` is clean. The complete non-publication affected
+  group passes 289/289 in 225.693 seconds, and the authorized host publication
+  transaction module passes 58/58 in 704.987 seconds. An earlier sandboxed
+  combined run reached 301 tests before disposable GPG key generation failed in
+  class setup; it is non-counting and is superseded by the host publication
+  result. Full host Python 3.13 discovery remains pending for the superseding
+  signed head.

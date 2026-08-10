@@ -64,6 +64,14 @@ class PreparedAcceptance:
     file: PreparedFile
 
 
+def require_new_segment_capacity(cell: Mapping[str, Any]) -> None:
+    descriptors = cell.get("continuation_segments")
+    if not isinstance(descriptors, Sequence) or isinstance(descriptors, (str, bytes)):
+        raise InvalidTransitionError("source continuation descriptors are invalid")
+    if len(descriptors) >= MAX_SOURCE_ACCEPTANCE_SEGMENTS:
+        raise InvalidTransitionError("source continuation chain exceeds bounds")
+
+
 def prepare_acceptance(
     run_dir: Path,
     *,

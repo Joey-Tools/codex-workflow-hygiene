@@ -95,13 +95,16 @@ acceptance digest. A preallocated receipt ledger exists before any final file is
 created, so rollback authority cannot be lost to a post-create collection
 allocation. Replay, failure, rollback, and success all discard the exact spool.
 
-Retained export uses a separate 250-line-bounded CLI support module. It
-canonicalizes the ignored destination and atomically persists a no-replace
-run-owned claim before artifact assembly or output writes. Serial and concurrent
-different-destination retries therefore stop before staging; a legacy final
-descriptor first supplies the authoritative destination for claim migration.
-Final descriptor persistence reauthenticates that same claim before binding the
-bundle digest and retention deadline.
+Retained export uses two independently 250-line-bounded CLI support modules: one
+owns the transaction and one owns the closed reservation, claim, and result
+schemas. The transaction canonicalizes the ignored destination, rejects every
+current-run cleanup root, occupies the legacy descriptor path with a no-replace
+reservation, and then establishes the immutable destination claim before
+artifact assembly or output writes. An exact legacy final descriptor remains
+authoritative; a legacy claim that was already in flight may become the effective
+destination without allowing two completed results. Final result persistence
+reauthenticates the claim and any legacy descriptor before binding the bundle
+digest and retention deadline.
 
 The transport program commitment includes every runtime module above. Adding a
 module without adding it to the closed allowlist fails source transport.
