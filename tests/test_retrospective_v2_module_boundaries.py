@@ -236,6 +236,14 @@ ORCHESTRATOR_OPERATION_MODULES = {
     "orchestrator_state.py",
 }
 
+RUN_STATE_AUTHORITY_MODULES = {
+    "run_state_authority.py",
+    "run_state_contracts.py",
+    "run_state_cursors.py",
+    "run_state_holdouts.py",
+    "run_state_lineage.py",
+}
+
 ORCHESTRATOR_FOUNDATION_MODULES = {
     "orchestrator_components.py",
     "orchestrator_context.py",
@@ -243,6 +251,7 @@ ORCHESTRATOR_FOUNDATION_MODULES = {
     "orchestrator_protocols.py",
     "orchestrator_support.py",
     "orchestrator_transport.py",
+    *RUN_STATE_AUTHORITY_MODULES,
 }
 
 ORCHESTRATOR_SOURCE_SUPPORT_MODULES = {
@@ -368,8 +377,13 @@ BOUNDED_MODULE_LINES = {
     "publication_git_commits.py": 1_000,
     "publication_git_storage.py": 800,
     "publication_state.py": 1_250,
-    "publication_support.py": 1_300,
+    "publication_support.py": 1_310,
     "publication_transaction.py": 2_100,
+    "run_state_authority.py": 250,
+    "run_state_contracts.py": 50,
+    "run_state_cursors.py": 225,
+    "run_state_holdouts.py": 240,
+    "run_state_lineage.py": 275,
     "reporting.py": 4_500,
     "result_validation.py": 3_250,
     "transport.py": 250,
@@ -672,6 +686,9 @@ class ModuleBoundaryTests(unittest.TestCase):
         self.assertFalse(module_imports("orchestrator_core.py") & forbidden)
         self.assertFalse(module_imports("orchestrator_state.py") & forbidden)
         self.assertFalse(module_imports("controlled_gaps.py") & forbidden)
+        for name in RUN_STATE_AUTHORITY_MODULES:
+            with self.subTest(run_state_authority=name):
+                self.assertFalse(module_imports(name) & forbidden)
         self.assertIn(
             "transport_contracts",
             module_imports("controlled_gaps.py"),
@@ -990,8 +1007,27 @@ spec.loader.exec_module(module)
                 len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
                 for name in ORCHESTRATOR_FOUNDATION_MODULES
             ),
-            2_300,
+            3_350,
         )
+        run_state_authority_inventory = {
+            name: len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
+            for name in sorted(RUN_STATE_AUTHORITY_MODULES)
+        }
+        self.assertEqual(
+            {path.name for path in PACKAGE.glob("run_state_*.py")},
+            RUN_STATE_AUTHORITY_MODULES,
+        )
+        self.assertEqual(
+            {
+                "run_state_authority.py": 243,
+                "run_state_contracts.py": 37,
+                "run_state_cursors.py": 219,
+                "run_state_holdouts.py": 236,
+                "run_state_lineage.py": 265,
+            },
+            run_state_authority_inventory,
+        )
+        self.assertLessEqual(sum(run_state_authority_inventory.values()), 1_000)
         self.assertLessEqual(
             sum(
                 len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
@@ -1112,7 +1148,8 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertLessEqual(branch_total, 8_375)
+        self.assertEqual(8_395, branch_total)
+        self.assertLessEqual(branch_total, 8_400)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)
 

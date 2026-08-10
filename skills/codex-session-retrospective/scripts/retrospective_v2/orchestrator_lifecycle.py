@@ -36,6 +36,7 @@ from .orchestrator_protocols import (
     LifecycleSourcePort,
     LifecycleStatePort,
 )
+from .run_state_holdouts import verify_shadow_daily_successor
 
 from .orchestrator_support import (
     InvalidInputError,
@@ -901,64 +902,26 @@ class RunLifecycleOperations(OrchestratorComponent):
         provenance: Mapping[str, Any],
         window: Mapping[str, str],
     ) -> dict[str, Any]:
-        fields = {
-            "authentication_tag",
-            "backfill_of",
-            "cleanup_receipt_ref",
-            "controlled_gap_receipt",
-            "coverage_receipt_ref",
-            "export_bundle_digest",
-            "history_repo",
-            "history_target_ref",
-            "host",
-            "partial_checkpoint_revision",
-            "provenance",
-            "schema",
-            "window",
-        }
-        if not isinstance(value, Mapping) or set(value) != fields:
-            raise InvalidInputError("shadow successor authorization is invalid")
-        successor = _json_copy(dict(value), label="shadow successor authorization")
-        body = {key: successor[key] for key in successor if key != "authentication_tag"}
-        expected_tag = "shadow_daily_successor_auth_v2:" + self.identity.derive_digest(
-            "shadow-daily-successor-auth-v2",
-            body,
-        )
-        expected_bindings = {
-            "backfill_of": backfill_of,
-            "controlled_gap_receipt": dict(controlled_gap_receipt),
-            "history_repo": history_repo,
-            "history_target_ref": history_target_ref,
-            "host": host,
-            "provenance": dict(provenance),
-            "window": dict(window),
-        }
-        if (
-            successor["schema"] != "shadow_daily_successor_v2"
-            or any(successor[key] != item for key, item in expected_bindings.items())
-            or not isinstance(successor["partial_checkpoint_revision"], int)
-            or isinstance(successor["partial_checkpoint_revision"], bool)
-            or successor["partial_checkpoint_revision"] < 0
-            or not isinstance(successor["export_bundle_digest"], str)
-            or _SHA256_RE.fullmatch(successor["export_bundle_digest"]) is None
-            or not isinstance(successor["coverage_receipt_ref"], str)
-            or not successor["coverage_receipt_ref"].startswith(
-                "shadow_coverage_receipt_v2:"
+        try:
+            normalized = _json_copy(
+                dict(value),
+                label="shadow successor authorization",
             )
-            or not isinstance(successor["cleanup_receipt_ref"], str)
-            or not successor["cleanup_receipt_ref"].startswith(
-                (
-                    "raw_cleanup_receipt_v2:",
-                    "raw_cleanup_receipt_v3:",
-                    "raw_cleanup_receipt_v4:",
-                    "raw_cleanup_receipt_v5:",
-                )
+            return verify_shadow_daily_successor(
+                self.identity,
+                normalized,
+                backfill_of=backfill_of,
+                controlled_gap_receipt=controlled_gap_receipt,
+                history_repo=history_repo,
+                history_target_ref=history_target_ref,
+                host=host,
+                provenance=provenance,
+                window=window,
             )
-            or not isinstance(successor["authentication_tag"], str)
-            or not hmac.compare_digest(successor["authentication_tag"], expected_tag)
-        ):
-            raise InvalidInputError("shadow successor authorization is invalid")
-        return successor
+        except (TypeError, ValueError) as error:
+            raise InvalidInputError(
+                "shadow successor authorization is invalid"
+            ) from error
 
     def export_retention_deadline(self) -> str:
         state = self._state.load_state()

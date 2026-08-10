@@ -34,7 +34,7 @@ from .authority_errors import AuthorityError as AuthorityError
 from .authority_errors import AutomationCutoverBlocked
 from .authority_errors import HistoryValidationError, ProductionMarkerError
 from .authority_errors import ProviderCacheConflict, ProviderCacheError
-from .contracts import RefType, canonical_json_bytes
+from .contracts import CANONICAL_HOSTS, RefType, canonical_json_bytes
 from .identity import IdentityKey
 from .orchestrator_core import LEGACY_SHADOW_CLEANUP_ROOTS, SHADOW_CLEANUP_ROOTS
 
@@ -1266,13 +1266,12 @@ _SOURCE_UNIT_FIELDS = {
     "explicit_gap",
     "structurally_excluded",
 }
-_PRODUCTION_HOSTS = ("local", "miku-bot-dev", "hoteng-srv-01")
 
 
 def _production_host_refs(identity: IdentityKey) -> list[str]:
     return sorted(
         str(identity.derive_ref(RefType.HOST, {"parts": [host]}))
-        for host in _PRODUCTION_HOSTS
+        for host in CANONICAL_HOSTS
     )
 
 
@@ -1574,12 +1573,14 @@ def _verify_shadow_coverage_receipt(
             or gap_hosts
             or configured != covered
             or len(covered) != 1
+            or any(item not in _production_host_refs(identity) for item in covered)
             or units["explicit_gap"] != 0
         ):
             raise ProductionMarkerError("daily backfill shadow coverage is invalid")
     elif (
         gap_ref is not None
         or gap_hosts
+        or configured != _production_host_refs(identity)
         or configured != covered
         or units["explicit_gap"] != 0
     ):

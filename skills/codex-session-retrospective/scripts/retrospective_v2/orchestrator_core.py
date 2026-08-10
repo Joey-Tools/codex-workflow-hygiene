@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 
 from .checkpoints import canonical_json_bytes
 from .contracts import (
+    CANONICAL_HOSTS,
     MAX_AGENT_CLAIM_GENERATIONS_PER_ATTEMPT,
     RunStage,
     SourceCellStatus,
@@ -17,7 +18,7 @@ from .contracts import (
 
 ENGINE_VERSION = "2.0"
 STATE_SCHEMA_VERSION = 2
-DEFAULT_HOSTS = ("local", "miku-bot-dev", "hoteng-srv-01")
+DEFAULT_HOSTS = CANONICAL_HOSTS
 REQUIRED_SOURCE_KINDS = (
     SourceKind.SESSION_INDEX.value,
     SourceKind.HISTORY.value,

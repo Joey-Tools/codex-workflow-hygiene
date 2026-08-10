@@ -86,6 +86,19 @@ Run `export` once. A shadow export cleans raw state and completes locally. For a
 production run, repeat parameterless `finalize --run-dir "$RUN"` until the
 durable commit, provider derivation, and cleanup are complete.
 
+Every `finalize` retry first authenticates the current five-host run checkpoint
+and persistent publication claim. Before any adapter action, it also rebuilds
+and compares the complete inventory of every still-present retained bundle. An
+exactly absent bundle is not accepted as pre-CAS evidence; it is usable only by
+the post-CAS durable-recovery path described below. Direct abort recovery repeats
+the claim check before it releases an adapter reservation. Before target CAS,
+`finalize` also revalidates the current retained bundle, signed history base,
+provider cache, cursor transition, and episode-head transition. If an exact
+target CAS already succeeded before a crash, recovery instead proves the bound
+adapter attempt and reachable signed history state; it does not require the
+expected history to remain at its old head or an already collected local bundle
+to reappear.
+
 `export` validates its identity, run, retained inputs, prior-period source, and
 exact destination. It never scans or garbage-collects sibling paths under the
 caller's `--output` parent. Expired-export collection is a separate internal
@@ -254,8 +267,8 @@ record and an `installed_commits` inventory containing its installed commit.
 - Session mode requires both `--session-target` and
   `--session-target-selector`; the target must equal the identity-derived
   reference for that selector. These arguments are rejected for all other
-  modes. Session runs always scan the complete canonical three-host set and all
-  four required source kinds (12 coverage cells); subsets, unknown hosts, and
+  modes. Session runs always scan the complete canonical five-host set and all
+  four required source kinds (20 coverage cells); subsets, unknown hosts, and
   partial publication are rejected. They structurally account discovered
   non-target records and reject any non-target consumed record.
 - Daily backfill requires an authenticated controlled-gap receipt; prior episode
@@ -264,7 +277,10 @@ record and an `installed_commits` inventory containing its installed commit.
 - A Daily `--allow-partial` run records an explicit missing-host holdout through
   `advance --holdout-host HOST --holdout-reason REASON`. Complete hosts advance
   their own cursors; held hosts keep their prior cursor and publish a durable
-  backlog reference for the required backfill.
+  backlog reference for the required backfill. Formal publication requires the
+  exact authenticated holdout set, reauthenticates every referenced underlying
+  transport receipt body against the checkpoint source receipts, and rejects
+  Weekly gaps or any ordinary run that would clear an existing durable backlog.
 
 Every command emits one canonical JSON object. Raw payloads never appear in CLI
 results or diagnostics. Failure objects include an allowlisted `reason_code`,

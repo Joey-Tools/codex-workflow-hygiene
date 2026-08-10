@@ -210,7 +210,7 @@ retained raw payload, and a submitted non-target consumed record is rejected.
   without staging files; claim and result transitions additionally remove their
   not-yet-committed candidate artifacts. These limits reserve the complete
   downstream pipeline before raw materialization and keep the conservative
-  cleanup inventory at no more than 260,308 entries under its fixed 300,000-entry
+  cleanup inventory at no more than 261,844 entries under its fixed 300,000-entry
   ceiling.
 - Accepted source records and raw-payload indexes live in canonical, owner-only,
   content-addressed sidecars under `raw-inputs/source-acceptances`; authenticated
@@ -248,7 +248,7 @@ retained raw payload, and a submitted non-target consumed record is rejected.
   carries the legacy full manifest or inline payload index remains readable; the
   next accepted continuation validates conflicts and migrates that index into
   the new sidecar before clearing the inline copy. A run accepts at most 64
-  continuation segments per host/source cell, 768 segments and 100,000 records
+  continuation segments per host/source cell, 1,280 segments and 100,000 records
   in total, 4 GiB of source bytes, and 256 MiB of acceptance-sidecar bytes.
   Transcript and acceptance digests derive from the compact per-record
   descriptors. Materialization reads each accepted segment once, merges payload
@@ -392,6 +392,42 @@ episode from the exact controlled missing host may create one new initial
 revision; session-only fallback matching is forbidden and every unrelated prior
 head remains unchanged. The full proposed head projection is durable state, while
 only changed or new revisions enter the review workset.
+The authenticated run checkpoint revalidates the controlled-gap receipt and its
+partial-run, canonical-host, window, and shadow bindings before the single-host
+matrix exception is granted. Formal publication repeats the same shared
+validation before deriving any durable cursor transaction. The history
+snapshot's cursor rows are the only authority for every `before` cursor; each
+proposal is derived from terminal source cells. The formal durable state must
+then equal those proposed rows plus the exact source snapshot refs,
+`backfill_of`, episode-head root, and complete episode-head list. A production
+backfill must consume the durable backlog and matching controlled-gap/head-set
+commitments; a shadow successor may derive only its authenticated run-local
+equivalent.
+
+Only an ordinary Daily run with `allow_partial=true` may publish source gaps.
+Its gap-host set must exactly equal its authenticated `controlled_holdouts` set,
+every source kind for each held host must be a gap with the receipt's exact
+transport references and reason, and every referenced transport receipt body
+must independently authenticate against the checkpoint source receipt inventory.
+Comparing only receipt references is insufficient. At least one other host must
+remain complete. Weekly gaps, mixed gap/complete cells, cross-host receipts, and
+a complete run carrying a stale holdout are rejected. An ordinary run cannot
+clear a non-null durable backlog; only the matching backfill lineage can do so.
+For shadow backfill, every checkpoint read revalidates the closed successor HMAC
+and its exact partial-run, gap, host, history, provenance, window, revision,
+coverage, cleanup, and export-digest bindings.
+
+A publication retry validates this authenticated run authority and its
+persistent claim before adapter recovery. It re-inventories every present local
+bundle and requires exact identity, content, and access-policy equality with the
+stored inventory before any adapter side effect. Direct abort recovery repeats
+the claim validation before release. While target CAS has not occurred, the
+retry also re-derives the complete journal plan from the current retained
+inventory, history base, provider cache, cursor vector, and episode update. Once
+the exact target CAS is reachable, recovery is authorized by the bound adapter
+attempt and signed durable-history projection; the expected history advance and
+a legally collected, exactly absent local bundle are not treated as
+prepublication inputs.
 
 The sole exception is a direct shadow successor derived from a completed Daily
 partial by `--shadow-successor-of`. Its authenticated shadow gap derives an

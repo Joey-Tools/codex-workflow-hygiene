@@ -1329,6 +1329,32 @@ class OrchestratorTests(unittest.TestCase):
         }
 
     def test_doctor_identity_publisher_and_all_host_policy(self) -> None:
+        expected_hosts = (
+            "local",
+            "BL-mac-mini-m4-hoteng",
+            "miku-bot-dev",
+            "hoteng-srv-01",
+            "codex-hoteng-srv-01",
+        )
+        self.assertEqual(expected_hosts, contracts.CANONICAL_HOSTS)
+        self.assertEqual(expected_hosts, DEFAULT_HOSTS)
+        self.assertEqual(
+            expected_hosts[1:],
+            contracts.CANONICAL_REMOTE_HOSTS,
+        )
+        self.assertEqual(
+            len(expected_hosts)
+            * len(REQUIRED_SOURCE_KINDS)
+            * contracts.MAX_SOURCE_ACCEPTANCE_SEGMENTS_PER_CELL,
+            contracts.MAX_RUN_SOURCE_SEGMENTS,
+        )
+        self.assertEqual(
+            sorted(
+                str(self.identity.derive_ref(RefType.HOST, {"parts": [host]}))
+                for host in expected_hosts
+            ),
+            authority._production_host_refs(self.identity),
+        )
         readiness = doctor(
             identity_path=self.identity_path,
             require_existing_identity=True,
@@ -1350,6 +1376,10 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertTrue(readiness["checks"]["durable_history_contract"]["ok"])
         self.assertTrue(readiness["checks"]["remote_host_context_transport"]["ok"])
+        self.assertEqual(
+            "5 canonical hosts",
+            readiness["checks"]["canonical_host_policy"]["detail"],
+        )
 
         production = doctor(
             identity_path=self.identity_path,
@@ -1468,6 +1498,12 @@ class OrchestratorTests(unittest.TestCase):
             session_target_selector=session_selector,
             **self.start_authority(),
         )
+        session_state = session.load_state()
+        self.assertEqual(set(expected_hosts), set(session_state["host_refs"]))
+        self.assertEqual(
+            len(expected_hosts) * len(REQUIRED_SOURCE_KINDS),
+            sum(len(cells) for cells in session_state["source"]["cells"].values()),
+        )
 
         def swap_host_bindings(current):
             left, right = DEFAULT_HOSTS[:2]
@@ -1514,6 +1550,41 @@ class OrchestratorTests(unittest.TestCase):
                     return current, None
 
                 checkpoint.store.transaction(tamper)
+                with self.assertRaisesRegex(
+                    InvalidTransitionError,
+                    "canonical source matrix",
+                ):
+                    checkpoint.status()
+
+        legacy_hosts = {"local", "miku-bot-dev", "hoteng-srv-01"}
+        for label, mode, start, end in (
+            ("daily", RunMode.DAILY, WINDOW_START, DAILY_END),
+            ("weekly", RunMode.WEEKLY, WINDOW_START, WINDOW_END),
+            (
+                "baseline",
+                RunMode.BASELINE,
+                "2026-04-08T00:00:00Z",
+                DAILY_END,
+            ),
+        ):
+            with self.subTest(legacy_checkpoint=label):
+                checkpoint = self.coordinator(f"legacy-host-checkpoint-{label}")
+                checkpoint.start(
+                    mode=mode,
+                    start=start,
+                    end=end,
+                    hosts=DEFAULT_HOSTS,
+                    **self.start_authority(),
+                )
+
+                def retain_legacy_hosts(current):
+                    for host in set(current["host_refs"]) - legacy_hosts:
+                        current["host_refs"].pop(host)
+                        current["source"]["cells"].pop(host)
+                        current["cursors"].pop(host)
+                    return current, None
+
+                checkpoint.store.transaction(retain_legacy_hosts)
                 with self.assertRaisesRegex(
                     InvalidTransitionError,
                     "canonical source matrix",
@@ -2742,6 +2813,20 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(expected_backlog, lineage.expected_backlog_ref)
         self.assertIsNone(lineage.proposed_backlog_ref)
 
+        def corrupt_authenticated_backfill_binding(current):
+            current["lineage"]["backfill_of"] = typed_ref(
+                RefType.RUN,
+                "different-partial-run",
+            )
+            return current, None
+
+        backfill.store.transaction(corrupt_authenticated_backfill_binding)
+        with self.assertRaisesRegex(
+            InvalidTransitionError,
+            "backfill authority is invalid",
+        ):
+            backfill.status()
+
     def test_shadow_backfill_derives_run_local_backlog_without_production_state(
         self,
     ) -> None:
@@ -2808,6 +2893,40 @@ class OrchestratorTests(unittest.TestCase):
             expected_backlog,
             state["lineage"]["expected_backlog_ref"],
         )
+
+        def remove_successor(current: dict[str, object]) -> None:
+            current["lineage"]["shadow_successor"] = None
+
+        def tamper_successor(current: dict[str, object]) -> None:
+            current["lineage"]["shadow_successor"]["coverage_receipt_ref"] = (
+                "shadow_coverage_receipt_v2:" + "0" * 64
+            )
+
+        for label, mutation in {
+            "missing": remove_successor,
+            "tampered": tamper_successor,
+        }.items():
+            with self.subTest(persisted_successor=label):
+                persisted = self.start_daily(
+                    f"shadow-backfill-persisted-{label}",
+                    hosts=(REMOTE_HOST,),
+                    backfill_of=partial_state["run_ref"],
+                    controlled_gap_receipt=held["controlled_gap_receipt"],
+                    shadow_successor=successor,
+                    shadow=True,
+                    durable_history=self.durable_history(),
+                )
+
+                def splice(current: dict[str, object]):
+                    mutation(current)
+                    return current, None
+
+                persisted.store.transaction(splice)
+                with self.assertRaisesRegex(
+                    InvalidTransitionError,
+                    "shadow successor authorization",
+                ):
+                    persisted.status()
 
     def test_controlled_source_gap_cannot_authorize_agent_gap(self) -> None:
         coordinator = self.start_daily(

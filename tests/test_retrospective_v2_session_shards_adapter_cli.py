@@ -129,12 +129,6 @@ class SessionShardsAdapterCliTests(unittest.TestCase):
             return_value=history,
         )
         self.history_patch.start()
-        self.host_policy_patch = mock.patch.object(
-            orchestrator_module,
-            "DEFAULT_HOSTS",
-            ("local",),
-        )
-        self.host_policy_patch.start()
         self.run_dir = self.root / "run"
         self.coordinator = RetrospectiveOrchestrator(
             self.run_dir,
@@ -145,18 +139,24 @@ class SessionShardsAdapterCliTests(unittest.TestCase):
             mode="daily",
             start=WINDOW_START,
             end=WINDOW_END,
-            hosts=("local",),
+            hosts=orchestrator_module.DEFAULT_HOSTS,
             created_at=self.created_at,
             history_repo=self.root / "history",
             history_target_ref="refs/heads/main",
             provenance=execution_provenance(),
+            allow_partial=True,
             shadow=True,
         )
+        for host in orchestrator_module.DEFAULT_HOSTS:
+            if host != "local":
+                self.coordinator.holdout_host(
+                    host,
+                    reason="shadow_missing_host_holdout",
+                )
         self.environment = dict(os.environ)
         self.environment["HOME"] = str(self.home)
 
     def tearDown(self) -> None:
-        self.host_policy_patch.stop()
         self.history_patch.stop()
         self.temporary.cleanup()
 
@@ -172,7 +172,11 @@ class SessionShardsAdapterCliTests(unittest.TestCase):
 
     def advance_to_active_rollout(self) -> dict[str, object]:
         for _ in range(20):
-            leases = self.coordinator.status()["active_source_leases"]
+            leases = [
+                lease
+                for lease in self.coordinator.status()["active_source_leases"]
+                if lease["host"] == "local"
+            ]
             if not leases:
                 self.coordinator.advance()
                 continue

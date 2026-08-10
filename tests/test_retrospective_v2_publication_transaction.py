@@ -27,14 +27,21 @@ import session_retrospective_v2 as cli_module  # noqa: E402
 from retrospective_v2 import (  # noqa: E402
     authority,
     calibration,
+    controlled_gaps,
     finalize as finalize_module,
     git_safety,
     orchestrator as orchestrator_module,
     publication_git_commits,
     publication_support,
     safe_io,
+    transport,
 )
-from retrospective_v2.contracts import RefType, RunStage  # noqa: E402
+from retrospective_v2.contracts import (  # noqa: E402
+    RefType,
+    RunStage,
+    SourceCellStatus,
+    SourceKind,
+)
 from retrospective_v2.checkpoints import CheckpointIntegrityError  # noqa: E402
 from retrospective_v2.export import (  # noqa: E402
     ExportConflictError,
@@ -1027,7 +1034,7 @@ class DurablePublicationTests(unittest.TestCase):
         return coordinator, coverage, cleanup
 
     def build_shadow_gate_evidence(self) -> list[dict[str, object]]:
-        production_hosts = ("local", "miku-bot-dev", "hoteng-srv-01")
+        production_hosts = orchestrator_module.DEFAULT_HOSTS
         weekly_evidence: list[dict[str, object]] = []
         for index, start, end in (
             (1, "2026-06-22T00:00:00Z", "2026-06-29T00:00:00Z"),
@@ -1088,6 +1095,11 @@ class DurablePublicationTests(unittest.TestCase):
         name: str,
         *,
         shadow: bool = False,
+        allow_partial: bool = False,
+        holdout_host: str | None = None,
+        hosts: tuple[str, ...] = orchestrator_module.DEFAULT_HOSTS,
+        backfill_of: str | None = None,
+        controlled_gap_receipt: Mapping[str, object] | None = None,
         bind_export: bool = True,
         persist_descriptor: bool = False,
     ) -> tuple[RetrospectiveOrchestrator, Path]:
@@ -1101,7 +1113,10 @@ class DurablePublicationTests(unittest.TestCase):
             mode="daily",
             start=WINDOW_START,
             end=WINDOW_END,
-            hosts=orchestrator_module.DEFAULT_HOSTS,
+            hosts=hosts,
+            allow_partial=allow_partial,
+            backfill_of=backfill_of,
+            controlled_gap_receipt=controlled_gap_receipt,
             provenance=self.provenance,
             shadow=shadow,
             created_at="2026-07-15T00:00:00Z",
@@ -1112,7 +1127,14 @@ class DurablePublicationTests(unittest.TestCase):
             publisher_fingerprint=self.fingerprint,
             publisher_gnupg_home=self.gnupg_home,
         )
-        for _ in range(40):
+        if holdout_host is not None:
+            coordinator.holdout_host(
+                holdout_host,
+                reason=(
+                    "shadow_missing_host_holdout" if shadow else "missing_host_holdout"
+                ),
+            )
+        for _ in range(80):
             status = coordinator.status()
             if status["stage"] == RunStage.EXPORT.value:
                 break
@@ -1128,9 +1150,42 @@ class DurablePublicationTests(unittest.TestCase):
                         ),
                     )
             else:
+                agent_jobs = [
+                    job for job in status["runnable_jobs"] if job["category"] == "agent"
+                ]
+                if agent_jobs:
+                    for job in agent_jobs:
+                        dispatcher_ref = str(
+                            self.identity.derive_ref(
+                                RefType.LEASE,
+                                {
+                                    "parts": [
+                                        "publication-test-dispatcher",
+                                        job["job_ref"],
+                                    ]
+                                },
+                            )
+                        )
+                        claimed = coordinator.claim_agent_job(
+                            job["job_ref"],
+                            job["active_attempt_ref"],
+                            dispatcher_ref,
+                        )
+                        coordinator.accept_agent_result(
+                            job["job_ref"],
+                            job["active_attempt_ref"],
+                            synthesis_result(),
+                            claim_ref=claimed["claim_ref"],
+                            result_ref=claimed["result_ref"],
+                        )
+                    continue
                 coordinator.advance()
         else:
-            self.fail("run did not become exportable")
+            self.fail(
+                "run did not become exportable: "
+                f"stage={status['stage']} blocked={status['blocked_reason']} "
+                f"next={status['next_actions']}"
+            )
 
         state = coordinator.load_state()
         run_state, review_data = cli_module._retained_inputs(coordinator, state)
@@ -1584,6 +1639,348 @@ class DurablePublicationTests(unittest.TestCase):
                 journal_name="open-job.json",
             )
 
+        legacy, legacy_bundle = self.build_exportable_run("legacy-host-matrix")
+        legacy_state = legacy.load_state()
+        legacy_destination = self.destination(legacy_state)
+        legacy_expected_head = legacy_state["authority"]["history_snapshot"][
+            "history_commit"
+        ]
+        legacy_hosts = {"local", "miku-bot-dev", "hoteng-srv-01"}
+
+        def retain_legacy_hosts(state: dict[str, object]):
+            for host in set(state["host_refs"]) - legacy_hosts:
+                state["host_refs"].pop(host)
+                state["source"]["cells"].pop(host)
+                state["cursors"].pop(host)
+            return state, None
+
+        legacy.store.transaction(retain_legacy_hosts)
+        with self.assertRaisesRegex(PublicationRejected, "canonical source matrix"):
+            PublicationTransaction.create(
+                legacy.run_dir / "legacy-host-matrix.json",
+                bundle_dir=legacy_bundle,
+                destination=legacy_destination,
+                target_ref=TARGET_REF,
+                expected_target_head=legacy_expected_head,
+                run_dir=legacy.run_dir,
+                identity_path=self.identity_path,
+                adapter=self.adapter,
+            )
+
+    def test_formal_publication_rejects_authenticated_cursor_forgery(self) -> None:
+        mutations = {
+            "history-start": lambda state, host: state["cursors"][host].update(
+                {
+                    "before": {
+                        "backlog_head": None,
+                        "cursor": str(
+                            self.identity.derive_ref(
+                                RefType.SOURCE,
+                                {"parts": ["forged-start-cursor"]},
+                            )
+                        ),
+                        "logical_boundary": WINDOW_START,
+                    }
+                }
+            ),
+            "source-proposal": lambda state, host: state["cursors"][host][
+                "proposed"
+            ].update(
+                {
+                    "source_snapshot_ref": str(
+                        self.identity.derive_ref(
+                            RefType.SOURCE,
+                            {"parts": ["forged-source-proposal"]},
+                        )
+                    )
+                }
+            ),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(case=label):
+                coordinator, bundle = self.build_exportable_run(
+                    f"forged-cursor-{label}"
+                )
+                state = coordinator.load_state()
+                host = "codex-hoteng-srv-01"
+
+                def forge(current: dict[str, object]):
+                    mutation(current, host)
+                    return current, None
+
+                coordinator.store.transaction(forge)
+                journal = coordinator.run_dir / f"{label}.json"
+                with self.assertRaisesRegex(
+                    PublicationRejected,
+                    "cursor start|cursor proposal",
+                ):
+                    PublicationTransaction.create(
+                        journal,
+                        bundle_dir=bundle,
+                        destination=self.destination(state),
+                        target_ref=TARGET_REF,
+                        expected_target_head=state["authority"]["history_snapshot"][
+                            "history_commit"
+                        ],
+                        run_dir=coordinator.run_dir,
+                        identity_path=self.identity_path,
+                        adapter=self.adapter,
+                    )
+                self.assertFalse(journal.exists())
+
+    def test_formal_publication_rejects_ordinary_durable_backlog(self) -> None:
+        coordinator, bundle = self.build_exportable_run("ordinary-backlog-splice")
+        state = coordinator.load_state()
+        host = "miku-bot-dev"
+        host_ref = state["host_refs"][host]
+        backlog_ref = str(
+            self.identity.derive_ref(
+                RefType.RUN_INPUT,
+                {"parts": ["unrelated-partial", host_ref, "publication_backlog"]},
+            )
+        )
+
+        def splice_backlog(current: dict[str, object]):
+            current["authority"]["history_snapshot"]["cursor_rows"].append(
+                {
+                    "backlog_ref": backlog_ref,
+                    "cursor_ref": None,
+                    "host_ref": host_ref,
+                    "logical_boundary": None,
+                }
+            )
+            return current, None
+
+        coordinator.store.transaction(splice_backlog)
+        journal = coordinator.run_dir / "ordinary-backlog-splice.json"
+        with self.assertRaisesRegex(PublicationRejected, "durable backlog"):
+            PublicationTransaction.create(
+                journal,
+                bundle_dir=bundle,
+                destination=self.destination(state),
+                target_ref=TARGET_REF,
+                expected_target_head=state["authority"]["history_snapshot"][
+                    "history_commit"
+                ],
+                run_dir=coordinator.run_dir,
+                identity_path=self.identity_path,
+                adapter=self.adapter,
+            )
+        self.assertFalse(journal.exists())
+
+    def test_formal_gaps_require_exact_daily_holdout_authority(self) -> None:
+        coordinator, bundle = self.build_exportable_run(
+            "formal-holdout-authority",
+            allow_partial=True,
+            holdout_host="miku-bot-dev",
+        )
+        original = coordinator.load_state()
+        gap_receipt = copy.deepcopy(original["controlled_holdouts"]["miku-bot-dev"])
+
+        def missing(current: dict[str, object]) -> None:
+            current["controlled_holdouts"] = {}
+
+        def cross_host(current: dict[str, object]) -> None:
+            current["controlled_holdouts"] = {"local": copy.deepcopy(gap_receipt)}
+
+        def weekly(current: dict[str, object]) -> None:
+            current["mode"] = "weekly"
+
+        def complete_receipt(current: dict[str, object]) -> None:
+            host = "miku-bot-dev"
+            cell = current["source"]["cells"][host][SourceKind.HISTORY.value]
+            existing = transport.TransportReceipt.from_dict(cell["transport_receipt"])
+            observed = existing.source_snapshot
+            snapshot = transport.AuthoritativeSourceSnapshot.create(
+                host_ref=observed.host_ref,
+                source_kind=observed.source_kind,
+                window_start=observed.window_start,
+                window_end=observed.window_end,
+                session_target=observed.session_target,
+                source_content_commitment=observed.source_content_commitment,
+                source_byte_count=0,
+                terminal_byte_offset=0,
+                catalog_record_count=0,
+                catalog_byte_count=0,
+                catalog_commitment=observed.transcript_commitment,
+                transcript_commitment=observed.transcript_commitment,
+                terminal_proof_commitment=observed.terminal_proof_commitment,
+                terminal_status=SourceCellStatus.NO_ACTIVITY,
+                terminal_reason="source_enumeration_complete",
+                complete=True,
+                resume_position=None,
+            )
+            unsigned = replace(
+                existing,
+                receipt_ref=transport.TRANSPORT_RECEIPT_REF_PREFIX + "0" * 64,
+                source_snapshot=snapshot,
+            )
+            forged = replace(
+                unsigned,
+                receipt_ref=transport.TRANSPORT_RECEIPT_REF_PREFIX
+                + self.identity.derive_digest(
+                    "source-transport-receipt/v2",
+                    unsigned.unsigned_dict(),
+                ),
+            )
+            cell["transport_receipt"] = forged.to_dict()
+            cell["transport_receipt_ref"] = forged.receipt_ref
+            current["controlled_holdouts"][host] = (
+                controlled_gaps.issue_controlled_gap_receipt(
+                    self.identity,
+                    run_ref=current["run_ref"],
+                    host=host,
+                    host_ref=current["host_refs"][host],
+                    source_kinds=[
+                        SourceKind(item) for item in current["source"]["cells"][host]
+                    ],
+                    window_start=current["window"]["start"],
+                    window_end=current["window"]["end"],
+                    reason="missing_host_holdout",
+                    shadow=False,
+                    source_receipt_refs=[
+                        item["transport_receipt_ref"]
+                        for item in current["source"]["cells"][host].values()
+                    ],
+                ).to_dict()
+            )
+
+        for label, mutation in {
+            "complete-receipt": complete_receipt,
+            "missing": missing,
+            "cross-host": cross_host,
+            "weekly": weekly,
+        }.items():
+            with self.subTest(case=label):
+
+                def tamper(current: dict[str, object]):
+                    mutation(current)
+                    return current, None
+
+                coordinator.store.transaction(tamper)
+                journal = coordinator.run_dir / f"formal-holdout-{label}.json"
+                with self.assertRaisesRegex(
+                    PublicationRejected,
+                    "controlled holdout authority",
+                ):
+                    PublicationTransaction.create(
+                        journal,
+                        bundle_dir=bundle,
+                        destination=self.destination(original),
+                        target_ref=TARGET_REF,
+                        expected_target_head=original["authority"]["history_snapshot"][
+                            "history_commit"
+                        ],
+                        run_dir=coordinator.run_dir,
+                        identity_path=self.identity_path,
+                        adapter=self.adapter,
+                    )
+                self.assertFalse(journal.exists())
+
+                def restore(current: dict[str, object]):
+                    current.clear()
+                    current.update(copy.deepcopy(original))
+                    return current, None
+
+                coordinator.store.transaction(restore)
+
+    def test_formal_publication_rejects_backfill_lineage_splice(self) -> None:
+        host = "miku-bot-dev"
+        partial, partial_bundle = self.build_exportable_run(
+            "backfill-lineage-partial",
+            allow_partial=True,
+            holdout_host=host,
+        )
+        partial_state = partial.load_state()
+        self.publish(self.transaction(partial, partial_bundle))
+        gap = partial_state["controlled_holdouts"][host]
+        coordinator, bundle = self.build_exportable_run(
+            "backfill-lineage-splice",
+            hosts=(host,),
+            backfill_of=partial_state["run_ref"],
+            controlled_gap_receipt=gap,
+        )
+        state = coordinator.load_state()
+
+        def splice(current: dict[str, object]):
+            lineage = current["lineage"]
+            forged = controlled_gaps.issue_backfill_lineage_receipt(
+                self.identity,
+                controlled_gap_receipt=lineage["controlled_gap_receipt"],
+                expected_episode_head_set_ref=lineage["expected_episode_head_set_ref"],
+                proposed_episode_head_set_ref=str(
+                    self.identity.derive_ref(
+                        RefType.EPISODE_HEAD_SET,
+                        {"parts": ["spliced-proposed-head-set"]},
+                    )
+                ),
+                prior_episode_heads=lineage["prior_episode_heads"],
+                proposed_episode_heads=lineage["proposed_episode_heads"],
+                expected_backlog_ref=lineage["expected_backlog_ref"],
+            )
+            lineage["backfill_lineage_receipt"] = forged.to_dict()
+            return current, None
+
+        coordinator.store.transaction(splice)
+        journal = coordinator.run_dir / "backfill-lineage-splice.json"
+        history_head = self.head()
+        with self.assertRaisesRegex(
+            PublicationRejected,
+            "formal backfill lineage does not bind durable publication state",
+        ):
+            PublicationTransaction.create(
+                journal,
+                bundle_dir=bundle,
+                destination=self.destination(state),
+                target_ref=TARGET_REF,
+                expected_target_head=state["authority"]["history_snapshot"][
+                    "history_commit"
+                ],
+                run_dir=coordinator.run_dir,
+                identity_path=self.identity_path,
+                adapter=self.adapter,
+            )
+        self.assertFalse(journal.exists())
+        self.assertEqual(history_head, self.head())
+
+    def test_pre_promotion_resume_revalidates_current_run_authority(self) -> None:
+        coordinator, bundle = self.build_exportable_run("legacy-resume-matrix")
+
+        def crash(point, _state):
+            if point == "promote.after_target_cas":
+                raise RuntimeError("simulated target CAS crash")
+
+        transaction = self.transaction(
+            coordinator,
+            bundle,
+            adapter=self.publication_adapter(failure_injector=crash),
+        )
+        transaction.prepare()
+        transaction.stage()
+        transaction.seal()
+        transaction.close_compliance()
+        with self.assertRaisesRegex(RuntimeError, "target CAS crash"):
+            transaction.promote()
+        published_head = self.head()
+        legacy_hosts = {"local", "miku-bot-dev", "hoteng-srv-01"}
+
+        def retain_legacy_hosts(state: dict[str, object]):
+            for host in set(state["host_refs"]) - legacy_hosts:
+                state["host_refs"].pop(host)
+                state["source"]["cells"].pop(host)
+                state["cursors"].pop(host)
+            return state, None
+
+        coordinator.store.transaction(retain_legacy_hosts)
+        with self.assertRaisesRegex(PublicationRejected, "canonical source matrix"):
+            PublicationTransaction.open(
+                transaction.journal_path,
+                adapter=self.adapter,
+                expected_attempt_ref=transaction.attempt_ref,
+            )
+        self.assertEqual("compliance_closed", transaction.status()["phase"])
+        self.assertEqual(published_head, self.head())
+
     def test_existing_journal_is_bound_to_current_run_before_claim(self) -> None:
         original, original_bundle = self.build_exportable_run("journal-original")
         original_state = original.load_state()
@@ -1854,6 +2251,120 @@ class DurablePublicationTests(unittest.TestCase):
                 automation_cutover_record=self.automation_cutover_record,
                 installed_commits=(self.base_head,),
             )
+
+        legacy_daily = copy.deepcopy(
+            next(item for item in self.shadow_evidence if item["mode"] == "weekly")[
+                "coverage_receipts"
+            ][0]
+        )
+        legacy_hosts = ("local", "miku-bot-dev", "hoteng-srv-01")
+        legacy_host_refs = sorted(
+            str(self.identity.derive_ref(RefType.HOST, {"parts": [host]}))
+            for host in legacy_hosts
+        )
+        legacy_daily.update(
+            {
+                "configured_host_refs": legacy_host_refs,
+                "covered_host_refs": legacy_host_refs,
+                "gap_host_refs": [],
+                "mode": "daily",
+                "source_units": {
+                    "consumed_candidate": 12,
+                    "expected": 12,
+                    "explicit_gap": 0,
+                    "structurally_excluded": 0,
+                },
+            }
+        )
+        (
+            legacy_daily["source_snapshot_refs"],
+            legacy_daily["source_receipt_refs"],
+            legacy_daily["source_evidence_commitment"],
+        ) = authority._shadow_source_evidence(
+            self.identity,
+            run_ref=legacy_daily["run_ref"],
+            window_start=legacy_daily["window_start"],
+            window_end=legacy_daily["window_end"],
+            configured_host_refs=legacy_daily["configured_host_refs"],
+            covered_host_refs=legacy_daily["covered_host_refs"],
+            gap_host_refs=legacy_daily["gap_host_refs"],
+            source_units=legacy_daily["source_units"],
+            source_snapshot_refs=legacy_daily["source_snapshot_refs"],
+            source_receipt_refs=legacy_daily["source_receipt_refs"],
+        )
+        legacy_body = {
+            key: value
+            for key, value in legacy_daily.items()
+            if key not in {"authentication_tag", "receipt_ref"}
+        }
+        legacy_daily["receipt_ref"] = (
+            "shadow_coverage_receipt_v2:"
+            + self.identity.derive_digest("shadow_coverage_receipt_v2", legacy_body)
+        )
+        legacy_daily["authentication_tag"] = (
+            "shadow_coverage_auth_v2:"
+            + self.identity.derive_digest("shadow_coverage_auth_v2", legacy_body)
+        )
+        with self.assertRaisesRegex(
+            authority.ProductionMarkerError,
+            "daily complete shadow coverage is invalid",
+        ):
+            authority.verify_shadow_coverage_receipt(
+                self.identity,
+                legacy_daily,
+            )
+
+        unknown_backfill = copy.deepcopy(
+            next(
+                item
+                for item in next(
+                    item for item in self.shadow_evidence if item["mode"] == "daily"
+                )["coverage_receipts"]
+                if item["backfill_of"] is not None
+            )
+        )
+        unknown_host_ref = str(
+            self.identity.derive_ref(
+                RefType.HOST,
+                {"parts": ["unknown-retrospective-host"]},
+            )
+        )
+        unknown_backfill["configured_host_refs"] = [unknown_host_ref]
+        unknown_backfill["covered_host_refs"] = [unknown_host_ref]
+        (
+            unknown_backfill["source_snapshot_refs"],
+            unknown_backfill["source_receipt_refs"],
+            unknown_backfill["source_evidence_commitment"],
+        ) = authority._shadow_source_evidence(
+            self.identity,
+            run_ref=unknown_backfill["run_ref"],
+            window_start=unknown_backfill["window_start"],
+            window_end=unknown_backfill["window_end"],
+            configured_host_refs=unknown_backfill["configured_host_refs"],
+            covered_host_refs=unknown_backfill["covered_host_refs"],
+            gap_host_refs=unknown_backfill["gap_host_refs"],
+            source_units=unknown_backfill["source_units"],
+            source_snapshot_refs=unknown_backfill["source_snapshot_refs"],
+            source_receipt_refs=unknown_backfill["source_receipt_refs"],
+        )
+        unknown_body = {
+            key: value
+            for key, value in unknown_backfill.items()
+            if key not in {"authentication_tag", "receipt_ref"}
+        }
+        unknown_backfill["receipt_ref"] = (
+            "shadow_coverage_receipt_v2:"
+            + self.identity.derive_digest("shadow_coverage_receipt_v2", unknown_body)
+        )
+        unknown_backfill["authentication_tag"] = (
+            "shadow_coverage_auth_v2:"
+            + self.identity.derive_digest("shadow_coverage_auth_v2", unknown_body)
+        )
+        with self.assertRaisesRegex(
+            authority.ProductionMarkerError,
+            "daily backfill shadow coverage is invalid",
+        ):
+            authority.verify_shadow_coverage_receipt(self.identity, unknown_backfill)
 
         forged = json.loads(json.dumps(self.marker))
         daily = next(
@@ -3167,6 +3678,106 @@ class DurablePublicationTests(unittest.TestCase):
         self.assertEqual("committed", recovered.status()["phase"])
         self.assertEqual(1, self.load_history().provider_revision)
 
+    def test_target_cas_recovery_rejects_present_bundle_drift_before_adapter(
+        self,
+    ) -> None:
+        for label, preinspect in (("direct", False), ("after-preinspect", True)):
+            with self.subTest(case=label):
+                coordinator, bundle = self.build_exportable_run(
+                    f"target-cas-present-drift-{label}"
+                )
+
+                def crash(point, _state):
+                    if point == "promote.after_target_cas":
+                        raise RuntimeError("simulated target CAS crash")
+
+                transaction = self.transaction(
+                    coordinator,
+                    bundle,
+                    adapter=self.publication_adapter(failure_injector=crash),
+                )
+                transaction.prepare()
+                transaction.stage()
+                transaction.seal()
+                transaction.close_compliance()
+                with self.assertRaisesRegex(RuntimeError, "target CAS crash"):
+                    transaction.promote()
+                if preinspect:
+                    PublicationTransaction.inspect_local_for_run(
+                        transaction.journal_path,
+                        bundle_dir=bundle,
+                        destination=self.destination(coordinator.load_state()),
+                        target_ref=TARGET_REF,
+                        expected_target_head=transaction.status()["plan"][
+                            "expected_target_head"
+                        ],
+                        run_dir=coordinator.run_dir,
+                        identity_path=self.identity_path,
+                    )
+                replacement = bundle.with_name(f"{bundle.name}-replacement")
+                shutil.copytree(bundle, replacement)
+                shutil.rmtree(bundle)
+                bundle.symlink_to(replacement, target_is_directory=True)
+                adapter = self.publication_adapter()
+                with (
+                    mock.patch.object(
+                        adapter,
+                        "promote",
+                        wraps=adapter.promote,
+                    ) as promote,
+                    self.assertRaises(finalize_module.ArtifactValidationError),
+                ):
+                    PublicationTransaction.open(
+                        transaction.journal_path,
+                        adapter=adapter,
+                        expected_attempt_ref=transaction.attempt_ref,
+                    )
+                promote.assert_not_called()
+                bundle.unlink()
+                os.replace(replacement, bundle)
+                recovered = PublicationTransaction.open(
+                    transaction.journal_path,
+                    adapter=adapter,
+                    expected_attempt_ref=transaction.attempt_ref,
+                )
+                recovered.commit()
+
+    def test_finalize_cli_recovers_target_cas_after_local_export_collection(
+        self,
+    ) -> None:
+        coordinator, bundle = self.build_exportable_run(
+            "target-cas-cli-bundle-collected",
+            persist_descriptor=True,
+        )
+
+        def crash(point, _state):
+            if point == "promote.after_target_cas":
+                raise RuntimeError("simulated target CAS crash")
+
+        transaction = self.transaction(
+            coordinator,
+            bundle,
+            adapter=self.publication_adapter(failure_injector=crash),
+        )
+        transaction.prepare()
+        transaction.stage()
+        transaction.seal()
+        transaction.close_compliance()
+        with self.assertRaisesRegex(RuntimeError, "target CAS crash"):
+            transaction.promote()
+        publication_tip = self.head()
+        sidecar = bundle.with_name(f".{bundle.name}.retention-v2.json")
+        shutil.rmtree(bundle)
+        sidecar.unlink()
+
+        finalized = self.finalize_cli(coordinator)
+
+        self.assertEqual("committed", finalized.result["transaction_phase"])
+        self.assertEqual(RunStage.COMPLETE.value, finalized.result["stage"])
+        self.assertEqual(publication_tip, self.load_history().publication_commit)
+        self.assertFalse(bundle.exists())
+        self.assertFalse(sidecar.exists())
+
     def test_target_cas_recovery_advances_cache_below_unrelated_successor(
         self,
     ) -> None:
@@ -3454,6 +4065,75 @@ class DurablePublicationTests(unittest.TestCase):
             expected_attempt_ref=transaction.attempt_ref,
         )
         self.assertEqual("committed", reopened.status()["phase"])
+
+    def test_abort_recovery_validates_checkpoint_and_claim_before_adapter(self) -> None:
+        coordinator, bundle = self.build_exportable_run("abort-claim-authority")
+        transaction = self.transaction(coordinator, bundle)
+        transaction.prepare()
+        transaction.abort("test_requested_abort")
+        original = coordinator.load_state()
+
+        def remove_host(current: dict[str, object]) -> None:
+            host = "codex-hoteng-srv-01"
+            current["host_refs"].pop(host)
+            current["source"]["cells"].pop(host)
+            current["cursors"].pop(host)
+
+        def tamper_claim(current: dict[str, object]) -> None:
+            current["publication"]["publication_claim"]["plan_digest"] = "0" * 64
+
+        for label, mutation in {
+            "checkpoint": remove_host,
+            "claim": tamper_claim,
+        }.items():
+            with self.subTest(case=label):
+
+                def tamper(current: dict[str, object]):
+                    mutation(current)
+                    return current, None
+
+                coordinator.store.transaction(tamper)
+                adapter = mock.Mock()
+                transaction._adapter = adapter
+                with self.assertRaises(PublicationRejected):
+                    transaction.recover_abort()
+                self.assertEqual([], adapter.mock_calls)
+                with self.assertRaises(PublicationRejected):
+                    PublicationTransaction.open(
+                        transaction.journal_path,
+                        adapter=adapter,
+                        expected_attempt_ref=transaction.attempt_ref,
+                    )
+                self.assertEqual([], adapter.mock_calls)
+
+                def restore(current: dict[str, object]):
+                    current.clear()
+                    current.update(copy.deepcopy(original))
+                    return current, None
+
+                coordinator.store.transaction(restore)
+
+    def test_pending_abort_direct_recovery_validates_claim_before_adapter(self) -> None:
+        coordinator, bundle = self.build_exportable_run("abort-pending-claim-authority")
+        transaction = self.transaction(coordinator, bundle)
+        transaction.prepare()
+        transaction._mark_abort_pending(
+            "test_requested_abort",
+            details={},
+            receipts={},
+            action="abort_pending",
+        )
+
+        def tamper(current: dict[str, object]):
+            current["publication"]["publication_claim"]["plan_digest"] = "0" * 64
+            return current, None
+
+        coordinator.store.transaction(tamper)
+        adapter = mock.Mock()
+        transaction._adapter = adapter
+        with self.assertRaises(PublicationRejected):
+            transaction.recover_abort()
+        self.assertEqual([], adapter.mock_calls)
 
     def test_pre_reservation_abort_recovers_lost_cleanup_responses_exactly_once(
         self,

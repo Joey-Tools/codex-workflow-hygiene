@@ -1095,14 +1095,14 @@ class SourceTransportProtocolTests(unittest.TestCase):
             ):
                 self._first_lease(coordinator)
 
-        state = coordinator.load_state()
-        self.assertEqual({}, state["jobs"])
-        self.assertTrue(
-            all(
-                cell["status"] == "pending"
-                for cell in state["source"]["cells"]["remote"].values()
+            state = coordinator.load_state()
+            self.assertEqual({}, state["jobs"])
+            self.assertTrue(
+                all(
+                    cell["status"] == "pending"
+                    for cell in state["source"]["cells"]["remote"].values()
+                )
             )
-        )
 
     def test_remote_helper_launch_rejects_snapshot_changed_after_command_binding(
         self,

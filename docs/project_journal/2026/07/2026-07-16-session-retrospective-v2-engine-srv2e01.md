@@ -1084,3 +1084,171 @@ superseded_by:
   unchanged at
   `6a014d01dba3b7a22713603aeb36ea3c816080715b66e8a9270c66c0589eadf3`;
   this evidence-only journal update is the sole subsequent edit.
+- Signed head `bb6d3a7` passed exact-secret admission and exact-head hosted CI,
+  then its fresh whole-range Codex review found that runtime and durable authority
+  independently treated only three of the five `$remote-host-context` machines as
+  canonical. That head's review finding remains valid, while its clean CI and
+  admission evidence are superseded for delivery. The repair derives runtime,
+  authority, and run-level source-segment capacity from one five-host role
+  inventory and adds exact matrix/ref/capacity regressions.
+- Two independent precommit audits then found that internally consistent legacy
+  three-host checkpoints and complete Daily shadow receipts could still bypass
+  the new inventory, while the normative CLI reference still described 12 source
+  cells. The follow-up revalidates every run checkpoint against the canonical
+  inventory, retaining only the authenticated single-host Daily-backfill shape;
+  requires ordinary complete Daily shadow evidence to cover the current
+  production host refs; rejects legacy subset evidence; and documents five hosts
+  and 20 source cells.
+- Focused host-policy, production-backfill, and shadow-backfill tests pass 3/3 in
+  10.627 seconds; the authorized host publication regression passes 1/1 in
+  28.490 seconds; module boundaries pass 18/18 in 2.545 seconds; and the complete
+  orchestrator module passes 110/110 in 426.417 seconds. The complete
+  source-transport plus adapter-CLI group passes 80/80 in 70.866 seconds.
+- The first full discovery reached all 1,664 tests but exposed two old test
+  fixtures whose process-local host-policy mocks could no longer authorize a
+  checkpoint after the new canonical-matrix revalidation; that 1-failure,
+  1-error run is non-counting. The fixtures now keep remote-only assertions in
+  their matching policy scope and construct the CLI subprocess checkpoint from
+  the real five-host inventory with authenticated remote holdouts. Both exact
+  regressions pass 2/2 in 4.569 seconds. The final authorized host Python 3.13
+  discovery passes all 1,664 tests in 1,871.206 seconds with
+  `TMPDIR=/private/tmp`. Its pre/post binary patch digest is unchanged at
+  `18e935006a3fdcef86411feb15ddc0905c4edda2fab1155ba4397ad31abe0ef2`.
+- Skill structure and validator-wrapper tests pass 39/39 in 5.632 seconds,
+  project-journal validation passes, the official isolated Python 3.13 validator
+  reports `Skill is valid!`, Ruff format/lint passes, and `git diff --check` is
+  clean. This evidence-only journal update is the sole edit after the full-run
+  digest comparison.
+- The final bounded precommit audits found three remaining authority gaps and two
+  evidence/documentation gaps: formal publication did not independently enforce
+  the source matrix; a non-null `backfill_of` granted single-host scope without
+  reauthenticating its controlled-gap binding; shadow backfill accepted an
+  unknown host ref; the legacy-receipt negative test mocked its source
+  commitment; and the cleanup budget still documented the three-host total.
+  A shared low-level validator now protects both orchestrator reads and formal
+  publication, authenticates exact partial-run/host/window/shadow backfill scope,
+  and rejects orphaned lineage. Shadow authority restricts backfill to the
+  canonical production inventory. Negative tests use HMAC-authenticated state and
+  internally consistent source commitments without mocks.
+- The five-host source-segment and lock inventory makes the conservative cleanup
+  total exactly 261,844 under the unchanged 300,000-entry ceiling. The focused
+  state/backfill and formal-publication regressions pass; the shadow receipt test
+  rejects both an internally consistent legacy three-host Daily receipt and an
+  authenticated unknown-host backfill. Module boundaries pass 18/18 at the
+  unchanged 8,375 branch ceiling. The complete orchestrator plus controlled-gap
+  group passes 124/124 in 263.036 seconds, and source transport plus adapter CLI
+  passes 80/80 in 48.327 seconds.
+- The final host Python 3.13 discovery passes all 1,664 tests in 1,668.917
+  seconds, including the authorized temporary-GPG publication suite. Its
+  pre/post implementation-and-test digest is unchanged at
+  `c3a622e3fda2c0d9c2ca8ab8028d14664a339025bb58d60e40fde043f0df29c6`;
+  this evidence-only journal update is the sole edit after that comparison.
+- A final authority audit found four related gaps: durable cursor proposals were
+  not independently derived from the signed history rows and terminal source
+  cells; a backfill checkpoint could be spliced into an ordinary publication;
+  a pre-promotion journal could recover adapter progress before revalidating the
+  current five-host checkpoint; and the shared authority implementation was not
+  included in the orchestrator foundation budget. Formal durable state now
+  binds exact cursor rows, source snapshot refs, backfill lineage, episode-head
+  commitments, and production backlog authority. Negative tests authenticate
+  their forged checkpoints and prove rejection before journal or history
+  mutation.
+- The shared authority is a closed four-module slice: contracts, cursor
+  derivation, lineage, and composition. It is exactly 721/750 lines and the full
+  orchestrator foundation is 3,018/3,050; publication support is 1,307/1,310
+  after claim-time checkpoint validation. Journal open validates the
+  authenticated checkpoint and persistent claim before adapter recovery. Every
+  pre-target-CAS transition additionally re-derives the retained inventory,
+  history base, provider cache, cursor vector, and episode update. Exact
+  target-CAS recovery remains idempotent below an unrelated successor and after
+  legal local-bundle collection.
+- The first post-audit publication-module run exposed five recovery-order errors
+  and is non-counting. The repaired exact paths pass 5/5 in 112.869 seconds, and
+  the complete authorized temporary-GPG publication module passes 63/63 in
+  1,042.299 seconds. Orchestrator plus controlled gaps passes 124/124 in 247.096
+  seconds; source transport plus adapter CLI passes 80/80 in 45.161 seconds;
+  module boundaries pass 18/18 in 1.566 seconds; and skill structure/wrapper
+  tests pass 39/39 in 6.242 seconds. The official OpenAI validator reports
+  `Skill is valid!`, project-journal validation passes, Ruff format/lint passes,
+  and `git diff --check` is clean. One sandboxed GPG setup and one unquoted shell
+  discovery pattern executed zero tests and are explicitly non-counting. The
+  final authorized host Python 3.13 discovery passes all 1,667 tests in
+  1,617.203 seconds. The binary patch digest immediately before this
+  evidence-only journal append is
+  `7bf20adaf23733db2847012649e9fd6618d1fd7660a0eb04661e906f8044f58d`.
+- The final authority/recovery audit found five remaining gaps. Abort recovery
+  could invoke the publication adapter before authenticating the checkpoint and
+  persistent claim. A `finalize` retry after exact target CAS could not recover
+  once legal export collection removed the local bundle. An ordinary run could
+  clear a durable backlog without backfill lineage. Formal gaps were not limited
+  to an exact authenticated Daily holdout set, and a completed shadow partial's
+  successor authorization was checked only when the backfill was created rather
+  than on every later checkpoint read.
+- Journal open now authenticates the publication claim before every abort or
+  forward-recovery adapter action. Durable target-CAS recovery uses the
+  authenticated stored artifact inventory only when the bound local bundle is
+  exactly absent; a present malformed, unsafe, changed, or unreadable bundle
+  still fails closed. Formal publication permits source gaps only for an
+  ordinary `Daily --allow-partial` run whose exact gap-host set has matching
+  authenticated holdout receipts, rejects Weekly and mixed-host gaps, and
+  refuses to clear any existing backlog outside authenticated backfill lineage.
+  Shadow backfill revalidates the closed successor schema, HMAC, history target,
+  provenance, window, host, coverage, cleanup, revision, and bundle digest on
+  every checkpoint read.
+- The shared run-state authority is now a closed five-module slice. Its exact
+  inventory is 985/1,000 physical lines: composition 243/250, contracts 37/50,
+  cursors 219/225, holdouts 221/240, and lineage 265/275. The orchestrator
+  foundation is 3,282/3,350 lines and the branch proxy is 8,389/8,400 nodes.
+  Module-boundary tests enforce both the exact file inventory and aggregate
+  budgets.
+- The new focused publication regressions pass 7/7 in 184.304 seconds under the
+  authorized host `/private/tmp` GPG fixture. The complete publication module
+  passes 67/67 in 1,217.415 seconds; orchestrator plus controlled gaps passes
+  124/124 in 276.270 seconds; source transport plus adapter CLI passes 80/80 in
+  56.784 seconds; module boundaries pass 18/18; and skill structure plus
+  validator-wrapper tests pass 39/39 in 5.714 seconds. The project-journal
+  validator passes, and the official isolated Python 3.13 OpenAI validator
+  reports `Skill is valid!`. One sandboxed disposable-GPG class setup and one
+  direct validator invocation without PyYAML are environment failures and are
+  explicitly non-counting.
+- The final authorized host Python 3.13 discovery passes all 1,671 tests in
+  1,800.596 seconds with `TMPDIR=/private/tmp` and a 2,400-second hard deadline.
+  The implementation, test, and reference-doc patch digest immediately before
+  and after that run is unchanged at
+  `9c57c8c14dd91b5fb1085220cf01a5497ba6384e5997fe6d9ab1b5e46e8c5670`;
+  this evidence-only journal append is the sole subsequent edit.
+- Three final bounded precommit audits superseded the 1,671-test checkpoint.
+  They found that direct abort recovery did not independently validate its
+  current publication claim, exact-target-CAS recovery could perform adapter
+  work after a present retained bundle changed, and a formal Daily holdout
+  authenticated only transport receipt references rather than the underlying
+  receipt bodies. The audits also found two evidence issues: the backfill
+  lineage negative test stopped at an earlier backlog check, and the module
+  inventory did not prove the exact on-disk `run_state_*.py` set. The architecture
+  reference's prior branch-proxy count was one node stale.
+- Journal open now re-inventories every present retained bundle before adapter
+  recovery and requires exact stored identity, content, and access-policy
+  equality. Exact absence remains usable only by the durable post-target-CAS
+  path; direct abort recovery independently validates the persistent claim
+  before adapter release. Formal holdouts reauthenticate all four source-cell
+  transport receipt bodies against the checkpoint inventory, so matching refs
+  cannot relabel complete source proof as a gap. The lineage regression now
+  creates a real durable partial/backfill pair before forging only its proposed
+  head-set binding, and the module boundary asserts the exact disk inventory.
+- The closed run-state authority slice is now exactly 1,000/1,000 physical
+  lines: composition 243/250, contracts 37/50, cursors 219/225, holdouts
+  236/240, and lineage 265/275. The orchestrator foundation is 3,297/3,350
+  lines and the branch proxy is 8,395/8,400 nodes. The publication transaction
+  remains 2,098/2,100 lines.
+- The complete authorized temporary-GPG publication module passes 69/69 in
+  1,266.885 seconds. Orchestrator plus controlled gaps passes 124/124 in
+  257.170 seconds; module boundaries pass 18/18 in 1.698 seconds; and skill
+  structure plus validator-wrapper tests pass 39/39 in 5.898 seconds. Ruff
+  format/lint and `git diff --check` pass, and the official isolated Python 3.13
+  validator reports `Skill is valid!`.
+- The final authorized host Python 3.13 discovery passes all 1,673 tests in
+  1,877.821 seconds with `TMPDIR=/private/tmp` and a 2,400-second hard deadline.
+  A no-follow changed-file manifest covers all 20 implementation, test, and
+  reference-document paths, including the five untracked new modules and
+  excluding this evidence-only journal. Its pre/post digest is unchanged at
+  `6098a91d946d9405b39ed0136d9002792bc4d88cc8b67d35d52c08ab726a1551`.

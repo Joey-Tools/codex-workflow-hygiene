@@ -21,7 +21,10 @@ from typing import Any
 
 from . import authority, reporting, safe_io
 from .checkpoints import AtomicCheckpointStore, canonical_json_bytes
+from .contracts import CANONICAL_HOSTS
 from .identity import IdentityKey
+from .run_state_authority import validate_run_source_authority
+from .run_state_contracts import RunStateAuthorityError
 from .publication_contracts import (  # noqa: F401
     _ATTEMPT_REF_RE,
     _CREDENTIAL_KEYS,
@@ -683,6 +686,14 @@ def _load_run_publication_authority(
     run_state = snapshot.state
     if run_state.get("identity_key_id") != identity.key_id:
         raise PublicationRejected("run checkpoint identity does not match")
+    try:
+        validate_run_source_authority(
+            identity,
+            run_state,
+            canonical_hosts=CANONICAL_HOSTS,
+        )
+    except RunStateAuthorityError as exc:
+        raise PublicationRejected(str(exc)) from exc
     if run_state.get("shadow") is not False:
         raise PublicationRejected("shadow runs cannot create formal publication")
     if run_state.get("stage") not in {"export", "finalize", "complete"}:
@@ -836,6 +847,14 @@ def _validate_persistent_publication_claim(
         authority_binding, Mapping
     ):
         raise PublicationRejected("run lacks a persistent publication claim")
+    try:
+        validate_run_source_authority(
+            identity,
+            run_state,
+            canonical_hosts=CANONICAL_HOSTS,
+        )
+    except RunStateAuthorityError as exc:
+        raise PublicationRejected(str(exc)) from exc
     claim = publication.get("publication_claim")
     fields = {
         "attempt_ref",

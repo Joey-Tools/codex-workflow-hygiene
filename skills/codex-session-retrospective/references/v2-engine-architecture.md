@@ -12,6 +12,11 @@ operate on that single coordinator context and do not import one another:
 | `orchestrator.py` | Stable facade, coordinator context, and CLI-compatible exports |
 | `orchestrator_support.py` | Source-frame consumption, shared contracts, and runtime readiness |
 | `orchestrator_state.py` | Authenticated checkpoint identity and state access primitives |
+| `run_state_contracts.py` | Closed run-authority schemas, host references, and common guards |
+| `run_state_cursors.py` | History-bound cursor starts and terminal-source cursor derivation |
+| `run_state_holdouts.py` | Formal Daily holdout and shadow-successor authorization |
+| `run_state_lineage.py` | Controlled-gap, backfill, backlog, and episode-head lineage validation |
+| `run_state_authority.py` | Shared formal source-matrix, cursor, lineage, and durable-state composition |
 | `orchestrator_projection.py` | Read-only status, metrics, references, and next actions |
 | `orchestrator_jobs.py` | Agent attempt, claim, sink, and envelope lifecycle |
 | `orchestrator_reduction.py` | Catalog materialization and episode/topic/synthesis hierarchies |
@@ -115,14 +120,55 @@ one-sided or unreadable retained state cannot authorize reservation release.
 The transport program commitment includes every runtime module above. Adding a
 module without adding it to the closed allowlist fails source transport.
 
+Runtime source matrices, run-level source capacity, and durable shadow/production
+authority derive from one canonical five-host role inventory: `local`,
+`BL-mac-mini-m4-hoteng`, `miku-bot-dev`, `hoteng-srv-01`, and
+`codex-hoteng-srv-01`. No independent production-host subset may authorize a
+complete run or cursor advancement.
+The closed five-module run-state authority slice validates the authenticated
+checkpoint at both the orchestrator state boundary and the formal publication
+boundary. It binds each cursor start to the signed history snapshot, derives
+each cursor proposal from terminal source cells, and requires the durable cursor
+rows, source snapshot refs, episode-head root/list, and `backfill_of` value to be
+the exact checkpoint projection. A single-host Daily backfill is accepted only
+when its controlled-gap receipt authenticates and binds the partial run,
+canonical host/ref, exact window, backlog, head-set commitments, and shadow mode;
+checkpoint HMAC validity or a non-null `backfill_of` field alone is insufficient.
+Formal source gaps additionally require an exact authenticated Daily partial
+holdout set and reauthenticate each referenced transport receipt body against
+the checkpoint source receipts; reference equality alone is not authority.
+Weekly gaps, mixed gap cells, cross-host receipts, and ordinary runs that would
+clear an existing backlog are rejected. Shadow backfills revalidate the
+completed-partial successor authorization and all of its history, provenance,
+window, coverage, cleanup, and bundle bindings on every checkpoint read.
+
+Opening a publication journal validates that authenticated checkpoint and its
+persistent claim before any adapter recovery. It rebuilds the exact inventory of
+every present retained bundle before adapter side effects; only the durable
+post-CAS recovery path may continue when that bundle is exactly absent. Direct
+abort recovery independently repeats the claim check before adapter release.
+Before target CAS, every forward transition additionally re-derives the journal
+plan from the current retained bundle, signed history base, provider cache,
+cursor vector, and episode update. After an exact target CAS is already
+reachable, recovery instead binds the adapter attempt and signed durable
+history; it neither mistakes the expected history advance for drift nor requires
+an already collected local bundle.
+
 The transport slice remains independently bounded after this hardening: 7,214
 physical lines across a 7,250-line aggregate limit. One exact 14-module
 inventory and its aggregate are enforced together, so omitting a transport
 module cannot create a false budget pass. The newly affected modules are
 `transport_program.py` at 432/450 lines, `transport_remote.py` at 315/320,
 `transport_snapshot.py` at 213/220, and `transport_remote_snapshot.py` at
-86/100, while `transport_contracts.py` is 984/1,000. The global branch proxy
-measures 8,367 nodes against an 8,375-node ceiling. The source coordinator and
+86/100, while `transport_contracts.py` is 984/1,000. The closed run-state
+authority inventory is exactly 1,000/1,000 lines: `run_state_authority.py` 243/250,
+`run_state_contracts.py` 37/50, `run_state_cursors.py` 219/225,
+`run_state_holdouts.py` 236/240, and `run_state_lineage.py` 265/275. Including
+this full slice, the orchestrator foundation is 3,297/3,350 lines. The global
+branch proxy is 8,395/8,400 nodes after adding the explicit holdout and shadow
+successor predicates. The publication support boundary is
+1,307/1,310 lines after adding claim-time checkpoint authority validation. The
+source coordinator and
 its original support slice are 2,930/3,000 lines; the three source-staging modules
 are independently capped at 749/775, and the claim/result reserve owner is
 123/130. The current increase is confined to run-global source/shard/task

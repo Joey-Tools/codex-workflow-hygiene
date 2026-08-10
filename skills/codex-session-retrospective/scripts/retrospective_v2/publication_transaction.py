@@ -233,13 +233,14 @@ class PublicationTransaction:
             adapter=adapter,
             failure_injector=failure_injector,
         )
+        transaction._assert_publication_claim()
+        transaction._revalidate_recovery_bundle()
         if transaction.phase in {
             PublicationPhase.ABORT_PENDING,
             PublicationPhase.ABORTED,
         }:
             transaction.recover_abort()
             return transaction
-        transaction._assert_publication_claim()
         transaction._recover_durable_adapter_progress()
         transaction._refresh_publication_authority()
         return transaction
@@ -284,22 +285,33 @@ class PublicationTransaction:
                 "publication journal is outside the authoritative run directory"
             )
         state = cls.inspect_local(journal)
-        inventory = build_artifact_inventory(Path(bundle_dir).absolute())
-        if state["inventory"] != inventory.to_dict():
-            raise AttemptMismatchError(
-                "publication journal inventory differs from the current run bundle"
-            )
-        if state["phase"] in {
+        bundle = Path(bundle_dir).absolute()
+        recovery_phases = {
             PublicationPhase.ABORT_PENDING.value,
             PublicationPhase.ABORTED.value,
             PublicationPhase.COMPLIANCE_CLOSED.value,
             PublicationPhase.PROMOTED.value,
             PublicationPhase.COMMITTED.value,
-        }:
+        }
+        inventory: ArtifactInventory | None
+        if state["phase"] in recovery_phases:
+            try:
+                bundle.lstat()
+            except FileNotFoundError:
+                inventory = None
+            else:
+                inventory = build_artifact_inventory(bundle)
+        else:
+            inventory = build_artifact_inventory(bundle)
+        if inventory is not None and state["inventory"] != inventory.to_dict():
+            raise AttemptMismatchError(
+                "publication journal inventory differs from the current run bundle"
+            )
+        if state["phase"] in recovery_phases:
             cls._validate_recovery_binding(
                 state,
                 inventory=inventory,
-                bundle_dir=Path(bundle_dir).absolute(),
+                bundle_dir=bundle,
                 destination=destination,
                 target_ref=target_ref,
                 expected_target_head=expected_target_head,
@@ -337,7 +349,7 @@ class PublicationTransaction:
     def _validate_recovery_binding(
         state: Mapping[str, Any],
         *,
-        inventory: ArtifactInventory,
+        inventory: ArtifactInventory | None,
         bundle_dir: Path,
         destination: str,
         target_ref: str,
@@ -349,6 +361,9 @@ class PublicationTransaction:
 
         plan = _require_mapping(state["plan"], "publication plan")
         try:
+            stored_inventory = ArtifactInventory.from_dict(
+                _require_mapping(state["inventory"], "publication inventory")
+            )
             binding = _normalize_publication_authority(
                 _require_mapping(
                     plan["publication_authority"],
@@ -359,6 +374,7 @@ class PublicationTransaction:
             raise AttemptMismatchError(
                 "publication journal does not belong to the current run"
             ) from error
+        effective_inventory = inventory or stored_inventory
         if any(
             (
                 plan.get("attempt_ref") != state["attempt_ref"],
@@ -366,8 +382,10 @@ class PublicationTransaction:
                 plan.get("destination") != destination,
                 plan.get("target_ref") != target_ref,
                 plan.get("expected_target_head") != expected_target_head,
-                plan.get("inventory_digest_v2") != inventory.inventory_digest_v2,
-                binding["candidate_digest"] != inventory.retained_bundle_digest_v2,
+                plan.get("inventory_digest_v2")
+                != effective_inventory.inventory_digest_v2,
+                binding["candidate_digest"]
+                != effective_inventory.retained_bundle_digest_v2,
                 binding["destination"] != destination,
                 binding["target_ref"] != target_ref,
                 binding["run_dir"] != str(run_dir),
@@ -813,6 +831,7 @@ class PublicationTransaction:
                 expected,
                 identity=identity,
             )
+            self._revalidate_current_run_plan()
             return
 
         promotion = self._state["receipts"].get("promotion")
@@ -841,6 +860,55 @@ class PublicationTransaction:
                 expected,
                 identity=identity,
             )
+
+    def _revalidate_current_run_plan(self) -> None:
+        plan = self._state["plan"]
+        binding = _normalize_publication_authority(
+            _require_mapping(plan["publication_authority"], "publication authority")
+        )
+        bundle = Path(plan["bundle_dir"])
+        inventory = build_artifact_inventory(bundle)
+        current_binding, cursor_vector, episode_update = (
+            _load_run_publication_authority(
+                run_dir=Path(binding["run_dir"]),
+                identity_path=Path(binding["identity_path"]),
+                bundle_dir=bundle,
+                inventory=inventory,
+            )
+        )
+        observed = [
+            self._state["inventory"],
+            plan["inventory_digest_v2"],
+            plan["destination"],
+            plan["target_ref"],
+            plan["expected_target_head"],
+            plan["publication_authority"],
+            plan["host_cursor_vector"],
+            plan["episode_head_update"],
+        ]
+        expected = [
+            inventory.to_dict(),
+            inventory.inventory_digest_v2,
+            current_binding["destination"],
+            current_binding["target_ref"],
+            current_binding["expected_history"]["history_commit"],
+            current_binding,
+            cursor_vector,
+            episode_update,
+        ]
+        if canonical_json_bytes(observed) != canonical_json_bytes(expected):
+            raise PublicationRejected(
+                "publication journal no longer matches current run authority"
+            )
+
+    def _revalidate_recovery_bundle(self) -> None:
+        bundle = Path(self._state["plan"]["bundle_dir"])
+        try:
+            bundle.lstat()
+        except FileNotFoundError:
+            return
+        if build_artifact_inventory(bundle).to_dict() != self._state["inventory"]:
+            raise PublicationRejected("publication recovery bundle changed")
 
     def _assert_publication_claim(self) -> dict[str, Any]:
         if self.kind is not TransactionKind.PUBLISH:
@@ -1066,6 +1134,8 @@ class PublicationTransaction:
     ) -> Mapping[str, Any]:
         """Idempotently finish only an already durable abort disposition."""
 
+        if self.kind is TransactionKind.PUBLISH:
+            self._assert_publication_claim()
         if self.phase not in {
             PublicationPhase.ABORT_PENDING,
             PublicationPhase.ABORTED,
