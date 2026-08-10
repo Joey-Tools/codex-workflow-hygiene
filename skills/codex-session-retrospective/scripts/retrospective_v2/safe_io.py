@@ -35,6 +35,12 @@ _DIRECTORY_FLAGS = (
     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 )
 _FILE_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_FILE_READ_FLAGS = (
+    os.O_RDONLY
+    | _FILE_NOFOLLOW
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 _MAX_TRUSTED_SYMLINKS = 16
 _ATOMIC_CREATE_PREFIX = ".atomic-create-"
 _ATOMIC_CREATE_RE = re.compile(
@@ -1060,6 +1066,8 @@ def _inspect_tree_descriptor(
                 counts[key] += value
             entries.extend(nested_entries)
             continue
+        if not stat.S_ISREG(observed.st_mode):
+            raise UnsafePathError(f"expected a regular file: {child_path}")
 
         file_entry = _inspect_file_inventory_entry(
             descriptor,
@@ -1242,11 +1250,12 @@ def open_checked_file_at(
     *,
     display_path: Path,
     require_owner_only: bool,
+    single_link: bool = True,
 ) -> int:
     try:
         descriptor = os.open(
             name,
-            os.O_RDONLY | _FILE_NOFOLLOW,
+            _FILE_READ_FLAGS,
             dir_fd=directory_fd,
         )
     except OSError as exc:
@@ -1258,7 +1267,12 @@ def open_checked_file_at(
     try:
         metadata = os.fstat(descriptor)
         if require_owner_only:
-            _validate_file_stat(metadata, display_path)
+            _validate_regular_file_stat(
+                metadata,
+                display_path,
+                exact_mode=True,
+                single_link=single_link,
+            )
             _validate_owner_only_acl(descriptor, display_path)
         elif not stat.S_ISREG(metadata.st_mode):
             raise UnsafePathError(f"expected a regular file: {display_path}")
@@ -1509,10 +1523,21 @@ def _atomic_create_target_token(target_name: str) -> str:
     return hashlib.sha256(os.fsencode(target_name)).hexdigest()[:32]
 
 
-def _atomic_create_pending_name(target_name: str, data: bytes) -> str:
+def _atomic_create_pending_name_from_commitment(
+    target_name: str,
+    byte_count: int,
+    digest: str,
+) -> str:
     token = _atomic_create_target_token(target_name)
-    digest = hashlib.sha256(data).hexdigest()
-    return f"{_ATOMIC_CREATE_PREFIX}{token}-{len(data):x}-{digest}.tmp"
+    return f"{_ATOMIC_CREATE_PREFIX}{token}-{byte_count:x}-{digest}.tmp"
+
+
+def _atomic_create_pending_name(target_name: str, data: bytes) -> str:
+    return _atomic_create_pending_name_from_commitment(
+        target_name,
+        len(data),
+        hashlib.sha256(data).hexdigest(),
+    )
 
 
 def _atomic_create_lock_name(target_name: str) -> str:
@@ -1544,8 +1569,16 @@ class AtomicCreateReceipt:
     path: Path
     parent_identity: tuple[int, ...]
     file_identity: tuple[int, ...]
+    pending_name: str
     byte_count: int
     digest: str
+
+
+@dataclass(slots=True)
+class AtomicCreateReceiptSlot:
+    """Preallocated rollback authority for staged exclusive creation."""
+
+    receipt: AtomicCreateReceipt | None = None
 
 
 def _hash_file_descriptor(
@@ -1581,9 +1614,7 @@ def _pending_candidates_at(
         if match is None or match.group("target") != token:
             raise UnsafePathError(f"invalid atomic-create recovery file name: {name}")
         try:
-            descriptor = os.open(
-                name, os.O_RDONLY | _FILE_NOFOLLOW, dir_fd=directory_fd
-            )
+            descriptor = os.open(name, _FILE_READ_FLAGS, dir_fd=directory_fd)
         except FileNotFoundError:
             continue
         try:
@@ -1648,7 +1679,7 @@ def _recover_atomic_create_at(
     if target_stat is not None:
         target_descriptor = os.open(
             target_name,
-            os.O_RDONLY | _FILE_NOFOLLOW,
+            _FILE_READ_FLAGS,
             dir_fd=directory_fd,
         )
         try:
@@ -1829,10 +1860,19 @@ def atomic_create_bytes_with_receipt(
     data: bytes | bytearray | memoryview,
     *,
     create_parents: bool = True,
+    receipt_slot: AtomicCreateReceiptSlot | None = None,
 ) -> AtomicCreateReceipt:
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError("atomic create data must be bytes-like")
+    match receipt_slot:
+        case None:
+            selected_slot = AtomicCreateReceiptSlot()
+        case AtomicCreateReceiptSlot(receipt=None):
+            selected_slot = receipt_slot
+        case _:
+            raise TypeError("atomic create receipt slot must be empty")
     payload = bytes(data)
+    payload_digest = hashlib.sha256(payload).hexdigest()
     target, directory_fd = _open_parent_directory(
         path,
         create_parents=create_parents,
@@ -1841,7 +1881,9 @@ def atomic_create_bytes_with_receipt(
     lock_path = target.parent / lock_name
     lock_fd: int | None = None
     pending_name: str | None = None
+    descriptor = -1
     prepared = False
+    deferred_close_error: OSError | None = None
     try:
         lock_fd = open_lock_file_at(
             directory_fd,
@@ -1869,26 +1911,41 @@ def atomic_create_bytes_with_receipt(
         pending_name = _atomic_create_pending_name(target.name, payload)
         descriptor = os.open(
             pending_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_NOFOLLOW,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | _FILE_NOFOLLOW,
             OWNER_FILE_MODE,
             dir_fd=directory_fd,
         )
-        try:
-            _validate_regular_file_stat(
-                os.fstat(descriptor),
-                target.parent / pending_name,
-                exact_mode=False,
-                single_link=True,
-            )
-            harden_created_owner_only_file_descriptor(
-                descriptor,
-                target.parent / pending_name,
-            )
-            _write_all(descriptor, payload)
-            os.fsync(descriptor)
-            prepared = True
-        finally:
-            os.close(descriptor)
+        _validate_regular_file_stat(
+            os.fstat(descriptor),
+            target.parent / pending_name,
+            exact_mode=False,
+            single_link=True,
+        )
+        harden_created_owner_only_file_descriptor(
+            descriptor,
+            target.parent / pending_name,
+        )
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        pending_metadata = os.fstat(descriptor)
+        validate_owner_only_file_descriptor(
+            descriptor,
+            target.parent / pending_name,
+            directory_fd=directory_fd,
+            name=pending_name,
+        )
+        if pending_metadata.st_size != len(payload):
+            raise UnsafePathError(f"atomic-create pending content changed: {target}")
+        receipt = AtomicCreateReceipt(
+            path=target,
+            parent_identity=_atomic_create_parent_identity(os.fstat(directory_fd)),
+            file_identity=_atomic_create_identity(pending_metadata),
+            pending_name=pending_name,
+            byte_count=len(payload),
+            digest=payload_digest,
+        )
+        selected_slot.receipt = receipt
+        prepared = True
         os.fsync(directory_fd)
         os.link(
             pending_name,
@@ -1897,42 +1954,57 @@ def atomic_create_bytes_with_receipt(
             dst_dir_fd=directory_fd,
             follow_symlinks=False,
         )
+        linked_metadata = os.fstat(descriptor)
+        target_metadata = os.stat(
+            target.name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _atomic_create_identity(linked_metadata)[:-1],
+            linked_metadata.st_nlink,
+            target_metadata.st_dev,
+            target_metadata.st_ino,
+        ) != (
+            receipt.file_identity[:-1],
+            2,
+            linked_metadata.st_dev,
+            linked_metadata.st_ino,
+        ):
+            raise UnsafePathError(
+                f"atomic-create target changed while linked: {target}"
+            )
         os.fsync(directory_fd)
         os.unlink(pending_name, dir_fd=directory_fd)
         pending_name = None
         os.fsync(directory_fd)
-        _validate_existing_target_at(directory_fd, target.name, target)
-        target_fd = open_checked_file_at(
-            directory_fd,
-            target.name,
-            display_path=target,
-            require_owner_only=True,
+        validate_owner_only_file_descriptor(
+            descriptor,
+            target,
+            directory_fd=directory_fd,
+            name=target.name,
         )
-        try:
-            target_metadata = os.fstat(target_fd)
-            validate_owner_only_file_descriptor(
-                target_fd,
-                target,
-                directory_fd=directory_fd,
-                name=target.name,
-            )
-            if (
-                target_metadata.st_size != len(payload)
-                or _hash_file_descriptor(target_fd)
-                != hashlib.sha256(payload).hexdigest()
-            ):
-                raise UnsafePathError(f"atomic-create target content changed: {target}")
-            parent_metadata = os.fstat(directory_fd)
-            return AtomicCreateReceipt(
-                path=target,
-                parent_identity=_atomic_create_parent_identity(parent_metadata),
-                file_identity=_atomic_create_identity(target_metadata),
-                byte_count=len(payload),
-                digest=hashlib.sha256(payload).hexdigest(),
-            )
-        finally:
-            os.close(target_fd)
+        target_metadata = os.fstat(descriptor)
+        if (
+            _atomic_create_identity(target_metadata),
+            target_metadata.st_size,
+            _hash_file_descriptor(descriptor),
+        ) != (receipt.file_identity, len(payload), payload_digest):
+            raise UnsafePathError(f"atomic-create target content changed: {target}")
+        return receipt
     finally:
+        primary = sys.exception()
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as close_error:
+                if primary is not None and hasattr(primary, "add_note"):
+                    primary.add_note(
+                        "atomic-create content descriptor close failed: "
+                        f"{type(close_error).__name__}"
+                    )
+                else:
+                    deferred_close_error = close_error
         if pending_name is not None and not prepared:
             try:
                 os.unlink(pending_name, dir_fd=directory_fd)
@@ -1946,6 +2018,8 @@ def atomic_create_bytes_with_receipt(
             finally:
                 os.close(lock_fd)
         os.close(directory_fd)
+        if deferred_close_error is not None:
+            raise deferred_close_error
 
 
 def atomic_create_bytes(
@@ -1971,6 +2045,13 @@ def remove_atomic_created_bytes(receipt: AtomicCreateReceipt) -> None:
 
     if not isinstance(receipt, AtomicCreateReceipt):
         raise TypeError("atomic-create rollback requires an ownership receipt")
+    expected_pending = _atomic_create_pending_name_from_commitment(
+        receipt.path.name,
+        receipt.byte_count,
+        receipt.digest,
+    )
+    if receipt.pending_name != expected_pending:
+        raise UnsafePathError("atomic-create rollback pending name changed")
     target, directory_fd = _open_parent_directory(
         receipt.path,
         create_parents=False,
@@ -1978,7 +2059,7 @@ def remove_atomic_created_bytes(receipt: AtomicCreateReceipt) -> None:
     lock_name = _atomic_create_lock_name(target.name)
     lock_path = target.parent / lock_name
     lock_fd: int | None = None
-    descriptor = -1
+    descriptors: list[tuple[str, Path, int]] = []
     try:
         if (
             _atomic_create_parent_identity(os.fstat(directory_fd))
@@ -2014,52 +2095,66 @@ def remove_atomic_created_bytes(receipt: AtomicCreateReceipt) -> None:
             raise UnsafePathError(
                 f"atomic-create rollback parent changed: {receipt.path.parent}"
             )
-        try:
-            descriptor = open_checked_file_at(
-                directory_fd,
-                target.name,
-                display_path=target,
-                require_owner_only=True,
-            )
-        except FileNotFoundError:
+        for name, display_path in (
+            (receipt.pending_name, target.parent / receipt.pending_name),
+            (target.name, target),
+        ):
+            try:
+                descriptor = open_checked_file_at(
+                    directory_fd,
+                    name,
+                    display_path=display_path,
+                    require_owner_only=True,
+                    single_link=False,
+                )
+            except FileNotFoundError:
+                continue
+            descriptors.append((name, display_path, descriptor))
+        if not descriptors:
             return
-        validate_owner_only_file_descriptor(
-            descriptor,
-            target,
-            directory_fd=directory_fd,
-            name=target.name,
-        )
-        before = os.fstat(descriptor)
-        if (
-            _atomic_create_identity(before) != receipt.file_identity
-            or before.st_size != receipt.byte_count
-            or _hash_file_descriptor(descriptor) != receipt.digest
-        ):
-            raise UnsafePathError(f"atomic-create rollback target changed: {target}")
-        validate_owner_only_file_descriptor(
-            descriptor,
-            target,
-            directory_fd=directory_fd,
-            name=target.name,
-        )
-        after = os.fstat(descriptor)
-        if (
-            _atomic_create_identity(after) != receipt.file_identity
-            or after.st_size != receipt.byte_count
-            or _hash_file_descriptor(descriptor) != receipt.digest
-        ):
-            raise UnsafePathError(f"atomic-create rollback target changed: {target}")
-        validate_owner_only_file_descriptor(
-            descriptor,
-            target,
-            directory_fd=directory_fd,
-            name=target.name,
-        )
-        os.unlink(target.name, dir_fd=directory_fd)
+        remaining = len(descriptors)
+        for name, display_path, descriptor in descriptors:
+            validate_owner_only_file_descriptor(
+                descriptor,
+                display_path,
+                directory_fd=directory_fd,
+                name=name,
+                single_link=False,
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                _atomic_create_identity(metadata)[:-1] != receipt.file_identity[:-1]
+                or metadata.st_nlink != remaining
+                or metadata.st_size != receipt.byte_count
+                or _hash_file_descriptor(descriptor) != receipt.digest
+            ):
+                raise UnsafePathError(
+                    f"atomic-create rollback target changed: {display_path}"
+                )
+        for name, display_path, descriptor in descriptors:
+            validate_owner_only_file_descriptor(
+                descriptor,
+                display_path,
+                directory_fd=directory_fd,
+                name=name,
+                single_link=False,
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                _atomic_create_identity(metadata)[:-1] != receipt.file_identity[:-1]
+                or metadata.st_nlink != remaining
+                or metadata.st_size != receipt.byte_count
+                or _hash_file_descriptor(descriptor) != receipt.digest
+            ):
+                raise UnsafePathError(
+                    f"atomic-create rollback target changed: {display_path}"
+                )
+            os.unlink(name, dir_fd=directory_fd)
+            remaining -= 1
         os.fsync(directory_fd)
     finally:
         primary = sys.exception()
-        if descriptor >= 0:
+        for _, _, descriptor in reversed(descriptors):
             try:
                 os.close(descriptor)
             except OSError as close_error:

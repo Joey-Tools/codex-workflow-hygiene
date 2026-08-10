@@ -34,10 +34,14 @@ MaterializedFile = safe_io.AtomicCreateReceipt
 class MaterializedFiles:
     """Preallocated rollback authority for one staged transaction."""
 
-    receipts: list[MaterializedFile | None]
+    slots: list[safe_io.AtomicCreateReceiptSlot]
+
+    @property
+    def receipts(self) -> list[MaterializedFile | None]:
+        return list(map(lambda slot: slot.receipt, self.slots))
 
     def __len__(self) -> int:
-        return sum(receipt is not None for receipt in self.receipts)
+        return sum(slot.receipt is not None for slot in self.slots)
 
 
 def prepare_file(path: Path, payload: bytes) -> PreparedFile:
@@ -75,7 +79,9 @@ def allocate_materializations(file_count: int) -> MaterializedFiles:
         or file_count < 0
     ):
         raise TypeError("materialization file count must be a nonnegative integer")
-    return MaterializedFiles(receipts=[None] * file_count)
+    return MaterializedFiles(
+        slots=list(map(lambda _: safe_io.AtomicCreateReceiptSlot(), range(file_count)))
+    )
 
 
 def materialize_file(
@@ -90,16 +96,17 @@ def materialize_file(
         or isinstance(index, bool)
         or not isinstance(index, int)
         or index < 0
-        or index >= len(materialized.receipts)
-        or materialized.receipts[index] is not None
+        or index >= len(materialized.slots)
+        or materialized.slots[index].receipt is not None
     ):
         raise TypeError("source materialization receipt slot is invalid")
     safe_io.ensure_owner_only_directory(prepared.path.parent)
     try:
-        receipt = safe_io.atomic_create_bytes_with_receipt(
+        safe_io.atomic_create_bytes_with_receipt(
             prepared.path,
             prepared.payload,
             create_parents=False,
+            receipt_slot=materialized.slots[index],
         )
     except FileExistsError:
         existing = safe_io.read_bounded_bytes(
@@ -109,8 +116,6 @@ def materialize_file(
         )
         if existing != prepared.payload:
             raise InvalidTransitionError("staged source file changed")
-    else:
-        materialized.receipts[index] = receipt
 
 
 def materialize(files: Sequence[PreparedFile]) -> MaterializedFiles:
@@ -137,9 +142,9 @@ def rollback(files: MaterializedFiles) -> None:
             "staged source rollback lacks a creation identity ledger"
         )
     primary: BaseException | None = None
-    index = len(files.receipts) - 1
+    index = len(files.slots) - 1
     while index >= 0:
-        receipt = files.receipts[index]
+        receipt = files.slots[index].receipt
         index -= 1
         if receipt is None:
             continue

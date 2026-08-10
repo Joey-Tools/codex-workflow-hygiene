@@ -684,6 +684,13 @@ def _exact_progress_snapshot(
                         quarantined["entries"],
                         claim["root_entries"][name],
                     ),
+                    any(
+                        (
+                            marker,
+                            len(quarantined["entries"])
+                            == len(claim["root_entries"][name]),
+                        )
+                    ),
                 )
             ):
                 raise safe_io.UnsafePathError(

@@ -370,6 +370,59 @@ class SafeIoTests(unittest.TestCase):
         finally:
             os.close(parent_fd)
 
+    def test_cleanup_inventory_rejects_fifo_without_blocking(self) -> None:
+        tree = self.root / "fifo-tree"
+        tree.mkdir(mode=0o700)
+        fifo = tree / "blocked"
+        os.mkfifo(fifo, 0o600)
+        parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.assertRaisesRegex(UnsafePathError, "regular file"):
+                safe_io.inspect_tree_inventory_at(
+                    parent_fd,
+                    tree.name,
+                    budget=self._inventory_budget(),
+                    display_path=tree,
+                )
+        finally:
+            os.close(parent_fd)
+        self.assertTrue(stat.S_ISFIFO(fifo.lstat().st_mode))
+
+    def test_checked_file_open_rejects_regular_to_fifo_swap_nonblocking(self) -> None:
+        target = self.root / "swapped"
+        target.write_bytes(b"regular\n")
+        os.chmod(target, 0o600)
+        parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        original_open = safe_io.os.open
+        observed_flags: list[int] = []
+        swapped = False
+
+        def swap_then_open(name, flags, *args, **kwargs):
+            nonlocal swapped
+            if name == target.name and not swapped:
+                swapped = True
+                target.unlink()
+                os.mkfifo(target, 0o600)
+                observed_flags.append(flags)
+            return original_open(name, flags, *args, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(safe_io.os, "open", side_effect=swap_then_open),
+                self.assertRaisesRegex(UnsafePathError, "regular file"),
+            ):
+                safe_io.open_checked_file_at(
+                    parent_fd,
+                    target.name,
+                    display_path=target,
+                    require_owner_only=True,
+                )
+        finally:
+            os.close(parent_fd)
+        self.assertTrue(swapped)
+        self.assertTrue(observed_flags[0] & os.O_NONBLOCK)
+        self.assertTrue(stat.S_ISFIFO(target.lstat().st_mode))
+
     def test_atomic_create_never_replaces_an_existing_file(self) -> None:
         target = self.root / "identity.key"
         atomic_create_bytes(target, b"first\n")
@@ -406,6 +459,71 @@ class SafeIoTests(unittest.TestCase):
 
         remove_atomic_created_bytes(receipt)
 
+        self.assertFalse(target.exists())
+
+    def test_atomic_create_slot_rolls_back_linked_base_exception(self) -> None:
+        class PublicationInterrupted(BaseException):
+            pass
+
+        target = self.root / "interrupted.json"
+        slot = safe_io.AtomicCreateReceiptSlot()
+        original_link = safe_io.os.link
+
+        def link_then_interrupt(*args, **kwargs):
+            original_link(*args, **kwargs)
+            if args[1] == target.name:
+                raise PublicationInterrupted
+
+        with (
+            mock.patch.object(safe_io.os, "link", side_effect=link_then_interrupt),
+            self.assertRaises(PublicationInterrupted),
+        ):
+            atomic_create_bytes_with_receipt(
+                target,
+                b"sensitive\n",
+                receipt_slot=slot,
+            )
+
+        self.assertIsNotNone(slot.receipt)
+        pending = self.root / slot.receipt.pending_name
+        self.assertTrue(target.is_file())
+        self.assertTrue(pending.is_file())
+        self.assertEqual(target.stat().st_ino, pending.stat().st_ino)
+        remove_atomic_created_bytes(slot.receipt)
+        self.assertFalse(target.exists())
+        self.assertFalse(pending.exists())
+
+    def test_atomic_create_slot_rolls_back_post_publish_base_exception(self) -> None:
+        class PublicationInterrupted(BaseException):
+            pass
+
+        target = self.root / "post-publish.json"
+        slot = safe_io.AtomicCreateReceiptSlot()
+        original_hash = safe_io._hash_file_descriptor
+
+        def interrupt_final_hash(descriptor, **kwargs):
+            if slot.receipt is not None and target.exists():
+                raise PublicationInterrupted
+            return original_hash(descriptor, **kwargs)
+
+        with (
+            mock.patch.object(
+                safe_io,
+                "_hash_file_descriptor",
+                side_effect=interrupt_final_hash,
+            ),
+            self.assertRaises(PublicationInterrupted),
+        ):
+            atomic_create_bytes_with_receipt(
+                target,
+                b"sensitive\n",
+                receipt_slot=slot,
+            )
+
+        self.assertIsNotNone(slot.receipt)
+        self.assertTrue(target.is_file())
+        self.assertFalse((self.root / slot.receipt.pending_name).exists())
+        remove_atomic_created_bytes(slot.receipt)
         self.assertFalse(target.exists())
 
     def test_atomic_create_uses_one_persistent_lock_per_directory(self) -> None:
@@ -458,6 +576,51 @@ class SafeIoTests(unittest.TestCase):
 
         self.assertTrue(close_failed)
         self.assertFalse(target.exists())
+
+    def test_atomic_create_close_failure_releases_lock_before_raising(self) -> None:
+        target = self.root / "close-failure.json"
+        slot = safe_io.AtomicCreateReceiptSlot()
+        original_hash = safe_io._hash_file_descriptor
+        original_close = os.close
+        target_descriptor: int | None = None
+        close_failed = False
+
+        def capture_final_descriptor(descriptor: int, **kwargs) -> str:
+            nonlocal target_descriptor
+            if slot.receipt is not None and target.exists():
+                target_descriptor = descriptor
+            return original_hash(descriptor, **kwargs)
+
+        def close_then_fail(descriptor: int) -> None:
+            nonlocal close_failed
+            original_close(descriptor)
+            if descriptor == target_descriptor and not close_failed:
+                close_failed = True
+                raise OSError("simulated atomic-create close failure")
+
+        with (
+            mock.patch.object(
+                safe_io,
+                "_hash_file_descriptor",
+                side_effect=capture_final_descriptor,
+            ),
+            mock.patch.object(safe_io.os, "close", side_effect=close_then_fail),
+            self.assertRaisesRegex(OSError, "atomic-create close failure"),
+        ):
+            atomic_create_bytes_with_receipt(
+                target,
+                b"payload\n",
+                receipt_slot=slot,
+            )
+
+        self.assertTrue(close_failed)
+        self.assertIsNotNone(slot.receipt)
+        remove_atomic_created_bytes(slot.receipt)
+        followup = atomic_create_bytes_with_receipt(
+            self.root / "followup.json",
+            b"followup\n",
+        )
+        remove_atomic_created_bytes(followup)
 
     def test_atomic_create_receipt_rejects_parent_replacement(self) -> None:
         parent = self.root / "created-parent"

@@ -1006,6 +1006,49 @@ class ShardingTests(unittest.TestCase):
                 )
             )
 
+    def test_streaming_shard_stage_rolls_back_post_link_base_exception(self) -> None:
+        class PublicationInterrupted(BaseException):
+            pass
+
+        payload = b'{"turn":1}\n'
+        records = [
+            raw_record(
+                candidate("interrupted-unit", payload),
+                payload,
+            )
+        ]
+        plan = sharding.plan_ordered_raw_shards(records)
+        original_link = sharding._safe_io.os.link
+
+        def link_then_interrupt(*args, **kwargs):
+            original_link(*args, **kwargs)
+            if str(args[1]).startswith("raw-shard-"):
+                raise PublicationInterrupted
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary) / "interrupted-raw-run"
+            with (
+                mock.patch.object(
+                    sharding._safe_io.os,
+                    "link",
+                    side_effect=link_then_interrupt,
+                ),
+                self.assertRaises(PublicationInterrupted),
+            ):
+                sharding.materialize_ordered_raw_shards(
+                    records,
+                    run_directory,
+                    plan=plan,
+                )
+            self.assertFalse(
+                any(
+                    path.name == sharding.RAW_SHARDS_MANIFEST_FILE
+                    or path.name.startswith("raw-shard-")
+                    or path.name.endswith(".tmp")
+                    for path in run_directory.iterdir()
+                )
+            )
+
     def test_streaming_shard_rollback_continues_after_receipt_mismatch(self) -> None:
         payloads = [b'{"turn":1}\n', b'{"turn":2}\n']
         records = [

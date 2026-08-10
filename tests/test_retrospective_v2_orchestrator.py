@@ -3629,14 +3629,30 @@ class OrchestratorTests(unittest.TestCase):
 
         def assert_migrated(coordinator, attempt_ref):
             state = coordinator.load_state()
+            task = next(
+                task
+                for task in state["jobs"].values()
+                if any(
+                    attempt["attempt_ref"] == attempt_ref
+                    for attempt in task.get("attempts", [])
+                )
+            )
             attempt = next(
                 attempt
-                for task in state["jobs"].values()
                 for attempt in task.get("attempts", [])
                 if attempt["attempt_ref"] == attempt_ref
             )
             self.assertNotIn("job_manifest", attempt)
-            self.assertRegex(attempt["job_manifest_digest"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                content_digest(
+                    coordinator._execution_manifest(
+                        state,
+                        task,
+                        attempt["ordinal"],
+                    )
+                ),
+                attempt["job_manifest_digest"],
+            )
 
         unclaimed = self.activity_run("legacy-unclaimed-manifest")
         unclaimed_job = unclaimed.status()["runnable_jobs"][0]
@@ -3667,6 +3683,61 @@ class OrchestratorTests(unittest.TestCase):
         )
         assert_migrated(expired, expired_job["active_attempt_ref"])
         self.clock.value -= expiry_delta
+
+        active = self.activity_run("legacy-active-manifest")
+        active_job = active.status()["runnable_jobs"][0]
+        active_dispatcher = typed_ref(RefType.LEASE, "legacy-active-dispatcher")
+        active_claim = active.claim_agent_job(
+            active_job["job_ref"],
+            active_job["active_attempt_ref"],
+            active_dispatcher,
+        )
+        install_legacy_manifest(active, active_job["active_attempt_ref"])
+        recovered = active.claim_agent_job(
+            active_job["job_ref"],
+            active_job["active_attempt_ref"],
+            active_dispatcher,
+        )
+        self.assertTrue(recovered["idempotent"])
+        assert_migrated(active, active_job["active_attempt_ref"])
+        install_legacy_manifest(active, active_job["active_attempt_ref"])
+        heartbeat = active.claim_agent_job(
+            active_job["job_ref"],
+            active_job["active_attempt_ref"],
+            active_dispatcher,
+            claim_ref=active_claim["claim_ref"],
+        )
+        self.assertTrue(heartbeat["heartbeat"])
+        assert_migrated(active, active_job["active_attempt_ref"])
+
+        for disposition in ("accept", "reject"):
+            coordinator = self.activity_run(f"legacy-first-{disposition}-manifest")
+            job = coordinator.status()["runnable_jobs"][0]
+            claimed = coordinator.claim_agent_job(
+                job["job_ref"],
+                job["active_attempt_ref"],
+                typed_ref(RefType.LEASE, f"legacy-first-{disposition}-dispatcher"),
+            )
+            install_legacy_manifest(coordinator, job["active_attempt_ref"])
+            if disposition == "accept":
+                RetrospectiveOrchestrator.accept_agent_result(
+                    coordinator,
+                    job["job_ref"],
+                    job["active_attempt_ref"],
+                    self.extractor_result(job),
+                    claim_ref=claimed["claim_ref"],
+                    result_ref=claimed["result_ref"],
+                )
+            else:
+                coordinator.reject_agent_result_payload(
+                    job["job_ref"],
+                    job["active_attempt_ref"],
+                    claim_ref=claimed["claim_ref"],
+                    result_ref=claimed["result_ref"],
+                    payload_digest="a" * 64,
+                    reason="malformed_json",
+                )
+            assert_migrated(coordinator, job["active_attempt_ref"])
 
         completed = self.activity_run("legacy-completed-manifest")
         completed_job = completed.status()["runnable_jobs"][0]
@@ -3822,6 +3893,23 @@ class OrchestratorTests(unittest.TestCase):
                 job["active_attempt_ref"],
                 typed_ref(RefType.LEASE, f"{label}-dispatcher-3"),
             )
+
+            def install_legacy_manifest(state):
+                task = state["jobs"][job["task_ref"]]
+                attempt = next(
+                    item
+                    for item in task["attempts"]
+                    if item["attempt_ref"] == job["active_attempt_ref"]
+                )
+                attempt["job_manifest"] = coordinator._execution_manifest(
+                    state,
+                    task,
+                    attempt["ordinal"],
+                )
+                attempt.pop("job_manifest_digest")
+                return state, None
+
+            coordinator.store.transaction(install_legacy_manifest)
             replay = coordinator.claim_agent_job(
                 job["job_ref"],
                 job["active_attempt_ref"],
@@ -3829,6 +3917,15 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertTrue(replay["idempotent"])
             self.assertEqual(exhausted["outcome"], replay["outcome"])
+            attempt = next(
+                item
+                for item in coordinator.load_state()["jobs"][job["task_ref"]][
+                    "attempts"
+                ]
+                if item["attempt_ref"] == job["active_attempt_ref"]
+            )
+            self.assertNotIn("job_manifest", attempt)
+            self.assertIn("job_manifest_digest", attempt)
             return exhausted
 
         first_exhaustion = exhaust_active_attempt("first-attempt")
@@ -3852,6 +3949,72 @@ class OrchestratorTests(unittest.TestCase):
             {"agent_claim_budget_exhausted"},
             {gap["reason"] for gap in state["gaps"]},
         )
+
+    def test_agent_claim_budget_replay_migration_preserves_terminal_reserve(
+        self,
+    ) -> None:
+        coordinator = self.activity_run("legacy-claim-budget-replay-capacity")
+        job = coordinator.status()["runnable_jobs"][0]
+        first = coordinator.claim_agent_job(
+            job["job_ref"],
+            job["active_attempt_ref"],
+            typed_ref(RefType.LEASE, "legacy-budget-first"),
+        )
+        self.clock.value += dt.timedelta(
+            seconds=orchestrator_module.DEFAULT_AGENT_CLAIM_TTL_SECONDS + 1
+        )
+        coordinator.claim_agent_job(
+            job["job_ref"],
+            job["active_attempt_ref"],
+            typed_ref(RefType.LEASE, "legacy-budget-second"),
+        )
+        self.clock.value += dt.timedelta(
+            seconds=orchestrator_module.DEFAULT_AGENT_CLAIM_TTL_SECONDS + 1
+        )
+        coordinator.claim_agent_job(
+            job["job_ref"],
+            job["active_attempt_ref"],
+            typed_ref(RefType.LEASE, "legacy-budget-third"),
+        )
+
+        def install_legacy_manifest(state):
+            task = state["jobs"][job["task_ref"]]
+            attempt = next(
+                item
+                for item in task["attempts"]
+                if item["attempt_ref"] == job["active_attempt_ref"]
+            )
+            attempt["job_manifest"] = coordinator._execution_manifest(
+                state,
+                task,
+                attempt["ordinal"],
+            )
+            attempt.pop("job_manifest_digest")
+            return state, None
+
+        coordinator.store.transaction(install_legacy_manifest)
+        with mock.patch.object(
+            coordinator.store,
+            "has_operating_capacity",
+            return_value=False,
+        ):
+            blocked = coordinator.claim_agent_job(
+                job["job_ref"],
+                job["active_attempt_ref"],
+                typed_ref(RefType.LEASE, "legacy-budget-replay"),
+            )
+
+        state = coordinator.load_state()
+        attempt = next(
+            item
+            for item in state["jobs"][job["task_ref"]]["attempts"]
+            if item["attempt_ref"] == job["active_attempt_ref"]
+        )
+        self.assertEqual(first["attempt_ref"], attempt["attempt_ref"])
+        self.assertTrue(blocked["checkpoint_capacity_exhausted"])
+        self.assertEqual(RunStage.BLOCKED.value, state["stage"])
+        self.assertIn("job_manifest", attempt)
+        self.assertNotIn("job_manifest_digest", attempt)
 
     def test_agent_claim_oversized_sink_exhausts_without_takeover(self) -> None:
         coordinator = self.activity_run("bounded-agent-claim-sink")
@@ -4275,6 +4438,35 @@ class OrchestratorTests(unittest.TestCase):
             handle.write(b"[")
         with self.assertRaisesRegex(InvalidTransitionError, "changed"):
             extracted_turns.load(coordinator.run_dir, descriptor)
+
+    def test_source_staging_rolls_back_post_link_base_exception(self) -> None:
+        class PublicationInterrupted(BaseException):
+            pass
+
+        target = self.root / "staged-source" / "payload.bin"
+        prepared = source_inputs.prepare_file(target, b"sensitive source\n")
+        original_link = safe_io.os.link
+
+        def link_then_interrupt(*args, **kwargs):
+            original_link(*args, **kwargs)
+            if args[1] == target.name:
+                raise PublicationInterrupted
+
+        with (
+            mock.patch.object(safe_io.os, "link", side_effect=link_then_interrupt),
+            self.assertRaises(PublicationInterrupted),
+        ):
+            source_inputs.materialize((prepared,))
+
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            [],
+            [
+                path
+                for path in target.parent.iterdir()
+                if path.name != ".atomic-create-directory.lock"
+            ],
+        )
 
     def test_result_sidecars_keep_near_limit_checkpoint_reloadable(self) -> None:
         run_dir = self.root / "accepted-result-capacity"
@@ -6561,6 +6753,111 @@ class OrchestratorTests(unittest.TestCase):
                 cross_schema,
             )
 
+    def test_legacy_v4_cleanup_claim_authenticates_original_wire_shape(
+        self,
+    ) -> None:
+        def legacy_wire_claim(coordinator, claim, contract):
+            legacy = copy.deepcopy(claim)
+            for entries in legacy["root_entries"].values():
+                for entry in entries:
+                    entry.pop("content_commitment")
+            body = {key: value for key, value in legacy.items() if key != "claim_ref"}
+            ref_prefix, digest_domain, *_ = contract
+            legacy["claim_ref"] = ref_prefix + coordinator.identity.derive_digest(
+                digest_domain,
+                body,
+            )
+            return legacy
+
+        raw = self.start_daily("legacy-v4-raw-wire")
+        raw_state = raw.load_state()
+        raw_claim = raw._raw_cleanup_claim_value(
+            raw_state,
+            disposition="expired",
+            durable_commit=None,
+            phase_before=raw_state["publication"]["phase"],
+            publication_claim_ref=None,
+            inventory=raw._raw_cleanup_inventory(),
+            schema="raw_cleanup_claim_v4",
+        )
+        legacy_raw = legacy_wire_claim(
+            raw,
+            raw_claim,
+            cleanup_inventory.RAW_CLEANUP_CONTRACTS["raw_cleanup_claim_v4"],
+        )
+        self.assertEqual(
+            legacy_raw,
+            raw._validate_raw_cleanup_claim(
+                raw_state,
+                legacy_raw,
+                disposition="expired",
+                durable_commit=None,
+                phase_before=raw_state["publication"]["phase"],
+                publication_claim_ref=None,
+            ),
+        )
+        unsigned_raw = copy.deepcopy(legacy_raw)
+        next(
+            entry
+            for entries in unsigned_raw["root_entries"].values()
+            for entry in entries
+        )["content_commitment"] = None
+        with self.assertRaisesRegex(InvalidTransitionError, "authentication"):
+            raw._validate_raw_cleanup_claim(
+                raw_state,
+                unsigned_raw,
+                disposition="expired",
+                durable_commit=None,
+                phase_before=raw_state["publication"]["phase"],
+                publication_claim_ref=None,
+            )
+
+        shadow = self.start_daily(
+            "legacy-v4-shadow-wire",
+            hosts=DEFAULT_HOSTS,
+            allow_partial=True,
+            shadow=True,
+        )
+        shadow.holdout_host(REMOTE_HOST, reason="shadow_missing_host_holdout")
+        self.complete_shadow_partial(shadow)
+        shadow_payload_root = safe_io.ensure_owner_only_directory(
+            shadow.run_dir / "raw-inputs"
+        )
+        safe_io.atomic_create_bytes(shadow_payload_root / "legacy.bin", b"legacy\n")
+        shadow_state = shadow.load_state()
+        coverage = shadow._verified_persisted_shadow_coverage(shadow_state)
+        shadow_claim = shadow._shadow_cleanup_claim_value(
+            shadow_state,
+            coverage,
+            shadow._raw_cleanup_inventory(),
+            schema="shadow_cleanup_claim_v4",
+        )
+        legacy_shadow = legacy_wire_claim(
+            shadow,
+            shadow_claim,
+            cleanup_inventory.SHADOW_CLEANUP_CONTRACTS["shadow_cleanup_claim_v4"],
+        )
+        self.assertEqual(
+            legacy_shadow,
+            shadow._validate_shadow_cleanup_claim(
+                shadow_state,
+                coverage,
+                legacy_shadow,
+            ),
+        )
+        unsigned_shadow = copy.deepcopy(legacy_shadow)
+        next(
+            entry
+            for entries in unsigned_shadow["root_entries"].values()
+            for entry in entries
+        )["content_commitment"] = None
+        with self.assertRaisesRegex(InvalidTransitionError, "authentication"):
+            shadow._validate_shadow_cleanup_claim(
+                shadow_state,
+                coverage,
+                unsigned_shadow,
+            )
+
     def test_expired_raw_gc_cannot_overwrite_interleaved_finalize(self) -> None:
         coordinator = self.start_daily("expired-finalize-race")
         self.drain_sources(coordinator)
@@ -6969,6 +7266,62 @@ class OrchestratorTests(unittest.TestCase):
         recovered = coordinator.gc_expired_raw()
         self.assertTrue(recovered["cleaned"])
         self.assertFalse((coordinator.run_dir / "raw-inputs").exists())
+
+    def test_cleanup_v5_rejects_markerless_quarantine_subset(self) -> None:
+        coordinator = self.start_daily("cleanup-markerless-subset")
+        payload = coordinator.run_dir / "raw-inputs" / "markerless.bin"
+        payload.write_bytes(b"sensitive raw payload")
+        os.chmod(payload, 0o600)
+        self.clock.value += dt.timedelta(days=8)
+        with mock.patch.object(
+            coordinator,
+            "_delete_claimed_raw_paths",
+            side_effect=safe_io.UnsafePathError("persist claim before cleanup"),
+        ):
+            self.assertFalse(coordinator.gc_expired_raw()["cleaned"])
+        removed = False
+
+        def remove_child_before_marker(
+            quarantine_fd,
+            quarantine_path,
+            marker_name,
+            marker_payload,
+        ):
+            nonlocal removed
+            for name in os.listdir(quarantine_fd):
+                if not name.startswith("root-"):
+                    continue
+                root_fd = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    dir_fd=quarantine_fd,
+                )
+                try:
+                    try:
+                        os.unlink("markerless.bin", dir_fd=root_fd)
+                    except FileNotFoundError:
+                        continue
+                    os.fsync(root_fd)
+                    removed = True
+                    raise OSError("simulated crash before progress marker")
+                finally:
+                    os.close(root_fd)
+            raise AssertionError("markerless cleanup payload was not quarantined")
+
+        with mock.patch.object(
+            cleanup_inventory,
+            "_create_marker",
+            side_effect=remove_child_before_marker,
+        ):
+            interrupted = coordinator.gc_expired_raw()
+        self.assertTrue(removed)
+        self.assertFalse(interrupted["cleaned"])
+        self.assertEqual("OSError", interrupted["cleanup_error"])
+
+        rejected = coordinator.gc_expired_raw()
+        self.assertFalse(rejected["cleaned"])
+        self.assertEqual("UnsafePathError", rejected["cleanup_error"])
+        self.assertIsNone(coordinator.load_state()["publication"]["cleanup_receipt"])
 
     def test_cleanup_v5_retries_after_completed_root_deletion(self) -> None:
         coordinator = self.start_daily("cleanup-completed-root-retry")

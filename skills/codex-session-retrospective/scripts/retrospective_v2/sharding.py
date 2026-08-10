@@ -577,7 +577,11 @@ class ShardPlan:
 
 @dataclass(frozen=True, slots=True)
 class MaterializedShardFile:
-    receipt: object
+    slot: object
+
+    @property
+    def receipt(self) -> object | None:
+        return getattr(self.slot, "receipt", None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1105,13 +1109,17 @@ def materialize_raw_shards(
 def _create_or_validate_staged_file(
     path: Path,
     payload: bytes,
-) -> MaterializedShardFile | None:
+    materialized: MaterializedShardFile,
+) -> None:
     if _safe_io is None:
         raise ShardingValidationError("secure raw shard I/O is unavailable")
     _safe_io.ensure_owner_only_directory(path.parent)
     try:
-        receipt = _safe_io.atomic_create_bytes_with_receipt(
-            path, payload, create_parents=False
+        _safe_io.atomic_create_bytes_with_receipt(
+            path,
+            payload,
+            create_parents=False,
+            receipt_slot=materialized.slot,
         )
     except FileExistsError:
         try:
@@ -1126,10 +1134,9 @@ def _create_or_validate_staged_file(
             ) from error
         if existing != payload:
             raise ShardingValidationError("staged raw shard changed")
-        return None
+        return
     except (OSError, _safe_io.UnsafePathError) as error:
         raise ShardingValidationError("staged raw shard cannot be created") from error
-    return MaterializedShardFile(receipt=receipt)
 
 
 def materialize_ordered_raw_shards(
@@ -1143,7 +1150,14 @@ def materialize_ordered_raw_shards(
 
     selected_limits = limits or ShardLimits()
     run_path = _ensure_private_directory(Path(run_directory))
-    created: list[MaterializedShardFile] = []
+    if _safe_io is None:
+        raise ShardingValidationError("secure raw shard I/O is unavailable")
+    stage_receipt = RawShardStageReceipt(
+        tuple(
+            MaterializedShardFile(_safe_io.AtomicCreateReceiptSlot())
+            for _ in range(len(plan.shards) + 1)
+        )
+    )
     observed_ordinal = 0
 
     def emit(artifact: RawShardArtifact) -> None:
@@ -1154,12 +1168,11 @@ def materialize_ordered_raw_shards(
             raise ShardingValidationError(
                 "raw shard materialization diverged from plan"
             )
-        receipt = _create_or_validate_staged_file(
+        _create_or_validate_staged_file(
             run_path / artifact.manifest.file_name,
             artifact.data,
+            stage_receipt.files[observed_ordinal],
         )
-        if receipt is not None:
-            created.append(receipt)
         observed_ordinal += 1
 
     try:
@@ -1176,15 +1189,14 @@ def materialize_ordered_raw_shards(
             raise ShardingValidationError(
                 "raw shard materialization manifest changed after planning"
             )
-        manifest_receipt = _create_or_validate_staged_file(
+        _create_or_validate_staged_file(
             run_path / RAW_SHARDS_MANIFEST_FILE,
             plan.canonical_manifest_bytes() + b"\n",
+            stage_receipt.files[-1],
         )
-        if manifest_receipt is not None:
-            created.append(manifest_receipt)
     except BaseException as error:
         try:
-            rollback_ordered_raw_shards(RawShardStageReceipt(tuple(created)))
+            rollback_ordered_raw_shards(stage_receipt)
         except BaseException as rollback_error:
             if hasattr(error, "add_note"):
                 error.add_note(
@@ -1192,7 +1204,7 @@ def materialize_ordered_raw_shards(
                     f"{type(rollback_error).__name__}"
                 )
         raise
-    return RawShardStageReceipt(tuple(created))
+    return stage_receipt
 
 
 def rollback_ordered_raw_shards(receipt: RawShardStageReceipt) -> None:
@@ -1216,6 +1228,8 @@ def rollback_ordered_raw_shards(receipt: RawShardStageReceipt) -> None:
 def _remove_matching_staged_file(materialized: MaterializedShardFile) -> None:
     if _safe_io is None:
         raise ShardingValidationError("secure raw shard I/O is unavailable")
+    if materialized.receipt is None:
+        return
     if not isinstance(materialized.receipt, _safe_io.AtomicCreateReceipt):
         raise ShardingValidationError(
             "staged raw shard rollback lacks a creation identity receipt"

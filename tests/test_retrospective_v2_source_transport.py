@@ -244,7 +244,13 @@ class SourceTransportProtocolTests(unittest.TestCase):
         original_create = safe_io.atomic_create_bytes_with_receipt
         calls = 0
 
-        def create_then_fail(path, payload, *, create_parents=True):
+        def create_then_fail(
+            path,
+            payload,
+            *,
+            create_parents=True,
+            receipt_slot=None,
+        ):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -252,6 +258,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
                     path,
                     payload,
                     create_parents=create_parents,
+                    receipt_slot=receipt_slot,
                 )
                 original = Path(path).with_name("primary-original.bin")
                 Path(path).rename(original)

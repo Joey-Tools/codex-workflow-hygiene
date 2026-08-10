@@ -3,6 +3,7 @@
 from __future__ import annotations
 import copy
 import datetime as dt
+from functools import partial
 import hashlib
 import hmac
 import json
@@ -1027,7 +1028,6 @@ class SourceCoordinationOperations(OrchestratorComponent):
             raise InvalidInputError(
                 "agent claim TTL is outside the closed lease bounds"
             )
-
         budget_action_key = f"exhaust_agent_claim_budget:{normalized_attempt_ref}"
         budget_input_digest = content_digest(
             {
@@ -1042,11 +1042,26 @@ class SourceCoordinationOperations(OrchestratorComponent):
             self._state._assert_state_identity(state)
             self._state._require_retention_active_state(state)
             original_state = copy.deepcopy(state)
+            finalize_mutation = partial(
+                agent_checkpoint_capacity.finalize_claim,
+                self.store,
+                self._state,
+                state,
+                original_state,
+                prepared_files=prepared_claim_files,
+                attempt_ref=normalized_attempt_ref,
+                job_ref=normalized_job_ref,
+            )
+
             previous_budget = state["actions"].get(budget_action_key)
             if previous_budget is not None:
                 if previous_budget.get("input_digest") != budget_input_digest:
                     raise RunConflictError("agent claim budget replay binding changed")
-                return state, {
+                _, task, attempt = self._projection._agent_attempt_binding(
+                    state, normalized_job_ref, normalized_attempt_ref
+                )
+                self._bound_agent_job_manifest(state, task, attempt)
+                value = {
                     "attempt_ref": normalized_attempt_ref,
                     "claim_budget_exhausted": True,
                     "idempotent": True,
@@ -1054,6 +1069,11 @@ class SourceCoordinationOperations(OrchestratorComponent):
                     "outcome": previous_budget.get("outcome"),
                     "takeover": bool(previous_budget.get("takeover")),
                 }
+                return finalize_mutation(
+                    task=task,
+                    value=value,
+                    changed=state != original_state,
+                )
             task = self._projection._task_for_active_job(state, normalized_job_ref)
             if task.get("stage") != state["stage"]:
                 raise InvalidTransitionError("agent job is not in the current stage")
@@ -1062,6 +1082,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
             if task.get("active_attempt_ref") != normalized_attempt_ref:
                 raise InvalidInputError("attempt_ref is not the active fresh attempt")
             attempt = self._projection._active_attempt(task, normalized_attempt_ref)
+            self._bound_agent_job_manifest(state, task, attempt)
             dispatch_state = attempt.get("dispatch_state")
             now_text = self._state._now()
             now = _parse_timestamp(now_text, label="clock")
@@ -1082,24 +1103,6 @@ class SourceCoordinationOperations(OrchestratorComponent):
                     takeover=takeover,
                 )
 
-            def finalize_mutation(
-                value: dict[str, Any],
-                *,
-                changed: bool,
-            ) -> tuple[dict[str, Any], dict[str, Any]]:
-                return agent_checkpoint_capacity.finalize_claim(
-                    self.store,
-                    self._state,
-                    state,
-                    original_state,
-                    task,
-                    prepared_claim_files,
-                    value,
-                    attempt_ref=normalized_attempt_ref,
-                    changed=changed,
-                    job_ref=normalized_job_ref,
-                )
-
             if (
                 dispatch_state == "claimed"
                 and agent_claim_artifacts.sink_exceeds_budget(
@@ -1109,7 +1112,8 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 )
             ):
                 return finalize_mutation(
-                    exhaust_claim_budget(takeover=expired),
+                    task=task,
+                    value=exhaust_claim_budget(takeover=expired),
                     changed=True,
                 )
             heartbeat = False
@@ -1155,7 +1159,8 @@ class SourceCoordinationOperations(OrchestratorComponent):
                 generation = int(attempt.get("claim_generation", 0)) + 1
                 if generation > MAX_AGENT_CLAIM_GENERATIONS:
                     return finalize_mutation(
-                        exhaust_claim_budget(takeover=expired),
+                        task=task,
+                        value=exhaust_claim_budget(takeover=expired),
                         changed=True,
                     )
                 active_claim_ref = self._ref(
@@ -1213,7 +1218,8 @@ class SourceCoordinationOperations(OrchestratorComponent):
             if not new_claim:
                 self._jobs._materialize_agent_result_sink(attempt)
             return finalize_mutation(
-                {
+                task=task,
+                value={
                     "attempt_ref": normalized_attempt_ref,
                     "claim_expires_at": attempt["claim_expires_at"],
                     "claim_heartbeat_at": attempt["claim_heartbeat_at"],
@@ -1229,7 +1235,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
                     "result_ref": attempt["result_ref"],
                     "takeover": takeover,
                 },
-                changed=new_claim or heartbeat,
+                changed=state != original_state,
             )
 
         transaction = self.store.staged_transaction(
@@ -1409,6 +1415,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
             if task.get("active_attempt_ref") != normalized_attempt_ref:
                 raise InvalidInputError("attempt_ref is not the active fresh attempt")
             attempt = self._projection._active_attempt(task, normalized_attempt_ref)
+            self._bound_agent_job_manifest(state, task, attempt)
             self._require_active_agent_claim(
                 attempt,
                 normalized_claim_ref,
@@ -1611,6 +1618,7 @@ class SourceCoordinationOperations(OrchestratorComponent):
             if task.get("active_attempt_ref") != normalized_attempt_ref:
                 raise InvalidInputError("attempt_ref is not the active fresh attempt")
             attempt = self._projection._active_attempt(task, normalized_attempt_ref)
+            self._bound_agent_job_manifest(state, task, attempt)
             self._require_active_agent_claim(
                 attempt,
                 normalized_claim_ref,
@@ -1836,20 +1844,9 @@ class SourceCoordinationOperations(OrchestratorComponent):
         }
         if not isinstance(action, Mapping) or action.get("binding") != expected_binding:
             raise RunConflictError("agent result replay binding changed")
-        matches: list[tuple[str, Mapping[str, Any], dict[str, Any]]] = []
-        for task_key, task in state["jobs"].items():
-            attempts = task.get("attempts")
-            if not isinstance(attempts, list):
-                continue
-            for attempt in attempts:
-                if (
-                    isinstance(attempt, dict)
-                    and attempt.get("attempt_ref") == attempt_ref
-                ):
-                    matches.append((task_key, task, attempt))
-        if len(matches) != 1:
-            raise RunConflictError("agent result replay attempt is not unique")
-        task_key, task, attempt = matches[0]
+        task_key, task, attempt = self._projection._agent_attempt_binding(
+            state, job_ref, attempt_ref
+        )
         ordinal = attempt.get("ordinal")
         generation = attempt.get("claim_generation")
         dispatcher_ref = attempt.get("dispatcher_ref")

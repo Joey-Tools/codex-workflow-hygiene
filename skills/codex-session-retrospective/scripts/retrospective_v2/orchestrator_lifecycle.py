@@ -2307,13 +2307,19 @@ class RunLifecycleOperations(OrchestratorComponent):
             label="raw",
             roots=contract[2],
         )
+        auth_inventory = {
+            **inventory,
+            "root_entries": copy.deepcopy(
+                claim.get("root_entries", inventory.get("root_entries"))
+            ),
+        }
         expected = self._raw_cleanup_claim_value(
             state,
             disposition=disposition,
             durable_commit=durable_commit,
             phase_before=phase_before,
             publication_claim_ref=publication_claim_ref,
-            inventory=inventory,
+            inventory=auth_inventory,
             schema=str(claim["schema"]),
         )
         if claim != expected:
@@ -2668,10 +2674,16 @@ class RunLifecycleOperations(OrchestratorComponent):
             label="shadow",
             roots=roots,
         )
+        auth_inventory = {
+            **inventory,
+            "root_entries": copy.deepcopy(
+                claim.get("root_entries", inventory.get("root_entries"))
+            ),
+        }
         expected = self._shadow_cleanup_claim_value(
             state,
             coverage,
-            inventory,
+            auth_inventory,
             schema=str(claim["schema"]),
         )
         if claim != expected:

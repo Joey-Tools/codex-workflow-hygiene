@@ -3,7 +3,7 @@ id: 20260716-srv2e01
 title: Session Retrospective v2 Engine
 status: completed
 created: 2026-07-16
-updated: 2026-08-09
+updated: 2026-08-10
 branch: codex/session-retrospective-v2-engine-linear
 pr: 67
 supersedes: []
@@ -904,3 +904,41 @@ superseded_by:
   isolated official OpenAI validator reports `Skill is valid!`. The only
   subsequent change is this evidence-only journal update; exact-head admission,
   review, CI, and PR lifecycle gates remain pending.
+- Fresh whole-range Codex review of signed head `4f2764c` found five actionable
+  issues. Legacy cleanup v4 authentication normalized the original wire shape
+  before checking its claim reference; active inline job manifests could bypass
+  binding and migration on claim heartbeat, idempotent recovery, first result
+  disposition, and terminal budget replay; markerless quarantine accepted a
+  subset of the planned tree; atomic create linked its final name before the
+  caller owned durable rollback authority; and cleanup inventory could block on
+  an owner-only FIFO before rejecting its type. The independent reviewer
+  workspace was postvalidated clean and removed, so its findings apply only to
+  the superseded head.
+- The repair authenticates legacy cleanup claims against their original
+  field-present representation, binds or migrates every active attempt path
+  under the checkpoint reserve, and requires either the complete quarantined set
+  or a durable progress marker. Atomic create now publishes a descriptor-bound
+  receipt into a caller-preallocated slot before linking and can roll back the
+  pending-only, two-link, or final-only state after any unwindable
+  `BaseException`. Cleanup rejects special files from parent-held metadata and
+  uses nonblocking no-follow opens before revalidating regular-file identity,
+  content, and access policy. A close-only create failure releases the directory
+  lock and parent descriptor before it propagates.
+- Exact close/rollback regressions pass 2/2, module boundaries pass 18/18 in
+  1.585 seconds, and the complete affected identity, catalog, source-transport,
+  orchestrator, and module-boundary group passes 267/267 in 177.443 seconds.
+  The package branch proxy is 8,374/8,375 with 20 functions over 200 lines.
+  Ruff lint and format checks pass for all 12 changed Python files,
+  `git diff --check` passes, skill structure and validator-wrapper tests pass
+  39/39 in 5.218 seconds, and the isolated official OpenAI validator reports
+  `Skill is valid!`. One initial affected run stopped at 265/266 because an old
+  test mock did not accept the new receipt-slot argument; the corrected terminal
+  group above supersedes that non-counting run.
+- A sandboxed full discovery reached 1,600 tests in 272.019 seconds before the
+  disposable-GPG class failed during key generation; it is non-counting because
+  the host publication permission gate was absent. Under the explicitly
+  authorized host `/private/tmp` shape, the publication module passes 58/58 in
+  719.725 seconds and the final Python 3.13 discovery passes all 1,646 tests in
+  1,106.765 seconds. The direct Claude lane is skipped under Joey's explicit
+  authorization for this Codex task and is not represented as an executed
+  double or triple review.

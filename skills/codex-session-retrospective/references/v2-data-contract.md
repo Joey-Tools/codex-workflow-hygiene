@@ -185,8 +185,12 @@ retained raw payload, and a submitted non-target consumed record is rejected.
   an execution envelope. A legacy attempt may carry the full manifest instead of
   its digest, but never both: the coordinator requires an exact reconstruction,
   migrates it to the digest form, and rejects every ambiguous or changed legacy
-  representation. Replaying an accepted result also reauthenticates its result
-  sidecar instead of trusting checkpoint status alone.
+  representation before every active claim mutation, first result disposition,
+  or terminal claim-budget replay. A migration-only transition consumes the same
+  terminal checkpoint reserve as a new mutation; insufficient reserve restores
+  the original inline representation and records the blocker. Replaying an
+  accepted result also reauthenticates its result sidecar instead of trusting
+  checkpoint status alone.
 - Reassembled extracted turns live in one canonical owner-only,
   content-addressed sidecar under `agent-sinks/derived`. Its 96 MiB cap is
   independent of the 32 MiB checkpoint cap, and the checkpoint retains only a
@@ -259,19 +263,38 @@ retained raw payload, and a submitted non-target consumed record is rejected.
   newly created rollback target.
 - Every newly created staged file returns an object-identity receipt binding its
   parent identity, file identity, owner-only access policy, exact byte count, and
-  SHA-256 content. All atomic creates in one directory share one persistent
-  directory lock, so two target names cannot bypass each other's transaction
-  boundary. Rollback reacquires that lock and performs
-  two descriptor-bound content and policy samples before unlinking. Parent or
-  leaf replacement, same-inode content mutation, unreadability, or policy drift
-  fails closed and retains the path. Child-entry churn that does not change the
-  protected parent identity is benign. The receipt excludes a non-cooperating
-  malicious same-UID writer from its guarantee; it proves and protects the
-  cooperating transaction boundary rather than claiming an atomic unlink-by-FD
-  primitive the platform does not provide. Independent receipts and staging
-  groups continue rollback after one retained mismatch; a close failure after a
-  proved unlink is secondary evidence and cannot reverse the known disposition
-  or replace the original primary failure.
+  SHA-256 content. A caller-owned receipt slot is allocated before I/O and is
+  populated while the descriptor-held file still has only its deterministic
+  pending name, before publication links the final name. The same receipt binds
+  the pending and final names and can roll back the proved one-name pending,
+  two-name commit, or one-name final state after any unwindable `BaseException`;
+  an extra hard link or any identity/content/policy mismatch fails closed. All
+  atomic creates in one directory share one persistent directory lock, so two
+  target names cannot bypass each other's transaction boundary. Rollback
+  reacquires that lock and performs two descriptor-bound content and policy
+  samples before unlinking. Parent or leaf replacement, same-inode content
+  mutation, unreadability, or policy drift fails closed and retains the path.
+  Child-entry churn that does not change the protected parent identity is benign.
+  The receipt excludes `SIGKILL`, `os._exit`, and a non-cooperating malicious
+  same-UID writer from its guarantee; it proves the cooperating unwind and
+  recovery boundary rather than claiming an atomic unlink-by-FD primitive the
+  platform does not provide. Independent receipts and staging groups continue
+  rollback after one retained mismatch; a close failure after a proved unlink is
+  secondary evidence and cannot reverse the known disposition or replace the
+  original primary failure.
+- Exact cleanup inventory rejects non-regular leaf objects from descriptor-held
+  parent metadata before opening them. Every subsequent file open uses
+  `O_NOFOLLOW | O_NONBLOCK`, so a regular-file-to-FIFO replacement cannot block
+  the cooperative traversal deadline before type and object identity are
+  revalidated. Nonblocking open does not claim a hard I/O deadline for ordinary
+  files or network/File Provider storage.
+- Legacy inline cleanup claim v4 authentication binds the original field-present
+  wire representation before semantic normalization; a missing legacy
+  `content_commitment` and an explicit null are not interchangeable without a
+  new valid claim reference. After quarantine rename, a missing durable progress
+  marker still requires the complete planned relative-path set. Only a verified,
+  fsynced marker permits a strict identity/content/policy-matching subset as
+  evidence of monotonic cleanup progress.
 - Raw run directory: mode `0700`; every file: mode `0600`. On Darwin, each
   owner-only directory and file must also have no extended ACL. Newly created
   objects clear inherited ACLs through their held descriptors before use;

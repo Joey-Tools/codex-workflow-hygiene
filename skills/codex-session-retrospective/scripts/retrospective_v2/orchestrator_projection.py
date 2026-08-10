@@ -234,6 +234,22 @@ class StateProjectionOperations(OrchestratorComponent):
         return matches[0]
 
     @staticmethod
+    def _agent_attempt_binding(
+        state: Mapping[str, Any], job_ref: str, attempt_ref: str
+    ) -> tuple[str, Mapping[str, Any], dict[str, Any]]:
+        matches = [
+            (task_key, task, attempt)
+            for task_key, task in state["jobs"].items()
+            for attempt in task.get("attempts", [])
+            if isinstance(attempt, dict)
+            and attempt.get("attempt_ref") == attempt_ref
+            and attempt.get("job_ref") == job_ref
+        ]
+        if len(matches) != 1:
+            raise RunConflictError("agent attempt replay binding is not unique")
+        return matches[0]
+
+    @staticmethod
     def _restore_shard_manifest(value: Mapping[str, Any]) -> sharding.ShardManifest:
         ranges: list[sharding.RawRangeDescriptor] = []
         for item in value["ranges"]:
