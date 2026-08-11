@@ -2849,6 +2849,71 @@ class DurablePublicationTests(unittest.TestCase):
             adapter._git(("rev-parse", "HEAD")).stdout.decode("ascii").strip(),
         )
 
+    def test_history_reader_and_publisher_share_repository_admission(self) -> None:
+        alias = self.root / "history-repository-alias"
+        alias.symlink_to(self.repo, target_is_directory=True)
+        with self.assertRaisesRegex(
+            authority.HistoryValidationError, "local safety admission"
+        ):
+            authority._GitRepository(
+                alias,
+                gnupg_home=self.gnupg_home,
+                git_binary="git",
+                gpg_program=self.gpg,
+            )
+
+        mode = self.repo.stat().st_mode & 0o777
+        os.chmod(self.repo, mode | 0o020)
+        try:
+            with self.assertRaisesRegex(
+                authority.HistoryValidationError, "local safety admission"
+            ):
+                authority._GitRepository(
+                    self.repo,
+                    gnupg_home=self.gnupg_home,
+                    git_binary="git",
+                    gpg_program=self.gpg,
+                )
+        finally:
+            os.chmod(self.repo, mode)
+
+        alternates = self.repo / ".git" / "objects" / "info" / "alternates"
+        alternates.write_text(str(self.root / "alternate-objects") + "\n")
+        try:
+            with self.assertRaisesRegex(
+                authority.HistoryValidationError, "local safety admission"
+            ):
+                authority._GitRepository(
+                    self.repo,
+                    gnupg_home=self.gnupg_home,
+                    git_binary="git",
+                    gpg_program=self.gpg,
+                )
+            with self.assertRaisesRegex(
+                publication_support.LocalGitPublicationError,
+                "Git object alternates are not allowed",
+            ):
+                self.publication_adapter()
+        finally:
+            alternates.unlink()
+
+    def test_history_reader_revalidates_shared_repository_admission(self) -> None:
+        repository = authority._GitRepository(
+            self.repo,
+            gnupg_home=self.gnupg_home,
+            git_binary="git",
+            gpg_program=self.gpg,
+        )
+        grafts = self.repo / ".git" / "info" / "grafts"
+        grafts.write_text(f"{self.base_head}\n", encoding="ascii")
+        try:
+            with self.assertRaisesRegex(
+                authority.HistoryValidationError, "safety binding changed"
+            ):
+                repository.text("rev-parse", "HEAD")
+        finally:
+            grafts.unlink()
+
     def test_history_git_commands_ignore_replace_refs(self) -> None:
         tree = run_command(
             ["git", "rev-parse", f"{self.base_head}^{{tree}}"], cwd=self.repo

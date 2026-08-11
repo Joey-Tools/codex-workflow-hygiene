@@ -49,7 +49,7 @@ Publication uses an explicit side-effect boundary:
 | `publication_state.py` | Durable publication state and transition validation |
 | `publication_contracts.py` | Side-effect protocols and injected adapter contracts |
 | `publication_support.py` | Immutable contracts, anchored I/O, and pure validation |
-| `git_safety.py` | Shared local-only Git environment and repository completeness policy |
+| `git_safety.py` | Shared local-only Git environment, repository admission, and revalidation |
 
 `retained_inputs.py` owns authenticated export-input sidecars, while
 `source_overlap.py` owns strict streaming JSON token decoding, deterministic
@@ -70,6 +70,13 @@ manifest does not expose the parent materializer.
 The bootstrap keeps the helper descriptor open through its bounded read and
 revalidates object identity plus owner/mode/link/size policy before executing
 the retained exact bytes.
+Both source-program bootstraps use no-follow, nonblocking descriptor opens and
+compare the opened object with the named object before and after the bounded
+read. They require a stable regular-file identity, owner/group/mode, single-link
+state, and exact size; the owner-private snapshots additionally require mode
+`0600`. FIFO, leaf-symlink, hardlink, access-policy drift, and same-path
+replacement therefore fail before compilation or execution. The Python runtime
+uses the same bounded reader with a root-or-current-user, non-writable policy.
 `transport_remote.py` launches the retained snapshot, never the live installed
 path. This preserves the worker manifest's no-parent-write boundary while
 closing the commitment-to-execution replacement window. The parent derives the
@@ -154,19 +161,28 @@ reachable, recovery instead binds the adapter attempt and signed durable
 history; it neither mistakes the expected history advance for drift nor requires
 an already collected local bundle.
 
-The transport slice remains independently bounded after this hardening: 7,214
+History readiness and formal publication use the same local-repository
+admission receipt. It binds owner-controlled real ancestry for the worktree,
+Git directory, common directory, and closed object store; rejects alternates,
+grafts, shallow repositories, and promisor/partial-clone configuration; and
+revalidates the bound directory identities plus forbidden metadata before each
+later Git command. A repository that finalize would reject is therefore blocked
+by doctor/start before an expensive retrospective run begins.
+
+The transport slice remains independently bounded after this hardening: 7,240
 physical lines across a 7,250-line aggregate limit. One exact 14-module
 inventory and its aggregate are enforced together, so omitting a transport
 module cannot create a false budget pass. The newly affected modules are
-`transport_program.py` at 432/450 lines, `transport_remote.py` at 315/320,
-`transport_snapshot.py` at 213/220, and `transport_remote_snapshot.py` at
-86/100, while `transport_contracts.py` is 984/1,000. The closed run-state
+`transport_paths.py` at 89/100 lines, `transport_program.py` at 437/450,
+`transport_remote.py` at 315/320, `transport_snapshot.py` at 215/220, and
+`transport_remote_snapshot.py` at 86/100, while `transport_contracts.py` is
+984/1,000. The closed run-state
 authority inventory is exactly 1,000/1,000 lines: `run_state_authority.py` 243/250,
 `run_state_contracts.py` 37/50, `run_state_cursors.py` 219/225,
 `run_state_holdouts.py` 236/240, and `run_state_lineage.py` 265/275. Including
 this full slice, the orchestrator foundation is 3,297/3,350 lines. The global
-branch proxy is 8,395/8,400 nodes after adding the explicit holdout and shadow
-successor predicates. The publication support boundary is
+branch proxy is 8,399/8,400 nodes after adding the repository-admission and
+transport access-policy predicates. The publication support boundary is
 1,307/1,310 lines after adding claim-time checkpoint authority validation. The
 source coordinator and
 its original support slice are 2,930/3,000 lines; the three source-staging modules

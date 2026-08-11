@@ -3,7 +3,7 @@ id: 20260716-srv2e01
 title: Session Retrospective v2 Engine
 status: completed
 created: 2026-07-16
-updated: 2026-08-10
+updated: 2026-08-11
 branch: codex/session-retrospective-v2-engine-linear
 pr: 67
 supersedes: []
@@ -263,7 +263,7 @@ superseded_by:
   journal and the run's cleanup-pending checkpoint are durable. Only then may the
   sidecar become terminal; recovery accepts a fully collected bundle/sidecar pair
   but rejects one-sided disappearance as a conflict.
-- The transport boundary is an exact 14-module inventory at 7,214 lines under a
+- The transport boundary is an exact 14-module inventory at 7,240 lines under a
   7,250-line aggregate ceiling. The contract fails on membership drift, individual
   module drift, or aggregate growth instead of relying on an approximate total.
 - The public finalize command advances exactly one durable publication phase per
@@ -1252,3 +1252,32 @@ superseded_by:
   reference-document paths, including the five untracked new modules and
   excluding this evidence-only journal. Its pre/post digest is unchanged at
   `6098a91d946d9405b39ed0136d9002792bc4d88cc8b67d35d52c08ab726a1551`.
+- The fresh named-single review of signed head `d9eddf7` found two remaining
+  P2 boundaries. Source-program and remote-helper bootstraps could block on a
+  FIFO or follow a leaf symlink before authenticating a regular file. History
+  readiness also accepted repositories whose alternates, grafts, real-directory
+  ancestry, or owner-control policy would later be rejected by finalize.
+- Source-program, Python-runtime, and remote-helper bootstrap reads now use
+  no-follow, nonblocking descriptors. They compare descriptor and named-object
+  identity, owner/group/mode, link count, and exact size before and after the
+  bounded read, rejecting FIFO, symlink, hardlink, unsafe access policy, and
+  permission drift before compilation or execution. The encoded bootstrap is
+  4,082 bytes and remains within the 4,096-byte lease argument contract.
+- Durable-history readers and the formal publication adapter now consume one
+  shared local-repository admission receipt. It binds owner-controlled real
+  ancestry for the worktree and Git metadata directories, proves a closed object
+  store, rejects alternates/grafts/shallow/promisor state, and revalidates the
+  bound directories plus forbidden metadata before later Git commands. Doctor
+  and start therefore fail before model work on repositories finalize would
+  reject.
+- Source transport passes 72/72 in 22.869 seconds; publication invariants pass
+  12/12 and the complete authorized temporary-GPG publication class passes
+  59/59 in 1,305.551 seconds; module boundaries pass 18/18. The exact transport
+  inventory is 7,240/7,250 lines and the branch proxy is 8,399/8,400 nodes.
+  Ruff lint/format, `git diff --check`, and project-journal validation pass; the
+  official isolated Python 3.13 OpenAI validator reports `Skill is valid!`.
+- The final authorized host Python 3.13 discovery passes all 1,678 tests in
+  1,854.399 seconds with `TMPDIR=/private/tmp` and a 2,400-second hard deadline.
+  The binary patch digest over the 10 implementation, test, and architecture
+  files, excluding this evidence-only journal append, is
+  `77f575db56359959c696fee0f6f6d63b495e6a7a631a4c7bd9a14cfe07e8b9e1`.

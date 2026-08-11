@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import pathlib
 import re
+import stat
 
 try:
     from .transport_contracts import TransportValidationError
@@ -26,12 +27,30 @@ def _program_stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         metadata.st_dev,
         metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
         metadata.st_mode,
         metadata.st_nlink,
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
     )
+
+
+def _require_program_component_policy(metadata: os.stat_result, role: str) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise TransportValidationError(
+            f"source transport {role} must be a regular non-symlink file"
+        )
+    mode = stat.S_IMODE(metadata.st_mode)
+    if not all((metadata.st_uid in {0, os.geteuid()}, not mode & 0o022)):
+        raise TransportValidationError(
+            f"source transport {role} has an unsafe access policy"
+        )
+    if metadata.st_nlink != 1:
+        raise TransportValidationError(
+            f"source transport {role} must have exactly one link"
+        )
 
 
 def _program_named_identity(

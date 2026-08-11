@@ -798,17 +798,11 @@ class _GitRepository:
         self.env = git_safety.history_git_environment(
             home=str(Path.home()), gnupg_home=str(self.gnupg_home)
         )
-        probe = self.run("rev-parse", "--is-inside-work-tree", check=False)
-        if probe.returncode != 0 or probe.stdout.strip() != b"true":
-            raise HistoryValidationError("history repository is not a Git work tree")
-        try:
-            git_safety.validate_complete_local_repository_commands(
-                lambda args: self.run(*args, check=False)
-            )
-        except ValueError as error:
-            raise HistoryValidationError(
-                "history repository must be complete and non-promisor"
-            ) from error
+        self._repository_admission = git_safety.admit_history_repository(
+            self.path,
+            lambda args: self.run(*args, check=False),
+            safe_io.owner_controlled_directory_identity,
+        )
 
     def run(
         self,
@@ -817,6 +811,10 @@ class _GitRepository:
         input_bytes: bytes | None = None,
         max_output_bytes: int = MAX_GIT_OUTPUT_BYTES,
     ) -> subprocess.CompletedProcess[bytes]:
+        git_safety.revalidate_history_repository(
+            getattr(self, "_repository_admission", None),
+            safe_io.owner_controlled_directory_identity,
+        )
         result = _run_bounded(
             (
                 self.git,

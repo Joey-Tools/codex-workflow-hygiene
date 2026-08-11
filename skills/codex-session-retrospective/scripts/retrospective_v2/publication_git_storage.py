@@ -171,43 +171,23 @@ class LocalGitStorageOperations:
             self._recover_provider_cas()
 
     def _validate_repo(self) -> None:
-        self._git_directory_identity(self._repo)
-        result = self._git(("rev-parse", "--is-inside-work-tree"), check=False)
-        if result.returncode != 0 or result.stdout.strip() != b"true":
-            raise LocalGitPublicationError(f"not a Git repository: {self._repo}")
-        git_dir = self._git_path("--git-dir")
-        common_dir = self._git_path("--git-common-dir")
-        object_store = common_dir / "objects"
-        if self._git_path("--git-path", "objects") != object_store:
-            raise LocalGitPublicationError("Git object store path is not closed")
-        paths = (git_dir, common_dir, object_store)
-        self._git_metadata_anchors = {
-            path: self._git_directory_identity(path) for path in paths
-        }
-        self._forbidden_git_metadata = {
-            object_store / "info" / "alternates": "Git object alternates",
-            common_dir / "info" / "grafts": "Git grafts",
-        }
-        self._reject_forbidden_git_metadata()
         try:
-            git_safety.validate_complete_local_repository_commands(
-                lambda args: self._git(args, check=False)
+            self._git_repository_admission = git_safety.admit_local_repository(
+                self._repo,
+                lambda args: self._git(args, check=False),
+                self._git_directory_identity,
             )
-        except ValueError as error:
+        except git_safety.LocalRepositorySafetyError as error:
+            if error.reason == "not-worktree":
+                raise LocalGitPublicationError(
+                    f"not a Git repository: {self._repo}"
+                ) from error
+            if error.reason != "incomplete":
+                raise LocalGitPublicationError(str(error)) from error
             raise LocalGitPublicationError(
                 "Git repository must be complete and non-promisor"
             ) from error
-        self._git_dir = git_dir
-
-    def _git_path(self, option: str, *values: str) -> Path:
-        result = self._git(
-            ("rev-parse", "--path-format=absolute", option, *values),
-            check=False,
-        )
-        path = Path(os.fsdecode(result.stdout).strip())
-        if result.returncode != 0 or not path.is_absolute():
-            raise LocalGitPublicationError("Git metadata path is invalid")
-        return path
+        self._git_dir = self._git_repository_admission.git_dir
 
     @staticmethod
     def _git_directory_identity(path: Path) -> tuple[int, ...]:
@@ -219,22 +199,15 @@ class LocalGitStorageOperations:
             ) from exc
 
     def _revalidate_git_metadata(self) -> None:
-        for path, expected in getattr(self, "_git_metadata_anchors", {}).items():
-            if self._git_directory_identity(path) != expected:
-                raise LocalGitPublicationError("Git metadata changed after validation")
-        self._reject_forbidden_git_metadata()
-
-    def _reject_forbidden_git_metadata(self) -> None:
-        for path, label in getattr(self, "_forbidden_git_metadata", {}).items():
-            try:
-                path.lstat()
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                raise LocalGitPublicationError(
-                    f"{label} cannot be authenticated"
-                ) from exc
-            raise LocalGitPublicationError(f"{label} are not allowed")
+        admission = getattr(self, "_git_repository_admission", None)
+        if admission is None:
+            return
+        try:
+            git_safety.revalidate_local_repository(
+                admission, self._git_directory_identity
+            )
+        except git_safety.LocalRepositorySafetyError as error:
+            raise LocalGitPublicationError(str(error)) from error
 
     def _validate_signing_identity(self) -> None:
         if self._signing_format != "openpgp":

@@ -1151,13 +1151,16 @@ class SourceTransportProtocolTests(unittest.TestCase):
         changed = types.SimpleNamespace(**vars(first))
         changed.st_mode = stat.S_IFREG | 0o644
         fake_os = types.ModuleType("os")
+        fake_os.O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
         fake_os.O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+        fake_os.O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
         fake_os.O_RDONLY = os.O_RDONLY
         fake_os.close = mock.Mock()
         fake_os.fstat = mock.Mock(side_effect=(first, changed))
         fake_os.geteuid = os.geteuid
         fake_os.open = mock.Mock(return_value=7)
         fake_os.read = mock.Mock(side_effect=(payload, b""))
+        fake_os.stat = mock.Mock(side_effect=(first, changed))
         digest = "sha256:" + hashlib.sha256(payload).hexdigest()
 
         with (
@@ -1180,6 +1183,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
             )
 
         self.assertEqual(2, fake_os.fstat.call_count)
+        self.assertEqual(2, fake_os.stat.call_count)
 
     def test_prepare_source_rejects_remote_snapshot_changed_after_output_capture(
         self,
@@ -3503,6 +3507,121 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 allow_missing=False,
             )
         self.assertTrue(replaced)
+
+    def test_program_hash_rejects_hardlinks_and_unsafe_access_policy(self) -> None:
+        component = self.root / "single-link-component.py"
+        alias = self.root / "single-link-component-alias.py"
+        component.write_bytes(b"print('bounded')\n")
+        os.chmod(component, 0o600)
+        os.link(component, alias)
+        with self.assertRaisesRegex(
+            transport.TransportValidationError, "exactly one link"
+        ):
+            transport._program_component(
+                component,
+                role="hardlinked_component",
+                allow_missing=False,
+            )
+        alias.unlink()
+        os.chmod(component, 0o620)
+        with self.assertRaisesRegex(
+            transport.TransportValidationError, "unsafe access policy"
+        ):
+            transport._program_component(
+                component,
+                role="writable_component",
+                allow_missing=False,
+            )
+
+    def test_program_hash_rejects_permission_drift_after_fd_open(self) -> None:
+        component = self.root / "permission-drift-component.py"
+        component.write_bytes(b"A" * (128 * 1024))
+        os.chmod(component, 0o600)
+        real_read = os.read
+        changed = False
+
+        def racing_read(descriptor: int, count: int) -> bytes:
+            nonlocal changed
+            chunk = real_read(descriptor, count)
+            if chunk and not changed:
+                changed = True
+                os.chmod(component, 0o640)
+            return chunk
+
+        with (
+            mock.patch.object(transport.os, "read", side_effect=racing_read),
+            self.assertRaisesRegex(
+                transport.TransportValidationError, "changed while read"
+            ),
+        ):
+            transport._program_component(
+                component,
+                role="permission_drift_component",
+                allow_missing=False,
+            )
+        self.assertTrue(changed)
+
+    def test_snapshot_bootstraps_reject_special_file_replacements(self) -> None:
+        regular = self.root / "bootstrap-snapshot"
+        regular.write_bytes(b"not-a-snapshot")
+        os.chmod(regular, 0o600)
+        symlink = self.root / "bootstrap-snapshot-symlink"
+        symlink.symlink_to(regular)
+        hardlink = self.root / "bootstrap-snapshot-hardlink"
+        os.link(regular, hardlink)
+        fifo = self.root / "bootstrap-snapshot-fifo"
+        os.mkfifo(fifo, 0o600)
+        unsafe = self.root / "bootstrap-snapshot-unsafe"
+        unsafe.write_bytes(b"not-a-snapshot")
+        os.chmod(unsafe, 0o620)
+        digest = "sha256:" + hashlib.sha256(regular.read_bytes()).hexdigest()
+
+        for name, path in (
+            ("symlink", symlink),
+            ("hardlink", hardlink),
+            ("fifo", fifo),
+            ("unsafe", unsafe),
+        ):
+            with self.subTest(name=name):
+                completed = subprocess.run(
+                    (
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-X",
+                        f"pycache_prefix={os.devnull}",
+                        "-c",
+                        transport_snapshot.SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP,
+                        transport_program.SOURCE_TRANSPORT_SNAPSHOT_SCHEMA,
+                        digest,
+                        str(path),
+                        "transport-worker.py",
+                    ),
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertNotEqual(0, completed.returncode)
+
+        remote = subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                "-X",
+                f"pycache_prefix={os.devnull}",
+                "-c",
+                transport_snapshot.REMOTE_HOST_CONTEXT_SNAPSHOT_BOOTSTRAP,
+                transport_snapshot.REMOTE_HOST_CONTEXT_SNAPSHOT_SCHEMA,
+                digest,
+                str(fifo),
+                "session-shards",
+            ),
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(0, remote.returncode)
 
 
 if __name__ == "__main__":

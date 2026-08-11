@@ -17,6 +17,7 @@ try:
     from .transport_contracts import TransportValidationError, _canonical_commitment
     from .transport_paths import (
         _program_named_identity,
+        _require_program_component_policy,
         _program_stat_identity,
         _read_program_component,
     )
@@ -29,6 +30,7 @@ except (ImportError, ModuleNotFoundError):
     )
     from transport_paths import (  # type: ignore[no-redef]
         _program_named_identity,
+        _require_program_component_policy,
         _program_stat_identity,
         _read_program_component,
     )
@@ -93,7 +95,12 @@ def _program_component_at(
         raise TransportValidationError(
             f"source transport {role} has an invalid component name"
         )
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(name, flags, dir_fd=parent_fd)
     except FileNotFoundError as exc:
@@ -108,10 +115,7 @@ def _program_component_at(
         ) from exc
     try:
         before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise TransportValidationError(
-                f"source transport {role} must be a regular non-symlink file"
-            )
+        _require_program_component_policy(before, role)
         if before.st_size > maximum_bytes:
             raise TransportValidationError(
                 f"source transport {role} exceeds the program component bound"
@@ -138,6 +142,7 @@ def _program_component_at(
             raise TransportValidationError(
                 f"source transport {role} changed while read"
             )
+        _require_program_component_policy(after, role)
         component: dict[str, JsonValue] = {
             "content_commitment": "sha256:" + hashlib.sha256(retained).hexdigest(),
             "path": str(display_path),
