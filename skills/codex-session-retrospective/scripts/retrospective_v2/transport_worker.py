@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import sys
 
 
@@ -14,10 +13,6 @@ if __name__ == "__main__" and (
     or len(snapshot) != 71
 ):
     raise SystemExit("source transport worker requires a committed program snapshot")
-
-WORKER_ROOT = Path(__file__).resolve().parent
-if str(WORKER_ROOT) not in sys.path:
-    sys.path.insert(0, str(WORKER_ROOT))
 
 from transport_source import _run_private_transport_worker  # noqa: E402
 

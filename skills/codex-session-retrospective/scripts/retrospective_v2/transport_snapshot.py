@@ -173,6 +173,7 @@ def _source_transport_decode_snapshot(
     maximum_bytes: int,
     component_reader: Callable[..., Mapping[str, JsonValue]],
     prepared_files: Mapping[pathlib.Path, bytes] | None = None,
+    recover: bool = True,
 ) -> tuple[dict[str, JsonValue], int, str]:
     try:
         from . import safe_io as snapshot_io
@@ -188,7 +189,8 @@ def _source_transport_decode_snapshot(
     prepared = None if prepared_files is None else prepared_files.get(snapshot_path)
     try:
         if prepared is None:
-            snapshot_io.recover_atomic_create(snapshot_path)
+            if recover:
+                snapshot_io.recover_atomic_create(snapshot_path)
             component = component_reader(
                 snapshot_path,
                 role="program_snapshot",

@@ -60,6 +60,7 @@ from .transport_contracts import (  # noqa: F401
     _source_transport_inventory_commitment,
     _stream_frame,
     _stream_object,
+    _valid_source_locator,
     transcript_commitment,
 )
 from .transport_discovery import window_dates as _window_dates  # noqa: F401
@@ -71,13 +72,12 @@ from .transport_paths import (  # noqa: F401
 )
 from .transport_program import (  # noqa: F401
     SOURCE_TRANSPORT_MAX_PROGRAM_COMPONENT_BYTES,
-    SOURCE_TRANSPORT_PYTHON_FLAGS,
     SOURCE_TRANSPORT_WORKER_MODULE_MANIFEST,
     _package_program_components,
     _program_component,
     _program_component_at,
     _program_stat_identity,
-    source_transport_python_flags,
+    source_transport_python_command,
     transport_program_commitment,
 )
 from .transport_remote_snapshot import snapshot_remote_host_context_helper  # noqa: F401

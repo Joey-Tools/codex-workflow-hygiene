@@ -322,17 +322,17 @@ TRANSPORT_LINE_INVENTORY = {
     "transport.py": 231,
     "transport_auth.py": 143,
     "transport_capture.py": 999,
-    "transport_contracts.py": 984,
+    "transport_contracts.py": 990,
     "transport_discovery.py": 240,
     "transport_paths.py": 89,
-    "transport_program.py": 443,
+    "transport_program.py": 449,
     "transport_remote.py": 316,
     "transport_remote_snapshot.py": 86,
-    "transport_resume.py": 170,
+    "transport_resume.py": 165,
     "transport_session_shards.py": 1_605,
-    "transport_snapshot.py": 217,
-    "transport_source.py": 1_700,
-    "transport_worker.py": 26,
+    "transport_snapshot.py": 219,
+    "transport_source.py": 1_695,
+    "transport_worker.py": 21,
 }
 TRANSPORT_AGGREGATE_LINE_LIMIT = 7_250
 
@@ -1102,7 +1102,7 @@ spec.loader.exec_module(module)
         }
         self.assertEqual(TRANSPORT_MODULES, set(TRANSPORT_LINE_INVENTORY))
         self.assertEqual(TRANSPORT_LINE_INVENTORY, observed)
-        self.assertEqual(7_249, sum(observed.values()))
+        self.assertEqual(7_248, sum(observed.values()))
         self.assertLessEqual(
             sum(observed.values()),
             TRANSPORT_AGGREGATE_LINE_LIMIT,
@@ -1148,7 +1148,7 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertEqual(8_431, branch_total)
+        self.assertEqual(8_434, branch_total)
         self.assertLessEqual(branch_total, 8_450)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)

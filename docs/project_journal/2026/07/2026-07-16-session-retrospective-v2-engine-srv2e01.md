@@ -1365,3 +1365,51 @@ superseded_by:
   30.923 seconds. `actionlint`, Ruff lint/format, and `git diff --check` pass.
   The workflow-and-contract patch digest, excluding this journal, is
   `f0cb0b69c8c2ddf52ff583ca9175ab2d1f29e3c4b35a0da7f1c31827548eff32`.
+- Hosted CI run `31562385557`, job `94007215628`, passed on signed head
+  `468c8d0`, including the copied Python 3.13 runtime. Exact-secret admission was
+  clean. Both results become stale when the following review fixes create a new
+  head and are retained only as evidence for the copied-runtime repair.
+- The fresh named-single review of `468c8d0` found four source-transport
+  boundaries. The worker could fall through from its authenticated snapshot
+  finder to modules under the live worker root; a lease retained an alias-valued
+  `sys.executable` after authenticating its physical target; a surrogate source
+  locator could raise `UnicodeEncodeError`; and timestamp-only metadata churn
+  could be mislabeled as a source-content change.
+- The worker no longer adds its live root to `sys.path`, so every package import
+  must come from the authenticated program manifest. Lease creation records the
+  complete canonical Python argv; status recomputes that exact program
+  commitment before command projection, and native source acceptance reuses the
+  canonical argv0. Noncanonical persisted argv is rejected before projection.
+  These point-in-time checks intentionally retain the documented non-guarantee
+  for an actively malicious same-UID replacement of the canonical target after
+  final validation.
+- Source locators now require both the closed grammar and exact UTF-8
+  representability; invalid discovered names produce the explicit
+  `source_locator_unrepresentable` gap. Source stability compares object
+  identity, access policy, and the exact scanned byte-range digest. Benign
+  timestamp-only churn no longer blocks a source, while content, replacement,
+  and access-policy changes remain explicit gaps.
+- Status projection validates an existing program snapshot with atomic recovery
+  disabled, after first authenticating the bound output directory. It therefore
+  rejects old or changed program commitments without creating lock, pending, or
+  restored raw state. Scheduling and source acceptance retain the separate
+  recovery-enabled write path.
+- The source-transport and module-boundary suites pass 98/98 in 34.573 seconds
+  on Python 3.13. The affected orchestrator, CLI, support, and CI-contract group
+  passes 155/155 in 445.932 seconds under the canonical Python 3.13 `-B -S`
+  runtime with `TMPDIR=/private/tmp`. The exact transport inventory is
+  7,248/7,250 lines and the branch proxy is 8,434/8,450 nodes. Changed-file Ruff
+  lint and format, `actionlint`, `git diff --check`, skill validation, and project
+  journal validation pass. Full discovery, admission, and frozen-head review
+  evidence remains pending for the new head.
+- The authorized host-level Python 3.13 discovery passes all 1,693 tests in
+  2,313.058 seconds with `TMPDIR=/private/tmp` and a 4,200-second process-group
+  deadline. It includes the disposable-GPG publication transactions. The
+  implementation, test, and architecture patch digest, excluding this
+  evidence-only journal, is unchanged before and after the run at
+  `896e997f8f4bbb7e0a5d7add9ee8078aafe0e3d19e5e984ebeafc3219331dbc6`.
+  Repository-wide Ruff remains non-counting because eight unrelated, untouched
+  files predate this patch's format baseline and one has an unused import; every
+  changed Python file passes Ruff lint and format. Exact-head admission and the
+  two-processor `skill-repo-codex-gate` remain pending until the signed commit is
+  frozen.

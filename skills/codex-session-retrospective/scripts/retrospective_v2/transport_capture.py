@@ -21,7 +21,6 @@ try:
         SourceTransportCapture,
         TransportLease,
         TransportValidationError,
-        _LOCATOR_RE,
         _REASON_RE,
         _canonical_commitment,
         _derive_source_resume_position,
@@ -33,6 +32,7 @@ try:
         _source_transport_inventory_commitment,
         _source_transport_resume_probe,
         _stream_frame,
+        _valid_source_locator,
     )
 except (ImportError, ModuleNotFoundError):
     import catalog  # type: ignore[no-redef]
@@ -46,7 +46,6 @@ except (ImportError, ModuleNotFoundError):
         SourceTransportCapture,
         TransportLease,
         TransportValidationError,
-        _LOCATOR_RE,
         _REASON_RE,
         _canonical_commitment,
         _derive_source_resume_position,
@@ -58,6 +57,7 @@ except (ImportError, ModuleNotFoundError):
         _source_transport_inventory_commitment,
         _source_transport_resume_probe,
         _stream_frame,
+        _valid_source_locator,
     )
 
 
@@ -235,7 +235,7 @@ class _SourceTransportCaptureValidator:
         if frame["schema"] != SOURCE_TRANSPORT_STREAM_SCHEMA:
             raise TransportValidationError("source transport inventory schema changed")
         locator = frame["source_locator"]
-        if not isinstance(locator, str) or _LOCATOR_RE.fullmatch(locator) is None:
+        if not _valid_source_locator(locator):
             raise TransportValidationError(
                 "source transport inventory locator is invalid"
             )
@@ -422,7 +422,7 @@ class _SourceTransportCaptureValidator:
         if frame["schema"] != SOURCE_TRANSPORT_STREAM_SCHEMA:
             raise TransportValidationError("source transport record schema changed")
         locator = frame["source_locator"]
-        if not isinstance(locator, str) or _LOCATOR_RE.fullmatch(locator) is None:
+        if not _valid_source_locator(locator):
             raise TransportValidationError("source transport source_locator is invalid")
         record_index = _non_negative_int(
             frame["record_index"], "source transport record_index"
@@ -526,7 +526,7 @@ class _SourceTransportCaptureValidator:
                 "source transport contains more than one resume probe"
             )
         locator = frame["source_locator"]
-        if not isinstance(locator, str) or _LOCATOR_RE.fullmatch(locator) is None:
+        if not _valid_source_locator(locator):
             raise TransportValidationError(
                 "source transport resume probe locator is invalid"
             )

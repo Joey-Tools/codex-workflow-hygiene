@@ -4,7 +4,6 @@ from __future__ import annotations
 import copy
 import hashlib
 from pathlib import Path
-import sys
 from typing import Any, Mapping
 
 from . import (
@@ -575,8 +574,7 @@ class StageSchedulingOperations(OrchestratorComponent):
     ) -> tuple[str, ...]:
         worker = Path(__file__).resolve().with_name("transport_worker.py")
         command = [
-            sys.executable,
-            *source_transport.source_transport_python_flags(
+            *source_transport.source_transport_python_command(
                 self.run_dir / RAW_INPUT_DIRECTORY / "source-program-snapshots",
                 stage_file=lambda path, payload: self._stage_prepared_file(
                     prepared_files,

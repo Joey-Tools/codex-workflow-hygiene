@@ -911,6 +911,9 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.assertEqual(transport_program.SOURCE_TRANSPORT_SNAPSHOT_SCHEMA, command[8])
         self.assertTrue(command[9].startswith("sha256:"))
         self.assertTrue(Path(command[10]).is_file())
+        accept_command = lease_view["native_coordinator_actions"][1]["command"]
+        self.assertEqual(command[0], accept_command[0])
+        self.assertEqual("-B", accept_command[1])
         isolated = subprocess.run(
             [
                 sys.executable,
@@ -1639,6 +1642,33 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.assertTrue(mutated)
         self.assertEqual("gap", frames[-1]["status"])
         self.assertEqual("source_enumeration_changed", frames[-1]["reason"])
+        self.assertIsNone(frames[-1]["resume_position"])
+
+    def test_non_utf8_rollout_locator_is_an_explicit_gap(self) -> None:
+        real_read_entries = transport_source.transport_discovery.read_directory_entries
+
+        def inject_surrogate(descriptor, *, observe_entry):
+            rows = real_read_entries(descriptor, observe_entry=observe_entry)
+            if not rows:
+                name = "rollout-\udcff.jsonl"
+                observe_entry(name)
+                return ((name, False, False, True),)
+            return rows
+
+        with mock.patch.object(
+            transport_source.transport_discovery,
+            "read_directory_entries",
+            side_effect=inject_surrogate,
+        ):
+            frames = self._direct_source_frames(
+                "non-utf8-locator",
+                source_kind="archived_rollout",
+                max_records=16,
+            )
+
+        self.assertEqual(2, len(frames))
+        self.assertEqual("gap", frames[-1]["status"])
+        self.assertEqual("source_locator_unrepresentable", frames[-1]["reason"])
         self.assertIsNone(frames[-1]["resume_position"])
 
     def test_archived_rollout_directory_date_is_not_event_time_authority(
@@ -2770,6 +2800,65 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.assertEqual("source_changed_during_scan", frames[-1]["reason"])
         self.assertIsNone(frames[-1]["resume_position"])
 
+    def test_source_scan_accepts_timestamp_only_change(self) -> None:
+        source = self.codex_root / "history.jsonl"
+        source.write_bytes(self._line("timestamp-only"))
+        real_read = transport_source._read_bounded_line
+        changed = False
+
+        def touch_after_read(*args, **kwargs):
+            nonlocal changed
+            line = real_read(*args, **kwargs)
+            if line.byte_count and not changed:
+                changed = True
+                metadata = source.stat()
+                os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1))
+            return line
+
+        with mock.patch.object(
+            transport_source,
+            "_read_bounded_line",
+            side_effect=touch_after_read,
+        ):
+            frames = self._direct_source_frames(
+                "timestamp-only-change",
+                source_kind="history",
+                max_records=16,
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual("no_activity", frames[-1]["status"])
+        self.assertTrue(frames[-1]["complete"])
+
+    def test_source_scan_rejects_access_policy_change(self) -> None:
+        source = self.codex_root / "history.jsonl"
+        source.write_bytes(self._line("access-policy-change"))
+        real_read = transport_source._read_bounded_line
+        changed = False
+
+        def chmod_after_read(*args, **kwargs):
+            nonlocal changed
+            line = real_read(*args, **kwargs)
+            if line.byte_count and not changed:
+                changed = True
+                os.chmod(source, 0o640)
+            return line
+
+        with mock.patch.object(
+            transport_source,
+            "_read_bounded_line",
+            side_effect=chmod_after_read,
+        ):
+            frames = self._direct_source_frames(
+                "access-policy-change",
+                source_kind="history",
+                max_records=16,
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual("gap", frames[-1]["status"])
+        self.assertEqual("source_enumeration_changed", frames[-1]["reason"])
+
     def test_codex_root_validation_uses_lexical_no_follow_open(self) -> None:
         self.codex_root.joinpath("history.jsonl").write_bytes(
             self._line("lexical-root")
@@ -3245,8 +3334,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
             ),
         ):
             argv = (
-                sys.executable,
-                *transport_program.SOURCE_TRANSPORT_PYTHON_FLAGS,
+                *transport_program.source_transport_python_command(),
                 str(worker),
                 "source-transport",
             )
@@ -3257,8 +3345,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 transport_program.transport_program_commitment(argv),
             )
             changed_argv = (
-                sys.executable,
-                *transport_program.SOURCE_TRANSPORT_PYTHON_FLAGS,
+                *transport_program.source_transport_python_command(),
                 str(worker),
                 "source-transport",
             )
@@ -3268,8 +3355,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
             unrelated = package / "reporting.py"
             unrelated.write_text("VALUE = 1\n", encoding="ascii")
             before_unrelated_change = (
-                sys.executable,
-                *transport_program.SOURCE_TRANSPORT_PYTHON_FLAGS,
+                *transport_program.source_transport_python_command(),
                 str(worker),
                 "source-transport",
             )
@@ -3278,8 +3364,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 transport_program.transport_program_commitment(before_unrelated_change),
                 transport_program.transport_program_commitment(
                     (
-                        sys.executable,
-                        *transport_program.SOURCE_TRANSPORT_PYTHON_FLAGS,
+                        *transport_program.source_transport_python_command(),
                         str(worker),
                         "source-transport",
                     )
@@ -3291,7 +3376,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 transport.TransportValidationError,
                 "package_module:catalog.py is unavailable",
             ):
-                tuple(transport_program.SOURCE_TRANSPORT_PYTHON_FLAGS)
+                transport_program.source_transport_python_command()
 
     def test_transport_program_rejects_a_missing_remote_helper(self) -> None:
         worker = Path(transport_program.__file__).with_name("transport_worker.py")
@@ -3302,8 +3387,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
             missing_commitment,
         )
         argv = (
-            sys.executable,
-            *transport_program.source_transport_python_flags(snapshot_cache),
+            *transport_program.source_transport_python_command(snapshot_cache),
             str(worker),
             "source-transport",
             "--remote-helper",
@@ -3334,8 +3418,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
             )
         )
         argv = (
-            sys.executable,
-            *transport_program.source_transport_python_flags(snapshot_cache),
+            *transport_program.source_transport_python_command(snapshot_cache),
             str(worker),
             "source-transport",
             "--remote-helper",
@@ -3392,6 +3475,136 @@ class SourceTransportProtocolTests(unittest.TestCase):
         )
         self.assertEqual(lease.lease_ref, preparation.lease_ref)
 
+    def test_source_command_survives_python_alias_replacement(self) -> None:
+        self._write_sources("python-alias")
+        alias = self.root / "python3.13-alias"
+        alias.symlink_to(sys.executable)
+        snapshot_cache = self.root / "python-alias-snapshots"
+        worker = Path(transport_program.__file__).with_name("transport_worker.py")
+        lease_ref = str(
+            self.identity.derive_ref(RefType.LEASE, {"case": "python-alias"})
+        )
+        command = (
+            *transport_program.source_transport_python_command(
+                snapshot_cache,
+                executable=alias,
+            ),
+            str(worker),
+            "source-transport",
+            "--host",
+            "local",
+            "--source-kind",
+            "history",
+            "--window-start",
+            WINDOW_START,
+            "--window-end",
+            WINDOW_END,
+            "--lease-ref",
+            lease_ref,
+            "--process-nonce",
+            "python-alias",
+            "--max-source-bytes",
+            str(1024 * 1024),
+            "--max-records",
+            "16",
+            "--max-frame-bytes",
+            "8192",
+            "--direct-root",
+            str(self.codex_root),
+        )
+        commitment = transport_program.transport_program_commitment(
+            command,
+            snapshot_cache=snapshot_cache,
+        )
+        self.assertEqual(os.path.realpath(sys.executable), command[0])
+
+        alias.unlink()
+        alias.symlink_to("/usr/bin/false")
+        self.assertEqual(
+            commitment,
+            transport_program.transport_program_commitment(
+                command,
+                snapshot_cache=snapshot_cache,
+            ),
+        )
+        completed = subprocess.run(command, check=True, capture_output=True, timeout=10)
+
+        frames = [json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertTrue(frames[-1]["complete"])
+
+    def test_status_rejects_authenticated_noncanonical_source_lease(self) -> None:
+        self._write_sources("legacy-python-alias")
+        coordinator = self._coordinator("legacy-python-alias")
+        lease_view = self._first_lease(coordinator)
+        lease = transport.TransportLease.from_dict(lease_view["transport_lease"])
+        alias = self.root / "legacy-python"
+        alias.symlink_to(lease.command_argv[0])
+        forged = transport.issue_transport_lease(
+            coordinator.identity,
+            lease_ref=lease.lease_ref,
+            run_ref=lease.run_ref,
+            job_ref=lease.job_ref,
+            host=lease.host,
+            host_ref=lease.host_ref,
+            source_kind=lease.source_kind,
+            window_start=lease.window_start,
+            window_end=lease.window_end,
+            process_nonce=lease.process_nonce,
+            command_argv=(str(alias), *lease.command_argv[1:]),
+            transport_program_commitment=lease.transport_program_commitment,
+            source_byte_limit=lease.source_byte_limit,
+            record_limit=lease.record_limit,
+            frame_byte_limit=lease.frame_byte_limit,
+            session_target=lease.session_target,
+            session_selector_commitment=lease.session_selector_commitment,
+            source_cursor=lease.source_cursor,
+            cursor_time=lease.cursor_time,
+            resume_position=lease.resume_position,
+        )
+
+        def install_forged_lease(state):
+            state["jobs"][lease.job_ref]["transport_lease"] = forged.to_dict()
+            return state, None
+
+        coordinator.store.transaction(install_forged_lease)
+        with self.assertRaisesRegex(
+            InvalidTransitionError,
+            "cannot be projected safely",
+        ):
+            coordinator.status()
+
+    def test_status_program_revalidation_does_not_recover_snapshot(self) -> None:
+        self._write_sources("read-only-program-revalidation")
+        coordinator = self._coordinator("read-only-program-revalidation")
+        lease = self._first_lease(coordinator)
+
+        with mock.patch.object(
+            safe_io,
+            "recover_atomic_create",
+            side_effect=AssertionError("status must not recover snapshot state"),
+        ):
+            status = coordinator.status()
+
+        self.assertEqual(
+            lease["lease_ref"], status["active_source_leases"][0]["lease_ref"]
+        )
+
+    def test_transport_program_rejects_noncanonical_python_alias(self) -> None:
+        alias = self.root / "noncanonical-python"
+        alias.symlink_to(sys.executable)
+        command = transport_program.source_transport_python_command(
+            executable=alias,
+        )
+        worker = Path(transport_program.__file__).with_name("transport_worker.py")
+
+        with self.assertRaisesRegex(
+            transport.TransportValidationError,
+            "Python path is not canonical",
+        ):
+            transport_program.transport_program_commitment(
+                (str(alias), *command[1:], str(worker), "source-transport")
+            )
+
     def test_committed_program_snapshot_survives_path_replacement_and_restore(
         self,
     ) -> None:
@@ -3413,8 +3626,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
             str(package / "transport_program.py"),
         ):
             argv = (
-                sys.executable,
-                *transport_program.SOURCE_TRANSPORT_PYTHON_FLAGS,
+                *transport_program.source_transport_python_command(),
                 str(worker),
                 "source-transport",
                 "--host",
@@ -3462,17 +3674,60 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertTrue(frames[-1]["complete"])
 
+    def test_committed_program_snapshot_does_not_import_uncommitted_module(
+        self,
+    ) -> None:
+        package = self.root / "closed-import-program"
+        package.mkdir(mode=0o700)
+        live_package = Path(transport_program.__file__).parent
+        for name in transport_program.SOURCE_TRANSPORT_WORKER_MODULE_MANIFEST:
+            payload = (live_package / name).read_bytes()
+            if name == "transport_source.py":
+                future = b"from __future__ import annotations\n"
+                payload = payload.replace(
+                    future,
+                    future + b"import uncommitted_dependency\n",
+                    1,
+                )
+            (package / name).write_bytes(payload)
+        marker = self.root / "uncommitted-module-executed"
+        package.joinpath("uncommitted_dependency.py").write_text(
+            f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n",
+            encoding="ascii",
+        )
+        worker = package / "transport_worker.py"
+
+        with mock.patch.object(
+            transport_program,
+            "__file__",
+            str(package / "transport_program.py"),
+        ):
+            argv = (
+                *transport_program.source_transport_python_command(),
+                str(worker),
+                "source-transport",
+            )
+            self.assertRegex(
+                transport_program.transport_program_commitment(argv),
+                r"sha256:[0-9a-f]{64}",
+            )
+            completed = subprocess.run(argv, capture_output=True, timeout=10)
+
+        self.assertNotEqual(0, completed.returncode)
+        self.assertFalse(marker.exists())
+        self.assertIn(b"uncommitted_dependency", completed.stderr)
+
     def test_content_addressed_program_snapshot_is_created_once_and_recovered(
         self,
     ) -> None:
-        first_flags = tuple(transport_program.SOURCE_TRANSPORT_PYTHON_FLAGS)
-        snapshot_path = Path(first_flags[-1])
+        first_command = transport_program.source_transport_python_command()
+        snapshot_path = Path(first_command[-1])
         payload = snapshot_path.read_bytes()
         first_stat = snapshot_path.stat()
 
-        second_flags = tuple(transport_program.SOURCE_TRANSPORT_PYTHON_FLAGS)
+        second_command = transport_program.source_transport_python_command()
         second_stat = snapshot_path.stat()
-        self.assertEqual(first_flags, second_flags)
+        self.assertEqual(first_command, second_command)
         self.assertEqual(
             (first_stat.st_dev, first_stat.st_ino),
             (second_stat.st_dev, second_stat.st_ino),
@@ -3486,9 +3741,9 @@ class SourceTransportProtocolTests(unittest.TestCase):
         os.link(snapshot_path, pending_path)
         self.assertEqual(snapshot_path.stat().st_nlink, 2)
 
-        recovered_flags = tuple(transport_program.SOURCE_TRANSPORT_PYTHON_FLAGS)
+        recovered_command = transport_program.source_transport_python_command()
         recovered_stat = snapshot_path.stat()
-        self.assertEqual(first_flags, recovered_flags)
+        self.assertEqual(first_command, recovered_command)
         self.assertEqual(recovered_stat.st_nlink, 1)
         self.assertFalse(pending_path.exists())
         self.assertEqual(

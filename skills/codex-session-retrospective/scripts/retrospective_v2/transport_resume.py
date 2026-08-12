@@ -62,16 +62,11 @@ def _source_transport_candidate_token(metadata: os.stat_result) -> str:
 
 
 def _source_transport_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    fields = (
-        "st_dev",
-        "st_ino",
-        "st_mode",
-        "st_nlink",
-        "st_size",
-        "st_mtime_ns",
-        "st_ctime_ns",
+    fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink")
+    return tuple(int(getattr(metadata, field)) for field in fields) + (
+        int(getattr(metadata, "st_flags", 0)),
+        int(getattr(metadata, "st_gen", -1)),
     )
-    return tuple(int(getattr(metadata, field)) for field in fields)
 
 
 def _source_transport_range_digest(descriptor: int, start: int, end: int) -> str:

@@ -223,8 +223,11 @@ def _package_program_components(
         os.close(directory_fd)
 
 
-def _python_runtime_authority() -> dict[str, JsonValue]:
-    resolved = pathlib.Path(os.path.realpath(sys.executable))
+def _python_runtime_authority(
+    executable: str | os.PathLike[str] | None = None,
+) -> dict[str, JsonValue]:
+    selected = pathlib.Path(sys.executable if executable is None else executable)
+    resolved = pathlib.Path(os.path.realpath(selected))
     return {
         "component": _program_component(
             resolved,
@@ -247,33 +250,30 @@ def _program_snapshot_protocol():
     return transport_snapshot
 
 
-def source_transport_python_flags(
+def source_transport_python_command(
     snapshot_cache: pathlib.Path | None = None,
     *,
     stage_file: Callable[[pathlib.Path, bytes], None] | None = None,
+    executable: str | os.PathLike[str] | None = None,
 ) -> tuple[str, ...]:
+    python_runtime = _python_runtime_authority(executable)
     package_dir = pathlib.Path(
         os.path.abspath(os.fspath(pathlib.Path(__file__).parent))
     )
-    return _program_snapshot_protocol()._source_transport_snapshot_flags(
-        package_dir=package_dir,
-        components=_package_program_components(package_dir, include_content=True),
-        module_manifest=SOURCE_TRANSPORT_WORKER_MODULE_MANIFEST,
-        python_runtime=_python_runtime_authority(),
-        base_flags=SOURCE_TRANSPORT_BASE_PYTHON_FLAGS,
-        schema=SOURCE_TRANSPORT_SNAPSHOT_SCHEMA,
-        cache=pathlib.Path(snapshot_cache or SOURCE_TRANSPORT_SNAPSHOT_CACHE),
-        maximum_bytes=SOURCE_TRANSPORT_MAX_SNAPSHOT_BYTES,
-        stage_file=stage_file,
+    return (
+        str(python_runtime["executable"]),
+        *_program_snapshot_protocol()._source_transport_snapshot_flags(
+            package_dir=package_dir,
+            components=_package_program_components(package_dir, include_content=True),
+            module_manifest=SOURCE_TRANSPORT_WORKER_MODULE_MANIFEST,
+            python_runtime=python_runtime,
+            base_flags=SOURCE_TRANSPORT_BASE_PYTHON_FLAGS,
+            schema=SOURCE_TRANSPORT_SNAPSHOT_SCHEMA,
+            cache=pathlib.Path(snapshot_cache or SOURCE_TRANSPORT_SNAPSHOT_CACHE),
+            maximum_bytes=SOURCE_TRANSPORT_MAX_SNAPSHOT_BYTES,
+            stage_file=stage_file,
+        ),
     )
-
-
-class _ProgramSnapshotPythonFlags:
-    def __iter__(self):
-        return iter(source_transport_python_flags())
-
-
-SOURCE_TRANSPORT_PYTHON_FLAGS = _ProgramSnapshotPythonFlags()
 
 
 def _decode_program_snapshot(
@@ -281,10 +281,17 @@ def _decode_program_snapshot(
     *,
     snapshot_cache: pathlib.Path,
     prepared_files: Mapping[pathlib.Path, bytes] | None = None,
+    recover: bool = True,
 ) -> tuple[dict[str, JsonValue], int, str]:
+    if not argv:
+        raise TransportValidationError("source transport command is incomplete")
+    executable = pathlib.Path(argv[0])
+    canonical = pathlib.Path(os.path.realpath(executable))
+    if not executable.is_absolute() or executable != canonical:
+        raise TransportValidationError("source transport Python path is not canonical")
     protocol = _program_snapshot_protocol()
     prefix = (
-        sys.executable,
+        str(executable),
         *SOURCE_TRANSPORT_BASE_PYTHON_FLAGS,
         "-c",
         protocol.SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP,
@@ -297,6 +304,7 @@ def _decode_program_snapshot(
         maximum_bytes=SOURCE_TRANSPORT_MAX_SNAPSHOT_BYTES,
         component_reader=_program_component,
         prepared_files=prepared_files,
+        recover=recover,
     )
 
 
@@ -305,14 +313,15 @@ def transport_program_commitment(
     *,
     snapshot_cache: pathlib.Path | None = None,
     prepared_files: Mapping[pathlib.Path, bytes] | None = None,
+    recover: bool = True,
 ) -> str:
     """Commit every executable component used by one source transport lease."""
-
     argv = tuple(command_argv)
     snapshot, worker_index, snapshot_commitment = _decode_program_snapshot(
         argv,
         snapshot_cache=pathlib.Path(snapshot_cache or SOURCE_TRANSPORT_SNAPSHOT_CACHE),
         prepared_files=prepared_files,
+        recover=recover,
     )
     worker = pathlib.Path(argv[worker_index])
     if not worker.is_absolute():
@@ -338,7 +347,7 @@ def transport_program_commitment(
         {"modules", "package_dir", "python_runtime", "schema"},
         SOURCE_TRANSPORT_SNAPSHOT_SCHEMA,
         str(package_dir),
-        _python_runtime_authority(),
+        _python_runtime_authority(argv[0]),
         dict,
         SOURCE_TRANSPORT_WORKER_MODULE_MANIFEST,
     )
@@ -420,9 +429,8 @@ def transport_program_commitment(
                 "source transport remote helper snapshot changed"
             )
         components.append(helper_component)
-    bootstrap = _program_snapshot_protocol().SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP.encode(
-        "utf-8"
-    )
+    protocol = _program_snapshot_protocol()
+    bootstrap = protocol.SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP.encode("utf-8")
     return _canonical_commitment(
         {
             "components": components,
@@ -433,11 +441,9 @@ def transport_program_commitment(
             + hashlib.sha256(bootstrap).hexdigest(),
             "remote_helper_bootstrap_commitment": "sha256:"
             + hashlib.sha256(
-                _program_snapshot_protocol().REMOTE_HOST_CONTEXT_SNAPSHOT_BOOTSTRAP.encode(
-                    "utf-8"
-                )
+                protocol.REMOTE_HOST_CONTEXT_SNAPSHOT_BOOTSTRAP.encode("utf-8")
             ).hexdigest(),
             "snapshot_commitment": snapshot_commitment,
-            "schema": "source_transport_worker_program_v7",
+            "schema": "source_transport_worker_program_v8",
         }
     )

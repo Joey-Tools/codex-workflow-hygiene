@@ -74,7 +74,13 @@ _RECEIPT_REF_RE = re.compile(
 )
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,511}\Z")
 _REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
-_LOCATOR_RE = re.compile(r"(?!/)(?!.*(?:^|/)\.\.(?:/|$))[^\x00-\x1f\x7f]{1,1024}\Z")
+_LOCATOR_RE = re.compile(
+    r"(?!/)(?!.*(?:^|/)\.\.(?:/|$))[^\x00-\x1f\x7f\ud800-\udfff]{1,1024}\Z"
+)
+
+
+def _valid_source_locator(value: object) -> bool:
+    return isinstance(value, str) and _LOCATOR_RE.fullmatch(value) is not None
 
 
 class TransportValidationError(ValueError):
@@ -226,7 +232,7 @@ def _normalize_source_resume_position(
     if value.get("schema") != SOURCE_TRANSPORT_RESUME_SCHEMA:
         raise TransportValidationError("source transport resume schema changed")
     locator = value.get("source_locator")
-    if not isinstance(locator, str) or _LOCATOR_RE.fullmatch(locator) is None:
+    if not _valid_source_locator(locator):
         raise TransportValidationError("source transport resume locator is invalid")
     raw_probe = value.get("resume_probe")
     if not isinstance(raw_probe, Mapping):
@@ -347,7 +353,7 @@ def _derive_source_resume_position(
             "source transport continuation inventory is incomplete"
         )
     locator = last["source_locator"]
-    if not isinstance(locator, str) or _LOCATOR_RE.fullmatch(locator) is None:
+    if not _valid_source_locator(locator):
         raise TransportValidationError(
             "source transport continuation locator is invalid"
         )

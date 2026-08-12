@@ -45,6 +45,7 @@ try:
         _source_transport_inventory_commitment,
         _source_transport_resume_probe,
         _stream_frame,
+        _valid_source_locator,
     )
     from .transport_paths import (
         ACTIVE_ROLLOUT_RELATIVE_RE,
@@ -94,6 +95,7 @@ except (ImportError, ModuleNotFoundError):
         _source_transport_inventory_commitment,
         _source_transport_resume_probe,
         _stream_frame,
+        _valid_source_locator,
     )
     from transport_paths import (  # type: ignore[no-redef]
         ACTIVE_ROLLOUT_RELATIVE_RE,
@@ -582,6 +584,8 @@ def _source_transport_candidate_paths(
     def add_candidate(relative: str) -> None:
         if relative in seen:
             return
+        if not _valid_source_locator(relative):
+            raise DiscoveryStop("source_locator_unrepresentable")
         if len(candidates) >= max_candidates:
             raise DiscoveryStop("source_discovery_candidate_limit_reached")
         budget.checkpoint()
@@ -1423,22 +1427,13 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
             after = os.fstat(descriptor)
             read_range_commitment = "sha256:" + digest.hexdigest()
             stable = (
-                before.st_dev == after.st_dev
-                and before.st_ino == after.st_ino
-                and before.st_mode == after.st_mode
+                _source_transport_file_identity(before)
+                == _source_transport_file_identity(proof_before)
                 and _source_transport_file_identity(proof_before)
                 == _source_transport_file_identity(after)
                 and after.st_size >= source_size
                 and scanned_range_commitment == read_range_commitment
                 and resume_probe_stable
-                and (
-                    after.st_size > before.st_size
-                    or (
-                        before.st_size == after.st_size
-                        and before.st_ctime_ns == after.st_ctime_ns
-                        and before.st_mtime_ns == after.st_mtime_ns
-                    )
-                )
                 and (
                     scanned == source_size
                     or (

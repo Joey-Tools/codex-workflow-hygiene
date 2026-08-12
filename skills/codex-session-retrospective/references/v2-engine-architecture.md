@@ -77,6 +77,14 @@ state, and exact size; the owner-private snapshots additionally require mode
 `0600`. FIFO, leaf-symlink, hardlink, access-policy drift, and same-path
 replacement therefore fail before compilation or execution. The Python runtime
 uses the same bounded reader with a root-or-current-user, non-writable policy.
+The scheduler resolves that authenticated runtime to its canonical physical
+path and records the complete argv in the lease. Status re-derives the exact
+program commitment before projecting any command, and native source acceptance
+reuses the same canonical argv0 rather than ambient `sys.executable`. Replacing
+an interpreter alias after lease creation therefore cannot redirect execution.
+These are point-in-time identity, content, and access-policy checks; they do not
+claim to defeat an actively malicious same-UID replacement of the canonical
+target after the final validation.
 `transport_remote.py` launches the retained snapshot, never the live installed
 path. This preserves the worker manifest's no-parent-write boundary while
 closing the commitment-to-execution replacement window. The parent derives the
@@ -84,13 +92,25 @@ live-helper source commitment from the same descriptor-bound read used to create
 the snapshot and requires it to equal the run's frozen transport provenance, so
 one run cannot mix helper versions across source leases.
 
+The transport worker imports only modules present in the authenticated program
+manifest. Its snapshot finder is the sole authority for the package namespace;
+the live worker root is never placed on `sys.path`, and a missing manifest
+module cannot fall through to repository or installed-package bytes. Discovered
+source locators must satisfy the closed grammar and be UTF-8 encodable. A
+filesystem name that cannot be represented becomes an explicit
+`source_locator_unrepresentable` gap rather than crashing discovery or being
+silently omitted. Source rereads compare the selected protected properties:
+object identity, access policy, and the exact scanned byte-range digest.
+Timestamp-only churn is benign, while content, identity, or access-policy drift
+remains an explicit source-stability gap.
+
 Source scheduling prepares the transport-program snapshot, remote-helper
 snapshot, and bound empty output together with the candidate checkpoint. Exact
 checkpoint capacity is proved before any file is materialized. A successful
 commit records the run-relative output binding; status projection only
-authenticates the existing binding and never creates raw state, so a stale
-snapshot cannot recreate a path after retention cleanup has claimed and removed
-the raw tree.
+authenticates the existing binding and program snapshot with recovery disabled;
+it never creates raw state. A stale snapshot therefore cannot recreate a path
+after retention cleanup has claimed and removed the raw tree.
 
 Source acceptance has a separate bounded staging boundary. Before transport
 iteration, the coordinator proves the candidate batch fits run-global source
@@ -182,20 +202,23 @@ captured bootstrap itself verifies isolated, no-site, no-bytecode flags before
 authenticating or compiling retained source. Global or user site initialization
 therefore cannot run before the authenticated source-only loader.
 
-The transport slice remains independently bounded after this hardening: 7,249
+The transport slice remains independently bounded after this hardening: 7,248
 physical lines across a 7,250-line aggregate limit. One exact 14-module
 inventory and its aggregate are enforced together, so omitting a transport
 module cannot create a false budget pass. The newly affected modules are
-`transport_paths.py` at 89/100 lines, `transport_program.py` at 443/450,
+`transport_paths.py` at 89/100 lines, `transport_program.py` at 449/450,
 `transport_remote.py` at 316/320, `transport_snapshot.py` at 217/220, and
 `transport_remote_snapshot.py` at 86/100, while `transport_contracts.py` is
-984/1,000. The closed run-state
+990/1,000, `transport_snapshot.py` is 219/220, `transport_resume.py` is 165/175,
+`transport_source.py` is
+1,695/1,700, and `transport_worker.py` is 21/25. The closed run-state
 authority inventory is exactly 1,000/1,000 lines: `run_state_authority.py` 243/250,
 `run_state_contracts.py` 37/50, `run_state_cursors.py` 219/225,
 `run_state_holdouts.py` 236/240, and `run_state_lineage.py` 265/275. Including
 this full slice, the orchestrator foundation is 3,297/3,350 lines. The global
-branch proxy is 8,431/8,450 nodes after adding the descriptor-custody,
-closed-config, and transport isolation predicates. The publication support
+branch proxy is 8,434/8,450 nodes after adding the descriptor-custody,
+closed-config, transport isolation, canonical-runtime, and locator predicates.
+The publication support
 boundary is 1,309/1,310 lines after adding claim-time checkpoint authority
 validation and inherited-descriptor launch support. The
 source coordinator and

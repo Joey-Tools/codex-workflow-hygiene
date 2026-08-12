@@ -4,9 +4,9 @@ from __future__ import annotations
 from collections import Counter
 import copy
 import datetime as dt
+import hmac
 from pathlib import Path
 import re
-import sys
 from typing import Any, Iterable, Mapping, Sequence
 from . import (
     agent_results,
@@ -710,6 +710,25 @@ class StateProjectionOperations(OrchestratorComponent):
             raise InvalidTransitionError(
                 "source transport output directory cannot be authenticated"
             ) from error
+        try:
+            current_program_commitment = source_transport.transport_program_commitment(
+                lease.command_argv,
+                snapshot_cache=(
+                    self.run_dir / RAW_INPUT_DIRECTORY / "source-program-snapshots"
+                ),
+                recover=False,
+            )
+        except (OSError, source_transport.TransportValidationError) as error:
+            raise InvalidTransitionError(
+                "source transport program cannot be projected safely"
+            ) from error
+        if not hmac.compare_digest(
+            current_program_commitment,
+            lease.transport_program_commitment,
+        ):
+            raise InvalidTransitionError(
+                "source transport program changed before projection"
+            )
         cli_path = Path(__file__).resolve().parents[1] / "session_retrospective_v2.py"
         identity_arguments = (
             []
@@ -751,7 +770,8 @@ class StateProjectionOperations(OrchestratorComponent):
                 {
                     "action": "accept-source",
                     "command": [
-                        sys.executable,
+                        lease.command_argv[0],
+                        "-B",
                         str(cli_path),
                         "accept-source",
                         "--run-dir",
