@@ -35,6 +35,9 @@ except (ImportError, ModuleNotFoundError):
     )
 
 
+_SOURCE_ACCESS_POLICY_FLAG_MASK = 0x001E0096  # BSD write/delete restriction flags.
+
+
 def _source_object_generation(metadata: os.stat_result) -> tuple[int, int]:
     birthtime_ns = getattr(metadata, "st_birthtime_ns", None)
     if birthtime_ns is None:
@@ -64,7 +67,7 @@ def _source_transport_candidate_token(metadata: os.stat_result) -> str:
 def _source_transport_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
     fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink")
     return tuple(int(getattr(metadata, field)) for field in fields) + (
-        int(getattr(metadata, "st_flags", 0)),
+        int(getattr(metadata, "st_flags", 0)) & _SOURCE_ACCESS_POLICY_FLAG_MASK,
         int(getattr(metadata, "st_gen", -1)),
     )
 

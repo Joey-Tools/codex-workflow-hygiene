@@ -135,19 +135,20 @@ def _program_component_at(
                 f"source transport {role} changed while opened"
             )
         retained = _read_program_component(descriptor, maximum_bytes, role)
+        changed_message = f"source transport {role} changed while read"
         if len(retained) != before.st_size:
-            raise TransportValidationError(
-                f"source transport {role} changed while read"
-            )
+            raise TransportValidationError(changed_message)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if _read_program_component(descriptor, maximum_bytes, role) != retained:
+            raise TransportValidationError(changed_message)
         after = os.fstat(descriptor)
         if (
             _program_stat_identity(after) != expected_identity
+            or after.st_size != before.st_size
             or _program_named_identity(parent_fd, name, role=role, phase="read")
             != expected_identity
         ):
-            raise TransportValidationError(
-                f"source transport {role} changed while read"
-            )
+            raise TransportValidationError(changed_message)
         _require_program_component_policy(after, role)
         component: dict[str, JsonValue] = {
             "content_commitment": "sha256:" + hashlib.sha256(retained).hexdigest(),

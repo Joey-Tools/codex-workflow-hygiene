@@ -11,7 +11,6 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import copy
 import hashlib
-import ipaddress
 import json
 import re
 from typing import Any
@@ -287,16 +286,6 @@ _PHONE_RE = re.compile(
 _LABELED_PERSONAL_ID_RE = re.compile(
     r"(?i)\b(?:account|customer|employee|person|user)[_ -]?(?:id|name)"
     r"\s*(?:=|:)\s*(?!\[REDACTED)[\"']?[A-Za-z0-9._@+-]{3,}"
-)
-_IPV4_CANDIDATE_RE = re.compile(
-    r"(?<![0-9A-Za-z.])"
-    r"(?P<address>(?:[0-9]{1,3}\.){3}[0-9]{1,3})"
-    r"(?::(?P<port>[0-9]{1,5}))?"
-    r"(?![0-9A-Za-z.])"
-)
-_IPV6_CANDIDATE_RE = re.compile(
-    r"(?<![0-9A-Za-z])(?:\[[0-9A-Za-z:.%_-]+\]|"
-    r"(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Za-z:.%_-]*)(?![0-9A-Za-z])"
 )
 _PRIVATE_KEY_BOUNDARY_RE = re.compile(
     r"(?i)-----\s*(?:BEGIN|END)\s+(?:(?:RSA|EC|OPENSSH|ENCRYPTED)\s+)?"
@@ -629,35 +618,6 @@ def _validate_source_text_groups(
     return prompts, outputs
 
 
-def _is_ipv6_token(value: str) -> bool:
-    candidate = value[1:-1] if value.startswith("[") and value.endswith("]") else value
-    address = candidate.split("%", 1)[0]
-    try:
-        return isinstance(ipaddress.ip_address(address), ipaddress.IPv6Address)
-    except ValueError:
-        return False
-
-
-def _is_ipv4_token(value: str) -> bool:
-    address = value.split(":", 1)[0]
-    try:
-        return isinstance(ipaddress.ip_address(address), ipaddress.IPv4Address)
-    except ValueError:
-        return False
-
-
-def _ipv4_matches(value: str) -> Iterable[re.Match[str]]:
-    for match in _IPV4_CANDIDATE_RE.finditer(value):
-        if _is_ipv4_token(match.group(0)):
-            yield match
-
-
-def _ipv6_matches(value: str) -> Iterable[re.Match[str]]:
-    for match in _IPV6_CANDIDATE_RE.finditer(value):
-        if _is_ipv6_token(match.group(0)):
-            yield match
-
-
 def scan_for_leaks(
     value: Any,
     *,
@@ -698,9 +658,9 @@ def scan_for_leaks(
             findings.add(LeakFinding(category, path, match.start(), match.end()))
         for match in _LABELED_INTERNAL_HOST_RE.finditer(text):
             findings.add(LeakFinding("internal_host", path, match.start(), match.end()))
-        for match in _ipv4_matches(text):
+        for match in privacy_locators.ipv4_matches(text):
             findings.add(LeakFinding("ip_address", path, match.start(), match.end()))
-        for match in _ipv6_matches(text):
+        for match in privacy_locators.ipv6_matches(text):
             findings.add(LeakFinding("ip_address", path, match.start(), match.end()))
         for pattern in (_EMAIL_RE, _PHONE_RE, _LABELED_PERSONAL_ID_RE):
             for match in pattern.finditer(text):
@@ -766,22 +726,7 @@ def _post_redact_text(
     redacted = _URL_RE.sub("[REDACTED_URL]", redacted)
     redacted = privacy_locators.BARE_PRIVATE_LOCATOR_RE.sub("[REDACTED_URL]", redacted)
     redacted = _LABELED_INTERNAL_HOST_RE.sub("[REDACTED_INTERNAL_HOST]", redacted)
-    redacted = _IPV4_CANDIDATE_RE.sub(
-        lambda match: (
-            "[REDACTED_IP_ADDRESS]"
-            if _is_ipv4_token(match.group(0))
-            else match.group(0)
-        ),
-        redacted,
-    )
-    redacted = _IPV6_CANDIDATE_RE.sub(
-        lambda match: (
-            "[REDACTED_IP_ADDRESS]"
-            if _is_ipv6_token(match.group(0))
-            else match.group(0)
-        ),
-        redacted,
-    )
+    redacted = privacy_locators.redact_ip_addresses(redacted)
     for pattern in (
         _RELATIVE_PATH_RE,
         _UNIX_PATH_RE,

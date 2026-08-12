@@ -43,6 +43,7 @@ from retrospective_v2 import (  # noqa: E402
     transport_program,
     transport_remote,
     transport_remote_snapshot,
+    transport_resume,
     transport_snapshot,
     transport_source,
 )
@@ -2830,6 +2831,36 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.assertEqual("no_activity", frames[-1]["status"])
         self.assertTrue(frames[-1]["complete"])
 
+    def test_source_identity_ignores_non_policy_flags(self) -> None:
+        hidden = getattr(stat, "UF_HIDDEN", 0)
+        immutable = getattr(stat, "UF_IMMUTABLE", 0)
+        if not hidden or not immutable:
+            self.skipTest("BSD file flags are unavailable")
+
+        def metadata(flags: int) -> types.SimpleNamespace:
+            return types.SimpleNamespace(
+                st_dev=1,
+                st_ino=2,
+                st_mode=stat.S_IFREG | 0o600,
+                st_uid=os.getuid(),
+                st_gid=os.getgid(),
+                st_nlink=1,
+                st_flags=flags,
+                st_gen=3,
+            )
+
+        baseline = transport_source._source_transport_file_identity(metadata(0))
+        self.assertEqual(
+            baseline,
+            transport_source._source_transport_file_identity(metadata(hidden)),
+        )
+        self.assertNotEqual(
+            baseline,
+            transport_source._source_transport_file_identity(metadata(immutable)),
+        )
+        self.assertFalse(transport_resume._SOURCE_ACCESS_POLICY_FLAG_MASK & hidden)
+        self.assertTrue(transport_resume._SOURCE_ACCESS_POLICY_FLAG_MASK & immutable)
+
     def test_source_scan_rejects_access_policy_change(self) -> None:
         source = self.codex_root / "history.jsonl"
         source.write_bytes(self._line("access-policy-change"))
@@ -3865,6 +3896,106 @@ class SourceTransportProtocolTests(unittest.TestCase):
                 allow_missing=False,
             )
         self.assertTrue(changed)
+
+    def test_program_hash_accepts_timestamp_only_churn(self) -> None:
+        component = self.root / "timestamp-churn-component.py"
+        component.write_bytes(b"print('bounded')\n")
+        os.chmod(component, 0o600)
+        real_read = transport_program._read_program_component
+        read_count = 0
+
+        def touch_after_first_read(*args, **kwargs):
+            nonlocal read_count
+            retained = real_read(*args, **kwargs)
+            read_count += 1
+            if read_count == 1:
+                metadata = component.stat()
+                os.utime(
+                    component,
+                    ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1),
+                )
+            return retained
+
+        with mock.patch.object(
+            transport_program,
+            "_read_program_component",
+            side_effect=touch_after_first_read,
+        ):
+            authenticated = transport._program_component(
+                component,
+                role="timestamp_churn_component",
+                allow_missing=False,
+            )
+
+        self.assertEqual("present", authenticated["state"])
+        self.assertEqual(2, read_count)
+
+    def test_program_hash_rejects_same_inode_content_mutation(self) -> None:
+        component = self.root / "same-inode-mutation-component.py"
+        component.write_bytes(b"A" * 4096)
+        os.chmod(component, 0o600)
+        original_inode = component.stat().st_ino
+        real_read = transport_program._read_program_component
+        read_count = 0
+
+        def mutate_after_first_read(*args, **kwargs):
+            nonlocal read_count
+            retained = real_read(*args, **kwargs)
+            read_count += 1
+            if read_count == 1:
+                component.write_bytes(b"B" * 4096)
+                self.assertEqual(original_inode, component.stat().st_ino)
+            return retained
+
+        with (
+            mock.patch.object(
+                transport_program,
+                "_read_program_component",
+                side_effect=mutate_after_first_read,
+            ),
+            self.assertRaisesRegex(
+                transport.TransportValidationError,
+                "changed while read",
+            ),
+        ):
+            transport._program_component(
+                component,
+                role="same_inode_mutation_component",
+                allow_missing=False,
+            )
+
+    def test_package_program_hash_accepts_unrelated_child_churn(self) -> None:
+        package = self.root / "bounded-package"
+        package.mkdir(mode=0o700)
+        package.joinpath("worker.py").write_bytes(b"VALUE = 1\n")
+        os.chmod(package / "worker.py", 0o600)
+        real_component = transport_program._program_component_at
+        changed = False
+
+        def add_unrelated_child(*args, **kwargs):
+            nonlocal changed
+            authenticated = real_component(*args, **kwargs)
+            if not changed:
+                changed = True
+                package.joinpath("__pycache__").mkdir(mode=0o700)
+            return authenticated
+
+        with (
+            mock.patch.object(
+                transport_program,
+                "SOURCE_TRANSPORT_WORKER_MODULE_MANIFEST",
+                ("worker.py",),
+            ),
+            mock.patch.object(
+                transport_program,
+                "_program_component_at",
+                side_effect=add_unrelated_child,
+            ),
+        ):
+            components = transport._package_program_components(package)
+
+        self.assertTrue(changed)
+        self.assertEqual("present", components[0]["state"])
 
     def test_snapshot_bootstraps_reject_special_file_replacements(self) -> None:
         regular = self.root / "bootstrap-snapshot"

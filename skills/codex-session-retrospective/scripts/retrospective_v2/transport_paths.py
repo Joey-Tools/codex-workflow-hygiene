@@ -24,17 +24,10 @@ ROOT_ROLLOUT_RELATIVE_RE = re.compile(r"^rollout-(?!summary)[^/]+\.jsonl$")
 
 
 def _program_stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_uid,
-        metadata.st_gid,
-        metadata.st_mode,
-        metadata.st_nlink,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
-    )
+    fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode")
+    if not stat.S_ISDIR(metadata.st_mode):
+        fields += ("st_nlink",)
+    return tuple(int(getattr(metadata, field)) for field in fields)
 
 
 def _require_program_component_policy(metadata: os.stat_result, role: str) -> None:

@@ -11,14 +11,17 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 import copy
 import datetime as dt
 import hashlib
+import importlib.util
 import io
 import json
 import math
+import pathlib
 import re
 import struct
 from typing import Any
 
 if __package__:
+    from . import privacy_locators
     from .result_validation import (
         EVENT_KINDS,
         FINDING_KINDS,
@@ -31,6 +34,15 @@ if __package__:
 else:
     # Finalization also loads this module directly by path. Keep that existing
     # contract usable while normal package imports share the working taxonomy.
+    _locator_spec = importlib.util.spec_from_file_location(
+        "_retrospective_v2_privacy_locators",
+        pathlib.Path(__file__).with_name("privacy_locators.py"),
+    )
+    if _locator_spec is None or _locator_spec.loader is None:
+        raise RuntimeError("retrospective privacy locator policy is unavailable")
+    privacy_locators = importlib.util.module_from_spec(_locator_spec)
+    _locator_spec.loader.exec_module(privacy_locators)
+
     EVENT_KINDS = frozenset(
         {
             "approval_request",
@@ -215,12 +227,6 @@ _OPAQUE_REF_RE = re.compile(
 )
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
 _URL_RE = re.compile(r"(?i)(?:[a-z][a-z0-9+.-]{0,31}://|git@)")
-_BARE_FQDN_RE = re.compile(
-    r"(?i)(?<![a-z0-9_@-])"
-    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
-    r"(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})"
-    r"(?::\d{1,5})?(?:/[^\s<>\"']*)?(?![a-z0-9_-])"
-)
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _LOCAL_PATH_RE = re.compile(
     r"(?:(?<![A-Za-z0-9_])/(?!/)"
@@ -664,7 +670,7 @@ def _validate_safe_string(value: str, *, path: str) -> None:
         raise RetainedPrivacyError(f"{path} exceeds the retained scalar length limit")
     if "\n" in value or "\r" in value or "\t" in value:
         raise RetainedPrivacyError(f"{path} contains multiline or tab-delimited text")
-    bare_fqdn = _BARE_FQDN_RE.search(value)
+    bare_fqdn = privacy_locators.BARE_FQDN_RE.search(value)
     if (
         bare_fqdn is not None
         and ".artifact_inventory[" in path
@@ -674,13 +680,15 @@ def _validate_safe_string(value: str, *, path: str) -> None:
     if any(
         (
             _URL_RE.search(value),
+            privacy_locators.BARE_PRIVATE_LOCATOR_RE.search(value),
             bare_fqdn,
+            privacy_locators.contains_ip_address(value),
             _EMAIL_RE.search(value),
             _LOCAL_PATH_RE.search(value),
         )
     ):
         raise RetainedPrivacyError(
-            f"{path} contains a URL, email address, or local path"
+            f"{path} contains a URL, email address, IP address, or local path"
         )
     if _SECRET_RE.search(value):
         raise RetainedPrivacyError(f"{path} contains credential-shaped material")
@@ -702,13 +710,15 @@ def _validate_reviewed_prose(value: Any, *, path: str) -> None:
     if any(
         (
             _URL_RE.search(value),
-            _BARE_FQDN_RE.search(value),
+            privacy_locators.BARE_PRIVATE_LOCATOR_RE.search(value),
+            privacy_locators.BARE_FQDN_RE.search(value),
+            privacy_locators.contains_ip_address(value),
             _EMAIL_RE.search(value),
             _LOCAL_PATH_RE.search(value),
         )
     ):
         raise RetainedPrivacyError(
-            f"{path} contains a URL, email address, or local path"
+            f"{path} contains a URL, email address, IP address, or local path"
         )
     if _SECRET_RE.search(value):
         raise RetainedPrivacyError(f"{path} contains credential-shaped material")
@@ -3616,7 +3626,9 @@ def _validate_report_bytes(
     if any(
         (
             _URL_RE.search(text),
-            _BARE_FQDN_RE.search(locator_scan_text),
+            privacy_locators.BARE_PRIVATE_LOCATOR_RE.search(locator_scan_text),
+            privacy_locators.BARE_FQDN_RE.search(locator_scan_text),
+            privacy_locators.contains_ip_address(locator_scan_text),
             _EMAIL_RE.search(text),
             _LOCAL_PATH_RE.search(text),
             _SECRET_RE.search(text),

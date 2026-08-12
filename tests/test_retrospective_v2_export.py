@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -454,6 +455,23 @@ def refresh_bundle_digest(artifacts: dict[str, bytes]) -> None:
 
 
 class RetrospectiveV2ReportingTests(unittest.TestCase):
+    def test_reporting_remains_directly_loadable_under_isolated_python(self) -> None:
+        completed = subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                str(SCRIPTS_DIR / "retrospective_v2" / "reporting.py"),
+            ),
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(b"", completed.stdout)
+        self.assertEqual(b"", completed.stderr)
+        self.assertEqual(0, completed.returncode)
+
     def test_assembly_is_deterministic_and_reports_required_metrics(self) -> None:
         previous = prior_trend()
         first = assemble_retained_artifacts(
@@ -1204,6 +1222,42 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
         with self.assertRaisesRegex(RetainedPrivacyError, "URL"):
             assemble_retained_artifacts(run_state(), bare_locator_review)
 
+        for network_locator in (
+            "localhost",
+            "10.0.0.1",
+            "203.0.113.7",
+            "2001:db8::1",
+        ):
+            with self.subTest(network_locator=network_locator, phase="assembly"):
+                network_review = review_data()
+                network_review["turn_findings"][1]["rewritten_prompt"] = (
+                    f"Inspect {network_locator} before continuing."
+                )
+                with self.assertRaisesRegex(RetainedPrivacyError, "IP address"):
+                    assemble_retained_artifacts(run_state(), network_review)
+
+            with self.subTest(network_locator=network_locator, phase="reread"):
+                network_artifacts = assemble_retained_artifacts(
+                    run_state(), review_data()
+                )
+                network_tampered = dict(network_artifacts)
+                network_rows = [
+                    json.loads(line)
+                    for line in network_tampered["turn_findings.jsonl"].splitlines()
+                ]
+                network_high_impact = next(
+                    row for row in network_rows if row["disposition"] == "high_impact"
+                )
+                network_high_impact["rewritten_prompt"] = (
+                    f"Inspect {network_locator} before continuing."
+                )
+                network_tampered["turn_findings.jsonl"] = b"".join(
+                    canonical_json_bytes(row) for row in network_rows
+                )
+                refresh_bundle_digest(network_tampered)
+                with self.assertRaisesRegex(RetainedPrivacyError, "IP address"):
+                    validate_retained_artifacts(network_tampered)
+
         artifacts = assemble_retained_artifacts(run_state(), review_data())
         tampered = dict(artifacts)
         rows = [
@@ -1257,6 +1311,13 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
                 refresh_bundle_digest(tampered)
                 with self.assertRaisesRegex(RetainedPrivacyError, "local path"):
                     validate_retained_artifacts(tampered)
+
+        report_artifacts = assemble_retained_artifacts(run_state(), review_data())
+        report_tampered = dict(report_artifacts)
+        report_tampered["report.md"] += b"\nInspect 203.0.113.7.\n"
+        refresh_bundle_digest(report_tampered)
+        with self.assertRaisesRegex(RetainedPrivacyError, "forbidden locator"):
+            validate_retained_artifacts(report_tampered)
 
     def test_non_http_uri_schemes_are_rejected_before_and_after_assembly(self) -> None:
         for uri in (

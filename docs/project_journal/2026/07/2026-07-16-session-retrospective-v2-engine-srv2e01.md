@@ -1413,3 +1413,41 @@ superseded_by:
   changed Python file passes Ruff lint and format. Exact-head admission and the
   two-processor `skill-repo-codex-gate` remain pending until the signed commit is
   frozen.
+- Signed head `34017a7` passed exact-secret admission and hosted Python 3.13 CI
+  run `31580723601`. The first fresh local Codex processor attempt produced no
+  terminal artifact within its 30-minute bound. It was interrupted once,
+  postvalidated with an unchanged seven-field receipt, and removed; its output
+  is non-counting. A separately materialized one-time transport retry returned
+  two P2 findings before its 45-minute bound, then passed the same postvalidation
+  and trusted-bundle digest checks before cleanup.
+- The first finding showed that retained reviewed prose and final report
+  validation rejected URLs and FQDNs but allowed bare IPv4, IPv6, and
+  `localhost`. `privacy_locators.py` now owns effective IP parsing as well as
+  private and public host patterns. Working-zone redaction, safe retained
+  strings, reviewed prose, and `report.md` reread use that shared policy.
+  Assembly, digest-preserving artifact tamper, sentence-final punctuation, and
+  report tamper regressions cover private/public IPv4, IPv6, and `localhost`.
+  The reporting module remains directly loadable under isolated `-I -B -S`
+  Python through its fixed sibling policy loader.
+- The second finding showed that program and source stability treated size,
+  timestamps, directory child churn, and every BSD flag as identity. Program
+  components now bind object identity and access policy, read regular-file bytes
+  twice through the held descriptor, compare exact content and final size, and
+  keep the one-link rule for files while allowing directory child/link-count
+  churn. Source identity masks flags to immutable, append, nounlink, restricted,
+  and datavault policy; `UF_HIDDEN` is benign. Tests cover timestamp-only churn,
+  same-inode same-size mutation, unrelated `__pycache__` creation, hard-link
+  rejection, non-policy flag churn, and access-policy drift.
+- The complete affected reporting/export, result-contract audit,
+  module-boundary, and source-transport modules pass 174/174 in 30.079 seconds.
+  Transport inventory is 7,245/7,250 physical lines, `transport_program.py` is
+  450/450, and the package branch proxy is 8,438/8,450. The signed head,
+  admission, CI, and both local-review attempts above become superseded when
+  these finding fixes create the next commit; a new exact-head admission,
+  current-head CI, and complete `skill-repo-codex-gate` are required.
+- The final authorized host-level Python 3.13 discovery passes all 1,698 tests
+  in 2,352.939 seconds with `TMPDIR=/private/tmp` and a 4,200-second
+  process-group deadline. It includes the disposable-GPG publication
+  transactions. The implementation, test, and architecture patch digest,
+  excluding this evidence-only journal, is unchanged before and after the run
+  at `3df4612fba15c2b3a901edec9f4c1c689d5a796e4dc329e91c872fba2bc4e123`.

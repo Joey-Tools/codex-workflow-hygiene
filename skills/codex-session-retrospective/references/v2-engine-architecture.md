@@ -55,8 +55,10 @@ Publication uses an explicit side-effect boundary:
 `source_overlap.py` owns strict streaming JSON token decoding, deterministic
 control-field classification, prose normalization, bounded overlap windows, and
 short source-token matching. `privacy_locators.py` owns working-zone bare-host
-patterns, while retained reporting keeps its independently loadable final
-locator validator.
+and effective IPv4/IPv6 detection. Working-zone redaction, retained safe
+strings, reviewed prose, and final report validation consume that same locator
+policy; the retained boundary still applies its stricter field and prose
+grammar.
 Keeping these deterministic policies outside the coordinator capabilities
 prevents lifecycle and result-validation modules from growing a second copy of
 either state machine.
@@ -202,21 +204,31 @@ captured bootstrap itself verifies isolated, no-site, no-bytecode flags before
 authenticating or compiling retained source. Global or user site initialization
 therefore cannot run before the authenticated source-only loader.
 
-The transport slice remains independently bounded after this hardening: 7,248
+Program-component stability protects object identity and access policy without
+treating size or timestamps as identity. Every regular component is read twice
+through the held descriptor and the exact bytes and final size must agree.
+Package-directory child-entry, link-count, and timestamp churn is benign while
+directory identity, ownership, type, and mode remain exact; regular components
+still require one link. Source rollout
+stability similarly compares only BSD immutable, append, nounlink, restricted,
+and datavault flags; `UF_HIDDEN` and other presentation flags are not access
+policy.
+
+The transport slice remains independently bounded after this hardening: 7,245
 physical lines across a 7,250-line aggregate limit. One exact 14-module
 inventory and its aggregate are enforced together, so omitting a transport
 module cannot create a false budget pass. The newly affected modules are
-`transport_paths.py` at 89/100 lines, `transport_program.py` at 449/450,
-`transport_remote.py` at 316/320, `transport_snapshot.py` at 217/220, and
+`transport_paths.py` at 82/100 lines, `transport_program.py` at 450/450,
+`transport_remote.py` at 316/320, `transport_snapshot.py` at 219/220, and
 `transport_remote_snapshot.py` at 86/100, while `transport_contracts.py` is
-990/1,000, `transport_snapshot.py` is 219/220, `transport_resume.py` is 165/175,
+990/1,000 and `transport_resume.py` is 168/200,
 `transport_source.py` is
 1,695/1,700, and `transport_worker.py` is 21/25. The closed run-state
 authority inventory is exactly 1,000/1,000 lines: `run_state_authority.py` 243/250,
 `run_state_contracts.py` 37/50, `run_state_cursors.py` 219/225,
 `run_state_holdouts.py` 236/240, and `run_state_lineage.py` 265/275. Including
 this full slice, the orchestrator foundation is 3,297/3,350 lines. The global
-branch proxy is 8,434/8,450 nodes after adding the descriptor-custody,
+branch proxy is 8,438/8,450 nodes after adding the descriptor-custody,
 closed-config, transport isolation, canonical-runtime, and locator predicates.
 The publication support
 boundary is 1,309/1,310 lines after adding claim-time checkpoint authority
