@@ -1,0 +1,600 @@
+# Session Retrospective v2 Data Contract
+
+The coordinator and all local transport workers require Python 3.13 or newer.
+The public entrypoint remains parseable under the Python 3.9 grammar solely so
+older runtimes can emit the closed unsupported-runtime result before loading the
+engine package; that parse path does not add runtime support.
+
+## Source Transport Authority
+
+A source cell is accepted only when all of these independently bound objects
+agree:
+
+- an identity-authenticated transport lease issued by the coordinator;
+- the exact leased worker/engine program commitment and, for remote work, the
+  run-owned `$remote-host-context` helper snapshot commitment;
+- a closed source transport stream with an authoritative inventory terminal;
+- an authenticated transport receipt binding the lease, manifest, independently
+  derived source snapshot, transcript commitment, and terminal proof;
+- exact raw bytes from the sealed stream or exact `session-shards` requests and
+  streams that reassemble to that same transcript.
+
+Arbitrary `eof_proof`, `terminal_receipt_ref`, path strings, or self-hashed
+snapshots are not coverage evidence. Truncation, byte/count mismatch, program
+replacement, helper replacement, and terminal mutation fail before the source
+cell or cursor changes.
+
+The transport program commitment uses a closed allowlist for every executable
+Python module in the local v2 package, including package initialization,
+catalog, contracts, identity, transport, and the worker entrypoint. The actual
+package-tree `.py` inventory must equal that allowlist; a missing or unexpected
+module fails closed. Each component is opened relative to an fd-anchored package
+directory with `O_NOFOLLOW`, must be a bounded regular file, and is hashed only
+after matching `fstat` and no-follow name identities before and after the read.
+
+Before a remote lease is committed, the parent opens the installed
+`$remote-host-context` helper and prepares its exact bytes for an owner-only,
+content-addressed snapshot below that run's `raw-inputs` tree. The source
+commitment derived from that same descriptor-bound read must equal the run's
+frozen helper provenance before snapshot preparation or lease creation. The
+transport-program snapshot, remote-helper snapshot, bound empty transport output,
+and candidate checkpoint are capacity-checked and staged as one transaction;
+none of those files is materialized before the candidate checkpoint fits. The
+worker receives only the snapshot path and SHA-256 commitment. Its isolated
+`-I -B` bootstrap opens the snapshot with no-follow descriptor checks, verifies
+regular-file identity, owner, mode, link count, byte count, and digest, then
+compiles exactly those retained bytes. Replacing the installed helper after
+scheduling cannot change the program that executes, replacing it between leases
+cannot mix helper versions within one run, and source acceptance revalidates the
+same run-owned commitment.
+
+`session_index` and `history` use bounded metadata JSONL transport. Active and
+archived rollouts use bounded rollout JSONL transport. Remote execution is always
+delegated to `$remote-host-context`; v2 contains no SSH command, host table, or
+generated remote program.
+
+The `session-shards` adapter validates authoritative descriptor EOF, derives the
+exact records-mode request, validates request/resume bindings and conservation,
+and reassembles fragments before acceptance. One oversized logical JSONL record
+retains one stable source/turn identity regardless of transport fragment count or
+local shard packing. Transcript bindings cover exactly the `source_ref` values
+that contain consumed candidates. Excluded-only source refs stay in catalog
+accounting and require no raw transcript.
+
+Descriptor pagination binds one stable source object, frozen byte end, record
+coordinates, and domain-separated full-prefix commitment in every closed resume
+cursor. Later appends cannot extend that descriptor snapshot. Continuation pages
+must repeat the requested source token, frozen byte end, byte offset, and record
+index exactly. Each page stops before its derived records stream would exceed
+1,024 data frames, using the closed `max_record_data_frames` continuation reason.
+A retained transcript stores every descriptor page first, followed by one exact
+records stream per page. The adapter validates and closes the complete descriptor
+chain before lazily replaying those contiguous records requests into the
+coordinator. Abandoning any records iterator closes its replay immediately even
+while the outer segment iterator remains live. Descriptor pages alone are
+discovery metadata and never authorize retained raw evidence.
+
+The `session_shards_source_v2` token binds device, inode, mode, owner, group, and
+the platform generation and birth-time fields when they exist. On a filesystem
+that supplies neither generation nor birth time, a same-inode replacement with
+byte-identical frozen content cannot be distinguished from the prior object;
+this is an explicit platform non-guarantee, not an identity proof. Every
+records-mode request separately scans and hashes the complete frozen prefix into
+an owner-only temporary spool before emitting its first frame. Content mutation
+anywhere in that prefix therefore rejects the stream even on the fallback
+platform, while the spool retains only the requested byte range and closes on
+every terminal path.
+
+Remote descriptor and record streams are incrementally validated before spool.
+Every frame is either consistently wrapped and bound to the exact requested
+host and rollout, or consistently legacy-unwrapped and wrapped locally with
+those exact values; missing wrappers at the adapter boundary, mixed wrapper
+mode, and cross-host or cross-rollout replay fail closed. Record relay output is
+bounded from the requested byte range plus compact metadata allowance, with
+per-frame size, coordinates, fragments, hashes, counters, and terminal
+conservation checked before the complete output can be retained.
+Fragment continuation also repeats the logical record byte range, record-index
+range, delimiter width, encoding, and complete-record commitment; drift in any
+one field rejects the relay before retained output exists.
+
+## Accounting, Shards, And Jobs
+
+Every discovered source unit ends in exactly one accounting class:
+`consumed_candidate`, `structurally_excluded`, or `explicit_gap`. Duplicate active
+and archived copies retain distinct physical-file occurrence coordinates. An
+archived record is excluded only by the closed canonical-equivalence rule when
+there is exactly one equivalent active record; multiple active files never
+collapse. Source discovery walks the complete active-rollout year/month/day
+hierarchy through descriptor-relative no-follow opens under global entry and
+candidate ceilings. It therefore includes old still-active sessions; exhausting
+either ceiling produces an explicit coverage gap instead of a partial catalog.
+Before a complete or no-activity terminal, the worker reopens every traversed
+active directory through its anchored identity chain and requires the bounded,
+type-aware entry snapshot to remain exact. A replacement or entry-set change is
+an explicit enumeration gap rather than an incomplete success.
+Archived discovery remains window-bound, and filesystem mtimes never prefilter
+candidates. Resume positions use the closed
+`source_transport_resume_v4` schema. They carry a public
+`accepted_prefix_commitment` transition chain plus the exact trailing probe
+range and content commitment; the chain is authoritative only because the
+incoming position is carried by the authenticated durable checkpoint, lease,
+and exact stream header and the outgoing position is independently reconstructed
+by capture before the receipt is issued. `source_token` and public stat fields
+never create or replace that authentication.
+
+Each invocation may spend at most three 64 KiB internal reads on resume probes;
+budget exhaustion is the explicit `source_resume_probe_budget_exhausted` gap.
+The worker rereads the current page separately to prove page stability, freezes
+the original source size so later appends are not admitted to that snapshot, and
+retains only the bounded trailing bytes needed to construct the next probe. It
+never rescans `0..byte_offset` to continue. Without an immutable source snapshot,
+this O(page) continuation detects only mutation intersecting the bounded
+prior-prefix probe; it does not detect or claim to detect arbitrary mutation deep
+in already accepted history. Every enumerated candidate is scanned or represented
+by an explicit bound/transport gap, and stable event time, cursor, and window
+classification happens only after the bounded read. Logical turn sequencing
+preserves each physical file's
+`byte_start` order before digest tie-breakers while deterministically merging
+different files. Session mode consumes only records matching `session_target`,
+records discovered for other sessions remain structurally accounted without
+retained raw payload, and a submitted non-target consumed record is rejected.
+
+- Extractor shard: at most 20 turns and 480 KiB.
+- Agent input: at most 512 KiB, including its control envelope.
+- Job identity: HMAC-derived from immutable inputs, role, schema, prompt, policy,
+  and retry ordinal.
+- Attempt identity: unique to one fresh launch and never reused as evidence
+  identity.
+- Task-cache metadata conserves every deterministic task lookup: one miss per
+  created task, one hit/reuse per returned existing task, and the sum of
+  per-task reuse counts. These counters and agent attempts are retained in run
+  provenance.
+- Claim identity: a bounded dispatcher lease over one attempt. Heartbeat extends
+  only the matching unexpired claim; expiry permits safe takeover on the same
+  attempt with a new envelope and output sink. Result acceptance binds the exact
+  active, unexpired claim. Each fresh attempt permits exactly two claim
+  generations: the initial claim and one expired-lease takeover. Further takeover
+  or an over-limit result sink records `agent_claim_budget_exhausted` and closes
+  that attempt through the ordinary retry/explicit-gap state machine without
+  counting an agent result or accumulating more claim files.
+- Every new claim, heartbeat, accepted result, and rejected-result disposition
+  serializes the actual candidate checkpoint before commit. If either the task
+  bound or the 512 KiB terminal reserve would be consumed, the coordinator
+  restores the prior task/claim state, clears only the candidate envelope, sink,
+  or result-sidecar staging it owns, and persists a content-free
+  `checkpoint_capacity_exhausted` blocker from the reserve. A byte-identical
+  replay that makes no state change needs no new reserve; replay-time migration
+  of a legacy inline job manifest does and is blocked before that migration can
+  consume the terminal reserve.
+- Accepted agent results live in canonical owner-only sidecars under
+  `agent-sinks/results`. The checkpoint stores only a closed descriptor that
+  binds the task reference, canonical result hash, byte count, SHA-256 content
+  commitment, and content-addressed run-relative path. Every consumer
+  authenticates the descriptor and exact canonical payload before use. Existing
+  checkpoints with a legacy inline result remain read-compatible, but every new
+  acceptance stages the sidecar and its exact checkpoint revision as one
+  transaction; a failed checkpoint commit rolls back only the newly created,
+  identity- and content-matching sidecar.
+- Immutable agent-task inputs live in canonical owner-only sidecars under
+  `agent-sinks/task-inputs`. The checkpoint keeps only their authenticated
+  descriptor plus bounded scheduling summaries; hierarchy inputs, turn metadata,
+  candidate results, framing, and payloads remain sidecar-only. Each sidecar is
+  capped at 640 KiB and every checkpoint task is capped at 16 KiB. Attempts retain
+  only the deterministic job reference and manifest digest; claim and replay
+  reconstruct the full manifest and require the digest to match before returning
+  an execution envelope. A legacy attempt may carry the full manifest instead of
+  its digest, but never both: the coordinator requires an exact reconstruction,
+  migrates it to the digest form, and rejects every ambiguous or changed legacy
+  representation before every active claim mutation, first result disposition,
+  or terminal claim-budget replay. A migration-only transition consumes the same
+  terminal checkpoint reserve as a new mutation; insufficient reserve restores
+  the original inline representation and records the blocker. Replaying an
+  accepted result also reauthenticates its result sidecar instead of trusting
+  checkpoint status alone.
+- Reassembled extracted turns live in one canonical owner-only,
+  content-addressed sidecar under `agent-sinks/derived`. Its 96 MiB cap is
+  independent of the 32 MiB checkpoint cap, and the checkpoint retains only a
+  descriptor binding its schema, turn count, byte count, SHA-256 commitment, and
+  run-relative path. Every consumer authenticates the complete canonical mapping
+  and each turn reference. Legacy inline extracted-turn mappings remain
+  read-compatible; new non-empty writes always use the sidecar.
+- One run admits at most 1,500 deterministic agent-task cache misses. Exactly
+  1,000 are reserved for extractor-redactor tasks and exactly 500 for episode
+  review, adjudication, topic reduction, and global synthesis. Cache hits do not
+  consume another task slot. Partition counters are authenticated checkpoint
+  state and are reconstructed from legacy task state before a new miss is
+  accepted. Before any task input, envelope, or shard is published, the
+  coordinator serializes the exact candidate checkpoint and requires it to fit
+  below the 32 MiB checkpoint bound with a 512 KiB terminal reserve. Scheduling
+  exhaustion restores the prior state and records an explicit repairable blocker
+  without staging files; claim and result transitions additionally remove their
+  not-yet-committed candidate artifacts. These limits reserve the complete
+  downstream pipeline before raw materialization and keep the conservative
+  cleanup inventory at no more than 261,844 entries under its fixed 300,000-entry
+  ceiling.
+- Accepted source records and raw-payload indexes live in canonical, owner-only,
+  content-addressed sidecars under `raw-inputs/source-acceptances`; authenticated
+  checkpoint state stores only bounded descriptors and a compact manifest summary.
+  Before segmented transport is consumed, the target host/source cell must have
+  room below its 64-segment ceiling and the candidate batch must fit the
+  run-global source capacity while reserving the complete 64 MiB per-segment
+  acceptance-sidecar ceiling. These conservative proofs happen before streaming
+  is enabled, the segment iterator advances, or a spool path is created; the
+  same boundary returns an already-authenticated accepted lease replay directly
+  from its durable action binding without consuming the supplied transport. The
+  checkpoint transaction later repeats the cell check and uses the sidecar's
+  exact canonical byte count for its final capacity check against the current
+  state.
+  Accepted bytes then stream into one deterministic
+  lease-derived, owner-only, descriptor-held spool under
+  `raw-inputs/source-spool-v1`. A persistent owner-only lock serializes retry;
+  after acquiring it, the next process authenticates and removes only the same
+  orphan spool. Exact byte and record caps are checked before every write. Only
+  one bounded record is retained in memory; the coordinator keeps compact
+  offsets, byte counts, content commitments, and final paths, so the legal 4 GiB
+  corpus is never assembled in the Python heap. The spool is not retained
+  evidence and is removed on replay, rejection, rollback, and successful
+  materialization.
+  Checkpoint capacity is proved before any final raw file or acceptance sidecar
+  is created. A rollback receipt ledger is fully allocated before the first
+  create and stores no payload bytes. Those files and the exact next checkpoint
+  revision are then staged
+  under one checkpoint lock: a proved unchanged old revision rolls back only
+  identity- and content-matching files, an exact committed new revision retains
+  them, and an unreadable or inconsistent disposition fails closed with explicit
+  retained-file evidence. Rollback revalidates the held file's identity,
+  single-link state, owner-only access policy, and exact content through two
+  bounded descriptor reads before unlink. A same-schema checkpoint that still
+  carries the legacy full manifest or inline payload index remains readable; the
+  next accepted continuation validates conflicts and migrates that index into
+  the new sidecar before clearing the inline copy. A run accepts at most 64
+  continuation segments per host/source cell, 1,280 segments and 100,000 records
+  in total, 4 GiB of source bytes, and 256 MiB of acceptance-sidecar bytes.
+  Transcript and acceptance digests derive from the compact per-record
+  descriptors. Materialization reads each accepted segment once, merges payload
+  indexes in place, and sorts only the final aggregate; accepting a later segment
+  never reloads earlier sidecars. The coordinator rejects an over-limit segment
+  before final-file staging, leaving coverage unresolved rather than committing
+  an incomplete aggregate.
+- Raw sharding uses two bounded ordered passes over the authenticated source
+  payload sidecars. The first pass retains only shard/gap manifests and rejects
+  more than 1,000 shards before raw-shard I/O. A catalog record whose declared
+  byte or turn count exceeds its processing budget becomes an explicit gap before
+  its payload file is read. The second pass reads one source
+  payload at a time, emits one shard at a time, and requires every emitted
+  manifest plus the complete canonical manifest to match the first pass. Its
+  working data is bounded by one source record, that record's fragments, the
+  current shard, and one maximum-sized serialization buffer; the legal 4 GiB
+  source corpus is never assembled in memory. Newly created shard files and the
+  manifest are staged with the candidate checkpoint revision. A checkpoint
+  failure performs descriptor-authenticated exact-file rollback, while an
+  existing byte-identical artifact remains idempotent and is never claimed as a
+  newly created rollback target.
+- Every newly created staged file returns an object-identity receipt binding its
+  parent identity, file identity, owner-only access policy, exact byte count, and
+  SHA-256 content. A caller-owned receipt slot is allocated before I/O and is
+  populated while the descriptor-held file still has only its deterministic
+  pending name, before publication links the final name. The same receipt binds
+  the pending and final names and can roll back the proved one-name pending,
+  two-name commit, or one-name final state after any unwindable `BaseException`;
+  an extra hard link or any identity/content/policy mismatch fails closed. All
+  atomic creates in one directory share one persistent directory lock, so two
+  target names cannot bypass each other's transaction boundary. Rollback
+  reacquires that lock and performs two descriptor-bound content and policy
+  samples before unlinking. Parent or leaf replacement, same-inode content
+  mutation, unreadability, or policy drift fails closed and retains the path.
+  Child-entry churn that does not change the protected parent identity is benign.
+  The receipt excludes `SIGKILL`, `os._exit`, and a non-cooperating malicious
+  same-UID writer from its guarantee; it proves the cooperating unwind and
+  recovery boundary rather than claiming an atomic unlink-by-FD primitive the
+  platform does not provide. Independent receipts and staging groups continue
+  rollback after one retained mismatch; a close failure after a proved unlink is
+  secondary evidence and cannot reverse the known disposition or replace the
+  original primary failure.
+- Exact cleanup inventory rejects non-regular leaf objects from descriptor-held
+  parent metadata before opening them. Every subsequent file open uses
+  `O_NOFOLLOW | O_NONBLOCK`, so a regular-file-to-FIFO replacement cannot block
+  the cooperative traversal deadline before type and object identity are
+  revalidated. Nonblocking open does not claim a hard I/O deadline for ordinary
+  files or network/File Provider storage.
+- Legacy inline cleanup claim v4 authentication binds the original field-present
+  wire representation before semantic normalization; a missing legacy
+  `content_commitment` and an explicit null are not interchangeable without a
+  new valid claim reference. After quarantine rename, a missing durable progress
+  marker still requires the complete planned relative-path set. Only a verified,
+  fsynced marker permits a strict identity/content/policy-matching subset as
+  evidence of monotonic cleanup progress.
+- Raw run directory: mode `0700`; every file: mode `0600`. On Darwin, each
+  owner-only directory and file must also have no extended ACL. Newly created
+  objects clear inherited ACLs through their held descriptors before use;
+  existing objects with an ACL fail closed rather than being repaired.
+- Successful publication removes raw shards. Blocked raw state expires within
+  seven days and remains an explicit recoverability/coverage outcome.
+
+Extractor validation receives bounded original prompt/tool-output material or
+safe fingerprints directly from the sealed raw shard. It rejects ordinary raw
+overlap before retained state is written; raw material never leaves working
+retention. Each reassembled record is streamed through a strict UTF-8 and JSON
+token parser. The parser validates literals and numbers with a closed grammar;
+an invalid primitive cannot consume a following string. Object keys,
+non-string primitives, exact per-field low-risk classifier values, and semantic
+timestamps are not source-prose candidates. Unknown classifier values, model and
+schema identifiers without an exact allowlisted value, instance-bearing IDs,
+host and cwd values, typed references, digests, and commitments always remain
+source candidates. Every other decoded string value, including long
+escaped values and surrogate pairs, is case-folded, whitespace-normalized, and
+split into overlapping bounded windows; no long prose value is skipped. The
+normalizer accumulates one-character parser emissions in fixed-size chunks and
+keeps the active window in a bounded deque rather than repeatedly copying a
+growing string. The
+result-side projection contains only the extractor's schema-authorized
+`turns[].generalized_working_text`, both before and after deterministic
+post-redaction. Source values from 4 through 11 normalized characters use
+Unicode token-boundary matching, so a value such as `Acme` is removed from
+derived prose without treating `Acmeology` as the same source token. Bare FQDNs
+are redacted regardless of suffix; protocol URLs, private locators, paths, and
+bare hosts retain distinct deterministic precedence. Typed references and hashes
+are exempt from source-literal
+replacement only in result-side schema fields that are independently format- and
+allow-list validated; the same bytes in retained prose are rejected. Fixed enum,
+status, outcome, and object-key strings are not treated as retained source-derived
+prose. Window batches have independent
+item and aggregate-character bounds while preserving enough overlap to detect a
+query split across windows or transport fragments.
+
+The complete export input is stored as one owner-only, content-addressed
+`retained-inputs` sidecar. Authenticated run state retains only its descriptor.
+The descriptor binds canonical byte count, SHA-256 commitment, and the one
+allowed relative filename; loading reads no more than that exact byte count and
+revalidates the canonical payload, digest, run, mode, and window. Existing
+same-v2 checkpoints with the exact legacy embedded `{run_state, review_data}`
+shape remain readable, but new writes always use the sidecar. The sidecar is a
+fixed authenticated cleanup root and is never retained in durable history.
+Idempotent replay of each authenticated published, shadow, or expired terminal
+cleanup clears any legacy embedded retained input after revalidating the
+terminal receipt.
+
+Before retained artifact assembly or staging, the CLI canonicalizes the ignored
+output path and rejects every destination equal to or below `raw-inputs`,
+`raw-shards`, `agent-sinks`, or `retained-inputs` for the current run. This keeps
+shadow cleanup from deleting the bundle that the same command just exported.
+Component comparison applies NFD before and after Unicode case folding, so
+case-insensitive filesystem aliases are rejected conservatively on every
+supported filesystem.
+
+Export destination binding uses three immutable records so new and legacy CLI
+writers cannot split one run across outputs. `cli-export-v2.json` remains the
+legacy final-descriptor location. A new writer first occupies that location with
+a closed v3 reservation, which prevents a not-yet-committed legacy writer from
+later publishing a final descriptor there. `cli-export-destination-v2.json` is
+the destination claim and `cli-export-result-v3.json` is the completed result.
+An exact legacy final descriptor remains authoritative and is promoted to the
+same claim before retry comparison. If an already-started legacy writer publishes
+its no-replace claim after the reservation but before the new claim, that claim
+becomes the effective destination; the conflicting invocation stops before
+artifact assembly and an exact retry can finish it. Final receipt persistence
+reauthenticates the effective claim and any legacy final descriptor. The result
+continues to bind the bundle digest, publication role, and retention deadline.
+
+## Partial And Backfill Lineage
+
+Controlled missing-host authority uses the closed reasons
+`missing_host_holdout` for production and `shadow_missing_host_holdout` for
+shadow runs. Its authenticated aggregate receipt binds the partial run, host,
+window, every required source kind, and every accepted source transport receipt.
+It requires a later backfill and cannot authorize extraction, review, reduction,
+malformed JSON, processing-budget, authentication, or transport gaps.
+
+A backfill binds the controlled-gap receipt, `backfill_of`, the exact durable
+backlog reference, prior episode revisions, episode-head root, and stable anchor
+membership. A stable match must append one successor revision. An unmatched
+episode from the exact controlled missing host may create one new initial
+revision; session-only fallback matching is forbidden and every unrelated prior
+head remains unchanged. The full proposed head projection is durable state, while
+only changed or new revisions enter the review workset.
+The authenticated run checkpoint revalidates the controlled-gap receipt and its
+partial-run, canonical-host, window, and shadow bindings before the single-host
+matrix exception is granted. Formal publication repeats the same shared
+validation before deriving any durable cursor transaction. The history
+snapshot's cursor rows are the only authority for every `before` cursor; each
+proposal is derived from terminal source cells. The formal durable state must
+then equal those proposed rows plus the exact source snapshot refs,
+`backfill_of`, episode-head root, and complete episode-head list. A production
+backfill must consume the durable backlog and matching controlled-gap/head-set
+commitments; a shadow successor may derive only its authenticated run-local
+equivalent.
+
+Only an ordinary Daily run with `allow_partial=true` may publish source gaps.
+Its gap-host set must exactly equal its authenticated `controlled_holdouts` set,
+every source kind for each held host must be a gap with the receipt's exact
+transport references and reason, and every referenced transport receipt body
+must independently authenticate against the checkpoint source receipt inventory.
+Comparing only receipt references is insufficient. At least one other host must
+remain complete. Weekly gaps, mixed gap/complete cells, cross-host receipts, and
+a complete run carrying a stale holdout are rejected. An ordinary run cannot
+clear a non-null durable backlog; only the matching backfill lineage can do so.
+For shadow backfill, every checkpoint read revalidates the closed successor HMAC
+and its exact partial-run, gap, host, history, provenance, window, revision,
+coverage, cleanup, and export-digest bindings.
+
+A publication retry validates this authenticated run authority and its
+persistent claim before adapter recovery. It re-inventories every present local
+bundle and requires exact identity, content, and access-policy equality with the
+stored inventory before any adapter side effect. Direct abort recovery repeats
+the claim validation before release. While target CAS has not occurred, the
+retry also re-derives the complete journal plan from the current retained
+inventory, history base, provider cache, cursor vector, and episode update. Once
+the exact target CAS is reachable, recovery is authorized by the bound adapter
+attempt and signed durable-history projection; the expected history advance and
+a legally collected, exactly absent local bundle are not treated as
+prepublication inputs.
+
+The sole exception is a direct shadow successor derived from a completed Daily
+partial by `--shadow-successor-of`. Its authenticated shadow gap derives an
+exact run-local backlog reference without changing durable history. This
+exception is unavailable to production, cannot enter `finalize`, and cannot
+advance or suppress production host coverage.
+
+Extractor control metadata binds each goal, workstream, evidence, and span
+reference to one logical turn. A turn cannot borrow another turn's references
+from a shard-wide union. After validation, the coordinator resolves goal and
+workstream continuity in canonical session order from the closed
+`goal_change`/`workstream_change` decisions. Backfill predecessor matching
+requires a stable turn or goal anchor; a session-default workstream alone is
+never a semantic predecessor.
+
+A successor review receives payload material for every member turn, including
+all turns inherited from its prior durable head. If any prior validated payload
+cannot be restored from the current sealed extraction material, the coordinator
+records `episode_turn_material_gap` with an exact missing-ref commitment and
+blocks before creating a partial review input. A prior turn reference without
+its validated material is never treated as coverage.
+
+Oversized episode reviews use validated hierarchical children. Every parent
+binds the exact child result hashes and conserves all high/critical events and
+findings, high-impact turn adjudications, risk flags, associated evidence,
+escalation/conflict decisions, and the minimum child confidence. Omitting any of
+those values rejects the parent result.
+
+Episode adjudication additionally carries both validated candidate results and
+an ordered `candidate_item_decisions` trace. Every candidate event, finding,
+strength, risk flag, high-impact turn, and evidence reference must be selected,
+merged with duplicate support, or explicitly rejected with a closed reason and
+the exact candidate hash/reviewer/attempt provenance. Downstream topic input
+embeds and revalidates that complete candidate context; an adjudicator cannot
+silently erase candidate-unique content.
+
+## Automation Cutover Authority
+
+`automation_cutover_snapshot_v2` is captured before the capability call and
+identity-authenticates the exact stable-ID inventory, canonical record paths,
+and either the absent state or verified existing record digest.
+`automation_update_result_v2` then contains exactly the available
+`automation_update` capability, that snapshot ref, and one successful
+`register` or `update` operation for each stable ID:
+`daily-session-retrospective` and `weekly-session-retrospective`. Registration
+is admissible only for a snapshot-proven absent ID and requires a null previous
+digest. Update is admissible only for a snapshot-proven existing ID and requires
+its exact distinct previous digest. The internal authority derives the result
+commitment after validating installed bytes. Missing capability, opaque result
+refs, stale or forged pre-state, and every extra or unrelated ID fail closed.
+
+`automation_cutover_record_v2` binds the owner identity, installed release
+commit, exact installed v2 CLI path, operation lineage, and current SHA-256 plus
+identity-derived reference for both fixed `automation.toml` paths. The engine
+reads those records with bounded no-follow I/O and requires owner ownership,
+non-group-writable paths, active cron state, mode-appropriate schedule and
+prompt, and no reference-only, v1, shadow, holdout, or partial-production
+controls. The production marker embeds the complete authenticated cutover
+record and must include its release commit.
+
+## Retained Bundle
+
+Every published run contains exactly:
+
+```text
+manifest.json
+coverage.json
+episodes.jsonl
+turn_findings.jsonl
+topics.jsonl
+trend_report.json
+report.md
+summary.json
+```
+
+The retained bundle contains summaries, findings, strengths, reviewed prompt
+rewrites, typed metrics, confidence, opaque references, and pre-tree provenance
+only. Episode rows retain the exact revision ordinal, superseded revision,
+review-result hash, reviewer, and attempt lineage. High-impact turn rows retain
+the validated `problem_statement`, `cause`, `rewritten_prompt`,
+`expected_effect`, `confidence`, and opaque evidence references. These four
+reviewed text fields are the only retained prose exception and remain subject to
+ASCII, length, locator, and credential scans. The bundle never contains raw or
+quoted original prompts, excerpts, tool output, source paths, raw IDs, internal
+URLs, bare FQDNs, secrets, credentials, customer data, personal data, or
+proprietary code.
+
+Retained prose is also content-validated, not merely field-name validated.
+Original/verbatim prompt markers, tool or command output markers, role
+transcripts, direct source-request shapes, code/shell/key-value payloads, UUIDs,
+opaque internal IDs, and exact source-derived prompt/tool payload overlap are
+rejected. A useful generalized `rewritten_prompt` remains admissible when it
+does not reproduce those source forms.
+
+`manifest.json` retains the complete non-sensitive execution contract: actual
+model/provider/closed parameters, prompt digest/version, schema and transport
+bindings, component versions, configuration root, and every agent job's result,
+retry, reviewer, and issued/claimed/completed timing provenance. An opaque
+configuration commitment cannot replace these fields.
+Agent execution provenance includes the exact deterministic task-cache
+hit/miss/reuse conservation alongside every job, result, retry, reviewer, and
+issued/claimed/completed timestamp.
+
+Trend rates use all meaningful turns or episodes as denominators and are reported
+per 100. Incompatible model/policy/configuration eras are rendered separately and
+never compared as direct improvement or regression.
+
+Topic-reducer output uses a closed result schema. Validated topic aggregation
+contains evidence-bound episode/session membership and cross-session measures;
+global synthesis consumes those aggregations rather than byte-equal reducer
+input.
+
+Topic inputs are partitioned from bounded episode reviews before the 64 KiB
+result-contract validator is called. The durable partition index commits every
+expected episode revision and leaf input hash; reducers then combine only
+validated bounded children through the hierarchy. The coordinator never first
+constructs or validates one oversized topic input.
+
+Global synthesis requires a bijection between durable topic-input roots and
+accepted final topic tasks: every expected root appears exactly once, with no
+duplicate or extra root, before any dictionary reconstruction. Hash-key
+overwrite cannot collapse duplicate results.
+
+Global synthesis represents each exact canonical topic-signal union with a
+SHA-256 commitment and count plus at most 64 deterministic exemplars, selected
+high-severity-first and then by canonical order. The commitment and exact topic
+result hash inventory prevent omitted non-exemplar signals from disappearing.
+Retained compilation verifies the finding commitment against topic rows and
+writes the complete canonical finding/evidence union to `summary.json`, not just
+the bounded exemplars.
+
+Durable episode, topic, and global records use closed per-finding objects. Every
+object preserves the exact finding kind, confidence, optional severity, and
+non-empty opaque `evidence_refs` that justified that finding. Topic findings are
+the exact canonical union of their member episode findings, and global findings
+are the exact canonical union of the retained topic findings. Counts cannot
+replace these records, and evidence references cannot be dropped or rewritten
+during reduction. The existing privacy rules still reject prose, raw content,
+paths, identifiers, URLs, secrets, and any non-opaque evidence reference.
+
+## Calibration And Durable Authority
+
+Calibration receipts bind the exact corpus commitment and configuration root.
+Precision, recall, and F1 use bounded integer numerator/denominator pairs;
+missing denominators fail. The signed private Git publication chain is durable
+authority. The owner-local HMAC production marker records completed cutover, and
+the provider cache is initialized only by a request that proves
+`expected_revision=0` exactly, independently of the current durable-history
+projection revision, and then derived from each newly validated history commit.
+
+Production cutover binds exactly `daily-session-retrospective` and
+`weekly-session-retrospective` to the installed v2 CLI path. The internal
+authority API admits either a verified update of an existing record or an exact
+first registration of those stable IDs. Unrelated IDs, unavailable
+`automation_update`, a reference-only template, or a different executable path
+cannot establish production authority.
+
+Episode heads form an append-only revision chain. A successor advances the
+ordinal by exactly one, names the exact predecessor revision, and preserves the
+predecessor's `session_ref` byte for byte. Session reassignment requires a new
+episode identity and cannot be hidden in a superseding revision.
+
+## Durable Guidance Threshold
+
+AGENTS.md, Skill, and automation candidates require evidence from at least three
+episodes across at least two sessions. One independently reviewed high-severity
+safety issue may qualify as an exception. Every candidate carries a closed list
+of exact `{episode_ref, session_ref}` pairs. Each pair must match validated topic
+lineage and retained episode lineage; unrelated episodes or a real episode paired
+with the wrong session fail closed.
