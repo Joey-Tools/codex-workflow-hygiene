@@ -1559,3 +1559,13 @@ superseded_by:
   OpenAI skill validator through an isolated PyYAML runtime. Two direct wrapper
   attempts without PyYAML exited as dependency runtime errors and are
   non-counting; the authoritative isolated validator reported `Skill is valid!`.
+- The final #67 range could not start its required current-head reviewer after
+  canonical `master` advanced: its ordinary merge preserved both the original
+  `04325e6a` feature boundary and current `db0991dc` base, while the trusted
+  materializer permits exactly one shallow boundary. It failed closed with
+  `materializer review graph cannot be represented by the sole shallow
+  boundary`; no reviewer model started and the empty task root was removed.
+  The signed #67 branch remains unchanged as audit history. Signed linear
+  replacement commit `1162c67` starts directly from `db0991dc` and has the
+  exact same `9636955d77c5822ea3d02b93b95285aacc8eb54f` tree as #67 final head
+  `c358b950`; this journal note is its sole intentional follow-up difference.
