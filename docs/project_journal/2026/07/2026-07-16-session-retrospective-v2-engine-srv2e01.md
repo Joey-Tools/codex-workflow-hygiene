@@ -1319,3 +1319,31 @@ superseded_by:
   seconds. The implementation, test, and architecture patch digest, excluding
   this evidence-only journal, is unchanged before and after both runs at
   `70a56df69683c0087bc873badc49917db3a859753657150ab4a501e1e2c226b3`.
+- Signed head `d2dfa22` passed exact-secret admission, but hosted CI run
+  `31555756273` selected CPython 3.14.7 through the workflow's floating
+  `python-version: "3.x"` declaration and failed closed while authenticating
+  the source-transport interpreter. This was outside the user-authorized
+  Python 3.13 validation scope and made the head unpublishable. Its fresh Codex
+  reviewer was still running without a terminal artifact when the head became
+  stale; it was closed and is explicitly non-counting.
+- CI now pins the single authorized minor version, Python 3.13. A repository
+  contract asserts that exact declaration and rejects a return to the floating
+  `3.x` selector. The CI contract plus the complete source-transport suite
+  passes 73/73 in 40.153 seconds. `actionlint`, Ruff lint and format, and
+  `git diff --check` pass. The two-file workflow-and-test binary patch digest,
+  excluding this journal, is
+  `c1e9262a79322302aeeacf115d716929b3a24770bed13d2d11e3f6fe67bcde2a`.
+- A first local discovery without the authorized host temporary-directory and
+  GPG execution context is non-counting: it ran 1,621 tests in 570.932 seconds,
+  with one macOS `/var` versus `/private/var` alias assertion and one sandboxed
+  GPG class-setup failure. The path case passes 1/1 in 2.563 seconds with
+  `TMPDIR=/private/tmp`; the complete host temporary-GPG publication class
+  passes 63/63 in 2,033.812 seconds.
+- The final host Python 3.13 discovery enumerated all 1,684 tests and ran for
+  2,635.710 seconds. It passed 1,683 tests; the sole error was an `ENOSPC` from
+  an atomic checkpoint temporary-file create after the host volume reached its
+  space limit. After the suite cleaned its temporary trees and free space was
+  restored, that exact orchestrator test passed 1/1 in 32.449 seconds on the
+  unchanged tree. This combined local evidence covers every discovered test;
+  a fresh exact-head hosted CI run remains required to verify the pinned 3.13
+  toolcache and the complete suite in one clean environment.
