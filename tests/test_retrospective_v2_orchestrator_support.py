@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -18,7 +19,7 @@ from retrospective_v2 import orchestrator_support  # noqa: E402
 
 class PublisherCanaryProcessTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.temporary_directory = tempfile.TemporaryDirectory(dir=ROOT)
         self.root = Path(self.temporary_directory.name)
         self.gnupg_home = self.root / "gnupg"
         self.gnupg_home.mkdir(mode=0o700)
@@ -88,6 +89,27 @@ class PublisherCanaryProcessTests(unittest.TestCase):
                 )
             )
         self.assertFalse(sentinel.exists())
+
+    def test_canary_rejects_gpg_content_change_after_sign(self) -> None:
+        def mutate_after_sign(command, *, environment):
+            del environment
+            signature = Path(command[command.index("--output") + 1])
+            signature.write_bytes(b"signature")
+            self.gpg_program.write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
+            self.gpg_program.chmod(0o700)
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(
+            orchestrator_support,
+            "_run_bounded_publisher_canary_process",
+            side_effect=mutate_after_sign,
+        ):
+            self.assertFalse(
+                orchestrator_support.publisher_sign_verify_canary(
+                    gnupg_home=self.gnupg_home,
+                    gpg_program=self.gpg_program,
+                )
+            )
 
     def test_bounded_canary_terminates_oversized_stdout_during_execution(
         self,

@@ -49,6 +49,7 @@ Publication uses an explicit side-effect boundary:
 | `publication_state.py` | Durable publication state and transition validation |
 | `publication_contracts.py` | Side-effect protocols and injected adapter contracts |
 | `publication_support.py` | Immutable contracts, anchored I/O, and pure validation |
+| `executable_authority.py` | Shared executable path, content, and access-policy binding |
 | `git_safety.py` | Shared local-only Git environment, repository admission, and revalidation |
 
 `retained_inputs.py` owns authenticated export-input sidecars, while
@@ -228,11 +229,12 @@ authority inventory is exactly 1,000/1,000 lines: `run_state_authority.py` 243/2
 `run_state_contracts.py` 37/50, `run_state_cursors.py` 219/225,
 `run_state_holdouts.py` 236/240, and `run_state_lineage.py` 265/275. Including
 this full slice, the orchestrator foundation is 3,297/3,350 lines. The global
-branch proxy is 8,438/8,450 nodes after adding the descriptor-custody,
-closed-config, transport isolation, canonical-runtime, and locator predicates.
-The publication support
-boundary is 1,309/1,310 lines after adding claim-time checkpoint authority
-validation and inherited-descriptor launch support. The
+branch proxy is 8,494/8,500 nodes after adding executable path, content, and
+access-policy authority to the existing descriptor-custody, closed-config,
+transport-isolation, canonical-runtime, and locator predicates. The closed
+nine-module publication slice is 8,673/8,700 lines; within it,
+`publication_support.py` is 1,300/1,310 and `executable_authority.py` is
+314/320. The durable `authority.py` integration is 3,259/3,275 lines. The
 source coordinator and
 its original support slice are 2,930/3,000 lines; the three source-staging modules
 are independently capped at 749/775, and the claim/result reserve owner is

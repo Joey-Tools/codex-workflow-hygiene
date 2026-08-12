@@ -28,6 +28,7 @@ from retrospective_v2 import (  # noqa: E402
     authority,
     calibration,
     controlled_gaps,
+    executable_authority,
     finalize as finalize_module,
     git_safety,
     orchestrator as orchestrator_module,
@@ -107,6 +108,118 @@ def run_command(
 
 
 class PublicationInvariantUnitTests(unittest.TestCase):
+    def test_executable_authority_rejects_writable_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=_publication_test_temp_parent()
+        ) as temporary_directory:
+            executable = Path(temporary_directory) / "untrusted-tool"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
+
+            with self.assertRaisesRegex(
+                executable_authority.ExecutableAuthorityError,
+                "writable by another user",
+            ):
+                executable_authority.resolve_executable(executable, label="Fixture")
+
+    def test_executable_authority_ignores_timestamps_and_detects_content(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary_directory:
+            executable = Path(temporary_directory) / "trusted-tool"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
+            authority_receipt = executable_authority.resolve_executable(
+                executable, label="Fixture"
+            )
+
+            metadata = executable.stat()
+            os.utime(
+                executable,
+                ns=(metadata.st_atime_ns + 1, metadata.st_mtime_ns + 1),
+            )
+            executable_authority.revalidate_executable(authority_receipt)
+
+            executable.write_bytes(b"#!/bin/sh\nexit 1\n")
+            with self.assertRaisesRegex(
+                executable_authority.ExecutableAuthorityError,
+                "changed after validation",
+            ):
+                executable_authority.revalidate_executable(authority_receipt)
+
+    def test_executable_invocation_detects_post_resolution_replacement(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary_directory:
+            root = Path(temporary_directory)
+            executable = root / "trusted-tool"
+            displaced = root / "trusted-tool-original"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
+            authority_receipt = executable_authority.resolve_executable(
+                executable, label="Fixture"
+            )
+
+            with self.assertRaisesRegex(
+                executable_authority.ExecutableAuthorityError,
+                "changed after validation",
+            ):
+                with executable_authority.executable_invocation(authority_receipt):
+                    executable.rename(displaced)
+                    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+                    executable.chmod(0o700)
+
+    def test_executable_authority_detects_ancestor_policy_change(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary_directory:
+            root = Path(temporary_directory)
+            executable = root / "trusted-tool"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
+            authority_receipt = executable_authority.resolve_executable(
+                executable, label="Fixture"
+            )
+
+            root.chmod(0o722)
+            try:
+                with self.assertRaisesRegex(
+                    executable_authority.ExecutableAuthorityError,
+                    "no longer valid",
+                ):
+                    executable_authority.revalidate_executable(authority_receipt)
+            finally:
+                root.chmod(0o700)
+
+    def test_publisher_keyring_revalidates_gpg_executable_content(self) -> None:
+        with (
+            tempfile.TemporaryDirectory(dir=ROOT) as tool_directory,
+            tempfile.TemporaryDirectory(
+                dir=_publication_test_temp_parent()
+            ) as temporary_directory,
+        ):
+            executable = Path(tool_directory) / "gpg-fixture"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
+            home = Path(temporary_directory) / "gnupg"
+            home.mkdir(mode=0o700)
+
+            def mutate_executable(*_args, **_kwargs):
+                executable.write_bytes(b"#!/bin/sh\nexit 1\n")
+                return subprocess.CompletedProcess([], 0, b"", b"")
+
+            with (
+                mock.patch.object(
+                    publication_support,
+                    "_run_bounded_subprocess",
+                    side_effect=mutate_executable,
+                ),
+                self.assertRaisesRegex(
+                    publication_support.LocalGitPublicationError,
+                    "GPG executable authority changed",
+                ),
+            ):
+                publication_support.validate_publisher_keyring(
+                    gnupg_home=home,
+                    fingerprint="A" * 40,
+                    expected_uid=DEFAULT_PUBLISHER_UID,
+                    gpg_program=executable,
+                )
+
     def test_local_git_completeness_policy_is_closed(self) -> None:
         git_safety.validate_complete_local_repository(
             b"false\n",
@@ -294,7 +407,7 @@ class PublicationInvariantUnitTests(unittest.TestCase):
                     gnupg_home=home,
                     fingerprint=fingerprint,
                     expected_uid=DEFAULT_PUBLISHER_UID,
-                    gpg_program=sys.executable,
+                    gpg_program="/usr/bin/true",
                 )
 
             self.assertEqual(fingerprint, identity["fingerprint"])
@@ -337,7 +450,7 @@ class PublicationInvariantUnitTests(unittest.TestCase):
                     gnupg_home=home,
                     fingerprint="A" * 40,
                     expected_uid=DEFAULT_PUBLISHER_UID,
-                    gpg_program=sys.executable,
+                    gpg_program="/usr/bin/true",
                 )
 
             self.assertEqual(1, calls)
@@ -376,7 +489,7 @@ class PublicationInvariantUnitTests(unittest.TestCase):
                     gnupg_home=home,
                     fingerprint="A" * 40,
                     expected_uid=DEFAULT_PUBLISHER_UID,
-                    gpg_program=sys.executable,
+                    gpg_program="/usr/bin/true",
                 )
 
     def test_publisher_keyring_prioritizes_revalidation_after_listing_error(
@@ -414,7 +527,7 @@ class PublicationInvariantUnitTests(unittest.TestCase):
                         gnupg_home=home,
                         fingerprint="A" * 40,
                         expected_uid=DEFAULT_PUBLISHER_UID,
-                        gpg_program=sys.executable,
+                        gpg_program="/usr/bin/true",
                     )
 
             self.assertIs(operation_error, raised.exception.__cause__)
@@ -653,10 +766,23 @@ class PublicationInvariantUnitTests(unittest.TestCase):
 class DurablePublicationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.gpg = shutil.which("gpg")
-        if cls.gpg is None:
+        source_gpg = shutil.which("gpg")
+        if source_gpg is None:
             raise unittest.SkipTest("gpg is required for signed publication tests")
-        cls.key_fixture = tempfile.TemporaryDirectory()
+        cls.key_fixture = tempfile.TemporaryDirectory(
+            dir=_publication_test_temp_parent()
+        )
+        cls.tool_fixture = tempfile.TemporaryDirectory(dir=ROOT)
+        trusted_bin = Path(cls.tool_fixture.name) / "trusted-bin"
+        trusted_bin.mkdir(mode=0o700)
+        cls.gpg = os.fspath(trusted_bin / "gpg")
+        shutil.copyfile(source_gpg, cls.gpg)
+        os.chmod(cls.gpg, 0o700)
+        cls.path_patch = mock.patch.dict(
+            os.environ,
+            {"PATH": f"{trusted_bin}{os.pathsep}{os.environ.get('PATH', os.defpath)}"},
+        )
+        cls.path_patch.start()
         cls.gnupg_home = Path(cls.key_fixture.name) / "gnupg"
         cls.gnupg_home.mkdir(mode=0o700)
         run_command(
@@ -701,6 +827,8 @@ class DurablePublicationTests(unittest.TestCase):
                 check=False,
                 capture_output=True,
             )
+        cls.path_patch.stop()
+        cls.tool_fixture.cleanup()
         cls.key_fixture.cleanup()
 
     def setUp(self) -> None:
@@ -2922,7 +3050,7 @@ class DurablePublicationTests(unittest.TestCase):
             authority._GitRepository(
                 alias,
                 gnupg_home=self.gnupg_home,
-                git_binary="git",
+                git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
                 gpg_program=self.gpg,
             )
 
@@ -2935,7 +3063,7 @@ class DurablePublicationTests(unittest.TestCase):
                 authority._GitRepository(
                     self.repo,
                     gnupg_home=self.gnupg_home,
-                    git_binary="git",
+                    git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
                     gpg_program=self.gpg,
                 )
         finally:
@@ -2950,7 +3078,7 @@ class DurablePublicationTests(unittest.TestCase):
                 authority._GitRepository(
                     self.repo,
                     gnupg_home=self.gnupg_home,
-                    git_binary="git",
+                    git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
                     gpg_program=self.gpg,
                 )
             with self.assertRaisesRegex(
@@ -2965,7 +3093,7 @@ class DurablePublicationTests(unittest.TestCase):
         repository = authority._GitRepository(
             self.repo,
             gnupg_home=self.gnupg_home,
-            git_binary="git",
+            git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
             gpg_program=self.gpg,
         )
         grafts = self.repo / ".git" / "info" / "grafts"
@@ -2998,7 +3126,7 @@ class DurablePublicationTests(unittest.TestCase):
                 authority._GitRepository(
                     self.repo,
                     gnupg_home=self.gnupg_home,
-                    git_binary="git",
+                    git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
                     gpg_program=self.gpg,
                 )
         finally:
@@ -3023,7 +3151,7 @@ class DurablePublicationTests(unittest.TestCase):
                 authority._GitRepository(
                     self.repo,
                     gnupg_home=self.gnupg_home,
-                    git_binary="git",
+                    git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
                     gpg_program=self.gpg,
                 )
         finally:
@@ -3046,7 +3174,7 @@ class DurablePublicationTests(unittest.TestCase):
                 authority._GitRepository(
                     self.repo,
                     gnupg_home=self.gnupg_home,
-                    git_binary="git",
+                    git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
                     gpg_program=self.gpg,
                 )
         finally:
@@ -3065,7 +3193,7 @@ class DurablePublicationTests(unittest.TestCase):
         repository = authority._GitRepository(
             self.repo,
             gnupg_home=self.gnupg_home,
-            git_binary="git",
+            git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
             gpg_program=self.gpg,
         )
         config_path = self.repo / ".git" / "config"
@@ -3088,7 +3216,7 @@ class DurablePublicationTests(unittest.TestCase):
         repository = authority._GitRepository(
             self.repo,
             gnupg_home=self.gnupg_home,
-            git_binary="git",
+            git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
             gpg_program=self.gpg,
         )
         replacement = self.root / "replacement-history"
@@ -3212,7 +3340,7 @@ class DurablePublicationTests(unittest.TestCase):
         repository = authority._GitRepository(
             self.repo,
             gnupg_home=self.gnupg_home,
-            git_binary="git",
+            git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
             gpg_program=self.gpg,
         )
 
@@ -3304,7 +3432,7 @@ class DurablePublicationTests(unittest.TestCase):
                 authority._GitRepository(
                     self.repo,
                     gnupg_home=self.gnupg_home,
-                    git_binary="git",
+                    git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
                     gpg_program=self.gpg,
                 )
             self.assertFalse(marker.exists())
@@ -3347,7 +3475,7 @@ class DurablePublicationTests(unittest.TestCase):
             repository = authority._GitRepository(
                 self.repo,
                 gnupg_home=self.gnupg_home,
-                git_binary="git",
+                git_binary=executable_authority.DEFAULT_GIT_EXECUTABLE,
                 gpg_program=self.gpg,
             )
             repository.text("rev-parse", "HEAD")

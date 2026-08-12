@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 from typing import Any
-from . import authority, git_safety
+from . import authority, executable_authority, git_safety
 from .checkpoints import canonical_json_bytes
 from .identity import IdentityKey
 
@@ -468,31 +468,38 @@ class LocalGitCommitOperations:
                 )
             environment.update(extra_env)
         try:
-            with git_safety.repository_git_invocation(
-                getattr(self, "_git_repository_admission", None),
-                self._repo,
-                self._git_binary,
-                arguments,
-                environment,
-                self._git_directory_identity,
-            ) as (command, environment, descriptors):
-                result = _run_bounded_subprocess(
-                    command,
-                    input_bytes=input_bytes,
-                    environment=environment,
-                    inherited_descriptors=descriptors,
-                    timeout_seconds=(
-                        self._subprocess_timeout_seconds
-                        if timeout_seconds is None
-                        else timeout_seconds
-                    ),
-                    max_output_bytes=(
-                        self._subprocess_output_limit_bytes
-                        if max_output_bytes is None
-                        else max_output_bytes
-                    ),
-                )
-        except git_safety.LocalRepositorySafetyError as error:
+            executable_authorities = [self._git_executable_authority]
+            if signing:
+                executable_authorities.append(self._signing_executable_authority)
+            with executable_authority.executable_invocation(*executable_authorities):
+                with git_safety.repository_git_invocation(
+                    getattr(self, "_git_repository_admission", None),
+                    self._repo,
+                    self._git_binary,
+                    arguments,
+                    environment,
+                    self._git_directory_identity,
+                ) as (command, environment, descriptors):
+                    result = _run_bounded_subprocess(
+                        command,
+                        input_bytes=input_bytes,
+                        environment=environment,
+                        inherited_descriptors=descriptors,
+                        timeout_seconds=(
+                            self._subprocess_timeout_seconds
+                            if timeout_seconds is None
+                            else timeout_seconds
+                        ),
+                        max_output_bytes=(
+                            self._subprocess_output_limit_bytes
+                            if max_output_bytes is None
+                            else max_output_bytes
+                        ),
+                    )
+        except (
+            executable_authority.ExecutableAuthorityError,
+            git_safety.LocalRepositorySafetyError,
+        ) as error:
             raise LocalGitPublicationError(str(error)) from error
         if check and result.returncode != 0:
             raise LocalGitPublicationError(

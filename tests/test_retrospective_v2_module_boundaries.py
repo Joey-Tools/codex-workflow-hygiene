@@ -291,6 +291,7 @@ ORCHESTRATOR_MODULES = (
 )
 
 PUBLICATION_MODULES = {
+    "executable_authority.py",
     "publication_contracts.py",
     "publication_git.py",
     "publication_git_capacity.py",
@@ -337,8 +338,9 @@ TRANSPORT_LINE_INVENTORY = {
 TRANSPORT_AGGREGATE_LINE_LIMIT = 7_250
 
 BOUNDED_MODULE_LINES = {
+    "executable_authority.py": 320,
     "finalize.py": 120,
-    "authority.py": 3_250,
+    "authority.py": 3_275,
     "cleanup_inventory.py": 925,
     "cleanup_sidecars.py": 300,
     "orchestrator.py": 720,
@@ -1000,7 +1002,7 @@ spec.loader.exec_module(module)
                 len((PACKAGE / name).read_text(encoding="utf-8").splitlines())
                 for name in PUBLICATION_MODULES
             ),
-            8_600,
+            8_700,
         )
         self.assertLessEqual(
             sum(
@@ -1148,8 +1150,8 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertEqual(8_438, branch_total)
-        self.assertLessEqual(branch_total, 8_450)
+        self.assertEqual(8_494, branch_total)
+        self.assertLessEqual(branch_total, 8_500)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)
 

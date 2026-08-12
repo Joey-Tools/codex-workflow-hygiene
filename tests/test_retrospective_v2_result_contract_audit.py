@@ -844,6 +844,44 @@ class AuditedResultContractTests(unittest.TestCase):
         self.assertIn("999.1.1.1", text)
         self.assertEqual(scan_for_leaks(validated), ())
 
+    def test_audit_redacts_bare_unspecified_ipv6(self) -> None:
+        for source, expected in (
+            (
+                "Inspect :: before continuing.",
+                "Inspect [REDACTED_IP_ADDRESS] before continuing.",
+            ),
+            (
+                'He wrote "Inspect ::."',
+                'He wrote "Inspect [REDACTED_IP_ADDRESS]."',
+            ),
+            (
+                "Inspect (::.)",
+                "Inspect ([REDACTED_IP_ADDRESS].)",
+            ),
+        ):
+            with self.subTest(source=source):
+                value = extractor_result()
+                value["turns"][0]["generalized_working_text"] = source
+
+                validated = validate_extractor_result(value, ALL_REFS)
+
+                self.assertEqual(
+                    expected,
+                    validated["turns"][0]["generalized_working_text"],
+                )
+                self.assertEqual(scan_for_leaks(validated), ())
+
+    def test_audit_does_not_extract_ipv6_suffix_from_syntax_tokens(self) -> None:
+        source = "Keep Python 3.13:: section and field:1:: marker unchanged."
+        self.assertEqual(scan_for_leaks({"summary": source}), ())
+
+        value = extractor_result()
+        value["turns"][0]["generalized_working_text"] = source
+        validated = validate_extractor_result(value, ALL_REFS)
+
+        self.assertEqual(source, validated["turns"][0]["generalized_working_text"])
+        self.assertEqual(scan_for_leaks(validated), ())
+
     def test_audit_redaction_fails_closed_when_secret_boundaries_are_ambiguous(
         self,
     ) -> None:

@@ -7,7 +7,7 @@ import fcntl
 import os
 from pathlib import Path
 from typing import Any
-from . import export as retained_export
+from . import executable_authority, export as retained_export
 
 from .publication_support import (
     AppendOnlyViolation,
@@ -33,7 +33,6 @@ from .publication_support import (
     _canonical_json_bytes,
     _normalize_cursor_store_hosts,
     _publication_chain_root,
-    _resolve_executable,
     _validate_cursor_state,
     _validate_destination,
     _validate_episode_heads_state,
@@ -79,7 +78,8 @@ class LocalGitPublicationAdapter(
         capacity_limit_bytes: int = DEFAULT_PUBLICATION_CAPACITY_BYTES,
         compliance_checker: Callable[[OperationRequest], bool] | None = None,
         failure_injector: FailureInjector | None = None,
-        git_binary: str | os.PathLike[str] = "git",
+        git_binary: str
+        | os.PathLike[str] = executable_authority.DEFAULT_GIT_EXECUTABLE,
         subprocess_timeout_seconds: float = DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
         subprocess_output_limit_bytes: int = MAX_SUBPROCESS_OUTPUT_BYTES,
         retained_export_lifecycle: RetainedExportLifecycle = retained_export,
@@ -93,7 +93,21 @@ class LocalGitPublicationAdapter(
         self._cursor_state_path = self._state_dir / "cursor-state.json"
         self._episode_heads_path = self._state_dir / "episode-heads.json"
         self._provider_cas_journal_path = self._state_dir / "provider-cas-v2.json"
-        self._git_binary = _resolve_executable(git_binary, label="Git")
+        try:
+            self._git_executable_authority = executable_authority.resolve_executable(
+                git_binary, label="Git"
+            )
+            self._signing_executable_authority = (
+                executable_authority.resolve_executable(
+                    signing_program or executable_authority.DEFAULT_GPG_EXECUTABLE,
+                    label="GPG",
+                )
+            )
+        except executable_authority.ExecutableAuthorityError as exc:
+            raise LocalGitPublicationError(
+                "publication executable authority is not trusted"
+            ) from exc
+        self._git_binary = self._git_executable_authority.path
         self._signing_key = None if signing_key is None else os.fspath(signing_key)
         self._signing_format = signing_format
         self._gnupg_home = None if gnupg_home is None else Path(gnupg_home).absolute()
@@ -103,9 +117,7 @@ class LocalGitPublicationAdapter(
             if allowed_signers_file is None
             else Path(allowed_signers_file).absolute()
         )
-        self._signing_program = _resolve_executable(
-            signing_program or "gpg", label="GPG"
-        )
+        self._signing_program = self._signing_executable_authority.path
         self._subprocess_timeout_seconds = float(subprocess_timeout_seconds)
         self._subprocess_output_limit_bytes = subprocess_output_limit_bytes
         self._capacity_limit_bytes = capacity_limit_bytes

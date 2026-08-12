@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import re
 import selectors
-import shutil
 import signal
 import stat
 import subprocess
@@ -25,6 +24,7 @@ from . import (
     calibration,
     controlled_gaps,
     episode_review,
+    executable_authority,
     git_safety,
     history_graph,
     reporting,
@@ -648,17 +648,6 @@ def validate_durable_state_transition(
         raise HistoryValidationError(str(exc)) from exc
 
 
-def _resolve_executable(value: str) -> str:
-    resolved = shutil.which(value, path=os.environ.get("PATH", os.defpath))
-    if resolved is None:
-        raise HistoryValidationError(f"required executable is unavailable: {value}")
-    path = Path(os.path.realpath(resolved))
-    metadata = path.stat()
-    if not stat.S_ISREG(metadata.st_mode) or not os.access(path, os.X_OK):
-        raise HistoryValidationError(f"required executable is not runnable: {value}")
-    return str(path)
-
-
 def _run_bounded(
     argv: Sequence[str],
     *,
@@ -788,11 +777,22 @@ class _GitRepository:
         *,
         gnupg_home: Path,
         git_binary: str,
-        gpg_program: str = "gpg",
+        gpg_program: str = executable_authority.DEFAULT_GPG_EXECUTABLE,
     ) -> None:
         self.path = path.absolute()
-        self.git = _resolve_executable(git_binary)
-        self.gpg = _resolve_executable(gpg_program)
+        try:
+            self._git_executable_authority = executable_authority.resolve_executable(
+                git_binary, label="Git"
+            )
+            self._gpg_executable_authority = executable_authority.resolve_executable(
+                gpg_program, label="GPG"
+            )
+        except executable_authority.ExecutableAuthorityError as exc:
+            raise HistoryValidationError(
+                "history executable authority is not trusted"
+            ) from exc
+        self.git = self._git_executable_authority.path
+        self.gpg = self._gpg_executable_authority.path
         self.gnupg_home = gnupg_home.expanduser().absolute()
         self.env = git_safety.history_git_environment(
             home=str(Path.home()), gnupg_home=str(self.gnupg_home)
@@ -825,21 +825,30 @@ class _GitRepository:
             f"gpg.openpgp.program={self.gpg}",
             *args,
         )
-        with git_safety.history_repository_git_invocation(
-            getattr(self, "_repository_admission", None),
-            self.path,
-            self.git,
-            arguments,
-            self.env,
-            safe_io.owner_controlled_directory_identity,
-        ) as (command, environment, descriptors):
-            result = _run_bounded(
-                command,
-                env=environment,
-                pass_fds=descriptors,
-                input_bytes=input_bytes,
-                max_output_bytes=max_output_bytes,
-            )
+        executable_authorities = [self._git_executable_authority]
+        if args and args[0] in {"verify-commit", "verify-tag"}:
+            executable_authorities.append(self._gpg_executable_authority)
+        try:
+            with executable_authority.executable_invocation(*executable_authorities):
+                with git_safety.history_repository_git_invocation(
+                    getattr(self, "_repository_admission", None),
+                    self.path,
+                    self.git,
+                    arguments,
+                    self.env,
+                    safe_io.owner_controlled_directory_identity,
+                ) as (command, environment, descriptors):
+                    result = _run_bounded(
+                        command,
+                        env=environment,
+                        pass_fds=descriptors,
+                        input_bytes=input_bytes,
+                        max_output_bytes=max_output_bytes,
+                    )
+        except executable_authority.ExecutableAuthorityError as exc:
+            raise HistoryValidationError(
+                "history executable authority changed after validation"
+            ) from exc
         if check and result.returncode != 0:
             raise HistoryValidationError("history Git command failed")
         return result
@@ -1039,8 +1048,8 @@ def load_durable_publication_commitment(
     identity: IdentityKey,
     expected_fingerprint: str = DEFAULT_PUBLISHER_FINGERPRINT,
     gnupg_home: str | os.PathLike[str] = DEFAULT_PUBLISHER_GNUPG_HOME,
-    git_binary: str = "git",
-    gpg_program: str = "gpg",
+    git_binary: str = executable_authority.DEFAULT_GIT_EXECUTABLE,
+    gpg_program: str = executable_authority.DEFAULT_GPG_EXECUTABLE,
 ) -> dict[str, Any]:
     """Load the exact signed attempt, plan, parent, bundle, and durable manifest."""
 
@@ -1070,8 +1079,8 @@ def load_durable_history(
     identity: IdentityKey,
     expected_fingerprint: str = DEFAULT_PUBLISHER_FINGERPRINT,
     gnupg_home: str | os.PathLike[str] = DEFAULT_PUBLISHER_GNUPG_HOME,
-    git_binary: str = "git",
-    gpg_program: str = "gpg",
+    git_binary: str = executable_authority.DEFAULT_GIT_EXECUTABLE,
+    gpg_program: str = executable_authority.DEFAULT_GPG_EXECUTABLE,
 ) -> DurableHistoryState:
     """Validate every publication state transition reachable from ``target_ref``."""
 
@@ -1166,8 +1175,8 @@ def load_prior_period_from_history(
     identity: IdentityKey,
     expected_fingerprint: str = DEFAULT_PUBLISHER_FINGERPRINT,
     gnupg_home: str | os.PathLike[str] = DEFAULT_PUBLISHER_GNUPG_HOME,
-    git_binary: str = "git",
-    gpg_program: str = "gpg",
+    git_binary: str = executable_authority.DEFAULT_GIT_EXECUTABLE,
+    gpg_program: str = executable_authority.DEFAULT_GPG_EXECUTABLE,
 ) -> dict[str, Any]:
     """Load the latest trend from the fully verified signed history chain."""
 
@@ -1218,7 +1227,7 @@ def history_repository_binding(
     target_ref: str,
     *,
     identity: IdentityKey,
-    git_binary: str = "git",
+    git_binary: str = executable_authority.DEFAULT_GIT_EXECUTABLE,
 ) -> str:
     repo = _GitRepository(
         Path(repo_path),

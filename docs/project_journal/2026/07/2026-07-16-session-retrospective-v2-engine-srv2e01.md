@@ -273,6 +273,29 @@ superseded_by:
 - Publication artifact reads protect descriptor identity, owner/mode/link/ACL
   policy, and the expected digest before and after reading. Timestamp-only changes
   trigger the proof but are not mutation evidence.
+- Formal publication and durable-history commands no longer treat `PATH`
+  resolution plus a regular/executable bit as executable authority. The shared
+  `executable_authority.py` layer resolves once, descriptor-walks the complete
+  physical path, rejects group/world-writable ancestry and allow ACLs, and binds
+  each ancestor's identity/access policy plus the executable's identity, exact
+  size, and double-read SHA-256. Git is revalidated before and after every
+  command; GPG is additionally revalidated for keyring inspection, signing, and
+  signature verification. Timestamp-only changes and deny-only ACLs remain
+  benign, while path replacement, same-inode content mutation, and access-policy
+  drift fail closed. This is point-in-time authority and does not claim to defeat
+  a non-cooperating same-UID ABA between final revalidation and kernel exec.
+- `/opt/homebrew/bin` and its Cellar ancestry are group-writable on the delivery
+  host, so ambient Homebrew Git/GPG selection is intentionally not admitted by
+  the new policy. The production default Git trust root is the fixed
+  `/usr/bin/git`; publication callers must supply a GPG executable under a
+  separately owner-controlled or root-controlled path. Tests copy the exact GPG
+  binary into an owner-only tool directory while allowing that binary to invoke
+  its fixed runtime helpers; this exercises the executable boundary without
+  asserting authority over GnuPG's separate helper or dynamic-library closure.
+- The shared IPv6 candidate policy now recognizes the valid unspecified address
+  `::` without weakening final `ipaddress` parsing. Regression coverage proves
+  deterministic working-zone redaction and rejection at retained assembly,
+  digest-preserving artifact reread, and final `report.md` validation.
 - Export GC uses a descriptor-anchored iterative walk with global entry, depth,
   path-byte, deadline, and result-sample budgets. Schema-v3 receipts retain full
   counts and typed incomplete reasons without unbounded path arrays.
@@ -1451,3 +1474,46 @@ superseded_by:
   transactions. The implementation, test, and architecture patch digest,
   excluding this evidence-only journal, is unchanged before and after the run
   at `3df4612fba15c2b3a901edec9f4c1c689d5a796e4dc329e91c872fba2bc4e123`.
+- Fresh local Codex review of signed head `e659981` returned two actionable
+  findings. The first identified the unbound Git/GPG executable path described
+  above; the second identified the bare `::` IPv6 redaction gap. That head's
+  admission, hosted CI, and review evidence are superseded by this fix. The
+  affected result/export/module/orchestrator suite passes 94/94 in 5.664
+  seconds. Publication invariants and every durable signed-publication path pass
+  81/81 in 2,087.093 seconds under the authorized host `/private/tmp` GPG
+  fixture; the independently repeated real history-signature selector passes in
+  42.587 seconds. The complete Python 3.13 discovery and new frozen-head review
+  remain required before publication.
+- The superseding finding-fix tree passes the complete host-level Python 3.13
+  discovery, 1,704/1,704 in 2,735.635 seconds with `TMPDIR=/private/tmp` and no
+  skips. The tracked implementation, test, and architecture diff digest,
+  excluding this evidence-only journal and the separately measured new module,
+  is unchanged before and after the run at
+  `3ff4ad0822a3c671a186a981aa91d8a735fc8d21aac06e925f318573225d06c3`.
+  The exact `executable_authority.py` bytes have SHA-256
+  `27ee1e0ec0c2dafe3e2f2aad2f53ae74220bf0ca11f25f5762a633b66f20ff82`.
+  Signed-head admission and the new exact-head review remain pending.
+- A bounded precommit pass found that the publisher sign/verify canary still
+  executed its configured GPG path outside the shared executable authority.
+  The canary now binds the same executable receipt and revalidates it before and
+  after both signing and verification; a sign-time content mutation regression
+  proves the canary fails closed. The IPv6 audit also found a closing-punctuation
+  false negative and syntax-token suffix false positives after the initial `::`
+  fix. Bare candidates now require a complete left token boundary, while a
+  terminal period may precede ordinary closing punctuation. Extraction,
+  assembly, retained reread, and report reread cover the quoted form; Python
+  version and field-label syntax remain unchanged. The final affected suite
+  passes 206/206 in 187.185 seconds. A separate executable auxiliary audit did
+  not return a terminal artifact after its bounded stop request and is
+  non-counting; the required frozen-head Codex processor remains pending. The
+  current tracked implementation/test/architecture diff digest, excluding this
+  journal and the separately measured new module, is
+  `3c4ecea82d0db7f9f4079267c494fd1aaffaf409441c86198a471992f1b8ab09`;
+  the new module digest remains
+  `27ee1e0ec0c2dafe3e2f2aad2f53ae74220bf0ca11f25f5762a633b66f20ff82`.
+  The final host-level Python 3.13 discovery passes 1,706/1,706 in
+  2,678.760 seconds with `TMPDIR=/private/tmp`; its independent 4,200-second
+  hard deadline did not trigger. Ruff lint/format, actionlint, isolated skill
+  validation, project-journal validation, and `git diff --check` also pass on
+  this exact tree. Signed-head admission and the required frozen-head review
+  remain pending.

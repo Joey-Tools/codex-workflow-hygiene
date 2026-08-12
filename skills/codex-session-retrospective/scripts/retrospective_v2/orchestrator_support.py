@@ -13,6 +13,7 @@ import time
 from typing import Any, Mapping, Sequence
 
 from . import (
+    executable_authority,
     finalize,
     result_validation,
     safe_io,
@@ -298,7 +299,7 @@ def publisher_readiness(
     gnupg_home: str | os.PathLike[str] = PUBLISHER_GNUPG_HOME,
     fingerprint: str = PUBLISHER_FINGERPRINT,
     expected_uid: str = PUBLISHER_UID,
-    gpg_program: str | os.PathLike[str] = "gpg",
+    gpg_program: str | os.PathLike[str] = executable_authority.DEFAULT_GPG_EXECUTABLE,
 ) -> dict[str, Any]:
     """Inspect only the dedicated publication keyring and return safe metadata."""
 
@@ -443,7 +444,7 @@ def publisher_sign_verify_canary(
     *,
     gnupg_home: str | os.PathLike[str] = PUBLISHER_GNUPG_HOME,
     fingerprint: str = PUBLISHER_FINGERPRINT,
-    gpg_program: str | os.PathLike[str] = "gpg",
+    gpg_program: str | os.PathLike[str] = executable_authority.DEFAULT_GPG_EXECUTABLE,
 ) -> bool:
     """Sign and verify one temporary payload with only the dedicated keyring."""
 
@@ -454,6 +455,10 @@ def publisher_sign_verify_canary(
     environment["GNUPGHOME"] = str(home)
     environment["LC_ALL"] = "C"
     try:
+        gpg_authority = executable_authority.resolve_executable(
+            gpg_program,
+            label="GPG",
+        )
         with tempfile.TemporaryDirectory(
             prefix="retrospective-publisher-canary-"
         ) as raw:
@@ -464,39 +469,45 @@ def publisher_sign_verify_canary(
             safe_io.atomic_create_bytes(
                 payload, b"session-retrospective-publisher-canary-v2\n"
             )
-            signed = _run_bounded_publisher_canary_process(
-                [
-                    os.fspath(gpg_program),
-                    "--homedir",
-                    str(home),
-                    "--batch",
-                    "--yes",
-                    "--local-user",
-                    fingerprint,
-                    "--detach-sign",
-                    "--output",
-                    str(signature),
-                    str(payload),
-                ],
-                environment=environment,
-            )
+            with executable_authority.executable_invocation(gpg_authority):
+                signed = _run_bounded_publisher_canary_process(
+                    [
+                        gpg_authority.path,
+                        "--homedir",
+                        str(home),
+                        "--batch",
+                        "--yes",
+                        "--local-user",
+                        fingerprint,
+                        "--detach-sign",
+                        "--output",
+                        str(signature),
+                        str(payload),
+                    ],
+                    environment=environment,
+                )
             if signed.returncode != 0 or not signature.is_file():
                 return False
-            verified = _run_bounded_publisher_canary_process(
-                [
-                    os.fspath(gpg_program),
-                    "--homedir",
-                    str(home),
-                    "--batch",
-                    "--status-fd",
-                    "1",
-                    "--verify",
-                    str(signature),
-                    str(payload),
-                ],
-                environment=environment,
-            )
-    except (OSError, _PublisherCanaryProcessError):
+            with executable_authority.executable_invocation(gpg_authority):
+                verified = _run_bounded_publisher_canary_process(
+                    [
+                        gpg_authority.path,
+                        "--homedir",
+                        str(home),
+                        "--batch",
+                        "--status-fd",
+                        "1",
+                        "--verify",
+                        str(signature),
+                        str(payload),
+                    ],
+                    environment=environment,
+                )
+    except (
+        OSError,
+        _PublisherCanaryProcessError,
+        executable_authority.ExecutableAuthorityError,
+    ):
         return False
     if verified.returncode != 0:
         return False

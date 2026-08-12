@@ -141,6 +141,12 @@ class _DarwinAclApi:
             self.acl_free = libc.acl_free
             self.acl_free.argtypes = (ctypes.c_void_p,)
             self.acl_free.restype = ctypes.c_int
+            self.acl_to_text = libc.acl_to_text
+            self.acl_to_text.argtypes = (
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_ssize_t),
+            )
+            self.acl_to_text.restype = ctypes.c_void_p
             self.filesec_init = libc.filesec_init
             self.filesec_init.argtypes = ()
             self.filesec_init.restype = ctypes.c_void_p
@@ -192,6 +198,52 @@ def _darwin_descriptor_has_extended_acl(descriptor: int) -> bool:
             f"errno={ctypes.get_errno()}"
         )
     return True
+
+
+def descriptor_has_extended_acl(descriptor: int) -> bool:
+    """Return whether a bound object has a Darwin extended ACL."""
+
+    return _darwin_descriptor_has_extended_acl(descriptor)
+
+
+def descriptor_acl_policy_bytes(descriptor: int) -> bytes:
+    """Return bounded canonical Darwin ACL text for one bound object."""
+
+    api = _darwin_acl_api()
+    if api is None:
+        return b""
+    ctypes.set_errno(0)
+    acl = api.acl_get_fd_np(descriptor, _DARWIN_ACL_TYPE_EXTENDED)
+    if not acl:
+        error_number = ctypes.get_errno()
+        if error_number == errno.ENOENT:
+            return b""
+        raise UnsafePathError(
+            f"could not inspect a bound object's Darwin ACL: errno={error_number}"
+        )
+    text_pointer: int | None = None
+    try:
+        length = ctypes.c_ssize_t()
+        ctypes.set_errno(0)
+        text_pointer = api.acl_to_text(acl, ctypes.byref(length))
+        if not text_pointer or length.value < 0 or length.value > 64 * 1024:
+            raise UnsafePathError(
+                "could not serialize a bound object's Darwin ACL: "
+                f"errno={ctypes.get_errno()}"
+            )
+        return bytes(ctypes.string_at(text_pointer, length.value))
+    finally:
+        cleanup_failures: list[str] = []
+        if text_pointer and api.acl_free(text_pointer) != 0:
+            cleanup_failures.append("serialized policy")
+        if api.acl_free(acl) != 0:
+            cleanup_failures.append("inspection object")
+        if cleanup_failures:
+            message = "could not release Darwin ACL " + " and ".join(cleanup_failures)
+            if (active_error := sys.exception()) is not None:
+                active_error.add_note(message)
+            else:
+                raise UnsafePathError(message)
 
 
 def _validate_owner_only_acl(descriptor: int, display_path: Path) -> None:

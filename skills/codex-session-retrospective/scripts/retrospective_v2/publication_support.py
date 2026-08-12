@@ -7,7 +7,6 @@ import hmac
 import os
 import re
 import selectors
-import shutil
 import signal
 import stat
 import subprocess
@@ -19,7 +18,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from . import authority, reporting, safe_io
+from . import authority, executable_authority, reporting, safe_io
 from .checkpoints import AtomicCheckpointStore, canonical_json_bytes
 from .contracts import CANONICAL_HOSTS
 from .identity import IdentityKey
@@ -157,25 +156,6 @@ _DESCRIPTOR_CWD_EXEC_SOURCE = (
     "os.fchdir(descriptor)\n"
     "os.execve(sys.argv[2],sys.argv[2:],os.environ)\n"
 )
-
-
-def _resolve_executable(
-    value: str | os.PathLike[str],
-    *,
-    label: str,
-) -> str:
-    candidate = os.fspath(value)
-    resolved = shutil.which(candidate, path=os.environ.get("PATH", os.defpath))
-    if resolved is None:
-        raise LocalGitPublicationError(f"{label} executable is unavailable")
-    path = Path(os.path.realpath(resolved))
-    try:
-        metadata = path.stat()
-    except OSError as exc:
-        raise LocalGitPublicationError(f"cannot inspect {label} executable") from exc
-    if not stat.S_ISREG(metadata.st_mode) or not os.access(path, os.X_OK):
-        raise LocalGitPublicationError(f"{label} executable is not runnable")
-    return str(path)
 
 
 def _strict_subprocess_environment(*, home: Path) -> dict[str, str]:
@@ -450,27 +430,33 @@ def _run_publisher_listing(
     *,
     argument: str,
     descriptor: int,
-    gpg_executable: str,
+    gpg_authority: executable_authority.ExecutableAuthority,
     home: Path,
     subprocess_home: Path,
     timeout_seconds: float,
 ) -> bytes:
     environment = _strict_subprocess_environment(home=subprocess_home)
     environment["GNUPGHOME"] = str(subprocess_home)
-    result = _run_bounded_subprocess(
-        [
-            gpg_executable,
-            "--homedir",
-            str(subprocess_home),
-            "--batch",
-            "--with-colons",
-            argument,
-        ],
-        environment=environment,
-        cwd_descriptor=descriptor,
-        timeout_seconds=timeout_seconds,
-        max_output_bytes=MAX_RECEIPT_BYTES,
-    )
+    try:
+        with executable_authority.executable_invocation(gpg_authority):
+            result = _run_bounded_subprocess(
+                [
+                    gpg_authority.path,
+                    "--homedir",
+                    str(subprocess_home),
+                    "--batch",
+                    "--with-colons",
+                    argument,
+                ],
+                environment=environment,
+                cwd_descriptor=descriptor,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=MAX_RECEIPT_BYTES,
+            )
+    except executable_authority.ExecutableAuthorityError as exc:
+        raise LocalGitPublicationError(
+            "GPG executable authority changed after validation"
+        ) from exc
     _revalidate_publisher_home_binding(descriptor, home, os.fstat(descriptor))
     if result.returncode != 0:
         raise LocalGitPublicationError(
@@ -484,7 +470,7 @@ def validate_publisher_keyring(
     gnupg_home: str | os.PathLike[str] = DEFAULT_PUBLISHER_GNUPG_HOME,
     fingerprint: str = DEFAULT_PUBLISHER_FINGERPRINT,
     expected_uid: str = DEFAULT_PUBLISHER_UID,
-    gpg_program: str | os.PathLike[str] = "gpg",
+    gpg_program: str | os.PathLike[str] = executable_authority.DEFAULT_GPG_EXECUTABLE,
     timeout_seconds: float = 10.0,
 ) -> dict[str, str]:
     """Validate only the dedicated owner-only OpenPGP publisher keyring."""
@@ -498,7 +484,12 @@ def validate_publisher_keyring(
         raise LocalGitPublicationError(
             "publisher UID has an invalid canonical name/email shape"
         )
-    gpg_executable = _resolve_executable(gpg_program, label="GPG")
+    try:
+        gpg_authority = executable_authority.resolve_executable(
+            gpg_program, label="GPG"
+        )
+    except executable_authority.ExecutableAuthorityError as exc:
+        raise LocalGitPublicationError("GPG executable is not trusted") from exc
 
     def inventory(
         payload: bytes,
@@ -536,7 +527,7 @@ def validate_publisher_keyring(
         secret_payload = _run_publisher_listing(
             argument="--list-secret-keys",
             descriptor=home_descriptor,
-            gpg_executable=gpg_executable,
+            gpg_authority=gpg_authority,
             home=home,
             subprocess_home=subprocess_home,
             timeout_seconds=timeout_seconds,
@@ -556,7 +547,7 @@ def validate_publisher_keyring(
         public_payload = _run_publisher_listing(
             argument="--list-keys",
             descriptor=home_descriptor,
-            gpg_executable=gpg_executable,
+            gpg_authority=gpg_authority,
             home=home,
             subprocess_home=subprocess_home,
             timeout_seconds=timeout_seconds,

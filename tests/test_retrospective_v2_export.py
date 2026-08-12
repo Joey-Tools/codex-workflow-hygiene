@@ -1227,36 +1227,61 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
             "10.0.0.1",
             "203.0.113.7",
             "2001:db8::1",
+            "::",
         ):
-            with self.subTest(network_locator=network_locator, phase="assembly"):
-                network_review = review_data()
-                network_review["turn_findings"][1]["rewritten_prompt"] = (
-                    f"Inspect {network_locator} before continuing."
-                )
-                with self.assertRaisesRegex(RetainedPrivacyError, "IP address"):
-                    assemble_retained_artifacts(run_state(), network_review)
+            contexts = [f"Inspect {network_locator} before continuing."]
+            if network_locator == "::":
+                contexts.append('He wrote "Inspect ::."')
+            for context in contexts:
+                with self.subTest(
+                    network_locator=network_locator,
+                    context=context,
+                    phase="assembly",
+                ):
+                    network_review = review_data()
+                    network_review["turn_findings"][1]["rewritten_prompt"] = context
+                    with self.assertRaisesRegex(RetainedPrivacyError, "IP address"):
+                        assemble_retained_artifacts(run_state(), network_review)
 
-            with self.subTest(network_locator=network_locator, phase="reread"):
-                network_artifacts = assemble_retained_artifacts(
-                    run_state(), review_data()
-                )
-                network_tampered = dict(network_artifacts)
-                network_rows = [
-                    json.loads(line)
-                    for line in network_tampered["turn_findings.jsonl"].splitlines()
-                ]
-                network_high_impact = next(
-                    row for row in network_rows if row["disposition"] == "high_impact"
-                )
-                network_high_impact["rewritten_prompt"] = (
-                    f"Inspect {network_locator} before continuing."
-                )
-                network_tampered["turn_findings.jsonl"] = b"".join(
-                    canonical_json_bytes(row) for row in network_rows
-                )
-                refresh_bundle_digest(network_tampered)
-                with self.assertRaisesRegex(RetainedPrivacyError, "IP address"):
-                    validate_retained_artifacts(network_tampered)
+                with self.subTest(
+                    network_locator=network_locator,
+                    context=context,
+                    phase="reread",
+                ):
+                    network_artifacts = assemble_retained_artifacts(
+                        run_state(), review_data()
+                    )
+                    network_tampered = dict(network_artifacts)
+                    network_rows = [
+                        json.loads(line)
+                        for line in network_tampered["turn_findings.jsonl"].splitlines()
+                    ]
+                    network_high_impact = next(
+                        row
+                        for row in network_rows
+                        if row["disposition"] == "high_impact"
+                    )
+                    network_high_impact["rewritten_prompt"] = context
+                    network_tampered["turn_findings.jsonl"] = b"".join(
+                        canonical_json_bytes(row) for row in network_rows
+                    )
+                    refresh_bundle_digest(network_tampered)
+                    with self.assertRaisesRegex(RetainedPrivacyError, "IP address"):
+                        validate_retained_artifacts(network_tampered)
+
+        syntax_review = review_data()
+        syntax_text = "Keep Python 3.13:: section and field:1:: marker unchanged."
+        syntax_review["turn_findings"][1]["rewritten_prompt"] = syntax_text
+        syntax_artifacts = assemble_retained_artifacts(run_state(), syntax_review)
+        syntax_rows = [
+            json.loads(line)
+            for line in syntax_artifacts["turn_findings.jsonl"].splitlines()
+        ]
+        syntax_high_impact = next(
+            row for row in syntax_rows if row["disposition"] == "high_impact"
+        )
+        self.assertEqual(syntax_text, syntax_high_impact["rewritten_prompt"])
+        validate_retained_artifacts(syntax_artifacts)
 
         artifacts = assemble_retained_artifacts(run_state(), review_data())
         tampered = dict(artifacts)
@@ -1312,12 +1337,24 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RetainedPrivacyError, "local path"):
                     validate_retained_artifacts(tampered)
 
-        report_artifacts = assemble_retained_artifacts(run_state(), review_data())
-        report_tampered = dict(report_artifacts)
-        report_tampered["report.md"] += b"\nInspect 203.0.113.7.\n"
-        refresh_bundle_digest(report_tampered)
-        with self.assertRaisesRegex(RetainedPrivacyError, "forbidden locator"):
-            validate_retained_artifacts(report_tampered)
+        for network_locator, report_line in (
+            ("203.0.113.7", "Inspect 203.0.113.7."),
+            ("::", "Inspect ::."),
+            ("::", 'He wrote "Inspect ::."'),
+        ):
+            with self.subTest(
+                network_locator=network_locator,
+                report_line=report_line,
+                phase="report",
+            ):
+                report_artifacts = assemble_retained_artifacts(
+                    run_state(), review_data()
+                )
+                report_tampered = dict(report_artifacts)
+                report_tampered["report.md"] += f"\n{report_line}\n".encode("ascii")
+                refresh_bundle_digest(report_tampered)
+                with self.assertRaisesRegex(RetainedPrivacyError, "forbidden locator"):
+                    validate_retained_artifacts(report_tampered)
 
     def test_non_http_uri_schemes_are_rejected_before_and_after_assembly(self) -> None:
         for uri in (
