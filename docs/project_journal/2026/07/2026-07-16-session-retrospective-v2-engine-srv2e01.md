@@ -1347,3 +1347,21 @@ superseded_by:
   unchanged tree. This combined local evidence covers every discovered test;
   a fresh exact-head hosted CI run remains required to verify the pinned 3.13
   toolcache and the complete suite in one clean environment.
+- Signed head `b94f818` retained the clean admission and pinned Python 3.13,
+  but exact CI run `31561469670`, job `94004485113`, still failed closed. The
+  workflow selected CPython 3.13.14 as intended; its hosted toolcache
+  executable did not satisfy the source transport's existing owner/mode access
+  policy, producing 206 cascading errors before model or transport execution.
+  The head's fresh reviewer remained running without a terminal artifact when
+  CI failed, so it was closed and is explicitly stale and non-counting.
+- The workflow now creates one runner-private Python 3.13 virtual environment
+  with `venv --copies`, fixes the copied `bin/python3` to mode `0755`, and
+  verifies that exact runtime is a real, current-UID-owned, single-link regular
+  file without group/world write before using it for the full suite. The test
+  harness uses `-B -S` so repository test-module imports remain available;
+  source-transport children retain their stricter `-I -B -S` contract. No
+  production interpreter policy was relaxed. Under a local copied-runtime
+  fixture, the CI contract passes 2/2 and source transport passes 72/72 in
+  30.923 seconds. `actionlint`, Ruff lint/format, and `git diff --check` pass.
+  The workflow-and-contract patch digest, excluding this journal, is
+  `f0cb0b69c8c2ddf52ff583ca9175ab2d1f29e3c4b35a0da7f1c31827548eff32`.
