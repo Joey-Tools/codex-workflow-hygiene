@@ -26,13 +26,14 @@ except (ImportError, ModuleNotFoundError):
 _SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP_SOURCE = "\n".join(
     (
         "import base64,hashlib,importlib.abc,importlib.util,json,os,stat,sys,zlib",
+        "if not sys.flags.isolated or not sys.flags.no_site or not sys.flags.dont_write_bytecode: raise SystemExit('source transport Python isolation failed')",
         "identity=lambda meta:(meta.st_dev,meta.st_ino,meta.st_uid,meta.st_gid,meta.st_mode,meta.st_nlink,meta.st_size)",
         "def _read(path,limit,p,label):\n flags=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK\n fd=os.open(path,flags)\n try:\n  before=os.fstat(fd); named_before=os.stat(path,follow_symlinks=False); mode=stat.S_IMODE(before.st_mode)\n  policy=stat.S_ISREG(before.st_mode) and before.st_nlink==1 and before.st_uid in (0,os.geteuid()) and not mode&0o022\n  if p: policy=policy and before.st_uid==os.geteuid() and mode==0o600\n  if not policy or identity(named_before)!=identity(before): raise SystemExit(label+' authentication failed')\n  remaining=limit+1; chunks=[]\n  while remaining:\n   chunk=os.read(fd,min(65536,remaining))\n   if not chunk: break\n   chunks.append(chunk); remaining-=len(chunk)\n  data=b''.join(chunks); after=os.fstat(fd); named_after=os.stat(path,follow_symlinks=False)\n  if identity(after)!=identity(before) or identity(named_after)!=identity(before) or len(data)!=after.st_size or len(data)>limit: raise SystemExit(label+' authentication failed')\n  return data\n finally:\n  os.close(fd)",
         "marker,digest,snapshot_path=sys.argv[1:4]\npayload=_read(snapshot_path,4194304,True,'source transport snapshot')",
         "if marker!='source_transport_worker_snapshot_v1' or 'sha256:'+hashlib.sha256(payload).hexdigest()!=digest: raise SystemExit('source transport snapshot authentication failed')",
         "snapshot=json.loads(zlib.decompress(payload))\nruntime=snapshot['python_runtime']",
         "path=os.path.realpath(sys.executable)\nexecutable=_read(path,67108864,False,'source transport Python authority')",
-        "component={'content_commitment':'sha256:'+hashlib.sha256(executable).hexdigest(),'path':path,'role':'python_interpreter','state':'present'}\nactual={'component':component,'executable':sys.executable,'implementation':sys.implementation.name,'schema':'source_transport_python_runtime_v1','version':list(sys.version_info)}",
+        "component={'content_commitment':'sha256:'+hashlib.sha256(executable).hexdigest(),'path':path,'role':'python_interpreter','state':'present'}\nactual={'component':component,'executable':path,'implementation':sys.implementation.name,'schema':'source_transport_python_runtime_v1','version':list(sys.version_info)}",
         "if actual!=runtime: raise SystemExit('source transport Python authority changed')",
         "sources={name.removesuffix('.py'):base64.b64decode(content,validate=True) for name,content in snapshot['modules'].items()}\npaths={name.removesuffix('.py'):snapshot['package_dir']+'/'+name for name in snapshot['modules']}",
         "class _Loader(importlib.abc.Loader):\n def __init__(self,name): self.name=name\n def create_module(self,spec): return None\n def exec_module(self,module): module.__file__=paths[self.name]; exec(compile(sources[self.name],paths[self.name],'exec'),module.__dict__)",
@@ -42,17 +43,18 @@ _SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP_SOURCE = "\n".join(
     )
 )
 _SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP_B64 = base64.b64encode(
-    _SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP_SOURCE.encode("utf-8")
+    zlib.compress(_SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP_SOURCE.encode("utf-8"), level=9)
 ).decode("ascii")
 SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP = (
-    "import base64;exec(compile(base64.b64decode("
+    "import base64,zlib;exec(compile(zlib.decompress(base64.b64decode("
     + repr(_SOURCE_TRANSPORT_SNAPSHOT_BOOTSTRAP_B64)
-    + "),'<source-transport-snapshot>','exec'))"
+    + ")),'<source-transport-snapshot>','exec'))"
 )
 
 _REMOTE_HELPER_BOOTSTRAP_SOURCE = "\n".join(
     (
         "import hashlib,os,stat,sys",
+        "if not sys.flags.isolated or not sys.flags.no_site or not sys.flags.dont_write_bytecode: raise SystemExit('remote helper Python isolation failed')",
         "schema,digest,path=sys.argv[1:4]",
         "flags=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK\nfd=os.open(path,flags)",
         "try:\n before=os.fstat(fd); named_before=os.stat(path,follow_symlinks=False)\n remaining=4194305\n chunks=[]\n while remaining:\n  chunk=os.read(fd,min(65536,remaining))\n  if not chunk: break\n  chunks.append(chunk); remaining-=len(chunk)\n data=b''.join(chunks)\n after=os.fstat(fd); named_after=os.stat(path,follow_symlinks=False)\nfinally:\n os.close(fd)",
@@ -63,13 +65,13 @@ _REMOTE_HELPER_BOOTSTRAP_SOURCE = "\n".join(
     )
 )
 REMOTE_HOST_CONTEXT_SNAPSHOT_BOOTSTRAP = (
-    "import base64;exec(compile(base64.b64decode("
+    "import base64,zlib;exec(compile(zlib.decompress(base64.b64decode("
     + repr(
-        base64.b64encode(_REMOTE_HELPER_BOOTSTRAP_SOURCE.encode("utf-8")).decode(
-            "ascii"
-        )
+        base64.b64encode(
+            zlib.compress(_REMOTE_HELPER_BOOTSTRAP_SOURCE.encode("utf-8"), level=9)
+        ).decode("ascii")
     )
-    + "),'<remote-helper-snapshot>','exec'))"
+    + ")),'<remote-helper-snapshot>','exec'))"
 )
 REMOTE_HOST_CONTEXT_SNAPSHOT_SCHEMA = "remote_host_context_helper_snapshot_v1"
 

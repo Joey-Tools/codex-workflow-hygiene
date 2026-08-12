@@ -580,15 +580,23 @@ def open_owner_only_directory(
     return normalized, descriptor
 
 
-def owner_controlled_directory_identity(
+def open_owner_controlled_directory(
     path: str | os.PathLike[str],
-) -> tuple[int, int, int, int]:
+) -> tuple[Path, int]:
+    normalized = _normalized_path(path)
     descriptor = _open_directory_chain(
-        _normalized_path(path),
+        normalized,
         exact_mode=False,
         create=False,
         reject_symlink_ancestors=True,
     )
+    return normalized, descriptor
+
+
+def owner_controlled_directory_identity(
+    path: str | os.PathLike[str],
+) -> tuple[int, int, int, int]:
+    _normalized, descriptor = open_owner_controlled_directory(path)
     try:
         metadata = os.fstat(descriptor)
         return metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid

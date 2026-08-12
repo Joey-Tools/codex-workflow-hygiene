@@ -3,7 +3,7 @@ id: 20260716-srv2e01
 title: Session Retrospective v2 Engine
 status: completed
 created: 2026-07-16
-updated: 2026-08-11
+updated: 2026-08-12
 branch: codex/session-retrospective-v2-engine-linear
 pr: 67
 supersedes: []
@@ -1281,3 +1281,41 @@ superseded_by:
   The binary patch digest over the 10 implementation, test, and architecture
   files, excluding this evidence-only journal append, is
   `77f575db56359959c696fee0f6f6d63b495e6a7a631a4c7bd9a14cfe07e8b9e1`.
+- A fresh named-single review of signed head `9c7ad35` found three remaining
+  control-plane gaps. Source-program and remote-helper Python could load global
+  site initialization before authenticated bootstrap. History and publication
+  Git commands revalidated repository paths but launched against mutable
+  absolute paths. Local completeness probes also ignored include directives,
+  worktree config, and `extensions.worktreeConfig`.
+- Both transport bootstraps now require `-I -B -S`, assert the corresponding
+  runtime flags in captured source, and use compressed bounded argv payloads.
+  History and publication share one repository command binding that holds the
+  worktree, Git, common, and object-store descriptors, launches Git from the held
+  worktree with relative discovery, and revalidates every directory plus the
+  exact owner-controlled common-config digest before and after the child. It
+  rejects include/worktree configuration and preserves primary exceptions when
+  descriptor close reports secondary failure. These point-in-time checks do not
+  claim to defeat an actively malicious same-UID ABA after the final pre-launch
+  validation.
+- The reviewer-focused transport tests pass 4/4; publication repository/config
+  tests pass 6/6 under the authorized host `/private/tmp` GPG fixture; descriptor
+  close precedence passes 2/2; and module boundaries pass 18/18. The exact
+  transport inventory is now 7,249/7,250 lines, and the added isolation and
+  repository-custody predicates move the branch proxy to 8,431 under a narrowly
+  raised 8,450 ceiling. Full source-transport, publication, discovery, admission,
+  and frozen-head review evidence follows after the implementation is frozen.
+- The frozen source-transport suite passes 72/72 in 25.946 seconds. The complete
+  publication invariant plus durable-publication suite passes 76/76 in
+  2,039.691 seconds under the authorized host `/private/tmp` GPG fixture. Ruff
+  lint and format checks pass, `git diff --check` passes, module boundaries pass
+  18/18 in 2.208 seconds, skill structure passes 28/28 in 3.991 seconds, the
+  project-journal validator passes, and the official isolated Python 3.13 skill
+  validator reports `Skill is valid!`.
+- The first frozen Python 3.13 discovery reached its 2,400-second hard deadline
+  after continuing to emit passing cases but before a unittest summary; it is
+  explicitly non-counting. After proving that process and its identifiable
+  children were quiescent, the unchanged patch was rerun once with a
+  3,600-second hard deadline. That run passes all 1,683 tests in 2,472.150
+  seconds. The implementation, test, and architecture patch digest, excluding
+  this evidence-only journal, is unchanged before and after both runs at
+  `70a56df69683c0087bc873badc49917db3a859753657150ab4a501e1e2c226b3`.

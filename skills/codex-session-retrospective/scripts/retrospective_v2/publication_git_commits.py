@@ -435,26 +435,20 @@ class LocalGitCommitOperations:
         timeout_seconds: float | None = None,
         max_output_bytes: int | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
-        self._revalidate_git_metadata()
-        command = [self._git_binary, "-C", str(self._repo)]
-        if hasattr(self, "_git_dir"):
-            command.extend((f"--git-dir={self._git_dir}", f"--work-tree={self._repo}"))
-        command.extend(
-            (
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.askPass=/usr/bin/false",
-                "-c",
-                "credential.helper=",
-            )
-        )
+        arguments = [
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.askPass=/usr/bin/false",
+            "-c",
+            "credential.helper=",
+        ]
         if signing:
-            command.extend(("-c", f"gpg.format={self._signing_format}"))
+            arguments.extend(("-c", f"gpg.format={self._signing_format}"))
             if self._signing_key is not None:
-                command.extend(("-c", f"user.signingkey={self._signing_key}"))
-            command.extend(("-c", f"gpg.program={self._signing_program}"))
-        command.extend(args)
+                arguments.extend(("-c", f"user.signingkey={self._signing_key}"))
+            arguments.extend(("-c", f"gpg.program={self._signing_program}"))
+        arguments.extend(args)
         environment = _strict_subprocess_environment(
             home=self._gnupg_home or self._repo
         )
@@ -473,21 +467,33 @@ class LocalGitCommitOperations:
                     "Git helper environment values must be strings"
                 )
             environment.update(extra_env)
-        result = _run_bounded_subprocess(
-            command,
-            input_bytes=input_bytes,
-            environment=environment,
-            timeout_seconds=(
-                self._subprocess_timeout_seconds
-                if timeout_seconds is None
-                else timeout_seconds
-            ),
-            max_output_bytes=(
-                self._subprocess_output_limit_bytes
-                if max_output_bytes is None
-                else max_output_bytes
-            ),
-        )
+        try:
+            with git_safety.repository_git_invocation(
+                getattr(self, "_git_repository_admission", None),
+                self._repo,
+                self._git_binary,
+                arguments,
+                environment,
+                self._git_directory_identity,
+            ) as (command, environment, descriptors):
+                result = _run_bounded_subprocess(
+                    command,
+                    input_bytes=input_bytes,
+                    environment=environment,
+                    inherited_descriptors=descriptors,
+                    timeout_seconds=(
+                        self._subprocess_timeout_seconds
+                        if timeout_seconds is None
+                        else timeout_seconds
+                    ),
+                    max_output_bytes=(
+                        self._subprocess_output_limit_bytes
+                        if max_output_bytes is None
+                        else max_output_bytes
+                    ),
+                )
+        except git_safety.LocalRepositorySafetyError as error:
+            raise LocalGitPublicationError(str(error)) from error
         if check and result.returncode != 0:
             raise LocalGitPublicationError(
                 f"Git command failed ({' '.join(args)}): {_bounded_git_error(result)}"

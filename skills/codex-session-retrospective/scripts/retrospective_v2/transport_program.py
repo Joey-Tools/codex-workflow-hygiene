@@ -37,7 +37,13 @@ except (ImportError, ModuleNotFoundError):
 
 SOURCE_TRANSPORT_MAX_PROGRAM_COMPONENT_BYTES = 4 * 1024 * 1024
 SOURCE_TRANSPORT_MAX_INTERPRETER_BYTES = 64 * 1024 * 1024
-SOURCE_TRANSPORT_BASE_PYTHON_FLAGS = ("-I", "-B", "-X", f"pycache_prefix={os.devnull}")
+SOURCE_TRANSPORT_BASE_PYTHON_FLAGS = (
+    "-I",
+    "-B",
+    "-S",
+    "-X",
+    f"pycache_prefix={os.devnull}",
+)
 SOURCE_TRANSPORT_SNAPSHOT_SCHEMA = "source_transport_worker_snapshot_v1"
 SOURCE_TRANSPORT_MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 SOURCE_TRANSPORT_SNAPSHOT_CACHE = pathlib.Path(tempfile.gettempdir()) / (
@@ -226,7 +232,7 @@ def _python_runtime_authority() -> dict[str, JsonValue]:
             allow_missing=False,
             maximum_bytes=SOURCE_TRANSPORT_MAX_INTERPRETER_BYTES,
         ),
-        "executable": sys.executable,
+        "executable": str(resolved),
         "implementation": sys.implementation.name,
         "schema": "source_transport_python_runtime_v1",
         "version": list(sys.version_info),

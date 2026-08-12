@@ -281,6 +281,7 @@ def _run_bounded_subprocess(
     *,
     environment: Mapping[str, str],
     cwd_descriptor: int | None = None,
+    inherited_descriptors: tuple[int, ...] = (),
     input_bytes: bytes | None = None,
     timeout_seconds: float,
     max_output_bytes: int,
@@ -297,8 +298,9 @@ def _run_bounded_subprocess(
         or max_output_bytes <= 0
     ):
         raise ValueError("subprocess output limit must be a positive integer")
-    launch_command, inherited_descriptors = _descriptor_bound_launch(
-        command, cwd_descriptor
+    launch_command, cwd_descriptors = _descriptor_bound_launch(command, cwd_descriptor)
+    inherited_descriptors = tuple(
+        dict.fromkeys((*cwd_descriptors, *inherited_descriptors))
     )
     try:
         process = subprocess.Popen(

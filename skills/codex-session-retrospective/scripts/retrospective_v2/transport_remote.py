@@ -95,6 +95,7 @@ def _remote_host_context_command(
         sys.executable,
         "-I",
         "-B",
+        "-S",
         "-X",
         f"pycache_prefix={os.devnull}",
         "-c",

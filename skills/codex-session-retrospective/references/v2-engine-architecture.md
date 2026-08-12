@@ -164,26 +164,40 @@ an already collected local bundle.
 History readiness and formal publication use the same local-repository
 admission receipt. It binds owner-controlled real ancestry for the worktree,
 Git directory, common directory, and closed object store; rejects alternates,
-grafts, shallow repositories, and promisor/partial-clone configuration; and
-revalidates the bound directory identities plus forbidden metadata before each
-later Git command. A repository that finalize would reject is therefore blocked
-by doctor/start before an expensive retrospective run begins.
+grafts, shallow repositories, promisor/partial-clone configuration, include
+directives, worktree configuration, and an enabled `extensions.worktreeConfig`;
+and binds the exact owner-controlled common-config bytes. Each later Git command
+holds all four admitted directory descriptors, launches from the held worktree
+descriptor with only relative repository discovery, and revalidates directory
+identity, access policy, config content, and forbidden metadata before and after
+the subprocess. Close failures fail the otherwise-successful command and remain
+secondary evidence when another failure is already primary. These are
+point-in-time checks: they detect path replacement and stable drift but do not
+claim to exclude an actively malicious same-UID ABA after the final pre-launch
+check. A repository that finalize would reject is therefore blocked by
+doctor/start before an expensive retrospective run begins.
 
-The transport slice remains independently bounded after this hardening: 7,240
+Source-program and remote-helper Python bootstraps run with `-I -B -S`; the
+captured bootstrap itself verifies isolated, no-site, no-bytecode flags before
+authenticating or compiling retained source. Global or user site initialization
+therefore cannot run before the authenticated source-only loader.
+
+The transport slice remains independently bounded after this hardening: 7,249
 physical lines across a 7,250-line aggregate limit. One exact 14-module
 inventory and its aggregate are enforced together, so omitting a transport
 module cannot create a false budget pass. The newly affected modules are
-`transport_paths.py` at 89/100 lines, `transport_program.py` at 437/450,
-`transport_remote.py` at 315/320, `transport_snapshot.py` at 215/220, and
+`transport_paths.py` at 89/100 lines, `transport_program.py` at 443/450,
+`transport_remote.py` at 316/320, `transport_snapshot.py` at 217/220, and
 `transport_remote_snapshot.py` at 86/100, while `transport_contracts.py` is
 984/1,000. The closed run-state
 authority inventory is exactly 1,000/1,000 lines: `run_state_authority.py` 243/250,
 `run_state_contracts.py` 37/50, `run_state_cursors.py` 219/225,
 `run_state_holdouts.py` 236/240, and `run_state_lineage.py` 265/275. Including
 this full slice, the orchestrator foundation is 3,297/3,350 lines. The global
-branch proxy is 8,399/8,400 nodes after adding the repository-admission and
-transport access-policy predicates. The publication support boundary is
-1,307/1,310 lines after adding claim-time checkpoint authority validation. The
+branch proxy is 8,431/8,450 nodes after adding the descriptor-custody,
+closed-config, and transport isolation predicates. The publication support
+boundary is 1,309/1,310 lines after adding claim-time checkpoint authority
+validation and inherited-descriptor launch support. The
 source coordinator and
 its original support slice are 2,930/3,000 lines; the three source-staging modules
 are independently capped at 749/775, and the claim/result reserve owner is

@@ -30,8 +30,7 @@ from . import (
     reporting,
     safe_io,
 )
-from .authority_errors import AuthorityError as AuthorityError
-from .authority_errors import AutomationCutoverBlocked
+from .authority_errors import AuthorityError as AuthorityError, AutomationCutoverBlocked
 from .authority_errors import HistoryValidationError, ProductionMarkerError
 from .authority_errors import ProviderCacheConflict, ProviderCacheError
 from .contracts import CANONICAL_HOSTS, RefType, canonical_json_bytes
@@ -664,6 +663,7 @@ def _run_bounded(
     argv: Sequence[str],
     *,
     env: Mapping[str, str],
+    pass_fds: tuple[int, ...] = (),
     input_bytes: bytes | None = None,
     max_output_bytes: int = MAX_GIT_OUTPUT_BYTES,
     timeout_seconds: float = 30.0,
@@ -678,6 +678,7 @@ def _run_bounded(
             stderr=subprocess.PIPE,
             env=dict(env),
             close_fds=True,
+            pass_fds=pass_fds,
             start_new_session=True,
         )
     except OSError as exc:
@@ -759,12 +760,10 @@ def _run_bounded(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError
-        # Close the task-owned group while the unreaped leader still pins its
-        # PID/PGID. Reaping first would open a process-group reuse race.
+        # Close the group while the unreaped leader still pins its PID/PGID.
         terminate_process_group()
-        return_code = process.wait(timeout=remaining)
         return subprocess.CompletedProcess(
-            argv, return_code, bytes(output), bytes(errors)
+            argv, process.wait(timeout=remaining), bytes(output), bytes(errors)
         )
     except (BufferError, TimeoutError, subprocess.TimeoutExpired) as exc:
         terminate_process_group()
@@ -811,33 +810,36 @@ class _GitRepository:
         input_bytes: bytes | None = None,
         max_output_bytes: int = MAX_GIT_OUTPUT_BYTES,
     ) -> subprocess.CompletedProcess[bytes]:
-        git_safety.revalidate_history_repository(
+        arguments = (
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.askPass=/usr/bin/false",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "gpg.format=openpgp",
+            "-c",
+            f"gpg.program={self.gpg}",
+            "-c",
+            f"gpg.openpgp.program={self.gpg}",
+            *args,
+        )
+        with git_safety.history_repository_git_invocation(
             getattr(self, "_repository_admission", None),
+            self.path,
+            self.git,
+            arguments,
+            self.env,
             safe_io.owner_controlled_directory_identity,
-        )
-        result = _run_bounded(
-            (
-                self.git,
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.askPass=/usr/bin/false",
-                "-c",
-                "credential.helper=",
-                "-c",
-                "gpg.format=openpgp",
-                "-c",
-                f"gpg.program={self.gpg}",
-                "-c",
-                f"gpg.openpgp.program={self.gpg}",
-                "-C",
-                str(self.path),
-                *args,
-            ),
-            env=self.env,
-            input_bytes=input_bytes,
-            max_output_bytes=max_output_bytes,
-        )
+        ) as (command, environment, descriptors):
+            result = _run_bounded(
+                command,
+                env=environment,
+                pass_fds=descriptors,
+                input_bytes=input_bytes,
+                max_output_bytes=max_output_bytes,
+            )
         if check and result.returncode != 0:
             raise HistoryValidationError("history Git command failed")
         return result

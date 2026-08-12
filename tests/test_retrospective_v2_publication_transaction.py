@@ -115,6 +115,9 @@ class PublicationInvariantUnitTests(unittest.TestCase):
         for shallow, keys in (
             (b"true\n", b"core.repositoryformatversion\n"),
             (b"false\n", b"extensions.partialClone\n"),
+            (b"false\n", b"extensions.worktreeConfig\n"),
+            (b"false\n", b"include.path\n"),
+            (b"false\n", b"includeIf.gitdir:example.path\n"),
             (b"false\n", b"remote.origin.promisor\n"),
             (b"false\n", b"remote.origin.partialCloneFilter\n"),
             (b"false\n", b"remote.origin.promisor\x00suffix\n"),
@@ -122,6 +125,67 @@ class PublicationInvariantUnitTests(unittest.TestCase):
             with self.subTest(shallow=shallow, keys=keys):
                 with self.assertRaises(ValueError):
                     git_safety.validate_complete_local_repository(shallow, keys)
+
+    def test_bound_git_descriptor_close_preserves_primary_and_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=_publication_test_temp_parent()
+        ) as temporary_directory:
+            root = Path(temporary_directory)
+            root.chmod(0o700)
+            repository = root / "repository"
+            run_command(["git", "init", "-q", str(repository)])
+            environment = git_safety.history_git_environment(
+                home=str(root), gnupg_home=str(root)
+            )
+
+            def run(arguments):
+                return subprocess.run(
+                    ["git", "-C", str(repository), *arguments],
+                    check=False,
+                    capture_output=True,
+                    env=environment,
+                    timeout=30,
+                )
+
+            admission = git_safety.admit_local_repository(
+                repository,
+                run,
+                safe_io.owner_controlled_directory_identity,
+            )
+            real_close = os.close
+            target: int | None = None
+
+            def close_then_fail(descriptor):
+                real_close(descriptor)
+                if descriptor == target:
+                    raise OSError("synthetic descriptor close failure")
+
+            with (
+                mock.patch.object(git_safety.os, "close", side_effect=close_then_fail),
+                self.assertRaisesRegex(
+                    git_safety.LocalRepositorySafetyError,
+                    "Git metadata descriptor close failed",
+                ),
+            ):
+                with git_safety.bind_local_repository_command(
+                    admission, safe_io.owner_controlled_directory_identity
+                ) as binding:
+                    target = binding.object_store_fd
+
+            target = None
+            with mock.patch.object(git_safety.os, "close", side_effect=close_then_fail):
+                with self.assertRaisesRegex(RuntimeError, "primary failure") as raised:
+                    with git_safety.bind_local_repository_command(
+                        admission, safe_io.owner_controlled_directory_identity
+                    ) as binding:
+                        target = binding.object_store_fd
+                        raise RuntimeError("primary failure")
+            self.assertIn(
+                "Git metadata descriptor close failed",
+                getattr(raised.exception, "__notes__", ()),
+            )
 
     def test_publication_temp_parent_uses_portable_fallback(self) -> None:
         with mock.patch.object(Path, "is_dir", return_value=True):
@@ -2913,6 +2977,215 @@ class DurablePublicationTests(unittest.TestCase):
                 repository.text("rev-parse", "HEAD")
         finally:
             grafts.unlink()
+
+    def test_history_reader_and_publisher_reject_unclosed_config_sources(self) -> None:
+        included = self.root / "included-history-config"
+        included.write_text('[remote "origin"]\n\tpromisor = true\n', encoding="ascii")
+        run_command(
+            ["git", "config", "--local", "include.path", str(included)],
+            cwd=self.repo,
+        )
+        try:
+            with self.assertRaisesRegex(
+                publication_support.LocalGitPublicationError,
+                "complete and non-promisor",
+            ):
+                self.publication_adapter()
+            with self.assertRaisesRegex(
+                authority.HistoryValidationError,
+                "complete and non-promisor",
+            ):
+                authority._GitRepository(
+                    self.repo,
+                    gnupg_home=self.gnupg_home,
+                    git_binary="git",
+                    gpg_program=self.gpg,
+                )
+        finally:
+            run_command(
+                ["git", "config", "--local", "--unset-all", "include.path"],
+                cwd=self.repo,
+            )
+
+        worktree_config = self.repo / ".git" / "config.worktree"
+        worktree_config.write_text(
+            '[remote "origin"]\n\tpromisor = true\n', encoding="ascii"
+        )
+        try:
+            with self.assertRaisesRegex(
+                publication_support.LocalGitPublicationError,
+                "Git worktree configurations are not allowed",
+            ):
+                self.publication_adapter()
+            with self.assertRaisesRegex(
+                authority.HistoryValidationError, "local safety admission"
+            ):
+                authority._GitRepository(
+                    self.repo,
+                    gnupg_home=self.gnupg_home,
+                    git_binary="git",
+                    gpg_program=self.gpg,
+                )
+        finally:
+            worktree_config.unlink()
+
+        run_command(
+            ["git", "config", "--local", "extensions.worktreeConfig", "true"],
+            cwd=self.repo,
+        )
+        try:
+            with self.assertRaisesRegex(
+                publication_support.LocalGitPublicationError,
+                "complete and non-promisor",
+            ):
+                self.publication_adapter()
+            with self.assertRaisesRegex(
+                authority.HistoryValidationError,
+                "complete and non-promisor",
+            ):
+                authority._GitRepository(
+                    self.repo,
+                    gnupg_home=self.gnupg_home,
+                    git_binary="git",
+                    gpg_program=self.gpg,
+                )
+        finally:
+            run_command(
+                [
+                    "git",
+                    "config",
+                    "--local",
+                    "--unset-all",
+                    "extensions.worktreeConfig",
+                ],
+                cwd=self.repo,
+            )
+
+    def test_history_reader_and_publisher_reject_config_drift(self) -> None:
+        repository = authority._GitRepository(
+            self.repo,
+            gnupg_home=self.gnupg_home,
+            git_binary="git",
+            gpg_program=self.gpg,
+        )
+        config_path = self.repo / ".git" / "config"
+        original = config_path.read_bytes()
+        config_path.write_bytes(original + b"\n")
+        try:
+            with self.assertRaisesRegex(
+                authority.HistoryValidationError, "safety binding changed"
+            ):
+                repository.text("rev-parse", "HEAD")
+            with self.assertRaisesRegex(
+                publication_support.LocalGitPublicationError,
+                "local Git configuration changed after validation",
+            ):
+                self.adapter._git(("rev-parse", "HEAD"))
+        finally:
+            config_path.write_bytes(original)
+
+    def test_history_git_uses_admitted_directories_after_path_replacement(self) -> None:
+        repository = authority._GitRepository(
+            self.repo,
+            gnupg_home=self.gnupg_home,
+            git_binary="git",
+            gpg_program=self.gpg,
+        )
+        replacement = self.root / "replacement-history"
+        displaced = self.root / "admitted-history"
+        run_command(["git", "init", "-q", str(replacement)])
+        real_run = authority._run_bounded
+        observed = False
+
+        def swap_after_binding(argv, **kwargs):
+            nonlocal observed
+            if not observed:
+                observed = True
+                self.assertIn(("-C", "."), tuple(zip(argv, argv[1:])))
+                self.assertNotIn(str(self.repo), argv)
+                self.assertFalse(
+                    {
+                        "GIT_COMMON_DIR",
+                        "GIT_DIR",
+                        "GIT_OBJECT_DIRECTORY",
+                        "GIT_WORK_TREE",
+                    }
+                    & kwargs["env"].keys()
+                )
+                self.assertEqual(4, len(kwargs["pass_fds"]))
+                self.repo.rename(displaced)
+                replacement.rename(self.repo)
+                try:
+                    return real_run(argv, **kwargs)
+                finally:
+                    self.repo.rename(replacement)
+                    displaced.rename(self.repo)
+            return real_run(argv, **kwargs)
+
+        with mock.patch.object(
+            authority, "_run_bounded", side_effect=swap_after_binding
+        ):
+            subject = repository.text("show", "-s", "--format=%s", self.base_head)
+
+        self.assertTrue(observed)
+        self.assertEqual("Initialize history", subject)
+
+    def test_publication_git_writes_admitted_object_store_after_path_replacement(
+        self,
+    ) -> None:
+        replacement = self.root / "replacement-publication"
+        displaced = self.root / "admitted-publication"
+        run_command(["git", "init", "-q", str(replacement)])
+        real_run = publication_git_commits._run_bounded_subprocess
+        observed = False
+
+        def swap_after_binding(argv, **kwargs):
+            nonlocal observed
+            if not observed:
+                observed = True
+                self.assertIn(("-C", "."), tuple(zip(argv, argv[1:])))
+                self.assertNotIn(str(self.repo), argv)
+                self.assertFalse(
+                    {
+                        "GIT_COMMON_DIR",
+                        "GIT_DIR",
+                        "GIT_OBJECT_DIRECTORY",
+                        "GIT_WORK_TREE",
+                    }
+                    & kwargs["environment"].keys()
+                )
+                self.assertEqual(4, len(kwargs["inherited_descriptors"]))
+                self.repo.rename(displaced)
+                replacement.rename(self.repo)
+                try:
+                    return real_run(argv, **kwargs)
+                finally:
+                    self.repo.rename(replacement)
+                    displaced.rename(self.repo)
+            return real_run(argv, **kwargs)
+
+        payload = b"descriptor-bound publication object\n"
+        with mock.patch.object(
+            publication_git_commits,
+            "_run_bounded_subprocess",
+            side_effect=swap_after_binding,
+        ):
+            object_id = (
+                self.adapter._git(("hash-object", "-w", "--stdin"), input_bytes=payload)
+                .stdout.decode("ascii")
+                .strip()
+            )
+
+        self.assertTrue(observed)
+        run_command(["git", "cat-file", "-e", object_id], cwd=self.repo)
+        replacement_result = subprocess.run(
+            ["git", "cat-file", "-e", object_id],
+            cwd=replacement,
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertNotEqual(0, replacement_result.returncode)
 
     def test_history_git_commands_ignore_replace_refs(self) -> None:
         tree = run_command(

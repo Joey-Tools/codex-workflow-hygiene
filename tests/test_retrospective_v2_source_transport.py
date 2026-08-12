@@ -491,9 +491,14 @@ class SourceTransportProtocolTests(unittest.TestCase):
         lease = transport.TransportLease.from_dict(lease_view["transport_lease"])
         completed = subprocess.run(
             list(lease.command_argv),
-            check=True,
+            check=False,
             capture_output=True,
             env=environment,
+        )
+        self.assertEqual(
+            0,
+            completed.returncode,
+            completed.stderr.decode("utf-8", errors="replace"),
         )
         preparation = coordinator.prepare_source(
             lease.lease_ref,
@@ -900,12 +905,37 @@ class SourceTransportProtocolTests(unittest.TestCase):
         command = lease_view["transport_lease"]["command_argv"]
         self.assertEqual(
             list(transport_program.SOURCE_TRANSPORT_BASE_PYTHON_FLAGS),
-            command[1:5],
+            command[1:6],
         )
-        self.assertEqual("-c", command[5])
-        self.assertEqual(transport_program.SOURCE_TRANSPORT_SNAPSHOT_SCHEMA, command[7])
-        self.assertTrue(command[8].startswith("sha256:"))
-        self.assertTrue(Path(command[9]).is_file())
+        self.assertEqual("-c", command[6])
+        self.assertEqual(transport_program.SOURCE_TRANSPORT_SNAPSHOT_SCHEMA, command[8])
+        self.assertTrue(command[9].startswith("sha256:"))
+        self.assertTrue(Path(command[10]).is_file())
+        isolated = subprocess.run(
+            [
+                sys.executable,
+                *transport_program.SOURCE_TRANSPORT_BASE_PYTHON_FLAGS,
+                "-c",
+                "import sys;print(sys.flags.no_site)",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual("1", isolated.stdout.strip())
+        missing_no_site = subprocess.run(
+            [component for component in command if component != "-S"],
+            check=False,
+            capture_output=True,
+            env={"HOME": str(self.home), "PATH": os.defpath},
+            text=True,
+            timeout=30,
+        )
+        self.assertNotEqual(0, missing_no_site.returncode)
+        self.assertIn(
+            "source transport Python isolation failed", missing_no_site.stderr
+        )
 
     def test_native_transport_ignores_uncommitted_unchecked_hash_bytecode(
         self,
@@ -975,12 +1005,23 @@ class SourceTransportProtocolTests(unittest.TestCase):
 
         self.assertEqual("-I", command[1])
         self.assertEqual("-B", command[2])
+        self.assertEqual("-S", command[3])
         self.assertEqual(
-            transport_snapshot.REMOTE_HOST_CONTEXT_SNAPSHOT_SCHEMA, command[7]
+            transport_snapshot.REMOTE_HOST_CONTEXT_SNAPSHOT_SCHEMA, command[8]
         )
-        self.assertEqual(commitment, command[8])
-        self.assertEqual(str(snapshot), command[9])
+        self.assertEqual(commitment, command[9])
+        self.assertEqual(str(snapshot), command[10])
         self.assertEqual(0o600, snapshot.stat().st_mode & 0o777)
+        missing_no_site = subprocess.run(
+            [component for component in command if component != "-S"],
+            check=False,
+            capture_output=True,
+            env=transport._remote_host_context_environment(),
+            text=True,
+            timeout=30,
+        )
+        self.assertNotEqual(0, missing_no_site.returncode)
+        self.assertIn("remote helper Python isolation failed", missing_no_site.stderr)
         with (
             mock.patch.dict(
                 os.environ,
@@ -1165,6 +1206,15 @@ class SourceTransportProtocolTests(unittest.TestCase):
 
         with (
             mock.patch.dict(sys.modules, {"os": fake_os}),
+            mock.patch.object(
+                sys,
+                "flags",
+                types.SimpleNamespace(
+                    isolated=1,
+                    no_site=1,
+                    dont_write_bytecode=1,
+                ),
+            ),
             mock.patch.object(
                 sys,
                 "argv",
@@ -3315,7 +3365,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
         lease = transport.TransportLease.from_dict(
             self._first_lease(coordinator)["transport_lease"]
         )
-        snapshot_path = Path(lease.command_argv[9])
+        snapshot_path = Path(lease.command_argv[10])
         self.assertEqual(
             coordinator.run_dir / "raw-inputs" / "source-program-snapshots",
             snapshot_path.parent,
@@ -3454,7 +3504,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
         lease = transport.TransportLease.from_dict(
             self._first_lease(coordinator)["transport_lease"]
         )
-        snapshot_path = Path(lease.command_argv[9])
+        snapshot_path = Path(lease.command_argv[10])
         original = snapshot_path.read_bytes()
         snapshot_path.write_bytes(b"replaced snapshot")
         try:
