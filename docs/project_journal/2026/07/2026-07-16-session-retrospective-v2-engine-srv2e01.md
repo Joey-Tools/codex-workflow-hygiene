@@ -1550,8 +1550,9 @@ superseded_by:
   deadline did not trigger. Two earlier full-discovery invocations are
   non-counting: the first was interrupted after an early failure marker, and
   fail-fast proved that the only failure was the invocation's missing `-S`
-  flag, not product behavior. The signed fix commit, admission, CI, and the new
-  exact-head `skill-repo-codex-gate` remain pending.
+  flag, not product behavior. Signed fix commit `798d754d` preserves the signed
+  merge checkpoint as its parent. Admission, CI, and the new exact-head
+  `skill-repo-codex-gate` remain pending.
 - Final static validation passes scoped Ruff check and format-check for all six
   changed Python files, `actionlint` for the canonical workflow, repository
   `git diff --check`, the installed project-journal validator, and the official
