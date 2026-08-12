@@ -575,6 +575,115 @@ class PrAttributionTests(unittest.TestCase):
 
             self.assertEqual(self.run_helper(home), sentence("GPT-5.6 Sol Max"))
 
+    def test_legacy_multi_lifecycle_family_is_indexed_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(
+                home,
+                ROOT,
+                [
+                    meta(ROOT, ROOT),
+                    turn("root-a", "max"),
+                    meta(CHILD, ROOT, parent_id=ROOT),
+                    turn("child-a", "xhigh"),
+                    turn("child-b", "xhigh"),
+                ],
+                relative_path=Path("archived_sessions", "rollout-legacy.jsonl"),
+            )
+
+            self.assertEqual(
+                self.run_helper(home),
+                sentence("GPT-5.6 Sol Extra High"),
+            )
+
+    def test_legacy_later_selected_lifecycle_resolves_its_family(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(
+                home,
+                ROOT,
+                [
+                    meta(ROOT, ROOT),
+                    turn("root-a", "max"),
+                    meta(CHILD, ROOT, parent_id=ROOT),
+                    turn("child-a", "xhigh"),
+                    turn("child-b", "xhigh"),
+                ],
+                relative_path=Path("archived_sessions", "rollout-legacy.jsonl"),
+            )
+
+            self.assertEqual(
+                self.run_helper(home, session_id=CHILD),
+                sentence("GPT-5.6 Sol Extra High"),
+            )
+
+    def test_legacy_later_selected_lifecycle_cannot_hide_foreign_prefix(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(home, ROOT, [meta(ROOT, ROOT), turn("root-a", "max")])
+            write_rollout(
+                home,
+                ROOT,
+                [
+                    meta(UNRELATED, UNRELATED),
+                    turn("unrelated-a", "ultra"),
+                    meta(ROOT, ROOT),
+                    turn("root-replay", "max"),
+                ],
+                relative_path=Path("archived_sessions", "rollout-legacy.jsonl"),
+            )
+
+            self.assertEqual(self.run_helper(home), FALLBACK)
+
+    def test_legacy_selected_lifecycle_cannot_hide_foreign_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(home, ROOT, [meta(ROOT, ROOT), turn("root-a", "max")])
+            write_rollout(
+                home,
+                ROOT,
+                [
+                    meta(ROOT, ROOT),
+                    turn("root-replay", "max"),
+                    meta(UNRELATED, UNRELATED),
+                    turn("unrelated-a", "ultra"),
+                ],
+                relative_path=Path("archived_sessions", "rollout-legacy.jsonl"),
+            )
+
+            self.assertEqual(self.run_helper(home), FALLBACK)
+
+    def test_unowned_or_malformed_legacy_rollout_uses_fallback(self) -> None:
+        cases = (
+            b'{"type":"event_msg","payload":{"type":"other"}}\n',
+            b"{malformed}\n",
+        )
+        for payload in cases:
+            with (
+                self.subTest(payload=payload),
+                tempfile.TemporaryDirectory() as temporary_directory,
+            ):
+                home = Path(temporary_directory)
+                write_rollout(home, ROOT, [meta(ROOT, ROOT), turn("root-a", "max")])
+                legacy = home / "archived_sessions" / "rollout-legacy.jsonl"
+                legacy.parent.mkdir(parents=True, exist_ok=True)
+                legacy.write_bytes(payload)
+
+                self.assertEqual(self.run_helper(home), FALLBACK)
+
+    def test_legacy_probe_limit_uses_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(home, ROOT, [meta(ROOT, ROOT), turn("root-a", "max")])
+            legacy = home / "archived_sessions" / "rollout-legacy.jsonl"
+            legacy.parent.mkdir(parents=True, exist_ok=True)
+            record = b'{"type":"event_msg","payload":{"type":"other"}}\n'
+            legacy.write_bytes(record * (1024 * 1024 // len(record) + 2))
+
+            self.assertEqual(self.run_helper(home), FALLBACK)
+
     def test_legacy_turn_before_lifecycle_owner_uses_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             home = Path(temporary_directory)
@@ -599,6 +708,23 @@ class PrAttributionTests(unittest.TestCase):
                     ROOT,
                     [turn("root-a", "max")],
                     relative_path=Path(root_name, f"rollout-{ROOT}.jsonl"),
+                )
+                with rollout.open("ab") as handle:
+                    handle.write(b'{"type":"turn_context",')
+                self.assertEqual(self.run_helper(home), expected)
+
+    def test_legacy_active_tail_is_ignored_but_archived_tail_fails(self) -> None:
+        for root_name, expected in (
+            ("sessions", sentence("GPT-5.6 Sol Max")),
+            ("archived_sessions", FALLBACK),
+        ):
+            with self.subTest(root_name=root_name), tempfile.TemporaryDirectory() as temporary_directory:
+                home = Path(temporary_directory)
+                rollout = write_rollout(
+                    home,
+                    ROOT,
+                    [meta(ROOT, ROOT), turn("root-a", "max")],
+                    relative_path=Path(root_name, "rollout-legacy.jsonl"),
                 )
                 with rollout.open("ab") as handle:
                     handle.write(b'{"type":"turn_context",')

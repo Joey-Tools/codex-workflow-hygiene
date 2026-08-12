@@ -239,31 +239,31 @@ def iter_records(
         raise RolloutError("unable to read selected rollout") from exc
 
 
-def probe_owner(
+def probe_lifecycle_ids(
     path: Path,
     expected_identity: FileIdentity,
     active: bool,
     deadline: float,
-) -> Optional[str]:
-    try:
-        for row in iter_records(
-            path,
-            expected_identity,
-            deadline,
-            allow_partial_tail=active,
-            byte_limit=MAX_PROBE_BYTES,
-        ):
-            if row.get("type") != "session_meta":
-                continue
-            payload = row.get("payload")
-            if not isinstance(payload, dict):
-                return None
-            owner = lifecycle_id(payload)
-            if owner is not None:
-                return owner
-    except RolloutError:
-        return None
-    return None
+) -> Tuple[str, ...]:
+    lifecycle_ids = set()
+    for row in iter_records(
+        path,
+        expected_identity,
+        deadline,
+        allow_partial_tail=active,
+        byte_limit=MAX_PROBE_BYTES,
+    ):
+        if row.get("type") != "session_meta":
+            continue
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            raise RolloutError("session metadata payload is invalid")
+        owner = lifecycle_id(payload)
+        if owner is not None:
+            lifecycle_ids.add(owner)
+    if not lifecycle_ids:
+        raise RolloutError("legacy rollout has no verified lifecycle owner")
+    return tuple(sorted(lifecycle_ids))
 
 
 def inventory_rollouts(
@@ -328,9 +328,14 @@ def inventory_rollouts(
                         if active:
                             active_paths.add(path)
                         if not ids:
-                            owner = probe_owner(path, identity, active, deadline)
-                            if owner is not None:
-                                ids.append(owner)
+                            ids.extend(
+                                probe_lifecycle_ids(
+                                    path,
+                                    identity,
+                                    active,
+                                    deadline,
+                                )
+                            )
                         for session_id in ids:
                             by_session.setdefault(session_id, []).append(path)
             except RolloutError:
@@ -346,6 +351,7 @@ def resolve_root(
     rollouts: Mapping[str, Sequence[Path]],
     active_paths: Set[Path],
     identities: Mapping[Path, FileIdentity],
+    filename_owned_paths: Set[Path],
     selected_id: str,
     deadline: float,
     chain: Optional[List[str]] = None,
@@ -378,7 +384,11 @@ def resolve_root(
                 if not isinstance(payload, dict):
                     raise RolloutError("session metadata payload is invalid")
                 owner = lifecycle_id(payload)
-                if owner is not None and not checked_first_meta:
+                if (
+                    owner is not None
+                    and path in filename_owned_paths
+                    and not checked_first_meta
+                ):
                     checked_first_meta = True
                     if owner != current:
                         raise RolloutError("rollout filename and owner disagree")
@@ -463,6 +473,7 @@ def collect_votes(
                 rollouts,
                 active_paths,
                 identities,
+                filename_owned_paths,
                 session_id,
                 deadline,
                 resolved_chain,
@@ -485,6 +496,7 @@ def collect_votes(
         return resolved_roots[session_id], resolved_parents[session_id]
 
     visited = set()
+    processed_paths: Set[Path] = set()
     file_votes: Dict[Tuple[str, str, Path], Vote] = {}
     turn_keys: Set[TurnKey] = set()
     while pending:
@@ -496,6 +508,9 @@ def collect_votes(
         if session_root != root_id:
             raise RolloutError("scheduled lifecycle is outside the task family")
         for path in rollouts.get(session_id, ()):
+            if path in processed_paths:
+                continue
+            processed_paths.add(path)
             checked_first_meta = False
             vote_session_id: Optional[str] = (
                 session_id if path in filename_owned_paths else None
@@ -530,7 +545,7 @@ def collect_votes(
                             root_id,
                             owner_parent,
                         )
-                        if not checked_first_meta:
+                        if path in filename_owned_paths and not checked_first_meta:
                             checked_first_meta = True
                             if owner != session_id:
                                 raise RolloutError("rollout filename and owner disagree")
@@ -626,6 +641,7 @@ def render_sentence(codex_home: Path, session_id: Optional[str]) -> str:
             rollouts,
             active_paths,
             identities,
+            filename_owned_paths,
             selected_id,
             deadline,
             chain,

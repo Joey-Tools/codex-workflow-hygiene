@@ -30,7 +30,8 @@ superseded_by:
 - `skills/codex-session-mining/scripts/pr_attribution.py`
 - `skills/codex-session-mining/SKILL.md`
 - `tests/test_pr_attribution.py`
-- `python3 -B -m unittest tests.test_pr_attribution`: 41 tests passed.
-- Full repository suite: 1,100 tests passed with commit signing disabled only for temporary Git fixtures.
+- `python3 -B -m unittest tests.test_pr_attribution`: 48 tests passed.
+- Full repository suite: 1,107 tests passed with commit signing disabled only for temporary Git fixtures.
+- Fresh-context review identified incomplete legacy multi-lifecycle indexing; the follow-up now indexes every verified lifecycle, rejects incomplete probes, and counts each physical rollout once.
 - `codex-session-mining` skill validation passed through the isolated PyYAML fallback.
 - Project journal validation passed.
