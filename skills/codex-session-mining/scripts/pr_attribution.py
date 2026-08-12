@@ -51,6 +51,14 @@ MODEL_LABELS = {
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "gpt-5.6-terra": "GPT-5.6 Terra",
 }
+MODEL_ALIASES = {
+    "gpt-5.6-sol": "gpt-5.6-sol",
+    "gpt-5.6-terra": "gpt-5.6-terra",
+    "gpt-5.5": "gpt-5.5",
+    "gpt-5.4": "gpt-5.4",
+    "gpt-5.3": "gpt-5.3-codex",
+    "gpt-5.3-codex": "gpt-5.3-codex",
+}
 EFFORT_LABELS = {
     "low": "Low",
     "medium": "Medium",
@@ -109,6 +117,19 @@ def check_deadline(deadline: float) -> None:
 
 def normalize_session_id(value: str) -> str:
     return value.lower() if UUID_RE.fullmatch(value) else value
+
+
+def normalize_model_id(value: str) -> str:
+    candidate = value.rsplit("/", 1)[-1]
+    return MODEL_ALIASES.get(candidate, value)
+
+
+def turn_model_id(payload: Mapping[str, object]) -> Optional[str]:
+    for key in ("model", "model_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def optional_id(payload: Mapping[str, object], key: str) -> Optional[str]:
@@ -326,6 +347,21 @@ def iter_records(
         raise RolloutError("unable to read selected rollout") from exc
 
 
+def freeze_rollout_contents(
+    active_paths: Set[Path],
+    identities: Mapping[Path, FileSnapshot],
+    deadline: float,
+) -> None:
+    for path in sorted(identities):
+        for _row in iter_records(
+            path,
+            identities[path],
+            deadline,
+            allow_partial_tail=path in active_paths,
+        ):
+            pass
+
+
 def probe_lifecycle_ids(
     path: Path,
     snapshot: FileSnapshot,
@@ -355,6 +391,11 @@ def probe_lifecycle_ids(
 
 def is_rollout_candidate(filename: str) -> bool:
     return filename.startswith("rollout-") and filename.endswith(".jsonl")
+
+
+def validate_rollout_component(name: str, *, kind: str) -> None:
+    if any(not character.isprintable() for character in name):
+        raise RolloutError(f"rollout {kind} name is not printable")
 
 
 def directory_open_flags() -> int:
@@ -414,8 +455,7 @@ def scan_rollout_inventory(
                                 raise RolloutError(
                                     "rollout inventory has too many files"
                                 )
-                            if any(not character.isprintable() for character in filename):
-                                raise RolloutError("rollout filename is not printable")
+                            validate_rollout_component(filename, kind="file")
                             try:
                                 metadata = entry.stat(follow_symlinks=False)
                             except OSError as exc:
@@ -449,6 +489,7 @@ def scan_rollout_inventory(
                             )
                             continue
                         if entry.is_dir(follow_symlinks=False):
+                            validate_rollout_component(filename, kind="directory")
                             if depth + 1 > MAX_DEPTH:
                                 raise RolloutError("rollout inventory is too deep")
                             try:
@@ -563,9 +604,13 @@ def scan_rollout_inventory(
                                     dir_fd=current_fd,
                                     follow_symlinks=False,
                                 )
-                                if is_rollout_candidate(filename) or stat.S_ISDIR(
-                                    entry_metadata.st_mode
-                                ):
+                                is_directory = stat.S_ISDIR(entry_metadata.st_mode)
+                                if is_directory:
+                                    validate_rollout_component(
+                                        filename,
+                                        kind="directory",
+                                    )
+                                if is_rollout_candidate(filename) or is_directory:
                                     current_relevant_entries.append(
                                         DirectoryEntrySnapshot(
                                             filename,
@@ -691,6 +736,8 @@ def inventory_rollouts(
             by_session.setdefault(session_id, []).append(path)
     for paths in by_session.values():
         paths.sort()
+    # Establish every candidate's content baseline before publishing the inventory.
+    freeze_rollout_contents(active_paths, identities, deadline)
     return (
         by_session,
         active_paths,
@@ -973,7 +1020,7 @@ def collect_votes(
                 if vote_session_id is None:
                     raise RolloutError("turn context has no verified lifecycle owner")
                 turn_id = payload.get("turn_id")
-                model = payload.get("model")
+                model = turn_model_id(payload)
                 effort = payload.get("effort")
                 if not isinstance(turn_id, str) or not turn_id:
                     raise RolloutError("turn context has no task ID")
@@ -981,6 +1028,7 @@ def collect_votes(
                     continue
                 if len(turn_id) > MAX_ID_CHARS or len(model) > 128 or len(effort) > 64:
                     raise RolloutError("turn context field exceeds its limit")
+                model = normalize_model_id(model)
                 normalized_id = normalized_turn_id(turn_id)
                 turn_key = (vote_session_id, normalized_id)
                 if turn_key not in turn_keys and len(turn_keys) >= MAX_TURNS:
@@ -1031,14 +1079,7 @@ def revalidate_rollout_contents(
     identities: Mapping[Path, FileSnapshot],
     deadline: float,
 ) -> None:
-    for path in sorted(identities):
-        for _row in iter_records(
-            path,
-            identities[path],
-            deadline,
-            allow_partial_tail=path in active_paths,
-        ):
-            pass
+    freeze_rollout_contents(active_paths, identities, deadline)
 
 
 def render_sentence(codex_home: Path, session_id: Optional[str]) -> str:

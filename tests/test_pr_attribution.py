@@ -164,6 +164,123 @@ class PrAttributionTests(unittest.TestCase):
 
             self.assertEqual(self.run_helper(home), sentence("GPT-5.6 Sol Extra High"))
 
+    def test_model_id_with_provider_prefix_is_normalized(self) -> None:
+        cases = (
+            ("openai/gpt-5.6-terra", sentence("GPT-5.6 Terra Max")),
+            ("openai/gpt-5.50", FALLBACK),
+            ("openai/gpt-5.6-solitude", FALLBACK),
+        )
+        for model_id, expected in cases:
+            with (
+                self.subTest(model_id=model_id),
+                tempfile.TemporaryDirectory() as temporary_directory,
+            ):
+                home = Path(temporary_directory)
+                model_turn = turn("root-a", "max")
+                model_turn["payload"]["model_id"] = model_id
+                del model_turn["payload"]["model"]
+                write_rollout(home, ROOT, [meta(ROOT, ROOT), model_turn])
+
+                self.assertEqual(self.run_helper(home), expected)
+
+    def test_model_field_precedes_model_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            model_turn = turn("root-a", "max")
+            model_turn["payload"]["model_id"] = "openai/gpt-5.6-terra"
+            write_rollout(home, ROOT, [meta(ROOT, ROOT), model_turn])
+
+            self.assertEqual(
+                self.run_helper(home),
+                sentence("GPT-5.6 Sol Max"),
+            )
+
+    def test_invalid_model_field_falls_back_to_model_id(self) -> None:
+        for model in (None, "", 7):
+            with (
+                self.subTest(model=model),
+                tempfile.TemporaryDirectory() as temporary_directory,
+            ):
+                home = Path(temporary_directory)
+                model_turn = turn("root-a", "max")
+                model_turn["payload"]["model"] = model
+                model_turn["payload"]["model_id"] = "openai/gpt-5.6-terra"
+                write_rollout(home, ROOT, [meta(ROOT, ROOT), model_turn])
+
+                self.assertEqual(
+                    self.run_helper(home),
+                    sentence("GPT-5.6 Terra Max"),
+                )
+
+    def test_provider_prefixed_replay_matches_canonical_model(self) -> None:
+        shared_turn = "019ff116-ddd1-72f2-bff7-8a0d997c4b66"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn(shared_turn, "max")],
+                relative_path=Path(
+                    "sessions",
+                    f"rollout-a-{ROOT}.jsonl",
+                ),
+            )
+            write_rollout(
+                home,
+                ROOT,
+                [
+                    meta(ROOT, ROOT),
+                    turn(
+                        shared_turn,
+                        "max",
+                        model="openai/gpt-5.6-sol",
+                    ),
+                ],
+                relative_path=Path(
+                    "sessions",
+                    f"rollout-b-{ROOT}.jsonl",
+                ),
+            )
+
+            self.assertEqual(
+                self.run_helper(home),
+                sentence("GPT-5.6 Sol Max"),
+            )
+
+    def test_canonical_model_alias_does_not_hide_true_replay_conflict(
+        self,
+    ) -> None:
+        shared_turn = "019ff116-ddd1-72f2-bff7-8a0d997c4b66"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn(shared_turn, "max")],
+                relative_path=Path(
+                    "sessions",
+                    f"rollout-a-{ROOT}.jsonl",
+                ),
+            )
+            write_rollout(
+                home,
+                ROOT,
+                [
+                    meta(ROOT, ROOT),
+                    turn(
+                        shared_turn,
+                        "max",
+                        model="openai/gpt-5.6-terra",
+                    ),
+                ],
+                relative_path=Path(
+                    "sessions",
+                    f"rollout-b-{ROOT}.jsonl",
+                ),
+            )
+
+            self.assertEqual(self.run_helper(home), FALLBACK)
+
     def test_selected_child_chain_is_counted_without_parent_activity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             home = Path(temporary_directory)
@@ -1063,6 +1180,26 @@ class PrAttributionTests(unittest.TestCase):
                 )
                 self.assertEqual(self.run_helper(home), FALLBACK)
 
+    def test_nonprintable_rollout_directory_uses_fallback(self) -> None:
+        for root_name in ("sessions", "archived_sessions"):
+            with (
+                self.subTest(root_name=root_name),
+                tempfile.TemporaryDirectory() as temporary_directory,
+            ):
+                home = Path(temporary_directory)
+                write_rollout(
+                    home,
+                    ROOT,
+                    [meta(ROOT, ROOT), turn("root-a", "max")],
+                    relative_path=Path(
+                        root_name,
+                        "2026\n08",
+                        f"rollout-{ROOT}.jsonl",
+                    ),
+                )
+
+                self.assertEqual(self.run_helper(home), FALLBACK)
+
     def test_conflicting_cross_file_copy_uses_fallback(self) -> None:
         shared = "019ff116-ddd1-72f2-bff7-8a0d997c4b66"
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1352,6 +1489,57 @@ class PrAttributionTests(unittest.TestCase):
                 ):
                     self.assertEqual(helper.render_sentence(home, ROOT), expected)
 
+    def test_rollout_content_is_frozen_before_inventory_returns(self) -> None:
+        helper = load_helper_module()
+        for root_name in ("sessions", "archived_sessions"):
+            with (
+                self.subTest(root_name=root_name),
+                tempfile.TemporaryDirectory() as temporary_directory,
+            ):
+                home = Path(temporary_directory)
+                rollout = write_rollout(
+                    home,
+                    ROOT,
+                    [meta(ROOT, ROOT), turn("root-a", "max")],
+                    relative_path=Path(
+                        root_name,
+                        f"rollout-{ROOT}.jsonl",
+                    ),
+                )
+                original_inventory = helper.inventory_rollouts
+                original_metadata = rollout.stat()
+
+                def inventory_then_rewrite(*args, **kwargs):
+                    result = original_inventory(*args, **kwargs)
+                    content = rollout.read_bytes()
+                    self.assertIn(b'"effort": "max"', content)
+                    replacement = content.replace(
+                        b'"effort": "max"',
+                        b'"effort": "low"',
+                    )
+                    self.assertEqual(len(replacement), len(content))
+                    rollout.write_bytes(replacement)
+                    rewritten_metadata = rollout.stat()
+                    self.assertEqual(
+                        (rewritten_metadata.st_dev, rewritten_metadata.st_ino),
+                        (original_metadata.st_dev, original_metadata.st_ino),
+                    )
+                    self.assertEqual(
+                        rewritten_metadata.st_size,
+                        original_metadata.st_size,
+                    )
+                    return result
+
+                with mock.patch.object(
+                    helper,
+                    "inventory_rollouts",
+                    side_effect=inventory_then_rewrite,
+                ):
+                    self.assertEqual(
+                        helper.render_sentence(home, ROOT),
+                        helper.SENTENCE.format(helper.FALLBACK_LABEL),
+                    )
+
     def test_final_revalidation_rejects_same_size_prefix_rewrite(self) -> None:
         helper = load_helper_module()
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1479,6 +1667,34 @@ class PrAttributionTests(unittest.TestCase):
                 helper,
                 "inventory_rollouts",
                 side_effect=inventory_then_add_nested,
+            ):
+                self.assertEqual(
+                    helper.render_sentence(home, ROOT),
+                    helper.SENTENCE.format(helper.FALLBACK_LABEL),
+                )
+
+    def test_nonprintable_directory_added_after_inventory_uses_fallback(
+        self,
+    ) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn("root-a", "max")],
+            )
+            original_inventory = helper.inventory_rollouts
+
+            def inventory_then_add_directory(*args, **kwargs):
+                result = original_inventory(*args, **kwargs)
+                (home / "sessions" / "late\nsegment").mkdir()
+                return result
+
+            with mock.patch.object(
+                helper,
+                "inventory_rollouts",
+                side_effect=inventory_then_add_directory,
             ):
                 self.assertEqual(
                     helper.render_sentence(home, ROOT),
