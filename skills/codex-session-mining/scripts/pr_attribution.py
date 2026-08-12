@@ -347,6 +347,42 @@ def inventory_rollouts(
     return by_session, active_paths, identities, filename_owned_paths
 
 
+def discover_metadata_children(
+    rollouts: Mapping[str, Sequence[Path]],
+    active_paths: Set[Path],
+    identities: Mapping[Path, FileIdentity],
+    deadline: float,
+) -> Dict[str, Set[str]]:
+    children: Dict[str, Set[str]] = {}
+    owned_paths = {owner: set(paths) for owner, paths in rollouts.items()}
+    links = 0
+    for path in sorted(identities):
+        for row in iter_records(
+            path,
+            identities[path],
+            deadline,
+            allow_partial_tail=path in active_paths,
+        ):
+            if row.get("type") != "session_meta":
+                continue
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                raise RolloutError("session metadata payload is invalid")
+            owner = lifecycle_id(payload)
+            if owner is None or path not in owned_paths.get(owner, ()):
+                continue
+            parent_id = parent_thread_id(payload)
+            if parent_id is None:
+                continue
+            parent_children = children.setdefault(parent_id, set())
+            if owner not in parent_children:
+                links += 1
+                if links > MAX_ENTRIES:
+                    raise RolloutError("rollout metadata has too many family links")
+                parent_children.add(owner)
+    return children
+
+
 def resolve_root(
     rollouts: Mapping[str, Sequence[Path]],
     active_paths: Set[Path],
@@ -454,6 +490,12 @@ def collect_votes(
     seed_ids: Sequence[str],
     deadline: float,
 ) -> Dict[TurnKey, Vote]:
+    metadata_children = discover_metadata_children(
+        rollouts,
+        active_paths,
+        identities,
+        deadline,
+    )
     pending = deque([root_id])
     scheduled = {root_id}
     for seed_id in seed_ids:
@@ -507,6 +549,13 @@ def collect_votes(
         session_root, _session_parent = resolve_binding(session_id)
         if session_root != root_id:
             raise RolloutError("scheduled lifecycle is outside the task family")
+        for child_id in sorted(metadata_children.get(session_id, ())):
+            child_root, child_parent = resolve_binding(child_id)
+            if child_root != root_id or child_parent != session_id:
+                raise RolloutError("session metadata child binding is inconsistent")
+            if child_id not in scheduled:
+                pending.append(child_id)
+                scheduled.add(child_id)
         for path in rollouts.get(session_id, ()):
             if path in processed_paths:
                 continue

@@ -182,6 +182,104 @@ class PrAttributionTests(unittest.TestCase):
                 sentence("GPT-5.6 Sol Extra High"),
             )
 
+    def test_metadata_only_descendants_are_counted_from_every_family_member(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn("root-a", "max"), turn("root-b", "max")],
+            )
+            write_rollout(
+                home,
+                CHILD,
+                [meta(CHILD, ROOT, parent_id=ROOT), turn("child-a", "xhigh")],
+            )
+            write_rollout(
+                home,
+                GRANDCHILD,
+                [
+                    meta(GRANDCHILD, ROOT, parent_id=CHILD),
+                    turn("grandchild-a", "xhigh"),
+                    turn("grandchild-b", "xhigh"),
+                ],
+            )
+            write_rollout(
+                home,
+                UNRELATED,
+                [
+                    meta(UNRELATED, UNRELATED),
+                    turn("unrelated-a", "ultra"),
+                    turn("unrelated-b", "ultra"),
+                    turn("unrelated-c", "ultra"),
+                    turn("unrelated-d", "ultra"),
+                ],
+            )
+
+            for selected_id in (ROOT, CHILD, GRANDCHILD):
+                with self.subTest(selected_id=selected_id):
+                    self.assertEqual(
+                        self.run_helper(home, "--session-id", selected_id),
+                        sentence("GPT-5.6 Sol Extra High"),
+                    )
+
+    def test_metadata_only_legacy_child_is_discovered_from_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn("root-a", "max")],
+                relative_path=Path("archived_sessions", "rollout-root-legacy.jsonl"),
+            )
+            write_rollout(
+                home,
+                CHILD,
+                [
+                    meta(CHILD, ROOT, parent_id=ROOT),
+                    turn("child-a", "xhigh"),
+                    turn("child-b", "xhigh"),
+                ],
+                relative_path=Path("archived_sessions", "rollout-child-legacy.jsonl"),
+            )
+
+            self.assertEqual(
+                self.run_helper(home),
+                sentence("GPT-5.6 Sol Extra High"),
+            )
+
+    def test_metadata_only_child_with_inconsistent_root_uses_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(home, ROOT, [meta(ROOT, ROOT), turn("root-a", "max")])
+            write_rollout(
+                home,
+                CHILD,
+                [
+                    meta(CHILD, UNRELATED, parent_id=ROOT),
+                    turn("child-a", "xhigh"),
+                    turn("child-b", "xhigh"),
+                ],
+            )
+
+            self.assertEqual(self.run_helper(home), FALLBACK)
+
+    def test_unrelated_modern_malformed_rollout_uses_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(home, ROOT, [meta(ROOT, ROOT), turn("root-a", "max")])
+            unrelated_path = write_rollout(
+                home,
+                UNRELATED,
+                [meta(UNRELATED, UNRELATED), turn("unrelated-a", "ultra")],
+            )
+            with unrelated_path.open("a", encoding="utf-8") as handle:
+                handle.write("{malformed-json}\n")
+
+            self.assertEqual(self.run_helper(home), FALLBACK)
+
     def test_selected_child_without_root_provenance_uses_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             home = Path(temporary_directory)
