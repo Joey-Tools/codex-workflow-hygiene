@@ -1,6 +1,6 @@
 ---
 name: codex-session-mining
-description: Search the user's `~/.codex` active and archived session/history artifacts to recover prior work, audit recent activity, find rollout files by session ID or date, or summarize repeated workflow issues. Use when the task depends on `session_index.jsonl`, `history.jsonl`, `sessions/**/rollout-*.jsonl`, `archived_sessions/**/rollout-*.jsonl`, or a complete current-host session corpus; pair with an environment-specific remote evidence workflow when remote-host evidence may matter.
+description: Search the user's `~/.codex` active and archived session/history artifacts to recover prior work, audit recent activity, find rollout files by session ID or date, summarize repeated workflow issues, or derive the OpenAI Codex PR attribution note from a task family. Use when the task depends on `session_index.jsonl`, `history.jsonl`, `sessions/**/rollout-*.jsonl`, `archived_sessions/**/rollout-*.jsonl`, or a complete current-host session corpus; pair with an environment-specific remote evidence workflow when remote-host evidence may matter.
 ---
 
 # Codex Session Mining
@@ -76,6 +76,21 @@ Use this skill for:
 - Quote or summarize only the decisive lines.
 - Keep the evidence tied to exact session IDs, dates, or file paths so the conclusion is auditable.
 - If the evidence is inconclusive, say which narrower search or missing host would resolve it fastest.
+
+## PR Attribution
+
+For a wholly Codex-authored PR, render the exact note sentence with:
+
+```bash
+python3 "$CODEX_HOME/skills/codex-session-mining/scripts/pr_attribution.py"
+```
+
+- The helper uses `--session-id` or exact `CODEX_THREAD_ID`, resolves the containing Desktop root task from session metadata and subagent provenance, and never guesses the latest task.
+- It inventories active and archived rollouts, including legacy filenames whose lifecycle ID is available only in bounded `session_meta`, binds each file's object identity while allowing active append, and applies bounded regular-file reads, inventory and turn caps, plus a shared best-effort deadline.
+- It follows recursive subagents, tracks each validated `session_meta` lifecycle cursor, counts one latest complete `(model, effort)` pair per unique `(lifecycle_id, turn_id)`, selects the pair mode, and breaks a tie with the UUIDv7 turn timestamp rather than a replayable record timestamp. This collapses replay copies without merging opaque turn IDs from distinct lifecycles; unknown ownership, conflicting copies, or an ambiguous same-millisecond tie fall back.
+- It always uses the whole task family. Resume, compaction, and replay can copy old turns with new record timestamps, so a simple time cutoff is not a reliable change-set boundary.
+- Unknown mappings, incomplete or unsafe rollout evidence, no usable complete pair, or a tie without reliable turn ordering produce the full `GPT-5.6 Sol Ultra` fallback sentence.
+- Run it when opening the PR and immediately before merge. If the sentence changed, update the PR body before merging.
 
 ## Guardrails
 
