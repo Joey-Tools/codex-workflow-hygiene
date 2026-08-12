@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1249,6 +1250,500 @@ class PrAttributionTests(unittest.TestCase):
                         deadline,
                         allow_partial_tail=True,
                     )
+                )
+
+    def test_archived_rollout_snapshot_rejects_append_after_inventory(
+        self,
+    ) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            rollout = Path(temporary_directory) / "rollout.jsonl"
+            rollout.write_bytes(b'{"a":1}\n')
+            metadata = rollout.stat()
+            snapshot = helper.FileSnapshot(
+                identity=(metadata.st_dev, metadata.st_ino),
+                inventory_size=metadata.st_size,
+            )
+            deadline = helper.time.monotonic() + 5
+
+            self.assertEqual(
+                list(
+                    helper.iter_records(
+                        rollout,
+                        snapshot,
+                        deadline,
+                        allow_partial_tail=False,
+                    )
+                ),
+                [{"a": 1}],
+            )
+            with rollout.open("ab") as handle:
+                handle.write(b'{"appended":true}\n')
+            with self.assertRaises(helper.RolloutError):
+                list(
+                    helper.iter_records(
+                        rollout,
+                        snapshot,
+                        deadline,
+                        allow_partial_tail=False,
+                    )
+                )
+
+    def test_archived_rollout_snapshot_rejects_same_size_rewrite(self) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            rollout = Path(temporary_directory) / "rollout.jsonl"
+            rollout.write_bytes(b'{"a":1}\n')
+            metadata = rollout.stat()
+            snapshot = helper.FileSnapshot(
+                identity=(metadata.st_dev, metadata.st_ino),
+                inventory_size=metadata.st_size,
+            )
+            deadline = helper.time.monotonic() + 5
+
+            self.assertEqual(
+                list(
+                    helper.iter_records(
+                        rollout,
+                        snapshot,
+                        deadline,
+                        allow_partial_tail=False,
+                    )
+                ),
+                [{"a": 1}],
+            )
+            rollout.write_bytes(b'{"b":2}\n')
+            with self.assertRaisesRegex(helper.RolloutError, "prefix changed"):
+                list(
+                    helper.iter_records(
+                        rollout,
+                        snapshot,
+                        deadline,
+                        allow_partial_tail=False,
+                    )
+                )
+
+    def test_post_inventory_append_policy_depends_on_rollout_root(self) -> None:
+        helper = load_helper_module()
+        for root_name, expected in (
+            ("sessions", helper.SENTENCE.format("GPT-5.6 Sol Max")),
+            ("archived_sessions", helper.SENTENCE.format(helper.FALLBACK_LABEL)),
+        ):
+            with self.subTest(root_name=root_name), tempfile.TemporaryDirectory() as temporary_directory:
+                home = Path(temporary_directory)
+                rollout = write_rollout(
+                    home,
+                    ROOT,
+                    [meta(ROOT, ROOT), turn("root-a", "max")],
+                    relative_path=Path(root_name, f"rollout-{ROOT}.jsonl"),
+                )
+                original_inventory = helper.inventory_rollouts
+
+                def inventory_then_append(*args, **kwargs):
+                    result = original_inventory(*args, **kwargs)
+                    with rollout.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(turn("root-b", "low")) + "\n")
+                    return result
+
+                with mock.patch.object(
+                    helper,
+                    "inventory_rollouts",
+                    side_effect=inventory_then_append,
+                ):
+                    self.assertEqual(helper.render_sentence(home, ROOT), expected)
+
+    def test_final_revalidation_rejects_same_size_prefix_rewrite(self) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            rollout = write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn("root-a", "max")],
+            )
+            original_revalidate = helper.revalidate_rollout_contents
+
+            def rewrite_then_revalidate(*args, **kwargs):
+                content = rollout.read_bytes()
+                self.assertIn(b'"effort": "max"', content)
+                rollout.write_bytes(content.replace(b'"effort": "max"', b'"effort": "low"'))
+                return original_revalidate(*args, **kwargs)
+
+            with mock.patch.object(
+                helper,
+                "revalidate_rollout_contents",
+                side_effect=rewrite_then_revalidate,
+            ):
+                self.assertEqual(
+                    helper.render_sentence(home, ROOT),
+                    helper.SENTENCE.format(helper.FALLBACK_LABEL),
+                )
+
+    def test_rewrite_after_content_revalidation_uses_fallback(self) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            rollout = write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn("root-a", "max")],
+            )
+            original_revalidate = helper.revalidate_rollout_contents
+
+            def revalidate_then_rewrite(*args, **kwargs):
+                result = original_revalidate(*args, **kwargs)
+                content = rollout.read_bytes()
+                self.assertIn(b'"effort": "max"', content)
+                rollout.write_bytes(content.replace(b'"effort": "max"', b'"effort": "low"'))
+                return result
+
+            with mock.patch.object(
+                helper,
+                "revalidate_rollout_contents",
+                side_effect=revalidate_then_rewrite,
+            ):
+                self.assertEqual(
+                    helper.render_sentence(home, ROOT),
+                    helper.SENTENCE.format(helper.FALLBACK_LABEL),
+                )
+
+    def test_rollout_candidate_added_after_inventory_uses_fallback(self) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            root_path = write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn("root-a", "max")],
+            )
+            child_path = root_path.with_name(f"rollout-late-{CHILD}.jsonl")
+            original_inventory = helper.inventory_rollouts
+
+            def inventory_then_add(*args, **kwargs):
+                result = original_inventory(*args, **kwargs)
+                child_path.write_text(
+                    "".join(
+                        json.dumps(row, sort_keys=True) + "\n"
+                        for row in (
+                            meta(CHILD, ROOT, parent_id=ROOT),
+                            turn("child-a", "xhigh"),
+                            turn("child-b", "xhigh"),
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                return result
+
+            with mock.patch.object(
+                helper,
+                "inventory_rollouts",
+                side_effect=inventory_then_add,
+            ):
+                self.assertEqual(
+                    helper.render_sentence(home, ROOT),
+                    helper.SENTENCE.format(helper.FALLBACK_LABEL),
+                )
+
+    def test_nested_rollout_candidate_added_after_inventory_uses_fallback(
+        self,
+    ) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn("root-a", "max")],
+            )
+            original_inventory = helper.inventory_rollouts
+
+            def inventory_then_add_nested(*args, **kwargs):
+                result = original_inventory(*args, **kwargs)
+                write_rollout(
+                    home,
+                    CHILD,
+                    [
+                        meta(CHILD, ROOT, parent_id=ROOT),
+                        turn("child-a", "xhigh"),
+                    ],
+                    relative_path=Path(
+                        "sessions",
+                        "late",
+                        "nested",
+                        f"rollout-{CHILD}.jsonl",
+                    ),
+                )
+                return result
+
+            with mock.patch.object(
+                helper,
+                "inventory_rollouts",
+                side_effect=inventory_then_add_nested,
+            ):
+                self.assertEqual(
+                    helper.render_sentence(home, ROOT),
+                    helper.SENTENCE.format(helper.FALLBACK_LABEL),
+                )
+
+    def test_candidate_added_during_directory_projection_is_rejected(
+        self,
+    ) -> None:
+        helper = load_helper_module()
+        for insertion_pass in (1, 2, 3):
+            with self.subTest(insertion_pass=insertion_pass), tempfile.TemporaryDirectory() as temporary_directory:
+                home = Path(temporary_directory)
+                root_path = write_rollout(
+                    home,
+                    ROOT,
+                    [meta(ROOT, ROOT), turn("root-a", "max")],
+                )
+                child_path = root_path.with_name(f"rollout-late-{CHILD}.jsonl")
+                target_metadata = root_path.parent.stat()
+                target_identity = (target_metadata.st_dev, target_metadata.st_ino)
+                original_scandir = helper.os.scandir
+                target_passes = 0
+                inserted = False
+
+                class ScandirWrapper:
+                    def __init__(self, wrapped):
+                        self.wrapped = wrapped
+
+                    def __enter__(self):
+                        self.iterator = iter(self.wrapped.__enter__())
+                        return self
+
+                    def __exit__(self, *args):
+                        return self.wrapped.__exit__(*args)
+
+                    def __iter__(self):
+                        return self
+
+                    def __next__(self):
+                        nonlocal inserted
+                        try:
+                            return next(self.iterator)
+                        except StopIteration:
+                            if not inserted:
+                                inserted = True
+                                child_path.write_text(
+                                    "".join(
+                                        json.dumps(row, sort_keys=True) + "\n"
+                                        for row in (
+                                            meta(CHILD, ROOT, parent_id=ROOT),
+                                            turn("child-a", "xhigh"),
+                                        )
+                                    ),
+                                    encoding="utf-8",
+                                )
+                            raise
+
+                def scandir_then_add(path):
+                    nonlocal target_passes
+                    wrapped = original_scandir(path)
+                    if not isinstance(path, int):
+                        return wrapped
+                    metadata = os.fstat(path)
+                    if (metadata.st_dev, metadata.st_ino) == target_identity:
+                        target_passes += 1
+                        if not inserted and target_passes == insertion_pass:
+                            return ScandirWrapper(wrapped)
+                    return wrapped
+
+                with mock.patch.object(
+                    helper.os,
+                    "scandir",
+                    side_effect=scandir_then_add,
+                ):
+                    with self.assertRaisesRegex(
+                        helper.RolloutError,
+                        "rollout inventory changed during traversal",
+                    ):
+                        helper.scan_rollout_inventory(
+                            home,
+                            helper.time.monotonic() + 5,
+                        )
+                self.assertTrue(inserted)
+                if insertion_pass == 3:
+                    self.assertGreaterEqual(target_passes, 4)
+
+    def test_non_candidate_churn_during_revalidation_is_retried(self) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            root_path = write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn("root-a", "max")],
+            )
+            note_path = root_path.with_name("notes.tmp")
+            target_metadata = root_path.parent.stat()
+            target_identity = (target_metadata.st_dev, target_metadata.st_ino)
+            original_scandir = helper.os.scandir
+            target_passes = 0
+            inserted = False
+            signal_before = None
+            signal_after = None
+
+            class ScandirWrapper:
+                def __init__(self, wrapped):
+                    self.wrapped = wrapped
+
+                def __enter__(self):
+                    self.iterator = iter(self.wrapped.__enter__())
+                    return self
+
+                def __exit__(self, *args):
+                    return self.wrapped.__exit__(*args)
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    nonlocal inserted, signal_after, signal_before
+                    try:
+                        return next(self.iterator)
+                    except StopIteration:
+                        if not inserted:
+                            before_metadata = root_path.parent.stat()
+                            signal_before = (
+                                before_metadata.st_mtime_ns,
+                                before_metadata.st_ctime_ns,
+                                before_metadata.st_size,
+                                before_metadata.st_nlink,
+                            )
+                            inserted = True
+                            note_path.write_text(
+                                "candidate-neutral churn\n",
+                                encoding="utf-8",
+                            )
+                            after_metadata = root_path.parent.stat()
+                            signal_after = (
+                                after_metadata.st_mtime_ns,
+                                after_metadata.st_ctime_ns,
+                                after_metadata.st_size,
+                                after_metadata.st_nlink,
+                            )
+                        raise
+
+            def scandir_then_add_note(path):
+                nonlocal target_passes
+                wrapped = original_scandir(path)
+                if not isinstance(path, int):
+                    return wrapped
+                metadata = os.fstat(path)
+                if (metadata.st_dev, metadata.st_ino) == target_identity:
+                    target_passes += 1
+                    if not inserted and target_passes == 3:
+                        return ScandirWrapper(wrapped)
+                return wrapped
+
+            with mock.patch.object(
+                helper.os,
+                "scandir",
+                side_effect=scandir_then_add_note,
+            ):
+                inventory, _candidate_metadata = helper.scan_rollout_inventory(
+                    home,
+                    helper.time.monotonic() + 5,
+                )
+            self.assertIn(root_path, inventory.candidates)
+            self.assertTrue(inserted)
+            self.assertNotEqual(signal_before, signal_after)
+            self.assertGreaterEqual(target_passes, 4)
+
+    def test_rollout_candidate_removed_or_replaced_after_inventory_uses_fallback(
+        self,
+    ) -> None:
+        helper = load_helper_module()
+        for mutation in ("remove", "replace"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary_directory:
+                home = Path(temporary_directory)
+                rollout = write_rollout(
+                    home,
+                    ROOT,
+                    [meta(ROOT, ROOT), turn("root-a", "max")],
+                )
+                original_inventory = helper.inventory_rollouts
+
+                def inventory_then_mutate(*args, **kwargs):
+                    result = original_inventory(*args, **kwargs)
+                    if mutation == "remove":
+                        rollout.unlink()
+                    else:
+                        replacement = rollout.with_name("replacement.jsonl")
+                        replacement.write_bytes(rollout.read_bytes())
+                        os.replace(replacement, rollout)
+                    return result
+
+                with mock.patch.object(
+                    helper,
+                    "inventory_rollouts",
+                    side_effect=inventory_then_mutate,
+                ):
+                    self.assertEqual(
+                        helper.render_sentence(home, ROOT),
+                        helper.SENTENCE.format(helper.FALLBACK_LABEL),
+                    )
+
+    def test_rollout_directory_replaced_after_inventory_uses_fallback(self) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn("root-a", "max")],
+            )
+            selected_directory = home / "sessions" / "empty"
+            selected_directory.mkdir()
+            replacement_directory = home / "replacement-empty"
+            replacement_directory.mkdir()
+            retained_directory = home / "retained-empty"
+            original_inventory = helper.inventory_rollouts
+
+            def inventory_then_replace(*args, **kwargs):
+                result = original_inventory(*args, **kwargs)
+                selected_directory.rename(retained_directory)
+                replacement_directory.rename(selected_directory)
+                return result
+
+            with mock.patch.object(
+                helper,
+                "inventory_rollouts",
+                side_effect=inventory_then_replace,
+            ):
+                self.assertEqual(
+                    helper.render_sentence(home, ROOT),
+                    helper.SENTENCE.format(helper.FALLBACK_LABEL),
+                )
+
+    def test_non_candidate_file_added_after_inventory_is_ignored(self) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            root_path = write_rollout(
+                home,
+                ROOT,
+                [meta(ROOT, ROOT), turn("root-a", "max")],
+            )
+            original_inventory = helper.inventory_rollouts
+
+            def inventory_then_add_note(*args, **kwargs):
+                result = original_inventory(*args, **kwargs)
+                root_path.with_name("notes.tmp").write_text(
+                    "candidate-neutral churn\n",
+                    encoding="utf-8",
+                )
+                return result
+
+            with mock.patch.object(
+                helper,
+                "inventory_rollouts",
+                side_effect=inventory_then_add_note,
+            ):
+                self.assertEqual(
+                    helper.render_sentence(home, ROOT),
+                    helper.SENTENCE.format("GPT-5.6 Sol Max"),
                 )
 
     def test_skill_contract_routes_pr_note_to_helper(self) -> None:

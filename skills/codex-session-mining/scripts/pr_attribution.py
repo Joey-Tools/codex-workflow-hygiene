@@ -36,6 +36,8 @@ MAX_PROBE_BYTES = 1024 * 1024
 MAX_ENTRIES = 100_000
 MAX_FILES = 50_000
 MAX_DEPTH = 8
+MAX_INVENTORY_REVALIDATION_ATTEMPTS = 3
+MAX_REVALIDATION_ENTRIES = MAX_ENTRIES * MAX_INVENTORY_REVALIDATION_ATTEMPTS
 MAX_TURNS = 100_000
 MAX_VOTE_COPIES = 200_000
 MAX_ID_CHARS = 1024
@@ -78,6 +80,26 @@ class FileSnapshot:
     inventory_size: int
     prefix_size: Optional[int] = None
     prefix_sha256: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CandidateSnapshot:
+    identity: FileIdentity
+    size: int
+    active: bool
+
+
+@dataclass(frozen=True)
+class DirectoryEntrySnapshot:
+    name: str
+    identity: FileIdentity
+    file_type: int
+
+
+@dataclass(frozen=True)
+class InventorySnapshot:
+    directories: Mapping[Path, FileIdentity]
+    candidates: Mapping[Path, CandidateSnapshot]
 
 
 def check_deadline(deadline: float) -> None:
@@ -212,6 +234,26 @@ def open_rollout(path: Path, expected_identity: FileIdentity) -> BinaryIO:
         raise RolloutError("unable to open selected rollout") from exc
 
 
+def validate_rollout_size(
+    handle: BinaryIO,
+    snapshot: FileSnapshot,
+    read_limit: int,
+    *,
+    allow_partial_tail: bool,
+) -> None:
+    try:
+        size = os.fstat(handle.fileno()).st_size
+    except OSError as exc:
+        raise RolloutError("unable to inspect selected rollout") from exc
+    if size > MAX_FILE_BYTES:
+        raise RolloutError("selected rollout exceeds a file bound")
+    if allow_partial_tail:
+        if size < read_limit:
+            raise RolloutError("selected rollout was truncated after inventory")
+    elif size != snapshot.inventory_size:
+        raise RolloutError("archived rollout size changed after inventory")
+
+
 def iter_records(
     path: Path,
     snapshot: FileSnapshot,
@@ -222,15 +264,17 @@ def iter_records(
 ) -> Iterator[Mapping[str, object]]:
     consumed = 0
     digest = hashlib.sha256()
-    read_limit = (
-        snapshot.prefix_size
-        if snapshot.prefix_size is not None
-        else snapshot.inventory_size
-    )
+    read_limit = snapshot.inventory_size
+    if allow_partial_tail and snapshot.prefix_size is not None:
+        read_limit = snapshot.prefix_size
     try:
         with open_rollout(path, snapshot.identity) as handle:
-            if os.fstat(handle.fileno()).st_size < read_limit:
-                raise RolloutError("selected rollout was truncated after inventory")
+            validate_rollout_size(
+                handle,
+                snapshot,
+                read_limit,
+                allow_partial_tail=allow_partial_tail,
+            )
             while consumed < read_limit:
                 check_deadline(deadline)
                 raw = handle.readline(
@@ -245,6 +289,12 @@ def iter_records(
                     if allow_partial_tail and snapshot.prefix_size is None:
                         snapshot.prefix_size = consumed - len(raw)
                         snapshot.prefix_sha256 = digest.hexdigest()
+                        validate_rollout_size(
+                            handle,
+                            snapshot,
+                            snapshot.prefix_size,
+                            allow_partial_tail=True,
+                        )
                         return
                     raise RolloutError("archived rollout has an incomplete record")
                 digest.update(raw)
@@ -255,6 +305,12 @@ def iter_records(
                 if not isinstance(row, dict):
                     raise RolloutError("selected rollout record is not an object")
                 yield row
+            validate_rollout_size(
+                handle,
+                snapshot,
+                read_limit,
+                allow_partial_tail=allow_partial_tail,
+            )
             current_digest = digest.hexdigest()
             if snapshot.prefix_size is None:
                 snapshot.prefix_size = consumed
@@ -297,88 +353,351 @@ def probe_lifecycle_ids(
     return tuple(sorted(lifecycle_ids))
 
 
-def inventory_rollouts(
+def is_rollout_candidate(filename: str) -> bool:
+    return filename.startswith("rollout-") and filename.endswith(".jsonl")
+
+
+def directory_open_flags() -> int:
+    try:
+        return os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    except AttributeError as exc:
+        raise RolloutError("descriptor-relative rollout inventory is unsupported") from exc
+
+
+def scan_rollout_inventory(
     codex_home: Path,
     deadline: float,
-) -> Tuple[Dict[str, List[Path]], Set[Path], Dict[Path, FileSnapshot], Set[Path]]:
-    by_session: Dict[str, List[Path]] = {}
-    active_paths: Set[Path] = set()
-    identities: Dict[Path, FileSnapshot] = {}
-    filename_owned_paths: Set[Path] = set()
+) -> Tuple[InventorySnapshot, Dict[Path, os.stat_result]]:
+    directories: Dict[Path, FileIdentity] = {}
+    candidates: Dict[Path, CandidateSnapshot] = {}
+    candidate_metadata: Dict[Path, os.stat_result] = {}
     entry_count = 0
     file_count = 0
+    revalidation_entry_count = 0
     for root_name in ("sessions", "archived_sessions"):
         root = codex_home / root_name
         try:
-            root_stat = root.lstat()
+            root_fd = os.open(root, directory_open_flags())
         except FileNotFoundError:
             continue
         except OSError as exc:
             raise RolloutError("unable to inspect rollout root") from exc
-        if not stat.S_ISDIR(root_stat.st_mode):
-            raise RolloutError("rollout root is not a directory")
-        pending = [(root, 0)]
-        while pending:
-            directory, depth = pending.pop()
+
+        root_directories: Dict[Path, FileIdentity] = {}
+        directory_entries: Dict[Path, Tuple[DirectoryEntrySnapshot, ...]] = {}
+
+        def walk_directory(directory_fd: int, directory: Path, depth: int) -> None:
+            nonlocal entry_count, file_count
             check_deadline(deadline)
             try:
-                with os.scandir(directory) as entries:
+                directory_stat = os.fstat(directory_fd)
+                directory_identity = (
+                    directory_stat.st_dev,
+                    directory_stat.st_ino,
+                )
+                if not stat.S_ISDIR(directory_stat.st_mode):
+                    raise RolloutError("rollout inventory root is not a directory")
+                directories[directory] = directory_identity
+                root_directories[directory] = directory_identity
+                relevant_entries: List[DirectoryEntrySnapshot] = []
+                with os.scandir(directory_fd) as entries:
                     for entry in entries:
                         check_deadline(deadline)
                         entry_count += 1
                         if entry_count > MAX_ENTRIES:
                             raise RolloutError("rollout inventory is too large")
+                        filename = entry.name
+                        path = directory / filename
+                        if is_rollout_candidate(filename):
+                            file_count += 1
+                            if file_count > MAX_FILES:
+                                raise RolloutError(
+                                    "rollout inventory has too many files"
+                                )
+                            if any(not character.isprintable() for character in filename):
+                                raise RolloutError("rollout filename is not printable")
+                            try:
+                                metadata = entry.stat(follow_symlinks=False)
+                            except OSError as exc:
+                                raise RolloutError(
+                                    "unable to inspect rollout file"
+                                ) from exc
+                            if (
+                                not stat.S_ISREG(metadata.st_mode)
+                                or metadata.st_size > MAX_FILE_BYTES
+                            ):
+                                raise RolloutError(
+                                    "rollout inventory contains an unsafe file"
+                                )
+                            candidate = CandidateSnapshot(
+                                identity=(metadata.st_dev, metadata.st_ino),
+                                size=metadata.st_size,
+                                active=root_name == "sessions",
+                            )
+                            if path in candidates:
+                                raise RolloutError(
+                                    "rollout inventory contains a duplicate path"
+                                )
+                            candidates[path] = candidate
+                            candidate_metadata[path] = metadata
+                            relevant_entries.append(
+                                DirectoryEntrySnapshot(
+                                    filename,
+                                    candidate.identity,
+                                    stat.S_IFMT(metadata.st_mode),
+                                )
+                            )
+                            continue
                         if entry.is_dir(follow_symlinks=False):
                             if depth + 1 > MAX_DEPTH:
                                 raise RolloutError("rollout inventory is too deep")
-                            pending.append((Path(entry.path), depth + 1))
-                            continue
-                        filename = entry.name
-                        if not filename.startswith("rollout-") or not filename.endswith(".jsonl"):
-                            continue
-                        file_count += 1
-                        if file_count > MAX_FILES:
-                            raise RolloutError("rollout inventory has too many files")
-                        if any(not character.isprintable() for character in filename):
-                            raise RolloutError("rollout filename is not printable")
-                        try:
-                            metadata = entry.stat(follow_symlinks=False)
-                        except OSError as exc:
-                            raise RolloutError("unable to inspect rollout file") from exc
-                        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_FILE_BYTES:
-                            raise RolloutError("rollout inventory contains an unsafe file")
-                        ids = sorted({match.group(0).lower() for match in UUID_RE.finditer(filename)})
-                        if len(ids) > 1:
-                            raise RolloutError("rollout filename contains multiple task IDs")
-                        path = Path(entry.path)
-                        if ids:
-                            filename_owned_paths.add(path)
-                        snapshot = FileSnapshot(
-                            identity=(metadata.st_dev, metadata.st_ino),
-                            inventory_size=metadata.st_size,
-                        )
-                        identities[path] = snapshot
-                        active = root_name == "sessions"
-                        if active:
-                            active_paths.add(path)
-                        if not ids:
-                            ids.extend(
-                                probe_lifecycle_ids(
-                                    path,
-                                    snapshot,
-                                    active,
-                                    deadline,
+                            try:
+                                metadata = entry.stat(follow_symlinks=False)
+                                child_fd = os.open(
+                                    filename,
+                                    directory_open_flags(),
+                                    dir_fd=directory_fd,
                                 )
-                            )
-                        for session_id in ids:
-                            by_session.setdefault(session_id, []).append(path)
+                            except OSError as exc:
+                                raise RolloutError(
+                                    "unable to open rollout inventory directory"
+                                ) from exc
+                            try:
+                                opened_metadata = os.fstat(child_fd)
+                                if (
+                                    not stat.S_ISDIR(metadata.st_mode)
+                                    or not stat.S_ISDIR(opened_metadata.st_mode)
+                                    or (
+                                        metadata.st_dev,
+                                        metadata.st_ino,
+                                    )
+                                    != (
+                                        opened_metadata.st_dev,
+                                        opened_metadata.st_ino,
+                                    )
+                                ):
+                                    raise RolloutError(
+                                        "rollout inventory directory changed during traversal"
+                                    )
+                                relevant_entries.append(
+                                    DirectoryEntrySnapshot(
+                                        filename,
+                                        (
+                                            opened_metadata.st_dev,
+                                            opened_metadata.st_ino,
+                                        ),
+                                        stat.S_IFMT(opened_metadata.st_mode),
+                                    )
+                                )
+                                walk_directory(child_fd, path, depth + 1)
+                            finally:
+                                os.close(child_fd)
+                final_directory_stat = os.fstat(directory_fd)
+                if (
+                    not stat.S_ISDIR(final_directory_stat.st_mode)
+                    or (
+                        final_directory_stat.st_dev,
+                        final_directory_stat.st_ino,
+                    )
+                    != directory_identity
+                ):
+                    raise RolloutError(
+                        "rollout inventory directory changed during traversal"
+                    )
+                directory_entries[directory] = tuple(
+                    sorted(relevant_entries, key=lambda item: item.name)
+                )
             except RolloutError:
                 raise
             except OSError as exc:
                 raise RolloutError("unable to inventory rollouts") from exc
+
+        try:
+            walk_directory(root_fd, root, 0)
+            for directory, expected_identity in sorted(root_directories.items()):
+                relative_parts = directory.relative_to(root).parts
+                current_fd = os.dup(root_fd)
+                try:
+                    for component in relative_parts:
+                        next_fd = os.open(
+                            component,
+                            directory_open_flags(),
+                            dir_fd=current_fd,
+                        )
+                        os.close(current_fd)
+                        current_fd = next_fd
+                    previous_relevant_entries = None
+                    directory_stable = False
+                    for _attempt in range(MAX_INVENTORY_REVALIDATION_ATTEMPTS):
+                        check_deadline(deadline)
+                        before_metadata = os.fstat(current_fd)
+                        if (
+                            not stat.S_ISDIR(before_metadata.st_mode)
+                            or (
+                                before_metadata.st_dev,
+                                before_metadata.st_ino,
+                            )
+                            != expected_identity
+                        ):
+                            raise RolloutError(
+                                "rollout inventory directory changed during traversal"
+                            )
+                        before_signal = (
+                            before_metadata.st_mtime_ns,
+                            before_metadata.st_ctime_ns,
+                            before_metadata.st_size,
+                            before_metadata.st_nlink,
+                        )
+                        current_relevant_entries: List[DirectoryEntrySnapshot] = []
+                        with os.scandir(current_fd) as entries:
+                            for entry in entries:
+                                revalidation_entry_count += 1
+                                if revalidation_entry_count > MAX_REVALIDATION_ENTRIES:
+                                    raise RolloutError(
+                                        "rollout inventory revalidation is too large"
+                                    )
+                                check_deadline(deadline)
+                                filename = entry.name
+                                entry_metadata = os.stat(
+                                    filename,
+                                    dir_fd=current_fd,
+                                    follow_symlinks=False,
+                                )
+                                if is_rollout_candidate(filename) or stat.S_ISDIR(
+                                    entry_metadata.st_mode
+                                ):
+                                    current_relevant_entries.append(
+                                        DirectoryEntrySnapshot(
+                                            filename,
+                                            (
+                                                entry_metadata.st_dev,
+                                                entry_metadata.st_ino,
+                                            ),
+                                            stat.S_IFMT(entry_metadata.st_mode),
+                                        )
+                                    )
+                        after_metadata = os.fstat(current_fd)
+                        if (
+                            not stat.S_ISDIR(after_metadata.st_mode)
+                            or (
+                                after_metadata.st_dev,
+                                after_metadata.st_ino,
+                            )
+                            != expected_identity
+                        ):
+                            raise RolloutError(
+                                "rollout inventory directory changed during traversal"
+                            )
+                        after_signal = (
+                            after_metadata.st_mtime_ns,
+                            after_metadata.st_ctime_ns,
+                            after_metadata.st_size,
+                            after_metadata.st_nlink,
+                        )
+                        relevant_entries = tuple(
+                            sorted(
+                                current_relevant_entries,
+                                key=lambda item: item.name,
+                            )
+                        )
+                        if directory_entries[directory] != relevant_entries:
+                            raise RolloutError(
+                                "rollout inventory changed during traversal"
+                            )
+                        if (
+                            before_signal == after_signal
+                            and previous_relevant_entries == relevant_entries
+                        ):
+                            directory_stable = True
+                            break
+                        previous_relevant_entries = relevant_entries
+                    if not directory_stable:
+                        raise RolloutError(
+                            "rollout inventory directory did not stabilize"
+                        )
+                except RolloutError:
+                    raise
+                except OSError as exc:
+                    raise RolloutError(
+                        "unable to revalidate rollout inventory directory"
+                    ) from exc
+                finally:
+                    os.close(current_fd)
+        finally:
+            os.close(root_fd)
+    return InventorySnapshot(directories, candidates), candidate_metadata
+
+
+def validate_rollout_inventory(
+    expected: InventorySnapshot,
+    actual: InventorySnapshot,
+) -> None:
+    if set(expected.candidates) != set(actual.candidates):
+        raise RolloutError("rollout candidate set changed after inventory")
+    for path, expected_candidate in expected.candidates.items():
+        actual_candidate = actual.candidates[path]
+        if (
+            actual_candidate.identity != expected_candidate.identity
+            or actual_candidate.active != expected_candidate.active
+        ):
+            raise RolloutError("rollout candidate identity changed after inventory")
+        if not expected_candidate.active and actual_candidate.size != expected_candidate.size:
+            raise RolloutError("archived rollout size changed after inventory")
+    for path, expected_identity in expected.directories.items():
+        if actual.directories.get(path) != expected_identity:
+            raise RolloutError("rollout directory identity changed after inventory")
+
+
+def inventory_rollouts(
+    codex_home: Path,
+    deadline: float,
+) -> Tuple[
+    Dict[str, List[Path]],
+    Set[Path],
+    Dict[Path, FileSnapshot],
+    Set[Path],
+    InventorySnapshot,
+]:
+    inventory, candidate_metadata = scan_rollout_inventory(codex_home, deadline)
+    by_session: Dict[str, List[Path]] = {}
+    active_paths: Set[Path] = set()
+    identities: Dict[Path, FileSnapshot] = {}
+    filename_owned_paths: Set[Path] = set()
+    for path in sorted(inventory.candidates):
+        candidate = inventory.candidates[path]
+        metadata = candidate_metadata[path]
+        ids = sorted({match.group(0).lower() for match in UUID_RE.finditer(path.name)})
+        if len(ids) > 1:
+            raise RolloutError("rollout filename contains multiple task IDs")
+        if ids:
+            filename_owned_paths.add(path)
+        snapshot = FileSnapshot(
+            identity=candidate.identity,
+            inventory_size=metadata.st_size,
+        )
+        identities[path] = snapshot
+        if candidate.active:
+            active_paths.add(path)
+        if not ids:
+            ids.extend(
+                probe_lifecycle_ids(
+                    path,
+                    snapshot,
+                    candidate.active,
+                    deadline,
+                )
+            )
+        for session_id in ids:
+            by_session.setdefault(session_id, []).append(path)
     for paths in by_session.values():
         paths.sort()
-    return by_session, active_paths, identities, filename_owned_paths
+    return (
+        by_session,
+        active_paths,
+        identities,
+        filename_owned_paths,
+        inventory,
+    )
 
 
 def discover_metadata_children(
@@ -707,15 +1026,33 @@ def label_for(pair: Optional[Pair]) -> str:
     return "{} {}".format(MODEL_LABELS[model], EFFORT_LABELS[effort])
 
 
+def revalidate_rollout_contents(
+    active_paths: Set[Path],
+    identities: Mapping[Path, FileSnapshot],
+    deadline: float,
+) -> None:
+    for path in sorted(identities):
+        for _row in iter_records(
+            path,
+            identities[path],
+            deadline,
+            allow_partial_tail=path in active_paths,
+        ):
+            pass
+
+
 def render_sentence(codex_home: Path, session_id: Optional[str]) -> str:
     if not session_id or len(session_id) > MAX_ID_CHARS:
         return SENTENCE.format(FALLBACK_LABEL)
     try:
         deadline = time.monotonic() + DEADLINE_SECONDS
-        rollouts, active_paths, identities, filename_owned_paths = inventory_rollouts(
-            codex_home,
-            deadline,
-        )
+        (
+            rollouts,
+            active_paths,
+            identities,
+            filename_owned_paths,
+            inventory,
+        ) = inventory_rollouts(codex_home, deadline)
         selected_id = normalize_session_id(session_id)
         if selected_id not in rollouts:
             return SENTENCE.format(FALLBACK_LABEL)
@@ -738,6 +1075,13 @@ def render_sentence(codex_home: Path, session_id: Optional[str]) -> str:
             tuple(reversed(chain)),
             deadline,
         )
+        revalidate_rollout_contents(active_paths, identities, deadline)
+        final_inventory, _final_metadata = scan_rollout_inventory(
+            codex_home,
+            deadline,
+        )
+        validate_rollout_inventory(inventory, final_inventory)
+        revalidate_rollout_contents(active_paths, identities, deadline)
         check_deadline(deadline)
     except (MemoryError, RecursionError, RolloutError):
         return SENTENCE.format(FALLBACK_LABEL)
