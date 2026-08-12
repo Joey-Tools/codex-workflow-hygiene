@@ -58,7 +58,9 @@ control-field classification, prose normalization, bounded overlap windows, and
 short source-token matching. `privacy_locators.py` owns working-zone bare-host
 and effective IPv4/IPv6 detection. Working-zone redaction, retained safe
 strings, reviewed prose, and final report validation consume that same locator
-policy; the retained boundary still applies its stricter field and prose
+policy. Protocol locators accept every syntactically legal scheme length and
+rely on the result field's existing character ceiling rather than a privacy-only
+scheme cap; the retained boundary still applies its stricter field and prose
 grammar.
 Keeping these deterministic policies outside the coordinator capabilities
 prevents lifecycle and result-validation modules from growing a second copy of
@@ -193,12 +195,15 @@ and binds the exact owner-controlled common-config bytes. Each later Git command
 holds all four admitted directory descriptors, launches from the held worktree
 descriptor with only relative repository discovery, and revalidates directory
 identity, access policy, config content, and forbidden metadata before and after
-the subprocess. Close failures fail the otherwise-successful command and remain
-secondary evidence when another failure is already primary. These are
-point-in-time checks: they detect path replacement and stable drift but do not
-claim to exclude an actively malicious same-UID ABA after the final pre-launch
-check. A repository that finalize would reject is therefore blocked by
-doctor/start before an expensive retrospective run begins.
+the subprocess. The isolated Python trampoline that performs descriptor-relative
+`fchdir` is itself resolved through the shared executable authority, contributes
+its physical path, content, and access-policy receipt, and is revalidated around
+every Git or GPG child launch. Close failures fail the otherwise-successful
+command and remain secondary evidence when another failure is already primary.
+These are point-in-time checks: they detect path replacement and stable drift but
+do not claim to exclude an actively malicious same-UID ABA after the final
+pre-launch check. A repository that finalize would reject is therefore blocked
+by doctor/start before an expensive retrospective run begins.
 
 Source-program and remote-helper Python bootstraps run with `-I -B -S`; the
 captured bootstrap itself verifies isolated, no-site, no-bytecode flags before
@@ -229,11 +234,11 @@ authority inventory is exactly 1,000/1,000 lines: `run_state_authority.py` 243/2
 `run_state_contracts.py` 37/50, `run_state_cursors.py` 219/225,
 `run_state_holdouts.py` 236/240, and `run_state_lineage.py` 265/275. Including
 this full slice, the orchestrator foundation is 3,297/3,350 lines. The global
-branch proxy is 8,494/8,500 nodes after adding executable path, content, and
+branch proxy is 8,500/8,500 nodes after adding executable path, content, and
 access-policy authority to the existing descriptor-custody, closed-config,
 transport-isolation, canonical-runtime, and locator predicates. The closed
-nine-module publication slice is 8,673/8,700 lines; within it,
-`publication_support.py` is 1,300/1,310 and `executable_authority.py` is
+nine-module publication slice is 8,689/8,700 lines; within it,
+`publication_support.py` is 1,317/1,320 and `executable_authority.py` is
 314/320. The durable `authority.py` integration is 3,259/3,275 lines. The
 source coordinator and
 its original support slice are 2,930/3,000 lines; the three source-staging modules

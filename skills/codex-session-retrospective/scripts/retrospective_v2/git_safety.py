@@ -13,7 +13,7 @@ import subprocess
 import sys
 from typing import Iterator, Mapping, Sequence
 
-from . import safe_io
+from . import executable_authority, safe_io
 from .authority_errors import HistoryValidationError
 
 
@@ -62,9 +62,14 @@ class LocalRepositoryCommandBinding:
             self.object_store_fd,
         )
 
-    def command(self, executable: str, arguments: Sequence[str]) -> tuple[str, ...]:
+    def command(
+        self,
+        python_executable: str,
+        executable: str,
+        arguments: Sequence[str],
+    ) -> tuple[str, ...]:
         return (
-            os.path.realpath(sys.executable),
+            python_executable,
             "-I",
             "-B",
             "-S",
@@ -284,12 +289,16 @@ def repository_git_invocation(
             (),
         )
         return
-    with bind_local_repository_command(admission, directory_identity) as binding:
-        yield (
-            binding.command(executable, arguments),
-            dict(environment),
-            binding.descriptors,
-        )
+    python_authority = executable_authority.resolve_executable(
+        sys.executable, label="Python"
+    )
+    with executable_authority.executable_invocation(python_authority):
+        with bind_local_repository_command(admission, directory_identity) as binding:
+            yield (
+                binding.command(python_authority.path, executable, arguments),
+                dict(environment),
+                binding.descriptors,
+            )
 
 
 @contextmanager

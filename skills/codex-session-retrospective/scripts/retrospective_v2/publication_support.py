@@ -234,6 +234,7 @@ def _publisher_home_subprocess_binding(
 def _descriptor_bound_launch(
     command: Sequence[str],
     descriptor: int | None,
+    python_executable: str | None,
 ) -> tuple[list[str], tuple[int, ...]]:
     if descriptor is None:
         return list(command), ()
@@ -241,9 +242,10 @@ def _descriptor_bound_launch(
         raise LocalGitPublicationError(
             "descriptor-bound subprocess launch is unavailable on this platform"
         )
+    assert python_executable is not None
     return (
         [
-            os.path.realpath(sys.executable),
+            python_executable,
             "-I",
             "-B",
             "-S",
@@ -278,10 +280,21 @@ def _run_bounded_subprocess(
         or max_output_bytes <= 0
     ):
         raise ValueError("subprocess output limit must be a positive integer")
-    launch_command, cwd_descriptors = _descriptor_bound_launch(command, cwd_descriptor)
+    python_authority = (
+        executable_authority.resolve_executable(sys.executable, label="Python")
+        if cwd_descriptor is not None
+        else None
+    )
+    launch_command, cwd_descriptors = _descriptor_bound_launch(
+        command,
+        cwd_descriptor,
+        None if python_authority is None else python_authority.path,
+    )
     inherited_descriptors = tuple(
         dict.fromkeys((*cwd_descriptors, *inherited_descriptors))
     )
+    if python_authority is not None:
+        executable_authority.revalidate_executable(python_authority)
     try:
         process = subprocess.Popen(
             launch_command,
@@ -294,6 +307,8 @@ def _run_bounded_subprocess(
             start_new_session=os.name == "posix",
         )
     except (OSError, subprocess.SubprocessError) as exc:
+        if python_authority is not None:
+            executable_authority.revalidate_executable(python_authority)
         raise LocalGitPublicationError("cannot start bounded subprocess") from exc
 
     assert process.stdout is not None
@@ -419,11 +434,15 @@ def _run_bounded_subprocess(
             stderr=bytes(stderr),
         )
     finally:
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                close_stream(stream)
-        selector.close()
-        kill_process()
+        try:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    close_stream(stream)
+            selector.close()
+            kill_process()
+        finally:
+            if python_authority is not None:
+                executable_authority.revalidate_executable(python_authority)
 
 
 def _run_publisher_listing(
@@ -454,9 +473,7 @@ def _run_publisher_listing(
                 max_output_bytes=MAX_RECEIPT_BYTES,
             )
     except executable_authority.ExecutableAuthorityError as exc:
-        raise LocalGitPublicationError(
-            "GPG executable authority changed after validation"
-        ) from exc
+        raise LocalGitPublicationError(str(exc)) from exc
     _revalidate_publisher_home_binding(descriptor, home, os.fstat(descriptor))
     if result.returncode != 0:
         raise LocalGitPublicationError(

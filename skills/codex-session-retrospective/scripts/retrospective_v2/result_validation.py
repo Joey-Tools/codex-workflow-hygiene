@@ -263,7 +263,7 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ),
 )
 
-_URL_RE = re.compile(r"(?i)\b[a-z][a-z0-9+.-]{0,31}://[^\s<>\"']+")
+_URL_RE = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s<>\"']+")
 _INTERNAL_HOST_RE = re.compile(
     r"(?i)(?:localhost|(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
     r"192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"

@@ -874,11 +874,20 @@ class ResultValidationTests(unittest.TestCase):
         )
 
     def test_post_redaction_removes_non_http_uri_schemes(self) -> None:
+        long_scheme_uri = f"{'a' * 33}://nas/jobs"
+        self.assertIn(
+            "url",
+            {
+                finding.category
+                for finding in scan_for_leaks({"unsafe": long_scheme_uri})
+            },
+        )
         for uri in (
             "x://private-endpoint/resource",
             "wss://build.internal/events",
             "s3://private-bucket/report",
             "postgresql://database.internal/history",
+            long_scheme_uri,
         ):
             with self.subTest(uri=uri):
                 value = extractor_result()

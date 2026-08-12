@@ -1517,3 +1517,44 @@ superseded_by:
   validation, project-journal validation, and `git diff --check` also pass on
   this exact tree. Signed-head admission and the required frozen-head review
   remain pending.
+- Fresh local Codex review of signed head `f0a6d419` returned two actionable
+  findings. Descriptor-bound retained-history Git and publisher-keyring GPG
+  launches authenticated Git/GPG but still executed ambient `sys.executable`
+  first while passing sensitive repository or keyring descriptors. Those
+  trampolines now resolve the physical Python target through the shared
+  executable authority, use that canonical path as `argv[0]`, and revalidate
+  its path, content, and access policy before and after each child launch.
+  Regressions cover an unsafe ancestor and same-path Python replacement for
+  both repository and publisher launch paths. The second finding identified
+  the 32-character protocol-scheme cap in working-zone redaction and leakage
+  scanning. The pattern now accepts every syntactically legal scheme length,
+  relying on the existing result-field character ceiling, and a 33-character
+  scheme with a single-label host is rejected and redacted.
+- While that review was running, canonical `master` advanced to `db0991dc` via
+  PR #68. Signed merge commit `1a9c4f77` preserves both `f0a6d419` and
+  `db0991dc` as parents without rebasing or rewriting either history. The merged
+  attribution helper is disjoint from the retrospective implementation but adds
+  74 tests, so all exact-head gates must run again on the superseding fix head.
+- Owner-controlled Python 3.13 focused evidence passes 77/77 in 3.532 seconds;
+  the non-GPG affected result, module-boundary, export, result-contract, and
+  orchestrator-support group passes 158/158 in 6.584 seconds. Sandboxed
+  disposable-GPG setup exited 2 before the durable class and is non-counting;
+  the explicitly authorized host retry passes the complete publication module,
+  84/84 in 2,360.881 seconds with `TMPDIR=/private/tmp`. The exact copied Python
+  runtime has SHA-256
+  `2bfbeb6d935f72272e37921df5f0588be257b95ac67187691461af74308169f1`
+  and no group/world-writable entries. The closed publication slice is
+  8,689/8,700 lines and the package branch proxy is exactly 8,500/8,500. Full
+  merged-tree discovery passes 1,783/1,783 in 2,994.722 seconds under the same
+  Python 3.13 `-B -S` runtime with `TMPDIR=/private/tmp`; its 4,200-second hard
+  deadline did not trigger. Two earlier full-discovery invocations are
+  non-counting: the first was interrupted after an early failure marker, and
+  fail-fast proved that the only failure was the invocation's missing `-S`
+  flag, not product behavior. The signed fix commit, admission, CI, and the new
+  exact-head `skill-repo-codex-gate` remain pending.
+- Final static validation passes scoped Ruff check and format-check for all six
+  changed Python files, `actionlint` for the canonical workflow, repository
+  `git diff --check`, the installed project-journal validator, and the official
+  OpenAI skill validator through an isolated PyYAML runtime. Two direct wrapper
+  attempts without PyYAML exited as dependency runtime errors and are
+  non-counting; the authoritative isolated validator reported `Skill is valid!`.

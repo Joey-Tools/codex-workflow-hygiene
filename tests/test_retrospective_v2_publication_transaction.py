@@ -185,6 +185,119 @@ class PublicationInvariantUnitTests(unittest.TestCase):
             finally:
                 root.chmod(0o700)
 
+    def test_bound_git_invocation_authenticates_python(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repository"
+            run_command(["git", "init", "-q", str(repository)])
+            environment = git_safety.history_git_environment(
+                home=str(root), gnupg_home=str(root)
+            )
+
+            def run(arguments):
+                return subprocess.run(
+                    ["git", "-C", str(repository), *arguments],
+                    check=False,
+                    capture_output=True,
+                    env=environment,
+                    timeout=30,
+                )
+
+            admission = git_safety.admit_local_repository(
+                repository,
+                run,
+                safe_io.owner_controlled_directory_identity,
+            )
+            python = root / "python-fixture"
+            displaced = root / "python-fixture-original"
+            python.write_bytes(b"#!/bin/sh\nexit 0\n")
+            python.chmod(0o700)
+
+            with (
+                mock.patch.object(git_safety.sys, "executable", str(python)),
+                self.assertRaisesRegex(
+                    executable_authority.ExecutableAuthorityError,
+                    "changed after validation",
+                ),
+            ):
+                with git_safety.repository_git_invocation(
+                    admission,
+                    repository,
+                    "/usr/bin/git",
+                    ("status", "--short"),
+                    environment,
+                    safe_io.owner_controlled_directory_identity,
+                ) as (command, _environment, _descriptors):
+                    self.assertEqual(os.path.realpath(python), command[0])
+                    python.rename(displaced)
+                    python.write_bytes(b"#!/bin/sh\nexit 0\n")
+                    python.chmod(0o700)
+
+    def test_descriptor_bound_subprocess_rejects_untrusted_python(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=_publication_test_temp_parent()
+        ) as temporary_directory:
+            root = Path(temporary_directory)
+            python = root / "python-fixture"
+            python.write_bytes(b"#!/bin/sh\nexit 0\n")
+            python.chmod(0o700)
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with (
+                    mock.patch.object(
+                        publication_support.sys, "executable", str(python)
+                    ),
+                    self.assertRaisesRegex(
+                        executable_authority.ExecutableAuthorityError,
+                        "writable by another user",
+                    ),
+                ):
+                    publication_support._run_bounded_subprocess(
+                        ["/usr/bin/true"],
+                        cwd_descriptor=descriptor,
+                        environment={},
+                        timeout_seconds=5,
+                        max_output_bytes=1024,
+                    )
+            finally:
+                os.close(descriptor)
+
+    def test_descriptor_bound_subprocess_revalidates_python(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary_directory:
+            root = Path(temporary_directory)
+            python = root / "python-fixture"
+            displaced = root / "python-fixture-original"
+            python.write_text(
+                "#!/bin/sh\n"
+                f'/bin/mv "$0" "{displaced}"\n'
+                "/usr/bin/printf '#!/bin/sh\\nexit 0\\n' > \"$0\"\n"
+                '/bin/chmod 700 "$0"\n'
+                "exit 0\n",
+                encoding="ascii",
+            )
+            python.chmod(0o700)
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+
+            try:
+                with (
+                    mock.patch.object(
+                        publication_support.sys, "executable", str(python)
+                    ),
+                    self.assertRaisesRegex(
+                        executable_authority.ExecutableAuthorityError,
+                        "changed after validation",
+                    ),
+                ):
+                    publication_support._run_bounded_subprocess(
+                        ["/usr/bin/true"],
+                        cwd_descriptor=descriptor,
+                        environment={},
+                        timeout_seconds=5,
+                        max_output_bytes=1024,
+                    )
+            finally:
+                os.close(descriptor)
+
     def test_publisher_keyring_revalidates_gpg_executable_content(self) -> None:
         with (
             tempfile.TemporaryDirectory(dir=ROOT) as tool_directory,

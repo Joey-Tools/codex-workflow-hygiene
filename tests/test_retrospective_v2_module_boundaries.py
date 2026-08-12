@@ -379,7 +379,7 @@ BOUNDED_MODULE_LINES = {
     "publication_git_commits.py": 1_000,
     "publication_git_storage.py": 800,
     "publication_state.py": 1_250,
-    "publication_support.py": 1_310,
+    "publication_support.py": 1_320,
     "publication_transaction.py": 2_100,
     "run_state_authority.py": 250,
     "run_state_contracts.py": 50,
@@ -1150,7 +1150,7 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertEqual(8_494, branch_total)
+        self.assertEqual(8_500, branch_total)
         self.assertLessEqual(branch_total, 8_500)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)
