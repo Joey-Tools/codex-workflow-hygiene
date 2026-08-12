@@ -1143,6 +1143,114 @@ class PrAttributionTests(unittest.TestCase):
             with self.assertRaises(helper.RolloutError):
                 helper.open_rollout(rollout, identity)
 
+    def test_rollout_snapshot_allows_append_but_rejects_prefix_rewrite(
+        self,
+    ) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            rollout = Path(temporary_directory) / "rollout.jsonl"
+            rollout.write_bytes(b'{"a":1}\n')
+            metadata = rollout.stat()
+            snapshot = helper.FileSnapshot(
+                identity=(metadata.st_dev, metadata.st_ino),
+                inventory_size=metadata.st_size,
+            )
+            deadline = helper.time.monotonic() + 5
+
+            self.assertEqual(
+                list(
+                    helper.iter_records(
+                        rollout,
+                        snapshot,
+                        deadline,
+                        allow_partial_tail=True,
+                    )
+                ),
+                [{"a": 1}],
+            )
+            with rollout.open("ab") as handle:
+                handle.write(b'{"appended":true}\n')
+            self.assertEqual(
+                list(
+                    helper.iter_records(
+                        rollout,
+                        snapshot,
+                        deadline,
+                        allow_partial_tail=True,
+                    )
+                ),
+                [{"a": 1}],
+            )
+
+            with rollout.open("r+b") as handle:
+                handle.write(b'{"b":2}\n')
+            with self.assertRaisesRegex(
+                helper.RolloutError,
+                "prefix changed",
+            ):
+                list(
+                    helper.iter_records(
+                        rollout,
+                        snapshot,
+                        deadline,
+                        allow_partial_tail=True,
+                    )
+                )
+
+    def test_rollout_snapshot_excludes_partial_tail_and_rejects_truncation(
+        self,
+    ) -> None:
+        helper = load_helper_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            rollout = Path(temporary_directory) / "rollout.jsonl"
+            rollout.write_bytes(b'{"a":1}\n{"b":')
+            metadata = rollout.stat()
+            snapshot = helper.FileSnapshot(
+                identity=(metadata.st_dev, metadata.st_ino),
+                inventory_size=metadata.st_size,
+            )
+            deadline = helper.time.monotonic() + 5
+
+            self.assertEqual(
+                list(
+                    helper.iter_records(
+                        rollout,
+                        snapshot,
+                        deadline,
+                        allow_partial_tail=True,
+                    )
+                ),
+                [{"a": 1}],
+            )
+            with rollout.open("ab") as handle:
+                handle.write(b"2}\n")
+            self.assertEqual(
+                list(
+                    helper.iter_records(
+                        rollout,
+                        snapshot,
+                        deadline,
+                        allow_partial_tail=True,
+                    )
+                ),
+                [{"a": 1}],
+            )
+
+            with rollout.open("r+b") as handle:
+                handle.truncate(snapshot.prefix_size - 1)
+            with self.assertRaisesRegex(
+                helper.RolloutError,
+                "truncated after inventory",
+            ):
+                list(
+                    helper.iter_records(
+                        rollout,
+                        snapshot,
+                        deadline,
+                        allow_partial_tail=True,
+                    )
+                )
+
     def test_skill_contract_routes_pr_note_to_helper(self) -> None:
         skill = (
             REPO_ROOT / "skills" / "codex-session-mining" / "SKILL.md"

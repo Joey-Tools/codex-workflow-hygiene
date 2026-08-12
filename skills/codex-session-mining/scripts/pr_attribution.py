@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter, deque
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -69,6 +70,14 @@ class RolloutError(RuntimeError):
 class Vote:
     pair: Pair
     turn_order: Optional[int]
+
+
+@dataclass
+class FileSnapshot:
+    identity: FileIdentity
+    inventory_size: int
+    prefix_size: Optional[int] = None
+    prefix_sha256: Optional[str] = None
 
 
 def check_deadline(deadline: float) -> None:
@@ -205,27 +214,40 @@ def open_rollout(path: Path, expected_identity: FileIdentity) -> BinaryIO:
 
 def iter_records(
     path: Path,
-    expected_identity: FileIdentity,
+    snapshot: FileSnapshot,
     deadline: float,
     *,
     allow_partial_tail: bool,
     byte_limit: int = MAX_FILE_BYTES,
 ) -> Iterator[Mapping[str, object]]:
     consumed = 0
+    digest = hashlib.sha256()
+    read_limit = (
+        snapshot.prefix_size
+        if snapshot.prefix_size is not None
+        else snapshot.inventory_size
+    )
     try:
-        with open_rollout(path, expected_identity) as handle:
-            while True:
+        with open_rollout(path, snapshot.identity) as handle:
+            if os.fstat(handle.fileno()).st_size < read_limit:
+                raise RolloutError("selected rollout was truncated after inventory")
+            while consumed < read_limit:
                 check_deadline(deadline)
-                raw = handle.readline(MAX_RECORD_BYTES + 1)
+                raw = handle.readline(
+                    min(MAX_RECORD_BYTES + 1, read_limit - consumed)
+                )
                 if not raw:
-                    return
+                    raise RolloutError("selected rollout was truncated while reading")
                 consumed += len(raw)
                 if consumed > byte_limit or len(raw) > MAX_RECORD_BYTES:
                     raise RolloutError("selected rollout exceeds a read bound")
                 if not raw.endswith(b"\n"):
-                    if allow_partial_tail:
+                    if allow_partial_tail and snapshot.prefix_size is None:
+                        snapshot.prefix_size = consumed - len(raw)
+                        snapshot.prefix_sha256 = digest.hexdigest()
                         return
                     raise RolloutError("archived rollout has an incomplete record")
+                digest.update(raw)
                 try:
                     row = json.loads(raw)
                 except (MemoryError, RecursionError, UnicodeError, ValueError) as exc:
@@ -233,6 +255,15 @@ def iter_records(
                 if not isinstance(row, dict):
                     raise RolloutError("selected rollout record is not an object")
                 yield row
+            current_digest = digest.hexdigest()
+            if snapshot.prefix_size is None:
+                snapshot.prefix_size = consumed
+                snapshot.prefix_sha256 = current_digest
+            elif (
+                consumed != snapshot.prefix_size
+                or current_digest != snapshot.prefix_sha256
+            ):
+                raise RolloutError("selected rollout prefix changed after inventory")
     except RolloutError:
         raise
     except OSError as exc:
@@ -241,14 +272,14 @@ def iter_records(
 
 def probe_lifecycle_ids(
     path: Path,
-    expected_identity: FileIdentity,
+    snapshot: FileSnapshot,
     active: bool,
     deadline: float,
 ) -> Tuple[str, ...]:
     lifecycle_ids = set()
     for row in iter_records(
         path,
-        expected_identity,
+        snapshot,
         deadline,
         allow_partial_tail=active,
         byte_limit=MAX_PROBE_BYTES,
@@ -269,10 +300,10 @@ def probe_lifecycle_ids(
 def inventory_rollouts(
     codex_home: Path,
     deadline: float,
-) -> Tuple[Dict[str, List[Path]], Set[Path], Dict[Path, FileIdentity], Set[Path]]:
+) -> Tuple[Dict[str, List[Path]], Set[Path], Dict[Path, FileSnapshot], Set[Path]]:
     by_session: Dict[str, List[Path]] = {}
     active_paths: Set[Path] = set()
-    identities: Dict[Path, FileIdentity] = {}
+    identities: Dict[Path, FileSnapshot] = {}
     filename_owned_paths: Set[Path] = set()
     entry_count = 0
     file_count = 0
@@ -322,8 +353,11 @@ def inventory_rollouts(
                         path = Path(entry.path)
                         if ids:
                             filename_owned_paths.add(path)
-                        identity = (metadata.st_dev, metadata.st_ino)
-                        identities[path] = identity
+                        snapshot = FileSnapshot(
+                            identity=(metadata.st_dev, metadata.st_ino),
+                            inventory_size=metadata.st_size,
+                        )
+                        identities[path] = snapshot
                         active = root_name == "sessions"
                         if active:
                             active_paths.add(path)
@@ -331,7 +365,7 @@ def inventory_rollouts(
                             ids.extend(
                                 probe_lifecycle_ids(
                                     path,
-                                    identity,
+                                    snapshot,
                                     active,
                                     deadline,
                                 )
@@ -350,7 +384,7 @@ def inventory_rollouts(
 def discover_metadata_children(
     rollouts: Mapping[str, Sequence[Path]],
     active_paths: Set[Path],
-    identities: Mapping[Path, FileIdentity],
+    identities: Mapping[Path, FileSnapshot],
     deadline: float,
 ) -> Dict[str, Set[str]]:
     children: Dict[str, Set[str]] = {}
@@ -386,7 +420,7 @@ def discover_metadata_children(
 def resolve_root(
     rollouts: Mapping[str, Sequence[Path]],
     active_paths: Set[Path],
-    identities: Mapping[Path, FileIdentity],
+    identities: Mapping[Path, FileSnapshot],
     filename_owned_paths: Set[Path],
     selected_id: str,
     deadline: float,
@@ -484,7 +518,7 @@ def resolve_root(
 def collect_votes(
     rollouts: Mapping[str, Sequence[Path]],
     active_paths: Set[Path],
-    identities: Mapping[Path, FileIdentity],
+    identities: Mapping[Path, FileSnapshot],
     filename_owned_paths: Set[Path],
     root_id: str,
     seed_ids: Sequence[str],
