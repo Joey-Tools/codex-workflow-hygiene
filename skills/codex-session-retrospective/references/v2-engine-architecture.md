@@ -224,21 +224,21 @@ stability similarly compares only BSD immutable, append, nounlink, restricted,
 and datavault flags; `UF_HIDDEN` and other presentation flags are not access
 policy.
 
-The transport slice remains independently bounded after this hardening: 7,245
+The transport slice remains independently bounded after this hardening: 7,203
 physical lines across a 7,250-line aggregate limit. One exact 14-module
 inventory and its aggregate are enforced together, so omitting a transport
 module cannot create a false budget pass. The newly affected modules are
 `transport_paths.py` at 82/100 lines, `transport_program.py` at 450/450,
 `transport_remote.py` at 316/320, `transport_snapshot.py` at 219/220, and
-`transport_remote_snapshot.py` at 86/100, while `transport_contracts.py` is
-990/1,000 and `transport_resume.py` is 168/200,
+`transport_remote_snapshot.py` at 86/100, while `transport_capture.py` is
+999/1,000, `transport_contracts.py` is 991/1,000, and `transport_resume.py` is 168/200,
 `transport_source.py` is
-1,695/1,700, and `transport_worker.py` is 21/25. The closed run-state
+1,646/1,700, and `transport_worker.py` is 21/25. The closed run-state
 authority inventory is exactly 1,000/1,000 lines: `run_state_authority.py` 243/250,
 `run_state_contracts.py` 37/50, `run_state_cursors.py` 219/225,
 `run_state_holdouts.py` 236/240, and `run_state_lineage.py` 265/275. Including
 this full slice, the orchestrator foundation is 3,297/3,350 lines. The global
-branch proxy is 8,500/8,500 nodes after adding executable path, content, and
+branch proxy is 8,499/8,500 nodes after adding executable path, content, and
 access-policy authority to the existing descriptor-custody, closed-config,
 transport-isolation, canonical-runtime, and locator predicates. The closed
 nine-module publication slice is 8,689/8,700 lines; within it,

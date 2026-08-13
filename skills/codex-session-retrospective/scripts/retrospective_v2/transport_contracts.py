@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 try:
-    from . import catalog
+    from . import catalog, contracts as common_contracts
     from .contracts import (
         JsonValue,
         RefType,
@@ -21,6 +21,7 @@ try:
     )
 except (ImportError, ModuleNotFoundError):
     import catalog  # type: ignore[no-redef]
+    import contracts as common_contracts  # type: ignore[no-redef]
     from contracts import (  # type: ignore[no-redef]
         JsonValue,
         RefType,
@@ -37,8 +38,8 @@ TRANSPORT_RECEIPT_SCHEMA = "source_transport_receipt_v2"
 TRANSPORT_LEASE_AUTH_PREFIX = "source_transport_lease_auth_v2:"
 SOURCE_SNAPSHOT_REF_PREFIX = "source_snapshot_v2:"
 TRANSPORT_RECEIPT_REF_PREFIX = "source_transport_receipt_v2:"
-SOURCE_TRANSPORT_STREAM_SCHEMA = "source_transport_stream_v2"
-SOURCE_TRANSPORT_RESUME_SCHEMA = "source_transport_resume_v4"
+SOURCE_TRANSPORT_STREAM_SCHEMA = "source_transport_stream_v3"
+SOURCE_TRANSPORT_RESUME_SCHEMA = "source_transport_resume_v5"
 SOURCE_TRANSPORT_MAX_RECORD_BYTES = 8 * 1024 * 1024
 SOURCE_TRANSPORT_SCAN_CHUNK_BYTES = 64 * 1024
 SOURCE_TRANSPORT_RESUME_PROBE_BYTES = 64 * 1024
@@ -204,6 +205,13 @@ def _sha256(value: object, label: str) -> str:
     return value
 
 
+def _locator_session_commitments(value: object) -> list[str]:
+    try:
+        return list(common_contracts.normalize_locator_session_commitments(value))
+    except ValueError as exc:
+        raise TransportValidationError(str(exc)) from exc
+
+
 def _canonical_commitment(value: JsonValue) -> str:
     return "sha256:" + hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
@@ -220,6 +228,7 @@ def _normalize_source_resume_position(
             "byte_offset",
             "candidate_index",
             "discovery_commitment",
+            "locator_session_commitments",
             "record_index",
             "resume_probe",
             "schema",
@@ -266,6 +275,9 @@ def _normalize_source_resume_position(
         "discovery_commitment": _sha256(
             value.get("discovery_commitment"),
             "source transport resume discovery_commitment",
+        ),
+        "locator_session_commitments": _locator_session_commitments(
+            value.get("locator_session_commitments")
         ),
         "record_index": _non_negative_int(
             value.get("record_index"),
@@ -343,6 +355,7 @@ def _derive_source_resume_position(
         "byte_end",
         "candidate_index",
         "discovery_commitment",
+        "locator_session_commitments",
         "record_index",
         "source_locator",
         "source_size",
@@ -388,6 +401,9 @@ def _derive_source_resume_position(
         "discovery_commitment": _sha256(
             last["discovery_commitment"],
             "source transport continuation discovery_commitment",
+        ),
+        "locator_session_commitments": _locator_session_commitments(
+            last["locator_session_commitments"]
         ),
         "record_index": record_index,
         "resume_probe": raw_probe,
@@ -945,21 +961,6 @@ def transcript_commitment(
     raw_records: Mapping[str, bytes], *, source_marker: str
 ) -> str:
     return catalog.transcript_commitment(raw_records, source_marker=source_marker)
-
-
-def _stream_object(pairs: Sequence[tuple[str, object]]) -> dict[str, object]:
-    value: dict[str, object] = {}
-    for key, item in pairs:
-        if key in value:
-            raise TransportValidationError(
-                "source transport frame contains duplicate keys"
-            )
-        value[key] = item
-    return value
-
-
-def _reject_stream_constant(_: str) -> None:
-    raise TransportValidationError("source transport frame contains non-finite JSON")
 
 
 def _stream_frame(value: bytes | str) -> Mapping[str, object]:

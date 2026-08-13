@@ -55,11 +55,9 @@ from .transport_contracts import (  # noqa: F401
     _normalize_source_resume_position,
     _positive_int,
     _read_bounded_line,
-    _reject_stream_constant,
     _sha256,
     _source_transport_inventory_commitment,
     _stream_frame,
-    _stream_object,
     _valid_source_locator,
     transcript_commitment,
 )
@@ -167,8 +165,16 @@ from .transport_source import (  # noqa: F401
     _source_transport_remote_arguments,
     _source_transport_scan,
     _SourceCandidateDiscovery,
-    session_selector_commitment,
 )
+from .contracts import session_selector_commitment as _session_selector_commitment
+
+
+def session_selector_commitment(session_id: str) -> str:
+    try:
+        return _session_selector_commitment(session_id)
+    except ValueError as exc:
+        raise TransportValidationError(str(exc)) from exc
+
 
 TRANSPORT_REMOTE_HELPER_CONTRACT = (
     ".codex/skills/remote-host-context/scripts/remote_codex_probe.py"

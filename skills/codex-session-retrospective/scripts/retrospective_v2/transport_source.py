@@ -18,13 +18,12 @@ import sys
 from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 try:
-    from . import catalog
+    from . import catalog, contracts as common_contracts
     from .contracts import (
         JsonValue,
         RefType,
         SourceCellStatus,
         SourceKind,
-        is_valid_session_identifier,
         parse_typed_ref,
     )
     from .transport_capture import _validate_source_transport_relay
@@ -67,12 +66,12 @@ try:
     )
 except (ImportError, ModuleNotFoundError):
     import catalog  # type: ignore[no-redef]
+    import contracts as common_contracts  # type: ignore[no-redef]
     from contracts import (  # type: ignore[no-redef]
         JsonValue,
         RefType,
         SourceCellStatus,
         SourceKind,
-        is_valid_session_identifier,
         parse_typed_ref,
     )
     from transport_capture import (  # type: ignore[no-redef]
@@ -664,6 +663,8 @@ def _source_inventory_row(
     accounting_class: str,
     reason: str,
     event_time: str | None,
+    direct_session_commitments: Sequence[str],
+    locator_session_commitments: Sequence[str],
     session_commitment: str | None,
     source_occurrence: str,
     source_size: int,
@@ -678,8 +679,10 @@ def _source_inventory_row(
             None if payload is None else "sha256:" + hashlib.sha256(payload).hexdigest()
         ),
         "discovery_commitment": discovery_commitment,
+        "direct_session_commitments": list(direct_session_commitments),
         "event_time": event_time,
         "frame": "inventory",
+        "locator_session_commitments": list(locator_session_commitments),
         "reason": reason,
         "record_index": record_index,
         "schema": SOURCE_TRANSPORT_STREAM_SCHEMA,
@@ -691,81 +694,15 @@ def _source_inventory_row(
     }
 
 
-def session_selector_commitment(session_id: str) -> str:
-    if not is_valid_session_identifier(session_id):
-        raise TransportValidationError("session selector is invalid")
-    return (
-        "sha256:"
-        + hashlib.sha256(
-            b"codex-session-retrospective/session-selector/v2\x00"
-            + session_id.encode("utf-8")
-        ).hexdigest()
-    )
-
-
 def _source_record_session_identifiers(
-    record: Mapping[str, Any],
-    *,
-    source_kind: SourceKind,
+    record: Mapping[str, Any], *, source_kind: SourceKind
 ) -> tuple[str, ...]:
-    identifiers: set[str] = set()
-    nodes: list[tuple[Mapping[str, Any], int]] = [(record, 0)]
-    visited = 0
-    explicit_keys = {
-        "conversation_id",
-        "sessionId",
-        "session_id",
-        "threadId",
-        "thread_id",
-    }
-    while nodes:
-        node, depth = nodes.pop()
-        visited += 1
-        if visited > 4096 or depth > 16:
-            raise TransportValidationError(
-                "source record identity structure exceeds bounds"
-            )
-        for key in explicit_keys:
-            candidate = node.get(key)
-            if isinstance(candidate, str) and not is_valid_session_identifier(
-                candidate
-            ):
-                raise TransportValidationError(
-                    "source record session identity is invalid"
-                )
-            if is_valid_session_identifier(candidate):
-                identifiers.add(candidate)
-        if source_kind is SourceKind.SESSION_INDEX:
-            candidate = node.get("id")
-            if isinstance(candidate, str) and not is_valid_session_identifier(
-                candidate
-            ):
-                raise TransportValidationError(
-                    "source record session identity is invalid"
-                )
-            if is_valid_session_identifier(candidate):
-                identifiers.add(candidate)
-        if node.get("type") == "session_meta":
-            payload = node.get("payload")
-            if isinstance(payload, Mapping):
-                for key in ("id", "session_id"):
-                    candidate = payload.get(key)
-                    if isinstance(candidate, str) and not is_valid_session_identifier(
-                        candidate
-                    ):
-                        raise TransportValidationError(
-                            "source record session identity is invalid"
-                        )
-                    if is_valid_session_identifier(candidate):
-                        identifiers.add(candidate)
-        for child in node.values():
-            if isinstance(child, Mapping):
-                nodes.append((child, depth + 1))
-    if len(identifiers) > 32:
-        raise TransportValidationError(
-            "source record contains too many session identifiers"
+    try:
+        return common_contracts.source_record_session_identifiers(
+            record, source_kind=source_kind
         )
-    return tuple(sorted(identifiers, key=lambda value: value.encode("utf-8")))
+    except ValueError as exc:
+        raise TransportValidationError(str(exc)) from exc
 
 
 def _source_structural_exclusion(
@@ -1153,7 +1090,11 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                     stop = True
                     continue
                 accepted_prefix_tail.extend(incoming_probe)
-            locator_session_ids: set[str] = set()
+            locator_session_commitments = (
+                tuple(normalized_resume["locator_session_commitments"])
+                if is_resume_candidate and normalized_resume is not None
+                else ()
+            )
             source_kind = SourceKind(args.source_kind)
             with os.fdopen(descriptor, "rb", closefd=False) as handle:
                 handle.seek(scanned)
@@ -1206,6 +1147,7 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                             ]
                     event_time: str | None = None
                     record_session_commitment: str | None = None
+                    direct_session_commitments: tuple[str, ...] = ()
                     accounting_class = catalog.AccountingClass.EXPLICIT_GAP.value
                     reason = "source_record_unparseable"
                     if line.oversized:
@@ -1228,19 +1170,29 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                                 record_value,
                                 source_kind=source_kind,
                             )
-                            locator_session_ids.update(direct_session_ids)
+                            direct_session_commitments = (
+                                common_contracts.session_selector_commitments(
+                                    direct_session_ids
+                                )
+                            )
                             event_time = catalog.event_time_from_record(
                                 record_value,
                                 stable_event_time=(
                                     catalog.stable_event_time_from_locator(relative)
                                 ),
                             )
+                            locator_session_commitments = (
+                                common_contracts.merge_locator_session_commitments(
+                                    locator_session_commitments,
+                                    direct_session_commitments,
+                                )
+                            )
                         except (
                             catalog.CatalogValidationError,
                             TransportValidationError,
                         ):
                             record_value = None
-                            direct_session_ids = ()
+                            direct_session_commitments = ()
                         if record_value is None:
                             terminal_status = "gap"
                             terminal_reason = "source_record_unparseable"
@@ -1258,16 +1210,17 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                                 event_time,
                                 label="source record event time",
                             )
-                            effective_session_ids = (
-                                set(direct_session_ids) or locator_session_ids
+                            effective_session_commitments = (
+                                direct_session_commitments
+                                or locator_session_commitments
                             )
-                            if len(effective_session_ids) == 1:
-                                record_session_commitment = session_selector_commitment(
-                                    next(iter(effective_session_ids))
+                            if len(effective_session_commitments) == 1:
+                                record_session_commitment = (
+                                    effective_session_commitments[0]
                                 )
                             if (
                                 args.session_selector_commitment is not None
-                                and len(effective_session_ids) != 1
+                                and len(effective_session_commitments) != 1
                             ):
                                 accounting_class = (
                                     catalog.AccountingClass.EXPLICIT_GAP.value
@@ -1278,9 +1231,7 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                                 stop = True
                             elif (
                                 args.session_selector_commitment is not None
-                                and session_selector_commitment(
-                                    next(iter(effective_session_ids))
-                                )
+                                and effective_session_commitments[0]
                                 != args.session_selector_commitment
                             ):
                                 accounting_class = (
@@ -1328,6 +1279,8 @@ def _source_transport_scan(args: argparse.Namespace) -> int:
                         accounting_class=accounting_class,
                         reason=reason,
                         event_time=event_time,
+                        direct_session_commitments=direct_session_commitments,
+                        locator_session_commitments=locator_session_commitments,
                         session_commitment=record_session_commitment,
                         source_occurrence=source_occurrence,
                         source_size=source_size,

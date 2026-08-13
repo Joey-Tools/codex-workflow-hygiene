@@ -1702,3 +1702,44 @@ superseded_by:
   preserves `72b6c6d9` as its parent. Exact-head admission and the
   `skill-repo-codex-gate` remain PR-lifecycle evidence rather than durable
   implementation state.
+- The fresh local Codex processor on signed replacement head `92694eb6`
+  returned one P1 finding: a bounded rollout page that ended after
+  `session_meta` resumed without its locator session commitment, so later
+  ID-less records either became `session_identity_unresolved` in Session mode
+  or received unstable pseudo-session refs in other modes. Hosted CI run
+  `31683103314` was cancelled as stale and is non-counting.
+- Source continuation now uses the closed `source_transport_resume_v5`
+  position. Its authenticated transition carries no raw session ID, only a
+  sorted zero/one/two-element locator commitment state for unknown, unique, or
+  permanently ambiguous identity. Capture validates monotonic identity state
+  within the resumed candidate and resets it at the next locator. Session and
+  non-Session regressions cover an ID-less second rollout page; negative
+  coverage rejects v4, malformed commitment sets, ambiguity narrowing, and a
+  direct multi-ID record that must not fall back to the cursor target.
+- Precommit audit then found that the initial fix did not independently bind
+  each consumed row's direct identity, rejected legitimate non-Session rows
+  with multiple direct IDs, leaked one malformed v5 commitment error as an
+  untyped `ValueError`, and changed the inventory field set without advancing
+  the stream schema. The closed `source_transport_stream_v3` inventory now
+  carries separate direct and locator commitment arrays. Capture reparses each
+  consumed payload, validates the direct array, and validates the monotonic
+  locator transition; current-row selection preserves direct ambiguity while
+  non-Session mode derives a stable unresolved ref. Public resume normalization
+  maps malformed commitments to `TransportValidationError`, and v2 streams are
+  rejected explicitly. The focused six-regression set passes 6/6 in 0.071
+  seconds, the source-transport module passes 90/90 in 15.574 seconds, the
+  orchestrator module passes 111/111 in 148.668 seconds, and the exact module
+  budget set passes 3/3 in 0.680 seconds under Python 3.13. The transport slice
+  is 7,203/7,250 physical lines, `transport_capture.py` is 999/1,000, and the
+  package branch proxy remains within its unchanged limit at 8,499/8,500.
+  One repository-wide run was interrupted immediately after the precommit
+  findings and is non-counting; two mistyped focused unittest selectors failed
+  during loading without executing product tests and are also non-counting.
+- The final frozen-tree read-only precommit audit returned `No findings.` The
+  repository-wide Python 3.13 discovery passes 1,803/1,803 in 2,581.784 seconds;
+  its 4,500-second process-group deadline did not trigger. Module boundaries
+  pass 19/19 in 1.413 seconds. Ruff 0.13.2 lint and format checks, actionlint,
+  `git diff --check`, project-journal validation, and the official isolated
+  Python 3.13 OpenAI skill validator all pass; the repo wrapper's fixed runtime
+  still lacks `PyYAML`, so that traceback is non-counting and the isolated
+  validator's `Skill is valid!` result is authoritative.

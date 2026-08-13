@@ -34,6 +34,10 @@ CHECKPOINT_FORMAT_VERSION = 2
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _CONTENT_COMMITMENT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
+SESSION_SELECTOR_COMMITMENT_DOMAIN = (
+    b"codex-session-retrospective/session-selector/v2\x00"
+)
+
 RAW_RECORD_FILE_SET_SCHEMA = "raw_record_file_set_v2"
 AGENT_FAILURE_SCHEMA = "agent_failure_v2"
 SESSION_SHARDS_SCHEMA = "session-shards-v1"
@@ -212,6 +216,78 @@ def is_valid_session_identifier(value: object) -> bool:
     )
 
 
+def session_selector_commitment(session_id: str) -> str:
+    if not is_valid_session_identifier(session_id):
+        raise ValueError("session selector is invalid")
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            SESSION_SELECTOR_COMMITMENT_DOMAIN + session_id.encode("utf-8")
+        ).hexdigest()
+    )
+
+
+def normalize_locator_session_commitments(value: object) -> tuple[str, ...]:
+    """Normalize the closed unknown, unique, or permanently ambiguous state."""
+
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("locator session commitments are not closed")
+    normalized = tuple(value)
+    if (
+        len(normalized) > 2
+        or any(
+            not isinstance(item, str) or _CONTENT_COMMITMENT_RE.fullmatch(item) is None
+            for item in normalized
+        )
+        or normalized != tuple(sorted(set(normalized)))
+    ):
+        raise ValueError("locator session commitments are not closed")
+    return normalized
+
+
+def merge_locator_session_commitments(
+    prior: object,
+    additions: object,
+) -> tuple[str, ...]:
+    """Add commitments without ever narrowing an established ambiguity."""
+
+    normalized_prior = normalize_locator_session_commitments(prior)
+    normalized_additions = normalize_locator_session_commitments(additions)
+    if len(normalized_prior) == 2:
+        return normalized_prior
+    additions_by_novelty = tuple(
+        item for item in normalized_additions if item not in normalized_prior
+    )
+    return tuple(
+        sorted((*normalized_prior, *additions_by_novelty[: 2 - len(normalized_prior)]))
+    )
+
+
+def session_selector_commitments(session_ids: Sequence[str]) -> tuple[str, ...]:
+    return tuple(
+        sorted({session_selector_commitment(identifier) for identifier in session_ids})
+    )[:2]
+
+
+def locator_session_commitment_baseline(
+    *,
+    locator: object,
+    prior_position: Mapping[str, object] | None,
+    prior_inventory: Mapping[str, object] | None,
+) -> object:
+    same_inventory = (
+        prior_inventory is not None and prior_inventory.get("source_locator") == locator
+    )
+    if same_inventory:
+        return prior_inventory.get("locator_session_commitments")
+    same_position = (
+        prior_position is not None and prior_position.get("source_locator") == locator
+    )
+    if prior_inventory is None and same_position:
+        return prior_position.get("locator_session_commitments")
+    return []
+
+
 def sha256_hex(data: bytes | bytearray | memoryview) -> str:
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError("sha256 input must be bytes-like")
@@ -287,6 +363,109 @@ class SourceCellStatus(StrEnum):
     NO_ACTIVITY = "no_activity"
     VERIFIED_ABSENT = "verified_absent"
     GAP = "gap"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceTransportTerminalEvidence:
+    status: SourceCellStatus
+    reason: str
+    resume_position: dict[str, JsonValue] | None
+    inventory_commitment: str
+    inventory_count: int
+    scan_byte_count: int
+    oversized_record_count: int
+    oversized_byte_count: int
+    emitted_record_count: int
+    emitted_byte_count: int
+
+
+def source_record_session_identifiers(
+    record: Mapping[str, object],
+    *,
+    source_kind: SourceKind,
+) -> tuple[str, ...]:
+    identifiers: set[str] = set()
+    nodes: list[tuple[Mapping[str, object], int]] = [(record, 0)]
+    visited = 0
+    explicit_keys = {
+        "conversation_id",
+        "sessionId",
+        "session_id",
+        "threadId",
+        "thread_id",
+    }
+    while nodes:
+        node, depth = nodes.pop()
+        visited += 1
+        if visited > 4096 or depth > 16:
+            raise ValueError("source record identity structure exceeds bounds")
+        candidate_keys = set(explicit_keys)
+        if source_kind is SourceKind.SESSION_INDEX:
+            candidate_keys.add("id")
+        if node.get("type") == "session_meta" and isinstance(
+            node.get("payload"), Mapping
+        ):
+            payload = node["payload"]
+            for key in ("id", "session_id"):
+                candidate = payload.get(key)  # type: ignore[union-attr]
+                if isinstance(candidate, str) and not is_valid_session_identifier(
+                    candidate
+                ):
+                    raise ValueError("source record session identity is invalid")
+                if is_valid_session_identifier(candidate):
+                    identifiers.add(candidate)  # type: ignore[arg-type]
+        for key in candidate_keys:
+            candidate = node.get(key)
+            if isinstance(candidate, str) and not is_valid_session_identifier(
+                candidate
+            ):
+                raise ValueError("source record session identity is invalid")
+            if is_valid_session_identifier(candidate):
+                identifiers.add(candidate)  # type: ignore[arg-type]
+        nodes.extend(
+            (child, depth + 1) for child in node.values() if isinstance(child, Mapping)
+        )
+    if len(identifiers) > 32:
+        raise ValueError("source record contains too many session identifiers")
+    return tuple(sorted(identifiers))
+
+
+def source_record_session_commitments(
+    record: Mapping[str, object],
+    *,
+    source_kind: SourceKind,
+) -> tuple[str, ...]:
+    return session_selector_commitments(
+        source_record_session_identifiers(record, source_kind=source_kind)
+    )
+
+
+def validate_source_inventory_session_commitments(
+    *,
+    locator: object,
+    direct: object,
+    accumulated: object,
+    session_commitment: object,
+    event_time_available: bool,
+    prior_position: Mapping[str, object] | None,
+    prior_inventory: Mapping[str, object] | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    direct_commitments = normalize_locator_session_commitments(direct)
+    locator_commitments = normalize_locator_session_commitments(accumulated)
+    baseline = locator_session_commitment_baseline(
+        locator=locator,
+        prior_position=prior_position,
+        prior_inventory=prior_inventory,
+    )
+    if locator_commitments != merge_locator_session_commitments(
+        baseline, direct_commitments
+    ):
+        raise ValueError("locator session commitments changed unexpectedly")
+    effective = direct_commitments or locator_commitments
+    expected = effective[0] if event_time_available and len(effective) == 1 else None
+    if session_commitment != expected:
+        raise ValueError("source transport inventory session commitment changed")
+    return direct_commitments, locator_commitments
 
 
 class ControlledGapReason(StrEnum):

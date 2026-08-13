@@ -324,10 +324,10 @@ TRANSPORT_MODULES = {
 }
 
 TRANSPORT_LINE_INVENTORY = {
-    "transport.py": 231,
+    "transport.py": 237,
     "transport_auth.py": 143,
     "transport_capture.py": 999,
-    "transport_contracts.py": 990,
+    "transport_contracts.py": 991,
     "transport_discovery.py": 240,
     "transport_paths.py": 82,
     "transport_program.py": 450,
@@ -336,7 +336,7 @@ TRANSPORT_LINE_INVENTORY = {
     "transport_resume.py": 168,
     "transport_session_shards.py": 1_605,
     "transport_snapshot.py": 219,
-    "transport_source.py": 1_693,
+    "transport_source.py": 1_646,
     "transport_worker.py": 21,
 }
 TRANSPORT_AGGREGATE_LINE_LIMIT = 7_250
@@ -1108,7 +1108,7 @@ spec.loader.exec_module(module)
         }
         self.assertEqual(TRANSPORT_MODULES, set(TRANSPORT_LINE_INVENTORY))
         self.assertEqual(TRANSPORT_LINE_INVENTORY, observed)
-        self.assertEqual(7_243, sum(observed.values()))
+        self.assertEqual(7_203, sum(observed.values()))
         self.assertLessEqual(
             sum(observed.values()),
             TRANSPORT_AGGREGATE_LINE_LIMIT,

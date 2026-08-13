@@ -33,6 +33,7 @@ from .contracts import (
     SessionShardsRequest,
     SourceCellStatus,
     SourceKind,
+    session_selector_commitments,
 )
 from .orchestrator_context import OrchestratorComponent, RuntimeContext
 from .orchestrator_protocols import (
@@ -282,10 +283,8 @@ class SourceCoordinationOperations(OrchestratorComponent):
                         value,
                         source_kind=source_kind,
                     )
-                    if len(identifiers) == 1 and (
-                        source_transport.session_selector_commitment(identifiers[0])
-                        != row_session_commitment
-                    ):
+                    direct_commitments = list(session_selector_commitments(identifiers))
+                    if direct_commitments != inventory["direct_session_commitments"]:
                         raise ValueError("source session commitment changed")
                     derived_time = catalog.event_time_from_record(
                         value,

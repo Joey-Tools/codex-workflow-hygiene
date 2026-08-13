@@ -20,7 +20,7 @@ from .contracts import (
     SESSION_SHARDS_SOURCE_TOKEN_PREFIX,
     SessionShardsRequest,
     SourceKind,
-    is_valid_session_identifier,
+    source_record_session_identifiers,
 )
 from .orchestrator_core import EXTRACTOR_SHARD_MAX_BYTES, InvalidInputError
 from .session_shards_relay import MAX_SESSION_SHARDS_RECORD_DATA_FRAMES
@@ -74,54 +74,7 @@ def _source_session_identifiers(
     *,
     source_kind: SourceKind,
 ) -> tuple[str, ...]:
-    identifiers: set[str] = set()
-    nodes: list[tuple[Mapping[str, Any], int]] = [(record, 0)]
-    visited = 0
-    explicit_keys = {
-        "conversation_id",
-        "sessionId",
-        "session_id",
-        "threadId",
-        "thread_id",
-    }
-    while nodes:
-        node, depth = nodes.pop()
-        visited += 1
-        if visited > 4096 or depth > 16:
-            raise ValueError("source record identity structure exceeds bounds")
-        for key in explicit_keys:
-            candidate = node.get(key)
-            if isinstance(candidate, str) and not is_valid_session_identifier(
-                candidate
-            ):
-                raise ValueError("source record session identity is invalid")
-            if is_valid_session_identifier(candidate):
-                identifiers.add(candidate)
-        if source_kind is SourceKind.SESSION_INDEX:
-            candidate = node.get("id")
-            if isinstance(candidate, str) and not is_valid_session_identifier(
-                candidate
-            ):
-                raise ValueError("source record session identity is invalid")
-            if is_valid_session_identifier(candidate):
-                identifiers.add(candidate)
-        if node.get("type") == "session_meta":
-            payload = node.get("payload")
-            if isinstance(payload, Mapping):
-                for key in ("id", "session_id"):
-                    candidate = payload.get(key)
-                    if isinstance(candidate, str) and not is_valid_session_identifier(
-                        candidate
-                    ):
-                        raise ValueError("source record session identity is invalid")
-                    if is_valid_session_identifier(candidate):
-                        identifiers.add(candidate)
-        for child in node.values():
-            if isinstance(child, Mapping):
-                nodes.append((child, depth + 1))
-    if len(identifiers) > 32:
-        raise ValueError("source record contains too many session identifiers")
-    return tuple(sorted(identifiers, key=lambda value: value.encode("utf-8")))
+    return source_record_session_identifiers(record, source_kind=source_kind)
 
 
 def _require_frame_keys(

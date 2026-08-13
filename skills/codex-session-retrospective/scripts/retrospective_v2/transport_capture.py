@@ -5,12 +5,11 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-from dataclasses import dataclass
 import hashlib
 from typing import Any, Iterable, Mapping
 
 try:
-    from . import catalog
+    from . import catalog, contracts as common_contracts
     from .contracts import JsonValue, SourceCellStatus
     from .transport_contracts import (
         SOURCE_TRANSPORT_MAX_RECORD_BYTES,
@@ -36,6 +35,7 @@ try:
     )
 except (ImportError, ModuleNotFoundError):
     import catalog  # type: ignore[no-redef]
+    import contracts as common_contracts  # type: ignore[no-redef]
     from contracts import JsonValue, SourceCellStatus  # type: ignore[no-redef]
     from transport_contracts import (  # type: ignore[no-redef]
         SOURCE_TRANSPORT_MAX_RECORD_BYTES,
@@ -59,20 +59,6 @@ except (ImportError, ModuleNotFoundError):
         _stream_frame,
         _valid_source_locator,
     )
-
-
-@dataclass(frozen=True, slots=True)
-class _TerminalEvidence:
-    status: SourceCellStatus
-    reason: str
-    resume_position: dict[str, JsonValue] | None
-    inventory_commitment: str
-    inventory_count: int
-    scan_byte_count: int
-    oversized_record_count: int
-    oversized_byte_count: int
-    emitted_record_count: int
-    emitted_byte_count: int
 
 
 class _SourceTransportCaptureValidator:
@@ -108,40 +94,21 @@ class _SourceTransportCaptureValidator:
         self.resume_probe_range: tuple[int, int] | None = None
         self.wire_bytes = 0
         self.payload_bytes = 0
-        self.prior_locator = (
-            None
-            if lease.resume_position is None
-            else str(lease.resume_position["source_locator"])
-        )
+        resume = lease.resume_position
+        self.prior_locator = None if resume is None else str(resume["source_locator"])
         self.prior_record_index = (
-            -1
-            if lease.resume_position is None
-            else int(lease.resume_position["record_index"]) - 1
+            -1 if resume is None else int(resume["record_index"]) - 1
         )
-        self.prior_byte_end = (
-            0
-            if lease.resume_position is None
-            else int(lease.resume_position["byte_offset"])
-        )
+        self.prior_byte_end = 0 if resume is None else int(resume["byte_offset"])
         self.prior_candidate_index = (
-            -1
-            if lease.resume_position is None
-            else int(lease.resume_position["candidate_index"])
+            -1 if resume is None else int(resume["candidate_index"])
         )
-        self.prior_source_size = (
-            None
-            if lease.resume_position is None
-            else int(lease.resume_position["source_size"])
-        )
+        self.prior_source_size = None if resume is None else int(resume["source_size"])
         self.prior_source_token = (
-            None
-            if lease.resume_position is None
-            else str(lease.resume_position["source_token"])
+            None if resume is None else str(resume["source_token"])
         )
         self.discovery_commitment = (
-            None
-            if lease.resume_position is None
-            else str(lease.resume_position["discovery_commitment"])
+            None if resume is None else str(resume["discovery_commitment"])
         )
         self.wire_limit = (
             lease.source_byte_limit * 2
@@ -194,6 +161,21 @@ class _SourceTransportCaptureValidator:
             raise TransportValidationError(
                 "source transport record does not match its inventory item"
             )
+        try:
+            direct_session_commitments = list(
+                common_contracts.source_record_session_commitments(
+                    _stream_frame(payload.rstrip(b"\r\n")),
+                    source_kind=self.lease.source_kind,
+                )
+            )
+        except ValueError as exc:
+            raise TransportValidationError(
+                "source transport record identity cannot be validated"
+            ) from exc
+        if direct_session_commitments != inventory_row["direct_session_commitments"]:
+            raise TransportValidationError(
+                "source transport record session identity changed"
+            )
         self.records.append(record)
         self.proof_rows.append(
             {
@@ -218,9 +200,11 @@ class _SourceTransportCaptureValidator:
                 "byte_start",
                 "candidate_index",
                 "content_commitment",
+                "direct_session_commitments",
                 "discovery_commitment",
                 "event_time",
                 "frame",
+                "locator_session_commitments",
                 "reason",
                 "record_index",
                 "schema",
@@ -306,6 +290,20 @@ class _SourceTransportCaptureValidator:
                 session_commitment,
                 "source transport inventory session commitment",
             )
+        try:
+            direct_session_commitments, locator_session_commitments = (
+                common_contracts.validate_source_inventory_session_commitments(
+                    locator=locator,
+                    direct=frame["direct_session_commitments"],
+                    accumulated=frame["locator_session_commitments"],
+                    session_commitment=session_commitment,
+                    event_time_available=event_time is not None,
+                    prior_position=self.lease.resume_position,
+                    prior_inventory=self.inventory[-1] if self.inventory else None,
+                )
+            )
+        except ValueError as exc:
+            raise TransportValidationError(str(exc)) from exc
         self._validate_inventory_coordinate(
             locator,
             candidate_index=candidate_index,
@@ -320,9 +318,11 @@ class _SourceTransportCaptureValidator:
             "byte_start": byte_start,
             "candidate_index": candidate_index,
             "content_commitment": commitment,  # type: ignore[dict-item]
+            "direct_session_commitments": list(direct_session_commitments),
             "discovery_commitment": discovery_commitment,
             "event_time": event_time,
             "frame": "inventory",
+            "locator_session_commitments": list(locator_session_commitments),
             "reason": reason,
             "record_index": record_index,
             "schema": SOURCE_TRANSPORT_STREAM_SCHEMA,
@@ -736,7 +736,7 @@ class _SourceTransportCaptureValidator:
 
     def _validated_outgoing_resume_position(
         self,
-        evidence: _TerminalEvidence,
+        evidence: common_contracts.SourceTransportTerminalEvidence,
     ) -> dict[str, JsonValue] | None:
         if evidence.resume_position is None:
             if self.resume_probe_payload is not None:
@@ -781,7 +781,9 @@ class _SourceTransportCaptureValidator:
         return expected
 
     @staticmethod
-    def _terminal_evidence(terminal: Mapping[str, object]) -> _TerminalEvidence:
+    def _terminal_evidence(
+        terminal: Mapping[str, object],
+    ) -> common_contracts.SourceTransportTerminalEvidence:
         if terminal["schema"] != SOURCE_TRANSPORT_STREAM_SCHEMA:
             raise TransportValidationError("source transport terminal schema changed")
         try:
@@ -803,7 +805,7 @@ class _SourceTransportCaptureValidator:
             raise TransportValidationError(
                 "source transport terminal resume position is invalid"
             )
-        return _TerminalEvidence(
+        return common_contracts.SourceTransportTerminalEvidence(
             status=terminal_status,
             reason=terminal_reason,
             resume_position=_normalize_source_resume_position(raw_resume),
@@ -837,7 +839,7 @@ class _SourceTransportCaptureValidator:
 
     def _validate_accounting(
         self,
-        evidence: _TerminalEvidence,
+        evidence: common_contracts.SourceTransportTerminalEvidence,
         terminal: Mapping[str, object],
     ) -> int:
         expected = {
@@ -886,7 +888,7 @@ class _SourceTransportCaptureValidator:
 
     def _validate_terminal_semantics(
         self,
-        evidence: _TerminalEvidence,
+        evidence: common_contracts.SourceTransportTerminalEvidence,
         explicit_gap_count: int,
         terminal: Mapping[str, object],
     ) -> None:
@@ -953,8 +955,6 @@ def capture_source_transport(
     *,
     lease: TransportLease,
 ) -> SourceTransportCapture:
-    """Validate and capture one exact, bounded source-transport process stream."""
-
     validator = _SourceTransportCaptureValidator(lease)
     for line in lines:
         validator.accept(line)

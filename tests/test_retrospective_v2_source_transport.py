@@ -520,6 +520,7 @@ class SourceTransportProtocolTests(unittest.TestCase):
         max_records: int,
         max_source_bytes: int = 16 * 1024 * 1024,
         resume_position: dict[str, object] | None = None,
+        session_selector_commitment: str | None = None,
         window_start: str = WINDOW_START,
         window_end: str = WINDOW_END,
     ) -> list[dict[str, object]]:
@@ -555,6 +556,10 @@ class SourceTransportProtocolTests(unittest.TestCase):
                     transport.encode_source_resume_position(resume_position),
                 )
             )
+        if session_selector_commitment is not None:
+            arguments.extend(
+                ("--session-selector-commitment", session_selector_commitment)
+            )
         with (
             output_path.open("w", encoding="ascii") as output,
             mock.patch.object(sys, "stdout", output),
@@ -576,7 +581,23 @@ class SourceTransportProtocolTests(unittest.TestCase):
         max_records: int,
         max_source_bytes: int = 16 * 1024 * 1024,
         resume_position: dict[str, object] | None = None,
+        session_selector_commitment: str | None = None,
+        session_target_selector: str | None = None,
     ) -> transport.TransportLease:
+        self.assertEqual(
+            session_selector_commitment is None,
+            session_target_selector is None,
+        )
+        session_target = (
+            None
+            if session_target_selector is None
+            else str(
+                self.identity.derive_ref(
+                    RefType.SESSION,
+                    {"session_id": session_target_selector},
+                )
+            )
+        )
         return transport.issue_transport_lease(
             self.identity,
             lease_ref=str(self.identity.derive_ref(RefType.LEASE, {"case": name})),
@@ -593,7 +614,8 @@ class SourceTransportProtocolTests(unittest.TestCase):
             source_byte_limit=max_source_bytes,
             record_limit=max_records,
             frame_byte_limit=8192,
-            session_target=None,
+            session_target=session_target,
+            session_selector_commitment=session_selector_commitment,
             source_cursor=None,
             cursor_time=None,
             resume_position=resume_position,
@@ -2265,6 +2287,37 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.assertEqual("source_record_unparseable", capture.terminal_reason)
         self.assertEqual("explicit_gap", capture.inventory[0]["accounting_class"])
 
+    def test_shared_session_parser_preserves_nested_key_scope(self) -> None:
+        ordinary_record = {
+            "payload": {
+                "id": "business-object",
+                "nested": {"session_id": "nested-session"},
+            },
+            "timestamp": "2026-07-06T01:00:00Z",
+            "type": "response_item",
+        }
+        session_meta = {
+            "payload": {
+                "id": "meta-session",
+                "nested": {"id": "nested-business-object"},
+            },
+            "timestamp": "2026-07-06T01:00:00Z",
+            "type": "session_meta",
+        }
+        for parser in (
+            transport_source._source_record_session_identifiers,
+            orchestrator_transport._source_session_identifiers,
+        ):
+            with self.subTest(parser=parser.__module__):
+                self.assertEqual(
+                    ("nested-session",),
+                    parser(ordinary_record, source_kind=SourceKind.ACTIVE_ROLLOUT),
+                )
+                self.assertEqual(
+                    ("meta-session",),
+                    parser(session_meta, source_kind=SourceKind.ACTIVE_ROLLOUT),
+                )
+
     def test_source_transport_continues_without_prefix_rescan_after_restart(
         self,
     ) -> None:
@@ -2452,13 +2505,13 @@ class SourceTransportProtocolTests(unittest.TestCase):
             )
         self.assertIsNone(segments[-1]["source_snapshot"]["resume_position"])
 
-    def test_source_resume_v4_is_canonical_and_v3_fails_closed(self) -> None:
+    def test_source_resume_v5_is_canonical_and_v4_fails_closed(self) -> None:
         source = self.codex_root / "history.jsonl"
         source.write_bytes(
             b"".join(self._line(f"schema-{index}") for index in range(3))
         )
         frames = self._direct_source_frames(
-            "resume-v4-schema",
+            "resume-v5-schema",
             source_kind="history",
             max_records=1,
         )
@@ -2466,13 +2519,14 @@ class SourceTransportProtocolTests(unittest.TestCase):
         self.assertIsInstance(resume, dict)
         assert isinstance(resume, dict)
 
-        self.assertEqual("source_transport_resume_v4", resume["schema"])
+        self.assertEqual("source_transport_resume_v5", resume["schema"])
         self.assertEqual(
             {
                 "accepted_prefix_commitment",
                 "byte_offset",
                 "candidate_index",
                 "discovery_commitment",
+                "locator_session_commitments",
                 "record_index",
                 "resume_probe",
                 "schema",
@@ -2488,9 +2542,29 @@ class SourceTransportProtocolTests(unittest.TestCase):
         )
         encoded = transport.encode_source_resume_position(resume)
         self.assertEqual(resume, transport.decode_source_resume_position(encoded))
+        self.assertEqual("source_transport_stream_v3", frames[0]["schema"])
+
+        legacy_stream = json.loads(json.dumps(frames))
+        legacy_stream[0]["schema"] = "source_transport_stream_v2"
+        lease = self._direct_source_lease(
+            "resume-v5-schema",
+            source_kind="history",
+            max_records=1,
+        )
+        with self.assertRaisesRegex(
+            transport.TransportValidationError,
+            "header is not bound",
+        ):
+            transport.capture_source_transport(
+                (
+                    json.dumps(frame, separators=(",", ":"), sort_keys=True) + "\n"
+                    for frame in legacy_stream
+                ),
+                lease=lease,
+            )
 
         wrong_schema = json.loads(json.dumps(resume))
-        wrong_schema["schema"] = "source_transport_resume_v3"
+        wrong_schema["schema"] = "source_transport_resume_v4"
         with self.assertRaisesRegex(
             transport.TransportValidationError,
             "resume schema changed",
@@ -2506,6 +2580,369 @@ class SourceTransportProtocolTests(unittest.TestCase):
             "closed field set",
         ):
             transport.encode_source_resume_position(legacy_fields)
+
+        commitment = transport.session_selector_commitment("schema-0")
+        with self.assertRaisesRegex(
+            transport.TransportValidationError,
+            "session selector is invalid",
+        ):
+            transport.session_selector_commitment("")
+        invalid_commitment_sets = (
+            None,
+            [commitment, commitment],
+            ["sha256:" + "f" * 64, commitment],
+            [commitment, "sha256:" + "e" * 64, "sha256:" + "f" * 64],
+        )
+        for index, invalid in enumerate(invalid_commitment_sets):
+            with self.subTest(index=index):
+                malformed = json.loads(json.dumps(resume))
+                malformed["locator_session_commitments"] = invalid
+                with self.assertRaisesRegex(
+                    transport.TransportValidationError,
+                    "locator session commitments are not closed",
+                ):
+                    transport.encode_source_resume_position(malformed)
+
+    def test_rollout_resume_preserves_idless_session_identity(self) -> None:
+        session_id = "resumed-session"
+        selector = transport.session_selector_commitment(session_id)
+        payloads = (
+            self._line(session_id, kind="session_meta"),
+            b'{"payload":{"content":"SecondPage","role":"user"},'
+            b'"timestamp":"2026-07-06T01:01:00Z",'
+            b'"type":"response_item"}\n',
+            b'{"payload":{"content":"ThirdPage","role":"assistant"},'
+            b'"timestamp":"2026-07-06T01:02:00Z",'
+            b'"type":"response_item"}\n',
+        )
+        for source_kind, directory in (
+            ("active_rollout", "sessions"),
+            ("archived_rollout", "archived_sessions"),
+        ):
+            with self.subTest(source_kind=source_kind):
+                rollout = self.codex_root.joinpath(
+                    directory,
+                    "2026/07/06",
+                    "rollout-2026-07-06T01-00-00-resume.jsonl",
+                )
+                rollout.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                rollout.write_bytes(b"".join(payloads))
+                first = self._direct_source_frames(
+                    f"{source_kind}-resume-first",
+                    source_kind=source_kind,
+                    max_records=1,
+                    session_selector_commitment=selector,
+                )
+                resume = first[-1]["resume_position"]
+                self.assertEqual([selector], resume["locator_session_commitments"])
+                second = self._direct_source_frames(
+                    f"{source_kind}-resume-second",
+                    source_kind=source_kind,
+                    max_records=1,
+                    resume_position=resume,
+                    session_selector_commitment=selector,
+                )
+                inventory = next(
+                    frame for frame in second if frame.get("frame") == "inventory"
+                )
+                self.assertEqual("consumed_candidate", inventory["accounting_class"])
+                self.assertEqual("inside_window", inventory["reason"])
+                self.assertEqual(selector, inventory["session_commitment"])
+                self.assertEqual([selector], inventory["locator_session_commitments"])
+
+                lease = self._direct_source_lease(
+                    f"{source_kind}-resume-second",
+                    source_kind=source_kind,
+                    max_records=1,
+                    resume_position=resume,
+                    session_selector_commitment=selector,
+                    session_target_selector=session_id,
+                )
+                capture = transport.capture_source_transport(
+                    (
+                        json.dumps(frame, separators=(",", ":"), sort_keys=True) + "\n"
+                        for frame in second
+                    ),
+                    lease=lease,
+                )
+                forged_direct = json.loads(json.dumps(second))
+                forged_inventory = next(
+                    frame
+                    for frame in forged_direct
+                    if frame.get("frame") == "inventory"
+                )
+                forged_inventory["direct_session_commitments"] = [
+                    transport.session_selector_commitment("forged-direct")
+                ]
+                with self.assertRaisesRegex(
+                    transport.TransportValidationError,
+                    "changed unexpectedly",
+                ):
+                    transport.capture_source_transport(
+                        (
+                            json.dumps(frame, separators=(",", ":"), sort_keys=True)
+                            + "\n"
+                            for frame in forged_direct
+                        ),
+                        lease=lease,
+                    )
+
+                forged_effective = json.loads(json.dumps(second))
+                forged_inventory = next(
+                    frame
+                    for frame in forged_effective
+                    if frame.get("frame") == "inventory"
+                )
+                forged_inventory["session_commitment"] = (
+                    transport.session_selector_commitment("forged-effective")
+                )
+                with self.assertRaisesRegex(
+                    transport.TransportValidationError,
+                    "session commitment changed",
+                ):
+                    transport.capture_source_transport(
+                        (
+                            json.dumps(frame, separators=(",", ":"), sort_keys=True)
+                            + "\n"
+                            for frame in forged_effective
+                        ),
+                        lease=lease,
+                    )
+                state = {
+                    "mode": RunMode.SESSION.value,
+                    "session_selector_commitment": selector,
+                    "session_target": lease.session_target,
+                }
+                coordinator = self._coordinator(
+                    f"{source_kind}-manifest",
+                    mode=RunMode.SESSION,
+                    session_target=lease.session_target,
+                    session_target_selector=session_id,
+                )
+                manifest, _raw_records = (
+                    coordinator._components.source._manifest_from_transport_capture(
+                        state,
+                        {},
+                        lease,
+                        capture,
+                    )
+                )
+                consumed = tuple(
+                    record
+                    for record in manifest.records
+                    if record.accounting_class
+                    is catalog.AccountingClass.CONSUMED_CANDIDATE
+                )
+                self.assertEqual(1, len(consumed))
+                self.assertEqual(
+                    lease.session_target, consumed[0].coordinate.source_ref
+                )
+
+    def test_resume_session_commitment_is_ambiguous_and_candidate_scoped(self) -> None:
+        first_id = "ambiguous-first"
+        second_id = "ambiguous-second"
+        first_commitment = transport.session_selector_commitment(first_id)
+        second_commitment = transport.session_selector_commitment(second_id)
+        first_rollout = self.codex_root.joinpath(
+            "sessions/2026/07/06/rollout-2026-07-06T01-00-00-first.jsonl"
+        )
+        first_rollout.parent.mkdir(mode=0o700, parents=True)
+        first_rollout.write_bytes(
+            self._line(first_id, kind="session_meta")
+            + self._line(second_id, kind="session_meta")
+            + b'{"payload":{"content":"Ambiguous","role":"user"},'
+            b'"timestamp":"2026-07-06T01:01:00Z","type":"response_item"}\n'
+        )
+        self.codex_root.joinpath(
+            "sessions/2026/07/06/rollout-2026-07-06T02-00-00-next.jsonl"
+        ).write_bytes(self._line("next-session", kind="session_meta"))
+        first = self._direct_source_frames(
+            "ambiguous-resume-first",
+            source_kind="active_rollout",
+            max_records=2,
+        )
+        resume = first[-1]["resume_position"]
+        self.assertEqual(
+            sorted((first_commitment, second_commitment)),
+            resume["locator_session_commitments"],
+        )
+        second = self._direct_source_frames(
+            "ambiguous-resume-second",
+            source_kind="active_rollout",
+            max_records=2,
+            resume_position=resume,
+        )
+        inventories = [frame for frame in second if frame.get("frame") == "inventory"]
+        self.assertIsNone(inventories[0]["session_commitment"])
+        self.assertEqual(
+            sorted((first_commitment, second_commitment)),
+            inventories[0]["locator_session_commitments"],
+        )
+        next_commitment = transport.session_selector_commitment("next-session")
+        self.assertEqual(next_commitment, inventories[1]["session_commitment"])
+        self.assertEqual(
+            [next_commitment], inventories[1]["locator_session_commitments"]
+        )
+
+        forged = json.loads(json.dumps(second))
+        forged_inventory = next(
+            frame for frame in forged if frame.get("frame") == "inventory"
+        )
+        forged_inventory["locator_session_commitments"] = [first_commitment]
+        lease = self._direct_source_lease(
+            "ambiguous-resume-second",
+            source_kind="active_rollout",
+            max_records=2,
+            resume_position=resume,
+        )
+        with self.assertRaisesRegex(
+            transport.TransportValidationError,
+            "changed unexpectedly",
+        ):
+            transport.capture_source_transport(
+                (
+                    json.dumps(frame, separators=(",", ":"), sort_keys=True) + "\n"
+                    for frame in forged
+                ),
+                lease=lease,
+            )
+
+        forged_cross_candidate = json.loads(json.dumps(second))
+        cross_inventory = [
+            frame
+            for frame in forged_cross_candidate
+            if frame.get("frame") == "inventory"
+        ][1]
+        cross_inventory["direct_session_commitments"] = []
+        cross_inventory["locator_session_commitments"] = [first_commitment]
+        cross_inventory["session_commitment"] = first_commitment
+        with self.assertRaisesRegex(
+            transport.TransportValidationError,
+            "changed unexpectedly",
+        ):
+            transport.capture_source_transport(
+                (
+                    json.dumps(frame, separators=(",", ":"), sort_keys=True) + "\n"
+                    for frame in forged_cross_candidate
+                ),
+                lease=lease,
+            )
+
+    def test_direct_ambiguous_identity_does_not_fall_back_to_resume_target(
+        self,
+    ) -> None:
+        target = "direct-target"
+        selector = transport.session_selector_commitment(target)
+        rollout = self.codex_root.joinpath(
+            "sessions/2026/07/06/rollout-2026-07-06T01-00-00-direct.jsonl"
+        )
+        rollout.parent.mkdir(mode=0o700, parents=True)
+        rollout.write_bytes(
+            self._line(target, kind="session_meta")
+            + (
+                json.dumps(
+                    {
+                        "payload": {"content": "Ambiguous", "role": "user"},
+                        "session_id": target,
+                        "thread_id": "direct-other",
+                        "timestamp": "2026-07-06T01:01:00Z",
+                        "type": "response_item",
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("ascii")
+                + b"\n"
+            )
+        )
+        first = self._direct_source_frames(
+            "direct-ambiguous-first",
+            source_kind="active_rollout",
+            max_records=1,
+            session_selector_commitment=selector,
+        )
+        second = self._direct_source_frames(
+            "direct-ambiguous-second",
+            source_kind="active_rollout",
+            max_records=1,
+            resume_position=first[-1]["resume_position"],
+            session_selector_commitment=selector,
+        )
+        inventory = next(frame for frame in second if frame.get("frame") == "inventory")
+        self.assertEqual("explicit_gap", inventory["accounting_class"])
+        self.assertEqual("session_identity_unresolved", inventory["reason"])
+        self.assertIsNone(inventory["session_commitment"])
+        self.assertEqual(2, len(inventory["locator_session_commitments"]))
+
+    def test_non_session_multi_identity_uses_stable_unresolved_ref(self) -> None:
+        payload = (
+            json.dumps(
+                {
+                    "payload": {"content": "Ambiguous", "role": "user"},
+                    "session_id": "daily-first",
+                    "thread_id": "daily-second",
+                    "timestamp": "2026-07-06T01:01:00Z",
+                    "type": "response_item",
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+            + b"\n"
+        )
+        observed_refs: list[str] = []
+        for source_kind, directory in (
+            ("active_rollout", "sessions"),
+            ("archived_rollout", "archived_sessions"),
+        ):
+            with self.subTest(source_kind=source_kind):
+                rollout = self.codex_root.joinpath(
+                    directory,
+                    "2026/07/06",
+                    f"rollout-2026-07-06T01-00-00-{source_kind}.jsonl",
+                )
+                rollout.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                rollout.write_bytes(payload)
+                name = f"{source_kind}-daily-ambiguous"
+                frames = self._direct_source_frames(
+                    name,
+                    source_kind=source_kind,
+                    max_records=2,
+                )
+                inventory = next(
+                    frame for frame in frames if frame.get("frame") == "inventory"
+                )
+                self.assertEqual("consumed_candidate", inventory["accounting_class"])
+                self.assertEqual(2, len(inventory["direct_session_commitments"]))
+                self.assertIsNone(inventory["session_commitment"])
+                lease = self._direct_source_lease(
+                    name,
+                    source_kind=source_kind,
+                    max_records=2,
+                )
+                capture = transport.capture_source_transport(
+                    (
+                        json.dumps(frame, separators=(",", ":"), sort_keys=True) + "\n"
+                        for frame in frames
+                    ),
+                    lease=lease,
+                )
+                coordinator = self._coordinator(name)
+                manifest, _raw_records = (
+                    coordinator._components.source._manifest_from_transport_capture(
+                        {"mode": RunMode.DAILY.value},
+                        {},
+                        lease,
+                        capture,
+                    )
+                )
+                consumed = tuple(
+                    record
+                    for record in manifest.records
+                    if record.accounting_class
+                    is catalog.AccountingClass.CONSUMED_CANDIDATE
+                )
+                self.assertEqual(1, len(consumed))
+                observed_refs.append(consumed[0].coordinate.source_ref)
+        self.assertEqual(observed_refs[0], observed_refs[1])
 
     def test_forged_incoming_resume_fails_probe_auth_and_header_chains(self) -> None:
         source = self.codex_root / "history.jsonl"

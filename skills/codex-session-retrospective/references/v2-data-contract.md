@@ -114,13 +114,30 @@ type-aware entry snapshot to remain exact. A replacement or entry-set change is
 an explicit enumeration gap rather than an incomplete success.
 Archived discovery remains window-bound, and filesystem mtimes never prefilter
 candidates. Resume positions use the closed
-`source_transport_resume_v4` schema. They carry a public
+`source_transport_resume_v5` schema. They carry a public
 `accepted_prefix_commitment` transition chain plus the exact trailing probe
 range and content commitment; the chain is authoritative only because the
 incoming position is carried by the authenticated durable checkpoint, lease,
 and exact stream header and the outgoing position is independently reconstructed
 by capture before the receipt is issued. `source_token` and public stat fields
 never create or replace that authentication.
+
+The `source_transport_stream_v3` inventory carries two closed, sorted identity
+arrays. `direct_session_commitments` binds the zero, one, or two identities
+parsed directly from the current row. `locator_session_commitments` carries the
+same locator's accumulated state: zero for unknown identity, one for a unique
+identity, or two as a permanent ambiguity witness. Neither array contains a raw
+session identifier. Capture independently reparses each consumed payload and
+requires its direct array to match, then requires the locator state to remain
+unchanged or move monotonically from unique to ambiguous within the same source
+locator. A new candidate starts from empty state. Current-row selection uses the
+direct array whenever it is non-empty, including direct ambiguity, and inherits
+the locator state only for an ID-less row. This lets an ID-less rollout record
+after a bounded page break retain the commitment established by its earlier
+`session_meta` without letting a cursor identity leak into the next rollout or
+letting a direct multi-ID row fall back to the cursor target. Durable v4
+continuations and v2 streams fail closed and require a new source-catalog run
+rather than silently resuming without these commitments.
 
 Each invocation may spend at most three 64 KiB internal reads on resume probes;
 budget exhaustion is the explicit `source_resume_probe_budget_exhausted` gap.
