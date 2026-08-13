@@ -1598,3 +1598,27 @@ superseded_by:
   zero; the 4,200-second deadline and 16 MiB retained-log limit did not trigger.
   Scoped Ruff lint/format, actionlint, `git diff --check`, project-journal
   validation, and the official isolated OpenAI skill validator also pass.
+- The final-head fresh Codex processor on `e156f86a` returned one P2 finding:
+  Python Unicode case-insensitive matching made the shared `[a-z]` URI scheme
+  class also accept `\u0130`, `\u0131`, `\u017f`, and `\u212a`. That could redact
+  ordinary non-scheme text even though RFC-style scheme syntax is ASCII. The
+  processor's postvalidation reproduced its exact 4-commit/3-edge receipt and
+  the trusted bundle digests were unchanged. Hosted CI run `31658897370` was
+  still running and was cancelled as stale after the finding.
+- The shared URI grammar now spells both the leading and continuation scheme
+  classes explicitly as ASCII upper- and lowercase characters without Unicode
+  case-folding flags. The left boundary uses the same complete ASCII scheme
+  alphabet and separately prevents a restart after Unicode alphanumeric text
+  while retaining `_` as a delimiter. Endpoint regressions preserve mixed-case
+  ASCII scheme redaction and prove that all four Python case-fold extras remain
+  unchanged and unflagged.
+- The final exact regressions pass 2/2 in 0.013 seconds; the result, export, and
+  module-boundary group passes 138/138 in 5.222 seconds; and the result-contract,
+  skill-structure, and validator-wrapper group passes 56/56 in 6.350 seconds.
+  Two earlier exact runs were implementation/test-shape feedback and are not
+  passing evidence: the first exposed an internal ASCII restart after a Unicode
+  prefix, and the second still asserted against the separate `//host` path
+  detector after the URI category had been removed. Pinned Ruff 0.13.2 lint and
+  format checks, actionlint, `git diff --check`, project-journal validation, and
+  the official isolated OpenAI skill validator pass. One direct validator run
+  without PyYAML is a non-counting runtime error.

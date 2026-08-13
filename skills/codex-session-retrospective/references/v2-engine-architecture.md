@@ -60,11 +60,12 @@ and effective IPv4/IPv6 detection. Working-zone redaction, retained safe
 strings, reviewed prose, and final report validation consume that same locator
 policy. Protocol locators accept every syntactically legal scheme length and
 rely on the result field's existing character ceiling rather than a privacy-only
-scheme cap. Their shared left boundary excludes every legal scheme character
-instead of relying on a word boundary, so a locator after `_` is detected while
-the scanner cannot restart inside a longer scheme. Empty authority remains a
-locator and is rejected conservatively. The retained boundary still applies its
-stricter field and prose grammar.
+scheme cap. Their shared left boundary excludes every legal ASCII scheme
+character and every Unicode alphanumeric character instead of relying on a
+case-folded word boundary. A locator after `_` is detected, while the scanner
+cannot restart inside a longer ASCII scheme or an invalid Unicode-prefixed word.
+Empty authority remains a locator and is rejected conservatively. The retained
+boundary still applies its stricter field and prose grammar.
 Keeping these deterministic policies outside the coordinator capabilities
 prevents lifecycle and result-validation modules from growing a second copy of
 either state machine.

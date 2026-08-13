@@ -19,7 +19,10 @@ BARE_FQDN_RE = re.compile(
     r"(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})"
     r"(?::\d{1,5})?(?:/[^\s<>\"']*)?(?![a-z0-9_-])"
 )
-URI_LOCATOR_RE = re.compile(r"(?i)(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s<>\"']*")
+URI_LOCATOR_RE = re.compile(
+    r"(?<![A-Za-z0-9+.-])(?<![^\W_])"
+    r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']*"
+)
 IPV4_CANDIDATE_RE = re.compile(
     r"(?<![0-9A-Za-z.])"
     r"(?P<address>(?:[0-9]{1,3}\.){3}[0-9]{1,3})"

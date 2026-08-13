@@ -886,6 +886,7 @@ class ResultValidationTests(unittest.TestCase):
         self.assertEqual(scan_for_leaks({"safe": "9abc://?not-a-uri"}), ())
         for uri in (
             "x://private-endpoint/resource",
+            "HtTp+S://private-endpoint/resource",
             "wss://build.internal/events",
             "s3://private-bucket/report",
             "postgresql://database.internal/history",
@@ -906,6 +907,32 @@ class ResultValidationTests(unittest.TestCase):
                     f"Inspect {expected_prefix}[REDACTED_URL] before continuing.",
                 )
                 self.assertEqual(scan_for_leaks(result), ())
+
+    def test_uri_scheme_matching_does_not_unicode_casefold(self) -> None:
+        for uri_like_text in (
+            "\u0130ttp://host",
+            "\u0131ttp://host",
+            "\u017fsh://host",
+            "\u212ahttp://host",
+        ):
+            with self.subTest(uri_like_text=uri_like_text):
+                self.assertIsNone(
+                    result_validation_module.privacy_locators.URI_LOCATOR_RE.search(
+                        uri_like_text
+                    )
+                )
+                self.assertEqual(
+                    result_validation_module.privacy_locators.URI_LOCATOR_RE.sub(
+                        "[REDACTED_URL]", uri_like_text
+                    ),
+                    uri_like_text,
+                )
+                self.assertTrue(
+                    {"url", "internal_url"}.isdisjoint(
+                        finding.category
+                        for finding in scan_for_leaks({"safe": uri_like_text})
+                    )
+                )
 
     def test_post_redaction_covers_posix_paths_under_unlisted_roots(self) -> None:
         for source_path in (
