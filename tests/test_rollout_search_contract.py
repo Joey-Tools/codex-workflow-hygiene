@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import json
 import os
 from pathlib import Path
@@ -504,6 +505,134 @@ class RolloutSearchReferenceTests(unittest.TestCase):
         self.assertEqual(metadata["matched_records"], 1)
         self.assertEqual(metadata["invalid_records"], 0)
         self.assertFalse(metadata["output_truncated"])
+
+    def test_field_aware_parser_rejects_non_utf8_json_encodings(self) -> None:
+        non_utf8_json = json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "needle in a non-UTF-8 record",
+                },
+            },
+            separators=(",", ":"),
+        )
+        encodings = (
+            "utf-16-be",
+            "utf-32-be",
+        )
+        encoded_records = [
+            (non_utf8_json + "\n").encode(encoding) for encoding in encodings
+        ]
+        self.assertTrue(
+            all(
+                isinstance(json.loads(record), dict)
+                for record in encoded_records
+            )
+        )
+        valid_record = (
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "needle in valid UTF-8",
+                    },
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout.jsonl"
+            rollout.write_bytes(b"".join(encoded_records + [valid_record]))
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    extract_field_aware_parser(),
+                    str(rollout),
+                    MATCH_PATTERN,
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(len(completed.stdout.splitlines()), 1)
+        self.assertIn("needle in valid UTF-8", completed.stdout)
+        self.assertNotIn("non-UTF-8 record", completed.stdout)
+        metadata = json.loads(completed.stderr)
+        self.assertEqual(
+            metadata,
+            {
+                "emitted_rows": 1,
+                "invalid_records": 2,
+                "kind": "scan_meta",
+                "matched_records": 1,
+                "max_rows": 20,
+                "output_truncated": False,
+                "oversized_records": 0,
+                "records_seen": 3,
+                "scan_complete": True,
+                "stop_reason": None,
+                "suppressed_rows": 0,
+            },
+        )
+
+    def test_field_aware_parser_rejects_little_endian_json_at_eof(self) -> None:
+        non_utf8_json = json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "needle in a little-endian record",
+                },
+            },
+            separators=(",", ":"),
+        )
+        expected_metadata = {
+            "emitted_rows": 0,
+            "invalid_records": 1,
+            "kind": "scan_meta",
+            "matched_records": 0,
+            "max_rows": 20,
+            "output_truncated": False,
+            "oversized_records": 0,
+            "records_seen": 1,
+            "scan_complete": True,
+            "stop_reason": None,
+            "suppressed_rows": 0,
+        }
+
+        for encoding, bom in (
+            ("utf-16-le", codecs.BOM_UTF16_LE),
+            ("utf-32-le", codecs.BOM_UTF32_LE),
+        ):
+            with self.subTest(encoding=encoding):
+                raw_record = bom + non_utf8_json.encode(encoding)
+                self.assertIsInstance(json.loads(raw_record), dict)
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    rollout = Path(temp_dir) / "rollout.jsonl"
+                    rollout.write_bytes(raw_record)
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            extract_field_aware_parser(),
+                            str(rollout),
+                            MATCH_PATTERN,
+                        ],
+                        capture_output=True,
+                        check=False,
+                        text=True,
+                    )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout, "")
+                self.assertEqual(json.loads(completed.stderr), expected_metadata)
 
     def test_field_aware_parser_rejects_whitespace_only_needle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
