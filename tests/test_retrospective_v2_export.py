@@ -1357,11 +1357,13 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
                     validate_retained_artifacts(report_tampered)
 
     def test_non_http_uri_schemes_are_rejected_before_and_after_assembly(self) -> None:
+        prefixed_mixed_scheme_uri = f"locator_a{'9' * 32}+.-x://?prod-build-queue"
         for uri in (
             "x://private-endpoint/resource",
             "wss://build.internal/events",
             "s3://private-bucket/report",
             "postgresql://database.internal/history",
+            prefixed_mixed_scheme_uri,
         ):
             with self.subTest(uri=uri, phase="assembly"):
                 unsafe = review_data()
@@ -1387,6 +1389,16 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
                 )
                 refresh_bundle_digest(tampered)
                 with self.assertRaisesRegex(RetainedPrivacyError, "URL"):
+                    validate_retained_artifacts(tampered)
+
+            with self.subTest(uri=uri, phase="report"):
+                artifacts = assemble_retained_artifacts(run_state(), review_data())
+                tampered = dict(artifacts)
+                tampered["report.md"] += f"\nInspect {uri} before continuing.\n".encode(
+                    "ascii"
+                )
+                refresh_bundle_digest(tampered)
+                with self.assertRaisesRegex(RetainedPrivacyError, "forbidden locator"):
                     validate_retained_artifacts(tampered)
 
         untyped_review = review_data()

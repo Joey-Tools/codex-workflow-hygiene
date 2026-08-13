@@ -875,19 +875,22 @@ class ResultValidationTests(unittest.TestCase):
 
     def test_post_redaction_removes_non_http_uri_schemes(self) -> None:
         long_scheme_uri = f"{'a' * 33}://nas/jobs"
+        prefixed_mixed_scheme_uri = f"locator_a{'9' * 32}+.-x://?prod-build-queue"
         self.assertIn(
             "url",
             {
                 finding.category
-                for finding in scan_for_leaks({"unsafe": long_scheme_uri})
+                for finding in scan_for_leaks({"unsafe": prefixed_mixed_scheme_uri})
             },
         )
+        self.assertEqual(scan_for_leaks({"safe": "9abc://?not-a-uri"}), ())
         for uri in (
             "x://private-endpoint/resource",
             "wss://build.internal/events",
             "s3://private-bucket/report",
             "postgresql://database.internal/history",
             long_scheme_uri,
+            prefixed_mixed_scheme_uri,
         ):
             with self.subTest(uri=uri):
                 value = extractor_result()
@@ -897,9 +900,10 @@ class ResultValidationTests(unittest.TestCase):
 
                 result = validate_extractor_result(value, ALL_REFS)
 
+                expected_prefix = "locator_" if uri == prefixed_mixed_scheme_uri else ""
                 self.assertEqual(
                     result["turns"][0]["generalized_working_text"],
-                    "Inspect [REDACTED_URL] before continuing.",
+                    f"Inspect {expected_prefix}[REDACTED_URL] before continuing.",
                 )
                 self.assertEqual(scan_for_leaks(result), ())
 

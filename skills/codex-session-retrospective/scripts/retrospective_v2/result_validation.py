@@ -263,7 +263,6 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ),
 )
 
-_URL_RE = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s<>\"']+")
 _INTERNAL_HOST_RE = re.compile(
     r"(?i)(?:localhost|(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
     r"192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
@@ -644,7 +643,7 @@ def scan_for_leaks(
         for category, pattern, _replacement in _SECRET_PATTERNS:
             for match in pattern.finditer(text):
                 findings.add(LeakFinding(category, path, match.start(), match.end()))
-        for match in _URL_RE.finditer(text):
+        for match in privacy_locators.URI_LOCATOR_RE.finditer(text):
             category = (
                 "internal_url" if _INTERNAL_HOST_RE.search(match.group(0)) else "url"
             )
@@ -723,7 +722,7 @@ def _post_redact_text(
         redacted = pattern.sub(replacement, redacted)
     for pattern in (_EMAIL_RE, _PHONE_RE, _LABELED_PERSONAL_ID_RE):
         redacted = pattern.sub("[REDACTED_PERSONAL_IDENTIFIER]", redacted)
-    redacted = _URL_RE.sub("[REDACTED_URL]", redacted)
+    redacted = privacy_locators.URI_LOCATOR_RE.sub("[REDACTED_URL]", redacted)
     redacted = privacy_locators.BARE_PRIVATE_LOCATOR_RE.sub("[REDACTED_URL]", redacted)
     redacted = _LABELED_INTERNAL_HOST_RE.sub("[REDACTED_INTERNAL_HOST]", redacted)
     redacted = privacy_locators.redact_ip_addresses(redacted)

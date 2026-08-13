@@ -1569,3 +1569,32 @@ superseded_by:
   replacement commit `1162c67` starts directly from `db0991dc` and has the
   exact same `9636955d77c5822ea3d02b93b95285aacc8eb54f` tree as #67 final head
   `c358b950`; this journal note is its sole intentional follow-up difference.
+- Replacement PR #69 exact range `db0991dc..433f5775` passed secret admission
+  with complete temporary cleanup and hosted CI run `31652515559`. Its first
+  fresh Codex attempt reached the parent-owned 30-minute deadline without a
+  terminal artifact and was interrupted once; postvalidation reproduced the
+  exact 3-commit/2-edge receipt and all trusted bundle digests, but the
+  owner-private workspace remains retained because the standing read-only local
+  Codex-data constraint denied deletion. That attempt is transport-inconclusive
+  and non-counting. The one allowed fresh retry returned a P1 privacy finding:
+  a `_`-prefixed 33-character mixed scheme with empty authority could evade the
+  working-zone `\b` boundary and the retained validator's separate 32-character
+  cap. Retry postvalidation and trusted digests were again unchanged.
+- URI locators now use one shared unbounded scheme grammar across working-zone
+  scan/redaction and retained safe-string, reviewed-prose, and report validation.
+  Its left boundary excludes every legal scheme character and it conservatively
+  admits empty authority, so the scanner neither misses a locator after `_` nor
+  restarts inside a longer scheme. The exact reviewer regression passes 2/2 in
+  0.250 seconds; complete result, export, and module-boundary coverage passes
+  137/137 in 5.293 seconds. One earlier exact command used a nonexistent test
+  class and produced a loader error without running the export regression; it is
+  non-counting.
+- The first full discovery on this fix tree ran 1,720 tests before the sandbox
+  rejected disposable-GPG key generation in `DurablePublicationTests` class
+  setup; it is non-counting and supplies no complete-suite result. The explicitly
+  authorized host rerun under the same owner-controlled Python 3.13 `-B -S`
+  runtime and `TMPDIR=/private/tmp` passes 1,783/1,783 in 2,554.535 seconds.
+  Its process-group supervisor completed in 2,580.711 seconds with return code
+  zero; the 4,200-second deadline and 16 MiB retained-log limit did not trigger.
+  Scoped Ruff lint/format, actionlint, `git diff --check`, project-journal
+  validation, and the official isolated OpenAI skill validator also pass.
