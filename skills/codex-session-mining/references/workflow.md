@@ -415,6 +415,15 @@ needle = ' '.join(sys.argv[2].split())
 if not needle:
     print('NEEDLE must contain non-whitespace text', file=sys.stderr)
     raise SystemExit(2)
+max_needle_bytes = 1024
+try:
+    needle_utf8_bytes = len(needle.encode('utf-8'))
+except UnicodeEncodeError:
+    print('NEEDLE must be valid UTF-8', file=sys.stderr)
+    raise SystemExit(2)
+if needle_utf8_bytes > max_needle_bytes:
+    print(f'NEEDLE must be at most {max_needle_bytes} UTF-8 bytes', file=sys.stderr)
+    raise SystemExit(2)
 printed = 0
 max_rows = 20
 max_record_bytes = 1024 * 1024
@@ -667,7 +676,7 @@ print(json.dumps(scan_meta, sort_keys=True, separators=(',', ':')), file=sys.std
 PY
 ```
 
-The parser rejects an empty or whitespace-only needle before opening the rollout. The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. After raw matching and window selection, the snippet JSON-escapes only non-printable characters so terminal control sequences cannot reach stdout while printable Unicode remains unchanged. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
+The parser rejects an empty, whitespace-only, invalid-UTF-8, or post-normalization needle larger than 1024 UTF-8 bytes before opening the rollout. This fixed needle cap bounds the portion repeated in each of the at most 20 output rows. The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. After raw matching and window selection, the snippet JSON-escapes only non-printable characters so terminal control sequences cannot reach stdout while printable Unicode remains unchanged. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
 
 The parser continues through point-in-time EOF after its 20 stdout rows are full. Its final stderr line is one compact `scan_meta` JSON object; keep it in a private bounded control sink and require normal process exit plus `scan_complete: true`. `matched_records` counts every matching physical record reached by the selected-field scan, while `emitted_rows`, `suppressed_rows`, and `output_truncated` distinguish complete matching from bounded presentation. `invalid_records` and `oversized_records` identify physical records the parser could not inspect; they must be zero before claiming a complete no-match result. These counters do not freeze a live rollout or prove content stability.
 

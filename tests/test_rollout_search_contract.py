@@ -236,10 +236,13 @@ class RolloutSearchReferenceTests(unittest.TestCase):
         self.assertIn("explicit `-` path makes ripgrep read stdin", self.reference_lower)
         self.assertIn("input redirection supplies that one stream", self.reference_lower)
         self.assertIn(
-            "case-sensitive literal pattern whose unicode-whitespace-normalized form is non-empty",
+            "case-sensitive literal pattern whose unicode-whitespace-normalized form is non-empty and at most 1024 utf-8 bytes",
             self.reference_lower,
         )
-        self.assertIn("reject an empty or whitespace-only pattern", self.reference_lower)
+        self.assertIn(
+            "reject an empty, whitespace-only, invalid-utf-8, or oversized pattern",
+            self.reference_lower,
+        )
         self.assertIn("no optional matching flags", self.reference_lower)
         self.assertIn("different ripgrep query may be useful for orientation", self.reference_lower)
         self.assertIn("outside this protocol", self.reference_lower)
@@ -383,6 +386,50 @@ class RolloutSearchReferenceTests(unittest.TestCase):
         self.assertEqual(completed.stdout, "")
         self.assertEqual(
             completed.stderr, "NEEDLE must contain non-whitespace text\n"
+        )
+
+    def test_field_aware_parser_enforces_utf8_needle_byte_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout.jsonl"
+            accepted_needle = "😀" * 256
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "user_message",
+                            "message": accepted_needle,
+                        },
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            code = extract_field_aware_parser()
+            accepted = subprocess.run(
+                [sys.executable, "-c", code, str(rollout), accepted_needle],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            rejected = subprocess.run(
+                [sys.executable, "-c", code, str(rollout), accepted_needle + "x"],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(len(accepted.stdout.splitlines()), 1)
+        accepted_metadata = json.loads(accepted.stderr)
+        self.assertEqual(accepted_metadata["matched_records"], 1)
+        self.assertTrue(accepted_metadata["scan_complete"])
+        self.assertEqual(rejected.returncode, 2)
+        self.assertEqual(rejected.stdout, "")
+        self.assertEqual(
+            rejected.stderr, "NEEDLE must be at most 1024 UTF-8 bytes\n"
         )
 
     def test_exhaustive_block_pins_complete_shell_structure(self) -> None:
