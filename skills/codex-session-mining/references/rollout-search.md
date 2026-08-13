@@ -1,8 +1,10 @@
-# Searching One Known Rollout With ripgrep 15.x
+# Searching One Known Rollout With A Conformance-Qualified ripgrep
 
 Use this protocol only for one exact regular rollout file that has already been selected. It is not a file-locator or corpus-search protocol, and it never authorizes a raw scan of an entire rollout tree.
 
-Before using any template, run `rg --version` as a direct command and require the first line to report ripgrep major version 15. If ripgrep is unavailable or another major version is selected, do not improvise with these flags; use the bounded field-aware JSON recipes in [workflow.md](workflow.md) until that version has its own conformance evidence. This version check is a compatibility gate, not an instruction to install or replace host tooling during a search.
+Before using any template, run `rg --version` as a direct command. The current conformance-qualified version set is exactly ripgrep 15.2.0. This is a fast-path eligibility check, not a developer-machine pin: do not install, downgrade, or replace host tooling for this protocol. If ripgrep is unavailable, reports an unparseable version, or reports any version outside that set—including a newer version—skip every raw ripgrep template and use the bounded field-aware JSON recipes in [workflow.md](workflow.md). CI pins 15.2.0 only as the reproducible conformance baseline.
+
+Do not try an unqualified ripgrep version on rollout data and then rely on post-command validation. Position and preview bytes may already have reached the terminal, and an artifact may already have exceeded its intended bound, before an unexpected frame or size can be rejected. A future floating compatibility range requires an execution-time bounded private stdout and stderr sink that terminates the producer on overflow and releases output only after validation; these pure command templates do not provide that wrapper. Because ripgrep results are locators rather than match/no-match evidence, even a qualified successful command never replaces parser validation.
 
 ## Fixed Command Shape
 
@@ -118,7 +120,7 @@ Use an exhaustive artifact only when refinement is impractical and a local aggre
 )
 ```
 
-Require this artifact command to exit `0`. Under ripgrep 15.x on a 64-bit target, the fixed position framing plus `--max-columns 1` is less than 256 bytes per output row. `--max-count "$COUNT"` caps matching lines, so the artifact retains at most `N` rows and 64 MiB even if the input gains matches during the command. This is a retained-stdout bound only; it is not a runtime, RSS, stderr, input-read, or privacy bound.
+Require this artifact command to exit `0` and validate every retained row against the documented numeric framing and 256-byte row ceiling. Under the conformance-qualified 15.2.0 baseline on a 64-bit target, the fixed position framing plus `--max-columns 1` is less than 256 bytes per output row. `--max-count "$COUNT"` caps matching lines, so the artifact retains at most `N` rows and 64 MiB even if the input gains matches during the command. This is a retained-stdout bound only; it is not a runtime, RSS, stderr, input-read, or privacy bound.
 
 Shell noclobber is not a general `O_EXCL`/no-follow primitive: special objects such as FIFOs and same-UID replacement races are outside this recipe's protection. The owner-private-directory and no-tamper precondition is therefore part of the artifact contract, not an implementation detail.
 

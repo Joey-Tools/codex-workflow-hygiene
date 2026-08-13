@@ -19,6 +19,7 @@ REFERENCE = ROOT / "skills/codex-session-mining/references/rollout-search.md"
 WORKFLOW = ROOT / "skills/codex-session-mining/references/workflow.md"
 
 MATCH_PATTERN = "needle"
+CONFORMANCE_RG_VERSIONS = frozenset({(15, 2, 0)})
 POSITION_SAMPLE_LIMIT = 20
 PREVIEW_SAMPLE_LIMIT = 5
 PREVIEW_COLUMN_LIMIT = 4096
@@ -210,6 +211,13 @@ def parse_position_rows(output: bytes) -> list[tuple[int, int, int, bytes]]:
     return rows
 
 
+def parse_rg_version(output: bytes) -> tuple[int, int, int] | None:
+    match = re.match(rb"ripgrep (\d+)\.(\d+)\.(\d+)(?:\s|$)", output)
+    if match is None:
+        return None
+    return tuple(int(component) for component in match.groups())
+
+
 def extract_field_aware_parser() -> str:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
@@ -231,7 +239,14 @@ class RolloutSearchReferenceTests(unittest.TestCase):
             self.skill_text,
         )
 
-    def test_reference_limits_input_and_pins_rg_major(self) -> None:
+    def test_conformance_set_does_not_pin_host_tooling(self) -> None:
+        self.assertEqual(parse_rg_version(b"ripgrep 15.2.0 (rev abc)\n"), (15, 2, 0))
+        self.assertEqual(parse_rg_version(b"ripgrep 16.0.1\n"), (16, 0, 1))
+        self.assertIn((15, 2, 0), CONFORMANCE_RG_VERSIONS)
+        self.assertNotIn((16, 0, 1), CONFORMANCE_RG_VERSIONS)
+        self.assertIsNone(parse_rg_version(b"ripgrep development build\n"))
+
+    def test_reference_limits_input_and_qualifies_rg_version(self) -> None:
         self.assertIn("one exact regular rollout file", self.reference_lower)
         self.assertIn("explicit `-` path makes ripgrep read stdin", self.reference_lower)
         self.assertIn("input redirection supplies that one stream", self.reference_lower)
@@ -247,7 +262,12 @@ class RolloutSearchReferenceTests(unittest.TestCase):
         self.assertIn("different ripgrep query may be useful for orientation", self.reference_lower)
         self.assertIn("outside this protocol", self.reference_lower)
         self.assertIn("do not reuse its counts", self.reference_lower)
-        self.assertIn("require the first line to report ripgrep major version 15", self.reference_lower)
+        self.assertIn("current conformance-qualified version set is exactly ripgrep 15.2.0", self.reference_lower)
+        self.assertIn("not a developer-machine pin", self.reference_lower)
+        self.assertIn("including a newer version", self.reference_lower)
+        self.assertIn("skip every raw ripgrep template", self.reference_lower)
+        self.assertIn("future floating compatibility range requires an execution-time bounded", self.reference_lower)
+        self.assertIn("releases output only after validation", self.reference_lower)
         for flag in ("--fixed-strings", "--case-sensitive"):
             with self.subTest(flag=flag):
                 self.assertIn(f"`{flag}`", self.reference_text)
@@ -446,7 +466,7 @@ class RolloutSearchReferenceTests(unittest.TestCase):
                 self.assertRegex(shell_block, re.compile(line, re.MULTILINE))
 
 
-class Ripgrep15ConformanceTests(unittest.TestCase):
+class RipgrepConformanceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         reference_text = REFERENCE.read_text(encoding="utf-8")
@@ -457,14 +477,14 @@ class Ripgrep15ConformanceTests(unittest.TestCase):
             version = subprocess.run(
                 [rg, "--version"], capture_output=True, check=False
             )
-            match = re.search(rb"ripgrep (\d+)\.", version.stdout)
-            if version.returncode == 0 and match is not None:
-                failure = "dynamic contract is pinned to ripgrep 15.x"
-                if int(match.group(1)) == 15:
+            parsed_version = parse_rg_version(version.stdout)
+            if version.returncode == 0 and parsed_version is not None:
+                failure = "dynamic contract requires a conformance-qualified ripgrep version"
+                if parsed_version in CONFORMANCE_RG_VERSIONS:
                     cls.rg = rg
                     return
             else:
-                failure = "unable to determine ripgrep major version"
+                failure = "unable to determine ripgrep semantic version"
         if any(
             os.environ.get(variable, "").lower() == "true"
             for variable in ("GITHUB_ACTIONS", "CI")
@@ -716,12 +736,27 @@ class Ripgrep15ConformanceTests(unittest.TestCase):
                     self.assertEqual(completed.returncode, 1, completed.stderr)
                     self.assertEqual(completed.stdout, b"")
 
-    def test_exhaustive_shell_creates_bounded_owner_private_artifact(self) -> None:
+    def test_position_and_exhaustive_outputs_bound_omitted_long_lines(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             rollout = temp / "rollout-fixture.jsonl"
             artifact = temp / "positions.txt"
-            rollout.write_text("first needle\nsecond needle\n", encoding="utf-8")
+            rollout.write_bytes(
+                (b"x" * (PREVIEW_COLUMN_LIMIT + 1) + b" needle\n") * 2
+            )
+
+            position = self.run_protocol(POSITION_HEADING, rollout)
+            self.assertEqual(position.returncode, 0, position.stderr)
+            position_lines = position.stdout.splitlines(keepends=True)
+            self.assertEqual(len(position_lines), 2)
+            self.assertTrue(
+                all(len(line) <= MAX_POSITION_ROW_BYTES for line in position_lines)
+            )
+            self.assertTrue(
+                all(b"[Omitted long line with 1 matches]" in line for line in position_lines)
+            )
+            self.assertNotIn(MATCH_PATTERN.encode(), position.stdout)
+
             completed = self.run_exhaustive_shell(
                 rollout=rollout, artifact=artifact, count=2
             )
@@ -731,6 +766,17 @@ class Ripgrep15ConformanceTests(unittest.TestCase):
             artifact_bytes = artifact.read_bytes()
             rows = parse_position_rows(artifact_bytes)
             self.assertEqual([row[0] for row in rows], [1, 2])
+            artifact_lines = artifact_bytes.splitlines(keepends=True)
+            self.assertTrue(
+                all(len(line) <= MAX_POSITION_ROW_BYTES for line in artifact_lines)
+            )
+            self.assertLessEqual(
+                len(artifact_bytes), len(artifact_lines) * MAX_POSITION_ROW_BYTES
+            )
+            self.assertTrue(
+                all(b"[Omitted long line with 1 matches]" in line for line in artifact_lines)
+            )
+            self.assertNotIn(MATCH_PATTERN.encode(), artifact_bytes)
 
             widest_uint64 = str((1 << 64) - 1).encode()
             worst_width_row = b":".join(
