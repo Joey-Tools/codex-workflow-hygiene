@@ -2,9 +2,9 @@
 
 Use this protocol only for one exact regular rollout file that has already been selected. It is not a file-locator or corpus-search protocol, and it never authorizes a raw scan of an entire rollout tree.
 
-Before using any template, run `rg --version` as a direct command. The current conformance-qualified version set is exactly ripgrep 15.2.0. This is a fast-path eligibility check, not a developer-machine pin: do not install, downgrade, or replace host tooling for this protocol. If ripgrep is unavailable, reports an unparseable version, or reports any version outside that set—including a newer version—skip every raw ripgrep template and use the bounded field-aware JSON recipes in [workflow.md](workflow.md). CI pins 15.2.0 only as the reproducible conformance baseline.
+Before using any template, resolve ripgrep once with `command -v rg`. Require the result to be an absolute path naming an executable regular file, assign that exact path to `RG_BIN`, and run `"$RG_BIN" --version` as a direct command. Keep the same unchanged `RG_BIN` value for every template in this protocol; never re-resolve a bare `rg` between qualification and use. The current conformance-qualified version set is exactly ripgrep 15.2.0. This is a fast-path eligibility check, not a developer-machine pin: do not install, downgrade, or replace host tooling for this protocol. If ripgrep is unavailable, the path or version is unparseable, or the version falls outside that set—including a newer version—skip every raw ripgrep template and use the bounded field-aware JSON recipes in [workflow.md](workflow.md). CI pins 15.2.0 only as the reproducible conformance baseline.
 
-Do not try an unqualified ripgrep version on rollout data and then rely on post-command validation. Position and preview bytes may already have reached the terminal, and an artifact may already have exceeded its intended bound, before an unexpected frame or size can be rejected. A future floating compatibility range requires an execution-time bounded private stdout and stderr sink that terminates the producer on overflow and releases output only after validation; these pure command templates do not provide that wrapper. Because ripgrep results are locators rather than match/no-match evidence, even a qualified successful command never replaces parser validation.
+Do not try an unqualified ripgrep version on rollout data and then rely on post-command validation. Position and preview bytes may already have reached the terminal, and an artifact may already have exceeded its intended bound, before an unexpected frame or size can be rejected. These pure shell templates bind one resolved pathname but do not authenticate an opened executable object or exclude same-UID or privileged replacement of that path between checks. If that no-tamper assumption is unavailable, skip the templates. A future floating compatibility range or stronger executable binding requires a helper with an execution-time bounded private stdout and stderr sink, producer termination on overflow, and output release only after validation. Because ripgrep results are locators rather than match/no-match evidence, even a qualified successful command never replaces parser validation.
 
 ## Fixed Command Shape
 
@@ -13,7 +13,7 @@ Quote the exact rollout path in input redirection and put `--` immediately befor
 Every command in this protocol uses:
 
 ```bash
-rg \
+"$RG_BIN" \
     --no-config --no-mmap --text --encoding none \
     --no-heading --no-filename --color never \
     --fixed-strings --case-sensitive \
@@ -32,7 +32,7 @@ After this fixed first pass, a different ripgrep query may be useful for orienta
 Run the fixed shape with these protocol options:
 
 ```bash
-rg \
+"$RG_BIN" \
     --no-config --no-mmap --text --encoding none \
     --no-heading --no-filename --color never \
     --fixed-strings --case-sensitive \
@@ -59,7 +59,7 @@ If the count is greater than 20, refine the pattern and count again by default. 
 For an initial count from 1 through 20, print a bounded sample of at most 20 matching-line positions:
 
 ```bash
-rg \
+"$RG_BIN" \
     --no-config --no-mmap --text --encoding none \
     --no-heading --no-filename --color never \
     --fixed-strings --case-sensitive \
@@ -81,7 +81,7 @@ Position output is not a sanitizer. A very short matching line without a final L
 Only when the initial count is from 1 through 5, an optional preview may show bounded prefixes of at most five matching lines:
 
 ```bash
-rg \
+"$RG_BIN" \
     --no-config --no-mmap --text --encoding none \
     --no-heading --no-filename --color never \
     --fixed-strings --case-sensitive \
@@ -108,7 +108,7 @@ Use an exhaustive artifact only when refinement is impractical and a local aggre
 (
     set -C
     umask 077
-    rg \
+    "$RG_BIN" \
         --no-config --no-mmap --text --encoding none \
         --no-heading --no-filename --color never \
         --fixed-strings --case-sensitive \

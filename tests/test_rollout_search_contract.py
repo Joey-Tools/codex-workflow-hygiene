@@ -39,7 +39,7 @@ PROTOCOL_HEADINGS = (
 )
 
 FIXED_RG_ARGV = [
-    "rg",
+    "$RG_BIN",
     "--no-config",
     "--no-mmap",
     "--text",
@@ -139,9 +139,9 @@ def extract_protocol_template(
             raise AssertionError(
                 f"invalid shell quoting under protocol heading {heading!r}"
             ) from error
-        if "rg" not in shell_argv:
+        if "$RG_BIN" not in shell_argv:
             continue
-        rg_argv = shell_argv[shell_argv.index("rg") :]
+        rg_argv = shell_argv[shell_argv.index("$RG_BIN") :]
         if "&&" in rg_argv:
             rg_argv = rg_argv[: rg_argv.index("&&")]
         if rg_argv and rg_argv[-1] == ")":
@@ -174,7 +174,7 @@ def instantiate_protocol_command(
     count: int | None = None,
 ) -> tuple[list[str], Path]:
     substitutions = {
-        "rg": rg,
+        "$RG_BIN": rg,
         "$PATTERN": pattern,
         "$ROLLOUT": str(path),
     }
@@ -266,8 +266,13 @@ class RolloutSearchReferenceTests(unittest.TestCase):
         self.assertIn("not a developer-machine pin", self.reference_lower)
         self.assertIn("including a newer version", self.reference_lower)
         self.assertIn("skip every raw ripgrep template", self.reference_lower)
-        self.assertIn("future floating compatibility range requires an execution-time bounded", self.reference_lower)
-        self.assertIn("releases output only after validation", self.reference_lower)
+        self.assertIn("future floating compatibility range or stronger executable binding requires a helper", self.reference_lower)
+        self.assertIn("execution-time bounded private stdout and stderr sink", self.reference_lower)
+        self.assertIn("output release only after validation", self.reference_lower)
+        self.assertIn("resolve ripgrep once with `command -v rg`", self.reference_lower)
+        self.assertIn("keep the same unchanged `rg_bin` value", self.reference_lower)
+        self.assertIn("never re-resolve a bare `rg`", self.reference_lower)
+        self.assertIn("do not authenticate an opened executable object", self.reference_lower)
         for flag in ("--fixed-strings", "--case-sensitive"):
             with self.subTest(flag=flag):
                 self.assertIn(f"`{flag}`", self.reference_text)
@@ -513,12 +518,18 @@ class RipgrepConformanceTests(unittest.TestCase):
             )
 
     def run_protocol_shell(
-        self, heading: str, *, rollout: Path, pattern: str
+        self,
+        heading: str,
+        *,
+        rollout: Path,
+        pattern: str,
+        search_path: str | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         environment = {
             "LC_ALL": "C",
-            "PATH": str(Path(self.rg).parent),
+            "PATH": search_path or str(Path(self.rg).parent),
             "PATTERN": pattern,
+            "RG_BIN": self.rg,
             "ROLLOUT": str(rollout),
         }
         return subprocess.run(
@@ -544,6 +555,7 @@ class RipgrepConformanceTests(unittest.TestCase):
             "LC_ALL": "C",
             "PATH": str(Path(self.rg).parent),
             "PATTERN": MATCH_PATTERN,
+            "RG_BIN": self.rg,
             "ROLLOUT": str(rollout),
         }
         return subprocess.run(
@@ -604,6 +616,30 @@ class RipgrepConformanceTests(unittest.TestCase):
                             len(parse_position_rows(completed.stdout)),
                             expected_row_count,
                         )
+
+    def test_documented_shell_reuses_qualified_rg_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            rollout = temp / "rollout-fixture.jsonl"
+            rollout.write_text("needle\n", encoding="utf-8")
+            fake_bin = temp / "fake-bin"
+            fake_bin.mkdir()
+            fake_rg = fake_bin / "rg"
+            fake_rg.write_text(
+                "#!/bin/sh\nprintf 'path-hijack\\n'\n",
+                encoding="utf-8",
+            )
+            fake_rg.chmod(0o700)
+
+            completed = self.run_protocol_shell(
+                COUNT_HEADING,
+                rollout=rollout,
+                pattern=MATCH_PATTERN,
+                search_path=str(fake_bin),
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, b"1\n")
 
     def test_raw_zero_does_not_override_selected_field_literal_match(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

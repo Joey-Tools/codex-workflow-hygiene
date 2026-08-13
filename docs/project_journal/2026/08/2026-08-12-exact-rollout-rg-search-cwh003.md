@@ -27,6 +27,7 @@ superseded_by:
 - Exceptional exhaustive position collection has a 64 MiB retained-output admission bound and remains explicitly live, non-snapshot evidence.
 - Dedicated contract tests cover the documentation surface and the conformance-qualified ripgrep 15.2.0 baseline without changing the shared skill-structure tests owned by the concurrent retrospective workstream.
 - CI installs the official ripgrep 15.2.0 Linux release asset after verifying its pinned SHA-256 digest as a reproducible reference baseline. Development hosts never need to install, downgrade, or pin ripgrep: an unavailable, unparseable, or unqualified version skips the raw locator and uses the field-aware parser.
+- Version qualification and every raw template reuse one absolute `RG_BIN` path so the command is not re-resolved through `PATH`; the pure-shell contract explicitly retains a same-UID/privileged path-tamper non-guarantee.
 
 ## Next Steps
 
@@ -38,9 +39,9 @@ superseded_by:
 - `skills/codex-session-mining/SKILL.md`
 - `skills/codex-session-mining/references/workflow.md`
 - `tests/test_rollout_search_contract.py`
-- `CI=true python3 -B -m unittest -q tests.test_rollout_search_contract tests.test_skill_structure`: 49 tests passed.
-- `CI=true python3 -B -m unittest -v tests.test_rollout_search_contract`: 21 tests passed with the CI-only ripgrep version gate enabled.
-- Full repository suite through `run_process_group_deadline.py`, with process-scoped test-fixture commit signing disabled and the CI version gate enabled: 1,154 tests passed in 66.238 seconds.
+- `CI=true python3 -B -m unittest -q tests.test_rollout_search_contract tests.test_skill_structure`: 50 tests passed.
+- `CI=true python3 -B -m unittest -v tests.test_rollout_search_contract`: 22 tests passed with the CI-only ripgrep version gate enabled.
+- Full repository suite through `run_process_group_deadline.py`, with process-scoped test-fixture commit signing disabled and the CI version gate enabled: 1,155 tests passed in 71.338 seconds.
 - `codex_skill_validate.py skills/codex-session-mining`: `Skill is valid!` via the isolated uv/PyYAML path.
 - `actionlint 1.7.12`, project-journal validation, and `git diff --check` passed.
 - Formal local review identified and closed two protocol-test gaps: the contract now preserves shell quoting with whitespace- and glob-sensitive inputs, and it treats live position/preview output as bounded samples whose count must be rechecked rather than as complete match sets.
