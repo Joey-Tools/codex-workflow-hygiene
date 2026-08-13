@@ -376,6 +376,8 @@ Use the later bounded rollout probe for `sessions/**/rollout-*.jsonl` and `archi
 
 ## 2. Extract Only The Relevant Parts
 
+For first-pass keyword discovery in one exact rollout, use the fixed count, matching-line position, and optional bounded raw-prefix templates in [rollout-search.md](rollout-search.md). Those templates deliberately keep ripgrep's native regex or literal semantics while preventing an unbounded matching JSONL record from reaching stdout. They do not parse JSON, select trusted fields, or freeze a live rollout. Treat their line coordinates as locators, then use a record-shape-aware parser below when decoded values or field provenance matter.
+
 Before printing details from a large rollout, count record shapes and then filter:
 
 ```bash
@@ -788,6 +790,8 @@ If you need the raw wrappers for provenance, keep a second pass for them, but do
 
 Focus on tool failures or approval friction:
 
+Use this field-aware parser after the fixed rollout-search protocol has identified the exact file or candidate lines.
+
 ```bash
 python3 - <<'PY'
 from pathlib import Path
@@ -893,6 +897,8 @@ PY
 ```
 
 Search a bounded rollout set without dumping full JSONL records:
+
+Use this field-aware parser after candidate discovery; it is not a replacement for the fixed one-file ripgrep output protocol.
 
 ```bash
 python3 - <<'PY'
