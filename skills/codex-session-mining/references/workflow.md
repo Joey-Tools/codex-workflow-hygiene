@@ -376,7 +376,7 @@ Use the later bounded rollout probe for `sessions/**/rollout-*.jsonl` and `archi
 
 ## 2. Extract Only The Relevant Parts
 
-For first-pass keyword discovery in one exact rollout, use the fixed count, bounded matching-line position sample, and optional bounded raw-prefix sample in [rollout-search.md](rollout-search.md). Those templates deliberately keep ripgrep's native regex or literal semantics while preventing an unbounded matching JSONL record from reaching stdout. They do not parse JSON, select trusted fields, freeze a live rollout, or prove a complete match set. Treat their line coordinates as locators, then let a record-shape-aware parser below scan its complete intended range when decoded values, field provenance, or coverage matters.
+For first-pass keyword discovery in one exact rollout, use the fixed case-sensitive literal count, bounded matching-line position sample, and optional bounded raw-prefix sample in [rollout-search.md](rollout-search.md). Those templates prevent an unbounded matching JSONL record from reaching stdout, but they do not parse JSON, select trusted fields, freeze a live rollout, or prove a complete match set. Treat positive and negative counts plus line coordinates as raw-text locator results only. Run the record-shape-aware parser below with the same literal for match or no-match evidence, including when ripgrep counted zero; decoded escapes, normalized whitespace, and field boundaries intentionally give the parser different semantics.
 
 Before printing details from a large rollout, count record shapes and then filter:
 
@@ -411,7 +411,10 @@ import json
 import sys
 
 path = Path(sys.argv[1]).expanduser()
-needle = sys.argv[2]
+needle = ' '.join(sys.argv[2].split())
+if not needle:
+    print('NEEDLE must contain non-whitespace text', file=sys.stderr)
+    raise SystemExit(2)
 printed = 0
 max_rows = 20
 max_record_bytes = 1024 * 1024
@@ -664,7 +667,7 @@ print(json.dumps(scan_meta, sort_keys=True, separators=(',', ':')), file=sys.std
 PY
 ```
 
-The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. After raw matching and window selection, the snippet JSON-escapes only non-printable characters so terminal control sequences cannot reach stdout while printable Unicode remains unchanged. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
+The parser rejects an empty or whitespace-only needle before opening the rollout. The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. After raw matching and window selection, the snippet JSON-escapes only non-printable characters so terminal control sequences cannot reach stdout while printable Unicode remains unchanged. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
 
 The parser continues through point-in-time EOF after its 20 stdout rows are full. Its final stderr line is one compact `scan_meta` JSON object; keep it in a private bounded control sink and require normal process exit plus `scan_complete: true`. `matched_records` counts every matching physical record reached by the selected-field scan, while `emitted_rows`, `suppressed_rows`, and `output_truncated` distinguish complete matching from bounded presentation. `invalid_records` and `oversized_records` identify physical records the parser could not inspect; they must be zero before claiming a complete no-match result. These counters do not freeze a live rollout or prove content stability.
 

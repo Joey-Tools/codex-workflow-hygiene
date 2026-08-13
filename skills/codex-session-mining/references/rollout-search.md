@@ -14,19 +14,16 @@ Every command in this protocol uses:
 rg \
     --no-config --no-mmap --text --encoding none \
     --no-heading --no-filename --color never \
-    [PROTOCOL_OPTIONS] \
+    --fixed-strings --case-sensitive \
+    [OUTPUT_OPTIONS] \
     -- "$PATTERN" - < "$ROLLOUT"
 ```
 
 The explicit `-` path makes ripgrep read stdin instead of falling back to its no-path current-directory search. Input redirection supplies that one stream, so an accidental directory path cannot fan out into a recursive, per-file search. Once the shell has opened the stream, replacing the pathname does not redirect that invocation to the replacement. This pure command recipe does not itself provide no-follow opening, regular-file authentication, or a frozen snapshot: resolve one exact rollout path, require it to be a regular file before running the command, and treat any open or read failure as a failed search.
 
-The default is ripgrep's case-sensitive Rust regex engine. The only optional search flags allowed by this protocol are:
+The evidence protocol always uses a case-sensitive literal pattern whose Unicode-whitespace-normalized form is non-empty. Its four templates have no optional matching flags: keep `--fixed-strings` and `--case-sensitive` plus the section-specific output options exactly as written. Reject an empty or whitespace-only pattern before running any template or parser. In particular, do not add case, boundary, output, framing, transformation, regex-engine, multiline, preprocessing, JSON, or context options such as `-i`, `-S`, `-w`, `-x`, `-o`, `--replace`, `-0`, `--null-data`, `-P`, `--engine`, `-U`, `--multiline-dotall`, `--pre`, `--json`, `-A`, `-B`, or `-C`.
 
-- `-F` or `--fixed-strings`.
-- At most one of `-i`, `-s`, or `-S` for case handling.
-- At most one of `-w` or `-x` for a word or whole-line boundary.
-
-Insert allowed flags as literal, separate arguments before `--`. Any other flag leaves this protocol and loses its bounds and output guarantees. In particular, do not override output, framing, transformation, regex-engine, multiline, preprocessing, JSON, context, or fixed count/column options. Do not use options such as `-o`, `--replace`, `-0`, `--null-data`, `-P`, `--engine`, `-U`, `--multiline-dotall`, `--pre`, `--json`, `-A`, `-B`, or `-C`.
+After this fixed first pass, a different ripgrep query may be useful for orientation, including regex, case-insensitive, or boundary matching. Such a query is outside this protocol: do not reuse its counts, positions, previews, or output bounds as evidence. Select one non-empty case-sensitive literal from the candidate, rerun the fixed templates with that same literal, and pass it as `NEEDLE` to the field-aware parser in [workflow.md](workflow.md). If the question cannot be expressed by that parser's literal selected-field semantics, use or add a field-aware parser for the intended semantics instead of promoting raw ripgrep output to evidence.
 
 ## Count Before Printing Matches
 
@@ -36,6 +33,7 @@ Run the fixed shape with these protocol options:
 rg \
     --no-config --no-mmap --text --encoding none \
     --no-heading --no-filename --color never \
+    --fixed-strings --case-sensitive \
     --count-matches --include-zero \
     -- "$PATTERN" - < "$ROLLOUT"
 ```
@@ -46,7 +44,9 @@ Interpret stdout and status together:
 - Exit `1`: stdout is exactly `0` followed by LF.
 - Exit `2` or greater: the search failed; do not interpret stdout as a count.
 
-For regex searches, the count is the number of non-overlapping matches, not the number of matching lines. One line can therefore contribute multiple matches.
+The count is the number of non-overlapping raw literal occurrences, not the number of matching lines. One line can therefore contribute multiple matches.
+
+This is a count over serialized JSONL bytes. A raw count of zero does not prove a selected-field no-match: JSON escape decoding, Unicode-whitespace normalization, or the parser's inserted field separators can create a semantic match that is absent from the raw byte stream. When the task needs match or no-match evidence, run the field-aware parser with the same literal even when this count is zero; its selected-field result and terminal `scan_meta` are authoritative.
 
 Treat the counted file as an observed live input, not a frozen snapshot. If the path is not a regular file at the time of the search, stop instead of substituting another reader or following a special-file stream.
 
@@ -60,6 +60,7 @@ For an initial count from 1 through 20, print a bounded sample of at most 20 mat
 rg \
     --no-config --no-mmap --text --encoding none \
     --no-heading --no-filename --color never \
+    --fixed-strings --case-sensitive \
     --line-number --column --byte-offset \
     --max-count 20 --max-columns 1 \
     -- "$PATTERN" - < "$ROLLOUT"
@@ -81,6 +82,7 @@ Only when the initial count is from 1 through 5, an optional preview may show bo
 rg \
     --no-config --no-mmap --text --encoding none \
     --no-heading --no-filename --color never \
+    --fixed-strings --case-sensitive \
     --line-number --column --byte-offset \
     --max-count 5 --max-columns 4096 --max-columns-preview \
     -- "$PATTERN" - < "$ROLLOUT"
@@ -107,6 +109,7 @@ Use an exhaustive artifact only when refinement is impractical and a local aggre
     rg \
         --no-config --no-mmap --text --encoding none \
         --no-heading --no-filename --color never \
+        --fixed-strings --case-sensitive \
         --line-number --column --byte-offset \
         --max-count "$COUNT" --max-columns 1 \
         -- "$PATTERN" - \
@@ -131,7 +134,7 @@ Here, `TASK_SUBPATH` is the exact task-scoped path relative to `.codex-tmp`, not
 
 ## Evidence Limits
 
-ripgrep provides a best-effort live text scan. This protocol does not parse the rollout schema, validate JSON, select fields, create a snapshot, or prove object identity or content stability. Follow candidate line positions with bounded, field-aware JSON parsing before treating a match as evidence.
+ripgrep provides a best-effort live raw-text locator. This protocol does not parse the rollout schema, validate JSON, select fields, create a snapshot, or prove object identity or content stability. Its positive and negative counts are not semantic evidence. Run bounded, field-aware JSON parsing with the same case-sensitive literal, and treat only the parser's selected-field result plus a complete terminal `scan_meta` as match or no-match evidence.
 
 The documented stdout budgets do not bound stderr. Diagnostics can repeat the pattern or other sensitive details, so keep diagnostic output in a private bounded sink when failure details are needed and never reinterpret stderr as search evidence.
 

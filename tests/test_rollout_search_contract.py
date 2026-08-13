@@ -48,6 +48,8 @@ FIXED_RG_ARGV = [
     "--no-filename",
     "--color",
     "never",
+    "--fixed-strings",
+    "--case-sensitive",
 ]
 EXPECTED_COMMAND_ARGV = {
     COUNT_HEADING: FIXED_RG_ARGV
@@ -208,6 +210,13 @@ def parse_position_rows(output: bytes) -> list[tuple[int, int, int, bytes]]:
     return rows
 
 
+def extract_field_aware_parser() -> str:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
+    start = workflow.index(marker) + len(marker)
+    return workflow[start : workflow.index("\nPY\n```", start)]
+
+
 class RolloutSearchReferenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -226,9 +235,17 @@ class RolloutSearchReferenceTests(unittest.TestCase):
         self.assertIn("one exact regular rollout file", self.reference_lower)
         self.assertIn("explicit `-` path makes ripgrep read stdin", self.reference_lower)
         self.assertIn("input redirection supplies that one stream", self.reference_lower)
-        self.assertIn("only optional search flags allowed", self.reference_lower)
+        self.assertIn(
+            "case-sensitive literal pattern whose unicode-whitespace-normalized form is non-empty",
+            self.reference_lower,
+        )
+        self.assertIn("reject an empty or whitespace-only pattern", self.reference_lower)
+        self.assertIn("no optional matching flags", self.reference_lower)
+        self.assertIn("different ripgrep query may be useful for orientation", self.reference_lower)
+        self.assertIn("outside this protocol", self.reference_lower)
+        self.assertIn("do not reuse its counts", self.reference_lower)
         self.assertIn("require the first line to report ripgrep major version 15", self.reference_lower)
-        for flag in ("--fixed-strings", "-i", "-s", "-S", "-w", "-x"):
+        for flag in ("--fixed-strings", "--case-sensitive"):
             with self.subTest(flag=flag):
                 self.assertIn(f"`{flag}`", self.reference_text)
 
@@ -242,9 +259,14 @@ class RolloutSearchReferenceTests(unittest.TestCase):
                 self.assertIn(expected, self.reference_text)
 
     def test_reference_distinguishes_occurrences_from_matching_lines(self) -> None:
-        self.assertIn("number of non-overlapping matches", self.reference_lower)
+        self.assertIn("number of non-overlapping raw literal occurrences", self.reference_lower)
         self.assertIn("not the number of matching lines", self.reference_lower)
         self.assertIn("one line can therefore contribute multiple matches", self.reference_lower)
+        self.assertIn("raw count of zero does not prove", self.reference_lower)
+        self.assertIn(
+            "selected-field result and terminal `scan_meta` are authoritative",
+            self.reference_lower,
+        )
 
     def test_reference_marks_output_as_raw_sensitive(self) -> None:
         self.assertIn("not a match-centered excerpt", self.reference_lower)
@@ -289,10 +311,7 @@ class RolloutSearchReferenceTests(unittest.TestCase):
         )
 
     def test_field_aware_parser_scans_past_output_cap_and_reports_coverage(self) -> None:
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
-        start = workflow.index(marker) + len(marker)
-        code = workflow[start : workflow.index("\nPY\n```", start)]
+        code = extract_field_aware_parser()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             rollout = Path(temp_dir) / "rollout.jsonl"
@@ -341,6 +360,29 @@ class RolloutSearchReferenceTests(unittest.TestCase):
                 "stop_reason": None,
                 "suppressed_rows": 2,
             },
+        )
+
+    def test_field_aware_parser_rejects_whitespace_only_needle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout.jsonl"
+            rollout.write_text('{"type":"event_msg"}\n', encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    extract_field_aware_parser(),
+                    str(rollout),
+                    " \t\u00a0 ",
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(
+            completed.stderr, "NEEDLE must contain non-whitespace text\n"
         )
 
     def test_exhaustive_block_pins_complete_shell_structure(self) -> None:
@@ -451,7 +493,7 @@ class Ripgrep15ConformanceTests(unittest.TestCase):
             check=False,
         )
 
-    def test_count_statuses_and_occurrence_semantics(self) -> None:
+    def test_count_statuses_and_literal_occurrence_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "rollout-fixture.jsonl"
             path.write_text("needle needle\nno match\nneedle\nlast needle\n", encoding="utf-8")
@@ -462,15 +504,18 @@ class Ripgrep15ConformanceTests(unittest.TestCase):
             unmatched = self.run_protocol(COUNT_HEADING, path)
             self.assertEqual((unmatched.returncode, unmatched.stdout), (1, b"0\n"))
 
-            failed = self.run_protocol(COUNT_HEADING, path, pattern="[")
-            self.assertGreaterEqual(failed.returncode, 2)
+            path.write_text("literal [ metacharacter\n", encoding="utf-8")
+            literal = self.run_protocol(COUNT_HEADING, path, pattern="[")
+            self.assertEqual((literal.returncode, literal.stdout), (0, b"1\n"))
 
     def test_documented_shell_preserves_pattern_and_rollout_as_single_words(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             rollout = temp / "rollout fixture [one].jsonl"
             pattern = "alpha.*beta gamma"
-            rollout.write_text("alphaZZbeta gamma\n", encoding="utf-8")
+            rollout.write_text(
+                "alphaZZbeta gamma\nalpha.*beta gamma\n", encoding="utf-8"
+            )
             (temp / "alpha.zzbeta").write_text("decoy\n", encoding="utf-8")
             (temp / "gamma").write_text("decoy\n", encoding="utf-8")
 
@@ -492,6 +537,52 @@ class Ripgrep15ConformanceTests(unittest.TestCase):
                             len(parse_position_rows(completed.stdout)),
                             expected_row_count,
                         )
+
+    def test_raw_zero_does_not_override_selected_field_literal_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "rollout-fixture.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "user_message",
+                            "message": "needle\u00a0value",
+                        },
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            raw = self.run_protocol(
+                COUNT_HEADING, path, pattern="needle value"
+            )
+            self.assertEqual((raw.returncode, raw.stdout), (1, b"0\n"))
+
+            parsed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    extract_field_aware_parser(),
+                    str(path),
+                    "needle value",
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        self.assertEqual(len(parsed.stdout.splitlines()), 1)
+        metadata = json.loads(parsed.stderr)
+        self.assertTrue(metadata["scan_complete"])
+        self.assertEqual(metadata["matched_records"], 1)
+        self.assertEqual(metadata["invalid_records"], 0)
+        self.assertEqual(metadata["oversized_records"], 0)
+        self.assertFalse(metadata["output_truncated"])
 
     def test_documented_shell_does_not_fall_back_to_searching_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
