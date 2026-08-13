@@ -153,6 +153,28 @@ class DurableTransitionTests(unittest.TestCase):
             successor["supersedes_episode_revision_ref"],
         )
 
+    def test_transition_rejects_boolean_provider_revisions(self) -> None:
+        previous = history_state(self.identity)
+        manifest = self.manifest(
+            previous,
+            cursor_rows=[],
+            episode_heads=[],
+        )
+
+        for field in ("provider_revision_before", "provider_revision_after"):
+            with self.subTest(field=field):
+                malformed = dict(manifest)
+                malformed[field] = True
+                with self.assertRaisesRegex(
+                    authority.HistoryValidationError,
+                    "provider revision is invalid",
+                ):
+                    authority.validate_durable_state_transition(
+                        previous,
+                        malformed,
+                        identity=self.identity,
+                    )
+
     def test_transition_rejects_cursor_deletion_rollback_and_head_rollback(
         self,
     ) -> None:

@@ -511,6 +511,9 @@ def _validate_manifest_state(
         not isinstance(before, int)
         or isinstance(before, bool)
         or before < 0
+        or not isinstance(after, int)
+        or isinstance(after, bool)
+        or after < 0
         or after != before + 1
     ):
         raise HistoryValidationError("durable history provider revision is invalid")

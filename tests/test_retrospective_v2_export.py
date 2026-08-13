@@ -181,6 +181,74 @@ def run_state(*, meaningful_turn_count: int = 4) -> dict[str, object]:
     }
 
 
+def agent_execution_provenance() -> dict[str, object]:
+    return {
+        "jobs": [
+            {
+                "attempts": [
+                    {
+                        "attempt_ref": ATTEMPT_ONE,
+                        "claimed_at": "2026-07-14T12:00:01Z",
+                        "completed_at": "2026-07-14T12:00:02Z",
+                        "issued_at": "2026-07-14T12:00:00Z",
+                        "job_ref": ref("job", "a"),
+                        "ordinal": 0,
+                        "reason": None,
+                        "result_ref": ref("result", "b"),
+                        "reviewer_ref": REVIEWER_ONE,
+                        "status": "accepted",
+                    }
+                ],
+                "job_kind": "episode_reviewer",
+                "partition_commitment": REVISION_ONE,
+                "result_hash": REVIEW_HASH_ONE,
+                "reuse_count": 0,
+                "stage": "episode_review",
+                "status": "accepted",
+                "task_ref": ref("run_input", "c"),
+            }
+        ],
+        "result_count": 1,
+        "retry_count": 0,
+        "schema": "agent_execution_provenance_v2",
+        "task_cache": {"hits": 0, "misses": 1, "reuses": 0},
+    }
+
+
+def agent_retry_execution_provenance() -> dict[str, object]:
+    execution = agent_execution_provenance()
+    first = execution["jobs"][0]["attempts"][0]
+    first.update(
+        {
+            "attempt_ref": ATTEMPT_TWO,
+            "job_ref": ref("job", "d"),
+            "reason": "schema_violation",
+            "result_ref": ref("result", "e"),
+            "reviewer_ref": REVIEWER_TWO,
+            "status": "failed",
+        }
+    )
+    retry = copy.deepcopy(first)
+    retry.update(
+        {
+            "attempt_ref": ATTEMPT_ONE,
+            "claimed_at": "2026-07-14T12:01:01Z",
+            "completed_at": "2026-07-14T12:01:02Z",
+            "issued_at": "2026-07-14T12:01:00Z",
+            "job_ref": ref("job", "a"),
+            "ordinal": 1,
+            "reason": None,
+            "result_ref": ref("result", "b"),
+            "reviewer_ref": REVIEWER_ONE,
+            "status": "accepted",
+        }
+    )
+    execution["jobs"][0]["attempts"].append(retry)
+    execution["result_count"] = 2
+    execution["retry_count"] = 1
+    return execution
+
+
 def review_data() -> dict[str, object]:
     episodes = [
         {
@@ -522,37 +590,7 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
 
     def test_retains_lineage_review_rewrite_and_execution_provenance(self) -> None:
         state = run_state()
-        state["provenance"]["agent_execution"] = {
-            "jobs": [
-                {
-                    "attempts": [
-                        {
-                            "attempt_ref": ATTEMPT_ONE,
-                            "claimed_at": "2026-07-14T12:00:01Z",
-                            "completed_at": "2026-07-14T12:00:02Z",
-                            "issued_at": "2026-07-14T12:00:00Z",
-                            "job_ref": ref("job", "a"),
-                            "ordinal": 0,
-                            "reason": None,
-                            "result_ref": ref("result", "b"),
-                            "reviewer_ref": REVIEWER_ONE,
-                            "status": "accepted",
-                        }
-                    ],
-                    "job_kind": "episode_reviewer",
-                    "partition_commitment": REVISION_ONE,
-                    "result_hash": REVIEW_HASH_ONE,
-                    "reuse_count": 0,
-                    "stage": "episode_review",
-                    "status": "accepted",
-                    "task_ref": ref("run_input", "c"),
-                }
-            ],
-            "result_count": 1,
-            "retry_count": 0,
-            "schema": "agent_execution_provenance_v2",
-            "task_cache": {"hits": 0, "misses": 1, "reuses": 0},
-        }
+        state["provenance"]["agent_execution"] = agent_execution_provenance()
         reviews = review_data()
         episode = next(
             row for row in reviews["episodes"] if row["episode_ref"] == EPISODE_ONE
@@ -602,6 +640,143 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
             {"hits": 0, "misses": 1, "reuses": 0},
             provenance["agent_execution"]["task_cache"],
         )
+
+    def test_rejects_malformed_agent_execution_lineage(self) -> None:
+        def attempt(execution: dict[str, object]) -> dict[str, object]:
+            return execution["jobs"][0]["attempts"][0]
+
+        def job(execution: dict[str, object]) -> dict[str, object]:
+            return execution["jobs"][0]
+
+        cases = (
+            (
+                "task-ref-type",
+                lambda value: job(value).__setitem__("task_ref", 7),
+                "closed job, stage, status, or reference contract",
+            ),
+            (
+                "attempt-ref-prefix",
+                lambda value: attempt(value).__setitem__(
+                    "attempt_ref", ref("job", "d")
+                ),
+                "closed terminal-attempt contract",
+            ),
+            (
+                "result-ref-type",
+                lambda value: attempt(value).__setitem__("result_ref", 9),
+                "closed terminal-attempt contract",
+            ),
+            (
+                "job-ref-type",
+                lambda value: attempt(value).__setitem__("job_ref", 11),
+                "closed terminal-attempt contract",
+            ),
+            (
+                "job-kind",
+                lambda value: job(value).__setitem__("job_kind", "future_reviewer"),
+                "closed job, stage, status, or reference contract",
+            ),
+            (
+                "stage",
+                lambda value: job(value).__setitem__("stage", "global_synthesis"),
+                "closed job, stage, status, or reference contract",
+            ),
+            (
+                "partition-prefix",
+                lambda value: job(value).__setitem__(
+                    "partition_commitment", ref("topic_candidate", "e")
+                ),
+                "closed job, stage, status, or reference contract",
+            ),
+            (
+                "attempt-status",
+                lambda value: attempt(value).__setitem__("status", "complete"),
+                "closed terminal-attempt contract",
+            ),
+            (
+                "reviewer-lineage",
+                lambda value: attempt(value).__setitem__("reviewer_ref", None),
+                "closed terminal-attempt contract",
+            ),
+            (
+                "accepted-lineage",
+                lambda value: job(value).__setitem__("status", "gap"),
+                "inconsistent terminal lineage",
+            ),
+            (
+                "result-count-bool",
+                lambda value: value.__setitem__("result_count", True),
+                "result/retry counts do not conserve attempts",
+            ),
+            (
+                "retry-count-bool",
+                lambda value: value.__setitem__("retry_count", False),
+                "result/retry counts do not conserve attempts",
+            ),
+            (
+                "timestamp-type",
+                lambda value: attempt(value).__setitem__("issued_at", 20260714),
+                "closed terminal-attempt contract",
+            ),
+            (
+                "timestamp-canonical",
+                lambda value: attempt(value).__setitem__(
+                    "issued_at", "2026-07-14T13:00:00+01:00"
+                ),
+                "timestamps are not canonical",
+            ),
+        )
+        for label, mutate, expected in cases:
+            with self.subTest(label=label):
+                state = run_state()
+                execution = agent_execution_provenance()
+                mutate(execution)
+                state["provenance"]["agent_execution"] = execution
+                with self.assertRaisesRegex(RetainedInventoryError, expected):
+                    assemble_retained_artifacts(state, review_data())
+
+    def test_accepts_conserved_agent_retry_lineage(self) -> None:
+        state = run_state()
+        execution = agent_retry_execution_provenance()
+        state["provenance"]["agent_execution"] = execution
+
+        parsed = validate_retained_artifacts(
+            assemble_retained_artifacts(state, review_data())
+        )
+
+        retained = parsed["manifest"]["provenance"]["agent_execution"]
+        self.assertEqual((2, 1), (retained["result_count"], retained["retry_count"]))
+
+    def test_accepts_conserved_terminal_agent_gap_lineage(self) -> None:
+        state = run_state()
+        execution = agent_retry_execution_provenance()
+        job = execution["jobs"][0]
+        retry = job["attempts"][-1]
+        retry.update({"reason": "review_gap", "status": "review_gap"})
+        job.update({"result_hash": None, "status": "gap"})
+        state["provenance"]["agent_execution"] = execution
+
+        parsed = validate_retained_artifacts(
+            assemble_retained_artifacts(state, review_data())
+        )
+
+        retained = parsed["manifest"]["provenance"]["agent_execution"]
+        self.assertEqual("gap", retained["jobs"][0]["status"])
+        self.assertEqual("review_gap", retained["jobs"][0]["attempts"][-1]["status"])
+
+    def test_rejects_duplicate_agent_attempt_lineage_refs(self) -> None:
+        for field in ("attempt_ref", "job_ref", "result_ref", "reviewer_ref"):
+            with self.subTest(field=field):
+                state = run_state()
+                execution = agent_retry_execution_provenance()
+                first, retry = execution["jobs"][0]["attempts"]
+                retry[field] = first[field]
+                state["provenance"]["agent_execution"] = execution
+                with self.assertRaisesRegex(
+                    RetainedInventoryError,
+                    "agent refs are not uniquely ordered and bound",
+                ):
+                    assemble_retained_artifacts(state, review_data())
 
     def test_rejects_nonconserving_agent_task_cache_metrics(self) -> None:
         artifacts = assemble_retained_artifacts(run_state(), review_data())

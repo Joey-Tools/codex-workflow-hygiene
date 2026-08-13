@@ -22,8 +22,12 @@ sys.path.insert(0, str(SCRIPTS))
 from retrospective_v2 import (  # noqa: E402
     finalize,
     orchestrator_protocols,
+    reporting,
     transport,
     transport_capture,
+)
+from retrospective_v2.orchestrator_support import (  # noqa: E402
+    _RESULT_SCHEMA_BY_KIND,
 )
 from retrospective_v2.orchestrator import (  # noqa: E402
     RetrospectiveOrchestrator,
@@ -1150,10 +1154,15 @@ spec.loader.exec_module(module)
                     )
         duplicates = [owners for owners in duplicate_bodies.values() if len(owners) > 1]
         self.assertEqual([], duplicates)
-        self.assertEqual(8_500, branch_total)
+        self.assertEqual(8_495, branch_total)
         self.assertLessEqual(branch_total, 8_500)
         self.assertLessEqual(functions_over_200, 20)
         self.assertLessEqual(sliced_functions_over_200, 3)
+
+    def test_retained_agent_job_contracts_cover_the_executable_job_set(self) -> None:
+        self.assertEqual(
+            set(_RESULT_SCHEMA_BY_KIND), set(reporting._AGENT_JOB_CONTRACTS)
+        )
 
     def test_public_cli_exposes_exactly_eight_top_level_verbs(self) -> None:
         tree = ast.parse(PUBLIC_CLI.read_text(encoding="utf-8"))

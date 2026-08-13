@@ -3,9 +3,9 @@ id: 20260716-srv2e01
 title: Session Retrospective v2 Engine
 status: completed
 created: 2026-07-16
-updated: 2026-08-12
-branch: codex/session-retrospective-v2-engine-linear
-pr: 67
+updated: 2026-08-13
+branch: codex/session-retrospective-v2-engine-replacement
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/69
 supersedes: []
 superseded_by:
 ---
@@ -1622,3 +1622,29 @@ superseded_by:
   format checks, actionlint, `git diff --check`, project-journal validation, and
   the official isolated OpenAI skill validator pass. One direct validator run
   without PyYAML is a non-counting runtime error.
+- The next frozen-head Codex processor on `0ba730c1` returned two P2 findings.
+  Retained agent execution provenance checked field inventories and aggregate
+  counts but did not close reference types, job/stage/partition enums, terminal
+  attempt lineage, or Boolean integer aliases. Durable-history transition
+  validation likewise accepted Boolean `provider_revision_after` when its
+  arithmetic value matched the expected successor. The processor's
+  postvalidation reproduced the exact five-commit/four-edge receipt and the
+  trusted bundle digests remained unchanged. Hosted CI run `31660617358` was
+  cancelled after the findings and is stale, non-counting evidence.
+- Retained provenance now enforces closed job and attempt inventories; exact
+  typed reference prefixes; job-kind/stage/partition compatibility; reviewer
+  assignment; terminal timestamps and ordered retry ordinals; accepted versus
+  gap outcome lineage; global task, attempt, job, result, and reviewer identity
+  uniqueness; result/retry count conservation without Boolean aliases; result
+  hashes; and cache metrics. The intentionally summarized history does not
+  claim to recompute omitted claim or immutable-manifest derivations. Durable
+  transitions now require both provider revisions to be non-Boolean,
+  non-negative integers before checking the one-step increment. The final
+  Python 3.13 orchestrator, export, authority, result-contract audit, and module
+  boundary matrix passes 213/213 in 179.547 seconds with no skips. That matrix
+  includes the real high-risk extractor, dual-review, adjudication, topic,
+  synthesis, and retained-export path; canonical terminal timestamps; retry and
+  terminal-gap conservation; duplicate-ref rejection; and parity between all
+  six executable agent kinds and the retained closed contract. One mistyped
+  unittest class selector failed during loading without running product code
+  and is non-counting.

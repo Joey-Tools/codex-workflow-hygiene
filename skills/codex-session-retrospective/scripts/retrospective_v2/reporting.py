@@ -1,6 +1,6 @@
 """Deterministic retained-artifact assembly for Session Retrospective v2.
 
-This module deliberately accepts plain mappings.  The coordinator may evolve its
+This module deliberately accepts plain mappings. The coordinator may evolve its
 internal run-state types without making retained reporting depend on them.
 """
 
@@ -210,7 +210,47 @@ PUBLICATION_ROLES = frozenset(("standalone",))
 RUN_MODES = frozenset(("daily", "weekly", "baseline", "session"))
 FINDING_CONFIDENCE_LEVELS = frozenset(("low", "medium", "high"))
 FINDING_SEVERITY_LEVELS = frozenset(("low", "medium", "high", "critical"))
-
+_EPISODE_PARTITIONS = ("episode_revision_ref_v2", "run_input_ref_v2")
+_REVIEW_CONTRACT = ("episode_review", _EPISODE_PARTITIONS, True)
+_AGENT_JOB_CONTRACTS = {
+    "extractor_redactor": ("extraction", ("raw_shard_sha256",), False),
+    **dict.fromkeys(
+        ("episode_reviewer", "independent_risk_reviewer"), _REVIEW_CONTRACT
+    ),
+    "adjudicator": ("episode_review", _EPISODE_PARTITIONS[:1], True),
+    "topic_reducer": (
+        "topic_reduction",
+        ("topic_candidate_ref_v2", "run_input_ref_v2"),
+        False,
+    ),
+    "global_synthesis": ("global_synthesis", ("run_input_ref_v2",), False),
+}
+_AGENT_JOB_FIELDS = frozenset(
+    {
+        "attempts",
+        "job_kind",
+        "partition_commitment",
+        "result_hash",
+        "reuse_count",
+        "stage",
+        "status",
+        "task_ref",
+    }
+)
+_AGENT_ATTEMPT_FIELDS = frozenset(
+    {
+        "attempt_ref",
+        "claimed_at",
+        "completed_at",
+        "issued_at",
+        "job_ref",
+        "ordinal",
+        "reason",
+        "result_ref",
+        "reviewer_ref",
+        "status",
+    }
+)
 _SCHEMA_VERSION = 2
 _BUNDLE_DIGEST_DOMAIN = b"session-retrospective-retained-bundle-v2\x00"
 MAX_RETAINED_ARTIFACT_BYTES = 256 * 1024 * 1024
@@ -814,8 +854,7 @@ def _validate_prior_window(
         current_window["start"]
     ):
         raise RetainedInventoryError(
-            "prior period window must be strictly earlier and non-overlapping with "
-            "the current window"
+            "prior period window must be strictly earlier and non-overlapping with the current window"
         )
 
 
@@ -2237,8 +2276,7 @@ def _validate_turn_episode_era_lineage(
                 or turn_era != episode_era
             ):
                 raise RetainedInventoryError(
-                    f"turn_findings[{index}].{era_field} does not match its "
-                    "episode era lineage"
+                    f"turn_findings[{index}].{era_field} does not match its episode era lineage"
                 )
 
 
@@ -2628,6 +2666,84 @@ def retained_bundle_digest(artifacts: Mapping[str, bytes]) -> str:
     return digest.hexdigest()
 
 
+def _validate_agent_execution_attempt(
+    value: Any,
+    *,
+    label: str,
+    reviewer_required: bool,
+) -> tuple[str, str, str, str, str, int]:
+    attempt = _require_mapping(value, label=label)
+    attempt_ref = attempt.get("attempt_ref")
+    job_ref = attempt.get("job_ref")
+    result_ref = attempt.get("result_ref")
+    reviewer_ref = attempt.get("reviewer_ref")
+    attempt_status = attempt.get("status")
+    reason = attempt.get("reason")
+    safe_reason = (
+        _SAFE_TOKEN_RE.fullmatch({str: reason}.get(type(reason), "")) is not None
+    )
+    reviewer_signature = (
+        reviewer_required,
+        reviewer_ref is None,
+        type(reviewer_ref) is str,
+        re.fullmatch(r"reviewer_ref_v2:[0-9a-f]{64}", str(reviewer_ref)) is not None,
+    )
+    attempt_signature = (
+        type(attempt_ref) is str,
+        re.fullmatch(r"attempt_ref_v2:[0-9a-f]{64}", str(attempt_ref)) is not None,
+        type(job_ref) is str,
+        re.fullmatch(r"job_ref_v2:[0-9a-f]{64}", str(job_ref)) is not None,
+        type(result_ref) is str,
+        re.fullmatch(r"result_ref_v2:[0-9a-f]{64}", str(result_ref)) is not None,
+        reviewer_signature in {(True, False, True, True), (False, True, False, False)},
+        type(attempt_status) is str,
+        attempt_status in {"accepted", "failed", "review_gap"},
+        (attempt_status == "accepted", reason is None, safe_reason)
+        in {(True, True, False), (False, False, True)},
+        type(attempt.get("issued_at")) is str,
+        type(attempt.get("claimed_at")) is str,
+        type(attempt.get("completed_at")) is str,
+    )
+    if (set(attempt), attempt_signature) != (
+        _AGENT_ATTEMPT_FIELDS,
+        (True,) * 13,
+    ):
+        raise RetainedInventoryError(
+            f"{label} violates the closed terminal-attempt contract"
+        )
+    try:
+        ordinal = _nonnegative_int(attempt["ordinal"], label=f"{label}.ordinal")
+        normalized_times = (
+            _normalize_timestamp(attempt["issued_at"], label=f"{label}.issued_at"),
+            _normalize_timestamp(attempt["claimed_at"], label=f"{label}.claimed_at"),
+            _normalize_timestamp(
+                attempt["completed_at"], label=f"{label}.completed_at"
+            ),
+        )
+    except RetainedReportingError as exc:
+        raise RetainedInventoryError(str(exc)) from exc
+    if normalized_times != (
+        attempt["issued_at"],
+        attempt["claimed_at"],
+        attempt["completed_at"],
+    ):
+        raise RetainedInventoryError(f"{label} timestamps are not canonical")
+    issued, claimed, completed = map(_parse_timestamp, normalized_times)
+    if claimed < issued:
+        raise RetainedInventoryError(f"{label}.claimed_at precedes issuance")
+    if completed < claimed:
+        raise RetainedInventoryError(f"{label}.completed_at precedes dispatch")
+    reviewer_identity_ref = attempt_ref if reviewer_ref is None else reviewer_ref
+    return (
+        attempt_ref,
+        job_ref,
+        result_ref,
+        reviewer_identity_ref,
+        attempt_status,
+        ordinal,
+    )
+
+
 def _validate_agent_execution_provenance(value: Any) -> None:
     execution = _require_mapping(value, label="manifest.provenance.agent_execution")
     if set(execution) != {
@@ -2643,73 +2759,83 @@ def _validate_agent_execution_provenance(value: Any) -> None:
     jobs = _require_rows(
         execution["jobs"], label="manifest.provenance.agent_execution.jobs"
     )
-    normalized_jobs: list[Mapping[str, Any]] = []
+    attempt_refs: list[str] = []
+    job_refs: list[str] = []
+    result_refs: list[str] = []
+    reviewer_identity_refs: list[str] = []
+    task_refs: list[str] = []
     result_count = 0
     retry_count = 0
     reuse_count = 0
     for job_index, raw_job in enumerate(jobs):
         label = f"manifest.provenance.agent_execution.jobs[{job_index}]"
         job = _require_mapping(raw_job, label=label)
-        if set(job) != {
-            "attempts",
-            "job_kind",
-            "partition_commitment",
-            "result_hash",
-            "reuse_count",
-            "stage",
-            "status",
-            "task_ref",
-        }:
-            raise RetainedInventoryError(f"{label} has an unexpected field inventory")
+        task_ref = job.get("task_ref")
+        job_kind = job.get("job_kind")
+        stage = job.get("stage")
+        task_status = job.get("status")
+        partition = job.get("partition_commitment")
+        contract = _AGENT_JOB_CONTRACTS.get(
+            {str: job_kind}.get(type(job_kind), ""), (None, (), None)
+        )
+        job_signature = (
+            type(task_ref) is str,
+            re.fullmatch(r"run_input_ref_v2:[0-9a-f]{64}", str(task_ref)) is not None,
+            type(job_kind) is str,
+            type(stage) is str,
+            stage == contract[0],
+            type(task_status) is str,
+            task_status in {"accepted", "gap"},
+            type(partition) is str,
+            str(partition).partition(":")[0] in contract[1],
+            re.fullmatch(r"[a-z_0-9]+:[0-9a-f]{64}", str(partition)) is not None,
+        )
+        if (set(job), job_signature) != (_AGENT_JOB_FIELDS, (True,) * 10):
+            raise RetainedInventoryError(
+                f"{label} violates the closed job, stage, status, or reference contract"
+            )
+        reviewer_required = contract[2]
         attempts = _require_rows(job["attempts"], label=f"{label}.attempts")
+        if not attempts:
+            raise RetainedInventoryError(
+                f"{label}.attempts must contain a terminal attempt"
+            )
         ordinals: list[int] = []
+        attempt_statuses: list[str] = []
         for attempt_index, raw_attempt in enumerate(attempts):
             attempt_label = f"{label}.attempts[{attempt_index}]"
-            attempt = _require_mapping(raw_attempt, label=attempt_label)
-            if set(attempt) != {
-                "attempt_ref",
-                "claimed_at",
-                "completed_at",
-                "issued_at",
-                "job_ref",
-                "ordinal",
-                "reason",
-                "result_ref",
-                "reviewer_ref",
-                "status",
-            }:
-                raise RetainedInventoryError(
-                    f"{attempt_label} has an unexpected field inventory"
-                )
-            ordinal = attempt["ordinal"]
-            if isinstance(ordinal, bool) or not isinstance(ordinal, int):
-                raise RetainedInventoryError(
-                    f"{attempt_label}.ordinal must be an integer"
-                )
+            (
+                attempt_ref,
+                job_ref,
+                result_ref,
+                reviewer_identity_ref,
+                attempt_status,
+                ordinal,
+            ) = _validate_agent_execution_attempt(
+                raw_attempt,
+                label=attempt_label,
+                reviewer_required=reviewer_required,
+            )
+            attempt_refs.append(attempt_ref)
+            job_refs.append(job_ref)
+            result_refs.append(result_ref)
+            reviewer_identity_refs.append(reviewer_identity_ref)
+            attempt_statuses.append(attempt_status)
             ordinals.append(ordinal)
-            issued = _parse_timestamp(str(attempt["issued_at"]))
-            claimed = (
-                None
-                if attempt["claimed_at"] is None
-                else _parse_timestamp(str(attempt["claimed_at"]))
-            )
-            completed = (
-                None
-                if attempt["completed_at"] is None
-                else _parse_timestamp(str(attempt["completed_at"]))
-            )
-            if claimed is not None and claimed < issued:
-                raise RetainedInventoryError(
-                    f"{attempt_label}.claimed_at precedes issuance"
-                )
-            if completed is not None and completed < (claimed or issued):
-                raise RetainedInventoryError(
-                    f"{attempt_label}.completed_at precedes dispatch"
-                )
-            if completed is not None:
-                result_count += 1
-        if ordinals != list(range(len(attempts))):
-            raise RetainedInventoryError(f"{label}.attempts are not ordinally complete")
+        result_count += len(attempts)
+        result_hash = job["result_hash"]
+        terminal_signature = (
+            task_status,
+            attempt_statuses.count("accepted"),
+            tuple(attempt_statuses[-1:]),
+            result_hash is None,
+        )
+        if (ordinals == list(range(len(attempts))), terminal_signature) not in {
+            (True, ("accepted", 1, ("accepted",), False)),
+            (True, ("gap", 0, ("failed",), True)),
+            (True, ("gap", 0, ("review_gap",), True)),
+        }:
+            raise RetainedInventoryError(f"{label} has inconsistent terminal lineage")
         retry_count += max(0, len(attempts) - 1)
         job_reuse_count = job["reuse_count"]
         if (
@@ -2721,7 +2847,6 @@ def _validate_agent_execution_provenance(value: Any) -> None:
                 f"{label}.reuse_count must be a non-negative integer"
             )
         reuse_count += job_reuse_count
-        result_hash = job["result_hash"]
         if result_hash is not None and (
             not isinstance(result_hash, str)
             or _HEX_64_RE.fullmatch(result_hash) is None
@@ -2729,15 +2854,24 @@ def _validate_agent_execution_provenance(value: Any) -> None:
             raise RetainedInventoryError(
                 f"{label}.result_hash is not lowercase SHA-256"
             )
-        normalized_jobs.append(job)
-    task_refs = [str(job["task_ref"]) for job in normalized_jobs]
-    if task_refs != sorted(task_refs) or len(task_refs) != len(set(task_refs)):
-        raise RetainedInventoryError(
-            "manifest agent jobs are not uniquely ordered by task_ref"
-        )
+        task_refs.append(task_ref)
     if (
-        execution["result_count"] != result_count
-        or execution["retry_count"] != retry_count
+        task_refs != sorted(task_refs)
+        or len(task_refs) != len(set(task_refs))
+        or len(attempt_refs) != len(set(attempt_refs))
+        or len(job_refs) != len(set(job_refs))
+        or len(result_refs) != len(set(result_refs))
+        or len(reviewer_identity_refs) != len(set(reviewer_identity_refs))
+    ):
+        raise RetainedInventoryError(
+            "manifest agent refs are not uniquely ordered and bound"
+        )
+    if (type(execution["result_count"]), execution["result_count"]) != (
+        int,
+        result_count,
+    ) or (type(execution["retry_count"]), execution["retry_count"]) != (
+        int,
+        retry_count,
     ):
         raise RetainedInventoryError(
             "manifest agent result/retry counts do not conserve attempts"
