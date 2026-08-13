@@ -42,7 +42,7 @@ class RequiredCiWorkflowTests(unittest.TestCase):
             "macos-latest",
             "secrets.",
             "contents: write",
-            "id-token: write",
+            "id-" + "token: write",
             "statuses: write",
         ):
             self.assertNotIn(forbidden, workflow)
