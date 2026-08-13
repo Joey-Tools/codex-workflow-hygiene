@@ -151,6 +151,10 @@ def load_protocol_templates(
     }
 
 
+def join_shell_continuations(shell_block: str) -> str:
+    return re.sub(r"\\\r?\n[ \t]*", " ", shell_block)
+
+
 def instantiate_protocol_command(
     template: list[str],
     *,
@@ -253,7 +257,26 @@ class RolloutSearchReferenceTests(unittest.TestCase):
     def test_reference_pins_each_protocol_command_shape(self) -> None:
         for heading, expected_argv in EXPECTED_COMMAND_ARGV.items():
             with self.subTest(heading=heading):
-                self.assertEqual(self.templates[heading][1], expected_argv)
+                shell_block, actual_argv = self.templates[heading]
+                self.assertEqual(actual_argv, expected_argv)
+                logical_block = join_shell_continuations(shell_block)
+                self.assertRegex(
+                    logical_block,
+                    re.compile(r'-- "\$PATTERN"\s+< "\$ROLLOUT"'),
+                )
+
+        exhaustive_block = join_shell_continuations(
+            self.templates[EXHAUSTIVE_HEADING][0]
+        )
+        self.assertRegex(exhaustive_block, re.compile(r'--max-count "\$COUNT"'))
+        self.assertRegex(
+            exhaustive_block,
+            re.compile(r'< "\$ROLLOUT"\s+> "\$ARTIFACT"'),
+        )
+        self.assertRegex(
+            exhaustive_block,
+            re.compile(r'test -f "\$ARTIFACT"'),
+        )
 
     def test_exhaustive_block_pins_complete_shell_structure(self) -> None:
         shell_block = self.templates[EXHAUSTIVE_HEADING][0]
@@ -315,6 +338,29 @@ class Ripgrep15ConformanceTests(unittest.TestCase):
                 argv, stdin=stdin, capture_output=True, check=False
             )
 
+    def run_protocol_shell(
+        self, heading: str, *, rollout: Path, pattern: str
+    ) -> subprocess.CompletedProcess[bytes]:
+        environment = {
+            "LC_ALL": "C",
+            "PATH": str(Path(self.rg).parent),
+            "PATTERN": pattern,
+            "ROLLOUT": str(rollout),
+        }
+        return subprocess.run(
+            [
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                self.templates[heading][0],
+            ],
+            cwd=rollout.parent,
+            env=environment,
+            capture_output=True,
+            check=False,
+        )
+
     def run_exhaustive_shell(
         self, *, rollout: Path, artifact: Path, count: int
     ) -> subprocess.CompletedProcess[bytes]:
@@ -353,6 +399,34 @@ class Ripgrep15ConformanceTests(unittest.TestCase):
 
             failed = self.run_protocol(COUNT_HEADING, path, pattern="[")
             self.assertGreaterEqual(failed.returncode, 2)
+
+    def test_documented_shell_preserves_pattern_and_rollout_as_single_words(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            rollout = temp / "rollout fixture [one].jsonl"
+            pattern = "alpha.*beta gamma"
+            rollout.write_text("alphaZZbeta gamma\n", encoding="utf-8")
+            (temp / "alpha.zzbeta").write_text("decoy\n", encoding="utf-8")
+            (temp / "gamma").write_text("decoy\n", encoding="utf-8")
+
+            expected_rows = {
+                COUNT_HEADING: 1,
+                POSITION_HEADING: 1,
+                PREVIEW_HEADING: 1,
+            }
+            for heading, expected_row_count in expected_rows.items():
+                with self.subTest(heading=heading):
+                    completed = self.run_protocol_shell(
+                        heading, rollout=rollout, pattern=pattern
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    if heading == COUNT_HEADING:
+                        self.assertEqual(completed.stdout, b"1\n")
+                    else:
+                        self.assertEqual(
+                            len(parse_position_rows(completed.stdout)),
+                            expected_row_count,
+                        )
 
     def test_position_sample_is_capped_by_matching_lines(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
