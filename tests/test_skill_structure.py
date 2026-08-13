@@ -640,8 +640,9 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("'output'", workflow)
         self.assertIn("'arguments'", workflow)
         self.assertIn("yield from iter_top_level_fields(payload)", workflow)
-        self.assertIn("elif isinstance(value, dict)", workflow)
-        self.assertIn("for item in value.values()", workflow)
+        self.assertIn("stack = [value]", keyword_recipe)
+        self.assertIn("stack.extend(reversed(tuple(current.values())))", keyword_recipe)
+        self.assertIn("stack.extend(reversed(current))", keyword_recipe)
         self.assertIn("elif item_type == 'user_message'", workflow)
         self.assertIn("elif item_type == 'task_complete'", workflow)
         self.assertIn("payload.get('message')", workflow)
@@ -653,7 +654,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("while raw_line and not raw_line.endswith(b'\\n'):", keyword_recipe)
         self.assertIn("def iter_text(value):", keyword_recipe)
         self.assertIn("def normalized_characters(parts):", keyword_recipe)
-        self.assertIn("yield from iter_text(item)", keyword_recipe)
+        self.assertNotIn("yield from iter_text(item)", keyword_recipe)
+        self.assertIn("except (ValueError, RecursionError):", keyword_recipe)
         self.assertIn("snippet = hit_window(", keyword_recipe)
         self.assertIn(
             "iter_record_text(obj, payload, item_type)",

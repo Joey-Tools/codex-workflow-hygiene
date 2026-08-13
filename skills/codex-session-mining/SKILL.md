@@ -47,7 +47,8 @@ Use this skill for:
 - Verify which transcript roots and archive layouts exist on the current host instead of assuming `archived_sessions` is either present or obsolete.
 
 3. Extract only the records and fields needed for the question.
-- Before printing details from a large rollout, count record shapes or line count, then add an explicit selector and row cap.
+- After selecting one exact rollout, start keyword discovery with the fixed case-sensitive literal ripgrep count, bounded matching-line position sample, and optional bounded-preview protocol in [references/rollout-search.md](references/rollout-search.md). Keep its output framing intact; positive and negative results are raw-text locators, never complete match sets, JSON parsing, or evidence by themselves. Use the field-aware parser for match or no-match evidence.
+- Before printing details from a large rollout, count record shapes or line count, then add an explicit selector and row cap. Follow raw-text candidate locations with field-aware JSON parsing when record shape, decoded values, or selected-field provenance matters.
 - Treat `corpus.jsonl` as a locator, not transcript output: inspect its accepted line numbers and a small amount of necessary nearby context instead of printing every accepted rollout.
 - Use `session_meta` and `turn_context` for `cwd`, date, model, sandbox, and approval context.
 - Use `response_item` messages for user intent, assistant decisions, and explicit skill mentions.
@@ -102,7 +103,7 @@ Keep the work read-only unless the user explicitly asks to modify `~/.codex`.
 - Do not dump full per-record inventories of large rollout files; a structured `jq` command can still produce tens of thousands of tokens if it emits every timestamp or tool call.
 - Do not use `jq select(tostring | contains(...))` as a shortcut on rollout/history records; it is still a whole-record search and can surface giant nested `function_call_output` payloads. For keyword probes, filter by record type and field first, then emit only an explicit short snippet.
 - Do not use JSONL schema probes that print keys for every record. Count lines and inspect one record, or aggregate unique keys once per file; do not run a per-line key dump such as `jq -R 'fromjson | keys' file.jsonl`.
-- Do not use `sed`, `head`, or raw `rg -n` as an orientation step on rollout/history JSONL records; the first few records often contain full instructions, and a keyword hit can print a whole nested tool output. Count record shapes or emit selected JSON fields instead.
+- Do not use `sed`, `head`, or ad hoc raw `rg -n` as an orientation step on rollout/history JSONL records; the first few records often contain full instructions, and a keyword hit can print a whole nested tool output. For one exact rollout, use the fixed protocol in `references/rollout-search.md`; otherwise count record shapes or emit selected JSON fields.
 - Do not scan all of `~/.codex` when the task is already bounded by session ID, repo, or date.
 - Do not point raw `rg -n` at the whole `$CODEX_HOME` / `~/.codex` tree. If the exact session is unknown, use `session_index.jsonl`, `history.jsonl`, bounded `sessions/YYYY/MM/DD` directories, `rg -l`, counts, or a JSON extractor before printing snippets.
 - Do not combine `session_index.jsonl`, `history.jsonl`, and `~/.codex/sessions` in one raw `rg`; if the ID appears inside a nested tool output, the match can dump an entire rollout JSON record back into context.
@@ -116,4 +117,5 @@ Keep the work read-only unless the user explicitly asks to modify `~/.codex`.
 
 ## References
 
+- Use [references/rollout-search.md](references/rollout-search.md) for the fixed ripgrep protocol on one exact rollout.
 - Use [references/workflow.md](references/workflow.md) for concrete lookup patterns and extraction recipes.
