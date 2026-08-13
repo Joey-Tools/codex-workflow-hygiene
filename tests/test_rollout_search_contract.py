@@ -226,6 +226,38 @@ def extract_field_aware_parser() -> str:
     return workflow[start : workflow.index("\nPY\n```", start)]
 
 
+def user_message_json(message: str, *, ensure_ascii: bool = True) -> str:
+    return json.dumps(
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": message},
+        },
+        ensure_ascii=ensure_ascii,
+        separators=(",", ":"),
+    )
+
+
+def user_message_record(message: str, *, ensure_ascii: bool = True) -> bytes:
+    return (user_message_json(message, ensure_ascii=ensure_ascii) + "\n").encode(
+        "utf-8"
+    )
+
+
+def run_field_aware_parser_bytes(
+    payload: bytes, needle: str = MATCH_PATTERN
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        rollout = Path(temp_dir) / "rollout.jsonl"
+        rollout.write_bytes(payload)
+        completed = subprocess.run(
+            [sys.executable, "-c", extract_field_aware_parser(), str(rollout), needle],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        return completed, str(rollout)
+
+
 class RolloutSearchReferenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -507,20 +539,8 @@ class RolloutSearchReferenceTests(unittest.TestCase):
         self.assertFalse(metadata["output_truncated"])
 
     def test_field_aware_parser_rejects_non_utf8_json_encodings(self) -> None:
-        non_utf8_json = json.dumps(
-            {
-                "type": "event_msg",
-                "payload": {
-                    "type": "user_message",
-                    "message": "needle in a non-UTF-8 record",
-                },
-            },
-            separators=(",", ":"),
-        )
-        encodings = (
-            "utf-16-be",
-            "utf-32-be",
-        )
+        non_utf8_json = user_message_json("needle in a non-UTF-8 record")
+        encodings = ("utf-16-be", "utf-32-be")
         encoded_records = [
             (non_utf8_json + "\n").encode(encoding) for encoding in encodings
         ]
@@ -530,35 +550,9 @@ class RolloutSearchReferenceTests(unittest.TestCase):
                 for record in encoded_records
             )
         )
-        valid_record = (
-            json.dumps(
-                {
-                    "type": "event_msg",
-                    "payload": {
-                        "type": "user_message",
-                        "message": "needle in valid UTF-8",
-                    },
-                },
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode("utf-8")
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            rollout = Path(temp_dir) / "rollout.jsonl"
-            rollout.write_bytes(b"".join(encoded_records + [valid_record]))
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    extract_field_aware_parser(),
-                    str(rollout),
-                    MATCH_PATTERN,
-                ],
-                capture_output=True,
-                check=False,
-                text=True,
-            )
+        completed, _ = run_field_aware_parser_bytes(
+            b"".join(encoded_records + [user_message_record("needle in valid UTF-8")])
+        )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(len(completed.stdout.splitlines()), 1)
@@ -583,16 +577,7 @@ class RolloutSearchReferenceTests(unittest.TestCase):
         )
 
     def test_field_aware_parser_rejects_little_endian_json_at_eof(self) -> None:
-        non_utf8_json = json.dumps(
-            {
-                "type": "event_msg",
-                "payload": {
-                    "type": "user_message",
-                    "message": "needle in a little-endian record",
-                },
-            },
-            separators=(",", ":"),
-        )
+        non_utf8_json = user_message_json("needle in a little-endian record")
         expected_metadata = {
             "emitted_rows": 0,
             "invalid_records": 1,
@@ -614,25 +599,151 @@ class RolloutSearchReferenceTests(unittest.TestCase):
             with self.subTest(encoding=encoding):
                 raw_record = bom + non_utf8_json.encode(encoding)
                 self.assertIsInstance(json.loads(raw_record), dict)
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    rollout = Path(temp_dir) / "rollout.jsonl"
-                    rollout.write_bytes(raw_record)
-                    completed = subprocess.run(
-                        [
-                            sys.executable,
-                            "-c",
-                            extract_field_aware_parser(),
-                            str(rollout),
-                            MATCH_PATTERN,
-                        ],
-                        capture_output=True,
-                        check=False,
-                        text=True,
-                    )
+                completed, _ = run_field_aware_parser_bytes(raw_record)
 
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertEqual(completed.stdout, "")
                 self.assertEqual(json.loads(completed.stderr), expected_metadata)
+
+    def test_field_aware_parser_recovers_after_little_endian_newline(self) -> None:
+        non_utf8_json = user_message_json("needle in a little-endian record")
+        valid_record = user_message_record("needle in valid UTF-8")
+        expected_metadata = {
+            "emitted_rows": 1,
+            "invalid_records": 1,
+            "kind": "scan_meta",
+            "matched_records": 1,
+            "max_rows": 20,
+            "output_truncated": False,
+            "oversized_records": 0,
+            "records_seen": 2,
+            "scan_complete": True,
+            "stop_reason": None,
+            "suppressed_rows": 0,
+        }
+
+        for encoding, bom in (
+            ("utf-16-le", codecs.BOM_UTF16_LE),
+            ("utf-32-le", codecs.BOM_UTF32_LE),
+        ):
+            with self.subTest(encoding=encoding):
+                foreign_record = bom + (non_utf8_json + "\n").encode(encoding)
+                self.assertIsInstance(json.loads(foreign_record), dict)
+                completed, rollout = run_field_aware_parser_bytes(
+                    foreign_record + valid_record
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(len(completed.stdout.splitlines()), 1)
+                self.assertIn(f"{rollout}:2:", completed.stdout)
+                self.assertIn("needle in valid UTF-8", completed.stdout)
+                self.assertNotIn("little-endian record", completed.stdout)
+                self.assertEqual(json.loads(completed.stderr), expected_metadata)
+
+    def test_field_aware_parser_does_not_strip_extra_nul(self) -> None:
+        non_utf8_json = json.dumps(
+            {"type": "event_msg", "payload": {"type": "user_message"}},
+            separators=(",", ":"),
+        )
+        valid_record = user_message_record("needle after extra NUL")
+
+        for encoding, bom in (
+            ("utf-16-le", codecs.BOM_UTF16_LE),
+            ("utf-32-le", codecs.BOM_UTF32_LE),
+        ):
+            with self.subTest(encoding=encoding):
+                foreign_record = bom + (non_utf8_json + "\n").encode(encoding)
+                completed, _ = run_field_aware_parser_bytes(
+                    foreign_record + b"\x00{}\n" + valid_record
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn("needle after extra NUL", completed.stdout)
+                metadata = json.loads(completed.stderr)
+                self.assertEqual(metadata["records_seen"], 3)
+                self.assertEqual(metadata["invalid_records"], 2)
+                self.assertEqual(metadata["matched_records"], 1)
+                self.assertTrue(metadata["scan_complete"])
+
+    def test_field_aware_parser_drains_oversized_little_endian_record(self) -> None:
+        max_record_bytes = 1024 * 1024
+        valid_record = user_message_record("needle after oversized record")
+
+        for width, bom in (
+            (2, codecs.BOM_UTF16_LE),
+            (4, codecs.BOM_UTF32_LE),
+        ):
+            with self.subTest(width=width):
+                encoded_a = b"a" + b"\x00" * (width - 1)
+                foreign_record = (
+                    bom
+                    + encoded_a * (max_record_bytes // width + 8)
+                    + b"\n"
+                    + b"\x00" * (width - 1)
+                )
+                completed, _ = run_field_aware_parser_bytes(
+                    foreign_record + valid_record
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn("needle after oversized record", completed.stdout)
+                metadata = json.loads(completed.stderr)
+                self.assertEqual(metadata["records_seen"], 2)
+                self.assertEqual(metadata["invalid_records"], 0)
+                self.assertEqual(metadata["oversized_records"], 1)
+                self.assertEqual(metadata["matched_records"], 1)
+                self.assertTrue(metadata["scan_complete"])
+
+    def test_field_aware_parser_recovers_across_buffer_boundary(self) -> None:
+        valid_record = user_message_record("needle after buffer boundary")
+        prefix = b" { }\n"
+        foreign_text = "{}" + " " * 2043
+        foreign_record = codecs.BOM_UTF32_LE + (
+            foreign_text + "\n"
+        ).encode("utf-32-le")
+        self.assertEqual(len(prefix), 5)
+        self.assertEqual(len(foreign_record), 8188)
+
+        completed, _ = run_field_aware_parser_bytes(
+            prefix + foreign_record + valid_record
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("needle after buffer boundary", completed.stdout)
+        metadata = json.loads(completed.stderr)
+        self.assertEqual(metadata["records_seen"], 3)
+        self.assertEqual(metadata["invalid_records"], 1)
+        self.assertEqual(metadata["matched_records"], 1)
+        self.assertTrue(metadata["scan_complete"])
+
+    def test_field_aware_parser_skips_raw_lf_bytes_inside_foreign_code_units(
+        self,
+    ) -> None:
+        foreign_json = user_message_json(
+            "U+010A \u010a and U+0A00 \u0a00 are not line terminators",
+            ensure_ascii=False,
+        )
+        valid_record = user_message_record("needle after foreign raw LF byte")
+
+        for encoding, bom in (
+            ("utf-16-le", codecs.BOM_UTF16_LE),
+            ("utf-32-le", codecs.BOM_UTF32_LE),
+        ):
+            with self.subTest(encoding=encoding):
+                foreign_record = bom + (foreign_json + "\n").encode(encoding)
+                self.assertIsInstance(json.loads(foreign_record), dict)
+                completed, rollout = run_field_aware_parser_bytes(
+                    foreign_record + valid_record
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn(f"{rollout}:4:", completed.stdout)
+                self.assertIn("needle after foreign raw LF byte", completed.stdout)
+                metadata = json.loads(completed.stderr)
+                self.assertEqual(metadata["records_seen"], 2)
+                self.assertEqual(metadata["invalid_records"], 1)
+                self.assertEqual(metadata["matched_records"], 1)
+                self.assertTrue(metadata["scan_complete"])
 
     def test_field_aware_parser_rejects_whitespace_only_needle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -445,20 +445,90 @@ scan_meta = {
 }
 
 
+def little_endian_code_unit_width(raw_line):
+    if raw_line.startswith(b'\xff\xfe\x00\x00'):
+        return 4
+    if raw_line.startswith(b'\xff\xfe'):
+        return 2
+    return 1
+
+
+def consume_aligned_little_endian_lf_padding(handle, width, record_bytes):
+    if width == 1 or (record_bytes - 1) % width != 0:
+        return b''
+    padding_bytes = width - 1
+    padding = b'\x00' * padding_bytes
+    checkpoint = handle.tell()
+    candidate = handle.read(padding_bytes)
+    if candidate != padding:
+        handle.seek(checkpoint)
+        return b''
+    return candidate
+
+
+def read_bounded_little_endian_record(handle, raw_line, width):
+    retained = bytearray()
+    record_bytes = 0
+    raw_lf_count = 0
+    oversized = False
+    while raw_line:
+        record_bytes += len(raw_line)
+        if not oversized:
+            if record_bytes <= max_record_bytes:
+                retained.extend(raw_line)
+            else:
+                retained.clear()
+                oversized = True
+        terminated = False
+        if raw_line.endswith(b'\n'):
+            raw_lf_count += 1
+            padding = consume_aligned_little_endian_lf_padding(
+                handle, width, record_bytes
+            )
+            if padding:
+                record_bytes += len(padding)
+                if not oversized:
+                    if record_bytes <= max_record_bytes:
+                        retained.extend(padding)
+                    else:
+                        retained.clear()
+                        oversized = True
+                terminated = True
+        if terminated:
+            break
+        raw_line = handle.readline(max_record_bytes + 1)
+    return (None if oversized else bytes(retained), raw_lf_count)
+
+
 def bounded_jsonl(handle):
-    line_no = 0
+    physical_line_no = 1
     while True:
         raw_line = handle.readline(max_record_bytes + 1)
         if not raw_line:
             return
-        line_no += 1
+        record_line_no = physical_line_no
         scan_meta['records_seen'] += 1
+        little_endian_width = little_endian_code_unit_width(raw_line)
+        if little_endian_width > 1:
+            raw_line, raw_lf_count = read_bounded_little_endian_record(
+                handle, raw_line, little_endian_width
+            )
+            physical_line_no += raw_lf_count
+            if raw_line is None:
+                scan_meta['oversized_records'] += 1
+                continue
+            yield record_line_no, raw_line
+            continue
+        raw_lf_count = int(raw_line.endswith(b'\n'))
         if len(raw_line) > max_record_bytes:
             while raw_line and not raw_line.endswith(b'\n'):
                 raw_line = handle.readline(max_record_bytes + 1)
+                raw_lf_count += int(raw_line.endswith(b'\n'))
+            physical_line_no += raw_lf_count
             scan_meta['oversized_records'] += 1
             continue
-        yield line_no, raw_line
+        physical_line_no += raw_lf_count
+        yield record_line_no, raw_line
 
 
 def iter_text(value):
@@ -677,7 +747,7 @@ print(json.dumps(scan_meta, sort_keys=True, separators=(',', ':')), file=sys.std
 PY
 ```
 
-The parser rejects an empty, whitespace-only, invalid-UTF-8, or post-normalization needle larger than 1024 UTF-8 bytes before opening the rollout. This fixed needle cap bounds the portion repeated in each of the at most 20 output rows. The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Every retained physical record is decoded as strict UTF-8 before JSON parsing, so `json.loads()` cannot auto-detect UTF-16 or UTF-32 input and bypass `invalid_records`. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. After raw matching and window selection, the snippet JSON-escapes only non-printable characters so terminal control sequences cannot reach stdout while printable Unicode remains unchanged. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
+The parser rejects an empty, whitespace-only, invalid-UTF-8, or post-normalization needle larger than 1024 UTF-8 bytes before opening the rollout. This fixed needle cap bounds the portion repeated in each of the at most 20 output rows. The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Raw LF is the default physical-record delimiter. The one recovery exception is a record that starts with a UTF-16LE or UTF-32LE BOM: it continues past raw `0a` bytes inside foreign code units until an LF is aligned to that code-unit width and the complete following 1 or 3 bytes are exactly NUL, then assigns that encoded-LF padding to the same rejected record. It checkpoints the buffered stream's logical position and restores that exact position when the full padding is unavailable or differs, never strips arbitrary NULs, and leaves the nonmatching or incomplete suffix attached to the same foreign record. This is a declared framing choice for BOM-prefixed input: a hybrid foreign record that instead uses a single-byte LF is ambiguous with an internal code-unit byte and remains one invalid or oversized record under this rule. The rule lets a UTF-8 record after a complete encoded LE terminator remain independently searchable; it does not accept or transcode the foreign encoding. Output line numbers remain 1-based raw-LF physical coordinates: every raw LF consumed inside a recovered foreign record advances the next record's coordinate, while `records_seen` counts the recovered foreign record once. Every retained physical record is decoded as strict UTF-8 before JSON parsing, so `json.loads()` cannot auto-detect UTF-16 or UTF-32 input and bypass `invalid_records`. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. After raw matching and window selection, the snippet JSON-escapes only non-printable characters so terminal control sequences cannot reach stdout while printable Unicode remains unchanged. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
 
 The parser continues through point-in-time EOF after its 20 stdout rows are full. Its final stderr line is one compact `scan_meta` JSON object; keep it in a private bounded control sink and require normal process exit plus `scan_complete: true`. `matched_records` counts every matching physical record reached by the selected-field scan, while `emitted_rows`, `suppressed_rows`, and `output_truncated` distinguish complete matching from bounded presentation. `invalid_records` and `oversized_records` identify physical records the parser could not inspect; they must be zero before claiming a complete no-match result. These counters do not freeze a live rollout or prove content stability.
 
