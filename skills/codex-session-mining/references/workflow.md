@@ -462,14 +462,15 @@ def bounded_jsonl(handle):
 
 
 def iter_text(value):
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from iter_text(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from iter_text(item)
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, str):
+            yield current
+        elif isinstance(current, dict):
+            stack.extend(reversed(tuple(current.values())))
+        elif isinstance(current, list):
+            stack.extend(reversed(current))
 
 
 def iter_top_level_fields(obj):
@@ -640,7 +641,7 @@ with path.open('rb') as handle:
     for line_no, raw_line in records:
         try:
             obj = json.loads(raw_line)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (ValueError, RecursionError):
             scan_meta['invalid_records'] += 1
             continue
         if not isinstance(obj, dict):

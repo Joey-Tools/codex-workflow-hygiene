@@ -390,6 +390,121 @@ class RolloutSearchReferenceTests(unittest.TestCase):
             },
         )
 
+    def test_field_aware_parser_handles_json_pathologies_after_output_cap(self) -> None:
+        code = extract_field_aware_parser()
+        nested_depth = 996
+        deep_message = (
+            '{"first":"deep-first","nested":'
+            + '{"node":' * nested_depth
+            + '"needle"'
+            + '}' * nested_depth
+            + ',"last":"deep-last"}'
+        )
+        deep_record = (
+            '{"type":"event_msg","payload":{"type":"user_message","message":'
+            + deep_message
+            + '}}\n'
+        ).encode("utf-8")
+        ordinary_records = [
+            (
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "user_message",
+                            "message": f"needle row {index}",
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            for index in range(20)
+        ]
+        final_record = (
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "needle after pathologies",
+                    },
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        self.assertIsInstance(json.loads(deep_record), dict)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout.jsonl"
+            rollout.write_bytes(
+                b"".join(
+                    ordinary_records
+                    + [b"9" * 5000 + b"\n", deep_record, final_record]
+                )
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", code, str(rollout), MATCH_PATTERN],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(len(completed.stdout.splitlines()), POSITION_SAMPLE_LIMIT)
+        metadata = json.loads(completed.stderr)
+        self.assertEqual(
+            metadata,
+            {
+                "emitted_rows": 20,
+                "invalid_records": 1,
+                "kind": "scan_meta",
+                "matched_records": 22,
+                "max_rows": 20,
+                "output_truncated": True,
+                "oversized_records": 0,
+                "records_seen": 23,
+                "scan_complete": True,
+                "stop_reason": None,
+                "suppressed_rows": 2,
+            },
+        )
+
+    def test_field_aware_parser_preserves_deep_selected_field_order(self) -> None:
+        nested_depth = 996
+        deep_message = (
+            '{"first":"deep-first","nested":'
+            + '{"node":' * nested_depth
+            + '"needle"'
+            + '}' * nested_depth
+            + ',"last":"deep-last"}'
+        )
+        record = (
+            '{"type":"event_msg","payload":{"type":"user_message","message":'
+            + deep_message
+            + '}}\n'
+        )
+        needle = "deep-first needle deep-last"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout.jsonl"
+            rollout.write_text(record, encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, "-c", extract_field_aware_parser(), str(rollout), needle],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(needle, completed.stdout)
+        metadata = json.loads(completed.stderr)
+        self.assertTrue(metadata["scan_complete"])
+        self.assertEqual(metadata["matched_records"], 1)
+        self.assertEqual(metadata["invalid_records"], 0)
+        self.assertFalse(metadata["output_truncated"])
+
     def test_field_aware_parser_rejects_whitespace_only_needle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             rollout = Path(temp_dir) / "rollout.jsonl"
