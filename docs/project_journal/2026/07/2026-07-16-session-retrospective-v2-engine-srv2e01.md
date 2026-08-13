@@ -1698,5 +1698,7 @@ superseded_by:
   fixture evidence from the bounded-command helper tests, not outer-run
   failures. Final scoped Ruff lint/format, actionlint, `git diff --check`,
   project-journal validation, and the official isolated OpenAI skill validator
-  also pass. The signed commit, admission, and exact-head
-  `skill-repo-codex-gate` remain pending.
+  also pass. Signed implementation commit `b9d5c754` records these fixes and
+  preserves `72b6c6d9` as its parent. Exact-head admission and the
+  `skill-repo-codex-gate` remain PR-lifecycle evidence rather than durable
+  implementation state.
