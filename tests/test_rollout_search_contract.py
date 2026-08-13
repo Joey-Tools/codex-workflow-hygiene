@@ -56,6 +56,7 @@ EXPECTED_COMMAND_ARGV = {
         "--include-zero",
         "--",
         "$PATTERN",
+        "-",
         "<",
         "$ROLLOUT",
     ],
@@ -70,6 +71,7 @@ EXPECTED_COMMAND_ARGV = {
         "1",
         "--",
         "$PATTERN",
+        "-",
         "<",
         "$ROLLOUT",
     ],
@@ -85,6 +87,7 @@ EXPECTED_COMMAND_ARGV = {
         "--max-columns-preview",
         "--",
         "$PATTERN",
+        "-",
         "<",
         "$ROLLOUT",
     ],
@@ -99,6 +102,7 @@ EXPECTED_COMMAND_ARGV = {
         "1",
         "--",
         "$PATTERN",
+        "-",
         "<",
         "$ROLLOUT",
         ">",
@@ -220,7 +224,8 @@ class RolloutSearchReferenceTests(unittest.TestCase):
 
     def test_reference_limits_input_and_pins_rg_major(self) -> None:
         self.assertIn("one exact regular rollout file", self.reference_lower)
-        self.assertIn("input redirection gives ripgrep one input stream", self.reference_lower)
+        self.assertIn("explicit `-` path makes ripgrep read stdin", self.reference_lower)
+        self.assertIn("input redirection supplies that one stream", self.reference_lower)
         self.assertIn("only optional search flags allowed", self.reference_lower)
         self.assertIn("require the first line to report ripgrep major version 15", self.reference_lower)
         for flag in ("--fixed-strings", "-i", "-s", "-S", "-w", "-x"):
@@ -267,7 +272,7 @@ class RolloutSearchReferenceTests(unittest.TestCase):
                 logical_block = join_shell_continuations(shell_block)
                 self.assertRegex(
                     logical_block,
-                    re.compile(r'-- "\$PATTERN"\s+< "\$ROLLOUT"'),
+                    re.compile(r'-- "\$PATTERN"\s+-\s+< "\$ROLLOUT"'),
                 )
 
         exhaustive_block = join_shell_continuations(
@@ -276,7 +281,7 @@ class RolloutSearchReferenceTests(unittest.TestCase):
         self.assertRegex(exhaustive_block, re.compile(r'--max-count "\$COUNT"'))
         self.assertRegex(
             exhaustive_block,
-            re.compile(r'< "\$ROLLOUT"\s+> "\$ARTIFACT"'),
+            re.compile(r'-\s+< "\$ROLLOUT"\s+> "\$ARTIFACT"'),
         )
         self.assertRegex(
             exhaustive_block,
@@ -487,6 +492,32 @@ class Ripgrep15ConformanceTests(unittest.TestCase):
                             len(parse_position_rows(completed.stdout)),
                             expected_row_count,
                         )
+
+    def test_documented_shell_does_not_fall_back_to_searching_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            rollout_directory = temp / "not-a-rollout"
+            rollout_directory.mkdir()
+            (temp / "decoy.jsonl").write_text("needle\n", encoding="utf-8")
+
+            for heading in (COUNT_HEADING, POSITION_HEADING, PREVIEW_HEADING):
+                with self.subTest(heading=heading):
+                    completed = self.run_protocol_shell(
+                        heading,
+                        rollout=rollout_directory,
+                        pattern=MATCH_PATTERN,
+                    )
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertEqual(completed.stdout, b"")
+
+            artifact = temp / "positions.txt"
+            exhaustive = self.run_exhaustive_shell(
+                rollout=rollout_directory,
+                artifact=artifact,
+                count=1,
+            )
+            self.assertNotEqual(exhaustive.returncode, 0)
+            self.assertEqual(artifact.read_bytes(), b"")
 
     def test_live_growth_keeps_position_sample_bounded_and_requires_recount(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -15,10 +15,10 @@ rg \
     --no-config --no-mmap --text --encoding none \
     --no-heading --no-filename --color never \
     [PROTOCOL_OPTIONS] \
-    -- "$PATTERN" < "$ROLLOUT"
+    -- "$PATTERN" - < "$ROLLOUT"
 ```
 
-Input redirection gives ripgrep one input stream, so an accidental directory path cannot fan out into a recursive, per-file search. Once the shell has opened the stream, replacing the pathname does not redirect that invocation to the replacement. This pure command recipe does not itself provide no-follow opening, regular-file authentication, or a frozen snapshot: resolve one exact rollout path, require it to be a regular file before running the command, and treat any open or read failure as a failed search.
+The explicit `-` path makes ripgrep read stdin instead of falling back to its no-path current-directory search. Input redirection supplies that one stream, so an accidental directory path cannot fan out into a recursive, per-file search. Once the shell has opened the stream, replacing the pathname does not redirect that invocation to the replacement. This pure command recipe does not itself provide no-follow opening, regular-file authentication, or a frozen snapshot: resolve one exact rollout path, require it to be a regular file before running the command, and treat any open or read failure as a failed search.
 
 The default is ripgrep's case-sensitive Rust regex engine. The only optional search flags allowed by this protocol are:
 
@@ -37,7 +37,7 @@ rg \
     --no-config --no-mmap --text --encoding none \
     --no-heading --no-filename --color never \
     --count-matches --include-zero \
-    -- "$PATTERN" < "$ROLLOUT"
+    -- "$PATTERN" - < "$ROLLOUT"
 ```
 
 Interpret stdout and status together:
@@ -62,7 +62,7 @@ rg \
     --no-heading --no-filename --color never \
     --line-number --column --byte-offset \
     --max-count 20 --max-columns 1 \
-    -- "$PATTERN" < "$ROLLOUT"
+    -- "$PATTERN" - < "$ROLLOUT"
 ```
 
 The line number is the 1-based physical line number, and the column is a 1-based byte column. The byte offset is the 0-based offset of the matching line's start, not the match's offset. Multiple occurrences on the same line still produce one row. With `--max-columns 1`, ripgrep emits its short omitted-line marker instead of retaining a long source line.
@@ -83,7 +83,7 @@ rg \
     --no-heading --no-filename --color never \
     --line-number --column --byte-offset \
     --max-count 5 --max-columns 4096 --max-columns-preview \
-    -- "$PATTERN" < "$ROLLOUT"
+    -- "$PATTERN" - < "$ROLLOUT"
 ```
 
 This is a line-prefix preview, not a match-centered excerpt. The match may occur after byte 4096 and therefore be absent from the preview. The source prefix can reach 4099 bytes when ripgrep finishes a UTF-8 code-point boundary; under this exact template, total successful stdout remains below 21 KiB.
@@ -109,7 +109,7 @@ Use an exhaustive artifact only when refinement is impractical and a local aggre
         --no-heading --no-filename --color never \
         --line-number --column --byte-offset \
         --max-count "$COUNT" --max-columns 1 \
-        -- "$PATTERN" \
+        -- "$PATTERN" - \
         < "$ROLLOUT" > "$ARTIFACT" &&
     test -f "$ARTIFACT"
 )
