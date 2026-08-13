@@ -376,7 +376,7 @@ Use the later bounded rollout probe for `sessions/**/rollout-*.jsonl` and `archi
 
 ## 2. Extract Only The Relevant Parts
 
-For first-pass keyword discovery in one exact rollout, use the fixed count, matching-line position, and optional bounded raw-prefix templates in [rollout-search.md](rollout-search.md). Those templates deliberately keep ripgrep's native regex or literal semantics while preventing an unbounded matching JSONL record from reaching stdout. They do not parse JSON, select trusted fields, or freeze a live rollout. Treat their line coordinates as locators, then use a record-shape-aware parser below when decoded values or field provenance matter.
+For first-pass keyword discovery in one exact rollout, use the fixed count, bounded matching-line position sample, and optional bounded raw-prefix sample in [rollout-search.md](rollout-search.md). Those templates deliberately keep ripgrep's native regex or literal semantics while preventing an unbounded matching JSONL record from reaching stdout. They do not parse JSON, select trusted fields, freeze a live rollout, or prove a complete match set. Treat their line coordinates as locators, then let a record-shape-aware parser below scan its complete intended range when decoded values, field provenance, or coverage matters.
 
 Before printing details from a large rollout, count record shapes and then filter:
 
@@ -413,10 +413,24 @@ import sys
 path = Path(sys.argv[1]).expanduser()
 needle = sys.argv[2]
 printed = 0
+max_rows = 20
 max_record_bytes = 1024 * 1024
 before_chars = 180
 after_chars = 220
 max_metadata_chars = 80
+scan_meta = {
+    'kind': 'scan_meta',
+    'scan_complete': False,
+    'stop_reason': None,
+    'records_seen': 0,
+    'invalid_records': 0,
+    'oversized_records': 0,
+    'matched_records': 0,
+    'emitted_rows': 0,
+    'suppressed_rows': 0,
+    'max_rows': max_rows,
+    'output_truncated': False,
+}
 
 
 def bounded_jsonl(handle):
@@ -426,9 +440,11 @@ def bounded_jsonl(handle):
         if not raw_line:
             return
         line_no += 1
+        scan_meta['records_seen'] += 1
         if len(raw_line) > max_record_bytes:
             while raw_line and not raw_line.endswith(b'\n'):
                 raw_line = handle.readline(max_record_bytes + 1)
+            scan_meta['oversized_records'] += 1
             continue
         yield line_no, raw_line
 
@@ -613,8 +629,10 @@ with path.open('rb') as handle:
         try:
             obj = json.loads(raw_line)
         except (UnicodeDecodeError, json.JSONDecodeError):
+            scan_meta['invalid_records'] += 1
             continue
         if not isinstance(obj, dict):
+            scan_meta['invalid_records'] += 1
             continue
         payload = obj.get('payload') or {}
         if not isinstance(payload, dict):
@@ -631,15 +649,24 @@ with path.open('rb') as handle:
         )
         if snippet is None:
             continue
-        safe_snippet = escaped_output_text(snippet)
-        print(f'{path}:{line_no}:{timestamp}:{record_kind}:{safe_snippet}')
-        printed += 1
-        if printed >= 20:
-            break
+        scan_meta['matched_records'] += 1
+        if printed < max_rows:
+            safe_snippet = escaped_output_text(snippet)
+            print(f'{path}:{line_no}:{timestamp}:{record_kind}:{safe_snippet}')
+            printed += 1
+        else:
+            scan_meta['suppressed_rows'] += 1
+
+scan_meta['scan_complete'] = True
+scan_meta['emitted_rows'] = printed
+scan_meta['output_truncated'] = scan_meta['suppressed_rows'] > 0
+print(json.dumps(scan_meta, sort_keys=True, separators=(',', ':')), file=sys.stderr)
 PY
 ```
 
 The binary reader accepts only physical JSONL records up to 1 MiB and drains an oversized record through LF in fixed-size chunks; a bare CR inside that record cannot expose its tail as a new record. Matching walks the full selected strings, including the original type string, incrementally, normalizes whitespace across both string and field boundaries, and retains only the needle plus the bounded context window instead of joining a complete tool output in memory. After raw matching and window selection, the snippet JSON-escapes only non-printable characters so terminal control sequences cannot reach stdout while printable Unicode remains unchanged. Printed metadata accepts strings only, normalizes whitespace, JSON-escapes non-ASCII and control characters, and caps each field before it reaches stdout.
+
+The parser continues through point-in-time EOF after its 20 stdout rows are full. Its final stderr line is one compact `scan_meta` JSON object; keep it in a private bounded control sink and require normal process exit plus `scan_complete: true`. `matched_records` counts every matching physical record reached by the selected-field scan, while `emitted_rows`, `suppressed_rows`, and `output_truncated` distinguish complete matching from bounded presentation. `invalid_records` and `oversized_records` identify physical records the parser could not inspect; they must be zero before claiming a complete no-match result. These counters do not freeze a live rollout or prove content stability.
 
 For JSONL schema checks, inspect one record or aggregate unique keys once. Do not run `jq -R 'fromjson | keys' file.jsonl`, because it prints the same key list for every line and can produce massive output on retained artifacts such as `turn_flags.jsonl`.
 

@@ -54,7 +54,7 @@ If the count is greater than 20, refine the pattern and count again by default. 
 
 ## Show Bounded Matching-Line Positions
 
-For a count from 1 through 20, print one position row per matching line:
+For an initial count from 1 through 20, print a bounded sample of at most 20 matching-line positions:
 
 ```bash
 rg \
@@ -67,13 +67,15 @@ rg \
 
 The line number is the 1-based physical line number, and the column is a 1-based byte column. The byte offset is the 0-based offset of the matching line's start, not the match's offset. Multiple occurrences on the same line still produce one row. With `--max-columns 1`, ripgrep emits its short omitted-line marker instead of retaining a long source line.
 
-Accept position output only when this command exits `0`. Exit `1` after a positive count means the live input no longer matches; discard the output and restart from count. Exit `2` or greater is a search failure; discard stdout rather than treating partial rows as evidence.
+Position output is always a bounded sample, never proof of a complete matching-line set. A live rollout can gain enough matches after the initial count for `--max-count 20` to stop successfully at 20 matching lines. Do not infer completeness from the initial count, the number of position rows, or exit `0`.
+
+Accept position output only when this command exits `0`. Exit `1` after a positive count means the live input no longer matches; discard the output and restart from count. Exit `2` or greater is a search failure; discard stdout rather than treating partial rows as evidence. After an accepted sample, run the count command again; if the count changed, discard the sample and restart. Equal counts still do not freeze the input. In every case, let the subsequent bounded field-aware parser in [workflow.md](workflow.md) continue through point-in-time EOF and inspect its terminal `scan_meta` coverage and truncation counters instead of treating sample coordinates as exhaustive evidence.
 
 Position output is not a sanitizer. A very short matching line without a final LF can still pass through as raw source, including a control byte. Treat stdout as sensitive and terminal-unsafe even though the normal omitted-line marker is small.
 
 ## Optionally Preview A Few Line Prefixes
 
-Only when the count is from 1 through 5, an optional preview may show bounded prefixes of at most five matching lines:
+Only when the initial count is from 1 through 5, an optional preview may show bounded prefixes of at most five matching lines:
 
 ```bash
 rg \
@@ -88,7 +90,7 @@ This is a line-prefix preview, not a match-centered excerpt. The match may occur
 
 Preview output is raw source data. It can expose secrets, terminal control bytes, or other sensitive content. Prefer the position-only command unless seeing source bytes is necessary.
 
-As with positions, accept preview output only on exit `0`. Exit `1` means the earlier positive count is stale and requires a recount; exit `2` or greater is a failure. Discard stdout in either case.
+As with positions, preview output is always a sample. Accept it only on exit `0`, then repeat the count and discard the preview if that count changed. Exit `1` means the earlier positive count is stale and requires a restart; exit `2` or greater is a failure. Discard stdout in either case. Even an unchanged count does not make the preview exhaustive or stable.
 
 ## Exceptional Exhaustive Matching-Line Artifact
 

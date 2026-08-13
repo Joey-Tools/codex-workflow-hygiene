@@ -34,9 +34,9 @@ superseded_by:
 - `skills/codex-session-mining/SKILL.md`
 - `skills/codex-session-mining/references/workflow.md`
 - `tests/test_rollout_search_contract.py`
-- `python3 -B -m unittest -v tests.test_rollout_search_contract tests.test_skill_structure`: 43 tests passed.
-- `CI=true python3 -B -m unittest -q tests.test_rollout_search_contract`: 15 tests passed with the CI-only ripgrep version gate enabled.
-- Full repository suite through `run_process_group_deadline.py`, with process-scoped test-fixture commit signing disabled and the CI version gate enabled: 1,148 tests passed in 71.800 seconds.
+- `python3 -B -m unittest -v tests.test_rollout_search_contract tests.test_skill_structure`: 44 tests passed.
+- `CI=true python3 -B -m unittest -q tests.test_rollout_search_contract`: 16 tests passed with the CI-only ripgrep version gate enabled.
+- Full repository suite through `run_process_group_deadline.py`, with process-scoped test-fixture commit signing disabled and the CI version gate enabled: 1,149 tests passed in 71.098 seconds.
 - `codex_skill_validate.py skills/codex-session-mining`: `Skill is valid!` via the isolated uv/PyYAML path.
 - `actionlint 1.7.12`, project-journal validation, and `git diff --check` passed.
-- Initial formal local review identified a missing shell-quoting test boundary; the follow-up contract now checks the raw quoted placeholders and executes all three interactive templates with a whitespace- and glob-sensitive pattern and rollout path.
+- Formal local review identified and closed two protocol-test gaps: the contract now preserves shell quoting with whitespace- and glob-sensitive inputs, and it treats live position/preview output as bounded samples whose count must be rechecked rather than as complete match sets.

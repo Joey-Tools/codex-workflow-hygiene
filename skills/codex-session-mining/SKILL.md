@@ -47,7 +47,7 @@ Use this skill for:
 - Verify which transcript roots and archive layouts exist on the current host instead of assuming `archived_sessions` is either present or obsolete.
 
 3. Extract only the records and fields needed for the question.
-- After selecting one exact rollout, start keyword discovery with the fixed ripgrep count, matching-line position, and optional bounded-preview protocol in [references/rollout-search.md](references/rollout-search.md). Keep its output framing intact; it is a raw-text locator, not JSON parsing or evidence by itself.
+- After selecting one exact rollout, start keyword discovery with the fixed ripgrep count, bounded matching-line position sample, and optional bounded-preview protocol in [references/rollout-search.md](references/rollout-search.md). Keep its output framing intact; samples are raw-text locators, never complete match sets, JSON parsing, or evidence by themselves.
 - Before printing details from a large rollout, count record shapes or line count, then add an explicit selector and row cap. Follow raw-text candidate locations with field-aware JSON parsing when record shape, decoded values, or selected-field provenance matters.
 - Treat `corpus.jsonl` as a locator, not transcript output: inspect its accepted line numbers and a small amount of necessary nearby context instead of printing every accepted rollout.
 - Use `session_meta` and `turn_context` for `cwd`, date, model, sandbox, and approval context.

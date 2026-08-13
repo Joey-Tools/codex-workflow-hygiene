@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -7,6 +8,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -14,6 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "skills/codex-session-mining/SKILL.md"
 REFERENCE = ROOT / "skills/codex-session-mining/references/rollout-search.md"
+WORKFLOW = ROOT / "skills/codex-session-mining/references/workflow.md"
 
 MATCH_PATTERN = "needle"
 POSITION_SAMPLE_LIMIT = 20
@@ -249,6 +252,8 @@ class RolloutSearchReferenceTests(unittest.TestCase):
             "does not parse the rollout schema",
             "not a runtime, rss, stderr, input-read, or privacy bound",
             "equal counts still do not freeze",
+            "position output is always a bounded sample",
+            "continue through point-in-time eof",
             "noclobber is not a general `o_excl`/no-follow primitive",
         ):
             with self.subTest(expected=expected):
@@ -276,6 +281,61 @@ class RolloutSearchReferenceTests(unittest.TestCase):
         self.assertRegex(
             exhaustive_block,
             re.compile(r'test -f "\$ARTIFACT"'),
+        )
+
+    def test_field_aware_parser_scans_past_output_cap_and_reports_coverage(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        marker = 'python3 - "$ROLLOUT" "$NEEDLE" <<\'PY\'\n'
+        start = workflow.index(marker) + len(marker)
+        code = workflow[start : workflow.index("\nPY\n```", start)]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rollout = Path(temp_dir) / "rollout.jsonl"
+            records = [b"not-json\n", b"[]\n", b"x" * (1024 * 1024 + 1) + b"\n"]
+            records.extend(
+                (
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "user_message",
+                                "message": f"needle row {index}",
+                            },
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                for index in range(22)
+            )
+            rollout.write_bytes(b"".join(records))
+            completed = subprocess.run(
+                [sys.executable, "-c", code, str(rollout), MATCH_PATTERN],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(len(completed.stdout.splitlines()), POSITION_SAMPLE_LIMIT)
+        metadata_lines = completed.stderr.splitlines()
+        self.assertEqual(len(metadata_lines), 1)
+        metadata = json.loads(metadata_lines[0])
+        self.assertEqual(
+            metadata,
+            {
+                "emitted_rows": 20,
+                "invalid_records": 2,
+                "kind": "scan_meta",
+                "matched_records": 22,
+                "max_rows": 20,
+                "output_truncated": True,
+                "oversized_records": 1,
+                "records_seen": 25,
+                "scan_complete": True,
+                "stop_reason": None,
+                "suppressed_rows": 2,
+            },
         )
 
     def test_exhaustive_block_pins_complete_shell_structure(self) -> None:
@@ -428,20 +488,26 @@ class Ripgrep15ConformanceTests(unittest.TestCase):
                             expected_row_count,
                         )
 
-    def test_position_sample_is_capped_by_matching_lines(self) -> None:
+    def test_live_growth_keeps_position_sample_bounded_and_requires_recount(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "rollout-fixture.jsonl"
-            path.write_text(
-                "needle needle\n"
-                + "".join(f"row {index} needle\n" for index in range(2, 31)),
-                encoding="utf-8",
-            )
+            path.write_text("needle needle\n", encoding="utf-8")
+            initial_count = self.run_protocol(COUNT_HEADING, path)
+            self.assertEqual((initial_count.returncode, initial_count.stdout), (0, b"2\n"))
+
+            with path.open("a", encoding="utf-8") as rollout:
+                rollout.write(
+                    "".join(f"row {index} needle\n" for index in range(2, 31))
+                )
             completed = self.run_protocol(POSITION_HEADING, path)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             rows = parse_position_rows(completed.stdout)
             self.assertEqual(len(rows), POSITION_SAMPLE_LIMIT)
             self.assertEqual([row[0] for row in rows], list(range(1, 21)))
             self.assertEqual(sum(row[0] == 1 for row in rows), 1)
+
+            final_count = self.run_protocol(COUNT_HEADING, path)
+            self.assertEqual((final_count.returncode, final_count.stdout), (0, b"31\n"))
 
     def test_preview_caps_rows_and_utf8_boundary_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
