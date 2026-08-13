@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-12
 updated: 2026-08-13
 branch: codex/rollout-rg-search
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/71
 supersedes: []
 superseded_by:
 ---
