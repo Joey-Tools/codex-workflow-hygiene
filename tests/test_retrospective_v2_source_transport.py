@@ -1409,6 +1409,35 @@ class SourceTransportProtocolTests(unittest.TestCase):
             transport.SOURCE_TRANSPORT_SCAN_CHUNK_BYTES,
         )
 
+    def test_generic_agent_roles_remain_evidence_candidates(self) -> None:
+        for role in ("worker", "coordinator"):
+            with self.subTest(role=role):
+                self.assertIsNone(
+                    transport_source._source_structural_exclusion(
+                        {
+                            "payload": {"content": "ordinary evidence", "role": role},
+                            "type": "response_item",
+                        },
+                        source_kind=SourceKind.ACTIVE_ROLLOUT,
+                    )
+                )
+
+        for role, expected in (
+            ("retrospective_worker", "retrospective_worker"),
+            ("session_retrospective_coordinator", "retrospective_coordinator"),
+        ):
+            with self.subTest(role=role):
+                self.assertEqual(
+                    expected,
+                    transport_source._source_structural_exclusion(
+                        {
+                            "payload": {"content": "control output", "role": role},
+                            "type": "response_item",
+                        },
+                        source_kind=SourceKind.ACTIVE_ROLLOUT,
+                    ),
+                )
+
     def test_metadata_is_filtered_before_copy_and_inventory_is_closed(self) -> None:
         before = self._line("before", kind="session_index").replace(
             b"2026-07-06T01:00:00Z",

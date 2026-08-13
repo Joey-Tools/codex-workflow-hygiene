@@ -362,6 +362,15 @@ def inspect_run_paths(
         os.close(run_fd)
 
 
+def _inventory_budget(*, deadline: float) -> safe_io.TreeInventoryBudget:
+    return safe_io.TreeInventoryBudget(
+        max_entries=cleanup_sidecars.MAX_CLEANUP_INVENTORY_ENTRIES,
+        max_path_bytes=cleanup_sidecars.MAX_CLEANUP_INVENTORY_PATH_BYTES,
+        max_depth=cleanup_sidecars.MAX_CLEANUP_INVENTORY_DEPTH,
+        deadline=deadline,
+    )
+
+
 def _new_inventory_budget() -> safe_io.TreeInventoryBudget:
     return safe_io.TreeInventoryBudget.from_timeout(
         max_entries=cleanup_sidecars.MAX_CLEANUP_INVENTORY_ENTRIES,
@@ -603,10 +612,10 @@ def _exact_progress_snapshot(
     claim: Mapping[str, Any],
     *,
     allow_legacy_all_absent: bool,
+    budget: safe_io.TreeInventoryBudget,
 ) -> dict[str, dict[str, Any]]:
     roots = claim["raw_path_inventory"]
     expected_names = {item for name in roots for item in _quarantine_names(name)}
-    budget = _new_inventory_budget()
     observed_names: set[str] = set()
     with os.scandir(quarantine_fd) as entries:
         for entry in entries:
@@ -729,6 +738,8 @@ def _delete_exact_claimed_paths(
     )
     try:
         allow_legacy_all_absent = claim["schema"] in INLINE_EXACT_CLAIM_SCHEMAS
+        initial_budget = _new_inventory_budget()
+        deadline = initial_budget.deadline
         states = _exact_progress_snapshot(
             run_fd,
             quarantine_fd,
@@ -736,6 +747,7 @@ def _delete_exact_claimed_paths(
             quarantine_path,
             claim,
             allow_legacy_all_absent=allow_legacy_all_absent,
+            budget=initial_budget,
         )
         revalidated = _exact_progress_snapshot(
             run_fd,
@@ -744,6 +756,7 @@ def _delete_exact_claimed_paths(
             quarantine_path,
             claim,
             allow_legacy_all_absent=allow_legacy_all_absent,
+            budget=_inventory_budget(deadline=deadline),
         )
         if revalidated != states:
             raise safe_io.UnsafePathError(
@@ -754,18 +767,6 @@ def _delete_exact_claimed_paths(
             phase = states[name]["phase"]
             if phase in {"absent", "complete", "legacy-complete"}:
                 continue
-            current = _exact_progress_snapshot(
-                run_fd,
-                quarantine_fd,
-                normalized,
-                quarantine_path,
-                claim,
-                allow_legacy_all_absent=allow_legacy_all_absent,
-            )
-            if current != states:
-                raise safe_io.UnsafePathError(
-                    "raw cleanup inventory changed before quarantine"
-                )
             quarantine_name, marker_name = _quarantine_names(name)
             if phase == "original":
                 os.rename(
@@ -779,7 +780,7 @@ def _delete_exact_claimed_paths(
                 quarantined = safe_io.inspect_tree_inventory_at(
                     quarantine_fd,
                     quarantine_name,
-                    budget=_new_inventory_budget(),
+                    budget=_inventory_budget(deadline=deadline),
                     display_path=quarantine_path / quarantine_name,
                 )
                 if quarantined != states[name]["inventory"]:
@@ -800,25 +801,9 @@ def _delete_exact_claimed_paths(
                 quarantine_name,
                 display_path=quarantine_path / quarantine_name,
                 expected_inventory=expected_entries,
+                budget=_inventory_budget(deadline=deadline),
             )
-            updated = _exact_progress_snapshot(
-                run_fd,
-                quarantine_fd,
-                normalized,
-                quarantine_path,
-                claim,
-                allow_legacy_all_absent=allow_legacy_all_absent,
-            )
-            if updated[name]["phase"] != "complete":
-                raise safe_io.UnsafePathError(
-                    f"raw cleanup progress was not durable: {normalized / name}"
-                )
-            for other_name in claim["raw_path_inventory"]:
-                if other_name != name and updated[other_name] != states[other_name]:
-                    raise safe_io.UnsafePathError(
-                        "another raw cleanup root changed during deletion"
-                    )
-            states = updated
+            states[name] = {"phase": "complete"}
         final = _exact_progress_snapshot(
             run_fd,
             quarantine_fd,
@@ -826,6 +811,7 @@ def _delete_exact_claimed_paths(
             quarantine_path,
             claim,
             allow_legacy_all_absent=allow_legacy_all_absent,
+            budget=_inventory_budget(deadline=deadline),
         )
         if any(
             value["phase"] not in {"absent", "complete", "legacy-complete"}

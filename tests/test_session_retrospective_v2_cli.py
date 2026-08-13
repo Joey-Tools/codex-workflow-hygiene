@@ -1453,7 +1453,11 @@ class CliContractTests(unittest.TestCase):
                 real_atomic_create(
                     claim_path,
                     {
-                        "output": str(legacy_output),
+                        "output": str(
+                            cli.export_api.normalize_retained_export_destination(
+                                legacy_output
+                            )
+                        ),
                         "publication_role": "standalone",
                         "schema": cli.export_cli_api.EXPORT_DESTINATION_CLAIM_SCHEMA,
                     },

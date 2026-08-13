@@ -370,6 +370,59 @@ class SafeIoTests(unittest.TestCase):
         finally:
             os.close(parent_fd)
 
+    def test_secure_remove_tree_hash_obeys_shared_deadline(self) -> None:
+        tree = self.root / "deadline-cleanup"
+        tree.mkdir(mode=0o700)
+        payload = tree / "payload.bin"
+        atomic_write_bytes(payload, b"x" * (128 * 1024))
+        parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            inventory = safe_io.inspect_tree_inventory_at(
+                parent_fd,
+                tree.name,
+                budget=self._inventory_budget(),
+                display_path=tree,
+            )
+            target_inode = payload.stat().st_ino
+            now = [0.0]
+            budget = safe_io.TreeInventoryBudget(
+                max_entries=100,
+                max_path_bytes=4096,
+                max_depth=8,
+                deadline=1.0,
+                clock=lambda: now[0],
+            )
+            real_read = safe_io.os.read
+
+            def expire_after_payload_read(descriptor: int, size: int) -> bytes:
+                chunk = real_read(descriptor, size)
+                if chunk and os.fstat(descriptor).st_ino == target_inode:
+                    now[0] = 1.0
+                return chunk
+
+            with (
+                mock.patch.object(
+                    safe_io.os,
+                    "read",
+                    side_effect=expire_after_payload_read,
+                ),
+                self.assertRaisesRegex(
+                    safe_io.TreeInventoryLimitExceeded,
+                    "deadline",
+                ),
+            ):
+                safe_io.secure_remove_tree_at(
+                    parent_fd,
+                    tree.name,
+                    display_path=tree,
+                    expected_inventory=inventory["entries"],
+                    budget=budget,
+                )
+        finally:
+            os.close(parent_fd)
+
+        self.assertEqual(128 * 1024, payload.stat().st_size)
+
     def test_cleanup_inventory_rejects_fifo_without_blocking(self) -> None:
         tree = self.root / "fifo-tree"
         tree.mkdir(mode=0o700)

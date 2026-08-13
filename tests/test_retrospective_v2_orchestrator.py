@@ -7464,6 +7464,73 @@ class OrchestratorTests(unittest.TestCase):
         ):
             coordinator._raw_cleanup_inventory(roots)
 
+    def test_cleanup_v5_reuses_stable_snapshot_and_shared_deadline(self) -> None:
+        coordinator = self.start_daily("cleanup-stable-snapshot-budget")
+        payload_bytes = b"unique cleanup payload for bounded hashing"
+        payload = coordinator.run_dir / "raw-inputs" / "bounded.bin"
+        payload.write_bytes(payload_bytes)
+        os.chmod(payload, 0o600)
+        self.clock.value += dt.timedelta(days=8)
+        with mock.patch.object(
+            coordinator,
+            "_delete_claimed_raw_paths",
+            side_effect=safe_io.UnsafePathError("persist claim before cleanup"),
+        ):
+            self.assertFalse(coordinator.gc_expired_raw()["cleaned"])
+        claim = coordinator.load_state()["publication"]["expired_cleanup_claim"]
+
+        real_hash = cleanup_inventory.safe_io._hash_file_descriptor
+        real_initial_budget = cleanup_inventory._new_inventory_budget
+        real_shared_budget = cleanup_inventory._inventory_budget
+        hashed_payloads = 0
+        budget_deadlines: list[float] = []
+
+        def count_hash(descriptor, *, checkpoint=None):
+            nonlocal hashed_payloads
+            if os.fstat(descriptor).st_size == len(payload_bytes):
+                hashed_payloads += 1
+            return real_hash(descriptor, checkpoint=checkpoint)
+
+        def record_initial_budget():
+            budget = real_initial_budget()
+            budget_deadlines.append(budget.deadline)
+            return budget
+
+        def record_shared_budget(*, deadline):
+            budget = real_shared_budget(deadline=deadline)
+            budget_deadlines.append(budget.deadline)
+            return budget
+
+        with (
+            mock.patch.object(
+                cleanup_inventory,
+                "_exact_progress_snapshot",
+                wraps=cleanup_inventory._exact_progress_snapshot,
+            ) as snapshots,
+            mock.patch.object(
+                cleanup_inventory,
+                "_new_inventory_budget",
+                side_effect=record_initial_budget,
+            ),
+            mock.patch.object(
+                cleanup_inventory,
+                "_inventory_budget",
+                side_effect=record_shared_budget,
+            ),
+            mock.patch.object(
+                cleanup_inventory.safe_io,
+                "_hash_file_descriptor",
+                side_effect=count_hash,
+            ),
+        ):
+            coordinator._delete_claimed_raw_paths(claim)
+
+        self.assertFalse((coordinator.run_dir / "raw-inputs").exists())
+        self.assertEqual(3, snapshots.call_count)
+        self.assertEqual(4, hashed_payloads)
+        self.assertGreaterEqual(len(budget_deadlines), 5)
+        self.assertEqual({budget_deadlines[0]}, set(budget_deadlines))
+
     def test_run_artifact_capacity_stays_within_cleanup_inventory(self) -> None:
         target_file_count = (
             contracts.MAX_RUN_AGENT_TASKS * contracts.MAX_AGENT_ARTIFACTS_PER_TASK
@@ -7555,6 +7622,7 @@ class OrchestratorTests(unittest.TestCase):
             *,
             display_path,
             expected_inventory=None,
+            budget=None,
         ):
             nonlocal crashed
             if not crashed and display_path.name.startswith("root-"):
@@ -7575,6 +7643,7 @@ class OrchestratorTests(unittest.TestCase):
                 name,
                 display_path=display_path,
                 expected_inventory=expected_inventory,
+                budget=budget,
             )
 
         with mock.patch.object(
@@ -7670,6 +7739,7 @@ class OrchestratorTests(unittest.TestCase):
             *,
             display_path,
             expected_inventory=None,
+            budget=None,
         ):
             nonlocal crashed
             removed = real_remove(
@@ -7677,6 +7747,7 @@ class OrchestratorTests(unittest.TestCase):
                 name,
                 display_path=display_path,
                 expected_inventory=expected_inventory,
+                budget=budget,
             )
             if not crashed and display_path.name.startswith("root-"):
                 crashed = True
@@ -7721,6 +7792,7 @@ class OrchestratorTests(unittest.TestCase):
             *,
             display_path,
             expected_inventory=None,
+            budget=None,
         ):
             nonlocal mutated
             if not mutated and display_path.name.startswith("root-"):
@@ -7744,6 +7816,7 @@ class OrchestratorTests(unittest.TestCase):
                 name,
                 display_path=display_path,
                 expected_inventory=expected_inventory,
+                budget=budget,
             )
 
         with mock.patch.object(

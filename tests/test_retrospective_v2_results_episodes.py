@@ -908,6 +908,28 @@ class ResultValidationTests(unittest.TestCase):
                 )
                 self.assertEqual(scan_for_leaks(result), ())
 
+    def test_post_redaction_removes_scp_locators_with_non_git_usernames(self) -> None:
+        for locator in (
+            "alice@buildbox:",
+            "alice@buildbox:repo",
+            "reviewer@internal-host:projects/session-retrospective",
+        ):
+            with self.subTest(locator=locator):
+                findings = scan_for_leaks({"unsafe": locator})
+                self.assertIn("internal_url", {item.category for item in findings})
+
+                value = extractor_result()
+                value["turns"][0]["generalized_working_text"] = (
+                    f"Inspect {locator} before continuing."
+                )
+                result = validate_extractor_result(value, ALL_REFS)
+
+                self.assertEqual(
+                    "Inspect [REDACTED_URL] before continuing.",
+                    result["turns"][0]["generalized_working_text"],
+                )
+                self.assertEqual(scan_for_leaks(result), ())
+
     def test_uri_scheme_matching_does_not_unicode_casefold(self) -> None:
         for uri_like_text in (
             "\u0130ttp://host",

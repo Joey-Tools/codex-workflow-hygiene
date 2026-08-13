@@ -108,6 +108,57 @@ def run_command(
 
 
 class PublicationInvariantUnitTests(unittest.TestCase):
+    def test_history_target_ref_requires_a_valid_fully_qualified_branch(self) -> None:
+        observed: list[tuple[str, ...]] = []
+
+        def run(arguments: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+            observed.append(arguments)
+            return subprocess.CompletedProcess(
+                arguments,
+                1 if arguments[-1] == "refs/heads/main..bad" else 0,
+                b"",
+                b"",
+            )
+
+        self.assertEqual(
+            "refs/heads/main",
+            git_safety.validate_history_target_ref(run, "refs/heads/main"),
+        )
+        self.assertEqual([("check-ref-format", "refs/heads/main")], observed)
+
+        for target_ref in ("HEAD", "refs/tags/release", "refs/heads/main..bad"):
+            with self.subTest(target_ref=target_ref):
+                with self.assertRaises(authority.HistoryValidationError):
+                    git_safety.validate_history_target_ref(run, target_ref)
+        self.assertEqual([("check-ref-format", "refs/heads/main")], observed)
+
+    def test_invalid_history_target_stops_before_repository_admission(self) -> None:
+        for target_ref in ("HEAD", "refs/tags/release", "refs/heads/main..bad"):
+            with self.subTest(target_ref=target_ref):
+                with mock.patch.object(authority, "_GitRepository") as repository:
+                    with self.assertRaisesRegex(
+                        authority.HistoryValidationError,
+                        "branch ref",
+                    ):
+                        authority.load_durable_history(
+                            "/unreached/history",
+                            target_ref,
+                            identity=mock.sentinel.identity,
+                        )
+                    repository.assert_not_called()
+
+                with mock.patch.object(authority, "_GitRepository") as repository:
+                    with self.assertRaisesRegex(
+                        authority.HistoryValidationError,
+                        "branch ref",
+                    ):
+                        authority.history_repository_binding(
+                            "/unreached/history",
+                            target_ref,
+                            identity=mock.sentinel.identity,
+                        )
+                    repository.assert_not_called()
+
     def test_executable_authority_rejects_writable_ancestor(self) -> None:
         with tempfile.TemporaryDirectory(
             dir=_publication_test_temp_parent()
@@ -1038,6 +1089,49 @@ class DurablePublicationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_history_authority_and_provider_reject_non_branch_targets(self) -> None:
+        run_command(["git", "tag", "release"], cwd=self.repo)
+        for target_ref in ("HEAD", "refs/tags/release", "refs/heads/main..bad"):
+            with self.subTest(target_ref=target_ref, boundary="authority"):
+                with self.assertRaisesRegex(
+                    authority.HistoryValidationError,
+                    "branch ref",
+                ):
+                    authority.load_durable_history(
+                        self.repo,
+                        target_ref,
+                        identity=self.identity,
+                        expected_fingerprint=self.fingerprint,
+                        gnupg_home=self.gnupg_home,
+                        gpg_program=self.gpg,
+                    )
+            with self.subTest(target_ref=target_ref, boundary="provider"):
+                with self.assertRaisesRegex(
+                    publication_support.LocalGitPublicationError,
+                    "branch ref",
+                ):
+                    self.adapter.inspect_target_state(target_ref)
+
+    def test_production_marker_rejects_invalid_history_target(self) -> None:
+        with self.assertRaisesRegex(
+            authority.HistoryValidationError,
+            "branch ref",
+        ):
+            authority.issue_production_marker(
+                self.root / "invalid-target-marker.json",
+                identity=self.identity,
+                history_repo=self.repo,
+                target_ref="HEAD",
+                configuration_root=self.configuration_root,
+                configuration_ref=self.configuration_ref,
+                model_era=self.model_era,
+                policy_era=self.policy_era,
+                calibration_receipt=self.calibration_receipt,
+                accepted_shadow_evidence=self.shadow_evidence,
+                automation_cutover_record=self.automation_cutover_record,
+                installed_commits=(self.base_head,),
+            )
 
     def build_automation_cutover_record(self) -> dict[str, object]:
         automation_root = self.root / ".codex" / "automations"

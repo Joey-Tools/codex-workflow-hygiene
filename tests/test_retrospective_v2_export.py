@@ -1397,6 +1397,49 @@ class RetrospectiveV2ReportingTests(unittest.TestCase):
         with self.assertRaisesRegex(RetainedPrivacyError, "URL"):
             assemble_retained_artifacts(run_state(), bare_locator_review)
 
+        for scp_locator in (
+            "alice@buildbox:",
+            "alice@buildbox:repo",
+            "reviewer@internal-host:projects/session-retrospective",
+        ):
+            with self.subTest(scp_locator=scp_locator, phase="assembly"):
+                scp_review = review_data()
+                scp_review["turn_findings"][1]["rewritten_prompt"] = (
+                    f"Inspect {scp_locator} before continuing."
+                )
+                with self.assertRaisesRegex(RetainedPrivacyError, "URL"):
+                    assemble_retained_artifacts(run_state(), scp_review)
+
+            with self.subTest(scp_locator=scp_locator, phase="retained-reread"):
+                scp_artifacts = assemble_retained_artifacts(run_state(), review_data())
+                scp_tampered = dict(scp_artifacts)
+                scp_rows = [
+                    json.loads(line)
+                    for line in scp_tampered["turn_findings.jsonl"].splitlines()
+                ]
+                scp_high_impact = next(
+                    row for row in scp_rows if row["disposition"] == "high_impact"
+                )
+                scp_high_impact["rewritten_prompt"] = (
+                    f"Inspect {scp_locator} before continuing."
+                )
+                scp_tampered["turn_findings.jsonl"] = b"".join(
+                    canonical_json_bytes(row) for row in scp_rows
+                )
+                refresh_bundle_digest(scp_tampered)
+                with self.assertRaisesRegex(RetainedPrivacyError, "URL"):
+                    validate_retained_artifacts(scp_tampered)
+
+            with self.subTest(scp_locator=scp_locator, phase="report"):
+                scp_artifacts = assemble_retained_artifacts(run_state(), review_data())
+                scp_tampered = dict(scp_artifacts)
+                scp_tampered["report.md"] += (
+                    f"\nInspect {scp_locator} before continuing.\n".encode("ascii")
+                )
+                refresh_bundle_digest(scp_tampered)
+                with self.assertRaisesRegex(RetainedPrivacyError, "forbidden locator"):
+                    validate_retained_artifacts(scp_tampered)
+
         for network_locator in (
             "localhost",
             "10.0.0.1",

@@ -648,6 +648,8 @@ def scan_for_leaks(
                 "internal_url" if _INTERNAL_HOST_RE.search(match.group(0)) else "url"
             )
             findings.add(LeakFinding(category, path, match.start(), match.end()))
+        for match in privacy_locators.SCP_STYLE_LOCATOR_RE.finditer(text):
+            findings.add(LeakFinding("internal_url", path, match.start(), match.end()))
         for match in privacy_locators.BARE_PRIVATE_LOCATOR_RE.finditer(text):
             findings.add(LeakFinding("internal_url", path, match.start(), match.end()))
         for match in privacy_locators.BARE_FQDN_RE.finditer(text):
@@ -720,6 +722,7 @@ def _post_redact_text(
             redacted = pattern.sub("[REDACTED_TOOL_OUTPUT]", redacted)
     for _category, pattern, replacement in _SECRET_PATTERNS:
         redacted = pattern.sub(replacement, redacted)
+    redacted = privacy_locators.SCP_STYLE_LOCATOR_RE.sub("[REDACTED_URL]", redacted)
     for pattern in (_EMAIL_RE, _PHONE_RE, _LABELED_PERSONAL_ID_RE):
         redacted = pattern.sub("[REDACTED_PERSONAL_IDENTIFIER]", redacted)
     redacted = privacy_locators.URI_LOCATOR_RE.sub("[REDACTED_URL]", redacted)

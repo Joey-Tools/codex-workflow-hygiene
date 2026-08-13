@@ -266,7 +266,6 @@ _OPAQUE_REF_RE = re.compile(
     r"(?:[a-z][a-z0-9_]*_ref_v2|source_snapshot_v2):[0-9a-f]{64}\Z"
 )
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
-_SCP_STYLE_GIT_RE = re.compile(r"(?i)git@")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _LOCAL_PATH_RE = re.compile(
     r"(?:(?<![A-Za-z0-9_])/(?!/)"
@@ -720,7 +719,7 @@ def _validate_safe_string(value: str, *, path: str) -> None:
     if any(
         (
             privacy_locators.URI_LOCATOR_RE.search(value),
-            _SCP_STYLE_GIT_RE.search(value),
+            privacy_locators.SCP_STYLE_LOCATOR_RE.search(value),
             privacy_locators.BARE_PRIVATE_LOCATOR_RE.search(value),
             bare_fqdn,
             privacy_locators.contains_ip_address(value),
@@ -751,7 +750,7 @@ def _validate_reviewed_prose(value: Any, *, path: str) -> None:
     if any(
         (
             privacy_locators.URI_LOCATOR_RE.search(value),
-            _SCP_STYLE_GIT_RE.search(value),
+            privacy_locators.SCP_STYLE_LOCATOR_RE.search(value),
             privacy_locators.BARE_PRIVATE_LOCATOR_RE.search(value),
             privacy_locators.BARE_FQDN_RE.search(value),
             privacy_locators.contains_ip_address(value),
@@ -3762,7 +3761,7 @@ def _validate_report_bytes(
     if any(
         (
             privacy_locators.URI_LOCATOR_RE.search(text),
-            _SCP_STYLE_GIT_RE.search(text),
+            privacy_locators.SCP_STYLE_LOCATOR_RE.search(text),
             privacy_locators.BARE_PRIVATE_LOCATOR_RE.search(locator_scan_text),
             privacy_locators.BARE_FQDN_RE.search(locator_scan_text),
             privacy_locators.contains_ip_address(locator_scan_text),

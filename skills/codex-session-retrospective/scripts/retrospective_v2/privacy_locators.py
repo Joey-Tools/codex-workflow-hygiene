@@ -23,6 +23,14 @@ URI_LOCATOR_RE = re.compile(
     r"(?<![A-Za-z0-9+.-])(?<![^\W_])"
     r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']*"
 )
+SCP_STYLE_LOCATOR_RE = re.compile(
+    r"(?<![A-Z0-9._%+-])"
+    r"[A-Z0-9._%+-]+@"
+    r"(?:\[[0-9A-F:.%_-]+\]|"
+    r"[A-Z0-9](?:[A-Z0-9.-]{0,251}[A-Z0-9])?)"
+    r":[^\s<>\"'`]*",
+    re.ASCII | re.IGNORECASE,
+)
 IPV4_CANDIDATE_RE = re.compile(
     r"(?<![0-9A-Za-z.])"
     r"(?P<address>(?:[0-9]{1,3}\.){3}[0-9]{1,3})"

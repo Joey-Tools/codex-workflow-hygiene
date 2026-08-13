@@ -368,15 +368,13 @@ class LocalGitStorageOperations:
                 "shadow mode cannot call the formal local Git adapter"
             )
         _validate_attempt_ref(request.attempt_ref)
-        if not request.target_ref.startswith("refs/heads/"):
-            raise LocalGitPublicationError(
-                "formal target must be a fully qualified heads ref"
+        try:
+            git_safety.validate_history_target_ref(
+                lambda args: self._git(args, check=False),
+                request.target_ref,
             )
-        result = self._git(("check-ref-format", request.target_ref), check=False)
-        if result.returncode != 0:
-            raise LocalGitPublicationError(
-                f"invalid Git target ref: {request.target_ref}"
-            )
+        except git_safety.HistoryValidationError as exc:
+            raise LocalGitPublicationError(str(exc)) from exc
         _validate_destination(request.destination)
         binding = _normalize_publication_authority(request.publication_authority)
         if (

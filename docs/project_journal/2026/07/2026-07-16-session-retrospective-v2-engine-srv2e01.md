@@ -82,11 +82,14 @@ superseded_by:
   globally bytewise-sorted per-object inventory of all four fixed roots. It
   writes inventory-sidecar v2 with a SHA-256 content commitment for every file
   while retaining authenticated contentless v1 sidecars only for legacy replay.
-  It revalidates every root twice, then records restart-safe progress in a
-  claim-scoped quarantine. Same-size replacement, unproved removal, shrinkage,
-  type or access-policy drift fail closed; timestamp-only and verified
-  child-deletion directory metadata changes remain benign. Legacy v2/v3/v4
-  claims retain schema-scoped replay semantics.
+  Exact cleanup takes two stable global snapshots, records restart-safe progress
+  in a claim-scoped quarantine, validates each quarantined root and its file
+  commitments through held descriptors during removal, and then takes one final
+  global snapshot. The complete phase shares one absolute deadline, and its
+  parent-to-child inventory index keeps traversal linear. Same-size replacement,
+  unproved removal, shrinkage, type or access-policy drift fail closed;
+  timestamp-only and verified child-deletion directory metadata changes remain
+  benign. Legacy v2/v3/v4 claims retain schema-scoped replay semantics.
 - Publication recovery can advance provider state when the exact signed
   publication remains reachable below an unrelated successor commit.
 - Retained episode, topic, turn, and global artifacts preserve opaque evidence
@@ -1648,3 +1651,52 @@ superseded_by:
   six executable agent kinds and the retained closed contract. One mistyped
   unittest class selector failed during loading without running product code
   and is non-counting.
+- Fresh local Codex review of signed replacement head `72b6c6d9` returned four
+  actionable findings. SCP-style locators only recognized the `git` username;
+  generic `worker` and `coordinator` source roles were structurally excluded;
+  durable history accepted `HEAD` and tags until final publication; and exact
+  cleanup repeatedly rebuilt and hashed the complete four-root inventory while
+  resetting its per-call deadline. Hosted CI run `31665039072` was cancelled as
+  stale after these findings and is non-counting.
+- One shared ASCII SCP-style locator grammar now covers arbitrary username and
+  single-label host forms across working-zone leak detection/redaction, retained
+  string validation, reviewed prose, and final report reread. Generic worker and
+  coordinator roles are consumed unless they use the explicit retrospective
+  role values. Durable history, provider inspection, publication requests, and
+  production-marker bindings require a syntactically valid fully qualified
+  `refs/heads/*` target; non-branch forms stop before repository admission.
+- Exact cleanup now removes the per-root global rescans, uses one linear
+  parent-to-child index for descriptor traversal, checks the shared absolute
+  deadline during directory enumeration and file hashing, and retains the
+  initial double snapshot, per-root commitment checks, crash-resume markers, and
+  final global snapshot. Deadline and content-mutation regressions prove that an
+  incomplete cleanup fails closed and retains the affected object.
+- Python 3.13 focused and component evidence passes: the late legacy-claim alias
+  regression and the two history-ref unit boundaries pass 3/3; the complete
+  privacy, coverage, cleanup, transport, orchestrator, and CLI matrix passes
+  406/406 in 247.425 seconds. The authorized host-level disposable-GPG
+  publication module passes 88/88 in 2,315.547 seconds. One earlier publication
+  run was interrupted as stale after precommit review found the empty SCP path
+  and pre-admission malformed-ref gaps; exact host process inspection proved no
+  matching test or temporary GPG-agent process remained, so it is non-counting.
+  Changed-file Ruff lint/format and `git diff --check` pass. Full discovery,
+  final static validation, signed commit, admission, and the exact-head
+  `skill-repo-codex-gate` remain pending.
+- The first repository-wide discovery is non-counting: its invocation omitted
+  the required `-S`, and it also exposed three machine-contract drifts in the
+  new tree. The run completed 1,798 tests in 2,721.689 seconds with those four
+  failures. The history-ref owner was then consolidated in `git_safety`, exact
+  cleanup normalized optional budgets once at its public boundary, and bounded
+  child enumeration was separated from descriptor traversal. `authority.py` is
+  3,270/3,275 lines, the transport inventory is 7,243/7,250 lines, and the exact
+  package branch proxy is 8,499/8,500 without raising any limit. The complete
+  module-boundary plus identity/SafeIO group passes 64/64 in 1.899 seconds under
+  the required Python 3.13 `-B -S` runtime. The final repository-wide discovery
+  on the corrected tree passes 1,798/1,798 in 2,580.347 seconds with the same
+  runtime and `TMPDIR=/private/tmp`; its 4,500-second process-group deadline did
+  not trigger. The nested deadline warnings in its output are expected negative
+  fixture evidence from the bounded-command helper tests, not outer-run
+  failures. Final scoped Ruff lint/format, actionlint, `git diff --check`,
+  project-journal validation, and the official isolated OpenAI skill validator
+  also pass. The signed commit, admission, and exact-head
+  `skill-repo-codex-gate` remain pending.

@@ -7,7 +7,7 @@ import fcntl
 import os
 from pathlib import Path
 from typing import Any
-from . import executable_authority, export as retained_export
+from . import executable_authority, export as retained_export, git_safety
 
 from .publication_support import (
     AppendOnlyViolation,
@@ -230,7 +230,13 @@ class LocalGitPublicationAdapter(
     ) -> dict[str, Any]:
         """Inspect a formal ref before a transaction or caller receipt exists."""
 
-        _validate_ref(target_ref, "target_ref")
+        try:
+            git_safety.validate_history_target_ref(
+                lambda args: self._git(args, check=False),
+                target_ref,
+            )
+        except git_safety.HistoryValidationError as exc:
+            raise LocalGitPublicationError(str(exc)) from exc
         if destination is not None:
             _validate_destination(destination)
         with self._short_publication_lock():

@@ -1087,11 +1087,15 @@ def load_durable_history(
 ) -> DurableHistoryState:
     """Validate every publication state transition reachable from ``target_ref``."""
 
+    git_safety.require_history_target_ref_shape(target_ref)
     repo = _GitRepository(
         Path(repo_path),
         gnupg_home=Path(gnupg_home),
         git_binary=git_binary,
         gpg_program=gpg_program,
+    )
+    git_safety.validate_history_target_ref(
+        lambda args: repo.run(*args, check=False), target_ref
     )
     head = repo.text("rev-parse", "--verify", target_ref)
     if _OBJECT_ID_RE.fullmatch(head) is None:
@@ -1232,10 +1236,14 @@ def history_repository_binding(
     identity: IdentityKey,
     git_binary: str = executable_authority.DEFAULT_GIT_EXECUTABLE,
 ) -> str:
+    git_safety.require_history_target_ref_shape(target_ref)
     repo = _GitRepository(
         Path(repo_path),
         gnupg_home=DEFAULT_PUBLISHER_GNUPG_HOME,
         git_binary=git_binary,
+    )
+    git_safety.validate_history_target_ref(
+        lambda args: repo.run(*args, check=False), target_ref
     )
     common_dir = repo.text("rev-parse", "--path-format=absolute", "--git-common-dir")
     remote = repo.run("remote", "get-url", "origin", check=False)

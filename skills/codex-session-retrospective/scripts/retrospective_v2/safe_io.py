@@ -717,19 +717,53 @@ def _cleanup_entry_path(relative_path: str, child_name: str) -> str:
     return child_name if relative_path == "." else f"{relative_path}/{child_name}"
 
 
-def _expected_direct_children(
-    entries: Mapping[str, Mapping[str, Any]],
-    relative_path: str,
-) -> list[str]:
-    prefix = "" if relative_path == "." else f"{relative_path}/"
-    names: set[str] = set()
-    for candidate in entries:
-        if candidate == relative_path or not candidate.startswith(prefix):
+def _expected_cleanup_children(
+    entries: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, tuple[str, ...]]:
+    if entries is None:
+        return {}
+    children: dict[str, list[str]] = {
+        path: []
+        for path, entry in entries.items()
+        if entry["object_type"] == "directory"
+    }
+    for path in entries:
+        if path == ".":
             continue
-        tail = candidate[len(prefix) :]
-        if tail and "/" not in tail:
-            names.add(tail)
+        parent, separator, name = path.rpartition("/")
+        parent = parent if separator else "."
+        if parent not in children:
+            raise UnsafePathError("expected cleanup inventory is not a connected tree")
+        children[parent].append(name)
+    return {
+        path: tuple(sorted(names, key=os.fsencode)) for path, names in children.items()
+    }
+
+
+def _bounded_cleanup_child_names(
+    descriptor: int,
+    *,
+    budget: TreeInventoryBudget,
+    display_path: Path,
+    limit: int,
+) -> list[str]:
+    names: list[str] = []
+    with os.scandir(descriptor) as children:
+        for child in children:
+            budget.checkpoint()
+            if len(names) >= limit:
+                raise UnsafePathError(f"cleanup tree contents changed: {display_path}")
+            names.append(child.name)
     return sorted(names, key=os.fsencode)
+
+
+def _unbounded_cleanup_budget() -> TreeInventoryBudget:
+    return TreeInventoryBudget(
+        max_entries=sys.maxsize,
+        max_path_bytes=sys.maxsize,
+        max_depth=sys.maxsize,
+        deadline=float("inf"),
+    )
 
 
 def _require_expected_cleanup_stat(
@@ -766,14 +800,19 @@ def _secure_remove_tree_at(
     *,
     display_path: Path,
     expected_entries: Mapping[str, Mapping[str, Any]] | None,
+    expected_children: Mapping[str, Sequence[str]],
     relative_path: str,
+    depth: int,
+    budget: TreeInventoryBudget,
 ) -> dict[str, int]:
+    budget.checkpoint()
     try:
         observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
         if expected_entries is not None:
             raise UnsafePathError(f"expected cleanup tree disappeared: {display_path}")
         return {"byte_count": 0, "directory_count": 0, "file_count": 0}
+    budget.reserve(relative_path, depth=depth)
     _validate_directory_stat(observed, display_path, exact_mode=True)
     try:
         descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
@@ -801,13 +840,24 @@ def _secure_remove_tree_at(
                 relaxed_directory_metadata=False,
             )
         counts = {"byte_count": 0, "directory_count": 1, "file_count": 0}
-        child_names = sorted(os.listdir(descriptor), key=os.fsencode)
-        if expected_entries is not None and child_names != _expected_direct_children(
-            expected_entries,
-            relative_path,
+        expected_child_names = expected_children.get(relative_path)
+        child_limit = (
+            len(expected_child_names)
+            if expected_child_names is not None
+            else budget.max_entries - budget.entry_count
+        )
+        child_names = _bounded_cleanup_child_names(
+            descriptor,
+            budget=budget,
+            display_path=display_path,
+            limit=child_limit,
+        )
+        if expected_child_names is not None and tuple(child_names) != tuple(
+            expected_child_names
         ):
             raise UnsafePathError(f"cleanup tree contents changed: {display_path}")
         for child_name in child_names:
+            budget.checkpoint()
             child_path = display_path / child_name
             child_relative = _cleanup_entry_path(relative_path, child_name)
             child = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
@@ -817,11 +867,15 @@ def _secure_remove_tree_at(
                     child_name,
                     display_path=child_path,
                     expected_entries=expected_entries,
+                    expected_children=expected_children,
                     relative_path=child_relative,
+                    depth=depth + 1,
+                    budget=budget,
                 )
                 for key, value in nested.items():
                     counts[key] += value
                 continue
+            budget.reserve(child_relative, depth=depth + 1)
             child_fd = open_checked_file_at(
                 descriptor,
                 child_name,
@@ -849,7 +903,11 @@ def _secure_remove_tree_at(
                     commitment = expected_child.get("content_commitment")
                     if commitment is not None and not hmac.compare_digest(
                         commitment,
-                        "sha256:" + _hash_file_descriptor(child_fd),
+                        "sha256:"
+                        + _hash_file_descriptor(
+                            child_fd,
+                            checkpoint=budget.checkpoint,
+                        ),
                     ):
                         raise UnsafePathError(
                             f"cleanup file content changed: {child_path}"
@@ -880,6 +938,7 @@ def _secure_remove_tree_at(
             finally:
                 os.close(child_fd)
         os.fsync(descriptor)
+        budget.checkpoint()
         validate_owner_only_directory_descriptor(descriptor, display_path)
         current_root = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if (anchored.st_dev, anchored.st_ino) != (
@@ -909,17 +968,23 @@ def secure_remove_tree_at(
     *,
     display_path: Path,
     expected_inventory: Sequence[Mapping[str, Any]] | None = None,
+    budget: TreeInventoryBudget | None = None,
 ) -> dict[str, int]:
     """Remove one owner-only tree through an already anchored parent fd."""
 
     if not name or name in {".", ".."} or "/" in name or "\x00" in name:
         raise UnsafePathError("remove-tree name must be one safe component")
+    expected_entries = _expected_cleanup_entries(expected_inventory)
+    active_budget = _unbounded_cleanup_budget() if budget is None else budget
     return _secure_remove_tree_at(
         parent_fd,
         name,
         display_path=display_path,
-        expected_entries=_expected_cleanup_entries(expected_inventory),
+        expected_entries=expected_entries,
+        expected_children=_expected_cleanup_children(expected_entries),
         relative_path=".",
+        depth=0,
+        budget=active_budget,
     )
 
 

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -19,6 +20,11 @@ from .authority_errors import HistoryValidationError
 
 GitRunner = Callable[[tuple[str, ...]], subprocess.CompletedProcess[bytes]]
 DirectoryIdentity = Callable[[Path], tuple[int, ...]]
+_HISTORY_TARGET_REF_RE = re.compile(
+    r"refs/heads/"
+    r"(?!\.)(?!.*(?:/\.|//|\.lock(?:/|\Z)|\.\.|@\{|[\x00-\x20\x7f~^:?*\[\\]))"
+    r"(?!.*\.\Z)[^/]+(?:/[^/]+)*\Z"
+)
 
 
 class LocalRepositorySafetyError(ValueError):
@@ -27,6 +33,31 @@ class LocalRepositorySafetyError(ValueError):
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+def require_history_target_ref_shape(target_ref: object) -> str:
+    """Require the closed lexical shape before repository admission starts."""
+
+    if (
+        not isinstance(target_ref, str)
+        or _HISTORY_TARGET_REF_RE.fullmatch(target_ref) is None
+    ):
+        raise HistoryValidationError(
+            "durable history target must be a valid fully qualified branch ref",
+        )
+    return target_ref
+
+
+def validate_history_target_ref(run: GitRunner, target_ref: object) -> str:
+    """Require one fully qualified, syntactically valid mutable branch ref."""
+
+    target_ref = require_history_target_ref_shape(target_ref)
+    result = run(("check-ref-format", target_ref))
+    if result.returncode != 0:
+        raise HistoryValidationError(
+            "durable history target is not a valid Git branch ref",
+        )
+    return target_ref
 
 
 @dataclass(frozen=True)

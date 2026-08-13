@@ -795,7 +795,6 @@ def _source_structural_exclusion(
         if isinstance(node.get(key), str)
     }
     if role_values & {
-        "coordinator",
         "retrospective_coordinator",
         "session_retrospective_coordinator",
     }:
@@ -803,7 +802,6 @@ def _source_structural_exclusion(
     if role_values & {
         "retrospective_worker",
         "session_retrospective_worker",
-        "worker",
     }:
         return "retrospective_worker"
     if isinstance(payload, Mapping) and not payload:
