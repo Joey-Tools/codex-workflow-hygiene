@@ -39,11 +39,14 @@ Keep `AGENTS.md` as the short policy/index layer, keep `SKILL.md` procedural, an
 
 ## Use These Creation Defaults
 
-- Prefer `python3 "$HOME/.codex/skills/.system/skill-creator/scripts/init_skill.py" <skill-name> --path ~/.codex/skills` for personal skills, or `python3 "$HOME/.codex/skills/.system/skill-creator/scripts/init_skill.py" <skill-name> --path .agents/skills` for repo-local skills.
-- Prefer `"$HOME/.codex/skills/codex-skill-authoring/scripts/codex_skill_validate.py" ...` to validate one or more skills through the local wrapper. The wrapper calls the installed OpenAI validator at `$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py`; do not edit or mirror OpenAI's validator for user-specific workflow changes.
-- If the wrapper is unavailable, fall back to `uv run --isolated --with pyyaml python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" ...` for direct single-skill validation.
-- Fall back to `python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" ...` only when the needed dependency is already available locally or when `uv` is not the right tool for the environment.
-- Use the Python entrypoint directly if the helper wrapper exists but is not executable in the current environment.
+- Resolve `SKILL_AUTHORING_DIR` from the loaded `$codex-skill-authoring` directory and `SKILL_CREATOR_DIR` from the loaded `$skill-creator` directory; do not assume either skill lives under the default home.
+- Prefer `python3 "$SKILL_CREATOR_DIR/scripts/init_skill.py" <skill-name> --path ~/.codex/skills` for personal skills, or `python3 "$SKILL_CREATOR_DIR/scripts/init_skill.py" <skill-name> --path .agents/skills` for repo-local skills.
+- Prefer `python3 "$SKILL_AUTHORING_DIR/scripts/codex_skill_validate.py" ...` to validate one or more skills through the local wrapper; do not edit or mirror OpenAI's validator for user-specific workflow changes.
+- Explicit validator overrides are authoritative: `--validator` takes priority over a non-empty `CODEX_SKILL_VALIDATOR`, and either must identify a regular file. A symlink to a regular file is accepted, while a directory is rejected rather than triggering automatic fallback.
+- Without an explicit override, the wrapper checks these fixed locations in order: when `CODEX_HOME` is non-empty, `$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py` then `$CODEX_HOME/.system/skill-creator/scripts/quick_validate.py`; next, the validator under the lexical loaded skills root; next, the validator under the resolved source skills root; finally, `$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py` only when `CODEX_HOME` is unset or empty.
+- Automatic candidates are de-duplicated as lexical absolute paths so a symlinked loaded skills root stays ahead of its resolved source. Directory candidates are skipped while discovery continues, and symlinks to regular files remain eligible. The wrapper does not scan ancestors or search `PATH`.
+- If the wrapper is unavailable, fall back to `uv run --isolated --with pyyaml python3 "$SKILL_CREATOR_DIR/scripts/quick_validate.py" ...` for direct single-skill validation.
+- Fall back to `python3 "$SKILL_CREATOR_DIR/scripts/quick_validate.py" ...` only when the needed dependency is already available locally or when `uv` is not the right tool for the environment.
 
 ## Check The Description
 
@@ -55,7 +58,7 @@ Keep `AGENTS.md` as the short policy/index layer, keep `SKILL.md` procedural, an
 
 ## Validate And Iterate
 
-- Run quick validation before installation or commit. For many skills, use `"$HOME/.codex/skills/codex-skill-authoring/scripts/codex_skill_validate.py" --report .codex-tmp/skill-validation/report.json <skill> [...]` so stdout stays compact and complete results go to a task-scoped file.
+- Run quick validation before installation or commit. For many skills, use `python3 "$SKILL_AUTHORING_DIR/scripts/codex_skill_validate.py" --report .codex-tmp/skill-validation/report.json <skill> [...]` so stdout stays compact and complete results go to a task-scoped file.
 - Smoke-test any newly added script with at least one real invocation.
 - If `quick_validate.py` cannot run directly because local dependencies such as `PyYAML` are missing, first retry via `uv run --isolated --with pyyaml ...`.
 - If the `uv` path is unavailable, inappropriate, or still fails, fall back to explicit checks: parse `agents/openai.yaml`, verify `SKILL.md` frontmatter/body structure, and confirm referenced resources exist.

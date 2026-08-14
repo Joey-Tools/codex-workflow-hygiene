@@ -17,7 +17,6 @@ EXIT_VALIDATION_FAILED = 1
 EXIT_RUNTIME_ERROR = 2
 MAX_SUMMARY_MESSAGE_LENGTH = 240
 VALIDATOR_RELATIVE_PATH = Path(".system/skill-creator/scripts/quick_validate.py")
-DEFAULT_VALIDATOR = Path("~/.codex/skills") / VALIDATOR_RELATIVE_PATH
 PYTHON_RUNTIME_ERROR_PATTERNS = (
     "Traceback (most recent call last):",
     "SyntaxError:",
@@ -37,18 +36,34 @@ UV_SETUP_FAILURE_PATTERNS = (
 )
 
 
+def lexical_absolute_path(path: Path) -> Path:
+    """Make a path absolute without resolving symlinks."""
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
 def default_validator_candidates() -> list[Path]:
     candidates: list[Path] = []
     codex_home = os.environ.get("CODEX_HOME")
     if codex_home:
-        base = Path(codex_home).expanduser()
-        candidates.extend([base / "skills" / VALIDATOR_RELATIVE_PATH, base / VALIDATOR_RELATIVE_PATH])
-    candidates.append(DEFAULT_VALIDATOR.expanduser())
+        base = lexical_absolute_path(Path(codex_home))
+        candidates.extend(
+            [base / "skills" / VALIDATOR_RELATIVE_PATH, base / VALIDATOR_RELATIVE_PATH]
+        )
+
+    invoked_script = lexical_absolute_path(Path(__file__))
+    loaded_skills_root = invoked_script.parents[2]
+    candidates.append(loaded_skills_root / VALIDATOR_RELATIVE_PATH)
+    resolved_source_root = invoked_script.resolve(strict=False).parents[2]
+    candidates.append(resolved_source_root / VALIDATOR_RELATIVE_PATH)
+
+    if not codex_home:
+        candidates.append(Path.home() / ".codex" / "skills" / VALIDATOR_RELATIVE_PATH)
 
     deduped: list[Path] = []
     seen: set[str] = set()
     for candidate in candidates:
-        key = str(candidate)
+        candidate = lexical_absolute_path(candidate)
+        key = os.path.normcase(os.fspath(candidate))
         if key not in seen:
             deduped.append(candidate)
             seen.add(key)
@@ -60,7 +75,7 @@ def default_validator_path() -> Path:
     if raw:
         return Path(raw).expanduser()
     candidates = default_validator_candidates()
-    return next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+    return next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -219,10 +234,17 @@ def write_report(report_path: str, results: list[dict[str, object]]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    validator = Path(args.validator).expanduser() if args.validator else default_validator_path()
-    if not validator.exists():
-        print(f"Installed skill validator not found: {validator}", file=sys.stderr)
-        if not args.validator:
+    validator = (
+        Path(args.validator).expanduser()
+        if args.validator is not None
+        else default_validator_path()
+    )
+    if not validator.is_file():
+        print(
+            f"Installed skill validator not found or not a regular file: {validator}",
+            file=sys.stderr,
+        )
+        if args.validator is None and not os.environ.get("CODEX_SKILL_VALIDATOR"):
             print(
                 "Checked: " + ", ".join(str(candidate) for candidate in default_validator_candidates()),
                 file=sys.stderr,

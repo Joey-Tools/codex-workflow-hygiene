@@ -1,6 +1,6 @@
 # Bounded Command Patterns
 
-Use these patterns after the main skill decides that a command needs an output budget. Adapt paths, predicates, and limits to the task instead of copying placeholders literally.
+Use these patterns only after the main skill's trigger gate applies. Treat producer scope, runtime, retained bytes, and visible output as separate bounds; satisfying one does not satisfy the others. Adapt paths, predicates, and limits to the task instead of copying placeholders literally.
 
 ## Searches And Inventories
 
@@ -12,6 +12,7 @@ Use these patterns after the main skill decides that a command needs an output b
 | Potentially large untracked set | `git status --short --untracked-files=no`, then stream `git ls-files --others --exclude-standard` through a total counter plus an explicit `N`-path sampler | Explicit candidate paths | Full untracked or ignored inventory first |
 | Sibling repository or reference checkout | Choose one exact repository and bounded file list; exclude generated output and dependency lockfiles unless relevant | Selected files only | Searching a broad parent directory or multiple repository roots |
 | Package metadata, cache JSON, lockfile, or binary | Check file type and size; use a structured parser or candidate-key extraction | Selected keys, symbols, or snippets | Raw broad search or unbounded `strings` output |
+| Tool registry or schema discovery | Filter entries on scalar `name` and `description` fields, cap the result count, and pass only each name plus a clipped description to `text()` | Inspect one exact selected schema or callable | Passing raw registry entries or full schema objects to `text()` |
 
 Common generated-tree excludes include:
 

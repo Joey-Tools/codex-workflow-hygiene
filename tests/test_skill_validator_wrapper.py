@@ -12,6 +12,7 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = REPO_ROOT / "skills/codex-skill-authoring/scripts/codex_skill_validate.py"
+VALIDATOR_RELATIVE_PATH = Path(".system/skill-creator/scripts/quick_validate.py")
 
 
 class SkillValidatorWrapperTests(unittest.TestCase):
@@ -86,6 +87,64 @@ class SkillValidatorWrapperTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
 
+    def make_portable_install(self, suffix: str) -> tuple[Path, Path]:
+        skills_root = self.root / suffix / "skills"
+        wrapper = skills_root / "codex-skill-authoring/scripts/codex_skill_validate.py"
+        wrapper.parent.mkdir(parents=True)
+        wrapper.write_text(WRAPPER.read_text(encoding="utf-8"), encoding="utf-8")
+        return wrapper, skills_root
+
+    def make_symlinked_install(
+        self, suffix: str
+    ) -> tuple[Path, Path, Path]:
+        source_skills_root = self.root / suffix / "source-checkout" / "skills"
+        source_skill = source_skills_root / "codex-skill-authoring"
+        source_wrapper = source_skill / "scripts/codex_skill_validate.py"
+        source_wrapper.parent.mkdir(parents=True)
+        source_wrapper.write_text(WRAPPER.read_text(encoding="utf-8"), encoding="utf-8")
+
+        loaded_skills_root = self.root / suffix / "loaded-install" / "skills"
+        loaded_skills_root.mkdir(parents=True)
+        loaded_skill = loaded_skills_root / "codex-skill-authoring"
+        loaded_skill.symlink_to(source_skill, target_is_directory=True)
+        return (
+            loaded_skill / "scripts/codex_skill_validate.py",
+            loaded_skills_root,
+            source_skills_root,
+        )
+
+    def write_success_validator(self, validator: Path, message: str) -> None:
+        validator.parent.mkdir(parents=True, exist_ok=True)
+        validator.write_text(f"print({message!r})\n", encoding="utf-8")
+
+    def default_validator_environment(self, home_name: str) -> dict[str, str]:
+        env = os.environ.copy()
+        env.pop("CODEX_HOME", None)
+        env.pop("CODEX_SKILL_VALIDATOR", None)
+        env["HOME"] = str(self.root / home_name)
+        return env
+
+    def run_discovery_wrapper(
+        self,
+        wrapper: Path,
+        *,
+        env: dict[str, str],
+        explicit_validator: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [sys.executable, str(wrapper), "--no-uv"]
+        if explicit_validator is not None:
+            command.extend(["--validator", str(explicit_validator)])
+        command.append(str(self.valid_skill))
+        return subprocess.run(
+            command,
+            check=False,
+            cwd=self.root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def test_single_skill_preserves_installed_validator_message(self) -> None:
         result = self.run_wrapper(str(self.valid_skill))
 
@@ -113,38 +172,256 @@ class SkillValidatorWrapperTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["failed"], 1)
         self.assertEqual(payload["summary"]["runtime_errors"], 0)
 
+    def test_validator_override_precedence_and_directory_rejection(self) -> None:
+        wrapper, skills_root = self.make_portable_install("override-precedence")
+        automatic_validator = skills_root / VALIDATOR_RELATIVE_PATH
+        environment_validator = self.root / "environment-validator.py"
+        explicit_validator = self.root / "explicit-validator.py"
+        self.write_success_validator(automatic_validator, "automatic validator")
+        self.write_success_validator(environment_validator, "environment validator")
+        self.write_success_validator(explicit_validator, "explicit validator")
+        env = self.default_validator_environment("override-home")
+        env["CODEX_SKILL_VALIDATOR"] = str(environment_validator)
+
+        result = self.run_discovery_wrapper(
+            wrapper,
+            env=env,
+            explicit_validator=explicit_validator,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "explicit validator")
+
+        result = self.run_discovery_wrapper(wrapper, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "environment validator")
+
+        env.pop("CODEX_SKILL_VALIDATOR")
+        result = self.run_discovery_wrapper(wrapper, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "automatic validator")
+
+        explicit_directory = self.root / "explicit-validator-directory"
+        explicit_directory.mkdir()
+        env["CODEX_SKILL_VALIDATOR"] = str(environment_validator)
+        result = self.run_discovery_wrapper(
+            wrapper,
+            env=env,
+            explicit_validator=explicit_directory,
+        )
+        self.assertEqual(result.returncode, 2)
+
+        environment_directory = self.root / "environment-validator-directory"
+        environment_directory.mkdir()
+        env["CODEX_SKILL_VALIDATOR"] = str(environment_directory)
+        result = self.run_discovery_wrapper(wrapper, env=env)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn("Checked:", result.stderr)
+
     def test_default_validator_respects_codex_home(self) -> None:
         layouts = [
-            Path("skills/.system/skill-creator/scripts/quick_validate.py"),
-            Path(".system/skill-creator/scripts/quick_validate.py"),
+            (Path("skills") / VALIDATOR_RELATIVE_PATH, "skills layout validator"),
+            (VALIDATOR_RELATIVE_PATH, "legacy layout validator"),
         ]
-        for index, relative_path in enumerate(layouts):
-            with self.subTest(relative_path=relative_path):
-                codex_home = self.root / f"codex-home-{index}"
-                validator = codex_home / relative_path
-                validator.parent.mkdir(parents=True)
-                validator.write_text(self.validator.read_text(encoding="utf-8"), encoding="utf-8")
-                validator.chmod(0o755)
-                env = os.environ.copy()
+        for index, (relative_path, message) in enumerate(layouts):
+            with self.subTest(layout=relative_path):
+                codex_home = self.root / f"codex-home-layout-{index}"
+                self.write_success_validator(codex_home / relative_path, message)
+                env = self.default_validator_environment(f"layout-home-{index}")
                 env["CODEX_HOME"] = str(codex_home)
-                env.pop("CODEX_SKILL_VALIDATOR", None)
 
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        str(WRAPPER),
-                        "--no-uv",
-                        str(self.valid_skill),
-                    ],
-                    check=False,
-                    env=env,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
+                result = self.run_discovery_wrapper(WRAPPER, env=env)
 
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), "Skill is valid!")
+                self.assertEqual(result.stdout.strip(), message)
+
+        codex_home = self.root / "codex-home-simultaneous"
+        self.write_success_validator(
+            codex_home / "skills" / VALIDATOR_RELATIVE_PATH,
+            "preferred skills layout validator",
+        )
+        self.write_success_validator(
+            codex_home / VALIDATOR_RELATIVE_PATH,
+            "lower priority legacy layout validator",
+        )
+        env = self.default_validator_environment("simultaneous-layout-home")
+        env["CODEX_HOME"] = str(codex_home)
+
+        result = self.run_discovery_wrapper(WRAPPER, env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "preferred skills layout validator")
+
+        codex_home = self.root / "codex-home-directory-skip"
+        (codex_home / "skills" / VALIDATOR_RELATIVE_PATH).mkdir(parents=True)
+        self.write_success_validator(
+            codex_home / VALIDATOR_RELATIVE_PATH,
+            "file after directory validator",
+        )
+        env = self.default_validator_environment("directory-skip-home")
+        env["CODEX_HOME"] = str(codex_home)
+
+        result = self.run_discovery_wrapper(WRAPPER, env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "file after directory validator")
+
+        codex_home = self.root / "codex-home-symlink-file"
+        symlink_target = self.root / "symlink-target-validator.py"
+        preferred_validator = codex_home / "skills" / VALIDATOR_RELATIVE_PATH
+        self.write_success_validator(symlink_target, "symlinked regular validator")
+        preferred_validator.parent.mkdir(parents=True)
+        preferred_validator.symlink_to(symlink_target)
+        self.write_success_validator(
+            codex_home / VALIDATOR_RELATIVE_PATH,
+            "lower priority file validator",
+        )
+        env = self.default_validator_environment("symlink-file-home")
+        env["CODEX_HOME"] = str(codex_home)
+
+        result = self.run_discovery_wrapper(WRAPPER, env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "symlinked regular validator")
+
+    def test_symlinked_install_discovery_order(self) -> None:
+        wrapper, loaded_root, _ = self.make_symlinked_install("loaded-only")
+        self.write_success_validator(
+            loaded_root / VALIDATOR_RELATIVE_PATH,
+            "loaded-only validator",
+        )
+        result = self.run_discovery_wrapper(
+            wrapper,
+            env=self.default_validator_environment("loaded-only-home"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "loaded-only validator")
+
+        wrapper, loaded_root, source_root = self.make_symlinked_install(
+            "loaded-before-source"
+        )
+        self.write_success_validator(
+            loaded_root / VALIDATOR_RELATIVE_PATH,
+            "loaded precedence validator",
+        )
+        self.write_success_validator(
+            source_root / VALIDATOR_RELATIVE_PATH,
+            "lower priority source validator",
+        )
+        result = self.run_discovery_wrapper(
+            wrapper,
+            env=self.default_validator_environment("loaded-source-home"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "loaded precedence validator")
+
+        wrapper, _, source_root = self.make_symlinked_install("source-fallback")
+        self.write_success_validator(
+            source_root / VALIDATOR_RELATIVE_PATH,
+            "resolved source validator",
+        )
+        result = self.run_discovery_wrapper(
+            wrapper,
+            env=self.default_validator_environment("source-fallback-home"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "resolved source validator")
+
+        wrapper, loaded_root, source_root = self.make_symlinked_install(
+            "codex-home-first"
+        )
+        self.write_success_validator(
+            loaded_root / VALIDATOR_RELATIVE_PATH,
+            "lower priority loaded validator",
+        )
+        self.write_success_validator(
+            source_root / VALIDATOR_RELATIVE_PATH,
+            "lower priority resolved validator",
+        )
+        codex_home = self.root / "preferred-codex-home"
+        self.write_success_validator(
+            codex_home / "skills" / VALIDATOR_RELATIVE_PATH,
+            "preferred CODEX_HOME validator",
+        )
+        env = self.default_validator_environment("codex-home-first-home")
+        env["CODEX_HOME"] = str(codex_home)
+        result = self.run_discovery_wrapper(wrapper, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "preferred CODEX_HOME validator")
+
+    def test_home_fallback_requires_unset_or_empty_codex_home(self) -> None:
+        for index, codex_home in enumerate((None, "")):
+            with self.subTest(codex_home=codex_home):
+                wrapper, _ = self.make_portable_install(f"home-fallback-{index}")
+                env = self.default_validator_environment(f"fallback-home-{index}")
+                if codex_home is not None:
+                    env["CODEX_HOME"] = codex_home
+                home_validator = (
+                    Path(env["HOME"])
+                    / ".codex"
+                    / "skills"
+                    / VALIDATOR_RELATIVE_PATH
+                )
+                message = f"HOME fallback validator {index}"
+                self.write_success_validator(home_validator, message)
+
+                result = self.run_discovery_wrapper(wrapper, env=env)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), message)
+
+        wrapper, skills_root = self.make_portable_install("invalid-codex-home")
+        env = self.default_validator_environment("disabled-home-fallback")
+        home_validator = (
+            Path(env["HOME"]) / ".codex" / "skills" / VALIDATOR_RELATIVE_PATH
+        )
+        self.write_success_validator(home_validator, "disabled HOME validator")
+        env["CODEX_HOME"] = str(self.root / "nonempty-invalid-codex-home")
+
+        result = self.run_discovery_wrapper(wrapper, env=env)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn("disabled HOME validator", result.stdout)
+        self.assertNotIn(str(home_validator), result.stderr)
+        checked_line = next(
+            line for line in result.stderr.splitlines() if line.startswith("Checked: ")
+        )
+        checked_candidates = checked_line.removeprefix("Checked: ").split(", ")
+        self.assertEqual(
+            checked_candidates.count(str(skills_root / VALIDATOR_RELATIVE_PATH)),
+            1,
+        )
+
+    def test_all_automatic_directory_candidates_are_rejected(self) -> None:
+        wrapper, loaded_root, source_root = self.make_symlinked_install(
+            "automatic-directories"
+        )
+        env = self.default_validator_environment("automatic-directory-home")
+        home_validator = (
+            Path(env["HOME"]) / ".codex" / "skills" / VALIDATOR_RELATIVE_PATH
+        )
+        candidates = [
+            loaded_root / VALIDATOR_RELATIVE_PATH,
+            source_root / VALIDATOR_RELATIVE_PATH,
+            home_validator,
+        ]
+        for candidate in candidates:
+            candidate.mkdir(parents=True)
+        ancestor_validator = (
+            self.root / "automatic-directories" / VALIDATOR_RELATIVE_PATH
+        )
+        path_validator = self.root / "automatic-directories/path-bin/quick_validate.py"
+        self.write_success_validator(ancestor_validator, "ancestor scan validator")
+        self.write_success_validator(path_validator, "PATH search validator")
+        env["PATH"] = str(path_validator.parent) + os.pathsep + env.get("PATH", "")
+
+        result = self.run_discovery_wrapper(wrapper, env=env)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Installed skill validator not found", result.stderr)
+        self.assertNotIn("ancestor scan validator", result.stdout)
+        self.assertNotIn("PATH search validator", result.stdout)
+        for candidate in candidates:
+            self.assertIn(str(candidate), result.stderr)
 
     def test_multiple_skill_stdout_uses_compact_messages(self) -> None:
         report = self.root / "report.json"
