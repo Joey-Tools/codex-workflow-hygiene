@@ -586,6 +586,65 @@ class RolloutSearchReferenceTests(unittest.TestCase):
             },
         )
 
+    def test_field_aware_parser_accepts_one_utf8_bom_per_record(self) -> None:
+        first_bom_record = codecs.BOM_UTF8 + user_message_record(
+            "needle in first UTF-8 BOM record"
+        )
+        later_bom_record = codecs.BOM_UTF8 + user_message_record(
+            "needle in later UTF-8 BOM record"
+        )
+        double_bom_record = codecs.BOM_UTF8 * 2 + user_message_record(
+            "needle in double BOM record"
+        )
+        self.assertIsInstance(json.loads(first_bom_record), dict)
+        self.assertIsInstance(json.loads(later_bom_record), dict)
+        with self.assertRaises(ValueError):
+            json.loads(double_bom_record)
+
+        completed, rollout_path = run_field_aware_parser_bytes(
+            b"".join(
+                (
+                    first_bom_record,
+                    user_message_record("needle in plain UTF-8 record"),
+                    later_bom_record,
+                    double_bom_record,
+                    user_message_record("needle after double BOM record"),
+                )
+            )
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        output_lines = completed.stdout.splitlines()
+        self.assertEqual(len(output_lines), 4)
+        for output_line, physical_line_no in zip(
+            output_lines, (1, 2, 3, 5), strict=True
+        ):
+            self.assertTrue(
+                output_line.startswith(f"{rollout_path}:{physical_line_no}:"),
+                output_line,
+            )
+        self.assertIn("needle in first UTF-8 BOM record", completed.stdout)
+        self.assertIn("needle in plain UTF-8 record", completed.stdout)
+        self.assertIn("needle in later UTF-8 BOM record", completed.stdout)
+        self.assertNotIn("needle in double BOM record", completed.stdout)
+        self.assertIn("needle after double BOM record", completed.stdout)
+        self.assertEqual(
+            json.loads(completed.stderr),
+            {
+                "emitted_rows": 4,
+                "invalid_records": 1,
+                "kind": "scan_meta",
+                "matched_records": 4,
+                "max_rows": 20,
+                "output_truncated": False,
+                "oversized_records": 0,
+                "records_seen": 5,
+                "scan_complete": True,
+                "stop_reason": None,
+                "suppressed_rows": 0,
+            },
+        )
+
     def test_field_aware_parser_rejects_little_endian_json_at_eof(self) -> None:
         non_utf8_json = user_message_json("needle in a little-endian record")
         expected_metadata = {
