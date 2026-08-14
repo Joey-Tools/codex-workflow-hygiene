@@ -1,5 +1,7 @@
 # Rules Audit Cadence
 
+> Frozen historical companion to the retired Codex Rules Hygiene workflow. It is not a current supported procedure.
+
 ## Default Rhythm
 
 - Prefer a light audit after one burst of work when `~/.codex/rules/default.rules` clearly gained shell-shaped literals.
@@ -24,7 +26,7 @@
 7. If a `helper gap` appears, decide the owner before ending the audit:
    - repo-local skill/helper when the drift is tied to one repo's scripts or policy
    - personal skill/helper when the drift is host-level and cross-repo
-   - [$codex-skill-authoring](../../codex-skill-authoring/SKILL.md) when the owner or instruction layer is unclear
+   - [codex-skill-authoring](../../../skills/codex-skill-authoring/SKILL.md) when the owner or instruction layer is unclear
 
 ## Full Audit Checklist
 
@@ -86,5 +88,5 @@ Use this branch only when a machine has neither `~/.codex/rules/default.rules.cl
 - Patch an existing skill/helper when the repeated literal is already clearly owned by that workflow family.
 - Prefer repo-local skills/helpers when the drift is tied to one repository's scripts, paths, or policy.
 - Create a new personal skill only when the repeated friction is host-level, cross-repo, and not already well owned.
-- If ownership or layering is unclear, route that decision through [$codex-skill-authoring](../../codex-skill-authoring/SKILL.md) instead of solving it by widening rules.
+- If ownership or layering is unclear, route that decision through [codex-skill-authoring](../../../skills/codex-skill-authoring/SKILL.md) instead of solving it by widening rules.
 - Prefer fixing examples and helper interfaces before inventing broader rules.

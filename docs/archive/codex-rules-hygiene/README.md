@@ -1,9 +1,9 @@
----
-name: codex-rules-hygiene
-description: Audit and prune the user's `~/.codex/rules/default.rules` by separating stable command families from wrapper drift, helper gaps, and disposable approval-log literals. Use when `default.rules` grows after recent sessions, when one-off literals keep appearing, or when deciding whether friction belongs in a skill/helper instead of the rules file.
----
+# Codex Rules Hygiene Archive
 
-# Codex Rules Hygiene
+> [!WARNING]
+> Historical archive only. This workflow was retired on 2026-08-14 because Joey's `Approve for me` workflow made ongoing Codex rules hygiene effectively obsolete. This directory is not a loadable Codex skill. It is not distributed or installed, it is unsupported, and it has no replacement. The procedure below is frozen for historical reference; only relative links were repaired during archival.
+
+## Historical Procedure (Frozen)
 
 ## Overview
 
@@ -38,11 +38,11 @@ The goal is not to preserve every approved command shape. The goal is to keep on
 - For `helper gap`, patch the existing helper/skill first when the workflow family already exists.
 - If the drift is tied to one repository's scripts, paths, or policy, prefer the repo-local skill/helper owner.
 - If the drift is host-level and cross-repo, prefer a personal skill/helper owner.
-- If the owner or the right instruction layer is unclear, hand the decision to [$codex-skill-authoring](../codex-skill-authoring/SKILL.md) instead of widening rules by reflex.
+- If the owner or the right instruction layer is unclear, hand the decision to [codex-skill-authoring](../../../skills/codex-skill-authoring/SKILL.md) instead of widening rules by reflex.
 - Delete `approval log` entries once a stable equivalent exists, or when they clearly describe one session's temporary scaffolding rather than a durable policy.
 
 4. Only mine sessions when the root cause is unclear.
-- If a rule's origin is not obvious from the diff, then use [$codex-session-mining](../codex-session-mining/SKILL.md) to inspect the smallest useful set of recent sessions.
+- If a rule's origin is not obvious from the diff, then use [codex-session-mining](../../../skills/codex-session-mining/SKILL.md) to inspect the smallest useful set of recent sessions.
 - Prefer targeted backtraces for a specific literal or workflow family instead of grepping broad rollout archives by default.
 - Treat session mining as evidence collection, not as the primary cleanup workflow.
 
@@ -73,4 +73,4 @@ The goal is not to preserve every approved command shape. The goal is to keep on
 
 ## References
 
-- Use [references/audit-cadence.md](references/audit-cadence.md) for the lightweight/full-audit checklist and the classification examples.
+- Use [audit-cadence.md](audit-cadence.md) for the lightweight/full-audit checklist and the classification examples.

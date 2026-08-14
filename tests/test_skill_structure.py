@@ -38,6 +38,28 @@ class SkillStructureTests(unittest.TestCase):
             self.assertIn("\nname:", frontmatter, path)
             self.assertIn("\ndescription:", frontmatter, path)
 
+    def test_codex_rules_hygiene_is_archived_and_not_loadable(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        active_path = root / "skills/codex-rules-hygiene"
+        archive_path = root / "docs/archive/codex-rules-hygiene"
+        archived_readme = archive_path / "README.md"
+        archived_reference = archive_path / "audit-cadence.md"
+
+        self.assertFalse(active_path.exists())
+        self.assertFalse(any(archive_path.rglob("SKILL.md")))
+        for path in (archived_readme, archived_reference):
+            self.assertTrue(path.is_file(), path)
+            self.assertFalse(path.is_symlink(), path)
+
+        archive_text = archived_readme.read_text(encoding="utf-8")
+        self.assertFalse(archive_text.startswith("---\n"))
+        self.assertIn("This directory is not a loadable Codex skill.", archive_text)
+        self.assertIn("## Historical Procedure (Frozen)", archive_text)
+        self.assertIn(
+            "Frozen historical companion",
+            archived_reference.read_text(encoding="utf-8"),
+        )
+
     def test_bounded_command_output_contract(self) -> None:
         root = Path(__file__).resolve().parents[1]
         skill_root = root / "skills/bounded-command-output"

@@ -1,7 +1,11 @@
 # Codex Workflow Hygiene
 
 Public skills for bounded command output, skill authoring, session mining,
-Codex rules hygiene, and redacted session retrospective artifact generation.
+and redacted session retrospective artifact generation.
+
+## Archived Workflows
+
+- [`codex-rules-hygiene`](docs/archive/codex-rules-hygiene/README.md) was retired on 2026-08-14 and is retained only as an unsupported historical reference.
 
 ## Test
 
