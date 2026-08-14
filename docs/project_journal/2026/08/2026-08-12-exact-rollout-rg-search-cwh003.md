@@ -3,7 +3,7 @@ id: 20260812-cwh003
 title: Exact Rollout ripgrep Search Protocol
 status: completed
 created: 2026-08-12
-updated: 2026-08-13
+updated: 2026-08-14
 branch: codex/rollout-rg-search
 pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/71
 supersedes: []
@@ -29,6 +29,7 @@ superseded_by:
 - CI installs the official ripgrep 15.2.0 Linux release asset after verifying its pinned SHA-256 digest as a reproducible reference baseline. Development hosts never need to install, downgrade, or pin ripgrep: an unavailable, unparseable, or unqualified version skips the raw locator and uses the field-aware parser.
 - Version qualification and every raw template reuse one absolute `RG_BIN` path so the command is not re-resolved through `PATH`; the pure-shell contract explicitly retains a same-UID/privileged path-tamper non-guarantee.
 - The field-aware fallback treats pathological JSON integers as invalid records and traverses deeply nested selected fields iteratively, so one bounded record cannot terminate the point-in-time scan before its final `scan_meta`.
+- The field-aware fallback decodes each physical record as strict UTF-8 before JSON parsing, preventing `json.loads()` from auto-detecting UTF-16 or UTF-32 records and bypassing `invalid_records` accounting. BOM-prefixed little-endian framing is recovered authoritatively; no-BOM candidates use a bounded, single-pass transactional probe and commit only after explicit codec decoding plus one complete JSON validation. Unproved candidates return to byte-preserving raw-LF framing, where ambiguous encoded padding can invalidate an adjacent line and therefore keeps the evidence counters nonzero.
 
 ## Next Steps
 
@@ -51,3 +52,9 @@ superseded_by:
 - Independent semantic audit identified and closed the parser's whitespace-only needle false-positive edge case.
 - Final whole-range review identified and closed the unbounded needle amplification path with a UTF-8 byte cap and multibyte boundary tests.
 - Final whole-range review identified and closed two post-output-cap parser failures: oversized JSON integers are now counted as invalid records, and deeply nested selected fields use an order-preserving iterative traversal.
+- Private-overlay sync review identified and closed a strict-decoding gap: UTF-16 and UTF-32 JSON records are now rejected as invalid.
+- GitHub Codex follow-up review identified and closed the little-endian encoded-LF framing gap: BOM-prefixed UTF-16LE/UTF-32LE candidates scan past internal raw LF bytes (including U+010A) until an aligned encoded terminator, then consume only its exact NUL padding. A BOM-prefixed hybrid that uses a single-byte LF remains one rejected foreign record by design; the parser does not guess a competing boundary or strip arbitrary NULs.
+- Current-head GitHub Codex review identified the distinct no-BOM variant. The follow-up infers only a provisional LE width, bounds each candidate to 64 raw-LF fragments, validates the first complete encoded-trailer candidate once before committing it, and rolls malformed, hybrid, multiline, incomplete, fragment-limited, or oversized candidates back to default raw-LF framing.
+- The no-BOM framing follow-up passed 65 focused contract/structure tests and the full 1,170-test repository suite with the CI ripgrep gate enabled. The full run used narrow GPG-keybox access for its temporary signed-history fixtures; skill validation, project-journal validation, Python compilation, and `git diff --check` also passed.
+- A later current-head GitHub Codex review found that strict `utf-8` decoding regressed the prior parser's acceptance of one leading UTF-8 BOM. The parser now uses strict `utf-8-sig` decoding per retained record, removes exactly one leading UTF-8 BOM, and continues to reject malformed UTF-8, a second consecutive leading BOM, UTF-16, and UTF-32 input.
+- The UTF-8 BOM follow-up passed 66 focused contract/structure tests and the full 1,171-test repository suite, plus skill validation, project-journal validation, Python compilation, and `git diff --check`.
