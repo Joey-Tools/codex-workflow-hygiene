@@ -244,16 +244,26 @@ def user_message_record(message: str, *, ensure_ascii: bool = True) -> bytes:
 
 
 def run_field_aware_parser_bytes(
-    payload: bytes, needle: str = MATCH_PATTERN
+    payload: bytes,
+    needle: str = MATCH_PATTERN,
+    parser_code: str | None = None,
+    timeout: float | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     with tempfile.TemporaryDirectory() as temp_dir:
         rollout = Path(temp_dir) / "rollout.jsonl"
         rollout.write_bytes(payload)
         completed = subprocess.run(
-            [sys.executable, "-c", extract_field_aware_parser(), str(rollout), needle],
+            [
+                sys.executable,
+                "-c",
+                parser_code or extract_field_aware_parser(),
+                str(rollout),
+                needle,
+            ],
             capture_output=True,
             check=False,
             text=True,
+            timeout=timeout,
         )
         return completed, str(rollout)
 
@@ -594,9 +604,11 @@ class RolloutSearchReferenceTests(unittest.TestCase):
 
         for encoding, bom in (
             ("utf-16-le", codecs.BOM_UTF16_LE),
+            ("utf-16-le", b""),
             ("utf-32-le", codecs.BOM_UTF32_LE),
+            ("utf-32-le", b""),
         ):
-            with self.subTest(encoding=encoding):
+            with self.subTest(encoding=encoding, bom=bool(bom)):
                 raw_record = bom + non_utf8_json.encode(encoding)
                 self.assertIsInstance(json.loads(raw_record), dict)
                 completed, _ = run_field_aware_parser_bytes(raw_record)
@@ -624,9 +636,11 @@ class RolloutSearchReferenceTests(unittest.TestCase):
 
         for encoding, bom in (
             ("utf-16-le", codecs.BOM_UTF16_LE),
+            ("utf-16-le", b""),
             ("utf-32-le", codecs.BOM_UTF32_LE),
+            ("utf-32-le", b""),
         ):
-            with self.subTest(encoding=encoding):
+            with self.subTest(encoding=encoding, bom=bool(bom)):
                 foreign_record = bom + (non_utf8_json + "\n").encode(encoding)
                 self.assertIsInstance(json.loads(foreign_record), dict)
                 completed, rollout = run_field_aware_parser_bytes(
@@ -640,6 +654,187 @@ class RolloutSearchReferenceTests(unittest.TestCase):
                 self.assertNotIn("little-endian record", completed.stdout)
                 self.assertEqual(json.loads(completed.stderr), expected_metadata)
 
+    def test_field_aware_parser_recovers_short_inferred_little_endian_json(
+        self,
+    ) -> None:
+        foreign_record = "0\n".encode("utf-16-le")
+        valid_record = user_message_record("needle after short foreign JSON")
+        self.assertEqual(foreign_record, b"0\x00\n\x00")
+        self.assertEqual(json.loads(foreign_record), 0)
+
+        completed, rollout = run_field_aware_parser_bytes(
+            foreign_record + valid_record
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(f"{rollout}:2:", completed.stdout)
+        self.assertIn("needle after short foreign JSON", completed.stdout)
+        metadata = json.loads(completed.stderr)
+        self.assertEqual(metadata["records_seen"], 2)
+        self.assertEqual(metadata["invalid_records"], 1)
+        self.assertEqual(metadata["matched_records"], 1)
+        self.assertTrue(metadata["scan_complete"])
+
+    def test_field_aware_parser_rolls_back_unproved_little_endian_prefix(
+        self,
+    ) -> None:
+        valid_record = user_message_record("needle after unproved prefix")
+        valid_json = user_message_json("foreign unselected value")
+        for name, candidate, preserves_following_record in (
+            ("utf16-padding-mismatch", b'{\x00"\x00oops\n', True),
+            ("utf32-padding-mismatch", b'{\x00\x00\x00"\x00\x00\x00oops\n', True),
+            ("utf16-hybrid-lf", valid_json.encode("utf-16-le") + b"\n", True),
+            ("utf32-hybrid-lf", valid_json.encode("utf-32-le") + b"\n", True),
+            ("utf16-malformed-json", '{"x":,}\n'.encode("utf-16-le"), False),
+            ("utf32-malformed-json", '{"x":,}\n'.encode("utf-32-le"), False),
+        ):
+            with self.subTest(name=name):
+                completed, rollout = run_field_aware_parser_bytes(
+                    candidate + valid_record
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                metadata = json.loads(completed.stderr)
+                self.assertEqual(metadata["records_seen"], 2)
+                self.assertTrue(metadata["scan_complete"])
+                if preserves_following_record:
+                    self.assertIn(f"{rollout}:2:", completed.stdout)
+                    self.assertIn(
+                        "needle after unproved prefix", completed.stdout
+                    )
+                    self.assertEqual(metadata["invalid_records"], 1)
+                    self.assertEqual(metadata["matched_records"], 1)
+                else:
+                    self.assertEqual(completed.stdout, "")
+                    self.assertEqual(metadata["invalid_records"], 2)
+                    self.assertEqual(metadata["matched_records"], 0)
+
+    def test_inferred_little_endian_json_is_fully_validated_once(self) -> None:
+        foreign_json = user_message_json(
+            "\u010a" * 32,
+            ensure_ascii=False,
+        ) + "\n"
+        self.assertIsInstance(json.loads(foreign_json), dict)
+        parser_code = extract_field_aware_parser()
+        injection_point = "path = Path(sys.argv[1])"
+        validation_guard = """
+real_json_loads = json.loads
+json_load_calls = 0
+
+
+def single_json_loads(value, *args, **kwargs):
+    global json_load_calls
+    if isinstance(value, str) and '\\x00' not in value:
+        json_load_calls += 1
+        if json_load_calls > 1:
+            raise RuntimeError('inferred candidate was fully validated more than once')
+    return real_json_loads(value, *args, **kwargs)
+
+
+json.loads = single_json_loads
+"""
+        self.assertIn(injection_point, parser_code)
+        parser_code = parser_code.replace(
+            injection_point,
+            validation_guard + "\n" + injection_point,
+            1,
+        )
+
+        completed, _ = run_field_aware_parser_bytes(
+            foreign_json.encode("utf-16-le"),
+            parser_code=parser_code,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        metadata = json.loads(completed.stderr)
+        self.assertEqual(metadata["records_seen"], 1)
+        self.assertEqual(metadata["invalid_records"], 1)
+        self.assertEqual(metadata["matched_records"], 0)
+        self.assertTrue(metadata["scan_complete"])
+
+    def test_inferred_little_endian_probe_caps_overlapping_failures(self) -> None:
+        candidate_lines = 4_000
+        valid_record = user_message_record("needle after adversarial prefixes")
+
+        completed, _ = run_field_aware_parser_bytes(
+            b"{\x00\n" * candidate_lines + valid_record,
+            timeout=5,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("needle after adversarial prefixes", completed.stdout)
+        metadata = json.loads(completed.stderr)
+        self.assertEqual(metadata["records_seen"], candidate_lines + 1)
+        self.assertEqual(metadata["invalid_records"], candidate_lines)
+        self.assertEqual(metadata["matched_records"], 1)
+        self.assertTrue(metadata["scan_complete"])
+
+    def test_inferred_little_endian_probe_enforces_fragment_boundary(self) -> None:
+        valid_record = user_message_record("needle after fragment boundary")
+        for width, internal_fragments, should_commit in (
+            (width, internal_fragments, should_commit)
+            for width in (2, 4)
+            for internal_fragments, should_commit in ((63, True), (64, False))
+        ):
+            encoding = f"utf-{width * 8}-le"
+            foreign_json = user_message_json(
+                "\u010a" * internal_fragments,
+                ensure_ascii=False,
+            ) + "\n"
+            self.assertIsInstance(json.loads(foreign_json), dict)
+
+            with self.subTest(width=width, fragments=internal_fragments + 1):
+                completed, _ = run_field_aware_parser_bytes(
+                    foreign_json.encode(encoding) + valid_record
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                metadata = json.loads(completed.stderr)
+                self.assertTrue(metadata["scan_complete"])
+                if should_commit:
+                    self.assertIn(
+                        "needle after fragment boundary", completed.stdout
+                    )
+                    self.assertEqual(metadata["matched_records"], 1)
+                else:
+                    self.assertEqual(completed.stdout, "")
+                    self.assertEqual(metadata["matched_records"], 0)
+                    self.assertGreater(metadata["invalid_records"], 0)
+
+    def test_inferred_little_endian_json_supports_root_shapes(self) -> None:
+        valid_record = user_message_record("needle after foreign root")
+        root_values = (
+            '"escaped \\\" quote"',
+            "[1,{\"nested\":true}]",
+            "0",
+            "-1.2e+3",
+            "true",
+            "false",
+            "null",
+        )
+
+        for width, root_value in (
+            (width, root_value)
+            for width in (2, 4)
+            for root_value in root_values
+        ):
+            encoding = f"utf-{width * 8}-le"
+            with self.subTest(width=width, root_value=root_value):
+                foreign_record = (root_value + "\n").encode(encoding)
+                self.assertEqual(json.loads(foreign_record), json.loads(root_value))
+                completed, rollout = run_field_aware_parser_bytes(
+                    foreign_record + valid_record
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn("needle after foreign root", completed.stdout)
+                metadata = json.loads(completed.stderr)
+                self.assertEqual(metadata["records_seen"], 2)
+                self.assertEqual(metadata["invalid_records"], 1)
+                self.assertEqual(metadata["matched_records"], 1)
+                self.assertTrue(metadata["scan_complete"])
+
     def test_field_aware_parser_does_not_strip_extra_nul(self) -> None:
         non_utf8_json = json.dumps(
             {"type": "event_msg", "payload": {"type": "user_message"}},
@@ -649,9 +844,11 @@ class RolloutSearchReferenceTests(unittest.TestCase):
 
         for encoding, bom in (
             ("utf-16-le", codecs.BOM_UTF16_LE),
+            ("utf-16-le", b""),
             ("utf-32-le", codecs.BOM_UTF32_LE),
+            ("utf-32-le", b""),
         ):
-            with self.subTest(encoding=encoding):
+            with self.subTest(encoding=encoding, bom=bool(bom)):
                 foreign_record = bom + (non_utf8_json + "\n").encode(encoding)
                 completed, _ = run_field_aware_parser_bytes(
                     foreign_record + b"\x00{}\n" + valid_record
@@ -727,9 +924,11 @@ class RolloutSearchReferenceTests(unittest.TestCase):
 
         for encoding, bom in (
             ("utf-16-le", codecs.BOM_UTF16_LE),
+            ("utf-16-le", b""),
             ("utf-32-le", codecs.BOM_UTF32_LE),
+            ("utf-32-le", b""),
         ):
-            with self.subTest(encoding=encoding):
+            with self.subTest(encoding=encoding, bom=bool(bom)):
                 foreign_record = bom + (foreign_json + "\n").encode(encoding)
                 self.assertIsInstance(json.loads(foreign_record), dict)
                 completed, rollout = run_field_aware_parser_bytes(
