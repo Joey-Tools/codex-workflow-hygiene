@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-14
 updated: 2026-08-14
 branch: codex/archive-codex-rules-hygiene
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/73
 supersedes: []
 superseded_by:
 ---
@@ -32,6 +32,7 @@ superseded_by:
 - `docs/archive/codex-rules-hygiene/audit-cadence.md`
 - `README.md`
 - `tests/test_skill_structure.py`
+- [codex-workflow-hygiene PR #73](https://github.com/Joey-Tools/codex-workflow-hygiene/pull/73)
 - Focused retirement and active-skill frontmatter structure tests: 2 tests passed.
 - Full repository suite: 1,172 tests passed.
 - The four remaining active skills passed overlay validation.
