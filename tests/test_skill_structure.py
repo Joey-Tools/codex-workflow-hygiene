@@ -65,6 +65,8 @@ class SkillStructureTests(unittest.TestCase):
         skill_root = root / "skills/bounded-command-output"
         skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
         patterns = (skill_root / "references/command-patterns.md").read_text(encoding="utf-8")
+        frontmatter = skill.split("---", 2)[1]
+        trigger_gate = skill.split("## Trigger Gate\n", 1)[1].split("\n## ", 1)[0]
         supervisor = skill_root / "scripts/run_process_group_deadline.py"
         interface = (skill_root / "agents/openai.yaml").read_text(encoding="utf-8")
 
@@ -78,6 +80,21 @@ class SkillStructureTests(unittest.TestCase):
         ):
             self.assertIn(trigger, skill)
         self.assertIn("Apply alongside the domain skill", skill)
+        self.assertIn(
+            "Do not use for routine exact commands whose scope, output, and runtime are already predictably small.",
+            frontmatter,
+        )
+        self.assertIn("## Trigger Gate", skill)
+        self.assertIn("at least one concern is real", trigger_gate)
+        self.assertIn(
+            "scope, output, and runtime are all known to be small and fast",
+            trigger_gate,
+        )
+        self.assertIn(
+            "Do not trigger it merely because any command could theoretically hang",
+            trigger_gate,
+        )
+        self.assertIn("Small visible output can still qualify", trigger_gate)
         self.assertIn(
             "controls command shape, execution deadlines, and output handling only",
             skill,
@@ -105,6 +122,18 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("do not by themselves bound disk growth", skill)
         self.assertIn("pollable TTY or PTY shape", skill)
         self.assertIn("plain-pipe session after stdin closes", skill)
+        self.assertIn("`ALL_TOOLS` and similar tool registries", skill)
+        self.assertIn("scalar `name` and `description` fields", skill)
+        self.assertIn("cap the result count", skill)
+        self.assertIn("clipped description before calling `text()`", skill)
+        self.assertIn("Never emit raw registry entries or a full schema", skill)
+        self.assertIn("only after the main skill's trigger gate applies", patterns)
+        self.assertIn(
+            "producer scope, runtime, retained bytes, and visible output as separate bounds",
+            patterns,
+        )
+        self.assertIn("Tool registry or schema discovery", patterns)
+        self.assertIn("Passing raw registry entries or full schema objects to `text()`", patterns)
         self.assertIn("## Searches And Inventories", patterns)
         self.assertIn("## Logs, Artifacts, And Manuals", patterns)
         self.assertIn("## Process And System Diagnostics", patterns)
@@ -177,6 +206,28 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("time-bounded, pollable, and compact", interface)
         self.assertIn("allow_implicit_invocation: true", interface)
         self.assertNotIn("TODO", skill)
+
+    def test_skill_authoring_validator_discovery_contract(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "skills/codex-skill-authoring/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("`SKILL_AUTHORING_DIR`", skill)
+        self.assertIn("`SKILL_CREATOR_DIR`", skill)
+        self.assertIn("`--validator` takes priority", skill)
+        self.assertIn("non-empty `CODEX_SKILL_VALIDATOR`", skill)
+        self.assertIn("the wrapper checks these fixed locations in order", skill)
+        self.assertIn("`$CODEX_HOME/skills/.system/skill-creator", skill)
+        self.assertIn("`$CODEX_HOME/.system/skill-creator", skill)
+        self.assertIn("lexical loaded skills root", skill)
+        self.assertIn("resolved source skills root", skill)
+        self.assertIn("only when `CODEX_HOME` is unset or empty", skill)
+        self.assertIn("does not scan ancestors or search `PATH`", skill)
+        self.assertNotIn(
+            '"$HOME/.codex/skills/codex-skill-authoring/scripts/codex_skill_validate.py"',
+            skill,
+        )
 
     def test_session_mining_avoids_per_record_jsonl_key_dumps(self) -> None:
         root = Path(__file__).resolve().parents[1]

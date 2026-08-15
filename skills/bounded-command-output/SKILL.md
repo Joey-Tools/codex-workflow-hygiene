@@ -1,6 +1,6 @@
 ---
 name: bounded-command-output
-description: Keep potentially high-output or long-running commands scoped, time-bounded, pollable, and compact while another skill owns the substantive task. Use for broad searches or inventories; large Jenkins, GitHub Actions, artifact, manual, diff, or review-range reads; broad database aggregates or filesystem walks with uncertain runtime; broad or noisy process diagnostics; verbose xcodebuild or other tests and builds; spinner-heavy container builds; and repeated polling. Apply alongside the domain skill and skip only exact commands known to be both small and fast.
+description: Keep potentially high-output or long-running commands scoped, time-bounded, pollable, and compact while another skill owns the substantive task. Use for broad searches or inventories; large Jenkins, GitHub Actions, artifact, manual, diff, or review-range reads; broad database aggregates or filesystem walks with uncertain runtime; broad or noisy process diagnostics; verbose xcodebuild or other tests and builds; spinner-heavy container builds; and repeated polling. Apply alongside the domain skill and skip only exact commands known to be both small and fast. Do not use for routine exact commands whose scope, output, and runtime are already predictably small.
 ---
 
 # Bounded Command Output
@@ -9,6 +9,13 @@ description: Keep potentially high-output or long-running commands scoped, time-
 
 Shape commands so the producer, runtime, retained artifact, polling path, and visible evidence all have deliberate bounds.
 This skill controls command shape, execution deadlines, and output handling only. It does not own diagnosis, implementation delivery, or review decisions.
+
+## Trigger Gate
+
+- Load this skill only when at least one concern is real: broad scope, noisy or potentially large output, or long or uncertain runtime.
+- Skip routine exact file reads, narrow metadata queries, ordinary status checks, and focused tests only when their scope, output, and runtime are all known to be small and fast.
+- Do not trigger it merely because any command could theoretically hang or fail.
+- Small visible output can still qualify when a genuinely broad database aggregate or filesystem producer has uncertain runtime.
 
 ## Workflow
 
@@ -61,6 +68,7 @@ This skill controls command shape, execution deadlines, and output handling only
 - Do not redirect a small interactive command when doing so would hide a prompt or other required interaction.
 - Do not skip runtime bounding solely because the expected output is a single value or a few lines.
 - Use direct commands when possible. Use a shell only when redirection, a pipeline, or another real shell feature is required.
+- Treat `ALL_TOOLS` and similar tool registries as metadata registries: filter entries on scalar `name` and `description` fields, cap the result count, and project each result to only its name plus a clipped description before calling `text()`. Never emit raw registry entries or a full schema; inspect one exact selected schema or callable only if needed.
 
 ## References
 
