@@ -3,7 +3,7 @@ id: 20260715-bco001
 title: Bounded Command Output Skill
 status: completed
 created: 2026-07-15
-updated: 2026-07-15
+updated: 2026-08-16
 branch: codex/daily-skill-friction-20260715-codex-workflow-hygiene-bounded-command-output
 pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/41
 supersedes: []
@@ -32,4 +32,3 @@ superseded_by:
 - `skills/bounded-command-output/SKILL.md`
 - `skills/bounded-command-output/references/command-patterns.md`
 - `tests/test_skill_structure.py`
-- `tests/test_session_retrospective.py` preserves the fake GitHub token test value through runtime composition so frozen review preflight does not mistake the tracked fixture for a credential.

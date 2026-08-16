@@ -3,7 +3,7 @@ id: 20260812-cwh003
 title: Exact Rollout ripgrep Search Protocol
 status: completed
 created: 2026-08-12
-updated: 2026-08-14
+updated: 2026-08-16
 branch: codex/rollout-rg-search
 pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/71
 supersedes: []
@@ -25,7 +25,7 @@ superseded_by:
 - The selected-field parser caps the normalized needle at 1024 UTF-8 bytes so a repeated match cannot amplify bounded rows into unbounded stdout.
 - Every template passes the explicit stdin path `-`, preventing an invalid redirected directory from triggering ripgrep's no-path current-directory fallback.
 - Exceptional exhaustive position collection has a 64 MiB retained-output admission bound and remains explicitly live, non-snapshot evidence.
-- Dedicated contract tests cover the documentation surface and the conformance-qualified ripgrep 15.2.0 baseline without changing the shared skill-structure tests owned by the concurrent retrospective workstream.
+- Dedicated contract tests cover the documentation surface and the conformance-qualified ripgrep 15.2.0 baseline.
 - CI installs the official ripgrep 15.2.0 Linux release asset after verifying its pinned SHA-256 digest as a reproducible reference baseline. Development hosts never need to install, downgrade, or pin ripgrep: an unavailable, unparseable, or unqualified version skips the raw locator and uses the field-aware parser.
 - Version qualification and every raw template reuse one absolute `RG_BIN` path so the command is not re-resolved through `PATH`; the pure-shell contract explicitly retains a same-UID/privileged path-tamper non-guarantee.
 - The field-aware fallback treats pathological JSON integers as invalid records and traverses deeply nested selected fields iteratively, so one bounded record cannot terminate the point-in-time scan before its final `scan_meta`.

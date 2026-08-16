@@ -24,7 +24,7 @@ Use this skill for:
 - `~/.codex/history.jsonl` for higher-level prompt or thread recovery when the exact rollout file is not known yet.
 - `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` for active transcript rollouts on the local machine.
 - `~/.codex/archived_sessions/**/rollout-*.jsonl` for user-archived rollouts when that root exists; current hosts may use either flat or date-nested archive layouts.
-- Session-derived retained or report JSONL artifacts, such as retrospective `turn_flags.jsonl`, when the user explicitly scopes the task to those artifacts instead of raw rollouts.
+- Session-derived retained or report JSONL artifacts when the user explicitly scopes the task to those artifacts instead of raw rollouts.
 
 ## Workflow
 
