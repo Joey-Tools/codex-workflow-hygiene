@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-16
 updated: 2026-08-16
 branch: codex/rollout-scanner
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/76
 supersedes:
   - 20260718-cwh001
   - 20260812-cwh003
