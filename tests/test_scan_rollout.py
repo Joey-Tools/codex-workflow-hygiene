@@ -1046,6 +1046,28 @@ class ScanRolloutTests(unittest.TestCase):
         self.assertEqual(self.result_events(events), [])
         self.assert_terminal(events, "checked")
 
+    def test_non_string_payload_type_does_not_fall_back_to_outer_evidence(self) -> None:
+        for payload_type in (None, [], {}, 1):
+            with self.subTest(payload_type=payload_type):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    path = self.write_payload(
+                        Path(temp_dir),
+                        compact_json(
+                            {
+                                "type": "function_call_output",
+                                "payload": {
+                                    "type": payload_type,
+                                    "output": "needle",
+                                },
+                            }
+                        )
+                        + b"\n",
+                    )
+                    events = self.parse_events(self.run_search(path))
+
+                self.assertEqual(self.result_events(events), [])
+                self.assert_terminal(events, "checked")
+
     def test_repeatable_category_filter_is_a_union(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = self.write_payload(

@@ -755,7 +755,7 @@ def _iter_evidence(value: dict[str, Any]) -> Iterator[Evidence]:
     outer_type = value.get("type")
     effective_type = (
         payload_type
-        if payload_type is not None
+        if "type" in payload
         else (outer_type if isinstance(outer_type, str) else None)
     )
     role = _role(payload)
