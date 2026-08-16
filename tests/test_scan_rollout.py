@@ -1844,8 +1844,9 @@ class ScanRolloutTests(unittest.TestCase):
         hit = self.result_events(events)[0]["hits"][0]
         self.assertEqual(hit["field_path"], "/payload/output/a~1b~0c")
 
-    def test_deep_evidence_traversal_is_iterative_and_deterministic(self) -> None:
-        depth = 980
+    def test_deep_json_end_to_end_evidence_order_is_deterministic(self) -> None:
+        # Keep the end-to-end JSON fixture safely parseable on CPython 3.10.
+        depth = 256
         output_json = (
             '{"first":"needle first","nested":'
             + '{"node":' * depth
@@ -1868,6 +1869,37 @@ class ScanRolloutTests(unittest.TestCase):
         self.assertEqual(
             [hit["snippet"] for hit in matches[0]["hits"]],
             ["needle first", "needle deep", "needle last"],
+        )
+
+    def test_decoded_evidence_tree_beyond_recursion_limit_is_iterative(self) -> None:
+        module = load_scanner_module()
+        depth = sys.getrecursionlimit() + 100
+        self.assertGreater(depth, sys.getrecursionlimit())
+
+        nested: object = "needle deep"
+        for _ in range(depth):
+            nested = {"node": nested}
+        decoded = {
+            "type": "event_msg",
+            "payload": {
+                "type": "function_call_output",
+                "output": {
+                    "first": "needle first",
+                    "nested": nested,
+                    "last": "needle last",
+                },
+            },
+        }
+
+        evidence = list(module._iter_evidence(decoded))
+
+        self.assertEqual(
+            [(item.category, item.text) for item in evidence],
+            [
+                ("tool_output", "needle first"),
+                ("tool_output", "needle deep"),
+                ("tool_output", "needle last"),
+            ],
         )
 
     def test_message_block_structural_type_is_not_searchable_text(self) -> None:
