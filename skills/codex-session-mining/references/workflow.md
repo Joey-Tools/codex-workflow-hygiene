@@ -70,11 +70,17 @@ python3 "$SCANNER" search \
     --literal 'case-sensitive text' \
     --mode evidence \
     --category tool_output
+python3 "$SCANNER" search \
+    --path "$ROLLOUT" \
+    --literal 'task_started' \
+    --category event
 ```
 
-`search` normalizes Unicode whitespace independently in each selected field, then applies a nonblank case-sensitive literal of at most 1024 UTF-8 bytes. It never concatenates fields. The default `evidence` mode uses an explicit typed whitelist for user, assistant, tool-call, tool-output, and task-complete evidence. Metadata is searched only when `--category metadata` is requested. `user-text` conservatively includes structurally identified user text without heuristically deleting wrapper text; an `origin_hint`, when present, is provenance rather than a claim that every role=`user` value was written by a human. Repeat `--category` to select more than one category.
+`search` normalizes Unicode whitespace independently in each selected field, then applies a nonblank case-sensitive literal of at most 1024 UTF-8 bytes. It never concatenates fields. The default `evidence` mode uses an explicit typed whitelist for user, assistant, tool-call, tool-output, and task-complete evidence. Metadata and lifecycle events are searched only when `--category metadata` or `--category event` is requested. `user-text` conservatively includes structurally identified user text without heuristically deleting wrapper text. A direct string `/payload/origin_hint` on a user-message record is record-level provenance, not searchable evidence or a claim that role=`user` is human; it is whitespace-normalized, capped at 80 characters, and marked when truncated. Non-string hints are ignored. Repeat `--category` to select more than one category.
 
 The tool-call whitelist follows each record schema rather than applying one broad alias set: function and custom calls use their documented name/argument or input fields, while computer calls and `web_search_call` use `action`. The listed function, custom, and computer output record types use only the explicit output/content/result aliases. Unknown fields remain structural orientation for `shapes`; they are not silently promoted into searchable evidence.
+
+The opt-in `event` category accepts only outer `event_msg` records with registered payload types. It maps `task_started` identifiers and collaboration mode, `turn_aborted` reason, `stream_error` retry messages, terminal `error` messages, and entered/exited review-mode fields, plus the outer timestamp and exact registered payload type. Numeric timing fields, `codex_error_info`, unknown payload fields, and unregistered event types are not searchable. Match record metadata also preserves bounded `turn_id`, `item_id`, and `trace_id` when present.
 
 Each matching physical record produces at most one `match` event. Its bounded `hits` entries identify category, role, field path, and a short safe snippet. The default result window is 20 records and may be raised to 250 with `--max-results`. The result-event byte budget defaults to 64 KiB and may be raised to 256 KiB with `--max-output-bytes`; fixed small `start`/`end` protocol headroom is separate, so detail pressure cannot suppress the terminal event. The scanner continues reading after presentation limits are reached so terminal coverage and per-category matched/emitted/suppressed record counts remain meaningful.
 

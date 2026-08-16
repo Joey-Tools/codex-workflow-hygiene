@@ -54,9 +54,16 @@ CATEGORY_ORDER = (
     "tool_call",
     "tool_output",
     "task_complete",
+    "event",
     "metadata",
 )
-DEFAULT_EVIDENCE_CATEGORIES = CATEGORY_ORDER[:-1]
+DEFAULT_EVIDENCE_CATEGORIES = (
+    "user",
+    "assistant",
+    "tool_call",
+    "tool_output",
+    "task_complete",
+)
 
 METADATA_FIELDS = (
     "id",
@@ -96,6 +103,16 @@ TOOL_OUTPUT_FIELDS = {
     "computer_call_output": ("output", "content", "result"),
     "computer_tool_call_output": ("output", "content", "result"),
 }
+
+EVENT_MSG_FIELDS = {
+    "task_started": ("turn_id", "trace_id", "collaboration_mode_kind"),
+    "turn_aborted": ("turn_id", "reason"),
+    "stream_error": ("message", "additional_details"),
+    "error": ("message",),
+    "entered_review_mode": ("target", "user_facing_hint", "turn_id", "item_id"),
+    "exited_review_mode": ("turn_id", "item_id", "review_output"),
+}
+EVENT_CONTEXT_FIELDS = ("turn_id", "item_id", "trace_id")
 
 
 class OutputFailure(Exception):
@@ -457,16 +474,17 @@ def _scan_records(
     source: Source, on_record: Callable[[Record], None]
 ) -> Coverage:
     buffer = bytearray()
+    buffer_offset = 0
     bytes_read = 0
     complete_records = 0
     complete_prefix = 0
 
     while True:
         while True:
-            newline = buffer.find(b"\n")
+            newline = buffer.find(b"\n", buffer_offset)
             if newline < 0:
                 break
-            record_bytes = newline + 1
+            record_bytes = newline + 1 - buffer_offset
             if record_bytes > MAX_RECORD_BYTES:
                 return Coverage(
                     "partial",
@@ -476,8 +494,8 @@ def _scan_records(
                     complete_prefix,
                     0,
                 )
-            raw_line = bytes(buffer[:record_bytes])
-            del buffer[:record_bytes]
+            raw_line = bytes(buffer[buffer_offset : newline + 1])
+            buffer_offset = newline + 1
             value, decode_error = _decode_record(raw_line[:-1])
             if decode_error is not None:
                 return Coverage(
@@ -499,6 +517,8 @@ def _scan_records(
             complete_records += 1
             complete_prefix += record_bytes
             if complete_records == MAX_RECORDS:
+                if buffer_offset:
+                    del buffer[:buffer_offset]
                 return _finish_at_record_budget(
                     source,
                     buffer,
@@ -507,6 +527,9 @@ def _scan_records(
                     complete_prefix,
                 )
 
+        if buffer_offset:
+            del buffer[:buffer_offset]
+            buffer_offset = 0
         if len(buffer) > MAX_RECORD_BYTES:
             return Coverage(
                 "partial",
@@ -750,14 +773,40 @@ def _iter_message_aliases(
             yield Evidence(category, role, field_path, text)
 
 
+def _effective_type(
+    value: dict[str, Any],
+    payload: dict[str, Any],
+    payload_type: object,
+) -> str | None:
+    if "type" in payload:
+        return payload_type if isinstance(payload_type, str) else None
+    outer_type = value.get("type")
+    return outer_type if isinstance(outer_type, str) else None
+
+
+def _iter_event_evidence(
+    value: dict[str, Any],
+    payload: dict[str, Any],
+    payload_type: str | None,
+) -> Iterator[Evidence]:
+    if value.get("type") != "event_msg" or payload_type not in EVENT_MSG_FIELDS:
+        return
+    assert payload_type is not None
+    yield Evidence("event", None, "/payload/type", payload_type)
+    yield from _iter_aliases(
+        payload,
+        EVENT_MSG_FIELDS[payload_type],
+        "event",
+        None,
+    )
+    timestamp = value.get("timestamp")
+    if isinstance(timestamp, str):
+        yield Evidence("event", None, "/timestamp", timestamp)
+
+
 def _iter_evidence(value: dict[str, Any]) -> Iterator[Evidence]:
     payload, payload_type = _payload_and_type(value)
-    outer_type = value.get("type")
-    effective_type = (
-        payload_type
-        if "type" in payload
-        else (outer_type if isinstance(outer_type, str) else None)
-    )
+    effective_type = _effective_type(value, payload, payload_type)
     role = _role(payload)
 
     if effective_type == "user_message":
@@ -802,6 +851,7 @@ def _iter_evidence(value: dict[str, Any]) -> Iterator[Evidence]:
             if not isinstance(nested, str):
                 continue
             yield Evidence("metadata", role, f"/{alias}", nested)
+    yield from _iter_event_evidence(value, payload, payload_type)
 
 
 def _bounded_scalar(value: object) -> str | None:
@@ -824,6 +874,25 @@ def _record_metadata(record: Record) -> dict[str, Any]:
     role = _role(payload)
     if role is not None:
         metadata["role"] = role
+    effective_type = _effective_type(record.value, payload, payload_type)
+    if effective_type == "user_message" or (
+        effective_type == "message" and role == "user"
+    ):
+        raw_origin_hint = payload.get("origin_hint")
+        if isinstance(raw_origin_hint, str):
+            origin_hint = _normalize_whitespace(raw_origin_hint)
+            if origin_hint:
+                metadata["origin_hint"] = origin_hint[:MAX_METADATA_CHARS]
+                if len(origin_hint) > MAX_METADATA_CHARS:
+                    metadata["origin_hint_truncated"] = True
+    if (
+        record.value.get("type") == "event_msg"
+        and payload_type in EVENT_MSG_FIELDS
+    ):
+        for key in EVENT_CONTEXT_FIELDS:
+            context_value = _bounded_scalar(payload.get(key))
+            if context_value:
+                metadata[key] = context_value
     timestamp = None
     for key in ("timestamp", "time", "created_at", "updated_at", "ts"):
         candidate = record.value.get(key)

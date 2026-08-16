@@ -679,6 +679,93 @@ class ScanRolloutTests(unittest.TestCase):
             events[-1]["coverage"]["tail_deferred_bytes"], len(b'{"tail":')
         )
 
+    def test_batch_compaction_preserves_cross_chunk_record_coordinates(self) -> None:
+        module = load_scanner_module()
+        first = user_record("first")
+        second = user_record("界 second")
+        tail = b'{"tail":"deferred"}'
+        payload = first + second + tail
+        original_chunk = module.READ_CHUNK_BYTES
+        module.READ_CHUNK_BYTES = 7
+        records: list[object] = []
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = self.write_payload(Path(temp_dir), payload)
+                source, source_error = module._open_source(str(path), None)
+                self.assertIsNone(source_error)
+                self.assertIsNotNone(source)
+                try:
+                    coverage = module._scan_records(source, records.append)
+                finally:
+                    os.close(source.fd)
+        finally:
+            module.READ_CHUNK_BYTES = original_chunk
+
+        self.assertEqual(
+            [
+                (record.number, record.byte_start, record.byte_end)
+                for record in records
+            ],
+            [
+                (1, 0, len(first)),
+                (2, len(first), len(first) + len(second)),
+            ],
+        )
+        self.assertEqual(coverage.status, "checked")
+        self.assertEqual(coverage.bytes_read, len(payload))
+        self.assertEqual(coverage.complete_records, 2)
+        self.assertEqual(
+            coverage.complete_record_prefix_bytes,
+            len(first) + len(second),
+        )
+        self.assertEqual(coverage.tail_deferred_bytes, len(tail))
+
+    def test_short_record_batch_compacts_once_per_read_not_once_per_record(self) -> None:
+        module = load_scanner_module()
+
+        class TrackingBytearray(bytearray):
+            prefix_deletions = 0
+            shifted_suffix_bytes = 0
+
+            def __delitem__(self, key: object) -> None:
+                if (
+                    isinstance(key, slice)
+                    and key.start in (None, 0)
+                    and isinstance(key.stop, int)
+                ):
+                    type(self).prefix_deletions += 1
+                    type(self).shifted_suffix_bytes += len(self) - key.stop
+                super().__delitem__(key)
+
+        payload = b"{}\n" * 8192
+        source = module.Source(
+            fd=123,
+            path="/synthetic/rollout.jsonl",
+            device=1,
+            inode=2,
+            observed_size_bytes=len(payload),
+            prefix_end_bytes=len(payload),
+        )
+        records: list[object] = []
+        with (
+            mock.patch.object(module, "bytearray", TrackingBytearray, create=True),
+            mock.patch.object(module.os, "read", return_value=payload) as read_source,
+        ):
+            coverage = module._scan_records(source, records.append)
+
+        self.assertEqual(coverage.status, "checked")
+        self.assertEqual(coverage.complete_records, 8192)
+        self.assertEqual(len(records), 8192)
+        self.assertEqual(read_source.call_count, 1)
+        self.assertLessEqual(
+            TrackingBytearray.prefix_deletions,
+            read_source.call_count + 1,
+        )
+        self.assertLessEqual(
+            TrackingBytearray.shifted_suffix_bytes,
+            len(payload),
+        )
+
     def test_small_scale_read_budget_counts_actual_bytes(self) -> None:
         module = load_scanner_module()
         original_read_budget = module.MAX_READ_BYTES
@@ -839,6 +926,146 @@ class ScanRolloutTests(unittest.TestCase):
             },
             {"metadata"},
         )
+
+    def test_documented_event_message_families_are_opt_in_typed_evidence(self) -> None:
+        task_started = compact_json(
+            {
+                "timestamp": "2026-08-16T12:34:56Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-start",
+                    "trace_id": "trace-start",
+                    "started_at": 1786910012,
+                    "model_context_window": 114688,
+                    "collaboration_mode_kind": "plan",
+                },
+            }
+        ) + b"\n"
+        rows = task_started + b"".join(
+            (
+                record(
+                    "turn_aborted",
+                    turn_id="turn-abort",
+                    reason="needle-aborted",
+                    started_at=1,
+                    completed_at=2,
+                    duration_ms=1,
+                ),
+                record(
+                    "stream_error",
+                    message="needle-retry-message",
+                    additional_details="needle-retry-details",
+                    codex_error_info={"detail": "not-selected"},
+                ),
+                record(
+                    "error",
+                    message="needle-terminal-error",
+                    codex_error_info={"detail": "not-selected"},
+                ),
+                record(
+                    "entered_review_mode",
+                    target={"type": "custom", "instructions": "needle-review-target"},
+                    user_facing_hint="needle-review-hint",
+                    turn_id="turn-enter",
+                    item_id="item-enter",
+                ),
+                record(
+                    "exited_review_mode",
+                    turn_id="turn-exit",
+                    item_id="item-exit",
+                    review_output={"overall_explanation": "needle-review-output"},
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self.write_payload(Path(temp_dir), rows)
+            default = self.parse_events(self.run_search(path, "task_started"))
+            family = self.parse_events(
+                self.run_search(path, "task_started", "--category", "event")
+            )
+            timestamp = self.parse_events(
+                self.run_search(
+                    path,
+                    "2026-08-16T12:34:56Z",
+                    "--category",
+                    "event",
+                )
+            )
+            cases = {
+                "needle-aborted": "/payload/reason",
+                "needle-retry-message": "/payload/message",
+                "needle-retry-details": "/payload/additional_details",
+                "needle-terminal-error": "/payload/message",
+                "needle-review-target": "/payload/target/instructions",
+                "needle-review-hint": "/payload/user_facing_hint",
+                "needle-review-output": "/payload/review_output/overall_explanation",
+            }
+            observed_paths = {}
+            for literal in cases:
+                events = self.parse_events(
+                    self.run_search(path, literal, "--category", "event")
+                )
+                matches = self.result_events(events)
+                self.assertEqual(len(matches), 1, literal)
+                observed_paths[literal] = matches[0]["hits"][0]["field_path"]
+
+        self.assertEqual(self.result_events(default), [])
+        self.assert_terminal(default, "checked")
+        task_match = self.result_events(family)[0]
+        self.assertEqual(task_match["hits"][0]["field_path"], "/payload/type")
+        self.assertEqual(task_match["record"]["turn_id"], "turn-start")
+        self.assertEqual(task_match["record"]["trace_id"], "trace-start")
+        self.assertEqual(
+            task_match["record"]["timestamp"],
+            "2026-08-16T12:34:56Z",
+        )
+        self.assertEqual(
+            self.result_events(timestamp)[0]["hits"][0]["field_path"],
+            "/timestamp",
+        )
+        self.assertEqual(observed_paths, cases)
+        self.assertEqual(
+            family[-1]["category_stats"]["event"],
+            {"matched_records": 1, "emitted_records": 1, "suppressed_records": 0},
+        )
+
+    def test_event_mapping_rejects_unregistered_types_fields_and_outer_decoys(self) -> None:
+        rows = b"".join(
+            (
+                record(
+                    "task_started",
+                    outer_type="response_item",
+                    turn_id="needle-response-decoy",
+                ),
+                record("thread/start", message="needle-thread-decoy"),
+                record(
+                    "stream_error",
+                    message="ordinary retry",
+                    codex_error_info={"detail": "needle-error-info"},
+                ),
+                record(
+                    "task_started",
+                    turn_id="ordinary-turn",
+                    started_at=1786910012,
+                    unknown="needle-unknown-field",
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self.write_payload(Path(temp_dir), rows)
+            for literal in (
+                "needle-response-decoy",
+                "needle-thread-decoy",
+                "needle-error-info",
+                "needle-unknown-field",
+                "1786910012",
+            ):
+                events = self.parse_events(
+                    self.run_search(path, literal, "--category", "event")
+                )
+                self.assertEqual(self.result_events(events), [], literal)
+                self.assert_terminal(events, "checked")
 
     def test_computer_call_families_use_typed_action_and_output_fields(self) -> None:
         payload = b"".join(
@@ -1148,6 +1375,75 @@ class ScanRolloutTests(unittest.TestCase):
             self.assertEqual(hit["category"], "user")
             self.assertEqual(hit["role"], "user")
             self.assertNotEqual(hit["role"], "human")
+
+    def test_user_matches_preserve_direct_origin_hint_as_record_provenance(self) -> None:
+        rows = (
+            record(
+                "user_message",
+                message="needle event user",
+                origin_hint="  automation\nwrapper  ",
+            )
+            + record(
+                "message",
+                outer_type="response_item",
+                role="user",
+                content=[{"type": "input_text", "text": "needle response user"}],
+                origin_hint="interactive",
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self.write_payload(Path(temp_dir), rows)
+            evidence = self.parse_events(self.run_search(path, "needle"))
+            user_text = self.parse_events(
+                self.run_search(path, "needle", "--mode", "user-text")
+            )
+
+        for events in (evidence, user_text):
+            matches = self.result_events(events)
+            self.assertEqual(len(matches), 2)
+            self.assertEqual(
+                [match["record"]["origin_hint"] for match in matches],
+                ["automation wrapper", "interactive"],
+            )
+            self.assertTrue(
+                all("origin_hint" not in hit for match in matches for hit in match["hits"])
+            )
+            self.assertTrue(
+                all(
+                    "origin_hint_truncated" not in match["record"]
+                    for match in matches
+                )
+            )
+
+    def test_origin_hint_is_bounded_optional_and_not_searchable(self) -> None:
+        long_hint = "x" * 81
+        rows = (
+            record("user_message", message="needle bounded", origin_hint=long_hint)
+            + record("user_message", message="needle invalid", origin_hint=["decoy"])
+            + record("user_message", message="ordinary", origin_hint="needle provenance")
+            + record(
+                "message",
+                outer_type="response_item",
+                role="assistant",
+                content=[{"type": "output_text", "text": "needle assistant"}],
+                origin_hint="assistant decoy",
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self.write_payload(Path(temp_dir), rows)
+            events = self.parse_events(self.run_search(path, "needle"))
+            provenance_only = self.parse_events(
+                self.run_search(path, "needle provenance", "--mode", "user-text")
+            )
+
+        matches = self.result_events(events)
+        self.assertEqual(len(matches), 3)
+        self.assertEqual(matches[0]["record"]["origin_hint"], "x" * 80)
+        self.assertTrue(matches[0]["record"]["origin_hint_truncated"])
+        self.assertNotIn("origin_hint", matches[1]["record"])
+        self.assertNotIn("origin_hint", matches[2]["record"])
+        self.assertEqual(self.result_events(provenance_only), [])
+        self.assert_terminal(provenance_only, "checked")
 
     def test_user_text_ignores_non_text_message_part_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
