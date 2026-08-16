@@ -822,7 +822,7 @@ Output line numbers remain 1-based raw-LF physical coordinates: every raw LF con
 
 The parser continues through point-in-time EOF after its 20 stdout rows are full. Its final stderr line is one compact `scan_meta` JSON object; keep it in a private bounded control sink and require normal process exit plus `scan_complete: true`. `matched_records` counts every matching physical record reached by the selected-field scan, while `emitted_rows`, `suppressed_rows`, and `output_truncated` distinguish complete matching from bounded presentation. `invalid_records` and `oversized_records` identify physical records the parser could not inspect; they must be zero before claiming a complete no-match result. These counters do not freeze a live rollout or prove content stability.
 
-For JSONL schema checks, inspect one record or aggregate unique keys once. Do not run `jq -R 'fromjson | keys' file.jsonl`, because it prints the same key list for every line and can produce massive output on retained artifacts such as `turn_flags.jsonl`.
+For JSONL schema checks, inspect one record or aggregate unique keys once. Do not run `jq -R 'fromjson | keys' file.jsonl`, because it prints the same key list for every line and can produce massive output on large retained artifacts.
 
 ```bash
 python3 - "$JSONL_PATH" <<'PY'

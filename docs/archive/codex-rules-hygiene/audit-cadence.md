@@ -73,7 +73,6 @@ Use this branch only when a machine has neither `~/.codex/rules/default.rules.cl
 ### Helper Gap
 
 - Repeated Apple Notes reads before `show-work-report-prefix` existed
-- Repeated remote `ssh ... jq/rg ...` before `remote_codex_probe.py`
 - Repeated tracker issue metadata fetches before a dedicated tracker helper
 
 ### Approval Log

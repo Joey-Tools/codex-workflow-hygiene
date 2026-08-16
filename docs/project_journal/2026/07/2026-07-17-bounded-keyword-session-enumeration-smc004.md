@@ -3,7 +3,7 @@ id: 20260717-smc004
 title: Bounded Keyword Search and Fail-Closed Session Enumeration
 status: completed
 created: 2026-07-17
-updated: 2026-07-17
+updated: 2026-08-16
 branch: codex/daily-skill-friction-20260717-codex-workflow-hygiene-bound-keyword-and-propagate-glob-errors
 pr:
 supersedes: []
@@ -18,8 +18,6 @@ superseded_by:
 - Replaced full selected-text joins with incremental nested-string traversal, whitespace normalization, matching, and bounded context projection.
 - Type-checked, normalized, escaped, and capped exact-match metadata before printing it to stdout.
 - Kept the full original type string in the match stream while applying the safe cap only to its output projection.
-- Replaced local and embedded session-meta Path.glob() enumeration with explicit os.scandir() filtering and sorting.
-- Preserved optional missing-directory semantics when a validated session directory disappears before enumeration, while keeping other enumeration errors fail closed.
 
 ## Current State
 
@@ -27,7 +25,6 @@ superseded_by:
 - An oversized bare-CR decoy is discarded through the next LF, while the following normal record remains discoverable.
 - Untrusted nested metadata values cannot expand or inject physical output lines; string metadata is escaped and capped before printing.
 - Keywords remain discoverable in non-ASCII or late portions of the type string beyond the output projection cap.
-- Missing session directories remain optional, including post-validation disappearance races, while permission and I/O failures during directory enumeration produce the redacted session directory unreadable failure.
 
 ## Next Steps
 
@@ -35,10 +32,7 @@ superseded_by:
 
 ## Evidence
 
-- Focused keyword and session-meta regressions: 10 tests passed.
-- Related skill modules: 882 tests passed with process-local fixture commit signing disabled.
-- Full test discovery: 949 tests passed with process-local fixture commit signing disabled.
-- Both codex-session-mining and codex-session-retrospective passed quick_validate.py.
-- Python compilation, project-journal validation, and git diff --check passed.
-- Ruff check passed when excluding the repository's existing F541 finding; the same lone finding is present at HEAD.
-- Ruff format check remains nonzero for the same three Python files at HEAD and in this branch, so no unrelated whole-file reformat was retained.
+- `skills/codex-session-mining/references/workflow.md`
+- `tests/test_skill_structure.py`
+- `codex-session-mining` passed `quick_validate.py`.
+- Project-journal validation and `git diff --check` passed.
