@@ -82,7 +82,7 @@ The tool-call whitelist follows each record schema rather than applying one broa
 
 The opt-in `event` category accepts only outer `event_msg` records with registered payload types. It maps `task_started` identifiers and collaboration mode, `turn_aborted` reason, `stream_error` retry messages, terminal `error` messages, and entered/exited review-mode fields, plus the outer timestamp and exact registered payload type. Numeric timing fields, `codex_error_info`, unknown payload fields, and unregistered event types are not searchable. Match record metadata also preserves bounded `turn_id`, `item_id`, and `trace_id` when present.
 
-Each matching physical record produces at most one `match` event. Its bounded `hits` entries identify category, role, field path, and a short safe snippet. The default result window is 20 records and may be raised to 250 with `--max-results`. The result-event byte budget defaults to 64 KiB and may be raised to 256 KiB with `--max-output-bytes`; fixed small `start`/`end` protocol headroom is separate, so detail pressure cannot suppress the terminal event. The scanner continues reading after presentation limits are reached so terminal coverage and per-category matched/emitted/suppressed record counts remain meaningful.
+Each matching physical record produces at most one `match` event. A full event's bounded `hits` identify category, role, field path, and a short safe snippet. The default result window is 20 records and may be raised to 250 with `--max-results`. The result-event byte budget configured by `--max-output-bytes` accepts 512 bytes through 256 KiB and defaults to 64 KiB; fixed small `start`/`end` protocol headroom is separate, so detail pressure cannot suppress the terminal event. If the first eligible full event cannot fit an otherwise empty result window, the scanner emits a compact `match` with physical record coordinates, ordered `matched_categories`, `hits_observed`, `details_truncated: true`, and `full_event_bytes`, but no fabricated path, role, snippet, or record metadata. This guarantees at least one result and strict offset progress at every legal byte budget. If a later full event cannot fit the remaining budget after an earlier result was emitted, the page stops at that contiguous boundary so the next page can still return the later event in full. The scanner continues reading after presentation limits are reached so terminal coverage and per-category matched/emitted/suppressed record counts remain meaningful.
 
 `shapes` emits value-free structural skeletons: outer and payload type, role, sorted bounded field paths, and container/scalar types. It retains the first 20 distinct shapes in first-seen order and counts those exactly while continuing the scan. Shape detail events use a fixed 64 KiB aggregate budget; the terminal event reports emitted and suppressed retained shapes, so detail pressure cannot hide `end`. Records with unretained shapes increment a separate counter; the output does not claim a complete distinct-shape count.
 
@@ -91,7 +91,7 @@ Each matching physical record produces at most one `match` event. Its bounded `h
 Every invocation writes typed JSONL to stdout. Every event carries `schema: codex.rollout-scan/v1`, one `run_id`, and a continuous `seq`:
 
 - `start` is first and binds the invocation's `run_id`, sequence, source observation, command, and limits.
-- `match` is emitted and flushed as each retained search result is found.
+- `match` is emitted and flushed as each retained search result is found. A compact match is explicitly marked with `details_truncated: true`; its coordinates and matched categories remain valid positive evidence, while omitted hit details make no claim.
 - `shape` is emitted only when `shapes` reaches normal or semantic-partial termination.
 - `end` is last, uses the same `run_id`, and closes a continuous `seq` sequence.
 
@@ -115,7 +115,7 @@ python3 "$SCANNER" search \
     --prefix-end-bytes "$FROZEN_PREFIX_BYTES"
 ```
 
-Read `next_result_offset` and `frozen_prefix_bytes` from the previous `end` event. The next offset advances by actually emitted result records only. Reusing the prior prefix bound excludes later append, but it does not detect a same-inode in-place rewrite. Each page remains an independent descriptor-prefix observation, not a stable multi-page snapshot. If one more window is needed, prefer a refined category/literal or raise the result count or byte limit once within the hard caps.
+Read `next_result_offset` and `frozen_prefix_bytes` from the previous `end` event. Continue only when the next offset is non-null and strictly greater than the requested offset; it advances by actually emitted result records only. Reusing the prior prefix bound excludes later append, but it does not detect a same-inode in-place rewrite. Each page remains an independent descriptor-prefix observation, not a stable multi-page snapshot. If a compact match's omitted details matter and `full_event_bytes` is within the hard ceiling, retry the same result offset once with that larger byte limit before advancing. Otherwise prefer a refined category/literal or raise the result count or byte limit once within the hard caps.
 
 ### Input And Completeness Boundaries
 

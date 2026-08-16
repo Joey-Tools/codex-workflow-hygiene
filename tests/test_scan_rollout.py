@@ -134,6 +134,12 @@ class ScanRolloutTests(unittest.TestCase):
         )
         for event in events:
             self.assertEqual(event["schema"], SCHEMA)
+        end = events[-1]
+        if "search" in end and end["next_result_offset"] is not None:
+            self.assertGreater(
+                end["next_result_offset"],
+                end["search"]["result_offset"],
+            )
         return events
 
     def write_payload(self, directory: Path, payload: bytes) -> Path:
@@ -279,6 +285,203 @@ class ScanRolloutTests(unittest.TestCase):
             end["search"]["emitted_records"],
         )
 
+    def test_worst_case_compact_match_fits_the_minimum_budget(self) -> None:
+        module = load_scanner_module()
+        # Compact fallback is always the first result event (seq 1). The scanner
+        # caps the other counters below, and a bytes length cannot exceed maxsize.
+        writer = module.EventWriter(
+            stream=io.BytesIO(),
+            run_id="f" * 32,
+        )
+        writer.seq = 1
+        compact = module._compact_match_event(
+            module.Record(
+                number=module.MAX_RECORDS,
+                byte_start=module.MAX_READ_BYTES - 1,
+                byte_end=module.MAX_READ_BYTES,
+                value={},
+            ),
+            module.MAX_RECORDS - 1,
+            module.MAX_RECORD_BYTES,
+            set(module.CATEGORY_ORDER),
+            sys.maxsize,
+        )
+        encoded = writer.encode(compact)
+
+        self.assertLessEqual(len(encoded), module.MIN_MAX_OUTPUT_BYTES)
+        event = json.loads(encoded)
+        self.assertEqual(event["run_id"], "f" * 32)
+        self.assertEqual(event["seq"], 1)
+        self.assertEqual(event["matched_categories"], list(module.CATEGORY_ORDER))
+        self.assertEqual(event["full_event_bytes"], sys.maxsize)
+
+    def test_minimum_budget_compact_pages_make_stateless_progress(self) -> None:
+        payload = b"".join(
+            user_record("a" * 180 + "needle" + "b" * 220 + f" {index}")
+            for index in range(3)
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self.write_payload(Path(temp_dir), payload)
+            offset = 0
+            pages: list[
+                tuple[
+                    subprocess.CompletedProcess[bytes],
+                    list[dict[str, object]],
+                ]
+            ] = []
+            while True:
+                completed = self.run_search(
+                    path,
+                    "needle",
+                    "--result-offset",
+                    str(offset),
+                    "--max-output-bytes",
+                    "512",
+                )
+                events = self.parse_events(completed)
+                pages.append((completed, events))
+                next_offset = events[-1]["next_result_offset"]
+                if next_offset is None:
+                    break
+                self.assertGreater(next_offset, offset)
+                offset = next_offset
+
+        self.assertEqual(len(pages), 3)
+        self.assertEqual(
+            [
+                self.result_events(events)[0]["result_index"]
+                for _, events in pages
+            ],
+            [0, 1, 2],
+        )
+        for completed, events in pages:
+            matches = self.result_events(events)
+            self.assertEqual(len(matches), 1)
+            match = matches[0]
+            self.assertEqual(
+                set(match),
+                {
+                    "schema",
+                    "event",
+                    "run_id",
+                    "seq",
+                    "result_index",
+                    "record",
+                    "matched_categories",
+                    "hits",
+                    "hits_observed",
+                    "hits_truncated",
+                    "details_truncated",
+                    "full_event_bytes",
+                },
+            )
+            self.assertEqual(
+                set(match["record"]),
+                {"number", "line_number", "byte_start", "byte_end"},
+            )
+            self.assertEqual(match["matched_categories"], ["user"])
+            self.assertEqual(match["hits"], [])
+            self.assertEqual(match["hits_observed"], 1)
+            self.assertTrue(match["hits_truncated"])
+            self.assertTrue(match["details_truncated"])
+            self.assertGreater(match["full_event_bytes"], 512)
+            match_lines = [
+                line
+                for line in completed.stdout.splitlines(keepends=True)
+                if json.loads(line)["event"] == "match"
+            ]
+            self.assertEqual(len(match_lines), 1)
+            self.assertLessEqual(len(match_lines[0]), 512)
+            self.assertEqual(
+                events[-1]["search"]["result_bytes"],
+                len(match_lines[0]),
+            )
+            self.assertEqual(
+                events[-1]["category_stats"]["user"]["emitted_records"],
+                1,
+            )
+
+    def test_partial_after_compact_match_retains_the_emitted_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self.write_payload(
+                Path(temp_dir),
+                user_record("a" * 180 + "needle" + "b" * 220)
+                + b"not-json\n",
+            )
+            completed = self.run_search(
+                path,
+                "needle",
+                "--max-output-bytes",
+                "512",
+            )
+            events = self.parse_events(completed)
+
+        matches = self.result_events(events)
+        self.assertEqual(len(matches), 1)
+        self.assertTrue(matches[0]["details_truncated"])
+        match_line = next(
+            line
+            for line in completed.stdout.splitlines(keepends=True)
+            if json.loads(line)["event"] == "match"
+        )
+        end = self.assert_terminal(events, "partial", "malformed_json")
+        self.assertEqual(end["search"]["emitted_records"], 1)
+        self.assertEqual(end["search"]["matched_records"], 1)
+        self.assertEqual(end["search"]["result_bytes"], len(match_line))
+        self.assertEqual(end["next_result_offset"], None)
+
+    def test_default_budget_compacts_an_adversarial_match_that_fits_hard_cap(
+        self,
+    ) -> None:
+        literal = "\x01" * 1024
+        before = "🟦" * 180
+        after = "🚀" * 220
+        long_key = "🧭" * 600
+        output = {
+            f"{long_key}{index}": before + literal + after
+            for index in range(4)
+        }
+        payload = record(
+            "function_call_output",
+            output=output,
+            role="🎈" * 80,
+            timestamp="⏱" * 80,
+        ) + user_record(literal)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self.write_payload(Path(temp_dir), payload)
+            default_completed = self.run_search(path, literal)
+            default_events = self.parse_events(default_completed)
+            hard_completed = self.run_search(
+                path,
+                literal,
+                "--max-output-bytes",
+                str(256 * 1024),
+            )
+            hard_events = self.parse_events(hard_completed)
+
+        default_matches = self.result_events(default_events)
+        hard_matches = self.result_events(hard_events)
+        default_match = default_matches[0]
+        hard_match = hard_matches[0]
+        hard_line = next(
+            line
+            for line in hard_completed.stdout.splitlines(keepends=True)
+            if json.loads(line)["event"] == "match"
+        )
+        self.assertGreater(len(hard_line), 64 * 1024)
+        self.assertLessEqual(len(hard_line), 256 * 1024)
+        self.assertTrue(default_match["details_truncated"])
+        self.assertEqual(default_match["full_event_bytes"], len(hard_line))
+        self.assertEqual(
+            [match["result_index"] for match in default_matches],
+            [0, 1],
+        )
+        self.assertNotIn("details_truncated", default_matches[1])
+        self.assertNotIn("details_truncated", hard_match)
+        self.assertNotIn("matched_categories", hard_match)
+        self.assertNotIn("full_event_bytes", hard_match)
+        self.assertEqual(len(hard_match["hits"]), 4)
+
     def test_output_budget_keeps_a_contiguous_result_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = self.write_payload(
@@ -313,6 +516,10 @@ class ScanRolloutTests(unittest.TestCase):
         self.assertEqual(
             [match["result_index"] for match in self.result_events(first_page)],
             [0],
+        )
+        self.assertNotIn(
+            "details_truncated",
+            self.result_events(first_page)[0],
         )
         self.assertEqual(first_page[-1]["next_result_offset"], 1)
         self.assertEqual(

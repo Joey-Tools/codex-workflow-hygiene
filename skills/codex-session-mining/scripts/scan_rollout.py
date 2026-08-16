@@ -943,6 +943,37 @@ def _match_record(
     return retained, observed, matched_categories
 
 
+def _compact_match_event(
+    record: Record,
+    result_index: int,
+    hits_observed: int,
+    matched_categories: set[str],
+    full_event_bytes: int,
+) -> dict[str, Any]:
+    """Retain result identity and category coverage when details cannot fit."""
+
+    return {
+        "event": "match",
+        "result_index": result_index,
+        "record": {
+            "number": record.number,
+            "line_number": record.number,
+            "byte_start": record.byte_start,
+            "byte_end": record.byte_end,
+        },
+        "matched_categories": [
+            category
+            for category in CATEGORY_ORDER
+            if category in matched_categories
+        ],
+        "hits": [],
+        "hits_observed": hits_observed,
+        "hits_truncated": True,
+        "details_truncated": True,
+        "full_event_bytes": full_event_bytes,
+    }
+
+
 def _start_payload(
     args: argparse.Namespace, source: Source | None, unavailable_reason: str | None
 ) -> dict[str, Any]:
@@ -1091,13 +1122,27 @@ def _run_search(
             "hits_truncated": hits_observed > len(hits),
         }
         encoded = writer.encode(event)
+        emitted_hit_categories = {hit["category"] for hit in hits}
         if emitted_bytes + len(encoded) > args.max_output_bytes:
-            presentation_open = False
-            return
+            if emitted_records:
+                presentation_open = False
+                return
+            compact_event = _compact_match_event(
+                record,
+                result_index,
+                hits_observed,
+                matched_categories,
+                len(encoded),
+            )
+            encoded = writer.encode(compact_event)
+            if len(encoded) > args.max_output_bytes:
+                raise RuntimeError(
+                    "compact match event exceeded the legal output budget"
+                )
+            emitted_hit_categories = matched_categories
         writer.write_encoded(encoded)
         emitted_bytes += len(encoded)
         emitted_records += 1
-        emitted_hit_categories = {hit["category"] for hit in hits}
         for category in emitted_hit_categories:
             category_emitted[category] += 1
 
