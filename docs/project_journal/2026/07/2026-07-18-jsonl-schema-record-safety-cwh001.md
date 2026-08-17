@@ -7,7 +7,7 @@ updated: 2026-08-16
 branch: codex/daily-skill-friction-20260718-codex-workflow-hygiene-jsonl-schema-record-bound
 pr:
 supersedes: []
-superseded_by:
+superseded_by: 20260816-cwh007
 ---
 
 # JSONL Schema and Record Safety

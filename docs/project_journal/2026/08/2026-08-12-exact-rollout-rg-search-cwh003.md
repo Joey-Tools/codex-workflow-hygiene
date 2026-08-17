@@ -7,7 +7,7 @@ updated: 2026-08-16
 branch: codex/rollout-rg-search
 pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/71
 supersedes: []
-superseded_by:
+superseded_by: 20260816-cwh007
 ---
 
 # Exact Rollout ripgrep Search Protocol
