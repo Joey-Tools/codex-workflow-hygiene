@@ -49,10 +49,12 @@ UUID_RE = re.compile(
 MODEL_LABELS = {
     "gpt-5.5": "GPT-5.5",
     "gpt-5.6-sol": "GPT-5.6 Sol",
+    "gpt-5.6-luna": "GPT-5.6 Luna",
     "gpt-5.6-terra": "GPT-5.6 Terra",
 }
 MODEL_ALIASES = {
     "gpt-5.6-sol": "gpt-5.6-sol",
+    "gpt-5.6-luna": "gpt-5.6-luna",
     "gpt-5.6-terra": "gpt-5.6-terra",
     "gpt-5.5": "gpt-5.5",
     "gpt-5.4": "gpt-5.4",

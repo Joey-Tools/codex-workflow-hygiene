@@ -18,6 +18,7 @@ superseded_by:
 
 ## Current State
 - The session-mining skill, attribution helper, and tests use the Terra Ultra fallback.
+- Observed `gpt-5.6-luna` rollout records use an explicit Luna label; unknown or incomplete evidence still uses the Terra Ultra fallback.
 - The skill validator and 74 attribution tests pass.
 
 ## Next Steps
