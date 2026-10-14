@@ -6,6 +6,7 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
+  actions: read
   contents: read
   issues: read
   pull-requests: read
@@ -24,7 +25,7 @@ jobs:
         id: gate
         uses: JoeyTeng/codex-review-gate-action@v2
         env:
-          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: ${{ vars.CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION == 'any' && 'any' || 'write' }}
+          CODEX_REVIEW_GATE_REQUEST_AUTHOR_PERMISSION: any
         with:
           github_token: ${{ github.token }}
           pr_number: ${{ github.event.pull_request.number }}

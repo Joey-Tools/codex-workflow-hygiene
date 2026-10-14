@@ -1,29 +1,29 @@
 ---
 id: 20260924-mpt002
-title: PR Attribution Terra Fallback
-status: active
+title: PR Attribution Sol High Fallback
+status: completed
 created: 2026-09-24
-updated: 2026-09-24
+updated: 2026-10-14
 branch: codex/daily-skill-friction-20260924-codex-workflow-hygiene-model-profile-terra
-pr:
+pr: https://github.com/Joey-Tools/codex-workflow-hygiene/pull/81
 supersedes: []
 superseded_by:
 ---
 
-# PR Attribution Terra Fallback
+# PR Attribution Sol High Fallback
 
 ## Summary
-- Change the PR attribution fallback label from Sol Ultra to GPT-5.6 Terra Ultra.
-- Keep historical Sol labels only for interpreting older rollout records.
+- Use `GPT-6.1 Sol High` for missing or incomplete attribution evidence while preserving the historical model and effort mappings from current master.
 
 ## Current State
-- The session-mining skill, attribution helper, and tests use the Terra Ultra fallback.
-- Observed `gpt-5.6-luna` rollout records use an explicit Luna label; unknown or incomplete evidence still uses the Terra Ultra fallback.
-- The skill validator and 74 attribution tests pass.
+- The attribution skill, helper, and tests use the `GPT-6.1 Sol High` missing-evidence fallback.
+- Current master model and effort mappings remain intact; observed `gpt-6.1-sol` / `medium` still renders as `GPT-6.1 Sol Medium`.
+- The attribution suite passes on Python 3.10.19 and 3.13.0, with 75 tests on each.
 
 ## Next Steps
-- Land the validated local change and synchronize the public skill release.
+- None; this workstream is complete.
 
 ## Evidence
 - Worktree: `codex/daily-skill-friction-20260924-codex-workflow-hygiene-model-profile-terra`
-- Skill validation: `codex_skill_validate.py` reports `Skill is valid!`.
+- `env PYTHONDONTWRITEBYTECODE=1 /Users/hoteng/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 -B tests/test_pr_attribution.py` — `Ran 75 tests in 11.453s`; `OK`.
+- `env PYTHONDONTWRITEBYTECODE=1 /Users/hoteng/.local/share/uv/python/cpython-3.13-macos-aarch64-none/bin/python3.13 -B tests/test_pr_attribution.py` — `Ran 75 tests in 11.757s`; `OK`.
