@@ -11,7 +11,7 @@ VERIFIER = REPO_ROOT / ".github/workflows/codex-review-gate.yml"
 
 
 class ReviewGateControllerTests(unittest.TestCase):
-    def test_stacked_and_material_edits_run_while_ignored_edits_are_isolated(self) -> None:
+    def test_stacked_and_edited_prs_use_stable_verifier_identity(self) -> None:
         verifier = VERIFIER.read_text(encoding="utf-8")
         controller = CONTROLLER.read_text(encoding="utf-8")
 
@@ -19,9 +19,26 @@ class ReviewGateControllerTests(unittest.TestCase):
             "types: [opened, reopened, synchronize, ready_for_review, stacked, edited]",
             verifier,
         )
-        self.assertIn("github.event.changes.base.ref.from", verifier)
-        self.assertIn("codex-review-gate-ignored-edit", verifier)
-        self.assertIn("codex-review-gate-verifier-ignored-", verifier)
+        self.assertIn(
+            "run-name: codex-review-gate-verifier/${{ github.event.pull_request.number }}/${{ github.sha }}",
+            verifier,
+        )
+        self.assertIn(
+            "group: ${{ format('codex-review-gate-verifier-{0}-{1}', github.repository, github.event.pull_request.number) }}",
+            verifier,
+        )
+        self.assertIn("    name: codex/github-review-gate", verifier)
+        verifier_job = verifier.split("jobs:\n  codex-review-gate:\n", 1)[1].split(
+            "    steps:\n", 1
+        )[0]
+        self.assertNotIn("    if:", verifier_job)
+        for obsolete_profile in (
+            "github.event.changes.base.ref.from",
+            "codex-review-gate-ignored-edit",
+            "codex-review-gate-verifier-ignored-",
+        ):
+            with self.subTest(obsolete_profile=obsolete_profile):
+                self.assertNotIn(obsolete_profile, verifier)
         self.assertIn("codex-review-gate-controller-ignored-", controller)
         self.assertIn(
             "startsWith(github.event.workflow_run.display_title, 'codex-review-gate-verifier/')",
@@ -161,8 +178,8 @@ class RequiredGateContractTests(unittest.TestCase):
         )
         self.assertIn("workflows: [Codex Review Gate Verifier]", workflow)
         self.assertIn("name: Codex Review Gate Verifier", verifier)
-        self.assertIn("'codex/github-review-gate'", verifier)
-        self.assertIn("'codex/ignored-review-gate-edit'", verifier)
+        self.assertIn("    name: codex/github-review-gate", verifier)
+        self.assertNotIn("'codex/ignored-review-gate-edit'", verifier)
         self.assertIn("uses: JoeyTeng/codex-review-gate-action@v2", verifier)
         self.assertIn("operation: reconcile", verifier)
         self.assertIn("request_review: false", verifier)
