@@ -11,6 +11,23 @@ VERIFIER = REPO_ROOT / ".github/workflows/codex-review-gate.yml"
 
 
 class ReviewGateControllerTests(unittest.TestCase):
+    def test_stacked_and_material_edits_run_while_ignored_edits_are_isolated(self) -> None:
+        verifier = VERIFIER.read_text(encoding="utf-8")
+        controller = CONTROLLER.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "types: [opened, reopened, synchronize, ready_for_review, stacked, edited]",
+            verifier,
+        )
+        self.assertIn("github.event.changes.base.ref.from", verifier)
+        self.assertIn("codex-review-gate-ignored-edit", verifier)
+        self.assertIn("codex-review-gate-verifier-ignored-", verifier)
+        self.assertIn("codex-review-gate-controller-ignored-", controller)
+        self.assertIn(
+            "startsWith(github.event.workflow_run.display_title, 'codex-review-gate-verifier/')",
+            controller,
+        )
+
     def test_workflow_run_completion_uses_only_the_canonical_verifier(self) -> None:
         workflow = CONTROLLER.read_text(encoding="utf-8")
         guard = workflow.split("    if: >-\n", 1)[1].split("    runs-on:", 1)[0]
@@ -144,7 +161,8 @@ class RequiredGateContractTests(unittest.TestCase):
         )
         self.assertIn("workflows: [Codex Review Gate Verifier]", workflow)
         self.assertIn("name: Codex Review Gate Verifier", verifier)
-        self.assertIn("    name: codex/github-review-gate", verifier)
+        self.assertIn("'codex/github-review-gate'", verifier)
+        self.assertIn("'codex/ignored-review-gate-edit'", verifier)
         self.assertIn("uses: JoeyTeng/codex-review-gate-action@v2", verifier)
         self.assertIn("operation: reconcile", verifier)
         self.assertIn("request_review: false", verifier)
