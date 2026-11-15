@@ -36,6 +36,8 @@ This skill controls command shape, execution deadlines, and output handling only
 - Let compact commands return directly.
 - Give a parallel batch one aggregate output and retained-byte budget. Per-command caps must fit inside that total, or each producer must write to a separately enforced bounded sink before a compact aggregate is emitted.
 - When full output may be large or useful for later inspection, redirect stdout and stderr to a task-scoped file before starting the command.
+- For a POSIX command, prefer the bundled deadline wrapper with `--output-log <new-task-log> --max-output-bytes <budget>` to capture both streams under one byte ceiling. It preserves ordinary artifact I/O and caller resource limits.
+- Do not apply `ulimit -f` or `RLIMIT_FSIZE` merely to bound logs: those limits also affect build products, downloads, and filesystem test fixtures. A task's intentional artifact-size constraint is separate from its log budget.
 - Before launch, set a finite wall-clock deadline and an enforced ceiling across all retained artifacts. Use a hard quota or bounded sink, rotation with fixed aggregate-byte and segment-count caps that removes or reuses old segments before writing more, or a supervisor that terminates the producer at the byte ceiling. The deadline must terminate the producer; byte enforcement must either keep the retained set below its fixed ceiling or terminate the producer.
 - A task-scoped path and byte-count polling do not by themselves bound disk growth.
 - Treat UI or tool output caps as display backstops, not as execution-time bounds.
@@ -56,7 +58,7 @@ This skill controls command shape, execution deadlines, and output handling only
 - Apply this skill alongside the task's domain skill. The domain skill owns the substantive workflow; this skill owns command shape and visible-output handling.
 - A debugging skill still owns artifact authority, authentication, hypothesis ranking, and root-cause decisions.
 - A delivery skill still owns implementation, validation, documentation, and commits.
-- A review skill's stricter evidence, byte, time, or process limits take precedence over this general guidance.
+- The selected review skill owns its evidence and capture contract, including any byte, time, or process limits. This general guidance does not add a model-report quota.
 
 ## Guardrails
 

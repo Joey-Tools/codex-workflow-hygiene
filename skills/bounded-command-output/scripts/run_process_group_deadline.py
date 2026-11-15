@@ -7,13 +7,14 @@ import enum
 import errno
 import math
 import os
+import select
 import signal
-import sys
 import threading
 import time
 
 
 TIMEOUT_EXIT = 124
+OUTPUT_LIMIT_EXIT = 123
 SUPERVISOR_ERROR_EXIT = 125
 CANNOT_EXECUTE_EXIT = 126
 COMMAND_NOT_FOUND_EXIT = 127
@@ -51,6 +52,86 @@ class SupervisorError(Exception):
 
 class ChildWaitTimeout(Exception):
     pass
+
+
+class OutputLimitExceeded(Exception):
+    pass
+
+
+class BoundedCapture:
+    """Own a new log and bound child stream bytes, without changing rlimits."""
+
+    def __init__(self, path: str, limit: int) -> None:
+        self.limit = limit
+        self.retained = 0
+        self.eof = False
+        self.log_fd: int | None = None
+        self.read_fd: int | None = None
+        self.write_fd: int | None = None
+        try:
+            # Exclusive creation protects existing destinations. Writes remain
+            # bound to this descriptor if the caller later renames its path.
+            self.log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            self.read_fd, self.write_fd = os.pipe()
+            os.set_blocking(self.read_fd, False)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        for attribute in ("read_fd", "write_fd", "log_fd"):
+            descriptor = getattr(self, attribute)
+            if descriptor is not None:
+                close_fd(descriptor)
+                setattr(self, attribute, None)
+
+    def parent_after_spawn(self) -> None:
+        assert self.write_fd is not None
+        close_fd(self.write_fd)
+        self.write_fd = None
+
+    def read_once(self) -> None:
+        assert self.read_fd is not None and self.log_fd is not None
+        try:
+            chunk = os.read(self.read_fd, min(65536, self.limit - self.retained + 1))
+        except BlockingIOError:
+            return
+        if not chunk:
+            self.eof = True
+            return
+        remaining = self.limit - self.retained
+        kept = memoryview(chunk)[:remaining]
+        while kept:
+            written = os.write(self.log_fd, kept)
+            if written <= 0:
+                raise SupervisorError("cannot write captured output: short write")
+            self.retained += written
+            kept = kept[written:]
+        if len(chunk) > remaining:
+            raise OutputLimitExceeded
+
+    def wait(self, process: ChildProcess, deadline: float) -> int:
+        while True:
+            require_time_remaining(deadline)
+            try:
+                # Read before observing exit so a flooding child's PID remains
+                # pinned for the existing process-group cleanup when possible.
+                self.read_once()
+                require_time_remaining(deadline)
+                if process.returncode is None:
+                    require_time_remaining(deadline)
+                    process.poll()
+                if process.returncode is not None and self.eof:
+                    return normalized_exit_code(process.returncode)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ChildWaitTimeout
+                if self.eof:
+                    time.sleep(min(WAIT_POLL_MAX_SECONDS, remaining))
+                else:
+                    select.select([self.read_fd], [], [], min(WAIT_POLL_MAX_SECONDS, remaining))
+            except OSError as exc:
+                raise SupervisorError(f"cannot capture command output: {exc}") from exc
 
 
 def require_time_remaining(deadline: float) -> None:
@@ -181,6 +262,16 @@ def finite_nonnegative(value: str) -> float:
     return parsed
 
 
+def positive_bytes(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive byte count") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive byte count")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -207,6 +298,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Use setsid instead of a same-session process group. This removes "
             "the child's controlling terminal and works on Python 3.10."
         ),
+    )
+    parser.add_argument(
+        "--output-log",
+        help="Create a new log containing merged command stdout/stderr.",
+    )
+    parser.add_argument(
+        "--max-output-bytes",
+        type=positive_bytes,
+        help="Maximum retained child-output bytes; requires --output-log.",
     )
     parser.add_argument(
         "command",
@@ -441,6 +541,7 @@ def exec_child(
     inherited_signal_mask: set[signal.Signals],
     inherited_sigchld_handler: signal.Handlers,
     inherited_file_descriptors_to_close: tuple[int, ...],
+    output_fd: int | None = None,
 ) -> None:
     try:
         if new_session:
@@ -486,6 +587,12 @@ def exec_child(
             start_fd,
         )
 
+    if output_fd is not None:
+        try:
+            os.dup2(output_fd, 1)
+            os.dup2(output_fd, 2)
+        except OSError as exc:
+            child_error(f"cannot redirect command output: {exc}", SUPERVISOR_ERROR_EXIT)
     for file_descriptor in inherited_file_descriptors_to_close:
         close_fd(file_descriptor)
     try:
@@ -541,6 +648,7 @@ def spawn_process(
     inherited_signal_mask: set[signal.Signals],
     parent_signal_mask: set[signal.Signals],
     deadline: float,
+    output_fd: int | None = None,
 ) -> tuple[ChildProcess, int, int]:
     opened_file_descriptors: list[int] = []
     try:
@@ -576,6 +684,7 @@ def spawn_process(
                 inherited_file_descriptors_to_close=(
                     inherited_file_descriptors_to_close
                 ),
+                output_fd=output_fd,
             )
         except BaseException as exc:
             child_error(
@@ -682,6 +791,8 @@ def main(argv: list[str] | None = None) -> int:
         command.pop(0)
     if not command:
         parser.error("a command is required after --")
+    if (args.output_log is None) != (args.max_output_bytes is None):
+        parser.error("--output-log and --max-output-bytes must be supplied together")
 
     if os.name != "posix":
         print_error(
@@ -726,6 +837,7 @@ def main(argv: list[str] | None = None) -> int:
     readiness_fd: int | None = None
     start_fd: int | None = None
     group_handoff_complete = False
+    capture: BoundedCapture | None = None
     deadline = time.monotonic() + args.timeout_seconds
 
     def run_command() -> int:
@@ -733,8 +845,14 @@ def main(argv: list[str] | None = None) -> int:
         nonlocal readiness_fd
         nonlocal start_fd
         nonlocal group_handoff_complete
+        nonlocal capture
         try:
             try:
+                if args.output_log is not None:
+                    capture = BoundedCapture(args.output_log, args.max_output_bytes)
+                capture_options = (
+                    {} if capture is None else {"output_fd": capture.write_fd}
+                )
                 (
                     process,
                     readiness_fd,
@@ -746,7 +864,10 @@ def main(argv: list[str] | None = None) -> int:
                     inherited_signal_mask=inherited_signal_mask,
                     parent_signal_mask=supervisor_signal_mask,
                     deadline=deadline,
+                    **capture_options,
                 )
+                if capture is not None:
+                    capture.parent_after_spawn()
             except ChildWaitTimeout:
                 gate.arm()
                 raise
@@ -779,7 +900,28 @@ def main(argv: list[str] | None = None) -> int:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise ChildWaitTimeout
+            if capture is not None:
+                return capture.wait(process, deadline)
             return normalized_exit_code(process.wait_until(deadline))
+        except OutputLimitExceeded:
+            gate.close()
+            ignore_managed_signals()
+            try:
+                cleanup_unverified = stop_process_group(
+                    process,
+                    process_group_id=process.pid,
+                    initial_signal=signal.SIGTERM,
+                    grace_seconds=args.grace_seconds,
+                    group_handoff_complete=group_handoff_complete,
+                )
+            except SupervisorError as exc:
+                print_error(str(exc))
+                return SUPERVISOR_ERROR_EXIT
+            message = "output byte limit exceeded; result incomplete"
+            if cleanup_unverified:
+                message += "; process-group cleanup unverified"
+            print_error(message)
+            return OUTPUT_LIMIT_EXIT
         except ChildWaitTimeout:
             gate.close()
             ignore_managed_signals()
@@ -826,6 +968,8 @@ def main(argv: list[str] | None = None) -> int:
                 close_fd(readiness_fd)
             if start_fd is not None:
                 close_fd(start_fd)
+            if capture is not None:
+                capture.close()
 
     try:
         try:
