@@ -125,6 +125,227 @@ class PlatformRejectionTests(unittest.TestCase):
 
 
 @unittest.skipUnless(POSIX, "requires POSIX")
+class BoundedCaptureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.log = self.root / "output.log"
+
+    def capture(self, code: str, *arguments: str, limit: int = 1024, seconds: str = "2"):
+        return run_supervisor(
+            "--timeout-seconds", seconds, "--grace-seconds", "0.1",
+            "--output-log", str(self.log), "--max-output-bytes", str(limit),
+            "--", sys.executable, "-c", code, *arguments,
+        )
+
+    def test_combined_exact_limit_preserves_status_and_bytes(self) -> None:
+        result = self.capture(
+            "import os; os.write(1, b'out\\n'); os.write(2, b'err\\n'); raise SystemExit(42)",
+            limit=8,
+        )
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self.log.read_bytes(), b"out\nerr\n")
+        self.assertEqual(self.log.stat().st_mode & 0o077, 0)
+
+    def test_one_extra_byte_is_incomplete_even_after_successful_child_exit(self) -> None:
+        result = self.capture(
+            "import os; os.write(1, b'out\\n'); os.write(2, b'err\\n')", limit=7,
+        )
+        self.assertEqual(result.returncode, 123, result.stderr)
+        self.assertEqual(self.log.read_bytes(), b"out\nerr")
+        self.assertIn("output byte limit exceeded; result incomplete", result.stderr)
+
+    def test_multiple_chunks_and_binary_bytes_are_counted_exactly(self) -> None:
+        result = self.capture(
+            "import os; os.write(1, b'x' * 65536); os.write(2, bytes([0,255,10]))",
+            limit=65539,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.log.read_bytes(), b"x" * 65536 + b"\x00\xff\n")
+
+    def test_log_budget_does_not_limit_artifacts_or_change_resource_limits(self) -> None:
+        import resource
+
+        artifact = self.root / "large-artifact.bin"
+        code = """
+import json, os, resource, sys
+from pathlib import Path
+assert list(resource.getrlimit(resource.RLIMIT_FSIZE)) == json.loads(sys.argv[2])
+Path(sys.argv[1]).write_bytes(b"x" * (2 * 1024 * 1024))
+os.write(1, b"done")
+"""
+        result = self.capture(
+            code, str(artifact), json.dumps(resource.getrlimit(resource.RLIMIT_FSIZE)),
+            limit=4,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(artifact.stat().st_size, 2 * 1024 * 1024)
+        self.assertEqual(self.log.read_bytes(), b"done")
+
+    def test_output_limit_stops_a_producer_ignoring_term_and_sigpipe(self) -> None:
+        marker = self.root / "should-not-run"
+        code = """
+import os, signal, sys
+from pathlib import Path
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+try:
+    os.write(1, b"x" * (1024 * 1024))
+except BrokenPipeError:
+    pass
+Path(sys.argv[1]).write_text("survived")
+"""
+        result = self.capture(code, str(marker), limit=32)
+        self.assertEqual(result.returncode, 123, result.stderr)
+        self.assertEqual(self.log.stat().st_size, 32)
+        self.assertFalse(marker.exists())
+
+    def test_timeout_keeps_captured_prefix(self) -> None:
+        result = self.capture(
+            "import os, time; os.write(1, b'begin\\n'); time.sleep(30)",
+            seconds="0.5",
+        )
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertEqual(self.log.read_bytes(), b"begin\n")
+        self.assertIn("deadline exceeded; result incomplete", result.stderr)
+
+    def test_capture_target_inherits_only_standard_descriptors(self) -> None:
+        code = """
+import json, os
+opened = []
+for descriptor in range(3, 64):
+    try:
+        os.fstat(descriptor)
+    except OSError:
+        continue
+    opened.append(descriptor)
+print(json.dumps(opened))
+"""
+        result = self.capture(code)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.log.read_bytes()), [])
+
+    def test_high_inherited_descriptors_preserve_capture_and_deadline(self) -> None:
+        import resource
+
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < 1100:
+            self.skipTest("requires at least 1100 open descriptors")
+        launcher = """
+import os, resource, sys
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+if soft < 1100:
+    resource.setrlimit(resource.RLIMIT_NOFILE, (1100, hard))
+opened = []
+while not opened or opened[-1] < 1030:
+    descriptor = os.open(os.devnull, os.O_RDONLY)
+    os.set_inheritable(descriptor, True)
+    opened.append(descriptor)
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+"""
+        marker = self.root / "survived-deadline"
+        child = (
+            "import os, sys, time; from pathlib import Path; "
+            "os.write(1, b'ready'); time.sleep(0.8); Path(sys.argv[1]).touch()"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", launcher, str(SCRIPT),
+             "--timeout-seconds", "0.3", "--grace-seconds", "0.05",
+             "--output-log", str(self.log), "--max-output-bytes", "32",
+             "--", sys.executable, "-c", child, str(marker)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertEqual(self.log.read_bytes(), b"ready")
+        time.sleep(0.8)
+        self.assertFalse(marker.exists())
+
+    def test_capture_forwards_external_cancellation(self) -> None:
+        with subprocess.Popen(
+            [
+                sys.executable, str(SCRIPT), "--timeout-seconds", "5",
+                "--grace-seconds", "0.1", "--output-log", str(self.log),
+                "--max-output-bytes", "1024", "--", sys.executable, "-c",
+                "import os, time; os.write(1, b'ready'); time.sleep(30)",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as process:
+            try:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if self.log.exists() and self.log.stat().st_size == 5:
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("target output was not captured")
+                process.send_signal(signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr)
+                self.assertEqual(stdout, "")
+                self.assertEqual(self.log.read_bytes(), b"ready")
+                self.assertNotIn("Traceback", stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=3)
+
+    def test_background_pipe_after_leader_exit_remains_deadline_bounded(self) -> None:
+        result = self.capture(
+            "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.8)'])",
+            seconds="0.3",
+        )
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertIn("cleanup unverified", result.stderr)
+
+    def test_existing_file_and_symlink_are_preserved_before_child_start(self) -> None:
+        marker = self.root / "started"
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                target = self.root / "existing"
+                target.write_bytes(b"keep")
+                if symlink:
+                    self.log.symlink_to(target)
+                else:
+                    self.log.write_bytes(b"keep")
+                result = self.capture(
+                    "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+                    str(marker),
+                )
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertFalse(marker.exists())
+                self.assertEqual(self.log.read_bytes(), b"keep")
+                self.assertEqual(target.read_bytes(), b"keep")
+                self.log.unlink()
+
+    def test_capture_options_require_a_positive_limit_and_a_new_destination(self) -> None:
+        cases = (
+            ("--output-log", str(self.log)),
+            ("--max-output-bytes", "20"),
+            ("--output-log", str(self.log), "--max-output-bytes", "0"),
+            ("--output-log", str(self.log), "--max-output-bytes", "-1"),
+            ("--output-log", str(self.log), "--max-output-bytes", "nan"),
+        )
+        for options in cases:
+            with self.subTest(options=options):
+                result = run_supervisor(
+                    "--timeout-seconds", "1", *options, "--", sys.executable, "-c", "pass",
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(self.log.exists())
+
+    def test_capture_does_not_hide_command_start_failure(self) -> None:
+        result = run_supervisor(
+            "--timeout-seconds", "1", "--output-log", str(self.log),
+            "--max-output-bytes", "1024", "--", "/definitely/missing/bounded-command",
+        )
+        self.assertEqual(result.returncode, 127, result.stderr)
+        self.assertIn(b"command not found", self.log.read_bytes())
+
+
+@unittest.skipUnless(POSIX, "requires POSIX")
 class PosixNewSessionDeadlineTests(unittest.TestCase):
     def test_new_session_mode_is_explicit(self) -> None:
         probe = (

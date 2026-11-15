@@ -77,7 +77,44 @@ The wrapper runs direct argv without an implicit shell, inherits only standard i
 
 Both same-session `setpgid()` and `--new-session` `setsid()` modes work on the repository's Python 3.10 baseline. Same-session mode preserves the session and controlling terminal, but the new group is not automatically the terminal's foreground group; use it for non-interactive commands or redirected input. `--new-session` explicitly removes the controlling terminal. The helper must run as a newly started, standalone single-threaded POSIX CLI with `fork`, `setpgid`, `setsid`, `waitpid`, `killpg`, `pthread_sigmask`, open file descriptors `0` through `2`, and either `/dev/fd` or `/proc/self/fd` available for closing inherited descriptors; its Python thread-count check cannot prove that an embedding host has no native threads, so imported or embedded use is unsupported. These are ordinary same-effective-UID process operations and require neither root, a container, nor a dedicated service manager. Pipe creation, file-descriptor enumeration, and the synchronous `fork()` system call are charged to the deadline when they return, but an uninterruptible kernel call cannot be preempted while it is still inside the kernel. Timeout and grace inputs are capped at one year solely to stay within portable sleep and wait representations; this is not a recommended deadline, default, or slow-command threshold.
 
-Both modes intentionally do not chase descendants that call `setsid()` or `setpgid()` to escape, clean up background descendants after a normal leader exit, or prove group quiescence. A surviving descendant that inherits stdout or stderr can keep an outer pipe reader waiting for EOF even after the direct child exits; redirect or close those descriptors when background survival is intentional. On macOS, signaling the group after `GO` may return `EPERM` during handoff or after its leader exits; the wrapper falls back to signaling a still-live direct child and reports group cleanup as unverified. The wrapper is not a real-time scheduler: CPU starvation or ordinary scheduler delay can postpone deadline recognition and return, even though the monotonic deadline is never reset. It also cannot enforce a deadline while it is stopped, after it receives `SIGKILL`, or while the host is suspended. It enforces time only; retained-output byte ceilings remain a separate caller responsibility. Use stronger supervision or OS containment only when task-owned work can outlive these accepted boundaries and must be stopped.
+Both modes intentionally do not chase descendants that call `setsid()` or `setpgid()` to escape, clean up background descendants after a normal leader exit, or prove group quiescence. A surviving descendant that inherits stdout or stderr can keep an outer pipe reader waiting for EOF even after the direct child exits; redirect or close those descriptors when background survival is intentional. On macOS, signaling the group after `GO` may return `EPERM` during handoff or after its leader exits; the wrapper falls back to signaling a still-live direct child and reports group cleanup as unverified. The wrapper is not a real-time scheduler: CPU starvation or ordinary scheduler delay can postpone deadline recognition and return, even though the monotonic deadline is never reset. It also cannot enforce a deadline while it is stopped, after it receives `SIGKILL`, or while the host is suspended. Without capture options it enforces time only; retained-output byte ceilings remain a separate caller responsibility. Use stronger supervision or OS containment only when task-owned work can outlive these accepted boundaries and must be stopped.
+
+### Bound The Log Stream Without Limiting Artifacts
+
+Supply both capture options when the command needs a retained log:
+
+```bash
+python3 <loaded-skill-dir>/scripts/run_process_group_deadline.py \
+  --timeout-seconds 1800 --grace-seconds 2 \
+  --output-log <new-task-log> --max-output-bytes 16777216 \
+  -- make test
+```
+
+Choose the deadline and byte count for the task; these values are illustrative.
+The log's parent directory must already exist. The wrapper exclusively creates
+a new owner-only log and refuses existing files, directories, or symlinks
+before starting the command. Its sink contract is bounded retained bytes and
+preservation of existing destinations, not protection against later caller-side
+renames or tampering with the log directory.
+
+Command stdout and stderr share one binary pipe and one aggregate byte budget.
+The wrapper retains at most that many bytes, allows an exact-size complete
+stream, and returns `123` with an explicit incomplete diagnostic when another
+byte arrives. It then uses the existing TERM/grace/KILL cleanup boundary.
+Below the ceiling, a complete stream preserves the command's exit status.
+The wrapper's own short diagnostics remain on its stderr.
+
+Capture does not set or raise `RLIMIT_FSIZE`, change `ulimit -f`, or restrict
+files created by the target command. A small log budget therefore permits
+larger test fixtures, archives, and build products. Preserve any intentional
+resource limits already imposed by the caller.
+
+Captured output must reach EOF as well as direct-child exit before it is
+complete. If a background descendant retains the pipe, the original deadline
+still bounds the wait. A timeout or overflow after the leader was reaped does
+not signal a possibly reused process group and reports cleanup as unverified.
+Escaped or intentionally surviving descendants retain the ordinary wrapper's
+documented boundary; redirect their standard streams when survival is intended.
 
 ## Builds, Tests, And Polling
 
