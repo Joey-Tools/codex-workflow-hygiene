@@ -29,6 +29,7 @@ limits and ordinary artifact creation.
 
 ## Evidence
 
-- 57 deadline/capture and skill-structure tests passed.
+- 58 deadline/capture and skill-structure tests passed.
 - Regressions cover a 2 MiB artifact under a 4-byte log budget, unchanged caller file-size limits, exact and excess output, binary chunks, descriptor closure, cancellation, and background EOF.
 - Ruff, skill validation, and diff checks passed.
+- High inherited descriptors retain capture and deadline enforcement through the platform's default selector.

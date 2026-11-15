@@ -7,7 +7,7 @@ import enum
 import errno
 import math
 import os
-import select
+import selectors
 import signal
 import threading
 import time
@@ -68,17 +68,23 @@ class BoundedCapture:
         self.log_fd: int | None = None
         self.read_fd: int | None = None
         self.write_fd: int | None = None
+        self.selector: selectors.BaseSelector | None = None
         try:
             # Exclusive creation protects existing destinations. Writes remain
             # bound to this descriptor if the caller later renames its path.
             self.log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             self.read_fd, self.write_fd = os.pipe()
             os.set_blocking(self.read_fd, False)
+            self.selector = selectors.DefaultSelector()
+            self.selector.register(self.read_fd, selectors.EVENT_READ)
         except BaseException:
             self.close()
             raise
 
     def close(self) -> None:
+        if self.selector is not None:
+            self.selector.close()
+            self.selector = None
         for attribute in ("read_fd", "write_fd", "log_fd"):
             descriptor = getattr(self, attribute)
             if descriptor is not None:
@@ -129,7 +135,8 @@ class BoundedCapture:
                 if self.eof:
                     time.sleep(min(WAIT_POLL_MAX_SECONDS, remaining))
                 else:
-                    select.select([self.read_fd], [], [], min(WAIT_POLL_MAX_SECONDS, remaining))
+                    assert self.selector is not None
+                    self.selector.select(min(WAIT_POLL_MAX_SECONDS, remaining))
             except OSError as exc:
                 raise SupervisorError(f"cannot capture command output: {exc}") from exc
 

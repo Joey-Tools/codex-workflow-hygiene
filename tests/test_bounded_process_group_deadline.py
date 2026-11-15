@@ -228,6 +228,41 @@ print(json.dumps(opened))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.log.read_bytes()), [])
 
+    def test_high_inherited_descriptors_preserve_capture_and_deadline(self) -> None:
+        import resource
+
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < 1100:
+            self.skipTest("requires at least 1100 open descriptors")
+        launcher = """
+import os, resource, sys
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+if soft < 1100:
+    resource.setrlimit(resource.RLIMIT_NOFILE, (1100, hard))
+opened = []
+while not opened or opened[-1] < 1030:
+    descriptor = os.open(os.devnull, os.O_RDONLY)
+    os.set_inheritable(descriptor, True)
+    opened.append(descriptor)
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+"""
+        marker = self.root / "survived-deadline"
+        child = (
+            "import os, sys, time; from pathlib import Path; "
+            "os.write(1, b'ready'); time.sleep(0.8); Path(sys.argv[1]).touch()"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", launcher, str(SCRIPT),
+             "--timeout-seconds", "0.3", "--grace-seconds", "0.05",
+             "--output-log", str(self.log), "--max-output-bytes", "32",
+             "--", sys.executable, "-c", child, str(marker)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertEqual(self.log.read_bytes(), b"ready")
+        time.sleep(0.8)
+        self.assertFalse(marker.exists())
+
     def test_capture_forwards_external_cancellation(self) -> None:
         with subprocess.Popen(
             [
