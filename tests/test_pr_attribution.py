@@ -168,6 +168,8 @@ class PrAttributionTests(unittest.TestCase):
         cases = (
             ("openai/gpt-5.6-terra", sentence("GPT-5.6 Terra Max")),
             ("openai/gpt-6.1-sol", sentence("GPT-6.1 Sol Max")),
+            ("openai/gpt-6.2-sol", sentence("GPT-6.2 Sol Max")),
+            ("openai/gpt-6-sol", sentence("GPT-6 Sol Max")),
             ("openai/gpt-6-luna", sentence("GPT-6 Luna Max")),
             ("openai/gpt-5.50", FALLBACK),
             ("openai/gpt-5.6-solitude", FALLBACK),
